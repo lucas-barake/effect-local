@@ -1,0 +1,26 @@
+{
+  "name": "@effect-local/api-tour",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b tsconfig.json --pretty false",
+    "check": "tsc -b tsconfig.json --pretty false",
+    "quickstart": "tsx src/quickstart.ts",
+    "backup": "tsx src/backup-and-portability.ts",
+    "peer-sync": "tsx src/peer-sync.ts",
+    "peer-session": "tsx src/peer-session.ts",
+    "faults": "tsx src/fault-injection.ts",
+    "all": "pnpm quickstart && pnpm backup && pnpm peer-sync && pnpm peer-session && pnpm faults"
+  },
+  "dependencies": {
+    "@effect/sql-sqlite-node": "4.0.0-beta.99",
+    "@lucas-barake/effect-local": "workspace:^",
+    "@lucas-barake/effect-local-browser": "workspace:^",
+    "@lucas-barake/effect-local-sql": "workspace:^",
+    "@lucas-barake/effect-local-test": "workspace:^",
+    "effect": "4.0.0-beta.99"
+  },
+  "devDependencies": {
+    "tsx": "4.20.6"
+  }
+}

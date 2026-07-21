@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Effect Local Browser Spike</title>
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">Stage 0</p>
+          <h1>Browser durability spike</h1>
+        </div>
+        <div class="actions">
+          <button id="new-command" type="button">New command</button>
+          <button id="run-proof" type="button">Run proof</button>
+        </div>
+      </header>
+      <section class="status-band" aria-live="polite">
+        <span id="status-dot" class="status-dot"></span>
+        <strong id="status">Starting shared engine</strong>
+        <code id="command-id"></code>
+      </section>
+      <section class="proofs" aria-label="Proof results">
+        <article data-proof="atomicity">
+          <span class="proof-mark">1</span>
+          <div><h2>Atomic commit</h2><p>Waiting</p></div>
+        </article>
+        <article data-proof="duplicate">
+          <span class="proof-mark">2</span>
+          <div><h2>Stored duplicate reply</h2><p>Waiting</p></div>
+        </article>
+        <article data-proof="reload">
+          <span class="proof-mark">3</span>
+          <div><h2>OPFS reload</h2><p>Waiting</p></div>
+        </article>
+        <article data-proof="stream">
+          <span class="proof-mark">4</span>
+          <div><h2>Responsive stream</h2><p>Waiting</p></div>
+        </article>
+      </section>
+      <pre id="details"></pre>
+    </main>
+  </body>
+</html>

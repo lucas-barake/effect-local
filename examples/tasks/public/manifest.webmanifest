@@ -1,0 +1,16 @@
+{
+  "name": "Local Tasks",
+  "short_name": "Tasks",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f6f3",
+  "theme_color": "#176b4b",
+  "icons": [
+    {
+      "src": "/task-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

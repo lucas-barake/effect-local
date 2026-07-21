@@ -1,0 +1,33 @@
+name: Check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.18.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm check
+      - run: pnpm test
+      - run: pnpm build
+      - run: pnpm build:examples
+      - run: pnpm test:examples
+      - run: pnpm circular
+      - run: pnpm docgen
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm test:browser

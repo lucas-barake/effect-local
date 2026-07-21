@@ -1,0 +1,23 @@
+{
+  "name": "@effect-local/advanced-api-examples",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b tsconfig.json",
+    "check": "tsc -b tsconfig.json --pretty false",
+    "presence": "tsx src/presence.ts",
+    "operations": "tsx src/operations.ts",
+    "examples": "pnpm build && tsx src/presence.ts && tsx src/operations.ts"
+  },
+  "dependencies": {
+    "@lucas-barake/effect-local": "workspace:^",
+    "@lucas-barake/effect-local-browser": "workspace:^",
+    "@lucas-barake/effect-local-sql": "workspace:^",
+    "effect": "4.0.0-beta.99"
+  },
+  "devDependencies": {
+    "@types/node": "^25.7.0",
+    "tsx": "^4.20.6",
+    "typescript": "^6.0.3"
+  }
+}

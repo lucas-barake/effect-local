@@ -1,0 +1,542 @@
+import { assert, describe, it } from "@effect/vitest"
+import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
+import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
+import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Replica from "@lucas-barake/effect-local/Replica"
+import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Deferred from "effect/Deferred"
+import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
+import * as Layer from "effect/Layer"
+import * as Stream from "effect/Stream"
+import { TestClock } from "effect/testing"
+import { Headers } from "effect/unstable/http"
+import { Rpc, RpcTest } from "effect/unstable/rpc"
+import * as RpcClientError from "effect/unstable/rpc/RpcClientError"
+import { RequestId } from "effect/unstable/rpc/RpcMessage"
+import * as ReplicaClient from "../src/ReplicaClient.js"
+import * as ReplicaOwner from "../src/ReplicaOwner.js"
+import * as ReplicaRpc from "../src/ReplicaRpc.js"
+import * as SessionManager from "../src/SessionManager.js"
+import { definition, documentId, Read, Rename, replica, Task } from "./fixtures.js"
+
+describe("ReplicaClient", () => {
+  const limits = {
+    maxBackupBytes: 1024,
+    maxChunkBytes: 128,
+    maxArchiveRecords: 100,
+    maxJsonDepth: 16,
+    maxSyncMessageBytes: 1024,
+    maxPeerSendMillis: 1_000,
+    maxSyncChangesPerMessage: 10,
+    maxSyncDependencyEdgesPerMessage: 20,
+    maxSyncOperationsPerMessage: 100,
+    maxPendingBytesPerDocument: 1024,
+    maxPendingBytesPerPeer: 2048,
+    maxPendingBytesPerReplica: 4096,
+    maxPendingAgeMillis: 60_000,
+    maxPendingChangesPerDocument: 10,
+    maxPendingChangesPerPeer: 20,
+    maxPendingChangesPerReplica: 40,
+    maxPendingDependencyEdgesPerDocument: 100,
+    maxPendingDependencyEdgesPerPeer: 200,
+    maxPendingDependencyEdgesPerReplica: 400,
+    maxSessions: 2,
+    maxStreamsPerSession: 2,
+    maxInFlightPerSession: 2,
+    maxQueuedRpc: 4
+  } satisfies ReplicaLimits.Values
+  const Sessions = SessionManager.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)))
+  const Publisher = Layer.succeed(
+    CommitPublisher.CommitPublisher,
+    CommitPublisher.CommitPublisher.of({
+      publishPending: Effect.succeed(0),
+      invalidate: () => Effect.void,
+      subscribe: Effect.succeed({
+        watermark: Identity.CommitSequence.make(0),
+        refreshGeneration: 0,
+        events: Stream.never
+      })
+    })
+  )
+  const Owner = ReplicaOwner.handlers(definition).pipe(
+    Layer.provideMerge(Sessions),
+    Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, replica)))
+  )
+
+  const disconnected = () =>
+    new RpcClientError.RpcClientError({
+      reason: new RpcClientError.RpcClientDefect({ message: "disconnected", cause: "disconnected" })
+    })
+
+  it.effect("round trips typed replica operations and releases its session", () =>
+    Effect.gen(function*() {
+      const sessions = yield* SessionManager.SessionManager
+      assert.strictEqual(yield* sessions.activeCount, 0)
+      yield* Effect.scoped(Effect.gen(function*() {
+        const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+        const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
+        assert.strictEqual(yield* sessions.activeCount, 1)
+        yield* TestClock.adjust(SessionManager.leaseDurationMillis / 2)
+        yield* TestClock.adjust(SessionManager.leaseDurationMillis / 2 + 1)
+        assert.strictEqual(yield* sessions.activeCount, 1)
+
+        const snapshot = yield* client.get(Task, documentId)
+        assert.strictEqual(snapshot.value.title, "stored")
+        const mutation = yield* client.mutate(Rename, {
+          commandId: Identity.makeCommandId(),
+          documentId,
+          payload: { title: "next" }
+        })
+        assert.strictEqual(mutation._tag, "DurablyCommittedLocal")
+        assert.deepStrictEqual(yield* client.query(Read, "filter"), [{ title: "filter" }])
+        assert.deepStrictEqual(Array.from(yield* Stream.runCollect(client.status)), [{
+          _tag: "Ready",
+          pendingCommands: 0
+        }])
+      }))
+      assert.strictEqual(yield* sessions.activeCount, 0)
+    }).pipe(
+      Effect.provide(Owner)
+    ))
+
+  it.effect("closes an opened session when acquisition is interrupted", () =>
+    Effect.gen(function*() {
+      const sessions = yield* SessionManager.SessionManager
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const opened = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const delayed = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property !== "OpenSession") return value
+          return (payload: never) =>
+            value(payload).pipe(
+              Effect.tap(() => Deferred.succeed(opened, undefined)),
+              Effect.tap(() => Deferred.await(release))
+            )
+        }
+      })
+      const fiber = yield* Effect.scoped(ReplicaClient.fromRpcClient(definition, delayed)).pipe(Effect.forkChild)
+      yield* Deferred.await(opened)
+      const interrupted = yield* Fiber.interrupt(fiber).pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(interrupted)
+      assert.strictEqual(yield* sessions.activeCount, 0)
+    }).pipe(Effect.provide(Owner)))
+
+  it.effect("rejects clients built for a different definition", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const error = yield* Effect.flip(ReplicaClient.fromRpcClient({ ...definition, hash: "different" }, rpc))
+      assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("recovers ambiguous commands through typed receipt lookup", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const ambiguous = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property !== "Create" && property !== "Mutate" && property !== "Delete") return value
+          return (payload: never) => value(payload).pipe(Effect.andThen(Effect.fail(disconnected())))
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, ambiguous)
+      const createId = Identity.makeCommandId()
+      const mutateId = Identity.makeCommandId()
+      const deleteId = Identity.makeCommandId()
+
+      assert.deepStrictEqual(
+        yield* client.create(Task, { commandId: createId, value: { title: "new" } }),
+        CommandOutcome.durablyCommitted(createId, documentId)
+      )
+      assert.deepStrictEqual(
+        yield* client.mutate(Rename, { commandId: mutateId, documentId, payload: { title: "next" } }),
+        CommandOutcome.durablyCommitted(mutateId, "renamed")
+      )
+      assert.deepStrictEqual(
+        yield* client.delete(Task, { commandId: deleteId, documentId }),
+        CommandOutcome.durablyCommitted(deleteId, undefined)
+      )
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("returns unknown when ambiguous command lookup also loses transport", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const unavailable = new Proxy(rpc, {
+        get(target, property, receiver) {
+          if (property === "Mutate" || property === "LookupMutation") {
+            return () => Effect.fail(disconnected())
+          }
+          return Reflect.get(target, property, receiver)
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, unavailable)
+      const commandId = Identity.makeCommandId()
+      assert.deepStrictEqual(
+        yield* client.mutate(Rename, { commandId, documentId, payload: { title: "next" } }),
+        CommandOutcome.unknown(commandId)
+      )
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("streams commit invalidations with handshake coverage", () => {
+    const Events = Layer.succeed(
+      CommitPublisher.CommitPublisher,
+      CommitPublisher.CommitPublisher.of({
+        publishPending: Effect.succeed(0),
+        invalidate: () => Effect.void,
+        subscribe: Effect.succeed({
+          watermark: Identity.CommitSequence.make(0),
+          refreshGeneration: 0,
+          events: Stream.make({
+            _tag: "Commit" as const,
+            commitSequence: Identity.CommitSequence.make(1),
+            documentId,
+            keys: [Task.name],
+            refreshGeneration: 0
+          })
+        })
+      })
+    )
+    const EventOwner = ReplicaOwner.handlers(definition).pipe(
+      Layer.provideMerge(Sessions),
+      Layer.provide(Layer.merge(Events, Layer.succeed(Replica.Replica, replica)))
+    )
+    return Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
+      assert.deepStrictEqual(Array.from(yield* Stream.runCollect(client.invalidations)), [{
+        _tag: "Invalidation",
+        ownerEpoch: client.ownerEpoch,
+        sequence: Identity.CommitSequence.make(1),
+        keys: [Task.name]
+      }])
+    })).pipe(Effect.provide(EventOwner))
+  })
+
+  it.effect("acquires a fresh commit subscription for every invalidation stream", () => {
+    let subscriptions = 0
+    const Events = Layer.succeed(
+      CommitPublisher.CommitPublisher,
+      CommitPublisher.CommitPublisher.of({
+        publishPending: Effect.succeed(0),
+        invalidate: () => Effect.void,
+        subscribe: Effect.sync(() => {
+          subscriptions++
+          return {
+            watermark: Identity.CommitSequence.make(subscriptions - 1),
+            refreshGeneration: 0,
+            events: Stream.make({
+              _tag: "Commit" as const,
+              commitSequence: Identity.CommitSequence.make(subscriptions),
+              documentId,
+              keys: [`subscription-${subscriptions}`],
+              refreshGeneration: 0
+            })
+          }
+        })
+      })
+    )
+    const EventOwner = ReplicaOwner.handlers(definition).pipe(
+      Layer.provideMerge(Sessions),
+      Layer.provide(Layer.merge(Events, Layer.succeed(Replica.Replica, replica)))
+    )
+    return Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const first = yield* ReplicaClient.fromRpcClient(definition, rpc)
+      const second = yield* ReplicaClient.fromRpcClient(definition, rpc)
+      const events = yield* Effect.all([
+        Stream.runCollect(first.invalidations),
+        Stream.runCollect(second.invalidations)
+      ], { concurrency: "unbounded" })
+      assert.strictEqual(subscriptions, 2)
+      assert.notDeepEqual(Array.from(events[0]), Array.from(events[1]))
+    })).pipe(Effect.provide(EventOwner))
+  })
+
+  it.effect("retries transient invalidation failures and refreshes across a new baseline", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      let subscriptions = 0
+      const reconnecting = new Proxy(rpc, {
+        get(target, property, receiver) {
+          if (property !== "Invalidations") return Reflect.get(target, property, receiver)
+          return ({ ownerEpoch }: { readonly ownerEpoch: string }) =>
+            Stream.unwrap(Effect.sync(() => {
+              subscriptions++
+              return subscriptions === 1
+                ? Stream.make({
+                  _tag: "InvalidationsReady" as const,
+                  ownerEpoch,
+                  watermark: Identity.CommitSequence.make(0),
+                  refreshGeneration: 0
+                }).pipe(Stream.concat(Stream.fail(disconnected())))
+                : Stream.make({
+                  _tag: "InvalidationsReady" as const,
+                  ownerEpoch,
+                  watermark: Identity.CommitSequence.make(2),
+                  refreshGeneration: 0
+                })
+            }))
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, reconnecting)
+      const fiber = yield* client.invalidations.pipe(Stream.take(1), Stream.runCollect, Effect.forkChild)
+      yield* TestClock.adjust(1_000)
+      assert.deepStrictEqual(Array.from(yield* Fiber.join(fiber)), [{
+        _tag: "FullRefreshRequired",
+        ownerEpoch: client.ownerEpoch,
+        keys: [Task.name]
+      }])
+      assert.strictEqual(subscriptions, 2)
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("requires a full refresh from an initial sticky refresh generation", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const sticky = new Proxy(rpc, {
+        get(target, property, receiver) {
+          if (property !== "Invalidations") return Reflect.get(target, property, receiver)
+          return ({ ownerEpoch }: { readonly ownerEpoch: string }) =>
+            Stream.make({
+              _tag: "InvalidationsReady" as const,
+              ownerEpoch,
+              watermark: Identity.CommitSequence.make(0),
+              refreshGeneration: 1
+            })
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, sticky)
+      assert.deepStrictEqual(Array.from(yield* Stream.runCollect(client.invalidations)), [{
+        _tag: "FullRefreshRequired",
+        ownerEpoch: client.ownerEpoch,
+        keys: [Task.name]
+      }])
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("bounds invalidation reconnect attempts after ready messages", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      let subscriptions = 0
+      const disconnectedAfterReady = new Proxy(rpc, {
+        get(target, property, receiver) {
+          if (property !== "Invalidations") return Reflect.get(target, property, receiver)
+          return ({ ownerEpoch }: { readonly ownerEpoch: string }) =>
+            Stream.unwrap(Effect.sync(() => {
+              subscriptions++
+              return Stream.make({
+                _tag: "InvalidationsReady" as const,
+                ownerEpoch,
+                watermark: Identity.CommitSequence.make(0),
+                refreshGeneration: 0
+              }).pipe(Stream.concat(Stream.fail(disconnected())))
+            }))
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, disconnectedAfterReady)
+      const fiber = yield* client.invalidations.pipe(Stream.runDrain, Effect.flip, Effect.forkChild)
+      yield* TestClock.adjust(2_000)
+      const error = yield* Fiber.join(fiber)
+      assert.strictEqual(error.reason._tag, "StorageUnavailable")
+      assert.strictEqual(subscriptions, 4)
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("retries transient lease renewal failures", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sessions = yield* SessionManager.SessionManager
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      let renewals = 0
+      const reconnecting = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property !== "RenewSession") return value
+          return (payload: never) =>
+            Effect.sync(() => ++renewals).pipe(
+              Effect.flatMap((attempt) => attempt < 3 ? Effect.fail(disconnected()) : value(payload))
+            )
+        }
+      })
+      yield* ReplicaClient.fromRpcClient(definition, reconnecting)
+      yield* TestClock.adjust(SessionManager.leaseDurationMillis / 2 + 1_000)
+      assert.strictEqual(renewals, 3)
+      assert.strictEqual(yield* sessions.activeCount, 1)
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("requires a full refresh for sequence gaps and discards stale owner events", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const withGap = new Proxy(rpc, {
+        get(target, property, receiver) {
+          if (property !== "Invalidations") return Reflect.get(target, property, receiver)
+          return ({ ownerEpoch }: { readonly ownerEpoch: string }) =>
+            Stream.make(
+              {
+                _tag: "Invalidation" as const,
+                ownerEpoch: "stale-owner",
+                sequence: Identity.CommitSequence.make(1),
+                keys: [Task.name]
+              },
+              {
+                _tag: "Invalidation" as const,
+                ownerEpoch,
+                sequence: Identity.CommitSequence.make(2),
+                keys: [Task.name]
+              }
+            )
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, withGap)
+      assert.deepStrictEqual(Array.from(yield* Stream.runCollect(client.invalidations)), [{
+        _tag: "FullRefreshRequired",
+        ownerEpoch: client.ownerEpoch,
+        keys: [Task.name]
+      }])
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("preserves a definite domain rejection", () => {
+    let lookups = 0
+    const rejected: Replica.Service = {
+      ...replica,
+      mutate: (_mutation, options) =>
+        Effect.succeed(CommandOutcome.rejected(options.commandId, "not allowed")) as never,
+      lookupMutation: () =>
+        Effect.sync(() => {
+          lookups++
+          return CommandOutcome.unknown(Identity.makeCommandId())
+        }) as never
+    }
+    const RejectedOwner = ReplicaOwner.handlers(definition).pipe(
+      Layer.provideMerge(Sessions),
+      Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, rejected)))
+    )
+    return Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
+      const commandId = Identity.makeCommandId()
+      assert.deepStrictEqual(
+        yield* client.mutate(Rename, { commandId, documentId, payload: { title: "next" } }),
+        CommandOutcome.rejected(commandId, "not allowed")
+      )
+      assert.strictEqual(lookups, 0)
+    })).pipe(Effect.provide(RejectedOwner))
+  })
+
+  it.effect("rejects operations without an active session", () =>
+    Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const error = yield* Effect.flip(rpc.Get({
+        sessionId: Identity.makeSessionId(),
+        document: Task.name,
+        documentId
+      }))
+      assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+    }).pipe(Effect.provide(Owner)))
+
+  it.effect("binds sessions to the transport client", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const open = yield* ReplicaRpc.group.accessHandler("OpenSession")
+      const renew = yield* ReplicaRpc.group.accessHandler("RenewSession")
+      const close = yield* ReplicaRpc.group.accessHandler("CloseSession")
+      const get = yield* ReplicaRpc.group.accessHandler("Get")
+      const status = yield* ReplicaRpc.group.accessHandler("Status")
+      const sessionId = Identity.makeSessionId()
+      const owner = new Rpc.ServerClient(1)
+      const other = new Rpc.ServerClient(2)
+      const options = (client: Rpc.ServerClient, requestId: string) => ({
+        client,
+        requestId: RequestId(requestId),
+        headers: Headers.empty
+      })
+      const unary = <A, E, R,>(effect: Effect.Effect<A | Deferred.Deferred<A, E>, E, R>) =>
+        Effect.flatMap(effect, (value) =>
+          Deferred.isDeferred<A, E>(value) ? Deferred.await(value) : Effect.succeed(value))
+
+      yield* unary(open({ sessionId, definitionHash: definition.hash }, options(owner, "open")))
+
+      assert.strictEqual(
+        (yield* Effect.flip(unary(open({ sessionId, definitionHash: definition.hash }, options(other, "open-other")))))
+          .reason._tag,
+        "ProtocolMismatch"
+      )
+      assert.strictEqual(
+        (yield* Effect.flip(unary(renew({ sessionId }, options(other, "renew-other"))))).reason._tag,
+        "ProtocolMismatch"
+      )
+      assert.strictEqual(
+        (yield* Effect.flip(unary(close({ sessionId }, options(other, "close-other"))))).reason._tag,
+        "ProtocolMismatch"
+      )
+      assert.strictEqual(
+        (yield* Effect.flip(unary(get(
+          { sessionId, document: Task.name, documentId },
+          options(other, "get-other")
+        )))).reason._tag,
+        "ProtocolMismatch"
+      )
+
+      const otherStatus = status({ sessionId }, options(other, "status-other"))
+      assert.isTrue(Stream.isStream(otherStatus))
+      const streamError = yield* (otherStatus as Stream.Stream<unknown, ReplicaError.ReplicaError>).pipe(
+        Stream.runDrain,
+        Effect.flip
+      )
+      assert.strictEqual(streamError.reason._tag, "ProtocolMismatch")
+
+      const snapshot = yield* unary(get(
+        { sessionId, document: Task.name, documentId },
+        options(owner, "get-owner")
+      ))
+      assert.strictEqual(snapshot.documentId, documentId)
+      const ownerStatus = status({ sessionId }, options(owner, "status-owner"))
+      assert.isTrue(Stream.isStream(ownerStatus))
+      assert.lengthOf(
+        Array.from(yield* Stream.runCollect(ownerStatus as Stream.Stream<unknown, ReplicaError.ReplicaError>)),
+        1
+      )
+      yield* unary(close({ sessionId }, options(owner, "close-owner")))
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("transfers backup bytes through the owner", () => {
+    let restored: ReadonlyArray<Uint8Array> = []
+    const BackupOwner = ReplicaOwner.handlers(definition).pipe(
+      Layer.provideMerge(Sessions),
+      Layer.provide(Layer.merge(
+        Publisher,
+        Layer.succeed(Replica.Replica, {
+          ...replica,
+          restoreBackup: ({ source }) =>
+            Stream.runCollect(source).pipe(
+              Effect.map((chunks) => {
+                restored = Array.from(chunks)
+              })
+            )
+        })
+      ))
+    )
+    return Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
+      const exported = Array.from(yield* Stream.runCollect(client.exportBackup({ maxBytes: 1024 })))
+      assert.deepStrictEqual(exported, [Uint8Array.of(1, 2, 3)])
+      yield* client.restoreBackup({
+        source: Stream.fromIterable(exported),
+        mode: "replace",
+        maxBytes: 1024,
+        expectedDefinitionHash: definition.hash
+      })
+      assert.deepStrictEqual(restored, exported)
+      restored = []
+      const oversized = yield* Effect.flip(client.restoreBackup({
+        source: Stream.fromIterable([new Uint8Array(700), new Uint8Array(700)]),
+        mode: "replace",
+        maxBytes: 1024,
+        expectedDefinitionHash: definition.hash
+      }))
+      assert.strictEqual(oversized.reason._tag, "BackupTooLarge")
+      assert.deepStrictEqual(restored, [])
+    })).pipe(Effect.provide(BackupOwner))
+  })
+})

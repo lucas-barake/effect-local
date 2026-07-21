@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json.schemastore.org/tsconfig",
+  "include": [],
+  "compilerOptions": {
+    "outDir": "${configDir}/dist",
+    "rootDir": "${configDir}/src",
+    "incremental": true,
+    "composite": true,
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleDetection": "force",
+    "verbatimModuleSyntax": true,
+    "allowJs": false,
+    "rewriteRelativeImportExtensions": true,
+    "erasableSyntaxOnly": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "strict": true,
+    "exactOptionalPropertyTypes": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": false,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "stripInternal": false,
+    "skipLibCheck": true,
+    "noErrorTruncation": true,
+    "types": [],
+    "plugins": [{ "name": "@effect/language-service" }]
+  }
+}

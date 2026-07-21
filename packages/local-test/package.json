@@ -1,0 +1,58 @@
+{
+  "name": "@lucas-barake/effect-local-test",
+  "version": "0.1.0",
+  "description": "Production-shaped test layers for Effect Local",
+  "homepage": "https://github.com/lucas-barake/effect-local#readme",
+  "bugs": "https://github.com/lucas-barake/effect-local/issues",
+  "keywords": ["effect", "local-first", "testing", "sqlite", "fault-injection"],
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": [],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lucas-barake/effect-local.git",
+    "directory": "packages/local-test"
+  },
+  "exports": {
+    "./package.json": "./package.json",
+    ".": "./src/index.ts",
+    "./*": "./src/*.ts",
+    "./internal/*": null
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "exports": {
+      "./package.json": "./package.json",
+      ".": "./dist/index.js",
+      "./*": "./dist/*.js",
+      "./internal/*": null
+    }
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "src/**/*.ts",
+    "dist/**/*.js",
+    "dist/**/*.js.map",
+    "dist/**/*.d.ts",
+    "dist/**/*.d.ts.map"
+  ],
+  "scripts": {
+    "build": "tsc -b tsconfig.json",
+    "build:tsgo": "tsgo -b tsconfig.json",
+    "check": "tsc -b tsconfig.json",
+    "test": "vitest --config vitest.config.ts"
+  },
+  "dependencies": {
+    "@effect/sql-sqlite-node": "4.0.0-beta.99",
+    "@lucas-barake/effect-local": "workspace:^",
+    "@lucas-barake/effect-local-sql": "workspace:^"
+  },
+  "peerDependencies": {
+    "effect": ">=4.0.0-beta.99 <4.0.1"
+  },
+  "devDependencies": {
+    "effect": "4.0.0-beta.99"
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oxc-project/oxc/main/npm/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "import", "oxc", "eslint", "unicorn", "node"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error",
+    "perf": "error"
+  },
+  "ignorePatterns": ["**/dist", "**/build", "**/coverage", "**/.tsbuildinfo"],
+  "rules": {
+    "typescript/consistent-type-imports": ["error", { "fixStyle": "inline-type-imports" }],
+    "typescript/no-import-type-side-effects": "error",
+    "import/no-duplicates": "error",
+    "import/no-self-import": "error",
+    "import/no-unassigned-import": "off",
+    "typescript/no-unnecessary-type-assertion": "error",
+    "typescript/no-unused-vars": ["error", { "argsIgnorePattern": "^_", "varsIgnorePattern": "^_" }],
+    "eslint/no-console": "error",
+    "eslint/no-var": "error",
+    "typescript/no-explicit-any": "off",
+    "typescript/ban-ts-comment": "off",
+    "typescript/no-namespace": "off",
+    "typescript/no-non-null-assertion": "off",
+    "eslint/no-unused-vars": "off",
+    "eslint/require-yield": "off",
+    "unicorn/consistent-function-scoping": "off",
+    "unicorn/require-post-message-target-origin": "off",
+    "unicorn/no-empty-file": "off"
+  },
+  "overrides": [
+    {
+      "files": ["**/test/**", "**/tests/**", "**/test-browser/**"],
+      "rules": { "eslint/no-console": "off" }
+    },
+    {
+      "files": ["examples/browser-spike/**"],
+      "rules": {
+        "eslint/no-console": "off",
+        "oxc/no-async-endpoint-handlers": "off",
+        "unicorn/prefer-add-event-listener": "off"
+      }
+    }
+  ]
+}

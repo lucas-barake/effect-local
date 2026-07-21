@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json.schemastore.org/tsconfig",
+  "extends": "../../tsconfig.base.json",
+  "include": ["src"],
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "composite": false,
+    "incremental": false,
+    "lib": ["ES2022", "DOM", "WebWorker"],
+    "types": ["vite/client"]
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.18.1",
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ],
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "build": "tsc -b tsconfig.packages.json",
+    "build:examples": "pnpm --dir examples/browser-spike build && pnpm --dir examples/tasks build && pnpm --dir examples/api-tour build && pnpm --dir examples/advanced-api build",
+    "build:tsgo": "tsgo -b tsconfig.packages.json",
+    "circular": "madge --extensions ts --circular --no-color --no-spinner packages/*/src",
+    "check": "pnpm check:types",
+    "check:types": "tsc -b tsconfig.json",
+    "check:tsgo": "tsgo -b tsconfig.json",
+    "check:all": "pnpm check:tsgo && pnpm lint && pnpm test",
+    "lint": "oxlint && dprint check",
+    "lint-fix": "oxlint --fix && dprint fmt",
+    "test": "vitest",
+    "test:examples": "pnpm --dir examples/api-tour all && pnpm --dir examples/advanced-api examples",
+    "test:browser": "pnpm --dir examples/browser-spike test:browser && pnpm --dir examples/tasks test:browser",
+    "coverage": "vitest --coverage",
+    "codegen": "node scripts/codegen.mjs",
+    "docgen": "tsc -b tsconfig.json",
+    "changeset-version": "changeset version",
+    "changeset-publish": "pnpm build && changeset publish"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "dprint",
+      "esbuild"
+    ]
+  },
+  "devDependencies": {
+    "@automerge/automerge": "3.3.2",
+    "@changesets/changelog-github": "^0.7.0",
+    "@changesets/cli": "^2.31.0",
+    "@effect/atom-react": "4.0.0-beta.99",
+    "@effect/language-service": "^0.85.1",
+    "@effect/platform-browser": "4.0.0-beta.99",
+    "@effect/sql-sqlite-wasm": "4.0.0-beta.99",
+    "@effect/vitest": "4.0.0-beta.99",
+    "@effect/wa-sqlite": "0.2.1",
+    "@playwright/test": "^1.61.1",
+    "@types/node": "^25.7.0",
+    "@typescript/native-preview": "7.0.0-dev.20260420.1",
+    "@vitest/coverage-v8": "4.1.10",
+    "dprint": "^0.55.1",
+    "effect": "4.0.0-beta.99",
+    "glob": "^13.0.6",
+    "madge": "^8.0.0",
+    "oxlint": "1.42.0",
+    "playwright": "^1.61.1",
+    "typescript": "^6.0.3",
+    "vite": "^7.2.7",
+    "vitest": "4.1.10"
+  }
+}
