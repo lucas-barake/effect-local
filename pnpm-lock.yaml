@@ -108,6 +108,9 @@ importers:
       '@lucas-barake/effect-local':
         specifier: workspace:^
         version: link:../../packages/local
+      '@lucas-barake/effect-local-browser':
+        specifier: workspace:^
+        version: link:../../packages/local-browser
       '@lucas-barake/effect-local-sql':
         specifier: workspace:^
         version: link:../../packages/local-sql
