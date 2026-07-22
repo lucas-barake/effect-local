@@ -103,6 +103,35 @@ describe("PeerSync", () => {
   const ReceiptSyncService = PeerSync.layer.pipe(Layer.provide(ReceiptServices))
   const ReceiptLayer = Layer.merge(ReceiptServices, ReceiptSyncService)
 
+  it.effect("does not issue a stale session during an exclusive claim", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sync = yield* PeerSync.PeerSync
+      const claimAcquired = yield* Deferred.make<void>()
+      const releaseClaim = yield* Deferred.make<void>()
+      const claim = yield* gate.claim(() =>
+        Deferred.succeed(claimAcquired, undefined).pipe(Effect.andThen(Deferred.await(releaseClaim)))
+      ).pipe(Effect.forkChild)
+
+      yield* Deferred.await(claimAcquired)
+      const opening = yield* sync.open(yield* Identity.makePeerId).pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      yield* Deferred.succeed(releaseClaim, undefined)
+      yield* Fiber.join(claim)
+
+      const session = yield* Fiber.join(opening)
+      assert.strictEqual(session.replicaIncarnation, (yield* gate.current).incarnation)
+    }).pipe(Effect.provide(TestLayer)))
+
+  it.effect("opens a session from an existing shared scope", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sync = yield* PeerSync.PeerSync
+      const permit = yield* gate.shared
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      assert.strictEqual(session.replicaIncarnation, permit.incarnation)
+    })).pipe(Effect.provide(TestLayer)))
+
   it.effect("persists inbound application and exact retransmission replies", () =>
     Effect.gen(function*() {
       const store = yield* DocumentStore.DocumentStore

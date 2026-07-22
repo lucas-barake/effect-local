@@ -348,3 +348,39 @@ test("reprovisions the durable owner after its database provider dies", async ({
   await takeoverPage.getByRole("button", { name: "Save title" }).click()
   await expect(takeoverPage.getByText(renamed, { exact: true })).toBeVisible()
 })
+
+test("keeps an accepted database provider while its acknowledgement is delayed", async ({ context, page }) => {
+  await page.addInitScript(() => {
+    const addEventListener = MessagePort.prototype.addEventListener
+    MessagePort.prototype.addEventListener = function(type, listener, options) {
+      if (type !== "message" || typeof listener !== "function") {
+        return addEventListener.call(this, type, listener, options)
+      }
+      return addEventListener.call(this, type, (event: MessageEvent) => {
+        if (event.data?._tag !== "ProvisionAccepted") {
+          listener.call(this, event)
+          return
+        }
+        setTimeout(() => {
+          listener.call(this, event)
+          ;(globalThis as typeof globalThis & { __effectLocalDelayedAcceptanceDelivered?: boolean })
+            .__effectLocalDelayedAcceptanceDelivered = true
+        }, 3_500)
+      }, options)
+    } as typeof MessagePort.prototype.addEventListener
+  })
+  await page.goto("/")
+  await ownerInfo(page)
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect.poll(() =>
+    page.evaluate(() =>
+      (globalThis as typeof globalThis & { __effectLocalDelayedAcceptanceDelivered?: boolean })
+        .__effectLocalDelayedAcceptanceDelivered
+    )
+  ).toBe(true)
+
+  const attachedPage = await context.newPage()
+  await attachedPage.goto("/")
+  await ownerInfo(attachedPage)
+  await expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+})

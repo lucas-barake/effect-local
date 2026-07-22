@@ -40,6 +40,7 @@ export const layer: Layer.Layer<ReplicaGate, never, ReplicaBootstrap.ReplicaBoot
       const state = yield* Ref.make<Permit>(bootstrap)
       const lock = yield* TxReentrantLock.make()
       const writer = yield* Ref.make<number | null>(null)
+      const readers = yield* Ref.make(new Map<number, number>())
       const requests = yield* Effect.acquireRelease(
         Queue.unbounded<
           | {
@@ -74,10 +75,29 @@ export const layer: Layer.Layer<ReplicaGate, never, ReplicaBootstrap.ReplicaBoot
           )
         )
       }).pipe(Effect.interruptible)
-      const readLock = Effect.acquireRelease(
-        TxReentrantLock.acquireRead(lock),
-        () => TxReentrantLock.releaseRead(lock),
-        { interruptible: true }
+      const readLock = Effect.withFiber((fiber) =>
+        Effect.acquireRelease(
+          TxReentrantLock.acquireRead(lock).pipe(
+            Effect.tap(() =>
+              Ref.update(readers, (current) => {
+                const next = new Map(current)
+                next.set(fiber.id, (current.get(fiber.id) ?? 0) + 1)
+                return next
+              })
+            )
+          ),
+          () =>
+            TxReentrantLock.releaseRead(lock).pipe(
+              Effect.andThen(Ref.update(readers, (current) => {
+                const next = new Map(current)
+                const count = current.get(fiber.id) ?? 0
+                if (count <= 1) next.delete(fiber.id)
+                else next.set(fiber.id, count - 1)
+                return next
+              }))
+            ),
+          { interruptible: true }
+        )
       )
       const writeLock = Effect.acquireRelease(
         TxReentrantLock.acquireWrite(lock),
@@ -141,9 +161,9 @@ export const layer: Layer.Layer<ReplicaGate, never, ReplicaBootstrap.ReplicaBoot
         current: Ref.get(state),
         refresh: readState.pipe(Effect.tap((next) => Ref.set(state, next))),
         shared: Effect.withFiber((fiber) =>
-          Ref.get(writer).pipe(
-            Effect.flatMap((writer) =>
-              writer === fiber.id
+          Effect.all({ readers: Ref.get(readers), writer: Ref.get(writer) }).pipe(
+            Effect.flatMap(({ readers, writer }) =>
+              writer === fiber.id || (readers.get(fiber.id) ?? 0) > 0
                 ? readLock
                 : Effect.acquireUseRelease(
                   acquire,

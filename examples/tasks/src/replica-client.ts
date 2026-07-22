@@ -27,7 +27,6 @@ const workers = new Set<{
   provisioning: {
     readonly database: Worker
     readonly nonce: string
-    readonly timeout: ReturnType<typeof setTimeout>
   } | undefined
   readonly replica: SharedWorker
 }>()
@@ -43,7 +42,6 @@ const WorkerLive = BrowserWorker.layer(() => {
     provisioning: {
       readonly database: Worker
       readonly nonce: string
-      readonly timeout: ReturnType<typeof setTimeout>
     } | undefined
     readonly replica: SharedWorker
   } = { database: undefined, provisioning: undefined, replica }
@@ -72,13 +70,7 @@ const WorkerLive = BrowserWorker.layer(() => {
       connection.database = database
       connection.provisioning = {
         database,
-        nonce: message.nonce,
-        timeout: setTimeout(() => {
-          if (connection.provisioning?.nonce !== message.nonce) return
-          database.terminate()
-          connection.database = undefined
-          connection.provisioning = undefined
-        }, 3000)
+        nonce: message.nonce
       }
       replica.port.postMessage({
         _tag: "Provision",
@@ -89,13 +81,11 @@ const WorkerLive = BrowserWorker.layer(() => {
     }
     if (message._tag === "ProvisionAccepted") {
       if (connection.provisioning?.nonce !== message.nonce) return
-      clearTimeout(connection.provisioning.timeout)
       connection.provisioning = undefined
       return
     }
     if (message._tag === "ProvisionRejected") {
       if (connection.provisioning?.nonce !== message.nonce) return
-      clearTimeout(connection.provisioning.timeout)
       connection.provisioning.database.terminate()
       connection.database = undefined
       connection.provisioning = undefined
@@ -106,7 +96,6 @@ const WorkerLive = BrowserWorker.layer(() => {
       return
     }
     if (!message.provider && connection.database !== undefined) {
-      if (connection.provisioning !== undefined) clearTimeout(connection.provisioning.timeout)
       connection.database.terminate()
       connection.database = undefined
       connection.provisioning = undefined

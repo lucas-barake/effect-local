@@ -103,6 +103,26 @@ describe("ReplicaGate", () => {
       assert.strictEqual((yield* gate.current).incarnation, 1)
     }).pipe(Effect.provide(Gate)))
 
+  it.live("reenters a shared scope ahead of a waiting restore", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const reentrant = yield* Effect.scoped(Effect.gen(function*() {
+        const permit = yield* gate.shared
+        const restore = yield* gate.claim(() => Effect.never).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        return yield* Effect.scoped(gate.shared).pipe(
+          Effect.ensuring(Fiber.interrupt(restore)),
+          Effect.map((nested) => ({ nested, permit }))
+        )
+      })).pipe(Effect.forkChild({ startImmediately: true }))
+      const { nested, permit } = yield* Fiber.join(reentrant).pipe(
+        Effect.timeout("100 millis"),
+        Effect.ensuring(Fiber.interrupt(reentrant))
+      )
+      assert.deepStrictEqual(nested, permit)
+    }).pipe(Effect.provide(Gate)))
+
   it.effect("allows concurrent shared scopes", () =>
     Effect.gen(function*() {
       const gate = yield* ReplicaGate.ReplicaGate

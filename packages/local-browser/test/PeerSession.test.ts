@@ -393,6 +393,83 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       assert.isTrue(yield* Ref.get(closed))
     }).pipe(Effect.provide(NodeCrypto.layer)))
 
+  it.effect("binds the transport identity and sync incarnation under one gate permit", () =>
+    Effect.gen(function*() {
+      const peerId = yield* Identity.makePeerId
+      const nextPermit = {
+        replicaId: Identity.ReplicaId.make("rep_00000000-0000-4000-8000-000000000002"),
+        incarnation: Identity.ReplicaIncarnation.make(2),
+        writerGeneration: Identity.WriterGeneration.make(3)
+      }
+      const current = yield* Ref.make<ReplicaGate.Permit>(permit)
+      const sharedHeld = yield* Ref.make(false)
+      const connectedReplica = yield* Ref.make<Identity.ReplicaId | null>(null)
+      const scopedGate = ReplicaGate.ReplicaGate.of({
+        current: Ref.get(current),
+        shared: Effect.acquireRelease(
+          Ref.set(sharedHeld, true).pipe(Effect.andThen(Ref.get(current))),
+          () => Ref.set(sharedHeld, false)
+        ),
+        claim: (use) => Ref.get(current).pipe(Effect.flatMap(use)),
+        refresh: Ref.get(current),
+        validate: () => Effect.void
+      })
+      const sync = PeerSync.PeerSync.of({
+        open: (id) =>
+          Ref.get(current).pipe(
+            Effect.map((current) => ({
+              peerId: id,
+              connectionEpoch: "local-epoch",
+              replicaIncarnation: current.incarnation
+            }))
+          ),
+        reset: () => Effect.void,
+        generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
+        receive: () => Effect.succeed(result),
+        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+        pending: () => Effect.succeed([]),
+        markSent: () => Effect.succeed(true)
+      })
+      const transport = PeerTransport.PeerTransport.of({
+        capabilities: { storeAndForward: false },
+        connect: ({ replicaId }) =>
+          Ref.get(sharedHeld).pipe(
+            Effect.flatMap((held) => held ? Effect.void : Ref.set(current, nextPermit)),
+            Effect.andThen(Ref.set(connectedReplica, replicaId)),
+            Effect.as({
+              peerId,
+              capabilities: { storeAndForward: false },
+              receive: Stream.never,
+              send: () => Effect.void,
+              close: Effect.void
+            })
+          )
+      })
+
+      yield* Effect.scoped(
+        PeerSession.makeTestClient({ peerId, documents: [] }, () => Effect.die("unexpected entity request")).pipe(
+          Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provideService(PeerSync.PeerSync, sync),
+          Effect.provideService(ReplicaGate.ReplicaGate, scopedGate),
+          Effect.provideService(
+            CommitPublisher.CommitPublisher,
+            CommitPublisher.CommitPublisher.of({
+              publishPending: Effect.succeed(0),
+              invalidate: () => Effect.void,
+              subscribe: Effect.succeed({
+                watermark: Identity.CommitSequence.make(0),
+                refreshGeneration: 0,
+                events: Stream.never
+              })
+            })
+          ),
+          Effect.provideService(ReplicaLimits.ReplicaLimits, limits)
+        )
+      )
+      assert.strictEqual(yield* Ref.get(connectedReplica), permit.replicaId)
+      assert.isFalse(yield* Ref.get(sharedHeld))
+    }).pipe(Effect.provide(NodeCrypto.layer)))
+
   it.effect("fails when the peer receive stream ends", () =>
     Effect.gen(function*() {
       const peerId = yield* Identity.makePeerId
@@ -647,7 +724,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       assert.isTrue(yield* Ref.get(gateReleased))
     }).pipe(Effect.provide(NodeCrypto.layer)))
 
-  it.effect("keeps one send in flight and ignores its completion after scope reset", () =>
+  it.effect("interrupts an admitted send before teardown reset", () =>
     Effect.gen(function*() {
       const firstStarted = yield* Deferred.make<void>()
       const releaseFirst = yield* Deferred.make<void>()
@@ -706,59 +783,286 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                   yield* Deferred.succeed(firstStarted, undefined)
                   yield* Deferred.await(releaseFirst)
                 }
-                yield* Ref.update(activeSends, (current) => current - 1)
-              }),
+              }).pipe(Effect.ensuring(Ref.update(activeSends, (current) => current - 1))),
             close: Effect.void
           })
       })
-      yield* Effect.scoped(
-        Effect.gen(function*() {
-          const entity = yield* Entity.makeTestClient(
-            DocumentEntity.DocumentEntity,
-            DocumentEntity.layer(definition).pipe(
-              Layer.provide(Layer.succeed(CommandExecutor.CommandExecutor, executor)),
-              Layer.provide(Layer.succeed(PeerSync.PeerSync, sync)),
-              Layer.provide(Layer.succeed(ReplicaGate.ReplicaGate, gate)),
-              Layer.provide(ReplicaLimits.layer(limits))
+      yield* Effect.acquireUseRelease(
+        Scope.make(),
+        (scope) =>
+          Effect.gen(function*() {
+            const entity = yield* Entity.makeTestClient(
+              DocumentEntity.DocumentEntity,
+              DocumentEntity.layer(definition).pipe(
+                Layer.provide(Layer.succeed(CommandExecutor.CommandExecutor, executor)),
+                Layer.provide(Layer.succeed(PeerSync.PeerSync, sync)),
+                Layer.provide(Layer.succeed(ReplicaGate.ReplicaGate, gate)),
+                Layer.provide(ReplicaLimits.layer(limits))
+              )
             )
-          )
-          const session = yield* PeerSession.makeTestClient(
-            { peerId, documents: [{ document: Task, documentId }] },
-            entity
-          ).pipe(
-            Effect.provideService(PeerTransport.PeerTransport, transport),
-            Effect.provideService(PeerSync.PeerSync, sync),
-            Effect.provideService(ReplicaGate.ReplicaGate, gate),
-            Effect.provideService(
-              CommitPublisher.CommitPublisher,
-              CommitPublisher.CommitPublisher.of({
-                publishPending: Effect.succeed(0),
-                invalidate: () => Effect.void,
-                subscribe: Effect.succeed({
-                  watermark: Identity.CommitSequence.make(0),
-                  refreshGeneration: 0,
-                  events: Stream.never
+            const session = yield* PeerSession.makeTestClient(
+              { peerId, documents: [{ document: Task, documentId }] },
+              entity
+            ).pipe(
+              Effect.provideService(Scope.Scope, scope),
+              Effect.provideService(PeerTransport.PeerTransport, transport),
+              Effect.provideService(PeerSync.PeerSync, sync),
+              Effect.provideService(ReplicaGate.ReplicaGate, gate),
+              Effect.provideService(
+                CommitPublisher.CommitPublisher,
+                CommitPublisher.CommitPublisher.of({
+                  publishPending: Effect.succeed(0),
+                  invalidate: () => Effect.void,
+                  subscribe: Effect.succeed({
+                    watermark: Identity.CommitSequence.make(0),
+                    refreshGeneration: 0,
+                    events: Stream.never
+                  })
                 })
-              })
-            ),
-            Effect.provideService(ReplicaLimits.ReplicaLimits, limits)
+              ),
+              Effect.provideService(ReplicaLimits.ReplicaLimits, limits)
+            )
+            yield* session.markDirty(documentId)
+            yield* Effect.forkChild(session.flush)
+            yield* Deferred.await(firstStarted)
+            yield* session.markDirty(documentId)
+            const second = yield* Effect.forkChild(session.flush)
+            yield* Effect.yieldNow
+            assert.strictEqual(yield* Ref.get(sends), 1)
+            assert.strictEqual(yield* Ref.get(maximum), 1)
+            yield* Fiber.interrupt(second)
+            yield* Scope.close(scope, Exit.succeed(undefined))
+            assert.strictEqual(yield* Ref.get(activeSends), 0)
+            assert.strictEqual(yield* Ref.get(marked), 0)
+            assert.strictEqual(yield* Ref.get(resets), 1)
+            assert.strictEqual(yield* Ref.get(maximum), 1)
+          }),
+        (scope) =>
+          Deferred.succeed(releaseFirst, undefined).pipe(
+            Effect.andThen(Scope.close(scope, Exit.succeed(undefined))),
+            Effect.ignore
           )
-          yield* session.markDirty(documentId)
-          yield* Effect.forkChild(session.flush)
-          yield* Deferred.await(firstStarted)
-          yield* session.markDirty(documentId)
-          const second = yield* Effect.forkChild(session.flush)
-          yield* Effect.yieldNow
-          assert.strictEqual(yield* Ref.get(sends), 1)
-          assert.strictEqual(yield* Ref.get(maximum), 1)
-          yield* Fiber.interrupt(second)
-        }).pipe(Effect.provide(TestShardingConfig))
-      )
-      yield* Deferred.succeed(releaseFirst, undefined)
-      assert.strictEqual(yield* Ref.get(marked), 0)
-      assert.strictEqual(yield* Ref.get(resets), 1)
-      assert.strictEqual(yield* Ref.get(maximum), 1)
+      ).pipe(Effect.provide(TestShardingConfig))
     }))
+
+  it.effect("does not send pending output after session teardown", () =>
+    Effect.gen(function*() {
+      const gateRequested = yield* Deferred.make<void>()
+      const releaseGate = yield* Deferred.make<void>()
+      const sharedCalls = yield* Ref.make(0)
+      const pendingCalls = yield* Ref.make(0)
+      const generateCalls = yield* Ref.make(0)
+      const sends = yield* Ref.make(0)
+      const resets = yield* Ref.make(0)
+      const closed = yield* Ref.make(false)
+      const documentId = yield* Identity.makeDocumentId
+      const peerId = yield* Identity.makePeerId
+      const scopedGate = ReplicaGate.ReplicaGate.of({
+        ...gate,
+        shared: Effect.acquireRelease(
+          Ref.updateAndGet(sharedCalls, (count) => count + 1).pipe(
+            Effect.flatMap((call) =>
+              call === 1
+                ? Effect.succeed(permit)
+                : Deferred.succeed(gateRequested, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseGate)),
+                  Effect.as(permit)
+                )
+            )
+          ),
+          () => Effect.void,
+          { interruptible: true }
+        )
+      })
+      const outbound = {
+        sendSequence: 1,
+        documentId,
+        message: Uint8Array.of(1),
+        messageHash: "message-hash",
+        heads: []
+      }
+      const sync = PeerSync.PeerSync.of({
+        open: (id) =>
+          Effect.succeed({
+            peerId: id,
+            connectionEpoch: "local-epoch",
+            replicaIncarnation: permit.incarnation
+          }),
+        reset: () => Ref.update(resets, (count) => count + 1),
+        generate: () =>
+          Ref.update(generateCalls, (count) => count + 1).pipe(
+            Effect.as({ outbound: null, observedByPeer: false, dirty: false })
+          ),
+        receive: () => Effect.succeed(result),
+        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+        pending: () =>
+          Ref.updateAndGet(pendingCalls, (count) => count + 1).pipe(
+            Effect.map((call) => call === 1 ? [] : [outbound])
+          ),
+        markSent: () => Effect.succeed(true)
+      })
+      const transport = PeerTransport.PeerTransport.of({
+        capabilities: { storeAndForward: false },
+        connect: () =>
+          Effect.succeed({
+            peerId,
+            capabilities: { storeAndForward: false },
+            receive: Stream.never,
+            send: () => Ref.update(sends, (count) => count + 1),
+            close: Ref.set(closed, true)
+          })
+      })
+
+      yield* Effect.acquireUseRelease(
+        Scope.make(),
+        (scope) =>
+          Effect.gen(function*() {
+            const session = yield* PeerSession.makeTestClient(
+              { peerId, documents: [{ document: Task, documentId }] },
+              () => Effect.die("unexpected entity request")
+            ).pipe(
+              Effect.provideService(Scope.Scope, scope),
+              Effect.provideService(PeerTransport.PeerTransport, transport),
+              Effect.provideService(PeerSync.PeerSync, sync),
+              Effect.provideService(ReplicaGate.ReplicaGate, scopedGate),
+              Effect.provideService(
+                CommitPublisher.CommitPublisher,
+                CommitPublisher.CommitPublisher.of({
+                  publishPending: Effect.succeed(0),
+                  invalidate: () => Effect.void,
+                  subscribe: Effect.succeed({
+                    watermark: Identity.CommitSequence.make(0),
+                    refreshGeneration: 0,
+                    events: Stream.never
+                  })
+                })
+              ),
+              Effect.provideService(ReplicaLimits.ReplicaLimits, limits)
+            )
+            yield* session.markDirty(documentId)
+            const flushing = yield* session.flush.pipe(Effect.forkChild)
+            yield* Deferred.await(gateRequested)
+            yield* Scope.close(scope, Exit.succeed(undefined))
+            assert.strictEqual(yield* Ref.get(resets), 1)
+            assert.isTrue(yield* Ref.get(closed))
+            yield* session.flush
+            yield* Deferred.succeed(releaseGate, undefined)
+            yield* Fiber.join(flushing)
+            assert.strictEqual(yield* Ref.get(sends), 0)
+            assert.strictEqual(yield* Ref.get(pendingCalls), 2)
+            assert.strictEqual(yield* Ref.get(generateCalls), 1)
+          }),
+        (scope) =>
+          Deferred.succeed(releaseGate, undefined).pipe(
+            Effect.andThen(Scope.close(scope, Exit.succeed(undefined))),
+            Effect.ignore
+          )
+      )
+    }).pipe(Effect.provide(NodeCrypto.layer)))
+
+  it.effect("interrupts blocked pending and generated output before teardown reset", () =>
+    Effect.gen(function*() {
+      for (const blocked of ["pending", "generate"] as const) {
+        const blockedStarted = yield* Deferred.make<void>()
+        const releaseBlocked = yield* Deferred.make<void>()
+        const pendingCalls = yield* Ref.make(0)
+        const generateCalls = yield* Ref.make(0)
+        const resets = yield* Ref.make(0)
+        const closed = yield* Ref.make(false)
+        const documentId = yield* Identity.makeDocumentId
+        const peerId = yield* Identity.makePeerId
+        const generated = { outbound: null, observedByPeer: false, dirty: false } as const
+        const sync = PeerSync.PeerSync.of({
+          open: (id) =>
+            Effect.succeed({
+              peerId: id,
+              connectionEpoch: "local-epoch",
+              replicaIncarnation: permit.incarnation
+            }),
+          reset: () => Ref.update(resets, (count) => count + 1),
+          generate: () =>
+            Ref.updateAndGet(generateCalls, (count) => count + 1).pipe(
+              Effect.flatMap((call) =>
+                blocked === "generate" && call === 2
+                  ? Deferred.succeed(blockedStarted, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseBlocked)),
+                    Effect.as(generated)
+                  )
+                  : Effect.succeed(generated)
+              )
+            ),
+          receive: () => Effect.succeed(result),
+          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+          pending: () =>
+            Ref.updateAndGet(pendingCalls, (count) => count + 1).pipe(
+              Effect.flatMap((call) =>
+                blocked === "pending" && call === 2
+                  ? Deferred.succeed(blockedStarted, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseBlocked)),
+                    Effect.as([])
+                  )
+                  : Effect.succeed([])
+              )
+            ),
+          markSent: () => Effect.succeed(true)
+        })
+        const transport = PeerTransport.PeerTransport.of({
+          capabilities: { storeAndForward: false },
+          connect: () =>
+            Effect.succeed({
+              peerId,
+              capabilities: { storeAndForward: false },
+              receive: Stream.never,
+              send: () => Effect.void,
+              close: Ref.set(closed, true)
+            })
+        })
+
+        yield* Effect.acquireUseRelease(
+          Scope.make(),
+          (scope) =>
+            Effect.gen(function*() {
+              const session = yield* PeerSession.makeTestClient(
+                { peerId, documents: [{ document: Task, documentId }] },
+                () => Effect.die("unexpected entity request")
+              ).pipe(
+                Effect.provideService(Scope.Scope, scope),
+                Effect.provideService(PeerTransport.PeerTransport, transport),
+                Effect.provideService(PeerSync.PeerSync, sync),
+                Effect.provideService(ReplicaGate.ReplicaGate, gate),
+                Effect.provideService(
+                  CommitPublisher.CommitPublisher,
+                  CommitPublisher.CommitPublisher.of({
+                    publishPending: Effect.succeed(0),
+                    invalidate: () => Effect.void,
+                    subscribe: Effect.succeed({
+                      watermark: Identity.CommitSequence.make(0),
+                      refreshGeneration: 0,
+                      events: Stream.never
+                    })
+                  })
+                ),
+                Effect.provideService(ReplicaLimits.ReplicaLimits, limits)
+              )
+              yield* session.markDirty(documentId)
+              const flushing = yield* session.flush.pipe(Effect.forkChild)
+              yield* Deferred.await(blockedStarted)
+              yield* Scope.close(scope, Exit.succeed(undefined))
+              yield* Fiber.join(flushing)
+              yield* session.flush
+              assert.strictEqual(yield* Ref.get(resets), 1)
+              assert.isTrue(yield* Ref.get(closed))
+              assert.strictEqual(yield* Ref.get(pendingCalls), 2)
+              assert.strictEqual(yield* Ref.get(generateCalls), blocked === "pending" ? 1 : 2)
+            }),
+          (scope) =>
+            Deferred.succeed(releaseBlocked, undefined).pipe(
+              Effect.andThen(Scope.close(scope, Exit.succeed(undefined))),
+              Effect.ignore
+            )
+        )
+      }
+    }).pipe(Effect.provide(NodeCrypto.layer)))
 
   it.effect("binds one remote epoch and resets both session directions", () =>
     Effect.gen(function*() {

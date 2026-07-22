@@ -13,7 +13,7 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
-import type * as Scope from "effect/Scope"
+import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
@@ -95,17 +95,25 @@ export const makeTestClient = (
     const transport = yield* PeerTransport.PeerTransport
     const sync = yield* PeerSync.PeerSync
     const crypto = yield* Crypto.Crypto
-    const permit = yield* Effect.scoped(gate.shared)
-    const connection = yield* transport.connect({ replicaId: permit.replicaId, peerId: options.peerId })
-    const session = yield* sync.open(connection.peerId)
-    if (session.replicaIncarnation !== permit.incarnation) {
-      return yield* new ReplicaError.ReplicaError({
-        reason: new ReplicaError.ProtocolMismatch({
-          expected: String(permit.incarnation),
-          observed: String(session.replicaIncarnation)
-        })
-      })
-    }
+    const { connection, session } = yield* Effect.acquireUseRelease(
+      Scope.make(),
+      (scope) =>
+        Effect.gen(function*() {
+          const permit = yield* gate.shared.pipe(Effect.provideService(Scope.Scope, scope))
+          const connection = yield* transport.connect({ replicaId: permit.replicaId, peerId: options.peerId })
+          const session = yield* sync.open(connection.peerId)
+          if (session.replicaIncarnation !== permit.incarnation) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: String(permit.incarnation),
+                observed: String(session.replicaIncarnation)
+              })
+            })
+          }
+          return { connection, session }
+        }),
+      Scope.close
+    )
     const selected = new Set(options.documents.map((entry) => key(entry.document.name, entry.documentId)))
     if (selected.size !== options.documents.length) {
       return yield* new ReplicaError.ReplicaError({
@@ -120,6 +128,7 @@ export const makeTestClient = (
     const remoteEpoch = yield* Ref.make<string | null>(null)
     const active = yield* Ref.make(true)
     const receiveFailure = yield* Deferred.make<never, ReplicaError.ReplicaError>()
+    const teardown = yield* Deferred.make<void>()
     const sendLock = yield* Semaphore.make(1)
     const flushLock = yield* Semaphore.make(1)
 
@@ -138,50 +147,68 @@ export const makeTestClient = (
     }
 
     const send = (outbound: PeerSync.Outbound) =>
-      sendLock.withPermit(Effect.gen(function*() {
-        const entry = yield* selectedById(outbound.documentId)
-        const bytes = yield* encode({
-          connectionEpoch: session.connectionEpoch,
-          sequence: outbound.sendSequence,
-          documentId: outbound.documentId,
-          documentType: entry.document.name,
-          messageHash: outbound.messageHash,
-          message: outbound.message
-        })
-        yield* Effect.scoped(Effect.gen(function*() {
-          const permit = yield* gate.shared
-          if (permit.incarnation !== session.replicaIncarnation) {
-            return yield* new ReplicaError.ReplicaError({
-              reason: new ReplicaError.ProtocolMismatch({
-                expected: String(session.replicaIncarnation),
-                observed: String(permit.incarnation)
-              })
-            })
-          }
-          yield* connection.send(bytes).pipe(
-            Effect.timeout(limits.maxPeerSendMillis),
-            Effect.catchTag("TimeoutError", (cause) =>
-              Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageUnavailable({
-                    cause
-                  })
+      Effect.raceFirst(
+        Deferred.await(teardown),
+        Effect.gen(function*() {
+          if (!(yield* Ref.get(active))) return
+          const entry = yield* selectedById(outbound.documentId)
+          const bytes = yield* encode({
+            connectionEpoch: session.connectionEpoch,
+            sequence: outbound.sendSequence,
+            documentId: outbound.documentId,
+            documentType: entry.document.name,
+            messageHash: outbound.messageHash,
+            message: outbound.message
+          })
+          yield* Effect.scoped(Effect.gen(function*() {
+            const permit = yield* gate.shared
+            if (permit.incarnation !== session.replicaIncarnation) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.ProtocolMismatch({
+                  expected: String(session.replicaIncarnation),
+                  observed: String(permit.incarnation)
                 })
-              ))
-          )
-        }))
-        if (yield* Ref.get(active)) {
-          yield* sync.markSent(session, outbound.sendSequence, outbound.messageHash)
-        }
-      }))
+              })
+            }
+            yield* sendLock.withPermit(Effect.gen(function*() {
+              if (!(yield* Ref.get(active))) return
+              yield* connection.send(bytes).pipe(
+                Effect.timeout(limits.maxPeerSendMillis),
+                Effect.catchTag("TimeoutError", (cause) =>
+                  Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageUnavailable({
+                        cause
+                      })
+                    })
+                  ))
+              )
+              if (yield* Ref.get(active)) {
+                yield* sync.markSent(session, outbound.sendSequence, outbound.messageHash)
+              }
+            }))
+          }))
+        })
+      )
 
     const flush = flushLock.withPermit(Effect.gen(function*() {
-      for (const outbound of yield* sync.pending(session)) yield* send(outbound)
+      if (!(yield* Ref.get(active))) return
+      const pending = yield* Effect.raceFirst(
+        Deferred.await(teardown).pipe(Effect.as([] as const)),
+        sync.pending(session)
+      )
+      for (const outbound of pending) yield* send(outbound)
+      if (!(yield* Ref.get(active))) return
       const current = yield* Ref.get(dirty)
       for (const entry of options.documents) {
+        if (!(yield* Ref.get(active))) return
         const revision = current.get(entry.documentId)
         if (revision === undefined) continue
-        const generated = yield* sync.generate(entry.document, entry.documentId, session)
+        const generated = yield* Effect.raceFirst(
+          Deferred.await(teardown).pipe(Effect.as(null)),
+          sync.generate(entry.document, entry.documentId, session)
+        )
+        if (generated === null) return
         if (generated.outbound !== null) yield* send(generated.outbound)
         yield* Ref.update(observed, (values) => {
           const next = new Map(values)
@@ -197,6 +224,7 @@ export const makeTestClient = (
         })
       }
     }))
+    const guardedFlush = Effect.raceFirst(Deferred.await(receiveFailure), flush)
 
     const receive = (bytes: Uint8Array) =>
       Effect.gen(function*() {
@@ -288,7 +316,6 @@ export const makeTestClient = (
 
     yield* Effect.addFinalizer(() =>
       Effect.gen(function*() {
-        yield* Ref.set(active, false)
         const boundEpoch = yield* Ref.get(remoteEpoch)
         yield* sync.reset(session).pipe(
           Effect.ensuring(
@@ -317,11 +344,21 @@ export const makeTestClient = (
         )
       ),
       Effect.tapError((error) => Deferred.fail(receiveFailure, error)),
-      Effect.ensuring(connection.close),
+      Effect.ensuring(
+        Ref.set(active, false).pipe(
+          Effect.andThen(sendLock.withPermit(connection.close))
+        )
+      ),
       Effect.forkScoped
     )
+    yield* Effect.addFinalizer(() =>
+      Ref.set(active, false).pipe(
+        Effect.andThen(Deferred.succeed(teardown, undefined)),
+        Effect.andThen(flushLock.withPermit(Effect.void))
+      )
+    )
     yield* Ref.set(dirty, new Map(options.documents.map((entry) => [entry.documentId, 0])))
-    yield* Effect.raceFirst(flush, Deferred.await(receiveFailure))
+    yield* guardedFlush
 
     return {
       peerId: connection.peerId,
@@ -337,7 +374,7 @@ export const makeTestClient = (
           ),
           Deferred.await(receiveFailure)
         ),
-      flush: Effect.raceFirst(flush, Deferred.await(receiveFailure)),
+      flush: guardedFlush,
       observedByPeer: (documentId) => Ref.get(observed).pipe(Effect.map((values) => values.get(documentId) ?? false)),
       durableConfirmation: () => Effect.succeed(false as const)
     }

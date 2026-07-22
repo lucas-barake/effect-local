@@ -1647,8 +1647,8 @@ export const layer: Layer.Layer<
 
     return PeerSync.of({
       open: (peerId) =>
-        Effect.gen(function*() {
-          const current = yield* gate.current
+        Effect.scoped(Effect.gen(function*() {
+          const permit = yield* gate.shared
           const connectionEpoch = yield* crypto.randomUUIDv4.pipe(
             Effect.mapError((cause) =>
               new ReplicaError.ReplicaError({
@@ -1658,8 +1658,8 @@ export const layer: Layer.Layer<
               })
             )
           )
-          return { peerId, connectionEpoch, replicaIncarnation: current.incarnation }
-        }),
+          return { peerId, connectionEpoch, replicaIncarnation: permit.incarnation }
+        })),
       reset: (session) =>
         withSessionGeneration(session, (generation) =>
           quotaLock.withPermit(Effect.scoped(Effect.gen(function*() {
