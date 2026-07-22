@@ -1,3 +1,4 @@
+import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
@@ -10,6 +11,7 @@ import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
@@ -46,7 +48,6 @@ describe("BackupStore", () => {
     migrations: [{
       id: 1,
       name: "task_list_v1",
-      checksum: "task-list-v1",
       run: (sql, table) =>
         sql`CREATE TABLE IF NOT EXISTS ${sql(table)} (
           source_document_id TEXT PRIMARY KEY,
@@ -91,7 +92,10 @@ describe("BackupStore", () => {
     maxInFlightPerSession: 32,
     maxQueuedRpc: 128
   }
-  const Database = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+  const Database = Layer.merge(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer
+  )
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Base = Layer.merge(Database, Bootstrap)
   const Gate = ReplicaGate.layer.pipe(Layer.provide(Base))
@@ -134,7 +138,7 @@ describe("BackupStore", () => {
     Effect.gen(function*() {
       const backups = yield* BackupStore.BackupStore
       const store = yield* DocumentStore.DocumentStore
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "before" })
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
       const staged = yield* store.stage(created, (draft) => {
@@ -162,7 +166,7 @@ describe("BackupStore", () => {
       const projections = yield* ProjectionStore.ProjectionStore
       const store = yield* DocumentStore.DocumentStore
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "before" })
       yield* projections.replaceDocument(Task, created.snapshot, created.commitSequence)
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
@@ -199,8 +203,8 @@ describe("BackupStore", () => {
       const commandIds: Array<Identity.CommandId> = []
       const expected = new Map<Identity.DocumentId, string>()
       for (let index = 0; index < 51; index++) {
-        const documentId = Identity.makeDocumentId()
-        const commandId = Identity.makeCommandId()
+        const documentId = yield* Identity.makeDocumentId
+        const commandId = yield* Identity.makeCommandId
         const title = `task-${index}`
         const encoded = yield* Document.encode(Task, documentId, { title })
         const requestHash = yield* CommandExecutor.createRequestHash({
@@ -297,12 +301,34 @@ describe("BackupStore", () => {
       assert.deepStrictEqual(rows[0], { messages: 0, replies: 0 })
     }).pipe(Effect.provide(Live)))
 
+  it.effect("reports invalid local rows as storage corruption during export", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one" })
+      yield* sql`UPDATE effect_local_documents SET schema_version = 1.5 WHERE document_id = ${documentId}`
+      const result = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(
+        Stream.runCollect,
+        Effect.result
+      )
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure.reason._tag, "StorageCorrupt")
+        if (result.failure.reason._tag === "StorageCorrupt") {
+          assert.strictEqual(result.failure.reason.cause._tag, "SchemaCause")
+        }
+      }
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Live)))
+
   it.effect("rolls back restore when its exclusive permit becomes stale", () =>
     Effect.gen(function*() {
       const backups = yield* BackupStore.BackupStore
       const store = yield* DocumentStore.DocumentStore
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "archive" })
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
       const staged = yield* store.stage(created, (draft) => {
@@ -330,11 +356,73 @@ describe("BackupStore", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(Live)))
 
+  it.effect("rolls back the claimed generation when checksum-valid records fail insertion", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "preserved" })
+      InternalAutomerge.free(created.automerge)
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.byteLength, 0))
+      let offset = 0
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset)
+        offset += chunk.byteLength
+      }
+      const lines = new TextDecoder().decode(bytes).trimEnd().split("\n")
+        .map((line) => JSON.parse(line))
+      const document = lines.find((line) => line.kind === "Document")!
+      lines.splice(-1, 0, { ...document, value: { ...document.value } })
+      const manifest = lines[0]!
+      const end = lines.at(-1)!
+      manifest.value.recordCount = lines.length - 2
+      end.value.recordCount = lines.length - 2
+      end.value.recordsChecksum = yield* Canonical.digest(lines.slice(1, -1).map((line) => line.checksum))
+      end.checksum = yield* Canonical.digest(end.value)
+      for (let attempt = 0; attempt < 8; attempt++) {
+        manifest.checksum = yield* Canonical.digest(manifest.value)
+        const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+        if (manifest.value.declaredBytes === archive.byteLength) break
+        manifest.value.declaredBytes = archive.byteLength
+      }
+      manifest.checksum = yield* Canonical.digest(manifest.value)
+      const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+      const before = yield* sql<{
+        readonly replica_incarnation: number
+        readonly writer_generation: number
+      }>`SELECT replica_incarnation, writer_generation FROM effect_local_metadata WHERE singleton = 1`
+
+      const restored = yield* Effect.result(backups.restore({
+        source: Stream.make(archive),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      }))
+
+      assert.isTrue(Result.isFailure(restored))
+      if (Result.isFailure(restored)) {
+        assert.strictEqual(restored.failure.reason._tag, "BackupInvalid")
+        if (restored.failure.reason._tag === "BackupInvalid") {
+          assert.strictEqual(restored.failure.reason.cause._tag, "SqlCause")
+        }
+      }
+      const after = yield* sql<{
+        readonly replica_incarnation: number
+        readonly writer_generation: number
+      }>`SELECT replica_incarnation, writer_generation FROM effect_local_metadata WHERE singleton = 1`
+      assert.deepStrictEqual(after, before)
+      const preserved = yield* store.load(Task, documentId)
+      assert.strictEqual(preserved.snapshot.value.title, "preserved")
+      InternalAutomerge.free(preserved.automerge)
+    }).pipe(Effect.provide(Live)))
+
   it.effect("rejects checksum-valid corrupt canonical history without replacing the replica", () =>
     Effect.gen(function*() {
       const backups = yield* BackupStore.BackupStore
       const store = yield* DocumentStore.DocumentStore
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "preserved" })
       InternalAutomerge.free(created.automerge)
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
@@ -371,7 +459,7 @@ describe("BackupStore", () => {
       const backups = yield* BackupStore.BackupStore
       const store = yield* DocumentStore.DocumentStore
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "preserved" })
       InternalAutomerge.free(created.automerge)
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)

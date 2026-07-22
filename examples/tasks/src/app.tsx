@@ -191,7 +191,7 @@ export const App = () => {
       refresh()
       return true
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error))
+      setMessage(String(error))
       return false
     } finally {
       setPending((value) => value - 1)
@@ -219,7 +219,7 @@ export const App = () => {
       URL.revokeObjectURL(url)
       setNotice("Backup downloaded")
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : String(error))
+      setMessage(String(error))
     } finally {
       setPending((value) => value - 1)
     }

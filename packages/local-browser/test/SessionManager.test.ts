@@ -1,4 +1,5 @@
-import { assert, describe, it } from "@effect/vitest"
+import { NodeCrypto } from "@effect/platform-node"
+import { assert, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Deferred from "effect/Deferred"
@@ -8,7 +9,7 @@ import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
 import * as SessionManager from "../src/SessionManager.js"
 
-describe("SessionManager", () => {
+it.layer(NodeCrypto.layer)("SessionManager", (it) => {
   const clientId = 1
   const limits = {
     maxBackupBytes: 1024,
@@ -39,7 +40,7 @@ describe("SessionManager", () => {
   it.effect("tracks idempotent session registration", () =>
     Effect.gen(function*() {
       const sessions = yield* SessionManager.SessionManager
-      const sessionId = Identity.makeSessionId()
+      const sessionId = yield* Identity.makeSessionId
       yield* sessions.open(sessionId, clientId)
       yield* sessions.open(sessionId, clientId)
       assert.strictEqual(yield* sessions.activeCount, 1)
@@ -51,9 +52,9 @@ describe("SessionManager", () => {
   it.effect("rejects sessions above the configured limit", () =>
     Effect.gen(function*() {
       const sessions = yield* SessionManager.SessionManager
-      yield* sessions.open(Identity.makeSessionId(), clientId)
-      yield* sessions.open(Identity.makeSessionId(), clientId)
-      const error = yield* Effect.flip(sessions.open(Identity.makeSessionId(), clientId))
+      yield* sessions.open(yield* Identity.makeSessionId, clientId)
+      yield* sessions.open(yield* Identity.makeSessionId, clientId)
+      const error = yield* Effect.flip(sessions.open(yield* Identity.makeSessionId, clientId))
       assert.strictEqual(error.reason._tag, "QuotaExceeded")
       if (error.reason._tag === "QuotaExceeded") assert.strictEqual(error.reason.limit, limits.maxSessions)
     }).pipe(Effect.provide(SessionManager.layer), Effect.provideService(ReplicaLimits.ReplicaLimits, limits)))
@@ -61,8 +62,8 @@ describe("SessionManager", () => {
   it.effect("expires and renews leases using the Effect clock", () =>
     Effect.gen(function*() {
       const sessions = yield* SessionManager.SessionManager
-      const expired = Identity.makeSessionId()
-      const renewed = Identity.makeSessionId()
+      const expired = yield* Identity.makeSessionId
+      const renewed = yield* Identity.makeSessionId
       yield* sessions.open(expired, clientId)
       yield* sessions.open(renewed, clientId)
       yield* TestClock.adjust(SessionManager.leaseDurationMillis / 2)
@@ -77,7 +78,7 @@ describe("SessionManager", () => {
   it.effect("bounds per session execution and the aggregate admitted queue", () =>
     Effect.gen(function*() {
       const sessions = yield* SessionManager.SessionManager
-      const sessionId = Identity.makeSessionId()
+      const sessionId = yield* Identity.makeSessionId
       const release = yield* Deferred.make<void>()
       const entered = yield* Deferred.make<void>()
       yield* sessions.open(sessionId, clientId)
@@ -100,7 +101,7 @@ describe("SessionManager", () => {
   it.effect("holds stream admission until consumption ends", () =>
     Effect.gen(function*() {
       const sessions = yield* SessionManager.SessionManager
-      const sessionId = Identity.makeSessionId()
+      const sessionId = yield* Identity.makeSessionId
       const release = yield* Deferred.make<void>()
       const entered = yield* Deferred.make<void>()
       yield* sessions.open(sessionId, clientId)
@@ -122,7 +123,7 @@ describe("SessionManager", () => {
   it.effect("does not let a queued stream consume unary admission", () =>
     Effect.gen(function*() {
       const sessions = yield* SessionManager.SessionManager
-      const sessionId = Identity.makeSessionId()
+      const sessionId = yield* Identity.makeSessionId
       const release = yield* Deferred.make<void>()
       const entered = yield* Deferred.make<void>()
       const unaryEntered = yield* Deferred.make<void>()
@@ -155,7 +156,7 @@ describe("SessionManager", () => {
   it.effect("interrupts active streams when their lease expires", () =>
     Effect.gen(function*() {
       const sessions = yield* SessionManager.SessionManager
-      const sessionId = Identity.makeSessionId()
+      const sessionId = yield* Identity.makeSessionId
       yield* sessions.open(sessionId, clientId)
       const fiber = yield* sessions.stream(sessionId, clientId, Stream.never).pipe(Stream.runDrain, Effect.forkChild)
       yield* TestClock.adjust(SessionManager.leaseDurationMillis)
@@ -167,7 +168,7 @@ describe("SessionManager", () => {
   it.effect("interrupts active unary work when its lease expires", () =>
     Effect.gen(function*() {
       const sessions = yield* SessionManager.SessionManager
-      const sessionId = Identity.makeSessionId()
+      const sessionId = yield* Identity.makeSessionId
       const entered = yield* Deferred.make<void>()
       const pending = yield* Deferred.make<void>()
       yield* sessions.open(sessionId, clientId)

@@ -1,3 +1,4 @@
+import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Document from "@lucas-barake/effect-local/Document"
@@ -34,7 +35,6 @@ describe("ProjectionStore", () => {
     migrations: [{
       id: 1,
       name: "task_labels_v1",
-      checksum: "task-labels-v1",
       run: (sql, table) =>
         sql`CREATE TABLE IF NOT EXISTS ${sql(table)} (
         source_document_id TEXT NOT NULL,
@@ -54,7 +54,10 @@ describe("ProjectionStore", () => {
     projections: [Labels],
     queries: []
   })
-  const Database = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+  const Database = Layer.merge(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer
+  )
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Base = Layer.merge(Database, Bootstrap)
   const Store = ProjectionStore.layer([LabelsSql]).pipe(Layer.provide(Layer.merge(Base, LabelsSql.layer)))
@@ -64,7 +67,7 @@ describe("ProjectionStore", () => {
     Effect.gen(function*() {
       const store = yield* ProjectionStore.ProjectionStore
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       yield* sql`INSERT INTO effect_local_documents (
         document_id, document_type, schema_version, observed_versions,
         materialized_heads, accepted_heads, tombstone, projection_status, checkpoint_hash
@@ -94,7 +97,7 @@ describe("ProjectionStore", () => {
     Effect.gen(function*() {
       const store = yield* ProjectionStore.ProjectionStore
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       yield* sql`INSERT INTO effect_local_documents (
         document_id, document_type, schema_version, observed_versions,
         materialized_heads, accepted_heads, tombstone, projection_status, checkpoint_hash

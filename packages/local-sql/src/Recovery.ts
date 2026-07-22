@@ -5,7 +5,10 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Snapshot from "@lucas-barake/effect-local/Snapshot"
 import * as Context from "effect/Context"
+import * as Crypto from "effect/Crypto"
+import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
+import * as Equal from "effect/Equal"
 import * as Layer from "effect/Layer"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
@@ -59,24 +62,35 @@ export interface RawRecoveryExport {
   readonly changes: ReadonlyArray<typeof ChangeRow.Type>
 }
 
-const decodeHeads = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Array(Schema.String)))
+const Heads = Schema.fromJsonString(Schema.Array(Schema.String))
+const decodeHeads = Schema.decodeUnknownSync(Heads)
+const encodeHeads = Schema.encodeSync(Heads)
+
+type RecoveredDocument<D extends Document.Any,> = {
+  readonly automerge: Automerge.Doc<InternalAutomerge.Root<D["schema"]["Encoded"]>>
+  readonly encoded: D["schema"]["Encoded"]
+  readonly snapshot: Snapshot.FromDocument<D>
+  readonly materializedHeads: ReadonlyArray<string>
+  readonly acceptedHeads: ReadonlyArray<string>
+  readonly commitSequence: Identity.CommitSequence
+}
 
 export class Recovery extends Context.Service<Recovery, {
   readonly recover: <D extends Document.Any,>(
     document: D,
     documentId: Identity.DocumentId
-  ) => Effect.Effect<{
-    readonly automerge: Automerge.Doc<InternalAutomerge.Root<D["schema"]["Encoded"]>>
-    readonly encoded: D["schema"]["Encoded"]
-    readonly snapshot: Snapshot.FromDocument<D>
-    readonly materializedHeads: ReadonlyArray<string>
-    readonly acceptedHeads: ReadonlyArray<string>
-    readonly commitSequence: Identity.CommitSequence
-  }, ReplicaError.ReplicaError>
+  ) => Effect.Effect<RecoveredDocument<D>, ReplicaError.ReplicaError>
+  readonly recoverWithPermit: <D extends Document.Any,>(
+    document: D,
+    documentId: Identity.DocumentId,
+    permit: ReplicaGate.Permit
+  ) => Effect.Effect<RecoveredDocument<D>, ReplicaError.ReplicaError>
   readonly exportRaw: (documentId: Identity.DocumentId) => Effect.Effect<RawRecoveryExport, ReplicaError.ReplicaError>
 }>()("@lucas-barake/effect-local-sql/Recovery") {}
 
 export const make = Effect.gen(function*() {
+  const crypto = yield* Crypto.Crypto
+  const digest = (value: unknown) => Canonical.digest(value).pipe(Effect.provideService(Crypto.Crypto, crypto))
   const sql = yield* SqlClient.SqlClient
   const gate = yield* ReplicaGate.ReplicaGate
 
@@ -137,14 +151,32 @@ export const make = Effect.gen(function*() {
         checkpoints: yield* findCheckpoints(documentId),
         changes: yield* findChanges(documentId)
       }
-    })).pipe(Effect.mapError((cause) =>
-      new ReplicaError.ReplicaError({
-        reason: {
-          _tag: "StorageUnavailable",
-          cause: { _tag: "SqlCause", message: String(cause), code: null }
-        }
+    })).pipe(
+      Effect.catchTags({
+        SchemaError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({
+                cause: new ReplicaError.SchemaCause({
+                  message: String(cause),
+                  path: []
+                })
+              })
+            })
+          ),
+        SqlError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({
+                cause: new ReplicaError.SqlCause({
+                  message: String(cause),
+                  code: null
+                })
+              })
+            })
+          )
       })
-    ))
+    )
 
   const quarantine = (
     documentId: Identity.DocumentId,
@@ -162,7 +194,7 @@ export const make = Effect.gen(function*() {
       yield* sql`DELETE FROM effect_local_quarantine
           WHERE document_id = ${documentId} AND peer_id IS NULL AND reason = ${reason}`
       yield* sql`INSERT INTO effect_local_quarantine (document_id, peer_id, reason, bytes, created_at)
-          VALUES (${documentId}, NULL, ${reason}, NULL, ${new Date().toISOString()})`
+          VALUES (${documentId}, NULL, ${reason}, NULL, ${DateTime.formatIso(yield* DateTime.now)})`
       yield* sql`DELETE FROM effect_local_quarantine WHERE id NOT IN (
           SELECT id FROM effect_local_quarantine ORDER BY id DESC LIMIT 1000
         )`
@@ -171,10 +203,12 @@ export const make = Effect.gen(function*() {
       Effect.catchTag("SqlError", (cause) =>
         Effect.fail(
           new ReplicaError.ReplicaError({
-            reason: {
-              _tag: "StorageUnavailable",
-              cause: { _tag: "SqlCause", message: String(cause), code: null }
-            }
+            reason: new ReplicaError.StorageUnavailable({
+              cause: new ReplicaError.SqlCause({
+                message: String(cause),
+                code: null
+              })
+            })
           })
         ))
     )
@@ -193,17 +227,22 @@ export const make = Effect.gen(function*() {
       Effect.catchTag("SqlError", (cause) =>
         Effect.fail(
           new ReplicaError.ReplicaError({
-            reason: {
-              _tag: "StorageUnavailable",
-              cause: { _tag: "SqlCause", message: String(cause), code: null }
-            }
+            reason: new ReplicaError.StorageUnavailable({
+              cause: new ReplicaError.SqlCause({
+                message: String(cause),
+                code: null
+              })
+            })
           })
         ))
     )
 
-  const recover = <D extends Document.Any,>(document: D, documentId: Identity.DocumentId) =>
+  const recoverWithPermit = <D extends Document.Any,>(
+    document: D,
+    documentId: Identity.DocumentId,
+    permit: ReplicaGate.Permit
+  ) =>
     Effect.gen(function*() {
-      const permit = yield* gate.current
       const { changes, checkpoints, option } = yield* sql.withTransaction(Effect.gen(function*() {
         const option = yield* findDocument(documentId)
         const checkpoints = yield* findVerifiedCheckpoints(documentId)
@@ -215,44 +254,46 @@ export const make = Effect.gen(function*() {
           SqlError: (cause) =>
             Effect.fail(
               new ReplicaError.ReplicaError({
-                reason: {
-                  _tag: "StorageUnavailable",
-                  cause: { _tag: "SqlCause", message: String(cause), code: null }
-                }
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: new ReplicaError.SqlCause({
+                    message: String(cause),
+                    code: null
+                  })
+                })
               })
             ),
           SchemaError: (cause) =>
             Effect.fail(
               new ReplicaError.ReplicaError({
-                reason: {
-                  _tag: "StorageUnavailable",
-                  cause: { _tag: "SqlCause", message: String(cause), code: null }
-                }
+                reason: new ReplicaError.StorageCorrupt({
+                  cause: new ReplicaError.SchemaCause({
+                    message: String(cause),
+                    path: []
+                  })
+                })
               })
             )
         })
       )
       if (option._tag === "None") {
-        return yield* new ReplicaError.ReplicaError({ reason: { _tag: "DocumentNotFound", documentId } })
+        return yield* new ReplicaError.ReplicaError({ reason: new ReplicaError.DocumentNotFound({ documentId }) })
       }
       const row = option.value
       if (row.document_type !== document.name) {
         yield* quarantine(documentId, [], `Stored document type does not match ${document.name}`, permit)
         return yield* new ReplicaError.ReplicaError({
-          reason: {
-            _tag: "StorageCorrupt",
-            cause: { _tag: "AutomergeCause", message: `Stored document type does not match ${document.name}` }
-          }
+          reason: new ReplicaError.StorageCorrupt({
+            cause: new ReplicaError.AutomergeCause({ message: `Stored document type does not match ${document.name}` })
+          })
         })
       }
       if (row.schema_version > document.version) {
         return yield* new ReplicaError.ReplicaError({
-          reason: {
-            _tag: "UnsupportedDocumentVersion",
+          reason: new ReplicaError.UnsupportedDocumentVersion({
             documentId,
             observedVersion: row.schema_version,
             supportedVersion: document.version
-          }
+          })
         })
       }
       const actor = InternalAutomerge.actorId(permit.replicaId, permit.writerGeneration, documentId)
@@ -263,10 +304,9 @@ export const make = Effect.gen(function*() {
         }),
         catch: (cause) =>
           new ReplicaError.ReplicaError({
-            reason: {
-              _tag: "StorageCorrupt",
-              cause: { _tag: "AutomergeCause", message: String(cause) }
-            }
+            reason: new ReplicaError.StorageCorrupt({
+              cause: new ReplicaError.AutomergeCause({ message: String(cause) })
+            })
           })
       }))
       if (Result.isFailure(parsedHeads)) {
@@ -287,31 +327,29 @@ export const make = Effect.gen(function*() {
                   : InternalAutomerge.load<D["schema"]["Encoded"]>(checkpoint.bytes, actor),
               catch: (cause) =>
                 new ReplicaError.ReplicaError({
-                  reason: {
-                    _tag: "StorageCorrupt",
-                    cause: { _tag: "AutomergeCause", message: String(cause) }
-                  }
+                  reason: new ReplicaError.StorageCorrupt({
+                    cause: new ReplicaError.AutomergeCause({ message: String(cause) })
+                  })
                 })
             })
             if (checkpoint !== null) {
               const [checksum, checkpointHash] = yield* Effect.all([
-                Canonical.digest(checkpoint.bytes),
-                Canonical.digest({ documentId, bytes: checkpoint.bytes })
+                digest(checkpoint.bytes),
+                digest({ documentId, bytes: checkpoint.bytes })
               ])
               yield* Effect.try({
                 try: () => {
                   const checkpointHeads = decodeHeads(checkpoint.heads)
                   if (
                     checksum !== checkpoint.checksum || checkpoint.checkpoint_hash !== checkpointHash ||
-                    JSON.stringify(InternalAutomerge.heads(current!)) !== JSON.stringify(checkpointHeads)
+                    !Equal.equals(InternalAutomerge.heads(current!), checkpointHeads)
                   ) throw new TypeError(`Invalid checkpoint: ${checkpoint.checkpoint_hash}`)
                 },
                 catch: (cause) =>
                   new ReplicaError.ReplicaError({
-                    reason: {
-                      _tag: "StorageCorrupt",
-                      cause: { _tag: "AutomergeCause", message: String(cause) }
-                    }
+                    reason: new ReplicaError.StorageCorrupt({
+                      cause: new ReplicaError.AutomergeCause({ message: String(cause) })
+                    })
                   })
               })
             }
@@ -323,22 +361,21 @@ export const make = Effect.gen(function*() {
                   if (
                     decoded.hash !== change.change_hash || decoded.actor !== change.actor ||
                     decoded.sequence !== change.sequence ||
-                    JSON.stringify(decoded.dependencies) !== change.dependencies
+                    encodeHeads(decoded.dependencies) !== change.dependencies
                   ) throw new TypeError(`Invalid stored change: ${change.change_hash}`)
                   current = InternalAutomerge.replay(current!, [change.bytes])
                 }
                 if (
-                  JSON.stringify(InternalAutomerge.heads(current!)) !== JSON.stringify(materializedHeads) ||
+                  !Equal.equals(InternalAutomerge.heads(current!), materializedHeads) ||
                   !Automerge.hasHeads(current!, [...materializedHeads])
                 ) throw new TypeError("Recovered Automerge heads do not match materialized heads")
                 return current!
               },
               catch: (cause) =>
                 new ReplicaError.ReplicaError({
-                  reason: {
-                    _tag: "StorageCorrupt",
-                    cause: { _tag: "AutomergeCause", message: String(cause) }
-                  }
+                  reason: new ReplicaError.StorageCorrupt({
+                    cause: new ReplicaError.AutomergeCause({ message: String(cause) })
+                  })
                 })
             })
             return current
@@ -389,17 +426,20 @@ export const make = Effect.gen(function*() {
 
       yield* quarantine(documentId, invalidCheckpoints, "Canonical recovery failed", permit)
       return yield* new ReplicaError.ReplicaError({
-        reason: {
-          _tag: "StorageCorrupt",
-          cause: { _tag: "AutomergeCause", message: `No complete verified history for document ${documentId}` }
-        }
+        reason: new ReplicaError.StorageCorrupt({
+          cause: new ReplicaError.AutomergeCause({ message: `No complete verified history for document ${documentId}` })
+        })
       })
     })
 
-  return Recovery.of({ exportRaw, recover })
+  const recover = <D extends Document.Any,>(document: D, documentId: Identity.DocumentId) =>
+    gate.current.pipe(Effect.flatMap((permit) => recoverWithPermit(document, documentId, permit)))
+
+  return Recovery.of({ exportRaw, recover, recoverWithPermit })
 })
 
-export const layer: Layer.Layer<Recovery, never, SqlClient.SqlClient | ReplicaGate.ReplicaGate> = Layer.effect(
-  Recovery,
-  make
-)
+export const layer: Layer.Layer<Recovery, never, Crypto.Crypto | SqlClient.SqlClient | ReplicaGate.ReplicaGate> = Layer
+  .effect(
+    Recovery,
+    make
+  )

@@ -7,6 +7,7 @@ import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as RcMap from "effect/RcMap"
@@ -29,10 +30,12 @@ const encode = <S extends Document.WireSchema,>(schema: S, value: S["Type"]) =>
     Effect.catchTag("SchemaError", (cause) =>
       Effect.fail(
         new ReplicaError.ReplicaError({
-          reason: {
-            _tag: "StorageCorrupt",
-            cause: { _tag: "SchemaCause", message: String(cause), path: [] }
-          }
+          reason: new ReplicaError.StorageCorrupt({
+            cause: new ReplicaError.SchemaCause({
+              message: String(cause),
+              path: []
+            })
+          })
         })
       ))
   )
@@ -44,10 +47,12 @@ const decode = <S extends Document.WireSchema,>(schema: S, bytes: Uint8Array) =>
     Effect.catchTag("SchemaError", (cause) =>
       Effect.fail(
         new ReplicaError.ReplicaError({
-          reason: {
-            _tag: "StorageCorrupt",
-            cause: { _tag: "SchemaCause", message: String(cause), path: [] }
-          }
+          reason: new ReplicaError.StorageCorrupt({
+            cause: new ReplicaError.SchemaCause({
+              message: String(cause),
+              path: []
+            })
+          })
         })
       ))
   )
@@ -62,6 +67,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
   | QueryExecutor.QueryExecutor
   | ReplicaGate.ReplicaGate
   | ReplicaLimits.ReplicaLimits
+  | Crypto.Crypto
   | Sharding.Sharding
 > =>
   Layer.effect(
@@ -75,32 +81,35 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       const queries = yield* QueryExecutor.QueryExecutor
       const gate = yield* ReplicaGate.ReplicaGate
       const limits = yield* ReplicaLimits.ReplicaLimits
+      const crypto = yield* Crypto.Crypto
       const commandLocks = yield* RcMap.make({
         capacity: limits.maxQueuedRpc,
         lookup: () => Semaphore.make(1)
       })
 
       const withPermit = <A, E, R,>(f: (permit: ReplicaGate.Permit) => Effect.Effect<A, E, R>) =>
-        Effect.scoped(Effect.flatMap(gate.shared, f))
+        gate.shared.pipe(Effect.flatMap(f), Effect.scoped)
 
       const withCommandPermit = <A, E, R,>(
         commandId: Identity.CommandId,
         f: (permit: ReplicaGate.Permit) => Effect.Effect<A, E, R>
       ) =>
         withPermit((permit) =>
-          Effect.scoped(
-            RcMap.get(commandLocks, `${permit.incarnation}:${commandId}`).pipe(
-              Effect.mapError(() =>
-                new ReplicaError.ReplicaError({
-                  reason: { _tag: "QuotaExceeded", resource: "in-flight commands", limit: limits.maxQueuedRpc }
+          RcMap.get(commandLocks, `${permit.incarnation}:${commandId}`).pipe(
+            Effect.mapError(() =>
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.QuotaExceeded({
+                  resource: "in-flight commands",
+                  limit: limits.maxQueuedRpc
                 })
-              ),
-              Effect.flatMap((lock) => lock.withPermit(f(permit)))
-            )
+              })
+            ),
+            Effect.flatMap((lock) => lock.withPermit(f(permit))),
+            Effect.scoped
           )
         )
 
-      const service: Replica.Service = {
+      const service: Replica.Replica["Service"] = {
         create: (document, options) =>
           withCommandPermit(options.commandId, (permit) =>
             Effect.gen(function*() {
@@ -112,7 +121,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 document,
                 documentId,
                 encoded
-              })
+              }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               const result = yield* entity(documentId).Create({
                 replicaIncarnation: permit.incarnation,
                 writerGeneration: permit.writerGeneration,
@@ -121,35 +130,14 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 requestHash,
                 payload: yield* encode(document.schema, options.value)
               }).pipe(
-                Effect.catchTags({
-                  MailboxFull: (cause) =>
-                    Effect.fail(
-                      new ReplicaError.ReplicaError({
-                        reason: {
-                          _tag: "StorageUnavailable",
-                          cause: { _tag: "RpcCause", message: String(cause) }
-                        }
+                Effect.catchTag(["MailboxFull", "AlreadyProcessingMessage", "PersistenceError"], (cause) =>
+                  Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageUnavailable({
+                        cause: new ReplicaError.RpcCause({ message: String(cause) })
                       })
-                    ),
-                  AlreadyProcessingMessage: (cause) =>
-                    Effect.fail(
-                      new ReplicaError.ReplicaError({
-                        reason: {
-                          _tag: "StorageUnavailable",
-                          cause: { _tag: "RpcCause", message: String(cause) }
-                        }
-                      })
-                    ),
-                  PersistenceError: (cause) =>
-                    Effect.fail(
-                      new ReplicaError.ReplicaError({
-                        reason: {
-                          _tag: "StorageUnavailable",
-                          cause: { _tag: "RpcCause", message: String(cause) }
-                        }
-                      })
-                    )
-                })
+                    })
+                  ))
               )
               yield* publisher.publishPending
               return yield* decode(CommandOutcome.schema(Identity.DocumentId, Schema.Never), result)
@@ -165,20 +153,22 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         mutate: <M extends Mutation.Any,>(mutation: M, options: {
           readonly commandId: Identity.CommandId
           readonly documentId: Identity.DocumentId
-          readonly payload?: M["payload"]["Type"]
+          readonly payload?: M["payloadSchema"]["Type"]
         }) =>
           withCommandPermit(options.commandId, (permit) =>
             Effect.gen(function*() {
-              const payload = options.payload as M["payload"]["Type"]
-              const encoded = yield* Schema.encodeEffect(mutation.payload)(payload).pipe(
+              const payload = options.payload as M["payloadSchema"]["Type"]
+              const encoded = yield* Schema.encodeEffect(mutation.payloadSchema)(payload).pipe(
                 Effect.catchTag("SchemaError", (cause) =>
                   Effect.fail(
                     new ReplicaError.ReplicaError({
-                      reason: {
-                        _tag: "DocumentDecodeError",
+                      reason: new ReplicaError.DocumentDecodeError({
                         documentId: options.documentId,
-                        cause: { _tag: "SchemaCause", message: String(cause), path: [] }
-                      }
+                        cause: new ReplicaError.SchemaCause({
+                          message: String(cause),
+                          path: []
+                        })
+                      })
                     })
                   ))
               )
@@ -188,7 +178,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 documentId: options.documentId,
                 mutation,
                 payload: encoded
-              })
+              }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               const result = yield* entity(options.documentId).Mutate({
                 replicaIncarnation: permit.incarnation,
                 writerGeneration: permit.writerGeneration,
@@ -196,41 +186,23 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 documentType: mutation.document.name,
                 mutationTag: mutation.name,
                 requestHash,
-                payload: yield* encode(mutation.payload, payload)
+                payload: yield* encode(mutation.payloadSchema, payload)
               }).pipe(
-                Effect.catchTags({
-                  MailboxFull: (cause) =>
-                    Effect.fail(
-                      new ReplicaError.ReplicaError({
-                        reason: {
-                          _tag: "StorageUnavailable",
-                          cause: { _tag: "RpcCause", message: String(cause) }
-                        }
+                Effect.catchTag(["MailboxFull", "AlreadyProcessingMessage", "PersistenceError"], (cause) =>
+                  Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageUnavailable({
+                        cause: new ReplicaError.RpcCause({ message: String(cause) })
                       })
-                    ),
-                  AlreadyProcessingMessage: (cause) =>
-                    Effect.fail(
-                      new ReplicaError.ReplicaError({
-                        reason: {
-                          _tag: "StorageUnavailable",
-                          cause: { _tag: "RpcCause", message: String(cause) }
-                        }
-                      })
-                    ),
-                  PersistenceError: (cause) =>
-                    Effect.fail(
-                      new ReplicaError.ReplicaError({
-                        reason: {
-                          _tag: "StorageUnavailable",
-                          cause: { _tag: "RpcCause", message: String(cause) }
-                        }
-                      })
-                    )
-                })
+                    })
+                  ))
               )
               yield* publisher.publishPending
-              return yield* decode(CommandOutcome.schema(mutation.success, mutation.error), result) as Effect.Effect<
-                CommandOutcome.CommandOutcome<M["success"]["Type"], M["error"]["Type"]>,
+              return yield* decode(
+                CommandOutcome.schema(mutation.successSchema, mutation.errorSchema),
+                result
+              ) as Effect.Effect<
+                CommandOutcome.CommandOutcome<M["successSchema"]["Type"], M["errorSchema"]["Type"]>,
                 ReplicaError.ReplicaError
               >
             })),
@@ -242,7 +214,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 commandId: options.commandId,
                 document,
                 documentId: options.documentId
-              })
+              }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               const result = yield* entity(options.documentId).Delete({
                 replicaIncarnation: permit.incarnation,
                 writerGeneration: permit.writerGeneration,
@@ -250,43 +222,23 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 documentType: document.name,
                 requestHash
               }).pipe(
-                Effect.catchTags({
-                  MailboxFull: (cause) =>
-                    Effect.fail(
-                      new ReplicaError.ReplicaError({
-                        reason: {
-                          _tag: "StorageUnavailable",
-                          cause: { _tag: "RpcCause", message: String(cause) }
-                        }
+                Effect.catchTag(["MailboxFull", "AlreadyProcessingMessage", "PersistenceError"], (cause) =>
+                  Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageUnavailable({
+                        cause: new ReplicaError.RpcCause({ message: String(cause) })
                       })
-                    ),
-                  AlreadyProcessingMessage: (cause) =>
-                    Effect.fail(
-                      new ReplicaError.ReplicaError({
-                        reason: {
-                          _tag: "StorageUnavailable",
-                          cause: { _tag: "RpcCause", message: String(cause) }
-                        }
-                      })
-                    ),
-                  PersistenceError: (cause) =>
-                    Effect.fail(
-                      new ReplicaError.ReplicaError({
-                        reason: {
-                          _tag: "StorageUnavailable",
-                          cause: { _tag: "RpcCause", message: String(cause) }
-                        }
-                      })
-                    )
-                })
+                    })
+                  ))
               )
               yield* publisher.publishPending
               return yield* decode(CommandOutcome.schema(Schema.Void, Schema.Never), result)
             })),
         query: <Q extends Query.Any,>(
           query: Q,
-          ...payload: [Q["payload"]["Type"]] extends [void] ? readonly [] : readonly [payload: Q["payload"]["Type"]]
-        ) => withPermit(() => queries.execute(query, payload[0] as Q["payload"]["Type"])),
+          ...payload: [Q["payloadSchema"]["Type"]] extends [void] ? readonly []
+            : readonly [payload: Q["payloadSchema"]["Type"]]
+        ) => withPermit(() => queries.execute(query, payload[0] as Q["payloadSchema"]["Type"])),
         lookupMutation: (mutation, commandId) =>
           withPermit((permit) => commands.lookupMutation(mutation, commandId, permit)),
         lookupCreate: (_document, commandId) => withPermit((permit) => commands.lookupCreate(commandId, permit)),
@@ -315,10 +267,12 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           Effect.gen(function*() {
             if (options.value.documentName !== document.name || options.value.schemaVersion !== document.version) {
               return yield* new ReplicaError.ReplicaError({
-                reason: {
-                  _tag: "BackupInvalid",
-                  cause: { _tag: "SchemaCause", message: "Portable document definition mismatch", path: [] }
-                }
+                reason: new ReplicaError.BackupInvalid({
+                  cause: new ReplicaError.SchemaCause({
+                    message: "Portable document definition mismatch",
+                    path: []
+                  })
+                })
               })
             }
             const documentId = Identity.documentIdFromCommandId(options.commandId)

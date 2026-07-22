@@ -18,15 +18,13 @@ export interface Decision {
   readonly reorder: boolean
 }
 
-export interface Service {
+export class FaultInjection extends Context.Service<FaultInjection, {
   readonly decide: (packet: Packet) => Effect.Effect<Decision>
-}
-
-export class FaultInjection extends Context.Service<FaultInjection, Service>()(
+}>()(
   "@lucas-barake/effect-local-test/FaultInjection"
 ) {}
 
-export const layer = (decide: Service["decide"]) => Layer.succeed(FaultInjection, { decide })
+export const layer = (decide: FaultInjection["Service"]["decide"]) => Layer.succeed(FaultInjection, { decide })
 
 export const none = layer(() => Effect.succeed({ drop: false, copies: 1, delay: 0, reorder: false }))
 

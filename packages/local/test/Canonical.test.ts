@@ -1,3 +1,4 @@
+import { NodeCrypto } from "@effect/platform-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
 import * as Canonical from "../src/Canonical.js"
@@ -14,5 +15,5 @@ describe("Canonical", () => {
       const second = yield* Canonical.digest({ a: 1, b: 2 })
       assert.strictEqual(first, second)
       assert.strictEqual(first.length, 64)
-    }))
+    }).pipe(Effect.provide(NodeCrypto.layer)))
 })

@@ -28,7 +28,7 @@ const program = Effect.scoped(Effect.gen(function*() {
   const network = yield* TestPeer.TestPeer
   const transport = yield* PeerTransport.PeerTransport
   const left = yield* transport.connect({
-    replicaId: Identity.makeReplicaId(),
+    replicaId: (yield* Identity.makeReplicaId),
     peerId: rightPeerId
   })
   const right = yield* network.connect(rightPeerId, leftPeerId)
@@ -54,4 +54,5 @@ const program = Effect.scoped(Effect.gen(function*() {
   })
 }))
 
-await Effect.runPromise(program.pipe(Effect.provide(Live)))
+await Effect.runPromise(program.pipe(Effect.provide(Live), Effect.provide(NodeCrypto.layer)))
+import { NodeCrypto } from "@effect/platform-node"

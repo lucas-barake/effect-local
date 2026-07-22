@@ -8,6 +8,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Ref from "effect/Ref"
@@ -22,7 +23,7 @@ export interface SelectedDocument {
   readonly documentId: Identity.DocumentId
 }
 
-export interface Service {
+export interface PeerSession {
   readonly peerId: Identity.PeerId
   readonly connectionEpoch: string
   readonly markDirty: (documentId: Identity.DocumentId) => Effect.Effect<void, ReplicaError.ReplicaError>
@@ -39,36 +40,36 @@ export const SyncEnvelope = Schema.Struct({
   messageHash: Schema.String,
   message: Schema.Uint8ArrayFromBase64
 })
+const SyncEnvelopeJson = Schema.fromJsonString(Schema.toCodecJson(SyncEnvelope))
 
 const key = (documentType: string, documentId: Identity.DocumentId) => `${documentType}:${documentId}`
 
 const encode = (envelope: typeof SyncEnvelope.Type) =>
-  Schema.encodeEffect(Schema.fromJsonString(Schema.toCodecJson(SyncEnvelope)))(envelope).pipe(
+  Schema.encodeEffect(SyncEnvelopeJson)(envelope).pipe(
     Effect.map((value) => new TextEncoder().encode(value)),
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
-        reason: { _tag: "ProtocolMismatch", expected: "encodable sync envelope", observed: String(cause) }
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: "encodable sync envelope",
+          observed: String(cause)
+        })
       })
     )
   )
 
 const decode = (bytes: Uint8Array) =>
-  Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))(new TextDecoder().decode(bytes)).pipe(
+  Schema.decodeUnknownEffect(SyncEnvelopeJson)(new TextDecoder().decode(bytes)).pipe(
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
-        reason: { _tag: "ProtocolMismatch", expected: "JSON sync envelope", observed: String(cause) }
-      })
-    ),
-    Effect.flatMap(Schema.decodeUnknownEffect(Schema.toCodecJson(SyncEnvelope))),
-    Effect.catchTag("SchemaError", (cause) =>
-      Effect.fail(
-        new ReplicaError.ReplicaError({
-          reason: { _tag: "ProtocolMismatch", expected: "sync envelope", observed: String(cause) }
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: "sync envelope",
+          observed: String(cause)
         })
-      ))
+      })
+    )
   )
 
-export const makeWithClient = (
+export const makeTestClient = (
   options: {
     readonly peerId: Identity.PeerId
     readonly documents: ReadonlyArray<SelectedDocument>
@@ -77,10 +78,11 @@ export const makeWithClient = (
     documentId: Identity.DocumentId
   ) => Effect.Effect<ReturnType<Effect.Success<typeof DocumentEntity.DocumentEntity.client>>>
 ): Effect.Effect<
-  Service,
+  PeerSession,
   ReplicaError.ReplicaError,
   | Scope.Scope
   | CommitPublisher.CommitPublisher
+  | Crypto.Crypto
   | PeerTransport.PeerTransport
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
@@ -92,29 +94,25 @@ export const makeWithClient = (
     const limits = yield* ReplicaLimits.ReplicaLimits
     const transport = yield* PeerTransport.PeerTransport
     const sync = yield* PeerSync.PeerSync
-    const [connection, session] = yield* Effect.gen(function*() {
-      const permit = yield* Effect.scoped(gate.shared)
-      const connection = yield* transport.connect({ replicaId: permit.replicaId, peerId: options.peerId })
-      const session = yield* sync.open(connection.peerId)
-      if (session.replicaIncarnation !== permit.incarnation) {
-        return yield* new ReplicaError.ReplicaError({
-          reason: {
-            _tag: "ProtocolMismatch",
-            expected: String(permit.incarnation),
-            observed: String(session.replicaIncarnation)
-          }
+    const crypto = yield* Crypto.Crypto
+    const permit = yield* Effect.scoped(gate.shared)
+    const connection = yield* transport.connect({ replicaId: permit.replicaId, peerId: options.peerId })
+    const session = yield* sync.open(connection.peerId)
+    if (session.replicaIncarnation !== permit.incarnation) {
+      return yield* new ReplicaError.ReplicaError({
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: String(permit.incarnation),
+          observed: String(session.replicaIncarnation)
         })
-      }
-      return [connection, session] as const
-    })
+      })
+    }
     const selected = new Set(options.documents.map((entry) => key(entry.document.name, entry.documentId)))
     if (selected.size !== options.documents.length) {
       return yield* new ReplicaError.ReplicaError({
-        reason: {
-          _tag: "ProtocolMismatch",
+        reason: new ReplicaError.ProtocolMismatch({
           expected: "unique selected documents",
           observed: String(options.documents.length)
-        }
+        })
       })
     }
     const dirty = yield* Ref.make(new Map<Identity.DocumentId, number>())
@@ -130,7 +128,10 @@ export const makeWithClient = (
       return entry === undefined
         ? Effect.fail(
           new ReplicaError.ReplicaError({
-            reason: { _tag: "ProtocolMismatch", expected: "selected document", observed: documentId }
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: "selected document",
+              observed: documentId
+            })
           })
         )
         : Effect.succeed(entry)
@@ -151,11 +152,10 @@ export const makeWithClient = (
           const permit = yield* gate.shared
           if (permit.incarnation !== session.replicaIncarnation) {
             return yield* new ReplicaError.ReplicaError({
-              reason: {
-                _tag: "ProtocolMismatch",
+              reason: new ReplicaError.ProtocolMismatch({
                 expected: String(session.replicaIncarnation),
                 observed: String(permit.incarnation)
-              }
+              })
             })
           }
           yield* connection.send(bytes).pipe(
@@ -163,10 +163,9 @@ export const makeWithClient = (
             Effect.catchTag("TimeoutError", (cause) =>
               Effect.fail(
                 new ReplicaError.ReplicaError({
-                  reason: {
-                    _tag: "StorageUnavailable",
-                    cause: { _tag: "RpcCause", message: String(cause) }
-                  }
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause: new ReplicaError.RpcCause({ message: String(cause) })
+                  })
                 })
               ))
           )
@@ -205,20 +204,18 @@ export const makeWithClient = (
           const permit = yield* gate.shared
           if (permit.incarnation !== session.replicaIncarnation) {
             return yield* new ReplicaError.ReplicaError({
-              reason: {
-                _tag: "ProtocolMismatch",
+              reason: new ReplicaError.ProtocolMismatch({
                 expected: String(session.replicaIncarnation),
                 observed: String(permit.incarnation)
-              }
+              })
             })
           }
           if (bytes.byteLength > limits.maxSyncMessageBytes * 2 + 4_096) {
             return yield* new ReplicaError.ReplicaError({
-              reason: {
-                _tag: "ProtocolMismatch",
-                expected: `sync envelope at most ${limits.maxSyncMessageBytes * 2 + 4_096} bytes`,
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: `sync envelope at most ${limits.maxSyncMessageBytes * 2 + 4096} bytes`,
                 observed: String(bytes.byteLength)
-              }
+              })
             })
           }
           const envelope = yield* decode(bytes)
@@ -228,22 +225,29 @@ export const makeWithClient = (
           )
           if (boundEpoch !== envelope.connectionEpoch) {
             return yield* new ReplicaError.ReplicaError({
-              reason: { _tag: "ProtocolMismatch", expected: boundEpoch, observed: envelope.connectionEpoch }
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: boundEpoch,
+                observed: envelope.connectionEpoch
+              })
             })
           }
-          const messageHash = yield* Canonical.digest(envelope.message)
+          const messageHash = yield* Canonical.digest(envelope.message).pipe(
+            Effect.provideService(Crypto.Crypto, crypto)
+          )
           if (messageHash !== envelope.messageHash) {
             return yield* new ReplicaError.ReplicaError({
-              reason: { _tag: "ProtocolMismatch", expected: messageHash, observed: envelope.messageHash }
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: messageHash,
+                observed: envelope.messageHash
+              })
             })
           }
           if (!selected.has(key(envelope.documentType, envelope.documentId))) {
             return yield* new ReplicaError.ReplicaError({
-              reason: {
-                _tag: "ProtocolMismatch",
+              reason: new ReplicaError.ProtocolMismatch({
                 expected: "selected whole document",
                 observed: `${envelope.documentType}:${envelope.documentId}`
-              }
+              })
             })
           }
           const client = yield* entity(envelope.documentId)
@@ -262,10 +266,9 @@ export const makeWithClient = (
               (cause) =>
                 Effect.fail(
                   new ReplicaError.ReplicaError({
-                    reason: {
-                      _tag: "StorageUnavailable",
-                      cause: { _tag: "RpcCause", message: String(cause) }
-                    }
+                    reason: new ReplicaError.StorageUnavailable({
+                      cause: new ReplicaError.RpcCause({ message: String(cause) })
+                    })
                   })
                 )
             )
@@ -335,10 +338,11 @@ export const make = (options: {
   readonly peerId: Identity.PeerId
   readonly documents: ReadonlyArray<SelectedDocument>
 }): Effect.Effect<
-  Service,
+  PeerSession,
   ReplicaError.ReplicaError,
   | Scope.Scope
   | CommitPublisher.CommitPublisher
+  | Crypto.Crypto
   | PeerTransport.PeerTransport
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
@@ -346,5 +350,5 @@ export const make = (options: {
   | Sharding.Sharding
 > =>
   DocumentEntity.DocumentEntity.client.pipe(
-    Effect.flatMap((entity) => makeWithClient(options, (documentId) => Effect.succeed(entity(documentId))))
+    Effect.flatMap((entity) => makeTestClient(options, (documentId) => Effect.succeed(entity(documentId))))
   )

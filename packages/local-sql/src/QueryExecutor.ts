@@ -8,16 +8,17 @@ import * as Schema from "effect/Schema"
 import type * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 
 export class QueryExecutor extends Context.Service<QueryExecutor, {
   readonly execute: <Q extends Query.Any,>(
     query: Q,
-    payload: Q["payload"]["Type"]
-  ) => Effect.Effect<Q["success"]["Type"], Q["error"]["Type"] | ReplicaError.ReplicaError>
+    payload: Q["payloadSchema"]["Type"]
+  ) => Effect.Effect<Q["successSchema"]["Type"], Q["errorSchema"]["Type"] | ReplicaError.ReplicaError>
   readonly reactive: <Q extends Query.Any,>(
     query: Q,
-    payload: Q["payload"]["Type"]
-  ) => Stream.Stream<Q["success"]["Type"], Q["error"]["Type"] | ReplicaError.ReplicaError>
+    payload: Q["payloadSchema"]["Type"]
+  ) => Stream.Stream<Q["successSchema"]["Type"], Q["errorSchema"]["Type"] | ReplicaError.ReplicaError>
 }>()("@lucas-barake/effect-local-sql/QueryExecutor") {}
 
 export type QueryHandlers<D extends ReplicaDefinition.Any,> = D["queries"][number] extends infer Q
@@ -39,110 +40,143 @@ export const layer = <D extends ReplicaDefinition.Any,>(
       for (const query of definition.queries) {
         handlers.set(query.name, Context.get(context, query.handler))
       }
-      const execute = <Q extends Query.Any,>(query: Q, payload: Q["payload"]["Type"]) =>
+      const findProjectionStatus = SqlSchema.findOneOption({
+        Request: Schema.String,
+        Result: Schema.Struct({ status: Schema.String }),
+        execute: (projectionName) =>
+          sql`SELECT status FROM effect_local_projection_registry
+            WHERE projection_name = ${projectionName}`
+      })
+      const findBlockedDocumentCount = SqlSchema.findOneOption({
+        Request: Schema.String,
+        Result: Schema.Struct({ count: Schema.Number }),
+        execute: (documentType) =>
+          sql`SELECT COUNT(*) AS count FROM effect_local_documents
+            WHERE document_type = ${documentType} AND projection_status != 'Ready'`
+      })
+      const findBlockedProjectionCount = SqlSchema.findOneOption({
+        Request: Schema.String,
+        Result: Schema.Struct({ count: Schema.Number }),
+        execute: (projectionName) =>
+          sql`SELECT COUNT(*) AS count FROM effect_local_document_projections
+            WHERE projection_name = ${projectionName} AND status != 'Ready'`
+      })
+      const execute = <Q extends Query.Any,>(query: Q, payload: Q["payloadSchema"]["Type"]) =>
         Effect.gen(function*() {
           for (const projection of query.dependsOn) {
-            const registry = yield* sql<{ readonly status: string }>`
-            SELECT status FROM effect_local_projection_registry
-            WHERE projection_name = ${projection.name}`.pipe(
+            const registry = yield* findProjectionStatus(projection.name).pipe(
               Effect.mapError((cause) =>
                 new ReplicaError.ReplicaError({
-                  reason: {
-                    _tag: "ProjectionBlocked",
+                  reason: new ReplicaError.ProjectionBlocked({
                     projection: projection.name,
-                    cause: { _tag: "SchemaCause", message: String(cause), path: [] }
-                  }
+                    cause: new ReplicaError.SchemaCause({
+                      message: String(cause),
+                      path: []
+                    })
+                  })
                 })
               )
             )
-            if (registry[0]?.status !== "Ready") {
+            if (registry._tag === "None" || registry.value.status !== "Ready") {
               return yield* new ReplicaError.ReplicaError({
-                reason: {
-                  _tag: "ProjectionBlocked",
+                reason: new ReplicaError.ProjectionBlocked({
                   projection: projection.name,
-                  cause: { _tag: "SchemaCause", message: "Projection is not ready", path: [] }
-                }
+                  cause: new ReplicaError.SchemaCause({
+                    message: "Projection is not ready",
+                    path: []
+                  })
+                })
               })
             }
-            const blockedDocuments = yield* sql<{ readonly count: number }>`
-            SELECT COUNT(*) AS count FROM effect_local_documents
-            WHERE document_type = ${projection.document.name} AND projection_status != 'Ready'`.pipe(
+            const blockedDocuments = yield* findBlockedDocumentCount(projection.document.name).pipe(
               Effect.mapError((cause) =>
                 new ReplicaError.ReplicaError({
-                  reason: {
-                    _tag: "ProjectionBlocked",
+                  reason: new ReplicaError.ProjectionBlocked({
                     projection: projection.name,
-                    cause: { _tag: "SchemaCause", message: String(cause), path: [] }
-                  }
+                    cause: new ReplicaError.SchemaCause({
+                      message: String(cause),
+                      path: []
+                    })
+                  })
                 })
               )
             )
-            if ((blockedDocuments[0]?.count ?? 0) > 0) {
+            if ((blockedDocuments._tag === "Some" ? blockedDocuments.value.count : 0) > 0) {
               return yield* new ReplicaError.ReplicaError({
-                reason: {
-                  _tag: "ProjectionBlocked",
+                reason: new ReplicaError.ProjectionBlocked({
                   projection: projection.name,
-                  cause: { _tag: "SchemaCause", message: "A source document projection is not ready", path: [] }
-                }
+                  cause: new ReplicaError.SchemaCause({
+                    message: "A source document projection is not ready",
+                    path: []
+                  })
+                })
               })
             }
-            const blocked = yield* sql<{ readonly count: number }>`
-            SELECT COUNT(*) AS count FROM effect_local_document_projections
-            WHERE projection_name = ${projection.name} AND status != 'Ready'`.pipe(
+            const blocked = yield* findBlockedProjectionCount(projection.name).pipe(
               Effect.mapError((cause) =>
                 new ReplicaError.ReplicaError({
-                  reason: {
-                    _tag: "ProjectionBlocked",
+                  reason: new ReplicaError.ProjectionBlocked({
                     projection: projection.name,
-                    cause: { _tag: "SchemaCause", message: String(cause), path: [] }
-                  }
+                    cause: new ReplicaError.SchemaCause({
+                      message: String(cause),
+                      path: []
+                    })
+                  })
                 })
               )
             )
-            if ((blocked[0]?.count ?? 0) > 0) {
+            if ((blocked._tag === "Some" ? blocked.value.count : 0) > 0) {
               return yield* new ReplicaError.ReplicaError({
-                reason: {
-                  _tag: "ProjectionBlocked",
+                reason: new ReplicaError.ProjectionBlocked({
                   projection: projection.name,
-                  cause: { _tag: "SchemaCause", message: "A document projection is not ready", path: [] }
-                }
+                  cause: new ReplicaError.SchemaCause({
+                    message: "A document projection is not ready",
+                    path: []
+                  })
+                })
               })
             }
           }
-          const encoded = yield* Schema.encodeEffect(query.payload)(payload).pipe(
+          const encoded = yield* Schema.encodeEffect(query.payloadSchema)(payload).pipe(
             Effect.mapError((cause) =>
               new ReplicaError.ReplicaError({
-                reason: {
-                  _tag: "StorageCorrupt",
-                  cause: { _tag: "SchemaCause", message: String(cause), path: [] }
-                }
+                reason: new ReplicaError.StorageCorrupt({
+                  cause: new ReplicaError.SchemaCause({
+                    message: String(cause),
+                    path: []
+                  })
+                })
               })
             )
           )
-          const decoded = yield* Schema.decodeEffect(query.payload)(encoded).pipe(
+          const decoded = yield* Schema.decodeEffect(query.payloadSchema)(encoded).pipe(
             Effect.mapError((cause) =>
               new ReplicaError.ReplicaError({
-                reason: {
-                  _tag: "StorageCorrupt",
-                  cause: { _tag: "SchemaCause", message: String(cause), path: [] }
-                }
+                reason: new ReplicaError.StorageCorrupt({
+                  cause: new ReplicaError.SchemaCause({
+                    message: String(cause),
+                    path: []
+                  })
+                })
               })
             )
           )
           const handler = handlers.get(query.name)
           if (handler === undefined) return yield* Effect.die(new Error(`Missing query handler: ${query.name}`))
           const result = yield* handler(decoded)
-          return yield* Schema.decodeUnknownEffect(Schema.toType(query.success))(result).pipe(
+          return yield* Schema.decodeUnknownEffect(Schema.toType(query.successSchema))(result).pipe(
             Effect.mapError((cause) =>
               new ReplicaError.ReplicaError({
-                reason: {
-                  _tag: "StorageCorrupt",
-                  cause: { _tag: "SchemaCause", message: String(cause), path: [] }
-                }
+                reason: new ReplicaError.StorageCorrupt({
+                  cause: new ReplicaError.SchemaCause({
+                    message: String(cause),
+                    path: []
+                  })
+                })
               })
             )
           )
-        }) as Effect.Effect<Q["success"]["Type"], Q["error"]["Type"] | ReplicaError.ReplicaError>
+        }) as Effect.Effect<Q["successSchema"]["Type"], Q["errorSchema"]["Type"] | ReplicaError.ReplicaError>
       const reactivityKeys = (query: Query.Any) =>
         query.dependsOn.flatMap((projection) => [projection.name, projection.document.name])
       return QueryExecutor.of({

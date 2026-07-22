@@ -11,6 +11,7 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 
 const Title = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(160))
 
@@ -72,7 +73,6 @@ export const TaskListSql = SqlProjection.make(TaskList, {
   migrations: [{
     id: 1,
     name: "task_list_v1",
-    checksum: "sha256:task-list-v1",
     run: (sql, table) =>
       sql`CREATE TABLE IF NOT EXISTS ${sql(table)} (
         source_document_id TEXT PRIMARY KEY,
@@ -92,28 +92,16 @@ export const TaskListSql = SqlProjection.make(TaskList, {
     )`.pipe(Effect.asVoid)
 })
 
-export const DomainLive = Layer.mergeAll(
-  Mutation.layer(RenameTask, ({ draft, payload }) => {
-    draft.title = payload.title
-    draft.updatedAt = Date.now()
-    return undefined
+const ListTasksSql = SqlSchema.findAll({
+  Request: ListTasks.payloadSchema,
+  Result: Schema.Struct({
+    ...TaskRow.fields,
+    completed: Schema.BooleanFromBit
   }),
-  Mutation.layer(SetTaskCompleted, ({ draft, payload }) => {
-    draft.completed = payload.completed
-    draft.updatedAt = Date.now()
-    return undefined
-  }),
-  Query.layer(ListTasks, (payload) =>
-    Effect.gen(function*() {
-      const sql = yield* SqlClient.SqlClient
-      const search = `%${payload.search.trim().toLocaleLowerCase()}%`
-      const rows = yield* sql<{
-        readonly sourceDocumentId: string
-        readonly title: string
-        readonly completed: number
-        readonly createdAt: number
-        readonly updatedAt: number
-      }>`SELECT
+  execute: (payload) => {
+    const search = `%${payload.search.trim().toLocaleLowerCase()}%`
+    return SqlClient.SqlClient.use((sql) =>
+      sql`SELECT
         source_document_id AS sourceDocumentId,
         title,
         completed,
@@ -125,14 +113,22 @@ export const DomainLive = Layer.mergeAll(
           (${payload.filter} = 'completed' AND completed = 1))
         AND (${search} = '%%' OR LOWER(title) LIKE ${search})
       ORDER BY completed ASC, created_at DESC`
-      return rows.map((row) => ({
-        sourceDocumentId: Identity.DocumentId.make(row.sourceDocumentId),
-        title: row.title,
-        completed: row.completed === 1,
-        createdAt: row.createdAt,
-        updatedAt: row.updatedAt
-      }))
-    }).pipe(Effect.orDie))
+    )
+  }
+})
+
+export const DomainLive = Layer.mergeAll(
+  RenameTask.toLayer(({ draft, payload }) => {
+    draft.title = payload.title
+    draft.updatedAt = Date.now()
+    return undefined
+  }),
+  SetTaskCompleted.toLayer(({ draft, payload }) => {
+    draft.completed = payload.completed
+    draft.updatedAt = Date.now()
+    return undefined
+  }),
+  ListTasks.toLayer((payload) => ListTasksSql(payload).pipe(Effect.orDie))
 )
 
 export const limits: ReplicaLimits.Values = {

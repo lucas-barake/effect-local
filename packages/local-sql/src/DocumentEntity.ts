@@ -7,6 +7,7 @@ import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
@@ -115,18 +116,23 @@ const decode = <S extends Document.WireSchema,>(
   Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))(new TextDecoder().decode(bytes)).pipe(
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
-        reason: { _tag: "ProtocolMismatch", expected: "schema-coded JSON", observed: String(cause) }
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: "schema-coded JSON",
+          observed: String(cause)
+        })
       })
     ),
     Effect.flatMap(Schema.decodeUnknownEffect(Schema.toCodecJson(schema))),
     Effect.catchTag("SchemaError", (cause) =>
       Effect.fail(
         new ReplicaError.ReplicaError({
-          reason: {
-            _tag: "DocumentDecodeError",
+          reason: new ReplicaError.DocumentDecodeError({
             documentId,
-            cause: { _tag: "SchemaCause", message: String(cause), path: [] }
-          }
+            cause: new ReplicaError.SchemaCause({
+              message: String(cause),
+              path: []
+            })
+          })
         })
       ))
   )
@@ -137,10 +143,12 @@ const encode = <S extends Document.WireSchema,>(schema: S, value: S["Type"]) =>
     Effect.catchTag("SchemaError", (cause) =>
       Effect.fail(
         new ReplicaError.ReplicaError({
-          reason: {
-            _tag: "StorageCorrupt",
-            cause: { _tag: "SchemaCause", message: String(cause), path: [] }
-          }
+          reason: new ReplicaError.StorageCorrupt({
+            cause: new ReplicaError.SchemaCause({
+              message: String(cause),
+              path: []
+            })
+          })
         })
       ))
   )
@@ -150,7 +158,10 @@ const resolveDocument = (definition: ReplicaDefinition.Any, name: string) => {
   return document === undefined
     ? Effect.fail(
       new ReplicaError.ReplicaError({
-        reason: { _tag: "ProtocolMismatch", expected: "registered document type", observed: name }
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: "registered document type",
+          observed: name
+        })
       })
     )
     : Effect.succeed(document)
@@ -167,7 +178,10 @@ const resolveMutation = (
   return mutation === undefined
     ? Effect.fail(
       new ReplicaError.ReplicaError({
-        reason: { _tag: "ProtocolMismatch", expected: `registered mutation for ${document.name}`, observed: name }
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: `registered mutation for ${document.name}`,
+          observed: name
+        })
       })
     )
     : Effect.succeed(mutation)
@@ -180,10 +194,12 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
   | ReplicaLimits.ReplicaLimits
+  | Crypto.Crypto
   | Sharding.Sharding
 > =>
   Layer.unwrap(Effect.gen(function*() {
     const limits = yield* ReplicaLimits.ReplicaLimits
+    const crypto = yield* Crypto.Crypto
     return DocumentEntity.toLayer(
       Effect.gen(function*() {
         const executor = yield* CommandExecutor.CommandExecutor
@@ -219,7 +235,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             return Effect.gen(function*() {
               const document = yield* resolveDocument(definition, request.payload.documentType)
               const mutation = yield* resolveMutation(definition, document, request.payload.mutationTag)
-              const payload = yield* decode(mutation.payload, documentId, request.payload.payload)
+              const payload = yield* decode(mutation.payloadSchema, documentId, request.payload.payload)
               const outcome = yield* executor.mutate(mutation, {
                 commandId: request.payload.commandId,
                 documentId,
@@ -228,7 +244,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 requestHash: request.payload.requestHash
               })
               return yield* encode(
-                CommandOutcome.schema(mutation.success, mutation.error) as unknown as Document.WireSchema,
+                CommandOutcome.schema(mutation.successSchema, mutation.errorSchema) as unknown as Document.WireSchema,
                 outcome
               )
             })
@@ -253,21 +269,21 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               const current = yield* gate.current
               if (request.payload.replicaIncarnation !== current.incarnation) {
                 return yield* new ReplicaError.ReplicaError({
-                  reason: {
-                    _tag: "ProtocolMismatch",
+                  reason: new ReplicaError.ProtocolMismatch({
                     expected: String(current.incarnation),
                     observed: String(request.payload.replicaIncarnation)
-                  }
+                  })
                 })
               }
-              const messageHash = yield* Canonical.digest(request.payload.message)
+              const messageHash = yield* Canonical.digest(request.payload.message).pipe(
+                Effect.provideService(Crypto.Crypto, crypto)
+              )
               if (messageHash !== request.payload.messageHash) {
                 return yield* new ReplicaError.ReplicaError({
-                  reason: {
-                    _tag: "ProtocolMismatch",
+                  reason: new ReplicaError.ProtocolMismatch({
                     expected: messageHash,
                     observed: request.payload.messageHash
-                  }
+                  })
                 })
               }
               return yield* peerSync.receive(

@@ -84,7 +84,7 @@ const runProof = async () => {
   } catch (error) {
     status.textContent = "Proof failed"
     statusDot.dataset.state = "failed"
-    details.textContent = error instanceof Error ? error.stack ?? error.message : String(error)
+    details.textContent = String(error)
   } finally {
     runButton.disabled = false
     newButton.disabled = false

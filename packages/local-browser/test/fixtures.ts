@@ -15,17 +15,22 @@ export const Task = Document.make("Task", {
   version: 1
 })
 
+export class ReadError extends Schema.TaggedErrorClass<ReadError>()("ReadError", {
+  filter: Schema.String
+}) {}
+export class RenameError extends Schema.TaggedErrorClass<RenameError>()("RenameError", {}) {}
+
 export const Rename = Mutation.make("Rename", {
   document: Task,
   payload: Schema.Struct({ title: Schema.String }),
   success: Schema.String,
-  error: Schema.String
+  error: RenameError
 })
 
 export const Read = Query.make("Read", {
   payload: Schema.String,
   success: Schema.Array(Task.schema),
-  error: Schema.String,
+  error: ReadError,
   dependsOn: []
 })
 
@@ -37,9 +42,9 @@ export const definition = ReplicaDefinition.make({
   queries: [Read]
 })
 
-export const documentId = Identity.makeDocumentId()
+export const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
 
-export const replica: Replica.Service = {
+export const replica: Replica.Replica["Service"] = {
   create: (_document, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, documentId)),
   get: (_document, requestedId) =>
     Effect.succeed({

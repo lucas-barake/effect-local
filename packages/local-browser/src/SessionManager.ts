@@ -22,7 +22,7 @@ interface SessionEntry {
   readonly expired: Deferred.Deferred<never, ReplicaError.ReplicaError>
 }
 
-export interface Service {
+export class SessionManager extends Context.Service<SessionManager, {
   readonly open: (sessionId: Identity.SessionId, clientId: number) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly renew: (sessionId: Identity.SessionId, clientId: number) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly close: (sessionId: Identity.SessionId, clientId: number) => Effect.Effect<void, ReplicaError.ReplicaError>
@@ -38,9 +38,7 @@ export interface Service {
     clientId: number,
     stream: Stream.Stream<A, E, R>
   ) => Stream.Stream<A, E | ReplicaError.ReplicaError, R>
-}
-
-export class SessionManager extends Context.Service<SessionManager, Service>()(
+}>()(
   "@lucas-barake/effect-local-browser/SessionManager"
 ) {}
 
@@ -67,7 +65,10 @@ export const layer = Layer.effect(
           Deferred.fail(
             entry.expired,
             new ReplicaError.ReplicaError({
-              reason: { _tag: "ProtocolMismatch", expected: "active session", observed: sessionId }
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: "active session",
+                observed: sessionId
+              })
             })
           ),
         { discard: true }
@@ -92,7 +93,10 @@ export const layer = Layer.effect(
           return [[
             Result.fail(
               new ReplicaError.ReplicaError({
-                reason: { _tag: "ProtocolMismatch", expected: "active session", observed: sessionId }
+                reason: new ReplicaError.ProtocolMismatch({
+                  expected: "active session",
+                  observed: sessionId
+                })
               })
             ),
             undefined
@@ -104,7 +108,10 @@ export const layer = Layer.effect(
         return [[
           Result.fail(
             new ReplicaError.ReplicaError({
-              reason: { _tag: "ProtocolMismatch", expected: "active session", observed: sessionId }
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: "active session",
+                observed: sessionId
+              })
             })
           ),
           entry
@@ -114,7 +121,10 @@ export const layer = Layer.effect(
         yield* Deferred.fail(
           expired.expired,
           new ReplicaError.ReplicaError({
-            reason: { _tag: "ProtocolMismatch", expected: "active session", observed: sessionId }
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: "active session",
+              observed: sessionId
+            })
           })
         )
       }
@@ -127,7 +137,10 @@ export const layer = Layer.effect(
           (entry) => entry.clientId === clientId,
           () =>
             new ReplicaError.ReplicaError({
-              reason: { _tag: "ProtocolMismatch", expected: "active session", observed: sessionId }
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: "active session",
+                observed: sessionId
+              })
             })
         )
       )
@@ -138,31 +151,31 @@ export const layer = Layer.effect(
           (entry) => entry.token === token,
           () =>
             new ReplicaError.ReplicaError({
-              reason: { _tag: "ProtocolMismatch", expected: "active session", observed: sessionId }
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: "active session",
+                observed: sessionId
+              })
             })
         )
       )
 
     const acquireQueued = Effect.gen(function*() {
-      const result = yield* Ref.modify(queued, (current): readonly [
-        Result.Result<void, ReplicaError.ReplicaError>,
-        number
-      ] =>
-        current >= limits.maxQueuedRpc
-          ? [
-            Result.fail(
-              new ReplicaError.ReplicaError({
-                reason: { _tag: "QuotaExceeded", resource: "queued RPCs", limit: limits.maxQueuedRpc }
-              })
-            ),
-            current
-          ]
-          : [Result.succeed(undefined), current + 1])
-      return yield* Effect.fromResult(result)
+      const admitted = yield* Ref.modify(
+        queued,
+        (current) => current >= limits.maxQueuedRpc ? [false, current] as const : [true, current + 1] as const
+      )
+      if (!admitted) {
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.QuotaExceeded({
+            resource: "queued RPCs",
+            limit: limits.maxQueuedRpc
+          })
+        })
+      }
     })
     const releaseQueued = Ref.update(queued, (current) => current - 1)
 
-    const run: Service["run"] = (sessionId, clientId, effect) =>
+    const run: SessionManager["Service"]["run"] = (sessionId, clientId, effect) =>
       Effect.acquireUseRelease(
         acquireQueued,
         () =>
@@ -176,8 +189,8 @@ export const layer = Layer.effect(
         () => releaseQueued
       )
 
-    const stream: Service["stream"] = (sessionId, clientId, source) =>
-      Stream.scoped(Stream.unwrap(Effect.gen(function*() {
+    const stream: SessionManager["Service"]["stream"] = (sessionId, clientId, source) =>
+      Effect.gen(function*() {
         yield* Effect.acquireRelease(acquireQueued, () => releaseQueued)
         const entry = yield* owned(sessionId, clientId)
         return yield* Effect.raceFirst(
@@ -189,7 +202,7 @@ export const layer = Layer.effect(
           }),
           Deferred.await(entry.expired)
         )
-      })))
+      }).pipe(Stream.unwrap, Stream.scoped)
 
     return {
       open: Effect.fnUntraced(function*(sessionId, clientId) {
@@ -216,7 +229,10 @@ export const layer = Layer.effect(
               return [[
                 Result.fail(
                   new ReplicaError.ReplicaError({
-                    reason: { _tag: "ProtocolMismatch", expected: "active session", observed: sessionId }
+                    reason: new ReplicaError.ProtocolMismatch({
+                      expected: "active session",
+                      observed: sessionId
+                    })
                   })
                 ),
                 expiredEntries
@@ -229,7 +245,10 @@ export const layer = Layer.effect(
             return [[
               Result.fail(
                 new ReplicaError.ReplicaError({
-                  reason: { _tag: "QuotaExceeded", resource: "sessions", limit: limits.maxSessions }
+                  reason: new ReplicaError.QuotaExceeded({
+                    resource: "sessions",
+                    limit: limits.maxSessions
+                  })
                 })
               ),
               expiredEntries
@@ -251,7 +270,10 @@ export const layer = Layer.effect(
             Deferred.fail(
               entry.expired,
               new ReplicaError.ReplicaError({
-                reason: { _tag: "ProtocolMismatch", expected: "active session", observed: expiredSessionId }
+                reason: new ReplicaError.ProtocolMismatch({
+                  expected: "active session",
+                  observed: expiredSessionId
+                })
               })
             ),
           { discard: true }
@@ -271,7 +293,10 @@ export const layer = Layer.effect(
             return [[
               Result.fail(
                 new ReplicaError.ReplicaError({
-                  reason: { _tag: "ProtocolMismatch", expected: "active session", observed: sessionId }
+                  reason: new ReplicaError.ProtocolMismatch({
+                    expected: "active session",
+                    observed: sessionId
+                  })
                 })
               ),
               entry
@@ -281,7 +306,10 @@ export const layer = Layer.effect(
             return [[
               Result.fail(
                 new ReplicaError.ReplicaError({
-                  reason: { _tag: "ProtocolMismatch", expected: "active session", observed: sessionId }
+                  reason: new ReplicaError.ProtocolMismatch({
+                    expected: "active session",
+                    observed: sessionId
+                  })
                 })
               ),
               undefined
@@ -295,7 +323,10 @@ export const layer = Layer.effect(
           yield* Deferred.fail(
             expired.expired,
             new ReplicaError.ReplicaError({
-              reason: { _tag: "ProtocolMismatch", expected: "active session", observed: sessionId }
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: "active session",
+                observed: sessionId
+              })
             })
           )
         }
@@ -312,7 +343,10 @@ export const layer = Layer.effect(
             return [
               Result.fail(
                 new ReplicaError.ReplicaError({
-                  reason: { _tag: "ProtocolMismatch", expected: "active session", observed: sessionId }
+                  reason: new ReplicaError.ProtocolMismatch({
+                    expected: "active session",
+                    observed: sessionId
+                  })
                 })
               ),
               current
@@ -327,12 +361,15 @@ export const layer = Layer.effect(
           yield* Deferred.fail(
             entry.expired,
             new ReplicaError.ReplicaError({
-              reason: { _tag: "ProtocolMismatch", expected: "active session", observed: sessionId }
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: "active session",
+                observed: sessionId
+              })
             })
           )
         }
       }),
-      contains: (sessionId) => Effect.result(active(sessionId)).pipe(Effect.map(Result.isSuccess)),
+      contains: (sessionId) => Effect.isSuccess(active(sessionId)),
       activeCount: Effect.gen(function*() {
         const now = yield* Clock.currentTimeMillis
         yield* expire(now)

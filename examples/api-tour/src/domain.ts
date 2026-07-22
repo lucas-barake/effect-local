@@ -1,3 +1,4 @@
+import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import * as SqlProjection from "@lucas-barake/effect-local-sql/SqlProjection"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
@@ -26,11 +27,20 @@ export const Task = Document.make("ApiTourTask", {
   version: 1
 })
 
+export class TitleEmpty extends Schema.TaggedErrorClass<TitleEmpty>("@effect-local/api-tour/TitleEmpty")(
+  "TitleEmpty",
+  {}
+) {}
+
+export class UnboundedTaskQuery extends Schema.TaggedErrorClass<UnboundedTaskQuery>(
+  "@effect-local/api-tour/UnboundedTaskQuery"
+)("UnboundedTaskQuery", {}) {}
+
 export const RenameTask = Mutation.make("ApiTourTask.Rename", {
   document: Task,
   payload: Schema.String,
   success: Schema.String,
-  error: Schema.Literal("TitleEmpty")
+  error: TitleEmpty
 })
 
 export const SetCompleted = Mutation.make("ApiTourTask.SetCompleted", {
@@ -67,6 +77,7 @@ export const TaskList = Projection.make("ApiTourTaskList", {
 export const ListTasks = Query.make("ApiTourListTasks", {
   payload: Schema.Struct({ state: Schema.NullOr(Schema.Literals(["open", "done"])) }),
   success: Schema.Array(TaskList.Row),
+  error: UnboundedTaskQuery,
   dependsOn: [TaskList]
 })
 
@@ -83,7 +94,6 @@ export const TaskListSql = SqlProjection.make(TaskList, {
   migrations: [{
     id: 1,
     name: "api_tour_task_list_v1",
-    checksum: "api-tour-task-list-v1",
     run: (sql, table) =>
       sql`CREATE TABLE IF NOT EXISTS ${sql(table)} (
         source_document_id TEXT PRIMARY KEY,
@@ -100,7 +110,7 @@ export const TaskListSql = SqlProjection.make(TaskList, {
 })
 
 const ListTasksSql = SqlSchema.findAll({
-  Request: ListTasks.payload,
+  Request: ListTasks.payloadSchema,
   Result: TaskList.Row,
   execute: ({ state }) =>
     SqlClient.SqlClient.use((sql) =>
@@ -116,17 +126,17 @@ const ListTasksSql = SqlSchema.findAll({
 })
 
 export const MutationLive = Layer.mergeAll(
-  Mutation.layer(RenameTask, ({ draft, payload }) => {
+  RenameTask.toLayer(({ draft, payload }) => {
     const title = payload.trim()
-    if (title.length === 0) return Result.fail("TitleEmpty" as const)
+    if (title.length === 0) return Result.fail(new TitleEmpty())
     draft.title = title
     return Result.succeed(title)
   }),
-  Mutation.layer(SetCompleted, ({ draft, payload }) => {
+  SetCompleted.toLayer(({ draft, payload }) => {
     draft.completed = payload
     return undefined
   }),
-  Mutation.layer(AddLabel, ({ draft, payload }) => {
+  AddLabel.toLayer(({ draft, payload }) => {
     draft.labels.push(payload)
     return undefined
   })
@@ -134,13 +144,18 @@ export const MutationLive = Layer.mergeAll(
 
 const DatabaseLive = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
 
-const QueryLive = Query.layer(ListTasks, (request) => ListTasksSql(request).pipe(Effect.orDie)).pipe(
+const QueryLive = ListTasks.toLayer((request) =>
+  request.state === null
+    ? Effect.fail(new UnboundedTaskQuery())
+    : ListTasksSql(request).pipe(Effect.orDie)
+).pipe(
   Layer.provide(DatabaseLive)
 )
 
 export const EngineLive = SqlReplica.layer(definition, { projections: [TaskListSql] }).pipe(
   Layer.provide(Layer.mergeAll(
     DatabaseLive,
+    NodeCrypto.layer,
     MutationLive,
     QueryLive,
     TaskListSql.layer
@@ -148,7 +163,7 @@ export const EngineLive = SqlReplica.layer(definition, { projections: [TaskListS
   Layer.provideMerge(ReplicaLimits.layer(TestReplica.defaultLimits))
 )
 
-const TestQueryLive = Query.layer(ListTasks, () => Effect.succeed([]))
+const TestQueryLive = ListTasks.toLayer(() => Effect.succeed([]))
 
 export const InMemoryTestLive = TestReplica.layer(definition, { projections: [TaskListSql] }).pipe(
   Layer.provide(Layer.mergeAll(MutationLive, TestQueryLive, TaskListSql.layer))

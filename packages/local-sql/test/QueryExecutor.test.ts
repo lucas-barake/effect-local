@@ -1,3 +1,4 @@
+import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Document from "@lucas-barake/effect-local/Document"
@@ -37,7 +38,6 @@ describe("QueryExecutor", () => {
     migrations: [{
       id: 1,
       name: "query_task_labels_v1",
-      checksum: "query-task-labels-v1",
       run: (sql, table) =>
         sql`CREATE TABLE IF NOT EXISTS ${sql(table)} (
           sourceDocumentId TEXT NOT NULL,
@@ -63,7 +63,7 @@ describe("QueryExecutor", () => {
     queries: [ListLabels]
   })
   const listLabels = SqlSchema.findAll({
-    Request: ListLabels.payload,
+    Request: ListLabels.payloadSchema,
     Result: Labels.Row,
     execute: ({ prefix }) =>
       SqlClient.SqlClient.use((sql) =>
@@ -71,14 +71,17 @@ describe("QueryExecutor", () => {
         WHERE label LIKE ${`${prefix}%`} ORDER BY label`
       )
   })
-  const Database = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+  const Database = Layer.merge(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer
+  )
   const Reactive = Reactivity.layer
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Base = Layer.merge(Database, Bootstrap)
   const Projections = ProjectionStore.layer([LabelsSql]).pipe(
     Layer.provide(Layer.merge(Base, LabelsSql.layer))
   )
-  const Handler = Query.layer(ListLabels, (request) => listLabels(request).pipe(Effect.orDie)).pipe(
+  const Handler = ListLabels.toLayer((request) => listLabels(request).pipe(Effect.orDie)).pipe(
     Layer.provide(Database)
   )
   const Executor = QueryExecutor.layer(definition).pipe(
@@ -90,7 +93,7 @@ describe("QueryExecutor", () => {
     Effect.gen(function*() {
       const executor = yield* QueryExecutor.QueryExecutor
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       yield* sql`INSERT INTO query_task_labels_v1 (sourceDocumentId, label)
         VALUES (${documentId}, 'alpha'), (${documentId}, 'beta')`
       const rows = yield* executor.execute(ListLabels, { prefix: "a" })
@@ -111,7 +114,7 @@ describe("QueryExecutor", () => {
     Effect.gen(function*() {
       const executor = yield* QueryExecutor.QueryExecutor
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       yield* sql`INSERT INTO effect_local_documents (
         document_id, document_type, schema_version, observed_versions,
         materialized_heads, accepted_heads, tombstone, projection_status, checkpoint_hash
@@ -128,7 +131,7 @@ describe("QueryExecutor", () => {
       const reactivity = yield* Reactivity.Reactivity
       const sql = yield* SqlClient.SqlClient
       const firstValue = yield* Deferred.make<void>()
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       yield* sql`INSERT INTO query_task_labels_v1 (sourceDocumentId, label)
         VALUES (${documentId}, 'alpha')`
       const values = yield* executor.reactive(ListLabels, { prefix: "" }).pipe(

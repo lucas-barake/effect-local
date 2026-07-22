@@ -1,3 +1,5 @@
+import * as Crypto from "effect/Crypto"
+import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 
 const identifier = <const Name extends string,>(name: Name, prefix: string) =>
@@ -39,11 +41,21 @@ export const ProjectionVersion = Schema.Int.check(Schema.isGreaterThan(0)).pipe(
 )
 export type ProjectionVersion = typeof ProjectionVersion.Type
 
-export const makeReplicaId = (): ReplicaId => ReplicaId.make(`rep_${globalThis.crypto.randomUUID()}`)
-export const makeSessionId = (): SessionId => SessionId.make(`ses_${globalThis.crypto.randomUUID()}`)
-export const makeDocumentId = (): DocumentId => DocumentId.make(`doc_${globalThis.crypto.randomUUID()}`)
-export const makeCommandId = (): CommandId => CommandId.make(`cmd_${globalThis.crypto.randomUUID()}`)
-export const makePeerId = (): PeerId => PeerId.make(`peer_${globalThis.crypto.randomUUID()}`)
+export const makeReplicaId = Crypto.Crypto.use((crypto) =>
+  crypto.randomUUIDv4.pipe(Effect.map((uuid) => ReplicaId.make(`rep_${uuid}`)))
+)
+export const makeSessionId = Crypto.Crypto.use((crypto) =>
+  crypto.randomUUIDv4.pipe(Effect.map((uuid) => SessionId.make(`ses_${uuid}`)))
+)
+export const makeDocumentId = Crypto.Crypto.use((crypto) =>
+  crypto.randomUUIDv4.pipe(Effect.map((uuid) => DocumentId.make(`doc_${uuid}`)))
+)
+export const makeCommandId = Crypto.Crypto.use((crypto) =>
+  crypto.randomUUIDv4.pipe(Effect.map((uuid) => CommandId.make(`cmd_${uuid}`)))
+)
+export const makePeerId = Crypto.Crypto.use((crypto) =>
+  crypto.randomUUIDv4.pipe(Effect.map((uuid) => PeerId.make(`peer_${uuid}`)))
+)
 
 export const documentIdFromCommandId = (commandId: CommandId): DocumentId =>
   DocumentId.make(`doc_${commandId.slice(4)}`)

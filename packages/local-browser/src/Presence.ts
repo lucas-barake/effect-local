@@ -1,6 +1,7 @@
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Clock from "effect/Clock"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
@@ -23,15 +24,19 @@ export interface Presence<A,> {
   readonly values: Effect.Effect<ReadonlyArray<Entry<A>>>
 }
 
-export const make = <A,>(schema: Schema.Decoder<A>, options: { readonly ttlMillis: number }) =>
+export const make = <A,>(schema: Schema.Decoder<A>, options: { readonly timeToLive: Duration.Input }) =>
   Effect.gen(function*() {
-    if (!Number.isSafeInteger(options.ttlMillis) || options.ttlMillis <= 0) {
+    const timeToLiveMillis = Duration.toMillis(options.timeToLive)
+    if (
+      !Number.isFinite(timeToLiveMillis) ||
+      timeToLiveMillis <= 0 ||
+      timeToLiveMillis > Number.MAX_SAFE_INTEGER
+    ) {
       return yield* new ReplicaError.ReplicaError({
-        reason: {
-          _tag: "ProtocolMismatch",
+        reason: new ReplicaError.ProtocolMismatch({
           expected: "schema-valid presence payload",
-          observed: "ttlMillis must be a positive safe integer"
-        }
+          observed: "timeToLive must resolve to positive finite milliseconds within the safe integer range"
+        })
       })
     }
     const entries = yield* Ref.make(new Map<Identity.PeerId, Entry<A> & { readonly token: number }>())
@@ -42,16 +47,15 @@ export const make = <A,>(schema: Schema.Decoder<A>, options: { readonly ttlMilli
         const decoded = yield* Schema.decodeUnknownEffect(schema)(value).pipe(
           Effect.mapError((cause) =>
             new ReplicaError.ReplicaError({
-              reason: {
-                _tag: "ProtocolMismatch",
+              reason: new ReplicaError.ProtocolMismatch({
                 expected: "schema-valid presence payload",
                 observed: String(cause)
-              }
+              })
             })
           )
         )
         const token = yield* Ref.updateAndGet(tokens, (current) => current + 1)
-        const expiresAtMillis = (yield* Clock.currentTimeMillis) + options.ttlMillis
+        const expiresAtMillis = (yield* Clock.currentTimeMillis) + timeToLiveMillis
         yield* Ref.update(entries, (current) => {
           const next = new Map(current)
           next.set(peerId, { peerId, value: decoded, expiresAtMillis, identity: "transport-peer", token })

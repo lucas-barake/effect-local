@@ -6,42 +6,39 @@ import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
+import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
-import * as Predicate from "effect/Predicate"
+import * as Option from "effect/Option"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as DocumentStore from "./DocumentStore.js"
 import * as InternalAutomerge from "./internal/automerge.js"
 import * as ProjectionStore from "./ProjectionStore.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
-interface ReceiptRow {
-  readonly commit_sequence: number
-  readonly document_id: string
-  readonly heads: string
-  readonly request_hash: string
-  readonly result: Uint8Array
-}
+const Heads = Schema.fromJsonString(Schema.Array(Schema.String))
 
-class DomainRejected {
-  readonly _tag = "DomainRejected"
-  readonly error: unknown
-  constructor(error: unknown) {
-    this.error = error
-  }
-}
+const ReceiptRow = Schema.Struct({
+  request_hash: Schema.String,
+  result: Schema.Uint8Array
+})
+
+type ReceiptRow = typeof ReceiptRow.Type
 
 const encodeResult = (schema: Document.WireSchema, value: unknown) =>
   Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.toCodecJson(schema)))(value).pipe(
     Effect.map((encoded) => new TextEncoder().encode(encoded)),
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
-        reason: {
-          _tag: "StorageCorrupt",
-          cause: { _tag: "SchemaCause", message: String(cause), path: [] }
-        }
+        reason: new ReplicaError.StorageCorrupt({
+          cause: new ReplicaError.SchemaCause({
+            message: String(cause),
+            path: []
+          })
+        })
       })
     )
   )
@@ -52,7 +49,12 @@ const decodeResult = (schema: Document.WireSchema, bytes: Uint8Array) =>
   )(new TextDecoder().decode(bytes)).pipe(
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
-        reason: { _tag: "StorageCorrupt", cause: { _tag: "SchemaCause", message: String(cause), path: [] } }
+        reason: new ReplicaError.StorageCorrupt({
+          cause: new ReplicaError.SchemaCause({
+            message: String(cause),
+            path: []
+          })
+        })
       })
     )
   )
@@ -95,7 +97,7 @@ export const mutationRequestHash = <M extends Mutation.Any,>(options: {
   readonly commandId: Identity.CommandId
   readonly documentId: Identity.DocumentId
   readonly mutation: M
-  readonly payload: M["payload"]["Encoded"]
+  readonly payload: M["payloadSchema"]["Encoded"]
 }) =>
   Canonical.digest({
     incarnation: options.incarnation,
@@ -139,12 +141,12 @@ export class CommandExecutor extends Context.Service<CommandExecutor, {
     options: {
       readonly commandId: Identity.CommandId
       readonly documentId: Identity.DocumentId
-      readonly payload: M["payload"]["Type"]
+      readonly payload: M["payloadSchema"]["Type"]
       readonly permit: ReplicaGate.Permit
       readonly requestHash: string
     }
   ) => Effect.Effect<
-    CommandOutcome.CommandOutcome<M["success"]["Type"], M["error"]["Type"]>,
+    CommandOutcome.CommandOutcome<M["successSchema"]["Type"], M["errorSchema"]["Type"]>,
     ReplicaError.ReplicaError
   >
   readonly delete: <D extends Document.Any,>(
@@ -165,7 +167,7 @@ export class CommandExecutor extends Context.Service<CommandExecutor, {
     commandId: Identity.CommandId,
     permit: ReplicaGate.Permit
   ) => Effect.Effect<
-    CommandOutcome.CommandOutcome<M["success"]["Type"], M["error"]["Type"]>,
+    CommandOutcome.CommandOutcome<M["successSchema"]["Type"], M["errorSchema"]["Type"]>,
     ReplicaError.ReplicaError
   >
   readonly lookupDelete: (
@@ -184,6 +186,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
   CommandExecutor,
   never,
   | DocumentStore.DocumentStore
+  | Crypto.Crypto
   | ProjectionStore.ProjectionStore
   | ReplicaGate.ReplicaGate
   | SqlClient.SqlClient
@@ -193,6 +196,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
     CommandExecutor,
     Effect.gen(function*() {
       const store = yield* DocumentStore.DocumentStore
+      const crypto = yield* Crypto.Crypto
       const projections = yield* ProjectionStore.ProjectionStore
       const gate = yield* ReplicaGate.ReplicaGate
       const sql = yield* SqlClient.SqlClient
@@ -202,19 +206,42 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
         handlers.set(mutation.name, Context.get(handlerContext, mutation.handler))
       }
 
+      const findReceipt = SqlSchema.findOneOption({
+        Request: Schema.Struct({
+          commandId: Identity.CommandId,
+          incarnation: Identity.ReplicaIncarnation
+        }),
+        Result: ReceiptRow,
+        execute: ({ commandId, incarnation }) =>
+          sql`SELECT request_hash, result FROM effect_local_command_receipts
+            WHERE replica_incarnation = ${incarnation} AND command_id = ${commandId}`
+      })
       const lookup = (commandId: Identity.CommandId, permit: ReplicaGate.Permit) =>
-        sql<ReceiptRow>`SELECT request_hash, result, document_id, heads, commit_sequence
-        FROM effect_local_command_receipts
-        WHERE replica_incarnation = ${permit.incarnation} AND command_id = ${commandId}`.pipe(
-          Effect.map((rows) => rows[0]),
-          Effect.mapError((cause) =>
-            new ReplicaError.ReplicaError({
-              reason: {
-                _tag: "StorageUnavailable",
-                cause: { _tag: "SqlCause", message: String(cause), code: null }
-              }
-            })
-          )
+        findReceipt({ commandId, incarnation: permit.incarnation }).pipe(
+          Effect.catchTags({
+            SqlError: (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause: new ReplicaError.SqlCause({
+                      message: String(cause),
+                      code: null
+                    })
+                  })
+                })
+              ),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageCorrupt({
+                    cause: new ReplicaError.SchemaCause({
+                      message: String(cause),
+                      path: []
+                    })
+                  })
+                })
+              )
+          })
         )
 
       const persistReceipt = (options: {
@@ -232,14 +259,16 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
         document_id, heads, commit_sequence
       ) VALUES (
         ${options.permit.incarnation}, ${options.commandId}, ${options.requestHash}, ${options.mutationName},
-        ${options.result}, ${options.documentId}, ${JSON.stringify(options.heads)}, ${options.commitSequence}
+        ${options.result}, ${options.documentId}, ${Schema.encodeSync(Heads)(options.heads)}, ${options.commitSequence}
       )`.pipe(
             Effect.mapError((cause) =>
               new ReplicaError.ReplicaError({
-                reason: {
-                  _tag: "StorageUnavailable",
-                  cause: { _tag: "SqlCause", message: String(cause), code: null }
-                }
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: new ReplicaError.SqlCause({
+                    message: String(cause),
+                    code: null
+                  })
+                })
               })
             ),
             Effect.asVoid
@@ -267,20 +296,20 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 document,
                 documentId: options.documentId,
                 encoded
-              })
+              }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               if (expectedHash !== options.requestHash) {
                 return yield* new ReplicaError.ReplicaError({
-                  reason: { _tag: "CommandIdConflict", commandId: options.commandId }
+                  reason: new ReplicaError.CommandIdConflict({ commandId: options.commandId })
                 })
               }
               const existing = yield* lookup(options.commandId, options.permit)
-              if (existing !== undefined) {
-                if (existing.request_hash !== expectedHash) {
+              if (Option.isSome(existing)) {
+                if (existing.value.request_hash !== expectedHash) {
                   return yield* new ReplicaError.ReplicaError({
-                    reason: { _tag: "CommandIdConflict", commandId: options.commandId }
+                    reason: new ReplicaError.CommandIdConflict({ commandId: options.commandId })
                   })
                 }
-                return yield* decodeReceipt(Identity.DocumentId, Schema.Never, existing)
+                return yield* decodeReceipt(Identity.DocumentId, Schema.Never, existing.value)
               }
               const stored = yield* store.create(document, options.documentId, options.value).pipe(
                 Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
@@ -304,10 +333,12 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
             Effect.catchTag("SqlError", (cause) =>
               Effect.fail(
                 new ReplicaError.ReplicaError({
-                  reason: {
-                    _tag: "StorageUnavailable",
-                    cause: { _tag: "SqlCause", message: String(cause), code: null }
-                  }
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause: new ReplicaError.SqlCause({
+                      message: String(cause),
+                      code: null
+                    })
+                  })
                 })
               ))
           ),
@@ -315,14 +346,16 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
           sql.withTransaction(withDocuments((track) =>
             Effect.gen(function*() {
               yield* gate.validate(options.permit)
-              const payload = yield* Schema.encodeEffect(mutation.payload)(options.payload).pipe(
+              const payload = yield* Schema.encodeEffect(mutation.payloadSchema)(options.payload).pipe(
                 Effect.mapError((cause) =>
                   new ReplicaError.ReplicaError({
-                    reason: {
-                      _tag: "DocumentDecodeError",
+                    reason: new ReplicaError.DocumentDecodeError({
                       documentId: options.documentId,
-                      cause: { _tag: "SchemaCause", message: String(cause), path: [] }
-                    }
+                      cause: new ReplicaError.SchemaCause({
+                        message: String(cause),
+                        path: []
+                      })
+                    })
                   })
                 )
               )
@@ -332,20 +365,20 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 documentId: options.documentId,
                 mutation,
                 payload
-              })
+              }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               if (expectedHash !== options.requestHash) {
                 return yield* new ReplicaError.ReplicaError({
-                  reason: { _tag: "CommandIdConflict", commandId: options.commandId }
+                  reason: new ReplicaError.CommandIdConflict({ commandId: options.commandId })
                 })
               }
               const existing = yield* lookup(options.commandId, options.permit)
-              if (existing !== undefined) {
-                if (existing.request_hash !== expectedHash) {
+              if (Option.isSome(existing)) {
+                if (existing.value.request_hash !== expectedHash) {
                   return yield* new ReplicaError.ReplicaError({
-                    reason: { _tag: "CommandIdConflict", commandId: options.commandId }
+                    reason: new ReplicaError.CommandIdConflict({ commandId: options.commandId })
                   })
                 }
-                return yield* decodeReceipt(mutation.success, mutation.error, existing)
+                return yield* decodeReceipt(mutation.successSchema, mutation.errorSchema, existing.value)
               }
               const durable = yield* store.load(mutation.document, options.documentId).pipe(
                 Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
@@ -354,25 +387,23 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
               if (handler === undefined) {
                 return yield* Effect.die(new Error(`Missing mutation handler: ${mutation.name}`))
               }
-              let success: unknown
+              let handlerResult!: Result.Result<
+                (typeof mutation)["successSchema"]["Type"],
+                (typeof mutation)["errorSchema"]["Type"]
+              >
               const staged = yield* store.stage(durable, (draft) => {
                 const result = handler({ draft, payload: options.payload, current: durable.snapshot.value })
-                if (mutation.error === Schema.Never) {
-                  success = result
-                } else if (Result.isFailure(result)) {
-                  throw new DomainRejected(result.failure)
-                } else {
-                  success = result.success
-                }
-              }).pipe(Effect.catch((cause) =>
-                Predicate.isTagged(cause, "DomainRejected") && Predicate.hasProperty(cause, "error")
-                  ? Effect.succeed(cause)
-                  : Effect.die(cause)
-              ))
-              if (Predicate.isTagged(staged, "DomainRejected") && Predicate.hasProperty(staged, "error")) {
-                const outcome = CommandOutcome.rejected(options.commandId, staged.error)
+                handlerResult = mutation.errorSchema === Schema.Never
+                  ? Result.succeed(result)
+                  : result as Result.Result<
+                    (typeof mutation)["successSchema"]["Type"],
+                    (typeof mutation)["errorSchema"]["Type"]
+                  >
+              })
+              if (Result.isFailure(handlerResult)) {
+                const outcome = CommandOutcome.rejected(options.commandId, handlerResult.failure)
                 const result = yield* encodeResult(
-                  CommandOutcome.schema(mutation.success, mutation.error) as unknown as Document.WireSchema,
+                  CommandOutcome.schema(mutation.successSchema, mutation.errorSchema) as unknown as Document.WireSchema,
                   outcome
                 )
                 yield* persistReceipt({
@@ -392,9 +423,9 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
               )
               yield* projections.replaceDocument(mutation.document, persisted.snapshot, persisted.commitSequence)
-              const outcome = CommandOutcome.durablyCommitted(options.commandId, success)
+              const outcome = CommandOutcome.durablyCommitted(options.commandId, handlerResult.success)
               const result = yield* encodeResult(
-                CommandOutcome.schema(mutation.success, mutation.error) as unknown as Document.WireSchema,
+                CommandOutcome.schema(mutation.successSchema, mutation.errorSchema) as unknown as Document.WireSchema,
                 outcome
               )
               yield* persistReceipt({
@@ -413,10 +444,12 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
             Effect.catchTag("SqlError", (cause) =>
               Effect.fail(
                 new ReplicaError.ReplicaError({
-                  reason: {
-                    _tag: "StorageUnavailable",
-                    cause: { _tag: "SqlCause", message: String(cause), code: null }
-                  }
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause: new ReplicaError.SqlCause({
+                      message: String(cause),
+                      code: null
+                    })
+                  })
                 })
               ))
           ),
@@ -429,20 +462,20 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 commandId: options.commandId,
                 document,
                 documentId: options.documentId
-              })
+              }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               if (expectedHash !== options.requestHash) {
                 return yield* new ReplicaError.ReplicaError({
-                  reason: { _tag: "CommandIdConflict", commandId: options.commandId }
+                  reason: new ReplicaError.CommandIdConflict({ commandId: options.commandId })
                 })
               }
               const existing = yield* lookup(options.commandId, options.permit)
-              if (existing !== undefined) {
-                if (existing.request_hash !== expectedHash) {
+              if (Option.isSome(existing)) {
+                if (existing.value.request_hash !== expectedHash) {
                   return yield* new ReplicaError.ReplicaError({
-                    reason: { _tag: "CommandIdConflict", commandId: options.commandId }
+                    reason: new ReplicaError.CommandIdConflict({ commandId: options.commandId })
                   })
                 }
-                return yield* decodeReceipt(Schema.Void, Schema.Never, existing)
+                return yield* decodeReceipt(Schema.Void, Schema.Never, existing.value)
               }
               const durable = yield* store.load(document, options.documentId).pipe(
                 Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
@@ -467,36 +500,35 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
               return outcome
             })
           )).pipe(
-            Effect.catch((cause) =>
-              Schema.is(ReplicaError.ReplicaError)(cause)
-                ? Effect.fail(cause)
-                : Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: {
-                      _tag: "StorageUnavailable",
-                      cause: { _tag: "SqlCause", message: String(cause), code: null }
-                    }
+            Effect.catchTag("SqlError", (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause: new ReplicaError.SqlCause({
+                      message: String(cause),
+                      code: null
+                    })
                   })
-                )
-            )
+                })
+              ))
           ),
         lookupCreate: (commandId, permit) =>
           lookup(commandId, permit).pipe(Effect.flatMap((receipt) =>
-            receipt === undefined
+            Option.isNone(receipt)
               ? Effect.succeed(CommandOutcome.unknown(commandId))
-              : decodeReceipt(Identity.DocumentId, Schema.Never, receipt)
+              : decodeReceipt(Identity.DocumentId, Schema.Never, receipt.value)
           )),
         lookupMutation: (mutation, commandId, permit) =>
           lookup(commandId, permit).pipe(Effect.flatMap((receipt) =>
-            receipt === undefined
+            Option.isNone(receipt)
               ? Effect.succeed(CommandOutcome.unknown(commandId))
-              : decodeReceipt(mutation.success, mutation.error, receipt)
+              : decodeReceipt(mutation.successSchema, mutation.errorSchema, receipt.value)
           )),
         lookupDelete: (commandId, permit) =>
           lookup(commandId, permit).pipe(Effect.flatMap((receipt) =>
-            receipt === undefined
+            Option.isNone(receipt)
               ? Effect.succeed(CommandOutcome.unknown(commandId))
-              : decodeReceipt(Schema.Void, Schema.Never, receipt)
+              : decodeReceipt(Schema.Void, Schema.Never, receipt.value)
           ))
       })
     })

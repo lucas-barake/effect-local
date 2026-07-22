@@ -1,5 +1,6 @@
 import * as Automerge from "@automerge/automerge"
-import { assert, describe, it } from "@effect/vitest"
+import { NodeCrypto } from "@effect/platform-node"
+import { assert, it } from "@effect/vitest"
 import * as DocumentStore from "@lucas-barake/effect-local-sql/DocumentStore"
 import * as PeerSync from "@lucas-barake/effect-local-sql/PeerSync"
 import * as Document from "@lucas-barake/effect-local/Document"
@@ -40,11 +41,11 @@ const definition = ReplicaDefinition.make({
 })
 
 const Handlers = Layer.mergeAll(
-  Mutation.layer(Rename, ({ draft, payload }) => {
+  Rename.toLayer(({ draft, payload }) => {
     draft.title = payload
     return undefined
   }),
-  Mutation.layer(AddLabel, ({ draft, payload }) => {
+  AddLabel.toLayer(({ draft, payload }) => {
     draft.labels.push(payload)
     return undefined
   })
@@ -56,7 +57,7 @@ const peerLeft = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001
 const peerRight = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000002")
 
 interface Side {
-  readonly replica: Replica.Service
+  readonly replica: Replica.Replica["Service"]
   readonly store: DocumentStore.DocumentStore["Service"]
   readonly sync: PeerSync.PeerSync["Service"]
   session: PeerSync.Session
@@ -81,7 +82,7 @@ const seedPair = Effect.gen(function*() {
   const leftBuilt = yield* buildSide
   const rightBuilt = yield* buildSide
   const created = yield* leftBuilt.replica.create(Task, {
-    commandId: Identity.makeCommandId(),
+    commandId: (yield* Identity.makeCommandId),
     value: { title: "base", labels: [] }
   })
   assert.strictEqual(created._tag, "DurablyCommittedLocal")
@@ -174,18 +175,19 @@ const mutate = (
   documentId: Identity.DocumentId,
   payload: string
 ) =>
-  side.replica.mutate(mutation, {
-    commandId: Identity.makeCommandId(),
-    documentId,
-    payload
-  })
+  Effect.flatMap(Identity.makeCommandId, (commandId) =>
+    side.replica.mutate(mutation, {
+      commandId,
+      documentId,
+      payload
+    }))
 
-describe("two replica convergence", () => {
+it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
   it.effect("converges a tombstone with a concurrent list edit after reordered duplicate delivery", () =>
     Effect.scoped(Effect.gen(function*() {
       const { documentId, left, right } = yield* seedPair
       yield* Effect.all([
-        left.replica.delete(Task, { commandId: Identity.makeCommandId(), documentId }),
+        left.replica.delete(Task, { commandId: (yield* Identity.makeCommandId), documentId }),
         mutate(right, AddLabel, documentId, "concurrent")
       ], { concurrency: "unbounded" })
       const rounds = yield* drain(documentId, left, right, true)

@@ -5,6 +5,7 @@ import type * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
@@ -23,18 +24,30 @@ const lookup = <A,>(
   return value === undefined
     ? Effect.fail(
       new ReplicaError.ReplicaError({
-        reason: { _tag: "ProtocolMismatch", expected: `known ${kind}`, observed: name }
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: `known ${kind}`,
+          observed: name
+        })
       })
     )
     : Effect.succeed(value)
 }
 
-export const handlers = (definition: ReplicaDefinition.Any) =>
+export const layerHandlers = (definition: ReplicaDefinition.Any) =>
   ReplicaRpc.group.toLayer(Effect.gen(function*() {
     const replica = yield* Replica.Replica
     const sessions = yield* SessionManager.SessionManager
     const commits = yield* CommitPublisher.CommitPublisher
-    const ownerEpoch = globalThis.crypto.randomUUID()
+    const crypto = yield* Crypto.Crypto
+    const ownerEpoch = yield* crypto.randomUUIDv4.pipe(
+      Effect.mapError((cause) =>
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.StorageUnavailable({
+            cause: new ReplicaError.CryptoCause({ message: String(cause) })
+          })
+        })
+      )
+    )
     const documents = new Map<string, Document.Any>(
       definition.documents.documents.map((document: Document.Any) => [document.name, document])
     )
@@ -56,7 +69,10 @@ export const handlers = (definition: ReplicaDefinition.Any) =>
           }))
           : Effect.fail(
             new ReplicaError.ReplicaError({
-              reason: { _tag: "ProtocolMismatch", expected: definition.hash, observed: definitionHash }
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: definition.hash,
+                observed: definitionHash
+              })
             })
           ),
       RenewSession: ({ sessionId }, { client }) =>
@@ -96,11 +112,13 @@ export const handlers = (definition: ReplicaDefinition.Any) =>
           client.id,
           lookup(mutations, "mutation", mutation).pipe(
             Effect.flatMap((definition) =>
-              Wire.decode(definition.payload, payload).pipe(
+              Wire.decode(definition.payloadSchema, payload).pipe(
                 Effect.flatMap((decoded) =>
                   replica.mutate(definition, { commandId, documentId, payload: decoded } as never)
                 ),
-                Effect.flatMap((outcome) => Wire.encodeOutcome(definition.success, definition.error, outcome))
+                Effect.flatMap((outcome) =>
+                  Wire.encodeOutcome(definition.successSchema, definition.errorSchema, outcome)
+                )
               )
             )
           )
@@ -123,21 +141,17 @@ export const handlers = (definition: ReplicaDefinition.Any) =>
           client.id,
           lookup(queries, "query", query).pipe(
             Effect.flatMap((definition) =>
-              Wire.decode(definition.payload, payload).pipe(
-                Effect.flatMap((decoded) =>
-                  (replica.query as unknown as (
-                    query: Query.Any,
-                    payload: unknown
-                  ) => Effect.Effect<unknown, unknown>)(definition, decoded)
-                ),
-                Effect.flatMap((result) => Wire.encode(definition.success, result)),
-                Effect.catch((error) =>
-                  Schema.is(ReplicaError.ReplicaError)(error)
-                    ? Effect.fail(error)
-                    : Wire.encode(definition.error, error).pipe(
-                      Effect.flatMap((encoded) => Effect.fail({ _tag: "ReplicaQueryError" as const, error: encoded }))
-                    )
-                )
+              Wire.decode(definition.payloadSchema, payload).pipe(
+                Effect.flatMap((decoded) => replica.query(definition, decoded as never)),
+                Effect.matchEffect({
+                  onSuccess: (result) => Wire.encode(definition.successSchema, result),
+                  onFailure: (error) =>
+                    Schema.is(ReplicaError.ReplicaError)(error)
+                      ? Effect.fail(error)
+                      : Wire.encode(definition.errorSchema, error).pipe(
+                        Effect.flatMap((encoded) => Effect.fail(new ReplicaRpc.ReplicaQueryError({ error: encoded })))
+                      )
+                })
               )
             )
           )
@@ -149,7 +163,9 @@ export const handlers = (definition: ReplicaDefinition.Any) =>
           lookup(mutations, "mutation", mutation).pipe(
             Effect.flatMap((definition) =>
               replica.lookupMutation(definition, commandId).pipe(
-                Effect.flatMap((outcome) => Wire.encodeOutcome(definition.success, definition.error, outcome))
+                Effect.flatMap((outcome) =>
+                  Wire.encodeOutcome(definition.successSchema, definition.errorSchema, outcome)
+                )
               )
             )
           )
@@ -180,7 +196,7 @@ export const handlers = (definition: ReplicaDefinition.Any) =>
           ? sessions.stream(
             sessionId,
             client.id,
-            Stream.scoped(Stream.unwrap(commits.subscribe.pipe(
+            commits.subscribe.pipe(
               Effect.map((subscription) =>
                 Stream.make({
                   _tag: "InvalidationsReady",
@@ -199,12 +215,17 @@ export const handlers = (definition: ReplicaDefinition.Any) =>
                       : { _tag: "FullRefreshRequired", ownerEpoch, keys: allInvalidationKeys }
                   )))
                 )
-              )
-            )))
+              ),
+              Stream.unwrap,
+              Stream.scoped
+            )
           )
           : Stream.fail(
             new ReplicaError.ReplicaError({
-              reason: { _tag: "ProtocolMismatch", expected: ownerEpoch, observed: requestedEpoch }
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: ownerEpoch,
+                observed: requestedEpoch
+              })
             })
           ),
       Status: ({ sessionId }, { client }) => sessions.stream(sessionId, client.id, replica.status),
@@ -259,7 +280,7 @@ export const handlers = (definition: ReplicaDefinition.Any) =>
   }))
 
 export const layer = (definition: ReplicaDefinition.Any) =>
-  RpcServer.layer(ReplicaRpc.group).pipe(Layer.provide(handlers(definition)))
+  RpcServer.layer(ReplicaRpc.group).pipe(Layer.provide(layerHandlers(definition)))
 
 export const layerWorker = (definition: ReplicaDefinition.Any) =>
   layer(definition).pipe(Layer.provide(RpcServer.layerProtocolWorkerRunner))

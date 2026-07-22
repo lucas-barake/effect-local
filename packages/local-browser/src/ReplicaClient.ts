@@ -5,6 +5,7 @@ import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
+import type * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -17,12 +18,13 @@ import type * as RpcClientError from "effect/unstable/rpc/RpcClientError"
 import * as Wire from "./internal/wire.js"
 import * as ReplicaRpc from "./ReplicaRpc.js"
 
-export interface Service extends Replica.Service {
-  readonly ownerEpoch: string
-  readonly invalidations: Stream.Stream<ReplicaRpc.Invalidation, ReplicaError.ReplicaError>
-}
-
-export class ReplicaClient extends Context.Service<ReplicaClient, Service>()(
+export class ReplicaClient extends Context.Service<
+  ReplicaClient,
+  Replica.Replica["Service"] & {
+    readonly ownerEpoch: string
+    readonly invalidations: Stream.Stream<ReplicaRpc.Invalidation, ReplicaError.ReplicaError>
+  }
+>()(
   "@lucas-barake/effect-local-browser/ReplicaClient"
 ) {}
 
@@ -43,15 +45,25 @@ const recoverCommand = <A,>(
 export const fromRpcClient = (
   definition: ReplicaDefinition.Any,
   rpc: RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>
-): Effect.Effect<Service, ReplicaError.ReplicaError, Scope.Scope> =>
+): Effect.Effect<ReplicaClient["Service"], ReplicaError.ReplicaError, Scope.Scope | Crypto.Crypto> =>
   Effect.gen(function*() {
-    const sessionId = Identity.makeSessionId()
+    const sessionId = yield* Identity.makeSessionId.pipe(
+      Effect.mapError((cause) =>
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.StorageUnavailable({
+            cause: new ReplicaError.CryptoCause({ message: String(cause) })
+          })
+        })
+      )
+    )
     const lease = yield* Effect.acquireRelease(
       rpc.OpenSession({ sessionId, definitionHash: definition.hash }).pipe(
         Effect.catchTag("RpcClientError", (error) =>
           Effect.fail(
             new ReplicaError.ReplicaError({
-              reason: { _tag: "StorageUnavailable", cause: { _tag: "RpcCause", message: error.message } }
+              reason: new ReplicaError.StorageUnavailable({
+                cause: new ReplicaError.RpcCause({ message: error.message })
+              })
             })
           ))
       ),
@@ -59,14 +71,13 @@ export const fromRpcClient = (
     )
     if (lease.protocolVersion !== ReplicaRpc.protocolVersion || lease.definitionHash !== definition.hash) {
       return yield* new ReplicaError.ReplicaError({
-        reason: {
-          _tag: "ProtocolMismatch",
+        reason: new ReplicaError.ProtocolMismatch({
           expected: `${ReplicaRpc.protocolVersion}:${definition.hash}`,
           observed: `${lease.protocolVersion}:${lease.definitionHash}`
-        }
+        })
       })
     }
-    const retrySchedule = Schedule.exponential(250).pipe(Schedule.upTo({ times: 3 }))
+    const retrySchedule = Schedule.exponential(250)
     const sessionFailure = yield* Deferred.make<never, ReplicaError.ReplicaError>()
     yield* Effect.sleep(lease.leaseMillis / 2).pipe(
       Effect.andThen(
@@ -74,7 +85,9 @@ export const fromRpcClient = (
           Effect.catchTag("RpcClientError", (error) =>
             Effect.fail(
               new ReplicaError.ReplicaError({
-                reason: { _tag: "StorageUnavailable", cause: { _tag: "RpcCause", message: error.message } }
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: new ReplicaError.RpcCause({ message: error.message })
+                })
               })
             )),
           Effect.retry({ times: 3, schedule: retrySchedule, while: isTransient })
@@ -100,18 +113,19 @@ export const fromRpcClient = (
         Stream.catchTag("RpcClientError", (error) =>
           Stream.fail(
             new ReplicaError.ReplicaError({
-              reason: { _tag: "StorageUnavailable", cause: { _tag: "RpcCause", message: error.message } }
+              reason: new ReplicaError.StorageUnavailable({
+                cause: new ReplicaError.RpcCause({ message: error.message })
+              })
             })
           )),
-        Stream.catch((error) =>
-          isTransient(error) && attempt < 3
+        Stream.catchReason("ReplicaError", "StorageUnavailable", (_reason, error) =>
+          attempt < 3
             ? Stream.unwrap(
               Effect.sleep(250 * 2 ** attempt).pipe(
                 Effect.map(() => invalidationMessages(attempt + 1))
               )
             )
-            : Stream.fail(error)
-        )
+            : Stream.fail(error))
       )
     const invalidations = invalidationMessages(0).pipe(
       Stream.mapAccum(
@@ -166,7 +180,9 @@ export const fromRpcClient = (
           Effect.catchTag("RpcClientError", (error) =>
             Effect.fail(
               new ReplicaError.ReplicaError({
-                reason: { _tag: "StorageUnavailable", cause: { _tag: "RpcCause", message: error.message } }
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: new ReplicaError.RpcCause({ message: error.message })
+                })
               })
             )),
           Effect.flatMap((snapshot) =>
@@ -176,7 +192,7 @@ export const fromRpcClient = (
           )
         ) as never,
       mutate: (mutation, options) =>
-        Wire.encode(mutation.payload, "payload" in options ? options.payload : undefined).pipe(
+        Wire.encode(mutation.payloadSchema, "payload" in options ? options.payload : undefined).pipe(
           Effect.flatMap((payload) =>
             recoverCommand(
               options.commandId,
@@ -194,7 +210,7 @@ export const fromRpcClient = (
               })
             )
           ),
-          Effect.flatMap((outcome) => Wire.decodeOutcome(mutation.success, mutation.error, outcome))
+          Effect.flatMap((outcome) => Wire.decodeOutcome(mutation.successSchema, mutation.errorSchema, outcome))
         ) as never,
       delete: (document, options) =>
         recoverCommand(
@@ -205,35 +221,41 @@ export const fromRpcClient = (
           Effect.flatMap((outcome) => Wire.decodeOutcome(Schema.Void, Schema.Never, outcome))
         ) as never,
       query: (query, ...payload) =>
-        Wire.encode(query.payload, payload[0]).pipe(
+        Wire.encode(query.payloadSchema, payload[0]).pipe(
           Effect.flatMap((encoded) => rpc.Query({ sessionId, query: query.name, payload: encoded })),
           Effect.catchTags({
             RpcClientError: (error) =>
               Effect.fail(
                 new ReplicaError.ReplicaError({
-                  reason: { _tag: "StorageUnavailable", cause: { _tag: "RpcCause", message: error.message } }
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause: new ReplicaError.RpcCause({ message: error.message })
+                  })
                 })
               ),
-            ReplicaQueryError: (error) => Wire.decode(query.error, error.error).pipe(Effect.flatMap(Effect.fail))
+            ReplicaQueryError: (error) => Wire.decode(query.errorSchema, error.error).pipe(Effect.flatMap(Effect.fail))
           }),
-          Effect.flatMap((encoded) => Wire.decode(query.success, encoded))
+          Effect.flatMap((encoded) => Wire.decode(query.successSchema, encoded))
         ) as never,
       lookupMutation: (mutation, commandId) =>
         rpc.LookupMutation({ sessionId, mutation: mutation.name, commandId }).pipe(
           Effect.catchTag("RpcClientError", (error) =>
             Effect.fail(
               new ReplicaError.ReplicaError({
-                reason: { _tag: "StorageUnavailable", cause: { _tag: "RpcCause", message: error.message } }
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: new ReplicaError.RpcCause({ message: error.message })
+                })
               })
             )),
-          Effect.flatMap((outcome) => Wire.decodeOutcome(mutation.success, mutation.error, outcome))
+          Effect.flatMap((outcome) => Wire.decodeOutcome(mutation.successSchema, mutation.errorSchema, outcome))
         ) as never,
       lookupCreate: (document, commandId) =>
         rpc.LookupCreate({ sessionId, document: document.name, commandId }).pipe(
           Effect.catchTag("RpcClientError", (error) =>
             Effect.fail(
               new ReplicaError.ReplicaError({
-                reason: { _tag: "StorageUnavailable", cause: { _tag: "RpcCause", message: error.message } }
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: new ReplicaError.RpcCause({ message: error.message })
+                })
               })
             ))
         ) as never,
@@ -242,7 +264,9 @@ export const fromRpcClient = (
           Effect.catchTag("RpcClientError", (error) =>
             Effect.fail(
               new ReplicaError.ReplicaError({
-                reason: { _tag: "StorageUnavailable", cause: { _tag: "RpcCause", message: error.message } }
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: new ReplicaError.RpcCause({ message: error.message })
+                })
               })
             )),
           Effect.flatMap((outcome) => Wire.decodeOutcome(Schema.Void, Schema.Never, outcome))
@@ -251,7 +275,9 @@ export const fromRpcClient = (
         Effect.catchTag("RpcClientError", (error) =>
           Effect.fail(
             new ReplicaError.ReplicaError({
-              reason: { _tag: "StorageUnavailable", cause: { _tag: "RpcCause", message: error.message } }
+              reason: new ReplicaError.StorageUnavailable({
+                cause: new ReplicaError.RpcCause({ message: error.message })
+              })
             })
           ))
       ),
@@ -259,7 +285,9 @@ export const fromRpcClient = (
         Stream.catchTag("RpcClientError", (error) =>
           Stream.fail(
             new ReplicaError.ReplicaError({
-              reason: { _tag: "StorageUnavailable", cause: { _tag: "RpcCause", message: error.message } }
+              reason: new ReplicaError.StorageUnavailable({
+                cause: new ReplicaError.RpcCause({ message: error.message })
+              })
             })
           ))
       ),
@@ -268,7 +296,9 @@ export const fromRpcClient = (
           Stream.catchTag("RpcClientError", (error) =>
             Stream.fail(
               new ReplicaError.ReplicaError({
-                reason: { _tag: "StorageUnavailable", cause: { _tag: "RpcCause", message: error.message } }
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: new ReplicaError.RpcCause({ message: error.message })
+                })
               })
             ))
         ),
@@ -281,7 +311,10 @@ export const fromRpcClient = (
             if (bytes > options.maxBytes) {
               return Effect.fail(
                 new ReplicaError.ReplicaError({
-                  reason: { _tag: "BackupTooLarge", limit: options.maxBytes, observed: bytes }
+                  reason: new ReplicaError.BackupTooLarge({
+                    limit: options.maxBytes,
+                    observed: bytes
+                  })
                 })
               )
             }
@@ -302,7 +335,9 @@ export const fromRpcClient = (
           Effect.catchTag("RpcClientError", (error) =>
             Effect.fail(
               new ReplicaError.ReplicaError({
-                reason: { _tag: "StorageUnavailable", cause: { _tag: "RpcCause", message: error.message } }
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: new ReplicaError.RpcCause({ message: error.message })
+                })
               })
             ))
         ),
@@ -311,7 +346,9 @@ export const fromRpcClient = (
           Effect.catchTag("RpcClientError", (error) =>
             Effect.fail(
               new ReplicaError.ReplicaError({
-                reason: { _tag: "StorageUnavailable", cause: { _tag: "RpcCause", message: error.message } }
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: new ReplicaError.RpcCause({ message: error.message })
+                })
               })
             )),
           Effect.flatMap((exported) =>
@@ -332,7 +369,9 @@ export const fromRpcClient = (
               Effect.catchTag("RpcClientError", (error) =>
                 Effect.fail(
                   new ReplicaError.ReplicaError({
-                    reason: { _tag: "StorageUnavailable", cause: { _tag: "RpcCause", message: error.message } }
+                    reason: new ReplicaError.StorageUnavailable({
+                      cause: new ReplicaError.RpcCause({ message: error.message })
+                    })
                   })
                 ))
             )

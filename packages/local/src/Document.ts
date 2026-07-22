@@ -66,11 +66,13 @@ export const decode = <Name extends string, S extends DocumentSchema,>(
   Schema.decodeUnknownEffect(self.schema)(input).pipe(
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
-        reason: {
-          _tag: "DocumentDecodeError",
+        reason: new ReplicaError.DocumentDecodeError({
           documentId,
-          cause: { _tag: "SchemaCause", message: String(cause), path: [] }
-        }
+          cause: new ReplicaError.SchemaCause({
+            message: String(cause),
+            path: []
+          })
+        })
       })
     )
   )
@@ -83,11 +85,13 @@ export const encode = <Name extends string, S extends DocumentSchema,>(
   Schema.encodeEffect(self.schema)(value).pipe(
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
-        reason: {
-          _tag: "DocumentDecodeError",
+        reason: new ReplicaError.DocumentEncodeError({
           documentId,
-          cause: { _tag: "SchemaCause", message: String(cause), path: [] }
-        }
+          cause: new ReplicaError.SchemaCause({
+            message: String(cause),
+            path: []
+          })
+        })
       })
     )
   )

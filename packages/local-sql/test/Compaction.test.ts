@@ -1,4 +1,5 @@
 import * as Automerge from "@automerge/automerge"
+import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Document from "@lucas-barake/effect-local/Document"
@@ -28,7 +29,10 @@ describe("Compaction", () => {
     projections: [],
     queries: []
   })
-  const Database = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+  const Database = Layer.merge(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer
+  )
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Base = Layer.merge(Database, Bootstrap)
   const Gate = ReplicaGate.layer.pipe(Layer.provide(Base))
@@ -42,7 +46,7 @@ describe("Compaction", () => {
       const compaction = yield* Compaction.Compaction
       const store = yield* DocumentStore.DocumentStore
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
       const prepared = yield* compaction.prepare(Task, documentId)
       const staged = yield* store.stage(created, (draft) => {
@@ -62,7 +66,7 @@ describe("Compaction", () => {
       const compaction = yield* Compaction.Compaction
       const store = yield* DocumentStore.DocumentStore
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
       const prepared = yield* compaction.prepare(Task, documentId)
       yield* sql`CREATE TRIGGER fence_checkpoint_publication
@@ -83,7 +87,7 @@ describe("Compaction", () => {
       const compaction = yield* Compaction.Compaction
       const store = yield* DocumentStore.DocumentStore
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       let durable = yield* store.create(Task, documentId, { title: "one", labels: [] })
       assert.isTrue((yield* compaction.compact(Task, documentId)).published)
       for (const title of ["two", "three"]) {
@@ -110,7 +114,7 @@ describe("Compaction", () => {
       const recovery = yield* Recovery.Recovery
       const store = yield* DocumentStore.DocumentStore
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
       const firstHeads = created.materializedHeads
       yield* compaction.compact(Task, documentId)
@@ -140,7 +144,7 @@ describe("Compaction", () => {
       const recovery = yield* Recovery.Recovery
       const store = yield* DocumentStore.DocumentStore
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
       yield* compaction.prepare(Task, documentId)
       const rows = yield* sql`SELECT checkpoint_hash FROM effect_local_checkpoints`
@@ -156,7 +160,7 @@ describe("Compaction", () => {
       const compaction = yield* Compaction.Compaction
       const store = yield* DocumentStore.DocumentStore
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
       yield* compaction.compact(Task, documentId)
       const second = yield* store.stage(created, (draft) => {

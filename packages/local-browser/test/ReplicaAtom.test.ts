@@ -1,4 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
+import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Projection from "@lucas-barake/effect-local/Projection"
@@ -17,24 +18,94 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as ReplicaAtom from "../src/ReplicaAtom.js"
 import * as ReplicaClient from "../src/ReplicaClient.js"
 import type * as ReplicaRpc from "../src/ReplicaRpc.js"
-import { Read, replica } from "./fixtures.js"
+import { Rename, replica, Task } from "./fixtures.js"
 
 describe("ReplicaAtom", () => {
-  it.effect("runs query atoms in the provided registry", () =>
+  it.effect("reads documents through documentFamily", () =>
     Effect.gen(function*() {
-      const atoms = yield* ReplicaAtom.ReplicaAtom
-      const query = atoms.query(Read, "visible")
-      const unmount = atoms.mount(query)
+      const requested = yield* Deferred.make<Identity.DocumentId>()
+      const snapshot = {
+        documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000010"),
+        value: { title: "from atom" },
+        version: 1,
+        heads: [],
+        tombstone: false,
+        projection: "Ready" as const
+      }
+      const atomRuntime = Atom.runtime(Layer.succeed(Replica.Replica, {
+        ...replica,
+        get: (_document, documentId) =>
+          Deferred.succeed(requested, documentId).pipe(
+            Effect.as(snapshot)
+          ) as never
+      }))
+      const registry = AtomRegistry.make()
+      const atom = ReplicaAtom.documentFamily(atomRuntime, Task)(snapshot.documentId)
+      const unmount = registry.mount(atom)
+      assert.strictEqual(yield* Deferred.await(requested), snapshot.documentId)
       yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 10)))
-      const result = atoms.registry.get(query)
-      assert.isTrue(AsyncResult.isSuccess(result))
-      if (AsyncResult.isSuccess(result)) assert.deepStrictEqual(result.value, [{ title: "visible" }])
+      const value = registry.get(atom)
+      assert.isTrue(AsyncResult.isSuccess(value))
+      if (AsyncResult.isSuccess(value)) assert.deepStrictEqual(value.value, snapshot)
       unmount()
-    }).pipe(
-      Effect.provide(ReplicaAtom.layer),
-      Effect.provide(Layer.succeed(Replica.Replica, replica)),
-      Effect.provide(AtomRegistry.layer)
-    ))
+      registry.dispose()
+    }))
+
+  it.effect("executes mutations through mutation atoms", () =>
+    Effect.gen(function*() {
+      const called = yield* Deferred.make<{
+        readonly commandId: Identity.CommandId
+        readonly documentId: Identity.DocumentId
+        readonly payload: { readonly title: string }
+      }>()
+      const release = yield* Deferred.make<void>()
+      const commandId = Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000010")
+      const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000010")
+      const options = { commandId, documentId, payload: { title: "renamed from atom" } }
+      const outcome = CommandOutcome.durablyCommitted(commandId, "renamed from atom")
+      const atomRuntime = Atom.runtime(Layer.succeed(Replica.Replica, {
+        ...replica,
+        mutate: (_mutation, received) =>
+          Deferred.succeed(called, received as typeof options).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.as(outcome)
+          ) as never
+      }))
+      const registry = AtomRegistry.make()
+      const atom = ReplicaAtom.mutation(atomRuntime, Rename)
+      const unmount = registry.mount(atom)
+      registry.set(atom, options)
+      assert.deepStrictEqual(yield* Deferred.await(called), options)
+      yield* Deferred.succeed(release, undefined)
+      yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 10)))
+      const value = registry.get(atom)
+      assert.isTrue(AsyncResult.isSuccess(value))
+      if (AsyncResult.isSuccess(value)) assert.deepStrictEqual(value.value, outcome)
+      unmount()
+      registry.dispose()
+    }))
+
+  it.effect("streams replica status through status atoms", () =>
+    Effect.gen(function*() {
+      const consumed = yield* Deferred.make<void>()
+      const ready = { _tag: "Ready" as const, pendingCommands: 2 }
+      const atomRuntime = Atom.runtime(Layer.succeed(Replica.Replica, {
+        ...replica,
+        status: Stream.make(ready).pipe(
+          Stream.tap(() => Deferred.succeed(consumed, undefined))
+        )
+      }))
+      const registry = AtomRegistry.make()
+      const atom = ReplicaAtom.status(atomRuntime)
+      const unmount = registry.mount(atom)
+      yield* Deferred.await(consumed)
+      yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 10)))
+      const value = registry.get(atom)
+      assert.isTrue(AsyncResult.isSuccess(value))
+      if (AsyncResult.isSuccess(value)) assert.deepStrictEqual(value.value, ready)
+      unmount()
+      registry.dispose()
+    }))
 
   it.effect("refreshes query atoms when a dependency document is invalidated", () =>
     Effect.gen(function*() {
@@ -100,7 +171,7 @@ describe("ReplicaAtom", () => {
       const second = yield* Deferred.make<void>()
       const consumed = yield* Deferred.make<void>()
       let executions = 0
-      const client: ReplicaClient.Service = {
+      const client: ReplicaClient.ReplicaClient["Service"] = {
         ...replica,
         ownerEpoch: "owner",
         invalidations: Stream.fromQueue(events).pipe(
@@ -117,7 +188,7 @@ describe("ReplicaAtom", () => {
       const Client = Layer.succeed(ReplicaClient.ReplicaClient, client)
       const atomRuntime = Atom.runtime(Layer.merge(
         Layer.succeed(Replica.Replica, client),
-        ReplicaAtom.reactivityLayer.pipe(Layer.provide(Client))
+        ReplicaAtom.layerReactivity.pipe(Layer.provide(Client))
       ))
       const registry = AtomRegistry.make()
       const atom = ReplicaAtom.queryFamily(atomRuntime, Search)()
@@ -142,7 +213,7 @@ describe("ReplicaAtom", () => {
       let subscriptions = 0
       let invalidations = 0
       reactivity.registerUnsafe(["retry-key"], () => invalidations++)
-      const client: ReplicaClient.Service = {
+      const client: ReplicaClient.ReplicaClient["Service"] = {
         ...replica,
         ownerEpoch: "owner",
         invalidations: Stream.unwrap(Effect.sync(() => {
@@ -150,10 +221,9 @@ describe("ReplicaAtom", () => {
           return subscriptions === 1
             ? Stream.fail(
               new ReplicaError.ReplicaError({
-                reason: {
-                  _tag: "StorageUnavailable",
-                  cause: { _tag: "RpcCause", message: "disconnected" }
-                }
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: new ReplicaError.RpcCause({ message: "disconnected" })
+                })
               })
             )
             : Stream.make({
@@ -166,7 +236,7 @@ describe("ReplicaAtom", () => {
       }
       yield* Effect.scoped(
         Effect.gen(function*() {
-          yield* Layer.build(ReplicaAtom.reactivityLayer)
+          yield* Layer.build(ReplicaAtom.layerReactivity)
           yield* TestClock.adjust(1_000)
           yield* Deferred.await(consumed)
           yield* Effect.yieldNow

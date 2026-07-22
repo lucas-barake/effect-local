@@ -1,5 +1,5 @@
 /// <reference lib="webworker" />
-import { BrowserWorkerRunner } from "@effect/platform-browser"
+import { BrowserCrypto, BrowserWorkerRunner } from "@effect/platform-browser"
 import { SqliteClient } from "@effect/sql-sqlite-wasm"
 import { Effect, Exit, Layer, Option, Schema, Stream } from "effect"
 import { ClusterWorkflowEngine, SingleRunner } from "effect/unstable/cluster"
@@ -320,7 +320,8 @@ self.onconnect = (connectEvent) => {
 
     const EngineLive = Layer.mergeAll(
       ApplicationSchemaLive,
-      ClusterLive
+      ClusterLive,
+      BrowserCrypto.layer
     ).pipe(Layer.provideMerge(DatabaseLive))
 
     const MainLive = RpcServer.layer(PageApi).pipe(

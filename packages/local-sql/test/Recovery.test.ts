@@ -1,3 +1,4 @@
+import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Document from "@lucas-barake/effect-local/Document"
@@ -6,6 +7,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as Compaction from "../src/Compaction.js"
@@ -24,7 +26,10 @@ describe("Recovery", () => {
     projections: [],
     queries: []
   })
-  const Database = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+  const Database = Layer.merge(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer
+  )
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Base = Layer.merge(Database, Bootstrap)
   const Gate = ReplicaGate.layer.pipe(Layer.provide(Base))
@@ -39,7 +44,7 @@ describe("Recovery", () => {
       const recovery = yield* Recovery.Recovery
       const store = yield* DocumentStore.DocumentStore
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "one" })
       yield* compaction.compact(Task, documentId)
       const staged = yield* store.stage(created, (draft) => {
@@ -68,7 +73,7 @@ describe("Recovery", () => {
       const recovery = yield* Recovery.Recovery
       const store = yield* DocumentStore.DocumentStore
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "one" })
       yield* sql`UPDATE effect_local_changes SET bytes = ${new Uint8Array([1, 2, 3])}
         WHERE document_id = ${documentId}`
@@ -84,12 +89,33 @@ describe("Recovery", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(Services)))
 
+  it.effect("reports invalid local rows as storage corruption during raw export", () =>
+    Effect.gen(function*() {
+      const recovery = yield* Recovery.Recovery
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one" })
+      yield* sql`PRAGMA ignore_check_constraints = ON`
+      yield* sql`UPDATE effect_local_documents SET projection_status = 'Invalid'
+        WHERE document_id = ${documentId}`
+      const result = yield* Effect.result(recovery.exportRaw(documentId))
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure.reason._tag, "StorageCorrupt")
+        if (result.failure.reason._tag === "StorageCorrupt") {
+          assert.strictEqual(result.failure.reason.cause._tag, "SchemaCause")
+        }
+      }
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Services)))
+
   it.effect("rolls back quarantine writes when the replica permit changes", () =>
     Effect.gen(function*() {
       const recovery = yield* Recovery.Recovery
       const store = yield* DocumentStore.DocumentStore
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "one" })
       yield* sql`UPDATE effect_local_changes SET bytes = ${new Uint8Array([1, 2, 3])}
         WHERE document_id = ${documentId}`

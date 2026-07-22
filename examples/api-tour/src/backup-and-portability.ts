@@ -15,7 +15,7 @@ const program = Effect.scoped(Effect.gen(function*() {
   const source = Context.get(sourceContext, Replica.Replica)
   const target = Context.get(targetContext, Replica.Replica)
   const created = yield* source.create(Task, {
-    commandId: Identity.makeCommandId(),
+    commandId: (yield* Identity.makeCommandId),
     value: { title: "Portable", completed: false, labels: ["backup"] }
   })
   const sourceDocumentId = yield* CommandOutcome.committedOrFail(created)
@@ -24,7 +24,7 @@ const program = Effect.scoped(Effect.gen(function*() {
   const decoded = yield* Document.decode(Task, sourceDocumentId, portable.value)
   const encoded = yield* Document.encode(Task, sourceDocumentId, decoded)
   const imported = yield* source.importDocument(Task, {
-    commandId: Identity.makeCommandId(),
+    commandId: (yield* Identity.makeCommandId),
     value: { ...portable, value: encoded }
   })
   const importedDocumentId = yield* CommandOutcome.committedOrFail(imported)
@@ -41,7 +41,7 @@ const program = Effect.scoped(Effect.gen(function*() {
   })
 
   yield* source.mutate(RenameTask, {
-    commandId: Identity.makeCommandId(),
+    commandId: (yield* Identity.makeCommandId),
     documentId: sourceDocumentId,
     payload: "Changed after backup"
   })
@@ -63,4 +63,5 @@ const program = Effect.scoped(Effect.gen(function*() {
   })
 }))
 
-await Effect.runPromise(program)
+await Effect.runPromise(program.pipe(Effect.provide(NodeCrypto.layer)))
+import { NodeCrypto } from "@effect/platform-node"

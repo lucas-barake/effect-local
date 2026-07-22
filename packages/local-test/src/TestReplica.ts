@@ -1,3 +1,4 @@
+import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import * as BackupStore from "@lucas-barake/effect-local-sql/BackupStore"
 import * as CommandExecutor from "@lucas-barake/effect-local-sql/CommandExecutor"
@@ -52,6 +53,7 @@ export const layerWithLimits = <
   SqlReplica.layer(definition, { projections: options.projections }).pipe(
     Layer.provide(Layer.mergeAll(
       SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+      NodeCrypto.layer,
       ReplicaLimits.layer(options.limits)
     ))
   )
@@ -70,7 +72,7 @@ export const layerWithSyncAndLimits = <
 ) => {
   const database = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
   const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provideMerge(database))
-  const infrastructure = Layer.merge(bootstrap, ReplicaLimits.layer(options.limits))
+  const infrastructure = Layer.mergeAll(bootstrap, ReplicaLimits.layer(options.limits), NodeCrypto.layer)
   const gate = ReplicaGate.layer.pipe(Layer.provideMerge(infrastructure))
   const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
   const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))

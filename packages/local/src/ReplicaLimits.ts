@@ -35,6 +35,6 @@ export class ReplicaLimits extends Context.Service<ReplicaLimits, Values>()(
   "@lucas-barake/effect-local/ReplicaLimits"
 ) {}
 
-export const make = (values: Values) => Schema.decodeUnknownEffect(Values)(values)
+export const make = (values: Values) => Values.makeEffect(values)
 
 export const layer = (values: Values) => Layer.effect(ReplicaLimits, make(values))

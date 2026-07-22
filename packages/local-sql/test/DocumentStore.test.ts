@@ -1,3 +1,4 @@
+import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Document from "@lucas-barake/effect-local/Document"
@@ -25,7 +26,10 @@ describe("DocumentStore", () => {
     projections: [],
     queries: []
   })
-  const Database = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+  const Database = Layer.merge(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer
+  )
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Base = Layer.merge(Database, Bootstrap)
   const Gate = ReplicaGate.layer.pipe(Layer.provide(Base))
@@ -35,7 +39,7 @@ describe("DocumentStore", () => {
   it.effect("persists explicit changes and reconstructs canonical state", () =>
     Effect.gen(function*() {
       const store = yield* DocumentStore.DocumentStore
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
       const staged = yield* store.stage(created, (draft) => {
         draft.title = "two"
@@ -56,7 +60,7 @@ describe("DocumentStore", () => {
     Effect.gen(function*() {
       const store = yield* DocumentStore.DocumentStore
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       yield* Effect.exit(sql.withTransaction(
         store.create(Task, documentId, { title: "rollback", labels: [] }).pipe(
           Effect.andThen(Effect.fail("rollback"))

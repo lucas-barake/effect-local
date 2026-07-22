@@ -11,7 +11,7 @@ import type * as ReplicaError from "./ReplicaError.js"
 import type * as ReplicaStatus from "./ReplicaStatus.js"
 import type * as Snapshot from "./Snapshot.js"
 
-export interface Service {
+export class Replica extends Context.Service<Replica, {
   readonly create: <D extends Document.Any,>(
     document: D,
     options: {
@@ -28,9 +28,9 @@ export interface Service {
     options: {
       readonly commandId: Identity.CommandId
       readonly documentId: Identity.DocumentId
-    } & ([M["payload"]["Type"]] extends [void] ? object : { readonly payload: M["payload"]["Type"] })
+    } & ([M["payloadSchema"]["Type"]] extends [void] ? object : { readonly payload: M["payloadSchema"]["Type"] })
   ) => Effect.Effect<
-    CommandOutcome.CommandOutcome<M["success"]["Type"], M["error"]["Type"]>,
+    CommandOutcome.CommandOutcome<M["successSchema"]["Type"], M["errorSchema"]["Type"]>,
     ReplicaError.ReplicaError
   >
   readonly delete: <D extends Document.Any,>(
@@ -42,13 +42,14 @@ export interface Service {
   ) => Effect.Effect<CommandOutcome.CommandOutcome<void>, ReplicaError.ReplicaError>
   readonly query: <Q extends Query.Any,>(
     query: Q,
-    ...payload: [Q["payload"]["Type"]] extends [void] ? readonly [] : readonly [payload: Q["payload"]["Type"]]
-  ) => Effect.Effect<Q["success"]["Type"], Q["error"]["Type"] | ReplicaError.ReplicaError>
+    ...payload: [Q["payloadSchema"]["Type"]] extends [void] ? readonly []
+      : readonly [payload: Q["payloadSchema"]["Type"]]
+  ) => Effect.Effect<Q["successSchema"]["Type"], Q["errorSchema"]["Type"] | ReplicaError.ReplicaError>
   readonly lookupMutation: <M extends Mutation.Any,>(
     mutation: M,
     commandId: Identity.CommandId
   ) => Effect.Effect<
-    CommandOutcome.CommandOutcome<M["success"]["Type"], M["error"]["Type"]>,
+    CommandOutcome.CommandOutcome<M["successSchema"]["Type"], M["errorSchema"]["Type"]>,
     ReplicaError.ReplicaError
   >
   readonly lookupCreate: <D extends Document.Any,>(
@@ -76,6 +77,4 @@ export interface Service {
       readonly value: Backup.ExportedDocument<D["schema"]["Encoded"]>
     }
   ) => Effect.Effect<CommandOutcome.CommandOutcome<Identity.DocumentId>, ReplicaError.ReplicaError>
-}
-
-export class Replica extends Context.Service<Replica, Service>()("@lucas-barake/effect-local/Replica") {}
+}>()("@lucas-barake/effect-local/Replica") {}

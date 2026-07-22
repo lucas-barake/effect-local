@@ -1,3 +1,4 @@
+import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
@@ -18,6 +19,8 @@ import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
 
 describe("CommandExecutor", () => {
+  class CheckedRejected extends Schema.TaggedErrorClass<CheckedRejected>()("CheckedRejected", {}) {}
+
   const Task = Document.make("Task", {
     schema: Schema.Struct({ title: Schema.String }),
     version: 1
@@ -31,7 +34,7 @@ describe("CommandExecutor", () => {
     document: Task,
     payload: Schema.String,
     success: Schema.String,
-    error: Schema.String
+    error: CheckedRejected
   })
   const definition = ReplicaDefinition.make({
     name: "tasks",
@@ -40,18 +43,21 @@ describe("CommandExecutor", () => {
     projections: [],
     queries: []
   })
-  const Database = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+  const Database = Layer.merge(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer
+  )
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Base = Layer.merge(Database, Bootstrap)
   const Gate = ReplicaGate.layer.pipe(Layer.provide(Base))
   const Store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Base, Gate)))
   const Projections = ProjectionStore.layer([]).pipe(Layer.provide(Base))
   const Handlers = Layer.merge(
-    Mutation.layer(Rename, ({ draft, payload }) => {
+    Rename.toLayer(({ draft, payload }) => {
       draft.title = payload
       return payload
     }),
-    Mutation.layer(Checked, () => Result.fail("rejected"))
+    Checked.toLayer(() => Result.fail(new CheckedRejected()))
   )
   const Dependencies = Layer.mergeAll(Base, Gate, Store, Projections, Handlers)
   const Executor = CommandExecutor.layer(definition).pipe(Layer.provide(Dependencies))
@@ -63,8 +69,8 @@ describe("CommandExecutor", () => {
       const gate = yield* ReplicaGate.ReplicaGate
       const sql = yield* SqlClient.SqlClient
       const permit = yield* gate.shared
-      const documentId = Identity.makeDocumentId()
-      const createCommandId = Identity.makeCommandId()
+      const documentId = yield* Identity.makeDocumentId
+      const createCommandId = yield* Identity.makeCommandId
       const encoded = yield* Document.encode(Task, documentId, { title: "one" })
       const createHash = yield* CommandExecutor.createRequestHash({
         incarnation: permit.incarnation,
@@ -89,7 +95,7 @@ describe("CommandExecutor", () => {
       })
       assert.deepStrictEqual(duplicate, created)
 
-      const mutationCommandId = Identity.makeCommandId()
+      const mutationCommandId = yield* Identity.makeCommandId
       const mutationHash = yield* CommandExecutor.mutationRequestHash({
         incarnation: permit.incarnation,
         commandId: mutationCommandId,
@@ -140,8 +146,8 @@ describe("CommandExecutor", () => {
       const gate = yield* ReplicaGate.ReplicaGate
       const sql = yield* SqlClient.SqlClient
       const permit = yield* gate.shared
-      const documentId = Identity.makeDocumentId()
-      const createCommandId = Identity.makeCommandId()
+      const documentId = yield* Identity.makeDocumentId
+      const createCommandId = yield* Identity.makeCommandId
       const encoded = yield* Document.encode(Task, documentId, { title: "one" })
       const createHash = yield* CommandExecutor.createRequestHash({
         incarnation: permit.incarnation,
@@ -157,7 +163,7 @@ describe("CommandExecutor", () => {
         requestHash: createHash,
         value: { title: "one" }
       })
-      const commandId = Identity.makeCommandId()
+      const commandId = yield* Identity.makeCommandId
       const requestHash = yield* CommandExecutor.mutationRequestHash({
         incarnation: permit.incarnation,
         commandId,
@@ -172,7 +178,7 @@ describe("CommandExecutor", () => {
         permit,
         requestHash
       })
-      assert.deepStrictEqual(outcome, CommandOutcome.rejected(commandId, "rejected"))
+      assert.deepStrictEqual(outcome, CommandOutcome.rejected(commandId, new CheckedRejected()))
       assert.deepStrictEqual(yield* executor.lookupMutation(Checked, commandId, permit), outcome)
       const rows = yield* sql<{ readonly commit_sequence: number }>`
         SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1
@@ -185,8 +191,8 @@ describe("CommandExecutor", () => {
       const executor = yield* CommandExecutor.CommandExecutor
       const gate = yield* ReplicaGate.ReplicaGate
       const permit = yield* gate.shared
-      const documentId = Identity.makeDocumentId()
-      const createCommandId = Identity.makeCommandId()
+      const documentId = yield* Identity.makeDocumentId
+      const createCommandId = yield* Identity.makeCommandId
       const encoded = yield* Document.encode(Task, documentId, { title: "one" })
       const createHash = yield* CommandExecutor.createRequestHash({
         incarnation: permit.incarnation,
@@ -203,7 +209,7 @@ describe("CommandExecutor", () => {
         value: { title: "one" }
       })
 
-      const commandId = Identity.makeCommandId()
+      const commandId = yield* Identity.makeCommandId
       const requestHash = yield* CommandExecutor.deleteRequestHash({
         incarnation: permit.incarnation,
         commandId,

@@ -1,4 +1,4 @@
-import { BrowserWorker } from "@effect/platform-browser"
+import { BrowserCrypto, BrowserWorker } from "@effect/platform-browser"
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
 import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
@@ -125,7 +125,10 @@ const WorkerLive = BrowserWorker.layer(() => {
 })
 
 export const runtime = Atom.runtime(
-  BrowserReplica.layer(definition).pipe(Layer.provide(WorkerLive))
+  Layer.merge(
+    BrowserReplica.layerWithReactivity(definition).pipe(Layer.provide(Layer.merge(WorkerLive, BrowserCrypto.layer))),
+    BrowserCrypto.layer
+  )
 )
 
 export const tasks = ReplicaAtom.queryFamily(runtime, ListTasks)
@@ -133,17 +136,15 @@ export const task = ReplicaAtom.documentFamily(runtime, TaskDocument)
 export const renameTaskCommand = ReplicaAtom.mutation(runtime, RenameTask)
 export const setTaskCompletedCommand = ReplicaAtom.mutation(runtime, SetTaskCompleted)
 
-const committed = <A, E,>(outcome: CommandOutcome.CommandOutcome<A, E>) =>
-  CommandOutcome.committedOrFail(outcome).pipe(
-    Effect.mapError((failure) => new Error(`Command did not commit: ${failure._tag}`))
-  )
+const committed = <A, E,>(outcome: CommandOutcome.CommandOutcome<A, E>) => CommandOutcome.committedOrFail(outcome)
 
 export const createTask = runtime.fn<{ readonly title: string }>()(
   ({ title }) =>
-    Replica.Replica.use((replica) => {
+    Effect.gen(function*() {
+      const replica = yield* Replica.Replica
       const now = Date.now()
-      return replica.create(TaskDocument, {
-        commandId: Identity.makeCommandId(),
+      return yield* replica.create(TaskDocument, {
+        commandId: yield* Identity.makeCommandId,
         value: { title, completed: false, createdAt: now, updatedAt: now }
       }).pipe(Effect.flatMap(committed))
     }),
@@ -155,13 +156,14 @@ export const renameTask = runtime.fn<{
   readonly title: string
 }>()(
   ({ documentId, title }) =>
-    Replica.Replica.use((replica) =>
-      replica.mutate(RenameTask, {
-        commandId: Identity.makeCommandId(),
+    Effect.gen(function*() {
+      const replica = yield* Replica.Replica
+      return yield* replica.mutate(RenameTask, {
+        commandId: yield* Identity.makeCommandId,
         documentId,
         payload: { title }
       }).pipe(Effect.flatMap(committed))
-    ),
+    }),
   { concurrent: true, reactivityKeys: [TaskList.name] }
 )
 
@@ -170,24 +172,26 @@ export const setTaskCompleted = runtime.fn<{
   readonly documentId: Identity.DocumentId
 }>()(
   ({ completed, documentId }) =>
-    Replica.Replica.use((replica) =>
-      replica.mutate(SetTaskCompleted, {
-        commandId: Identity.makeCommandId(),
+    Effect.gen(function*() {
+      const replica = yield* Replica.Replica
+      return yield* replica.mutate(SetTaskCompleted, {
+        commandId: yield* Identity.makeCommandId,
         documentId,
         payload: { completed }
       }).pipe(Effect.flatMap(committed))
-    ),
+    }),
   { concurrent: true, reactivityKeys: [TaskList.name] }
 )
 
 export const deleteTask = runtime.fn<{ readonly documentId: Identity.DocumentId }>()(
   ({ documentId }) =>
-    Replica.Replica.use((replica) =>
-      replica.delete(TaskDocument, {
-        commandId: Identity.makeCommandId(),
+    Effect.gen(function*() {
+      const replica = yield* Replica.Replica
+      return yield* replica.delete(TaskDocument, {
+        commandId: yield* Identity.makeCommandId,
         documentId
       }).pipe(Effect.flatMap(committed))
-    ),
+    }),
   { concurrent: true, reactivityKeys: [TaskList.name] }
 )
 

@@ -1,4 +1,5 @@
-import { assert, describe, it } from "@effect/vitest"
+import { NodeCrypto } from "@effect/platform-node"
+import { assert, it } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -19,9 +20,9 @@ import * as ReplicaClient from "../src/ReplicaClient.js"
 import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
-import { definition, documentId, Read, Rename, replica, Task } from "./fixtures.js"
+import { definition, documentId, Read, ReadError, Rename, RenameError, replica, Task } from "./fixtures.js"
 
-describe("ReplicaClient", () => {
+it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
   const limits = {
     maxBackupBytes: 1024,
     maxChunkBytes: 128,
@@ -60,7 +61,7 @@ describe("ReplicaClient", () => {
       })
     })
   )
-  const Owner = ReplicaOwner.handlers(definition).pipe(
+  const Owner = ReplicaOwner.layerHandlers(definition).pipe(
     Layer.provideMerge(Sessions),
     Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, replica)))
   )
@@ -85,12 +86,23 @@ describe("ReplicaClient", () => {
         const snapshot = yield* client.get(Task, documentId)
         assert.strictEqual(snapshot.value.title, "stored")
         const mutation = yield* client.mutate(Rename, {
-          commandId: Identity.makeCommandId(),
+          commandId: (yield* Identity.makeCommandId),
           documentId,
           payload: { title: "next" }
         })
         assert.strictEqual(mutation._tag, "DurablyCommittedLocal")
         assert.deepStrictEqual(yield* client.query(Read, "filter"), [{ title: "filter" }])
+        const exported = yield* client.exportDocument(Task, documentId)
+        assert.deepStrictEqual(exported, {
+          documentName: Task.name,
+          schemaVersion: Task.version,
+          value: { title: "stored" }
+        })
+        const importCommandId = yield* Identity.makeCommandId
+        assert.deepStrictEqual(
+          yield* client.importDocument(Task, { commandId: importCommandId, value: exported }),
+          CommandOutcome.durablyCommitted(importCommandId, documentId)
+        )
         assert.deepStrictEqual(Array.from(yield* Stream.runCollect(client.status)), [{
           _tag: "Ready",
           pendingCommands: 0
@@ -100,6 +112,23 @@ describe("ReplicaClient", () => {
     }).pipe(
       Effect.provide(Owner)
     ))
+
+  it.effect("round trips tagged query errors through the wire", () => {
+    const rejected: Replica.Replica["Service"] = {
+      ...replica,
+      query: (_query, ...payload) => Effect.fail(new ReadError({ filter: String(payload[0]) })) as never
+    }
+    const RejectedOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provideMerge(Sessions),
+      Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, rejected)))
+    )
+    return Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
+      const error = yield* client.query(Read, "blocked").pipe(Effect.flip)
+      assert.deepStrictEqual(error, new ReadError({ filter: "blocked" }))
+    })).pipe(Effect.provide(RejectedOwner))
+  })
 
   it.effect("closes an opened session when acquisition is interrupted", () =>
     Effect.gen(function*() {
@@ -145,9 +174,9 @@ describe("ReplicaClient", () => {
         }
       })
       const client = yield* ReplicaClient.fromRpcClient(definition, ambiguous)
-      const createId = Identity.makeCommandId()
-      const mutateId = Identity.makeCommandId()
-      const deleteId = Identity.makeCommandId()
+      const createId = yield* Identity.makeCommandId
+      const mutateId = yield* Identity.makeCommandId
+      const deleteId = yield* Identity.makeCommandId
 
       assert.deepStrictEqual(
         yield* client.create(Task, { commandId: createId, value: { title: "new" } }),
@@ -175,7 +204,7 @@ describe("ReplicaClient", () => {
         }
       })
       const client = yield* ReplicaClient.fromRpcClient(definition, unavailable)
-      const commandId = Identity.makeCommandId()
+      const commandId = yield* Identity.makeCommandId
       assert.deepStrictEqual(
         yield* client.mutate(Rename, { commandId, documentId, payload: { title: "next" } }),
         CommandOutcome.unknown(commandId)
@@ -201,7 +230,7 @@ describe("ReplicaClient", () => {
         })
       })
     )
-    const EventOwner = ReplicaOwner.handlers(definition).pipe(
+    const EventOwner = ReplicaOwner.layerHandlers(definition).pipe(
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(Events, Layer.succeed(Replica.Replica, replica)))
     )
@@ -240,7 +269,7 @@ describe("ReplicaClient", () => {
         })
       })
     )
-    const EventOwner = ReplicaOwner.handlers(definition).pipe(
+    const EventOwner = ReplicaOwner.layerHandlers(definition).pipe(
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(Events, Layer.succeed(Replica.Replica, replica)))
     )
@@ -398,37 +427,40 @@ describe("ReplicaClient", () => {
 
   it.effect("preserves a definite domain rejection", () => {
     let lookups = 0
-    const rejected: Replica.Service = {
-      ...replica,
-      mutate: (_mutation, options) =>
-        Effect.succeed(CommandOutcome.rejected(options.commandId, "not allowed")) as never,
-      lookupMutation: () =>
-        Effect.sync(() => {
-          lookups++
-          return CommandOutcome.unknown(Identity.makeCommandId())
-        }) as never
-    }
-    const RejectedOwner = ReplicaOwner.handlers(definition).pipe(
-      Layer.provideMerge(Sessions),
-      Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, rejected)))
-    )
-    return Effect.scoped(Effect.gen(function*() {
-      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-      const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
-      const commandId = Identity.makeCommandId()
-      assert.deepStrictEqual(
-        yield* client.mutate(Rename, { commandId, documentId, payload: { title: "next" } }),
-        CommandOutcome.rejected(commandId, "not allowed")
+    return Effect.gen(function*() {
+      const unknownCommandId = yield* Identity.makeCommandId
+      const rejected: Replica.Replica["Service"] = {
+        ...replica,
+        mutate: (_mutation, options) =>
+          Effect.succeed(CommandOutcome.rejected(options.commandId, new RenameError())) as never,
+        lookupMutation: () =>
+          Effect.sync(() => {
+            lookups++
+            return CommandOutcome.unknown(unknownCommandId)
+          }) as never
+      }
+      const RejectedOwner = ReplicaOwner.layerHandlers(definition).pipe(
+        Layer.provideMerge(Sessions),
+        Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, rejected)))
       )
-      assert.strictEqual(lookups, 0)
-    })).pipe(Effect.provide(RejectedOwner))
+      yield* Effect.scoped(Effect.gen(function*() {
+        const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+        const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
+        const commandId = yield* Identity.makeCommandId
+        assert.deepStrictEqual(
+          yield* client.mutate(Rename, { commandId, documentId, payload: { title: "next" } }),
+          CommandOutcome.rejected(commandId, new RenameError())
+        )
+        assert.strictEqual(lookups, 0)
+      })).pipe(Effect.provide(RejectedOwner))
+    })
   })
 
   it.effect("rejects operations without an active session", () =>
     Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       const error = yield* Effect.flip(rpc.Get({
-        sessionId: Identity.makeSessionId(),
+        sessionId: (yield* Identity.makeSessionId),
         document: Task.name,
         documentId
       }))
@@ -442,7 +474,7 @@ describe("ReplicaClient", () => {
       const close = yield* ReplicaRpc.group.accessHandler("CloseSession")
       const get = yield* ReplicaRpc.group.accessHandler("Get")
       const status = yield* ReplicaRpc.group.accessHandler("Status")
-      const sessionId = Identity.makeSessionId()
+      const sessionId = yield* Identity.makeSessionId
       const owner = new Rpc.ServerClient(1)
       const other = new Rpc.ServerClient(2)
       const options = (client: Rpc.ServerClient, requestId: string) => ({
@@ -501,7 +533,7 @@ describe("ReplicaClient", () => {
 
   it.effect("transfers backup bytes through the owner", () => {
     let restored: ReadonlyArray<Uint8Array> = []
-    const BackupOwner = ReplicaOwner.handlers(definition).pipe(
+    const BackupOwner = ReplicaOwner.layerHandlers(definition).pipe(
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(
         Publisher,

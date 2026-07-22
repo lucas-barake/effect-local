@@ -1,3 +1,4 @@
+import { NodeCrypto } from "@effect/platform-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
@@ -65,13 +66,16 @@ describe("DocumentEntity", () => {
     maxInFlightPerSession: 16,
     maxQueuedRpc: 32
   } satisfies ReplicaLimits.Values
-  const TestShardingConfig = ShardingConfig.layer({
-    shardsPerGroup: 16,
-    entityMailboxCapacity: limits.maxQueuedRpc,
-    entityTerminationTimeout: 0,
-    entityMessagePollInterval: 5_000,
-    sendRetryInterval: 100
-  })
+  const TestShardingConfig = Layer.merge(
+    ShardingConfig.layer({
+      shardsPerGroup: 16,
+      entityMailboxCapacity: limits.maxQueuedRpc,
+      entityTerminationTimeout: 0,
+      entityMessagePollInterval: 5_000,
+      sendRetryInterval: 100
+    }),
+    NodeCrypto.layer
+  )
   const syncResult = {
     reply: null,
     heads: [],
@@ -100,13 +104,13 @@ describe("DocumentEntity", () => {
     ReplicaGate.ReplicaGate.of({
       current: Effect.succeed(permit),
       shared: Effect.die("unused"),
-      exclusive: Effect.die("unused"),
+      claim: (use) => use(permit),
       refresh: Effect.succeed(permit),
       validate: () => Effect.void
     })
 
   it("uses the complete command identity as the persisted primary key", () => {
-    const commandId = Identity.makeCommandId()
+    const commandId = Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000001")
     const base = {
       replicaIncarnation: Identity.ReplicaIncarnation.make(1),
       writerGeneration: Identity.WriterGeneration.make(2),
@@ -130,7 +134,10 @@ describe("DocumentEntity", () => {
     )
     assert.notStrictEqual(
       key,
-      keyOf(DocumentEntity.Create.payloadSchema.make({ ...base, commandId: Identity.makeCommandId() }))
+      keyOf(DocumentEntity.Create.payloadSchema.make({
+        ...base,
+        commandId: Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000002")
+      }))
     )
     assert.notStrictEqual(
       key,
@@ -146,7 +153,7 @@ describe("DocumentEntity", () => {
   })
 
   it("uses peer connection sequence and message hash as the sync primary key", () => {
-    const peerId = Identity.makePeerId()
+    const peerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001")
     const base = {
       replicaIncarnation: Identity.ReplicaIncarnation.make(1),
       peerId,
@@ -193,10 +200,10 @@ describe("DocumentEntity", () => {
   it.effect("decodes commands and encodes their outcomes", () =>
     Effect.scoped(
       Effect.gen(function*() {
-        const commandId = Identity.makeCommandId()
-        const documentId = Identity.makeDocumentId()
+        const commandId = yield* Identity.makeCommandId
+        const documentId = yield* Identity.makeDocumentId
         const permit = {
-          replicaId: Identity.makeReplicaId(),
+          replicaId: (yield* Identity.makeReplicaId),
           incarnation: Identity.ReplicaIncarnation.make(1),
           writerGeneration: Identity.WriterGeneration.make(2)
         }
@@ -235,7 +242,7 @@ describe("DocumentEntity", () => {
         )
         assert.deepStrictEqual(outcome, CommandOutcome.durablyCommitted(commandId, documentId))
 
-        const mutationCommandId = Identity.makeCommandId()
+        const mutationCommandId = yield* Identity.makeCommandId
         const mutationBytes = yield* client.Mutate({
           replicaIncarnation: permit.incarnation,
           writerGeneration: permit.writerGeneration,
@@ -252,7 +259,7 @@ describe("DocumentEntity", () => {
           CommandOutcome.durablyCommitted(mutationCommandId, "renamed")
         )
 
-        const deleteCommandId = Identity.makeCommandId()
+        const deleteCommandId = yield* Identity.makeCommandId
         const deleteBytes = yield* client.Delete({
           replicaIncarnation: permit.incarnation,
           writerGeneration: permit.writerGeneration,
@@ -270,7 +277,7 @@ describe("DocumentEntity", () => {
         const message = new Uint8Array([1, 2, 3])
         const applied = yield* client.ApplySync({
           replicaIncarnation: permit.incarnation,
-          peerId: Identity.makePeerId(),
+          peerId: (yield* Identity.makePeerId),
           connectionEpoch: "connection",
           localConnectionEpoch: "local-connection",
           receiveSequence: 0,
@@ -281,7 +288,7 @@ describe("DocumentEntity", () => {
         assert.deepStrictEqual(applied, syncResult)
         const stale = yield* Effect.exit(client.ApplySync({
           replicaIncarnation: Identity.ReplicaIncarnation.make(permit.incarnation - 1),
-          peerId: Identity.makePeerId(),
+          peerId: (yield* Identity.makePeerId),
           connectionEpoch: "stale-connection",
           localConnectionEpoch: "local-connection",
           receiveSequence: 0,
@@ -301,7 +308,7 @@ describe("DocumentEntity", () => {
         const firstStarted = yield* Deferred.make<void>()
         const releaseFirst = yield* Deferred.make<void>()
         const permit = {
-          replicaId: Identity.makeReplicaId(),
+          replicaId: (yield* Identity.makeReplicaId),
           incarnation: Identity.ReplicaIncarnation.make(1),
           writerGeneration: Identity.WriterGeneration.make(2)
         }
@@ -334,7 +341,7 @@ describe("DocumentEntity", () => {
             Layer.provide(ReplicaLimits.layer(limits))
           )
         )
-        const client = yield* makeClient(Identity.makeDocumentId())
+        const client = yield* makeClient(yield* Identity.makeDocumentId)
         const request = (commandId: Identity.CommandId) => ({
           replicaIncarnation: permit.incarnation,
           writerGeneration: permit.writerGeneration,
@@ -343,12 +350,12 @@ describe("DocumentEntity", () => {
           payload: new TextEncoder().encode(JSON.stringify({ title: "first" })),
           requestHash: commandId
         })
-        const first = yield* Effect.forkChild(client.Create(request(Identity.makeCommandId())))
+        const first = yield* Effect.forkChild(client.Create(request(yield* Identity.makeCommandId)))
         yield* Deferred.await(firstStarted)
         const message = new Uint8Array([1, 2, 3])
         const second = yield* Effect.forkChild(client.ApplySync({
           replicaIncarnation: permit.incarnation,
-          peerId: Identity.makePeerId(),
+          peerId: (yield* Identity.makePeerId),
           connectionEpoch: "connection",
           localConnectionEpoch: "local-connection",
           receiveSequence: 0,

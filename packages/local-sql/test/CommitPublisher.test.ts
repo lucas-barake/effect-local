@@ -1,3 +1,4 @@
+import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Document from "@lucas-barake/effect-local/Document"
@@ -25,7 +26,7 @@ describe("CommitPublisher", () => {
     projections: [],
     queries: []
   })
-  const Database = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+  const Database = Layer.merge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer)
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Reactive = Reactivity.layer
   const Publisher = CommitPublisher.layer.pipe(Layer.provide(Layer.merge(Database, Reactive)))
@@ -36,7 +37,7 @@ describe("CommitPublisher", () => {
       const publisher = yield* CommitPublisher.CommitPublisher
       const reactivity = yield* Reactivity.Reactivity
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       let invalidations = 0
       const unregister = reactivity.registerUnsafe(["Items"], () => invalidations++)
       yield* sql`INSERT INTO effect_local_commit_outbox (
@@ -58,7 +59,7 @@ describe("CommitPublisher", () => {
       Effect.gen(function*() {
         const publisher = yield* CommitPublisher.CommitPublisher
         const sql = yield* SqlClient.SqlClient
-        const documentId = Identity.makeDocumentId()
+        const documentId = yield* Identity.makeDocumentId
         const subscription = yield* publisher.subscribe
         assert.strictEqual(subscription.watermark, 0)
         const commitFiber = yield* Stream.runHead(subscription.events).pipe(Effect.forkChild)
@@ -91,7 +92,7 @@ describe("CommitPublisher", () => {
       const publisher = yield* CommitPublisher.CommitPublisher
       const reactivity = yield* Reactivity.Reactivity
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       let invalidations = 0
       const unregister = reactivity.registerUnsafe(["Items"], () => invalidations++)
       yield* sql`INSERT INTO effect_local_commit_outbox (
@@ -109,7 +110,7 @@ describe("CommitPublisher", () => {
     Effect.scoped(Effect.gen(function*() {
       const publisher = yield* CommitPublisher.CommitPublisher
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const subscription = yield* publisher.subscribe
       const events = yield* subscription.events.pipe(Stream.take(2), Stream.runCollect, Effect.forkChild)
       yield* sql`INSERT INTO effect_local_commit_outbox (
@@ -146,7 +147,7 @@ describe("CommitPublisher", () => {
     Effect.scoped(Effect.gen(function*() {
       const publisher = yield* CommitPublisher.CommitPublisher
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const subscription = yield* publisher.subscribe
       const event = yield* Stream.runHead(subscription.events).pipe(Effect.forkChild)
       yield* sql`INSERT INTO effect_local_commit_outbox (
@@ -161,7 +162,7 @@ describe("CommitPublisher", () => {
     Effect.scoped(Effect.gen(function*() {
       const publisher = yield* CommitPublisher.CommitPublisher
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const subscription = yield* publisher.subscribe
       assert.strictEqual(subscription.refreshGeneration, 0)
       yield* publisher.invalidate(["Items"])

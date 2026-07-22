@@ -19,6 +19,29 @@ const options: TestPeer.Options = {
 const bytes = (value: number) => Uint8Array.of(value)
 
 describe("TestPeer", () => {
+  it.effect("fails invalid options in the typed error channel", () =>
+    Effect.gen(function*() {
+      const invalidOptions: ReadonlyArray<TestPeer.Options> = [
+        { ...options, queueCapacity: 0 },
+        { ...options, maxCopies: 0 },
+        { ...options, maxDelay: Number.POSITIVE_INFINITY }
+      ]
+      const errors = yield* Effect.forEach(
+        invalidOptions,
+        (options) => Effect.flip(TestPeer.make(options))
+      )
+      assert.deepStrictEqual(errors.map((error) => error._tag), [
+        "InvalidOptions",
+        "InvalidOptions",
+        "InvalidOptions"
+      ])
+      assert.deepStrictEqual(errors.map((error) => error.reason), [
+        "queueCapacity must be a positive integer",
+        "maxCopies must be a positive integer",
+        "maxDelay must be finite and nonnegative"
+      ])
+    }).pipe(Effect.provide(FaultInjection.none)))
+
   it.effect("uses the test clock for deterministic delays", () =>
     Effect.scoped(Effect.gen(function*() {
       const network = yield* TestPeer.make(options)
@@ -75,8 +98,8 @@ describe("TestPeer", () => {
       yield* network.connect(rightId, leftId)
       yield* left.send(bytes(1))
       const error = yield* Effect.flip(left.send(bytes(2)))
-      assert.strictEqual(error._tag, "TestPeerQueueFull")
-      if (error._tag === "TestPeerQueueFull") assert.strictEqual(error.capacity, 1)
+      assert.strictEqual(error._tag, "QueueFull")
+      if (error._tag === "QueueFull") assert.strictEqual(error.capacity, 1)
     })).pipe(Effect.provide(FaultInjection.none)))
 
   it.effect("rejects fault plans outside configured bounds", () =>
@@ -84,7 +107,7 @@ describe("TestPeer", () => {
       const network = yield* TestPeer.make(options)
       const left = yield* network.connect(leftId, rightId)
       const error = yield* Effect.flip(left.send(bytes(1)))
-      assert.strictEqual(error._tag, "TestPeerInvalidFault")
+      assert.strictEqual(error._tag, "InvalidFault")
     })).pipe(Effect.provide(FaultInjection.layerSequence([{
       drop: false,
       copies: 4,

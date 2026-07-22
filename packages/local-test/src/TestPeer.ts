@@ -12,20 +12,32 @@ import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as FaultInjection from "./FaultInjection.js"
 
-export class InvalidFault extends Schema.TaggedErrorClass<InvalidFault>()("TestPeerInvalidFault", {
+export class InvalidFault extends Schema.TaggedErrorClass<InvalidFault>(
+  "@lucas-barake/effect-local-test/InvalidFault"
+)("InvalidFault", {
   sequence: Schema.Int,
   reason: Schema.String
 }) {}
 
-export class QueueFull extends Schema.TaggedErrorClass<QueueFull>()("TestPeerQueueFull", {
+export class QueueFull extends Schema.TaggedErrorClass<QueueFull>(
+  "@lucas-barake/effect-local-test/QueueFull"
+)("QueueFull", {
   from: Identity.PeerId,
   to: Identity.PeerId,
   capacity: Schema.Int
 }) {}
 
-export class ConnectionClosed extends Schema.TaggedErrorClass<ConnectionClosed>()("TestPeerConnectionClosed", {
+export class ConnectionClosed extends Schema.TaggedErrorClass<ConnectionClosed>(
+  "@lucas-barake/effect-local-test/ConnectionClosed"
+)("ConnectionClosed", {
   from: Identity.PeerId,
   to: Identity.PeerId
+}) {}
+
+export class InvalidOptions extends Schema.TaggedErrorClass<InvalidOptions>(
+  "@lucas-barake/effect-local-test/InvalidOptions"
+)("InvalidOptions", {
+  reason: Schema.String
 }) {}
 
 export type TestPeerError = InvalidFault | QueueFull | ConnectionClosed
@@ -45,7 +57,7 @@ export interface Connection {
   readonly close: Effect.Effect<void>
 }
 
-export interface Service {
+export class TestPeer extends Context.Service<TestPeer, {
   readonly connect: (
     from: Identity.PeerId,
     to: Identity.PeerId
@@ -54,29 +66,29 @@ export interface Service {
   readonly heal: (left: Identity.PeerId, right: Identity.PeerId) => Effect.Effect<void>
   readonly flush: Effect.Effect<void, TestPeerError>
   readonly transport: (peerId: Identity.PeerId) => PeerTransport.PeerTransport["Service"]
-}
+}>()("@lucas-barake/effect-local-test/TestPeer") {}
 
 interface Scheduled {
   readonly packet: FaultInjection.Packet
   readonly decision: FaultInjection.Decision
 }
 
-export class TestPeer extends Context.Service<TestPeer, Service>()("@lucas-barake/effect-local-test/TestPeer") {}
-
 const route = (from: Identity.PeerId, to: Identity.PeerId) => `${from}\u0000${to}`
 
-export const make = (options: Options): Effect.Effect<Service, never, FaultInjection.FaultInjection> => {
-  const maxDelay = Duration.toMillis(options.maxDelay)
-  if (!Number.isSafeInteger(options.queueCapacity) || options.queueCapacity < 1) {
-    throw new TypeError("TestPeer queueCapacity must be a positive integer")
-  }
-  if (!Number.isSafeInteger(options.maxCopies) || options.maxCopies < 1) {
-    throw new TypeError("TestPeer maxCopies must be a positive integer")
-  }
-  if (!Number.isFinite(maxDelay) || maxDelay < 0) {
-    throw new TypeError("TestPeer maxDelay must be finite and nonnegative")
-  }
-  return Effect.gen(function*() {
+export const make = (
+  options: Options
+): Effect.Effect<TestPeer["Service"], InvalidOptions, FaultInjection.FaultInjection> =>
+  Effect.gen(function*() {
+    const maxDelay = Duration.toMillis(options.maxDelay)
+    if (!Number.isSafeInteger(options.queueCapacity) || options.queueCapacity < 1) {
+      return yield* new InvalidOptions({ reason: "queueCapacity must be a positive integer" })
+    }
+    if (!Number.isSafeInteger(options.maxCopies) || options.maxCopies < 1) {
+      return yield* new InvalidOptions({ reason: "maxCopies must be a positive integer" })
+    }
+    if (!Number.isFinite(maxDelay) || maxDelay < 0) {
+      return yield* new InvalidOptions({ reason: "maxDelay must be finite and nonnegative" })
+    }
     const faults = yield* FaultInjection.FaultInjection
     const routes = yield* Ref.make<ReadonlyMap<string, Queue.Queue<ReadonlyArray<Uint8Array>>>>(new Map())
     const partitions = yield* Ref.make<ReadonlySet<string>>(new Set())
@@ -206,7 +218,7 @@ export const make = (options: Options): Effect.Effect<Service, never, FaultInjec
         return next
       })
 
-    const service: Service = {
+    const service: TestPeer["Service"] = {
       connect,
       partition: (left, right) =>
         Effect.all([
@@ -232,13 +244,11 @@ export const make = (options: Options): Effect.Effect<Service, never, FaultInjec
                 connection.send(message).pipe(
                   Effect.mapError((error) =>
                     new ReplicaError.ReplicaError({
-                      reason: {
-                        _tag: "StorageUnavailable",
-                        cause: {
-                          _tag: "RpcCause",
+                      reason: new ReplicaError.StorageUnavailable({
+                        cause: new ReplicaError.RpcCause({
                           message: `${error._tag}: ${"reason" in error ? error.reason : "route unavailable"}`
-                        }
-                      }
+                        })
+                      })
                     })
                   )
                 ),
@@ -249,7 +259,6 @@ export const make = (options: Options): Effect.Effect<Service, never, FaultInjec
     }
     return service
   })
-}
 
 export const layer = (options: Options) => Layer.effect(TestPeer, make(options))
 

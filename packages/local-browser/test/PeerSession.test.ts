@@ -1,4 +1,5 @@
-import { assert, describe, it } from "@effect/vitest"
+import { NodeCrypto } from "@effect/platform-node"
+import { assert, it } from "@effect/vitest"
 import * as CommandExecutor from "@lucas-barake/effect-local-sql/CommandExecutor"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as DocumentEntity from "@lucas-barake/effect-local-sql/DocumentEntity"
@@ -26,7 +27,7 @@ import * as Entity from "effect/unstable/cluster/Entity"
 import * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
 import * as PeerSession from "../src/PeerSession.js"
 
-describe("PeerSession", () => {
+it.layer(NodeCrypto.layer)("PeerSession", (it) => {
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
   const definition = ReplicaDefinition.make({
     name: "tasks",
@@ -61,18 +62,21 @@ describe("PeerSession", () => {
     maxQueuedRpc: 32
   } satisfies ReplicaLimits.Values
   const permit = {
-    replicaId: Identity.makeReplicaId(),
+    replicaId: Identity.ReplicaId.make("rep_00000000-0000-4000-8000-000000000001"),
     incarnation: Identity.ReplicaIncarnation.make(1),
     writerGeneration: Identity.WriterGeneration.make(2),
     definitionHash: definition.hash
   }
-  const TestShardingConfig = ShardingConfig.layer({
-    shardsPerGroup: 16,
-    entityMailboxCapacity: limits.maxQueuedRpc,
-    entityTerminationTimeout: 0,
-    entityMessagePollInterval: 5_000,
-    sendRetryInterval: 100
-  })
+  const TestShardingConfig = Layer.merge(
+    ShardingConfig.layer({
+      shardsPerGroup: 16,
+      entityMailboxCapacity: limits.maxQueuedRpc,
+      entityTerminationTimeout: 0,
+      entityMessagePollInterval: 5_000,
+      sendRetryInterval: 100
+    }),
+    NodeCrypto.layer
+  )
   const executor = CommandExecutor.CommandExecutor.of({
     create: (_document, options) =>
       Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, options.documentId)),
@@ -94,14 +98,15 @@ describe("PeerSession", () => {
   const gate = ReplicaGate.ReplicaGate.of({
     current: Effect.succeed(permit),
     shared: Effect.acquireRelease(Effect.succeed(permit), () => Effect.void),
-    exclusive: Effect.acquireRelease(Effect.succeed(permit), () => Effect.void),
+    claim: (use) => use(permit),
     refresh: Effect.succeed(permit),
     validate: () => Effect.void
   })
 
+  const SyncEnvelopeJson = Schema.fromJsonString(Schema.toCodecJson(PeerSession.SyncEnvelope))
   const encode = (envelope: typeof PeerSession.SyncEnvelope.Type) =>
-    Schema.encodeUnknownEffect(Schema.toCodecJson(PeerSession.SyncEnvelope))(envelope).pipe(
-      Effect.map((value) => new TextEncoder().encode(JSON.stringify(value)))
+    Schema.encodeEffect(SyncEnvelopeJson)(envelope).pipe(
+      Effect.map((value) => new TextEncoder().encode(value))
     )
 
   it.effect("routes selected inbound documents through the entity and separates observation from durability", () =>
@@ -110,8 +115,8 @@ describe("PeerSession", () => {
         const inbound = yield* Queue.unbounded<Uint8Array>()
         const received = yield* Deferred.make<void>()
         const sent = yield* Deferred.make<Uint8Array>()
-        const documentId = Identity.makeDocumentId()
-        const peerId = Identity.makePeerId()
+        const documentId = yield* Identity.makeDocumentId
+        const peerId = yield* Identity.makePeerId
         const message = new Uint8Array([1, 2, 3])
         const published = yield* Ref.make(0)
         const gateReleased = yield* Ref.make(true)
@@ -167,7 +172,7 @@ describe("PeerSession", () => {
             Layer.provide(ReplicaLimits.layer(limits))
           )
         )
-        const session = yield* PeerSession.makeWithClient(
+        const session = yield* PeerSession.makeTestClient(
           { peerId, documents: [{ document: Task, documentId }] },
           entity
         ).pipe(
@@ -201,11 +206,7 @@ describe("PeerSession", () => {
         )
         yield* Deferred.await(received)
         const replyEnvelope = yield* Deferred.await(sent).pipe(
-          Effect.flatMap((bytes) =>
-            Effect.try(() => JSON.parse(new TextDecoder().decode(bytes))).pipe(
-              Effect.flatMap(Schema.decodeUnknownEffect(Schema.toCodecJson(PeerSession.SyncEnvelope)))
-            )
-          )
+          Effect.flatMap((bytes) => Schema.decodeUnknownEffect(SyncEnvelopeJson)(new TextDecoder().decode(bytes)))
         )
         assert.strictEqual(replyEnvelope.sequence, 7)
         assert.strictEqual(replyEnvelope.connectionEpoch, "local-epoch")
@@ -215,11 +216,119 @@ describe("PeerSession", () => {
       }).pipe(Effect.provide(TestShardingConfig))
     ))
 
+  it.effect("rejects invalid inbound envelopes before dispatch or publication and closes the connection", () =>
+    Effect.gen(function*() {
+      const documentId = yield* Identity.makeDocumentId
+      const otherDocumentId = yield* Identity.makeDocumentId
+      const message = Uint8Array.of(1, 2, 3)
+      const messageHash = yield* Canonical.digest(message)
+      const cases = [
+        { name: "malformed JSON", bytes: new TextEncoder().encode("{") },
+        {
+          name: "oversized envelope",
+          bytes: new Uint8Array(limits.maxSyncMessageBytes * 2 + 4_097)
+        },
+        {
+          name: "incorrect hash",
+          bytes: yield* encode({
+            connectionEpoch: "remote-epoch",
+            sequence: 0,
+            documentId,
+            documentType: Task.name,
+            messageHash: "incorrect-hash",
+            message
+          })
+        },
+        {
+          name: "unselected document",
+          bytes: yield* encode({
+            connectionEpoch: "remote-epoch",
+            sequence: 0,
+            documentId: otherDocumentId,
+            documentType: Task.name,
+            messageHash,
+            message
+          })
+        }
+      ]
+
+      for (const testCase of cases) {
+        yield* Effect.scoped(Effect.gen(function*() {
+          const inbound = yield* Queue.unbounded<Uint8Array>()
+          const closed = yield* Deferred.make<void>()
+          const entityCalls = yield* Ref.make(0)
+          const publications = yield* Ref.make(0)
+          const peerId = yield* Identity.makePeerId
+          const sync = PeerSync.PeerSync.of({
+            open: (id) =>
+              Effect.succeed({
+                peerId: id,
+                connectionEpoch: "local-epoch",
+                replicaIncarnation: permit.incarnation
+              }),
+            reset: () => Effect.void,
+            generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
+            receive: () => Effect.succeed(result),
+            enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+            pending: () => Effect.succeed([]),
+            markSent: () => Effect.succeed(true)
+          })
+          const transport = PeerTransport.PeerTransport.of({
+            capabilities: { storeAndForward: false },
+            connect: () =>
+              Effect.succeed({
+                peerId,
+                capabilities: { storeAndForward: false },
+                receive: Stream.fromQueue(inbound),
+                send: () => Effect.die(`unexpected send for ${testCase.name}`),
+                close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
+              })
+          })
+          yield* PeerSession.makeTestClient(
+            { peerId, documents: [{ document: Task, documentId }] },
+            () =>
+              Ref.update(entityCalls, (count) => count + 1).pipe(
+                Effect.andThen(Effect.die(`unexpected entity dispatch for ${testCase.name}`))
+              )
+          ).pipe(
+            Effect.provideService(PeerTransport.PeerTransport, transport),
+            Effect.provideService(PeerSync.PeerSync, sync),
+            Effect.provideService(ReplicaGate.ReplicaGate, gate),
+            Effect.provideService(
+              CommitPublisher.CommitPublisher,
+              CommitPublisher.CommitPublisher.of({
+                publishPending: Ref.update(publications, (count) => count + 1).pipe(Effect.as(1)),
+                invalidate: () => Effect.void,
+                subscribe: Effect.succeed({
+                  watermark: Identity.CommitSequence.make(0),
+                  refreshGeneration: 0,
+                  events: Stream.never
+                })
+              })
+            ),
+            Effect.provideService(ReplicaLimits.ReplicaLimits, limits)
+          )
+          yield* Queue.offer(inbound, testCase.bytes)
+          yield* Deferred.await(closed)
+          assert.strictEqual(yield* Ref.get(entityCalls), 0)
+          assert.strictEqual(yield* Ref.get(publications), 0)
+        }))
+      }
+    }).pipe(Effect.provide(NodeCrypto.layer)))
+
   it.effect("keeps the transport connection scope open for the peer session lifetime", () =>
     Effect.gen(function*() {
       const released = yield* Ref.make(false)
       const closed = yield* Ref.make(false)
-      const peerId = Identity.makePeerId()
+      const gateReleased = yield* Ref.make(true)
+      const peerId = yield* Identity.makePeerId
+      const scopedGate = ReplicaGate.ReplicaGate.of({
+        ...gate,
+        shared: Effect.acquireRelease(
+          Ref.set(gateReleased, false).pipe(Effect.as(permit)),
+          () => Ref.set(gateReleased, true)
+        )
+      })
       const sync = PeerSync.PeerSync.of({
         open: (id) =>
           Effect.succeed({
@@ -249,11 +358,20 @@ describe("PeerSession", () => {
           )
       })
       yield* Effect.scoped(
-        PeerSession.makeWithClient({ peerId, documents: [] }, () => Effect.die("unexpected entity request")).pipe(
-          Effect.tap(() => Ref.get(released).pipe(Effect.map((value) => assert.isFalse(value)))),
+        PeerSession.makeTestClient({ peerId, documents: [] }, () => Effect.die("unexpected entity request")).pipe(
+          Effect.tap(() =>
+            Effect.all({ gateReleased: Ref.get(gateReleased), transportReleased: Ref.get(released) }).pipe(
+              Effect.tap(({ gateReleased, transportReleased }) =>
+                Effect.sync(() => {
+                  assert.isTrue(gateReleased)
+                  assert.isFalse(transportReleased)
+                })
+              )
+            )
+          ),
           Effect.provideService(PeerTransport.PeerTransport, transport),
           Effect.provideService(PeerSync.PeerSync, sync),
-          Effect.provideService(ReplicaGate.ReplicaGate, gate),
+          Effect.provideService(ReplicaGate.ReplicaGate, scopedGate),
           Effect.provideService(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
@@ -271,12 +389,12 @@ describe("PeerSession", () => {
       )
       assert.isTrue(yield* Ref.get(released))
       assert.isTrue(yield* Ref.get(closed))
-    }))
+    }).pipe(Effect.provide(NodeCrypto.layer)))
 
   it.effect("bounds network sends while retaining the restore fence", () =>
     Effect.gen(function*() {
-      const documentId = Identity.makeDocumentId()
-      const peerId = Identity.makePeerId()
+      const documentId = yield* Identity.makeDocumentId
+      const peerId = yield* Identity.makePeerId
       const sendStarted = yield* Deferred.make<void>()
       const gateReleased = yield* Ref.make(true)
       const scopedGate = ReplicaGate.ReplicaGate.of({
@@ -322,7 +440,7 @@ describe("PeerSession", () => {
             close: Effect.void
           })
       })
-      const fiber = yield* Effect.scoped(PeerSession.makeWithClient(
+      const fiber = yield* Effect.scoped(PeerSession.makeTestClient(
         { peerId, documents: [{ document: Task, documentId }] },
         () => Effect.die("entity should not be called")
       )).pipe(
@@ -349,7 +467,7 @@ describe("PeerSession", () => {
       yield* TestClock.adjust(100)
       assert.strictEqual((yield* Fiber.await(fiber))._tag, "Failure")
       assert.isTrue(yield* Ref.get(gateReleased))
-    }))
+    }).pipe(Effect.provide(NodeCrypto.layer)))
 
   it.effect("keeps one send in flight and ignores its completion after scope reset", () =>
     Effect.gen(function*() {
@@ -360,8 +478,8 @@ describe("PeerSession", () => {
       const maximum = yield* Ref.make(0)
       const marked = yield* Ref.make(0)
       const resets = yield* Ref.make(0)
-      const documentId = Identity.makeDocumentId()
-      const peerId = Identity.makePeerId()
+      const documentId = yield* Identity.makeDocumentId
+      const peerId = yield* Identity.makePeerId
       const generateCalls = yield* Ref.make(0)
       const sync = PeerSync.PeerSync.of({
         open: (id) =>
@@ -426,7 +544,7 @@ describe("PeerSession", () => {
               Layer.provide(ReplicaLimits.layer(limits))
             )
           )
-          const session = yield* PeerSession.makeWithClient(
+          const session = yield* PeerSession.makeTestClient(
             { peerId, documents: [{ document: Task, documentId }] },
             entity
           ).pipe(
@@ -471,8 +589,8 @@ describe("PeerSession", () => {
       const receiveEnded = yield* Deferred.make<void>()
       const receives = yield* Ref.make(0)
       const resets = yield* Ref.make<ReadonlyArray<PeerSync.Session>>([])
-      const documentId = Identity.makeDocumentId()
-      const peerId = Identity.makePeerId()
+      const documentId = yield* Identity.makeDocumentId
+      const peerId = yield* Identity.makePeerId
       const message = new Uint8Array([1])
       const messageHash = yield* Canonical.digest(message)
       const sync = PeerSync.PeerSync.of({
@@ -508,7 +626,7 @@ describe("PeerSession", () => {
       })
       yield* Effect.scoped(
         Effect.gen(function*() {
-          yield* PeerSession.makeWithClient(
+          yield* PeerSession.makeTestClient(
             { peerId, documents: [{ document: Task, documentId }] },
             () =>
               Effect.succeed({
@@ -566,13 +684,13 @@ describe("PeerSession", () => {
         (yield* Ref.get(resets)).map((session) => session.connectionEpoch).toSorted(),
         ["local-epoch", "remote-epoch"]
       )
-    }))
+    }).pipe(Effect.provide(NodeCrypto.layer)))
 
   it.effect("preserves the current and unprocessed dirty documents when sending fails", () =>
     Effect.scoped(Effect.gen(function*() {
-      const firstDocumentId = Identity.makeDocumentId()
-      const secondDocumentId = Identity.makeDocumentId()
-      const peerId = Identity.makePeerId()
+      const firstDocumentId = yield* Identity.makeDocumentId
+      const secondDocumentId = yield* Identity.makeDocumentId
+      const peerId = yield* Identity.makePeerId
       const generated = yield* Ref.make<ReadonlyArray<Identity.DocumentId>>([])
       const sends = yield* Ref.make(0)
       const sync = PeerSync.PeerSync.of({
@@ -619,10 +737,9 @@ describe("PeerSession", () => {
                   attempt === 1
                     ? Effect.fail(
                       new ReplicaError.ReplicaError({
-                        reason: {
-                          _tag: "StorageUnavailable",
-                          cause: { _tag: "RpcCause", message: "offline" }
-                        }
+                        reason: new ReplicaError.StorageUnavailable({
+                          cause: new ReplicaError.RpcCause({ message: "offline" })
+                        })
                       })
                     )
                     : Effect.void
@@ -631,7 +748,7 @@ describe("PeerSession", () => {
             close: Effect.void
           })
       })
-      const session = yield* PeerSession.makeWithClient(
+      const session = yield* PeerSession.makeTestClient(
         {
           peerId,
           documents: [
@@ -666,5 +783,5 @@ describe("PeerSession", () => {
         (yield* Ref.get(generated)).slice(2),
         [firstDocumentId, firstDocumentId, secondDocumentId]
       )
-    })))
+    })).pipe(Effect.provide(NodeCrypto.layer)))
 })

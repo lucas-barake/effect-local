@@ -1,4 +1,5 @@
 import * as Automerge from "@automerge/automerge"
+import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
@@ -6,10 +7,11 @@ import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
-import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Result from "effect/Result"
@@ -62,7 +64,10 @@ describe("PeerSync", () => {
     maxInFlightPerSession: 1,
     maxQueuedRpc: 100
   }
-  const Database = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+  const Database = Layer.merge(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer
+  )
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Base = Layer.merge(Database, Bootstrap)
   const Gate = ReplicaGate.layer.pipe(Layer.provide(Base))
@@ -103,8 +108,8 @@ describe("PeerSync", () => {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
-      const peerId = Identity.makePeerId()
+      const documentId = yield* Identity.makeDocumentId
+      const peerId = yield* Identity.makePeerId
       const session = yield* sync.open(peerId)
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
       const remote = Automerge.change(Automerge.clone(created.automerge, { actor: "1".repeat(32) }), (draft) => {
@@ -160,8 +165,8 @@ describe("PeerSync", () => {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
-      const peerId = Identity.makePeerId()
+      const documentId = yield* Identity.makeDocumentId
+      const peerId = yield* Identity.makePeerId
       const firstSession = yield* sync.open(peerId)
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
       const remote = Automerge.change(Automerge.clone(created.automerge, { actor: "9".repeat(32) }), (draft) => {
@@ -200,9 +205,9 @@ describe("PeerSync", () => {
     Effect.gen(function*() {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
-      const firstDocumentId = Identity.makeDocumentId()
-      const secondDocumentId = Identity.makeDocumentId()
-      const session = yield* sync.open(Identity.makePeerId())
+      const firstDocumentId = yield* Identity.makeDocumentId
+      const secondDocumentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
       const first = yield* store.create(Task, firstDocumentId, { title: "one", labels: [] })
       const second = yield* store.create(Task, secondDocumentId, { title: "two", labels: [] })
       const remote = Automerge.change(Automerge.clone(first.automerge, { actor: "8".repeat(32) }), (draft) => {
@@ -233,8 +238,8 @@ describe("PeerSync", () => {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
-      const session = yield* sync.open(Identity.makePeerId())
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
       const remote = Automerge.change(Automerge.clone(created.automerge, { actor: "2".repeat(32) }), (draft) => {
         ;(draft.value as { title: string }).title = "two"
@@ -273,8 +278,8 @@ describe("PeerSync", () => {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
-      const session = yield* sync.open(Identity.makePeerId())
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
       const created = yield* store.create(Task, documentId, { title: "preserved", labels: [] })
       const remote = Automerge.change(
         Automerge.clone(created.automerge, { actor: "7".repeat(32) }),
@@ -297,7 +302,7 @@ describe("PeerSync", () => {
         (SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1) AS commit_sequence,
         (SELECT materialized_heads FROM effect_local_documents WHERE document_id = ${documentId}) AS materialized_heads,
         (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts`
-      yield* Effect.scoped(gate.exclusive)
+      yield* gate.claim(() => Effect.void)
 
       assert.strictEqual(
         (yield* Effect.exit(sync.receive(Task, documentId, session, {
@@ -331,8 +336,8 @@ describe("PeerSync", () => {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
-      const session = yield* sync.open(Identity.makePeerId())
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
       const remote = Automerge.change(Automerge.clone(created.automerge, { actor: "6".repeat(32) }), (draft) => {
         ;(draft.value as { title: string }).title = "two"
@@ -371,8 +376,8 @@ describe("PeerSync", () => {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
-      const session = yield* sync.open(Identity.makePeerId())
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
       const exit = yield* Effect.exit(
         sync.receive(Task, documentId, session, {
@@ -415,8 +420,8 @@ describe("PeerSync", () => {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
-      const session = yield* sync.open(Identity.makePeerId())
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
       const generated = yield* sync.generate(Task, documentId, session)
       assert.isNotNull(generated.outbound)
@@ -444,13 +449,145 @@ describe("PeerSync", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(TestLayer)))
 
+  it.effect("serializes one document across sessions without blocking independent documents", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const firstDocumentId = yield* Identity.makeDocumentId
+      const secondDocumentId = yield* Identity.makeDocumentId
+      const firstCreated = yield* store.create(Task, firstDocumentId, { title: "one", labels: [] })
+      const secondCreated = yield* store.create(Task, secondDocumentId, { title: "two", labels: [] })
+      const firstRemote = Automerge.change(
+        Automerge.clone(firstCreated.automerge, { actor: "a".repeat(32) }),
+        (draft) => {
+          ;(draft.value as { title: string }).title = "first remote"
+        }
+      )
+      const secondRemote = Automerge.change(
+        Automerge.clone(secondCreated.automerge, { actor: "b".repeat(32) }),
+        (draft) => {
+          ;(draft.value as { title: string }).title = "second remote"
+        }
+      )
+      const firstMessage = Automerge.generateSyncMessage(firstRemote, Automerge.initSyncState())[1]!
+      const secondMessage = Automerge.generateSyncMessage(secondRemote, Automerge.initSyncState())[1]!
+      const firstStarted = yield* Deferred.make<void>()
+      const releaseFirst = yield* Deferred.make<void>()
+      const secondStarted = yield* Deferred.make<void>()
+      const blockingStore = new Proxy(store, {
+        get(target, property, receiver) {
+          if (property !== "load") return Reflect.get(target, property, receiver)
+          const load: typeof store.load = (document, documentId) =>
+            documentId === firstDocumentId
+              ? Deferred.succeed(firstStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseFirst)),
+                Effect.andThen(store.load(document, documentId))
+              )
+              : Deferred.succeed(secondStarted, undefined).pipe(
+                Effect.andThen(store.load(document, documentId))
+              )
+          return load
+        }
+      })
+      yield* Effect.gen(function*() {
+        const sync = yield* PeerSync.PeerSync
+        const firstSession = yield* sync.open(yield* Identity.makePeerId)
+        const secondSession = yield* sync.open(yield* Identity.makePeerId)
+        const firstInput = {
+          remoteConnectionEpoch: "first remote",
+          receiveSequence: 0,
+          message: firstMessage
+        }
+        const first = yield* sync.receive(Task, firstDocumentId, firstSession, firstInput).pipe(Effect.forkChild)
+        yield* Deferred.await(firstStarted)
+        const same = yield* sync.receive(Task, firstDocumentId, secondSession, firstInput).pipe(Effect.forkChild)
+        const independent = yield* sync.receive(Task, secondDocumentId, secondSession, {
+          remoteConnectionEpoch: "second remote",
+          receiveSequence: 0,
+          message: secondMessage
+        }).pipe(Effect.forkChild)
+        yield* Deferred.await(secondStarted)
+        assert.isUndefined(same.pollUnsafe())
+        assert.isFalse((yield* Fiber.join(independent)).duplicate)
+        yield* Deferred.succeed(releaseFirst, undefined)
+        assert.isFalse((yield* Fiber.join(first)).duplicate)
+        const serialized = yield* Fiber.join(same)
+        assert.isFalse(serialized.duplicate)
+      }).pipe(
+        Effect.provide(PeerSync.layer.pipe(
+          Layer.provide(Layer.succeed(DocumentStore.DocumentStore, blockingStore))
+        )),
+        Effect.ensuring(Deferred.succeed(releaseFirst, undefined))
+      )
+      InternalAutomerge.free(firstCreated.automerge)
+      InternalAutomerge.free(secondCreated.automerge)
+      InternalAutomerge.free(firstRemote)
+      InternalAutomerge.free(secondRemote)
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("rejects in-flight work across reset without retiring the session", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      const remote = Automerge.change(
+        Automerge.clone(created.automerge, { actor: "c".repeat(32) }),
+        (draft) => {
+          ;(draft.value as { title: string }).title = "remote"
+        }
+      )
+      const message = Automerge.generateSyncMessage(remote, Automerge.initSyncState())[1]!
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const blockingStore = new Proxy(store, {
+        get(target, property, receiver) {
+          if (property !== "load") return Reflect.get(target, property, receiver)
+          const load: typeof store.load = (document, documentId) =>
+            Deferred.succeed(started, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.andThen(store.load(document, documentId))
+            )
+          return load
+        }
+      })
+      yield* Effect.gen(function*() {
+        const sync = yield* PeerSync.PeerSync
+        const session = yield* sync.open(yield* Identity.makePeerId)
+        const input = { remoteConnectionEpoch: "remote", receiveSequence: 0, message }
+        const inFlight = yield* Effect.exit(sync.receive(Task, documentId, session, input)).pipe(Effect.forkChild)
+        yield* Deferred.await(started)
+        yield* sync.reset(session)
+        yield* Deferred.succeed(release, undefined)
+        const interrupted = yield* Fiber.join(inFlight)
+        assert.strictEqual(interrupted._tag, "Failure")
+        if (interrupted._tag === "Failure") {
+          assert.strictEqual(
+            Option.getOrThrow(Cause.findErrorOption(interrupted.cause)).reason._tag,
+            "ProtocolMismatch"
+          )
+        }
+        assert.deepStrictEqual(
+          yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM effect_local_peer_receipts`,
+          [{ count: 0 }]
+        )
+        assert.isFalse((yield* sync.receive(Task, documentId, session, input)).duplicate)
+      }).pipe(
+        Effect.provide(PeerSync.layer.pipe(
+          Layer.provide(Layer.succeed(DocumentStore.DocumentStore, blockingStore))
+        )),
+        Effect.ensuring(Deferred.succeed(release, undefined))
+      )
+      InternalAutomerge.free(created.automerge)
+      InternalAutomerge.free(remote)
+    }).pipe(Effect.provide(Services)))
+
   it.effect("rejects operation-heavy messages without persisting the rejected transition", () =>
     Effect.gen(function*() {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
-      const session = yield* sync.open(Identity.makePeerId())
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
       let remote = Automerge.change(Automerge.clone(created.automerge, { actor: "4".repeat(32) }), (draft) => {
         const value = draft.value as unknown as { title: string; labels: Array<string> }
@@ -498,7 +635,7 @@ describe("PeerSync", () => {
       const sync = yield* PeerSync.PeerSync
       const gate = yield* ReplicaGate.ReplicaGate
       const sql = yield* SqlClient.SqlClient
-      const session = yield* sync.open(Identity.makePeerId())
+      const session = yield* sync.open(yield* Identity.makePeerId)
       yield* sql`UPDATE effect_local_metadata SET
         replica_incarnation = replica_incarnation + 1,
         writer_generation = writer_generation + 1
@@ -519,8 +656,8 @@ describe("PeerSync", () => {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
-      const session = yield* sync.open(Identity.makePeerId())
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
       const remote = Automerge.change(Automerge.clone(created.automerge, { actor: "5".repeat(32) }), (draft) => {
         ;(draft.value as { title: string }).title = "fresh"
@@ -576,8 +713,8 @@ describe("PeerSync", () => {
     Effect.gen(function*() {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
-      const documentId = Identity.makeDocumentId()
-      const peerId = Identity.makePeerId()
+      const documentId = yield* Identity.makeDocumentId
+      const peerId = yield* Identity.makePeerId
       const session = yield* sync.open(peerId)
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
       let remote = Automerge.clone(created.automerge, { actor: "3".repeat(32) })
@@ -637,8 +774,8 @@ describe("PeerSync", () => {
     Effect.gen(function*() {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
-      const documentId = Identity.makeDocumentId()
-      const session = yield* sync.open(Identity.makePeerId())
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
       let remote = Automerge.clone(created.automerge, { actor: "6".repeat(32) })
       let remoteState = Automerge.initSyncState()
@@ -701,7 +838,7 @@ describe("PeerSync", () => {
     Effect.gen(function*() {
       const filename = join(tmpdir(), `effect-local-peer-sync-${globalThis.crypto.randomUUID()}.sqlite`)
       yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(filename, { force: true })))
-      const database = SqliteClient.layer({ filename, disableWAL: true })
+      const database = Layer.merge(SqliteClient.layer({ filename, disableWAL: true }), NodeCrypto.layer)
       yield* Effect.scoped(
         Effect.gen(function*() {
           yield* ReplicaBootstrap.make(definition)
@@ -722,7 +859,7 @@ describe("PeerSync", () => {
         }).pipe(Effect.provide(sync))
       ))
       assert.isTrue(Result.isFailure(result))
-      if (Result.isFailure(result) && result.failure instanceof ReplicaError.ReplicaError) {
+      if (Result.isFailure(result) && result.failure._tag === "ReplicaError") {
         assert.strictEqual(result.failure.reason._tag, "StorageUnavailable")
       }
     }))

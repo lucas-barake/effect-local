@@ -1,11 +1,12 @@
-import { assert, describe, it } from "@effect/vitest"
+import { NodeCrypto } from "@effect/platform-node"
+import { assert, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as Document from "../src/Document.js"
 import * as Identity from "../src/Identity.js"
 import * as Projection from "../src/Projection.js"
 
-describe("Projection", () => {
+it.layer(NodeCrypto.layer)("Projection", (it) => {
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
   const Rows = Projection.make("TaskRows", {
     document: Task,
@@ -17,7 +18,7 @@ describe("Projection", () => {
 
   it.effect("projects validated rows with stable keys", () =>
     Effect.gen(function*() {
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const rows = yield* Projection.evaluate(Rows, {
         documentId,
         value: { title: "one" },
@@ -38,7 +39,7 @@ describe("Projection", () => {
         key: (row) => row.sourceDocumentId,
         project: (snapshot) => [{ sourceDocumentId: snapshot.documentId, priority: 1 }]
       })
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const rows = yield* Projection.evaluate(Transformed, {
         documentId,
         value: { title: "one" },
@@ -51,7 +52,7 @@ describe("Projection", () => {
     }))
 
   it("rejects duplicate row keys", () => {
-    const documentId = Identity.makeDocumentId()
+    const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
     assert.throws(() =>
       Projection.assertUniqueKeys(Rows, [
         { sourceDocumentId: documentId, title: "one" },

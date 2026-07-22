@@ -1,4 +1,4 @@
-import { BrowserWorkerRunner } from "@effect/platform-browser"
+import { BrowserCrypto, BrowserWorkerRunner } from "@effect/platform-browser"
 import * as BrowserSqlite from "@lucas-barake/effect-local-browser/BrowserSqlite"
 import * as ReplicaOwner from "@lucas-barake/effect-local-browser/ReplicaOwner"
 import * as SessionManager from "@lucas-barake/effect-local-browser/SessionManager"
@@ -14,9 +14,10 @@ declare const self: SharedWorkerGlobalScope
 
 const makeEngine = (databasePort: MessagePort, providerPort: MessagePort) => {
   databasePort.start()
-  const DatabaseLive = BrowserSqlite.layerPort(databasePort)
+  const DatabaseLive = BrowserSqlite.layerMessagePort(databasePort)
   const DependenciesLive = Layer.mergeAll(
     DatabaseLive,
+    BrowserCrypto.layer,
     DomainLive.pipe(Layer.provide(DatabaseLive)),
     ReplicaLimits.layer(limits),
     TaskListSql.layer
@@ -73,13 +74,16 @@ const resetEngine = () => {
   engine = undefined
   if (verification !== undefined) clearTimeout(verification.timeout)
   verification = undefined
-  void Promise.race([
-    currentEngine.runtime.dispose().catch(() => undefined),
-    new Promise<void>((resolve) => setTimeout(resolve, 1000))
-  ]).finally(() => {
-    resetting = false
-    requestProvision()
-  })
+  Effect.runFork(
+    currentEngine.runtime.disposeEffect.pipe(
+      Effect.timeout("1 second"),
+      Effect.catchTag("TimeoutError", () => Effect.void),
+      Effect.ensuring(Effect.sync(() => {
+        resetting = false
+        requestProvision()
+      }))
+    )
+  )
 }
 
 const verifyProvider = () => {

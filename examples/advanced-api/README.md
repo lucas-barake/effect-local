@@ -23,7 +23,7 @@ Run the Presence example:
 pnpm --dir examples/advanced-api presence
 ```
 
-[`src/presence.ts`](src/presence.ts) creates an in memory implementation of the public `PeerSession.Service` contract
+[`src/presence.ts`](src/presence.ts) creates an in memory implementation of the public `PeerSession.PeerSession` contract
 and provides it through an Effect Layer. It then creates a schema validated Presence registry and demonstrates:
 
 - scoped publication for the local peer
@@ -47,13 +47,13 @@ pnpm --dir examples/advanced-api operations
 
 [`src/operations.ts`](src/operations.ts) demonstrates the public operational service contracts through injected Layers:
 
-- `WorkflowRuntime.execute`, `poll`, and `resume`
+- `CompactionWorkflow.execute`, `poll`, `interrupt`, and `resume`
 - `Compaction.prepare`, `publish`, `compact`, and `prune`
 - `Recovery.exportRaw`
 - scoped `CommitPublisher.subscribe` streams
 - commit delivery and full refresh invalidations
 
-The implementations in this example are deterministic in memory adapters. This is deliberate. A live `WorkflowRuntime`,
+The implementations in this example are deterministic in memory adapters. This is deliberate. A live `CompactionWorkflow`,
 `Compaction`, and `Recovery` composition requires the SQLite schema, replica gate, Workflow engine, replica definition, and
 Cluster runners. The Tasks application demonstrates that complete browser composition. The browser durability proof covers
 restart recovery and durable workflow behavior. This example instead isolates the dependency injection surface consumers use

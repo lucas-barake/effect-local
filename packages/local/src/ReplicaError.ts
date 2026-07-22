@@ -1,79 +1,147 @@
 import * as Schema from "effect/Schema"
 import * as Identity from "./Identity.js"
 
-export const SqlCause = Schema.TaggedStruct("SqlCause", {
+export class SqlCause extends Schema.TaggedErrorClass<SqlCause>(
+  "@lucas-barake/effect-local/ReplicaError/SqlCause"
+)("SqlCause", {
   message: Schema.String,
   code: Schema.NullOr(Schema.String)
-})
+}) {}
 
-export const SchemaCause = Schema.TaggedStruct("SchemaCause", {
+export class SchemaCause extends Schema.TaggedErrorClass<SchemaCause>(
+  "@lucas-barake/effect-local/ReplicaError/SchemaCause"
+)("SchemaCause", {
   message: Schema.String,
   path: Schema.Array(Schema.String)
-})
+}) {}
 
-export const WorkerCause = Schema.TaggedStruct("WorkerCause", {
+export class WorkerCause extends Schema.TaggedErrorClass<WorkerCause>(
+  "@lucas-barake/effect-local/ReplicaError/WorkerCause"
+)("WorkerCause", {
   message: Schema.String
-})
+}) {}
 
-export const RpcCause = Schema.TaggedStruct("RpcCause", {
+export class RpcCause extends Schema.TaggedErrorClass<RpcCause>(
+  "@lucas-barake/effect-local/ReplicaError/RpcCause"
+)("RpcCause", {
   message: Schema.String
-})
+}) {}
 
-export const AutomergeCause = Schema.TaggedStruct("AutomergeCause", {
+export class AutomergeCause extends Schema.TaggedErrorClass<AutomergeCause>(
+  "@lucas-barake/effect-local/ReplicaError/AutomergeCause"
+)("AutomergeCause", {
   message: Schema.String
-})
+}) {}
 
-export const Cause = Schema.Union([SqlCause, SchemaCause, WorkerCause, RpcCause, AutomergeCause])
+export class CryptoCause extends Schema.TaggedErrorClass<CryptoCause>(
+  "@lucas-barake/effect-local/ReplicaError/CryptoCause"
+)("CryptoCause", {
+  message: Schema.String
+}) {}
+
+export const Cause = Schema.Union([SqlCause, SchemaCause, WorkerCause, RpcCause, AutomergeCause, CryptoCause])
 export type Cause = typeof Cause.Type
 
-export const DocumentNotFound = Schema.TaggedStruct("DocumentNotFound", {
+export class DocumentNotFound extends Schema.TaggedErrorClass<DocumentNotFound>(
+  "@lucas-barake/effect-local/ReplicaError/DocumentNotFound"
+)("DocumentNotFound", {
   documentId: Identity.DocumentId
-})
-export const DocumentDecodeError = Schema.TaggedStruct("DocumentDecodeError", {
+}) {}
+
+export class DocumentDecodeError extends Schema.TaggedErrorClass<DocumentDecodeError>(
+  "@lucas-barake/effect-local/ReplicaError/DocumentDecodeError"
+)("DocumentDecodeError", {
   documentId: Identity.DocumentId,
   cause: SchemaCause
-})
-export const UnsupportedDocumentVersion = Schema.TaggedStruct("UnsupportedDocumentVersion", {
+}) {}
+
+export class DocumentEncodeError extends Schema.TaggedErrorClass<DocumentEncodeError>(
+  "@lucas-barake/effect-local/ReplicaError/DocumentEncodeError"
+)("DocumentEncodeError", {
+  documentId: Identity.DocumentId,
+  cause: SchemaCause
+}) {}
+
+export class UnsupportedDocumentVersion extends Schema.TaggedErrorClass<UnsupportedDocumentVersion>(
+  "@lucas-barake/effect-local/ReplicaError/UnsupportedDocumentVersion"
+)("UnsupportedDocumentVersion", {
   documentId: Identity.DocumentId,
   observedVersion: Schema.Int,
   supportedVersion: Schema.Int
-})
-export const ProjectionBlocked = Schema.TaggedStruct("ProjectionBlocked", {
+}) {}
+
+export class ProjectionBlocked extends Schema.TaggedErrorClass<ProjectionBlocked>(
+  "@lucas-barake/effect-local/ReplicaError/ProjectionBlocked"
+)("ProjectionBlocked", {
   projection: Schema.String,
   cause: SchemaCause
-})
-export const CommandIdConflict = Schema.TaggedStruct("CommandIdConflict", {
+}) {}
+
+export class CommandIdConflict extends Schema.TaggedErrorClass<CommandIdConflict>(
+  "@lucas-barake/effect-local/ReplicaError/CommandIdConflict"
+)("CommandIdConflict", {
   commandId: Identity.CommandId
-})
-export const StorageUnavailable = Schema.TaggedStruct("StorageUnavailable", { cause: Cause })
-export const StorageCorrupt = Schema.TaggedStruct("StorageCorrupt", { cause: Cause })
-export const QuotaExceeded = Schema.TaggedStruct("QuotaExceeded", {
+}) {}
+
+export class StorageUnavailable extends Schema.TaggedErrorClass<StorageUnavailable>(
+  "@lucas-barake/effect-local/ReplicaError/StorageUnavailable"
+)("StorageUnavailable", { cause: Cause }) {}
+
+export class StorageCorrupt extends Schema.TaggedErrorClass<StorageCorrupt>(
+  "@lucas-barake/effect-local/ReplicaError/StorageCorrupt"
+)("StorageCorrupt", { cause: Cause }) {}
+
+export class QuotaExceeded extends Schema.TaggedErrorClass<QuotaExceeded>(
+  "@lucas-barake/effect-local/ReplicaError/QuotaExceeded"
+)("QuotaExceeded", {
   resource: Schema.String,
   limit: Schema.Int
-})
-export const MigrationFailed = Schema.TaggedStruct("MigrationFailed", {
+}) {}
+
+export class MigrationFailed extends Schema.TaggedErrorClass<MigrationFailed>(
+  "@lucas-barake/effect-local/ReplicaError/MigrationFailed"
+)("MigrationFailed", {
   migration: Schema.String,
   cause: Cause
-})
-export const BackupInvalid = Schema.TaggedStruct("BackupInvalid", { cause: Cause })
-export const BackupTooLarge = Schema.TaggedStruct("BackupTooLarge", {
+}) {}
+
+export class BackupInvalid extends Schema.TaggedErrorClass<BackupInvalid>(
+  "@lucas-barake/effect-local/ReplicaError/BackupInvalid"
+)("BackupInvalid", { cause: Cause }) {}
+
+export class BackupTooLarge extends Schema.TaggedErrorClass<BackupTooLarge>(
+  "@lucas-barake/effect-local/ReplicaError/BackupTooLarge"
+)("BackupTooLarge", {
   limit: Schema.Int,
   observed: Schema.Int
-})
-export const RestoreBusy = Schema.TaggedStruct("RestoreBusy", { replica: Schema.String })
-export const RestoreFailed = Schema.TaggedStruct("RestoreFailed", { cause: Cause })
-export const ProtocolMismatch = Schema.TaggedStruct("ProtocolMismatch", {
+}) {}
+
+export class RestoreBusy extends Schema.TaggedErrorClass<RestoreBusy>(
+  "@lucas-barake/effect-local/ReplicaError/RestoreBusy"
+)("RestoreBusy", { replica: Schema.String }) {}
+
+export class RestoreFailed extends Schema.TaggedErrorClass<RestoreFailed>(
+  "@lucas-barake/effect-local/ReplicaError/RestoreFailed"
+)("RestoreFailed", { cause: Cause }) {}
+
+export class ProtocolMismatch extends Schema.TaggedErrorClass<ProtocolMismatch>(
+  "@lucas-barake/effect-local/ReplicaError/ProtocolMismatch"
+)("ProtocolMismatch", {
   expected: Schema.String,
   observed: Schema.String
-})
-export const ReplicaFenced = Schema.TaggedStruct("ReplicaFenced", {
+}) {}
+
+export class ReplicaFenced extends Schema.TaggedErrorClass<ReplicaFenced>(
+  "@lucas-barake/effect-local/ReplicaError/ReplicaFenced"
+)("ReplicaFenced", {
   expectedGeneration: Identity.WriterGeneration,
   observedGeneration: Identity.WriterGeneration
-})
+}) {}
 
 export const Reason = Schema.Union([
   DocumentNotFound,
   DocumentDecodeError,
+  DocumentEncodeError,
   UnsupportedDocumentVersion,
   ProjectionBlocked,
   CommandIdConflict,
@@ -90,6 +158,15 @@ export const Reason = Schema.Union([
 ])
 export type Reason = typeof Reason.Type
 
-export class ReplicaError extends Schema.TaggedErrorClass<ReplicaError>()("ReplicaError", {
-  reason: Reason
-}) {}
+export class ReplicaError extends Schema.TaggedErrorClass<ReplicaError>("@lucas-barake/effect-local/ReplicaError")(
+  "ReplicaError",
+  {
+    reason: Reason
+  }
+) {
+  override readonly cause = this.reason
+
+  override get message(): string {
+    return this.reason._tag
+  }
+}

@@ -1,3 +1,4 @@
+import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
@@ -11,6 +12,7 @@ import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
+import { TestClock } from "effect/testing"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as ClusterStorage from "../src/internal/clusterStorage.js"
 import * as ReplicaWorkflow from "../src/ReplicaWorkflow.js"
@@ -52,13 +54,16 @@ describe("SqlReplica", () => {
     maxInFlightPerSession: 32,
     maxQueuedRpc: 128
   }
-  const Database = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+  const Database = Layer.merge(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer
+  )
   const Handler = Layer.merge(
-    Mutation.layer(Rename, ({ draft, payload }) => {
+    Rename.toLayer(({ draft, payload }) => {
       draft.title = payload
       return undefined
     }),
-    Mutation.layer(Noop, () => undefined)
+    Noop.toLayer(() => undefined)
   )
   const Limits = ReplicaLimits.layer(limits)
   const Live = SqlReplica.layer(definition, { projections: [] }).pipe(
@@ -68,8 +73,8 @@ describe("SqlReplica", () => {
   it.effect("creates, reads, mutates, tombstones, and resolves receipts", () =>
     Effect.gen(function*() {
       const replica = yield* Replica.Replica
-      assert.ok(yield* ReplicaWorkflow.WorkflowRuntime)
-      const createCommandId = Identity.makeCommandId()
+      assert.ok(yield* ReplicaWorkflow.CompactionWorkflow)
+      const createCommandId = yield* Identity.makeCommandId
       const created = yield* replica.create(Task, { commandId: createCommandId, value: { title: "one" } })
       assert.strictEqual(created._tag, "DurablyCommittedLocal")
       if (created._tag !== "DurablyCommittedLocal") return
@@ -83,20 +88,20 @@ describe("SqlReplica", () => {
           .reason._tag,
         "CommandIdConflict"
       )
-      const concurrentCommandId = Identity.makeCommandId()
+      const concurrentCommandId = yield* Identity.makeCommandId
       const concurrent = yield* Effect.all([
         replica.create(Task, { commandId: concurrentCommandId, value: { title: "parallel" } }),
         replica.create(Task, { commandId: concurrentCommandId, value: { title: "parallel" } })
       ], { concurrency: "unbounded" })
       assert.deepStrictEqual(concurrent[0], concurrent[1])
       assert.deepStrictEqual((yield* replica.get(Task, documentId)).value, { title: "one" })
-      const mutationCommandId = Identity.makeCommandId()
+      const mutationCommandId = yield* Identity.makeCommandId
       assert.deepStrictEqual(
         yield* replica.mutate(Rename, { commandId: mutationCommandId, documentId, payload: "two" }),
         CommandOutcome.durablyCommitted(mutationCommandId, undefined)
       )
       assert.deepStrictEqual((yield* replica.get(Task, documentId)).value, { title: "two" })
-      const noopCommandId = Identity.makeCommandId()
+      const noopCommandId = yield* Identity.makeCommandId
       assert.deepStrictEqual(
         yield* replica.mutate(Noop, { commandId: noopCommandId, documentId }),
         CommandOutcome.durablyCommitted(noopCommandId, undefined)
@@ -106,7 +111,7 @@ describe("SqlReplica", () => {
         yield* replica.lookupMutation(Rename, mutationCommandId),
         CommandOutcome.durablyCommitted(mutationCommandId, undefined)
       )
-      const deleteCommandId = Identity.makeCommandId()
+      const deleteCommandId = yield* Identity.makeCommandId
       yield* replica.delete(Task, { commandId: deleteCommandId, documentId })
       assert.isTrue((yield* replica.get(Task, documentId)).tombstone)
       assert.deepStrictEqual(
@@ -114,13 +119,13 @@ describe("SqlReplica", () => {
         CommandOutcome.durablyCommitted(deleteCommandId, undefined)
       )
       const portableCreated = yield* replica.create(Task, {
-        commandId: Identity.makeCommandId(),
+        commandId: (yield* Identity.makeCommandId),
         value: { title: "portable" }
       })
       assert.strictEqual(portableCreated._tag, "DurablyCommittedLocal")
       if (portableCreated._tag !== "DurablyCommittedLocal") return
       const exported = yield* replica.exportDocument(Task, portableCreated.value)
-      const importCommandId = Identity.makeCommandId()
+      const importCommandId = yield* Identity.makeCommandId
       const imported = yield* replica.importDocument(Task, {
         commandId: importCommandId,
         value: exported
@@ -148,5 +153,5 @@ describe("SqlReplica", () => {
         (SELECT COUNT(*) FROM effect_local_documents) AS documents,
         (SELECT COUNT(*) FROM effect_local_command_receipts) AS receipts`
       assert.deepStrictEqual(rows[0], { changes: 6, clusterMessages: 8, documents: 4, receipts: 7 })
-    }).pipe(Effect.provide(Live), Effect.provide(Database)))
+    }).pipe(Effect.provide(Live), Effect.provide(Database), TestClock.withLive))
 })

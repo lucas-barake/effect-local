@@ -1,14 +1,15 @@
-import { assert, describe, it } from "@effect/vitest"
+import { NodeCrypto } from "@effect/platform-node"
+import { assert, it } from "@effect/vitest"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as Wire from "../src/internal/wire.js"
 
-describe("browser wire", () => {
+it.layer(NodeCrypto.layer)("browser wire", (it) => {
   it.effect("represents void outcomes as JSON null", () =>
     Effect.gen(function*() {
-      const commandId = Identity.makeCommandId()
+      const commandId = yield* Identity.makeCommandId
       const encoded = yield* Wire.encodeOutcome(
         Schema.Void,
         Schema.Never,
@@ -23,7 +24,7 @@ describe("browser wire", () => {
 
   it.effect("round trips transformed mutation outcomes", () =>
     Effect.gen(function*() {
-      const commandId = Identity.makeCommandId()
+      const commandId = yield* Identity.makeCommandId
       const encoded = yield* Wire.encodeOutcome(
         Schema.NumberFromString,
         Schema.Never,

@@ -8,7 +8,10 @@ export const encode = <S extends Document.WireSchema,>(schema: S, value: S["Type
   Schema.encodeUnknownEffect(Schema.toCodecJson(schema))(value).pipe(
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
-        reason: { _tag: "ProtocolMismatch", expected: "schema coded JSON", observed: String(cause) }
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: "schema coded JSON",
+          observed: String(cause)
+        })
       })
     )
   ) as Effect.Effect<Schema.Json, ReplicaError.ReplicaError>
@@ -17,7 +20,10 @@ export const decode = <S extends Document.WireSchema,>(schema: S, value: Schema.
   Schema.decodeUnknownEffect(Schema.toCodecJson(schema))(value).pipe(
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
-        reason: { _tag: "ProtocolMismatch", expected: "schema coded JSON", observed: String(cause) }
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: "schema coded JSON",
+          observed: String(cause)
+        })
       })
     )
   ) as Effect.Effect<S["Type"], ReplicaError.ReplicaError>

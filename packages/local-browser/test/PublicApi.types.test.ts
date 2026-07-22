@@ -2,6 +2,7 @@ import type * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { assert, describe, it } from "@effect/vitest"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import type * as Crypto from "effect/Crypto"
 import type * as Layer from "effect/Layer"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
@@ -16,7 +17,7 @@ describe("public browser API types", () => {
     const layer: Layer.Layer<
       Replica.Replica,
       ReplicaError.ReplicaError | WorkerError.WorkerError,
-      Worker.WorkerPlatform | Worker.Spawner
+      Crypto.Crypto | Worker.WorkerPlatform | Worker.Spawner
     > = BrowserReplica.layer(definition)
     assert.isDefined(layer)
   })
@@ -30,7 +31,7 @@ describe("public browser API types", () => {
     const provisioned: Layer.Layer<
       SqliteClient.SqliteClient | SqlClient.SqlClient,
       SqlError.SqlError
-    > = BrowserSqlite.layerPort(new MessageChannel().port1)
+    > = BrowserSqlite.layerMessagePort(new MessageChannel().port1)
     assert.isDefined(layer)
     assert.isDefined(provisioned)
   })

@@ -33,7 +33,7 @@ pnpm add @lucas-barake/effect-local @lucas-barake/effect-local-sql
 pnpm add @lucas-barake/effect-local-browser @effect/platform-browser@4.0.0-beta.99
 pnpm add @effect/sql-sqlite-wasm@4.0.0-beta.99 @effect/wa-sqlite@0.2.1
 pnpm add @effect/atom-react@4.0.0-beta.99
-pnpm add -D @lucas-barake/effect-local-test @effect/sql-sqlite-node@4.0.0-beta.99
+pnpm add -D @lucas-barake/effect-local-test @effect/platform-node@4.0.0-beta.99 @effect/sql-sqlite-node@4.0.0-beta.99
 ```
 
 Package roles:
@@ -94,8 +94,9 @@ The supported encoded shape consists of Automerge scalar values, arrays, and pla
 
 ### 2. Define mutations and inject handlers
 
-Mutation definitions contain schemas. Implementations are separate Layer services. A mutation handler is synchronous
-because it runs inside an Automerge change and a durable SQL command transaction.
+Mutation definitions expose `payloadSchema`, `successSchema`, and `errorSchema`. Implementations are separate Layer
+services. A mutation handler is synchronous because it runs inside an Automerge change and a durable SQL command
+transaction. `toLayer` accepts a handler directly or an Effect that constructs one.
 
 ```ts
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
@@ -104,10 +105,12 @@ import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import { Task } from "./domain.js"
 
+export class TitleEmpty extends Schema.TaggedErrorClass<TitleEmpty>()("TitleEmpty", {}) {}
+
 export const RenameTask = Mutation.make("RenameTask", {
   document: Task,
   payload: Schema.Struct({ title: Schema.String }),
-  error: Schema.Literal("TitleEmpty")
+  error: TitleEmpty
 })
 
 export const SetTaskCompleted = Mutation.make("SetTaskCompleted", {
@@ -116,14 +119,14 @@ export const SetTaskCompleted = Mutation.make("SetTaskCompleted", {
 })
 
 export const MutationLive = Layer.mergeAll(
-  Mutation.layer(RenameTask, ({ draft, payload }) => {
+  RenameTask.toLayer(({ draft, payload }) => {
     const title = payload.title.trim()
-    if (title.length === 0) return Result.fail("TitleEmpty" as const)
+    if (title.length === 0) return Result.fail(new TitleEmpty())
     draft.title = title
     draft.updatedAt = Date.now()
     return Result.succeed(undefined)
   }),
-  Mutation.layer(SetTaskCompleted, ({ draft, payload }) => {
+  SetTaskCompleted.toLayer(({ draft, payload }) => {
     draft.completed = payload.completed
     draft.updatedAt = Date.now()
     return undefined
@@ -133,6 +136,9 @@ export const MutationLive = Layer.mergeAll(
 
 The handler receives the mutable encoded `draft`, the decoded `payload`, and the decoded `current` value. A mutation
 with a declared error schema returns `Result`. A mutation whose error is `Schema.Never` returns its success directly.
+Declared domain errors must be schema backed yieldable tagged errors. Define one error with `Schema.TaggedErrorClass`,
+or pass a `Schema.Union` of tagged error classes when a mutation can reject for several domain reasons. This keeps
+`Effect.catchTag`, `Effect.catchTags`, `Result`, RPC encoding, and durable receipts on one discriminated error model.
 
 ### 3. Define projections, queries, and the replica
 
@@ -196,22 +202,25 @@ import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Effect from "effect/Effect"
 import { RenameTask, Task } from "./domain.js"
 
-const create = Replica.Replica.use((replica) => {
+const create = Effect.gen(function*() {
+  const replica = yield* Replica.Replica
   const now = Date.now()
-  return replica.create(Task, {
-    commandId: Identity.makeCommandId(),
+  const outcome = yield* replica.create(Task, {
+    commandId: yield* Identity.makeCommandId,
     value: { title: "Read the paper", completed: false, createdAt: now, updatedAt: now }
   })
-}).pipe(Effect.flatMap(CommandOutcome.committedOrFail))
+  return yield* CommandOutcome.committedOrFail(outcome)
+})
 
 const rename = (documentId: Identity.DocumentId) =>
-  Replica.Replica.use((replica) =>
-    replica.mutate(RenameTask, {
-      commandId: Identity.makeCommandId(),
+  Effect.gen(function*() {
+    const replica = yield* Replica.Replica
+    return yield* replica.mutate(RenameTask, {
+      commandId: yield* Identity.makeCommandId,
       documentId,
       payload: { title: "Build the engine" }
     })
-  ).pipe(
+  }).pipe(
     Effect.map((outcome) =>
       CommandOutcome.match(outcome, {
         onCommitted: ({ value }) => ({ _tag: "Committed" as const, value }),
@@ -266,7 +275,6 @@ export const TaskListSql = SqlProjection.make(TaskList, {
   migrations: [{
     id: 1,
     name: "task_list_v1",
-    checksum: "sha256:task-list-v1",
     run: (sql, table) =>
       sql`CREATE TABLE IF NOT EXISTS ${sql(table)} (
         source_document_id TEXT PRIMARY KEY,
@@ -286,44 +294,54 @@ export const TaskListSql = SqlProjection.make(TaskList, {
 })
 ```
 
-Query handlers are also injected Layers and may depend on `SqlClient.SqlClient`.
+`committedOrFail` returns the committed value, fails directly with a declared mutation error for `Rejected`, and fails
+with `CommandOutcomeUnknown` when durability cannot be established. Both failure paths are tagged and work with
+`Effect.catchTag`.
+
+Query definitions expose the same `payloadSchema`, `successSchema`, and `errorSchema` metadata. Query handlers are also
+injected Layers and may depend on `SqlClient.SqlClient`. `toLayer` accepts a handler directly or an Effect that
+constructs one, then captures its Effect services in the installed handler Layer.
 
 ```ts
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Query from "@lucas-barake/effect-local/Query"
 import * as Effect from "effect/Effect"
+import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import { ListTasks } from "./domain.js"
 
-export const QueryLive = Query.layer(ListTasks, ({ search }) =>
-  Effect.gen(function*() {
-    const sql = yield* SqlClient.SqlClient
+const ListTasksSql = SqlSchema.findAll({
+  Request: ListTasks.payloadSchema,
+  Result: Schema.Struct({
+    sourceDocumentId: Identity.DocumentId,
+    title: Schema.String,
+    completed: Schema.BooleanFromBit,
+    updatedAt: Schema.Number
+  }),
+  execute: ({ search }) => {
     const pattern = `%${search.trim().toLocaleLowerCase()}%`
-    const rows = yield* sql<{
-      readonly sourceDocumentId: string
-      readonly title: string
-      readonly completed: number
-      readonly updatedAt: number
-    }>`SELECT source_document_id AS sourceDocumentId, title, completed, updated_at AS updatedAt
-       FROM task_list_v1
-       WHERE ${pattern} = '%%' OR LOWER(title) LIKE ${pattern}
-       ORDER BY updated_at DESC`
-    return rows.map((row) => ({
-      ...row,
-      sourceDocumentId: Identity.DocumentId.make(row.sourceDocumentId),
-      completed: row.completed === 1
-    }))
-  }).pipe(Effect.orDie))
+    return SqlClient.SqlClient.use((sql) =>
+      sql`SELECT source_document_id AS sourceDocumentId, title, completed, updated_at AS updatedAt
+          FROM task_list_v1
+          WHERE ${pattern} = '%%' OR LOWER(title) LIKE ${pattern}
+          ORDER BY updated_at DESC`
+    )
+  }
+})
+
+export const QueryLive = ListTasks.toLayer((payload) => ListTasksSql(payload).pipe(Effect.orDie))
 ```
 
 ### 6. Compose the durable engine
 
 `SqlReplica.layer` requires exactly one SQL binding per declared projection plus every mutation and query handler,
-`ReplicaLimits`, and `SqlClient`. It provides `Replica`, `CommitPublisher`, `ReplicaWorkflow.WorkflowRuntime`,
+`ReplicaLimits`, `Crypto`, and `SqlClient`. It provides `Replica`, `CommitPublisher`, `ReplicaWorkflow.CompactionWorkflow`,
 `PeerSync`, `ReplicaGate`, and Effect Cluster `Sharding`. The owner side peer services stay available so
 `PeerSession.make` can share the same durable runtime and fencing gate.
 
 ```ts
+import { BrowserCrypto } from "@effect/platform-browser"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Layer from "effect/Layer"
@@ -335,13 +353,16 @@ export const EngineLive = SqlReplica.layer(definition, {
   projections: [TaskListSql]
 }).pipe(
   Layer.provideMerge(DomainLive),
+  Layer.provideMerge(BrowserCrypto.layer),
   Layer.provideMerge(ReplicaLimits.layer(limits)),
   Layer.provideMerge(DatabaseLive)
 )
 ```
 
-`DatabaseLive` is any Effect v4 `SqlClient.SqlClient` Layer. In the browser it comes from `BrowserSqlite.layer` or
-`BrowserSqlite.layerPort`. The complete limits object is available as `TestReplica.defaultLimits` for tests and in
+`DatabaseLive` is any Effect v4 `SqlClient.SqlClient` Layer. `SqlReplica.layer` also requires the Effect `Crypto`
+service. In the browser these come from `BrowserSqlite.layer` or `BrowserSqlite.layerMessagePort` and
+`BrowserCrypto.layer`. Node programs provide `NodeCrypto.layer`. The complete limits object is available as
+`TestReplica.defaultLimits` for tests and in
 [`examples/tasks/src/domain.ts`](examples/tasks/src/domain.ts) for a browser configuration.
 
 ### 7. Provide the official Effect Worker layer
@@ -350,7 +371,7 @@ export const EngineLive = SqlReplica.layer(definition, {
 or hide a `SharedWorker`.
 
 ```ts
-import { BrowserWorker } from "@effect/platform-browser"
+import { BrowserCrypto, BrowserWorker } from "@effect/platform-browser"
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
 import * as Layer from "effect/Layer"
 
@@ -365,8 +386,8 @@ const WorkerLive = BrowserWorker.layer(() => {
   return channel.port2
 })
 
-export const BrowserLive = BrowserReplica.layer(definition).pipe(
-  Layer.provide(WorkerLive)
+export const BrowserLive = BrowserReplica.layerWithReactivity(definition).pipe(
+  Layer.provide(Layer.merge(WorkerLive, BrowserCrypto.layer))
 )
 ```
 
@@ -375,7 +396,7 @@ handles liveness, expiring provisioning nonces, OPFS worker creation, database p
 [`examples/tasks/src/replica-client.ts`](examples/tasks/src/replica-client.ts) and
 [`examples/tasks/src/replica.shared-worker.ts`](examples/tasks/src/replica.shared-worker.ts).
 
-Inside the SharedWorker, compose `BrowserSqlite.layerPort(databasePort)`, domain Layers, `SqlReplica.layer`, and
+Inside the SharedWorker, compose `BrowserSqlite.layerMessagePort(databasePort)`, domain Layers, `SqlReplica.layer`, and
 `SessionManager.layer`. Serve each attached RPC port with `ReplicaOwner.layerWorker(definition)` and the official
 `BrowserWorkerRunner.layerMessagePort(rpcPort)` Layer.
 
@@ -387,6 +408,7 @@ authority.
 ```ts
 import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Effect from "effect/Effect"
 import { Atom } from "effect/unstable/reactivity"
 import { BrowserLive } from "./browser.js"
 import { ListTasks, RenameTask, Task } from "./domain.js"
@@ -397,9 +419,8 @@ export const task = ReplicaAtom.documentFamily(runtime, Task)
 export const renameTask = ReplicaAtom.mutation(runtime, RenameTask)
 export const replicaStatus = ReplicaAtom.status(runtime)
 
-const taskId = Identity.makeDocumentId()
 const allTasks = tasks({ search: "" })
-const oneTask = task(taskId)
+const oneTask = Effect.map(Identity.makeDocumentId, task)
 ```
 
 `queryFamily` canonicalizes its schema encoded payload for stable family identity. It invalidates on every declared
@@ -407,8 +428,8 @@ projection and source document key. `mutation` invalidates the mutation's docume
 with custom invalidation needs, use `runtime.fn` and its `reactivityKeys` option as the Tasks example does.
 
 React applications provide an `AtomRegistry` through `@effect/atom-react` and consume the returned atoms with
-`useAtomValue`, `useAtomSet`, and `useAtomRefresh`. The lower level `ReplicaAtom` service exposes a registry plus
-`get`, `query`, `status`, `refresh`, and `mount` for non React integration.
+`useAtomValue`, `useAtomSet`, and `useAtomRefresh`. Non React integrations mount the same atoms directly in an
+`AtomRegistry`.
 
 ### 9. Observe status and lifecycle
 
@@ -454,16 +475,14 @@ const restore = (archive: Uint8Array) =>
   )
 
 const duplicateDocument = (documentId: Identity.DocumentId) =>
-  Replica.Replica.use((replica) =>
-    replica.exportDocument(Task, documentId).pipe(
-      Effect.flatMap((value) =>
-        replica.importDocument(Task, {
-          commandId: Identity.makeCommandId(),
-          value
-        })
-      )
-    )
-  )
+  Effect.gen(function*() {
+    const replica = yield* Replica.Replica
+    const value = yield* replica.exportDocument(Task, documentId)
+    return yield* replica.importDocument(Task, {
+      commandId: yield* Identity.makeCommandId,
+      value
+    })
+  })
 ```
 
 Replace restore stages and validates the archive before changing the active incarnation. Clone restore creates a new
@@ -526,11 +545,12 @@ import * as Presence from "@lucas-barake/effect-local-browser/Presence"
 import * as Schema from "effect/Schema"
 
 const Cursor = Schema.Struct({ documentId: Schema.String, offset: Schema.Number })
-const presence = Presence.make(Cursor, { ttlMillis: 15_000 })
+const presence = Presence.make(Cursor, { timeToLive: "15 seconds" })
 ```
 
 `Presence.make` returns an Effect that builds `receive`, scoped `publish`, `remove`, and `values`. Presence identity is
-the authenticated transport peer. It is not a durable user identity.
+the authenticated transport peer. It is not a durable user identity. `timeToLive` accepts any Effect `Duration.Input`
+whose normalized millisecond value is positive, finite, and no greater than `Number.MAX_SAFE_INTEGER`.
 
 ### 12. Run compaction and recovery workflows
 
@@ -541,12 +561,11 @@ import * as ReplicaWorkflow from "@lucas-barake/effect-local-sql/ReplicaWorkflow
 import * as Effect from "effect/Effect"
 
 const compact = Effect.gen(function*() {
-  const workflows = yield* ReplicaWorkflow.WorkflowRuntime
+  const workflows = yield* ReplicaWorkflow.CompactionWorkflow
   const execution = yield* workflows.execute(
     ReplicaWorkflow.OperationId.make("scheduled-compaction-2026-07")
   )
   const current = yield* workflows.poll(execution)
-  yield* workflows.resume(execution)
   return current
 })
 ```
@@ -555,8 +574,7 @@ The registered workflow journals document listing and one compact and prune acti
 checkpoint checksums, heads, change metadata, and tombstones. It can fall back to an older verified checkpoint and
 replay accepted changes. `Compaction` and `Recovery` are public injectable services for lower level engine assembly.
 
-`ProjectionRebuild`, `CreateBackup`, and `RestoreBackup` reserve stable Workflow definitions but are not registered
-operations in the current beta. Backup and restore streams do not become durable merely because a Workflow is used.
+Backup and restore streams do not become durable merely because a Workflow is used.
 
 ### 13. Write deterministic tests
 
@@ -576,7 +594,7 @@ import { definition, ListTasks, MutationLive, Task, TaskListSql } from "./domain
 
 const TestDomain = Layer.mergeAll(
   MutationLive,
-  Query.layer(ListTasks, () => Effect.succeed([])),
+  ListTasks.toLayer(() => Effect.succeed([])),
   TaskListSql.layer
 )
 
@@ -589,7 +607,7 @@ it.effect("commits locally", () =>
     const replica = yield* Replica.Replica
     const now = Date.now()
     const outcome = yield* replica.create(Task, {
-      commandId: Identity.makeCommandId(),
+      commandId: yield* Identity.makeCommandId,
       value: { title: "test", completed: false, createdAt: now, updatedAt: now }
     })
     assert.strictEqual(outcome._tag, "DurablyCommittedLocal")
@@ -599,7 +617,8 @@ it.effect("commits locally", () =>
 
 For sync tests use `TestReplica.layerWithSync`, `TestPeer.layer`, and `FaultInjection.layerSequence`. Fault decisions
 can deterministically drop, duplicate, delay, reorder, partition, heal, and flush bounded peer traffic. Effect's
-`TestClock` controls delay and presence expiration without wall clock sleeps.
+`TestClock` controls delay and presence expiration without wall clock sleeps. `TestPeer.make` and `TestPeer.layer`
+validate their bounds in the Effect error channel with the tagged `InvalidOptions` error.
 
 ## State and consistency model
 
@@ -643,7 +662,6 @@ This beta deliberately does not promise a complete collaboration product.
 - Store and forward capability is a transport declaration, not an implementation supplied by this library.
 - Conflict inspection, history browsing, sharing policy, and resolution UI belong to the application.
 - Presence is not durable awareness and must not carry authorization decisions.
-- Backup creation and restore Workflow definitions are reserved but not registered in the current beta.
 - Limits must be selected for the product. They bound backup bytes, archive records, JSON depth, sync messages,
   dependency graphs, pending changes, peers, sessions, RPC streams, and queues.
 
@@ -687,70 +705,70 @@ Every root package exports module namespaces. Every module is also available thr
 
 ### `@lucas-barake/effect-local`
 
-| Namespace           | Public API                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Backup`            | `FormatVersion`, `Header`, `ExportOptions`, `RestoreOptions`, `ExportedDocument`                                                                                                                                                                                                                                                                                                                                                                     |
-| `Canonical`         | `stringify`, `hash`, `digest`                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `CommandOutcome`    | `Rejected`, `DurablyCommittedLocal`, `OutcomeUnknown`, `CommandOutcome`, `schema`, `rejected`, `durablyCommitted`, `unknown`, `match`, `committedOrFail`                                                                                                                                                                                                                                                                                             |
-| `Commit`            | `Heads`, `Commit` and their inferred types                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `Document`          | `WireSchema`, `AutomergeEncoded`, `DocumentSchema`, `Document`, `Any`, `make`, `isAutomergeValue`, `decode`, `encode`                                                                                                                                                                                                                                                                                                                                |
-| `DocumentSet`       | `DocumentSet`, `make`, `get`                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `Identity`          | Schemas and types for `ReplicaId`, `ReplicaIncarnation`, `SessionId`, `DocumentId`, `CommandId`, `WriterGeneration`, `CommitSequence`, `PeerId`, and `ProjectionVersion`. `makeReplicaId`, `makeSessionId`, `makeDocumentId`, `makeCommandId`, `makePeerId`, `documentIdFromCommandId`                                                                                                                                                               |
-| `Mutation`          | `DraftValue`, `Draft`, `SuccessResult`, `HandlerResult`, `HandlerOptions`, `Handler`, `HandlerService`, `Mutation`, `Any`, `make`, `handler`, `layer`                                                                                                                                                                                                                                                                                                |
-| `PeerTransport`     | `Capabilities`, `Connection`, `ConnectOptions`, `PeerTransport` service                                                                                                                                                                                                                                                                                                                                                                              |
-| `Projection`        | `Projection`, `Any`, `make`, `assertUniqueKeys`, `evaluate`                                                                                                                                                                                                                                                                                                                                                                                          |
-| `Query`             | `Handler`, `HandlerService`, `Query`, `Any`, `make`, `handler`, `layer`                                                                                                                                                                                                                                                                                                                                                                              |
-| `Replica`           | `Service`, `Replica` service                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `ReplicaDefinition` | `ReplicaDefinition`, `Any`, `invalidationKeys`, `make`                                                                                                                                                                                                                                                                                                                                                                                               |
-| `ReplicaError`      | Cause schemas `SqlCause`, `SchemaCause`, `WorkerCause`, `RpcCause`, `AutomergeCause`, `Cause`. Reason schemas `DocumentNotFound`, `DocumentDecodeError`, `UnsupportedDocumentVersion`, `ProjectionBlocked`, `CommandIdConflict`, `StorageUnavailable`, `StorageCorrupt`, `QuotaExceeded`, `MigrationFailed`, `BackupInvalid`, `BackupTooLarge`, `RestoreBusy`, `RestoreFailed`, `ProtocolMismatch`, `ReplicaFenced`. `Reason`, tagged `ReplicaError` |
-| `ReplicaLimits`     | `Values`, `ReplicaLimits` service, `make`, `layer`                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `ReplicaStatus`     | `Starting`, `Ready`, `ReadOnly`, `Degraded`, `ProjectionBlocked`, `Restoring`, `Failed`, `ReplicaStatus` schemas and types                                                                                                                                                                                                                                                                                                                           |
-| `Snapshot`          | `ProjectionState`, `Snapshot`, `FromDocument`                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Namespace           | Public API                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Backup`            | `FormatVersion`, `Header`, `ExportOptions`, `RestoreOptions`, `ExportedDocument`                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `Canonical`         | `stringify`, `hash`, `digest`                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `CommandOutcome`    | `Rejected`, `DurablyCommittedLocal`, `OutcomeUnknown`, `CommandOutcomeUnknown`, `CommandOutcome`, `schema`, `rejected`, `durablyCommitted`, `unknown`, `match`, `committedOrFail`                                                                                                                                                                                                                                                                                                          |
+| `Commit`            | `Heads`, `Commit` and their inferred types                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `Document`          | `WireSchema`, `AutomergeEncoded`, `DocumentSchema`, `Document`, `Any`, `make`, `isAutomergeValue`, `decode`, `encode`                                                                                                                                                                                                                                                                                                                                                                      |
+| `DocumentSet`       | `DocumentSet`, `make`, `get`                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `Identity`          | Schemas and types for `ReplicaId`, `ReplicaIncarnation`, `SessionId`, `DocumentId`, `CommandId`, `WriterGeneration`, `CommitSequence`, `PeerId`, and `ProjectionVersion`. `makeReplicaId`, `makeSessionId`, `makeDocumentId`, `makeCommandId`, `makePeerId`, `documentIdFromCommandId`                                                                                                                                                                                                     |
+| `Mutation`          | `DraftValue`, `Draft`, `SuccessResult`, `HandlerResult`, `HandlerOptions`, `Handler`, `HandlerService`, `Mutation`, `Any`, `make`; definitions expose `payloadSchema`, `successSchema`, `errorSchema`, `of`, and `toLayer`; `toLayer` accepts a handler or an Effect that builds one                                                                                                                                                                                                       |
+| `PeerTransport`     | `Capabilities`, `Connection`, `ConnectOptions`, `PeerTransport` service                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `Projection`        | `Projection`, `Any`, `make`, `assertUniqueKeys`, `evaluate`                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `Query`             | `Handler`, `HandlerService`, `Query`, `Any`, `make`; definitions expose `payloadSchema`, `successSchema`, `errorSchema`, `of`, and `toLayer`; `toLayer` accepts a handler or an Effect that builds one                                                                                                                                                                                                                                                                                     |
+| `Replica`           | `Replica` service                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `ReplicaDefinition` | `ReplicaDefinition`, `Any`, `invalidationKeys`, `make`                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `ReplicaError`      | Cause schemas `SqlCause`, `SchemaCause`, `WorkerCause`, `RpcCause`, `AutomergeCause`, `CryptoCause`, `Cause`. Reason schemas `DocumentNotFound`, `DocumentDecodeError`, `DocumentEncodeError`, `UnsupportedDocumentVersion`, `ProjectionBlocked`, `CommandIdConflict`, `StorageUnavailable`, `StorageCorrupt`, `QuotaExceeded`, `MigrationFailed`, `BackupInvalid`, `BackupTooLarge`, `RestoreBusy`, `RestoreFailed`, `ProtocolMismatch`, `ReplicaFenced`. `Reason`, tagged `ReplicaError` |
+| `ReplicaLimits`     | `Values`, `ReplicaLimits` service, `make`, `layer`                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `ReplicaStatus`     | `Starting`, `Ready`, `ReadOnly`, `Degraded`, `ProjectionBlocked`, `Restoring`, `Failed`, `ReplicaStatus` schemas and types                                                                                                                                                                                                                                                                                                                                                                 |
+| `Snapshot`          | `ProjectionState`, `Snapshot`, `FromDocument`                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 ### `@lucas-barake/effect-local-sql`
 
-| Namespace          | Public API                                                                                                                                                                      |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BackupStore`      | `BackupStore` service, `layer`                                                                                                                                                  |
-| `CommandExecutor`  | `createRequestHash`, `mutationRequestHash`, `deleteRequestHash`, `CommandExecutor` service, `MutationHandlers`, `layer`                                                         |
-| `CommitPublisher`  | `CommitEvent`, `CommitSubscription`, `CommitPublisher` service, `layer`                                                                                                         |
-| `Compaction`       | `PreparedCheckpoint`, `CompactResult`, `Compaction` service, `layer`                                                                                                            |
-| `DocumentEntity`   | Cluster RPC definitions `Create`, `Mutate`, `Delete`, `ApplySync`, plus `ApplySyncResult`, `DocumentEntity`, `layer`                                                            |
-| `DocumentStore`    | `Stored`, `DocumentStore` service, `layer`                                                                                                                                      |
-| `DurableRuntime`   | `layer`                                                                                                                                                                         |
-| `EntityReplica`    | `layer`                                                                                                                                                                         |
-| `Migrations`       | `canonicalStoreChecksum`, `peerSyncChecksum`, `durabilityIndexesChecksum`, `loader`, `run`, `layer`                                                                             |
-| `PeerSync`         | `Session`, `Outbound`, `Reply`, `Generated`, `Received`, `PeerSync` service, `layer`                                                                                            |
-| `ProjectionStore`  | `ProjectionStore` service, `BindingServices`, `layer`                                                                                                                           |
-| `QueryExecutor`    | `QueryExecutor` service, `QueryHandlers`, `layer`                                                                                                                               |
-| `Recovery`         | `RawRecoveryExport`, `Recovery` service, `make`, `layer`                                                                                                                        |
-| `ReplicaBootstrap` | `State`, `ReplicaBootstrap` service, `make`, `layer`                                                                                                                            |
-| `ReplicaGate`      | `Permit`, `ReplicaGate` service, `layer`                                                                                                                                        |
-| `ReplicaWorkflow`  | `OperationId`, Workflow definitions `ProjectionRebuild`, `CompactReplica`, `CreateBackup`, `RestoreBackup`, `Execution`, `WorkflowRuntime`, `registrationLayer`, `runtimeLayer` |
-| `SqlProjection`    | `Migration`, `SqlProjection`, `BindingService`, `make`, `Any`                                                                                                                   |
-| `SqlReplica`       | `layerFromServices`, `layer`                                                                                                                                                    |
+| Namespace          | Public API                                                                                                              |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| `BackupStore`      | `BackupStore` service, `layer`                                                                                          |
+| `CommandExecutor`  | `createRequestHash`, `mutationRequestHash`, `deleteRequestHash`, `CommandExecutor` service, `MutationHandlers`, `layer` |
+| `CommitPublisher`  | `CommitEvent`, `CommitSubscription`, `CommitPublisher` service, `layer`                                                 |
+| `Compaction`       | `PreparedCheckpoint`, `CompactResult`, `Compaction` service, `layer`                                                    |
+| `DocumentEntity`   | Cluster RPC definitions `Create`, `Mutate`, `Delete`, `ApplySync`, plus `ApplySyncResult`, `DocumentEntity`, `layer`    |
+| `DocumentStore`    | `Stored`, `DocumentStore` service, `layer`                                                                              |
+| `DurableRuntime`   | `layer`, `layerWith`                                                                                                    |
+| `EntityReplica`    | `layer`                                                                                                                 |
+| `Migrations`       | `canonicalStoreChecksum`, `peerSyncChecksum`, `durabilityIndexesChecksum`, `loader`, `run`, `layer`                     |
+| `PeerSync`         | `Session`, `Outbound`, `Reply`, `Generated`, `Received`, `PeerSync` service, `layer`                                    |
+| `ProjectionStore`  | `ProjectionStore` service, `BindingServices`, `layer`                                                                   |
+| `QueryExecutor`    | `QueryExecutor` service, `QueryHandlers`, `layer`                                                                       |
+| `Recovery`         | `RawRecoveryExport`, `Recovery` service, `make`, `layer`                                                                |
+| `ReplicaBootstrap` | `State`, `ReplicaBootstrap` service, `make`, `layer`                                                                    |
+| `ReplicaGate`      | `Permit`, `ReplicaGate` service, `layer`                                                                                |
+| `ReplicaWorkflow`  | `OperationId`, `CompactReplica`, `Execution`, `CompactionWorkflow`, `layerRegistration`, `layerRuntime`                 |
+| `SqlProjection`    | `Migration`, `SqlProjection`, `BindingService`, `make`, `Any`                                                           |
+| `SqlReplica`       | `layerFromServices`, `layer`                                                                                            |
 
 ### `@lucas-barake/effect-local-browser`
 
-| Namespace        | Public API                                                                                                          |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `BrowserReplica` | `layer`                                                                                                             |
-| `BrowserSqlite`  | `DatabasePort` service, `layer`, `layerPort`                                                                        |
-| `PeerSession`    | `SelectedDocument`, `Service`, `SyncEnvelope`, `makeWithClient`, `make`                                             |
-| `Presence`       | `Entry`, `Presence`, `make`                                                                                         |
-| `ReplicaAtom`    | `Service`, `ReplicaAtom` service, `reactivityLayer`, `layer`, `documentFamily`, `queryFamily`, `mutation`, `status` |
-| `ReplicaClient`  | `Service`, `ReplicaClient` service, `fromRpcClient`, `layer`                                                        |
-| `ReplicaOwner`   | `handlers`, `layer`, `layerWorker`                                                                                  |
-| `ReplicaRpc`     | `protocolVersion`, `Invalidation`, `InvalidationMessage`, `QueryError`, `group`                                     |
-| `SessionManager` | `leaseDurationMillis`, `Service`, `SessionManager` service, `layer`                                                 |
+| Namespace        | Public API                                                                             |
+| ---------------- | -------------------------------------------------------------------------------------- |
+| `BrowserReplica` | `layer`, `layerWith`, `layerWithReactivity`, `layerWithReactivityOptions`              |
+| `BrowserSqlite`  | `DatabasePort` service, `layer`, `layerMessagePort`                                    |
+| `PeerSession`    | `SelectedDocument`, `PeerSession`, `SyncEnvelope`, `makeTestClient`, `make`            |
+| `Presence`       | `Entry`, `Presence`, `make`                                                            |
+| `ReplicaAtom`    | `layerReactivity`, `documentFamily`, `queryFamily`, `mutation`, `status`               |
+| `ReplicaClient`  | `ReplicaClient` service, `fromRpcClient`, `layer`                                      |
+| `ReplicaOwner`   | `layerHandlers`, `layer`, `layerWorker`                                                |
+| `ReplicaRpc`     | `protocolVersion`, `Invalidation`, `InvalidationMessage`, `ReplicaQueryError`, `group` |
+| `SessionManager` | `leaseDurationMillis`, `SessionManager` service, `layer`                               |
 
 ### `@lucas-barake/effect-local-test`
 
-| Namespace        | Public API                                                                                                                                                                     |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `FaultInjection` | `Packet`, `Decision`, `Service`, `FaultInjection` service, `layer`, `none`, `layerSequence`                                                                                    |
-| `TestPeer`       | Tagged errors `InvalidFault`, `QueueFull`, `ConnectionClosed`, plus `TestPeerError`, `Options`, `Connection`, `Service`, `TestPeer` service, `make`, `layer`, `transportLayer` |
-| `TestReplica`    | `defaultLimits`, `layerWithLimits`, `layer`, `layerWithSyncAndLimits`, `layerWithSync`                                                                                         |
+| Namespace        | Public API                                                                                                                                                                            |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `FaultInjection` | `Packet`, `Decision`, `FaultInjection` service, `layer`, `none`, `layerSequence`                                                                                                      |
+| `TestPeer`       | Tagged errors `InvalidOptions`, `InvalidFault`, `QueueFull`, `ConnectionClosed`, plus `TestPeerError`, `Options`, `Connection`, `TestPeer` service, `make`, `layer`, `transportLayer` |
+| `TestReplica`    | `defaultLimits`, `layerWithLimits`, `layer`, `layerWithSyncAndLimits`, `layerWithSync`                                                                                                |
 
 ## License
 

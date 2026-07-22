@@ -1,12 +1,12 @@
 import type * as Automerge from "@automerge/automerge"
 import * as Context from "effect/Context"
+import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import type * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
+import type * as Scope from "effect/Scope"
 import type * as Document from "./Document.js"
-
-let handlerId = 0
-const nextHandlerId = () => ++handlerId
+import type * as TaggedError from "./internal/taggedError.js"
 
 export type DraftValue<A,> = A extends Automerge.ScalarValue ? A
   : A extends ReadonlyArray<infer Item> ? Array<DraftValue<Item>>
@@ -29,12 +29,14 @@ export type Handler<D extends Document.Any, P, A, E,> = (
   options: HandlerOptions<D, P>
 ) => HandlerResult<A, E>
 
+let handlerId = 0
+
 export interface HandlerService<
   Name extends string,
   D extends Document.Any,
   P extends Document.WireSchema,
   A extends Document.WireSchema,
-  E extends Document.WireSchema,
+  E extends TaggedError.Schema,
 > {
   readonly mutation: Mutation<Name, D, P, A, E>
 }
@@ -44,28 +46,39 @@ export interface Mutation<
   D extends Document.Any,
   P extends Document.WireSchema,
   A extends Document.WireSchema,
-  E extends Document.WireSchema,
+  E extends TaggedError.Schema,
 > {
   readonly name: Name
   readonly version: number
   readonly document: D
-  readonly payload: P
-  readonly success: A
-  readonly error: E
+  readonly payloadSchema: P
+  readonly successSchema: A
+  readonly errorSchema: E
   readonly handler: Context.Service<
     HandlerService<Name, D, P, A, E>,
     Handler<D, P["Type"], A["Type"], E["Type"]>
   >
+  readonly of: (implementation: Handler<D, P["Type"], A["Type"], E["Type"]>) => Handler<
+    D,
+    P["Type"],
+    A["Type"],
+    E["Type"]
+  >
+  readonly toLayer: <EX = never, RX = never,>(
+    build:
+      | Handler<D, P["Type"], A["Type"], E["Type"]>
+      | Effect.Effect<Handler<D, P["Type"], A["Type"], E["Type"]>, EX, RX>
+  ) => Layer.Layer<HandlerService<Name, D, P, A, E>, EX, Exclude<RX, Scope.Scope>>
 }
 
 export interface Any {
   readonly name: string
   readonly version: number
   readonly document: Document.Any
-  readonly payload: Document.WireSchema
-  readonly success: Document.WireSchema
-  readonly error: Document.WireSchema
-  readonly handler: Context.Service<any, any>
+  readonly payloadSchema: Document.WireSchema
+  readonly successSchema: Document.WireSchema
+  readonly errorSchema: TaggedError.Schema
+  readonly handler: Context.Service.Any
 }
 
 export const make = <
@@ -73,7 +86,7 @@ export const make = <
   D extends Document.Any,
   P extends Document.WireSchema = typeof Schema.Void,
   A extends Document.WireSchema = typeof Schema.Void,
-  E extends Document.WireSchema = typeof Schema.Never,
+  E extends TaggedError.Schema = typeof Schema.Never,
 >(
   name: Name,
   options: {
@@ -87,35 +100,19 @@ export const make = <
   if (name.length === 0) throw new TypeError("Mutation name must be nonempty")
   const version = options.version ?? 1
   if (!Number.isSafeInteger(version) || version < 1) throw new TypeError("Mutation version must be a positive integer")
+  const handler = Context.Service<
+    HandlerService<Name, D, P, A, E>,
+    Handler<D, P["Type"], A["Type"], E["Type"]>
+  >(`@lucas-barake/effect-local/Mutation/${options.document.name}/${name}/${handlerId++}`)
   return {
     name,
     version,
     document: options.document,
-    payload: (options.payload ?? Schema.Void) as unknown as P,
-    success: (options.success ?? Schema.Void) as unknown as A,
-    error: (options.error ?? Schema.Never) as unknown as E,
-    handler: Context.Service(`@lucas-barake/effect-local/Mutation/${name}/${nextHandlerId()}`)
+    payloadSchema: (options.payload ?? Schema.Void) as unknown as P,
+    successSchema: (options.success ?? Schema.Void) as unknown as A,
+    errorSchema: (options.error ?? Schema.Never) as unknown as E,
+    handler,
+    of: (implementation) => implementation,
+    toLayer: (build) => Layer.effect(handler, Effect.isEffect(build) ? build : Effect.succeed(build))
   }
 }
-
-export const handler = <
-  Name extends string,
-  D extends Document.Any,
-  P extends Document.WireSchema,
-  A extends Document.WireSchema,
-  E extends Document.WireSchema,
->(
-  _definition: Mutation<Name, D, P, A, E>,
-  implementation: Handler<D, P["Type"], A["Type"], E["Type"]>
-): Handler<D, P["Type"], A["Type"], E["Type"]> => implementation
-
-export const layer = <
-  Name extends string,
-  D extends Document.Any,
-  P extends Document.WireSchema,
-  A extends Document.WireSchema,
-  E extends Document.WireSchema,
->(
-  definition: Mutation<Name, D, P, A, E>,
-  implementation: Handler<D, P["Type"], A["Type"], E["Type"]>
-): Layer.Layer<HandlerService<Name, D, P, A, E>> => Layer.succeed(definition.handler, implementation)

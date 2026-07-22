@@ -1,7 +1,9 @@
+import { NodeCrypto } from "@effect/platform-node"
 import type * as BrowserPeerSession from "@lucas-barake/effect-local-browser/PeerSession"
 import * as Presence from "@lucas-barake/effect-local-browser/Presence"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Context from "effect/Context"
+import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
@@ -9,21 +11,21 @@ import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
 import assert from "node:assert/strict"
 
-class InMemoryPeerSession extends Context.Service<InMemoryPeerSession, BrowserPeerSession.Service>()(
+class InMemoryPeerSession extends Context.Service<InMemoryPeerSession, BrowserPeerSession.PeerSession>()(
   "@effect-local/advanced-api/InMemoryPeerSession"
 ) {}
-
-const peerId = Identity.makePeerId()
 
 const PeerSessionLive = Layer.effect(
   InMemoryPeerSession,
   Effect.gen(function*() {
+    const peerId = yield* Identity.makePeerId
+    const crypto = yield* Crypto.Crypto
     const dirty = yield* Ref.make(new Set<Identity.DocumentId>())
     const observed = yield* Ref.make(new Set<Identity.DocumentId>())
 
     return InMemoryPeerSession.of({
       peerId,
-      connectionEpoch: globalThis.crypto.randomUUID(),
+      connectionEpoch: yield* crypto.randomUUIDv4,
       markDirty: (documentId) => Ref.update(dirty, (documents) => new Set(documents).add(documentId)),
       flush: Effect.gen(function*() {
         const documents = yield* Ref.getAndSet(dirty, new Set())
@@ -42,9 +44,9 @@ const Cursor = Schema.Struct({
 
 const program = Effect.gen(function*() {
   const session = yield* InMemoryPeerSession
-  const presence = yield* Presence.make(Cursor, { ttlMillis: 1_000 })
-  const documentId = Identity.makeDocumentId()
-  const remotePeerId = Identity.makePeerId()
+  const presence = yield* Presence.make(Cursor, { timeToLive: "1 second" })
+  const documentId = yield* Identity.makeDocumentId
+  const remotePeerId = yield* Identity.makePeerId
 
   yield* Effect.scoped(Effect.gen(function*() {
     yield* presence.publish(session.peerId, { cursor: 1, status: "active" })
@@ -73,4 +75,4 @@ const program = Effect.gen(function*() {
   yield* Effect.log("presence expired", yield* presence.values)
 })
 
-Effect.runPromise(program.pipe(Effect.provide(PeerSessionLive)))
+Effect.runPromise(program.pipe(Effect.provide(PeerSessionLive), Effect.provide(NodeCrypto.layer)))

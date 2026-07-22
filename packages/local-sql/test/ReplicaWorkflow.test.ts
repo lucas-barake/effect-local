@@ -8,37 +8,24 @@ describe("ReplicaWorkflow", () => {
     Effect.gen(function*() {
       const payload = {
         replicaIncarnation: Identity.ReplicaIncarnation.make(2),
-        operationId: ReplicaWorkflow.OperationId.make("backup-2026-07-21")
+        operationId: ReplicaWorkflow.OperationId.make("compact-2026-07-21")
       }
-      const first = yield* ReplicaWorkflow.CreateBackup.executionId(payload)
-      const second = yield* ReplicaWorkflow.CreateBackup.executionId(payload)
+      const first = yield* ReplicaWorkflow.CompactReplica.executionId(payload)
+      const second = yield* ReplicaWorkflow.CompactReplica.executionId(payload)
       assert.strictEqual(first, second)
       assert.notStrictEqual(
         first,
-        yield* ReplicaWorkflow.CreateBackup.executionId({
+        yield* ReplicaWorkflow.CompactReplica.executionId({
           ...payload,
           replicaIncarnation: Identity.ReplicaIncarnation.make(3)
         })
       )
       assert.notStrictEqual(
         first,
-        yield* ReplicaWorkflow.CreateBackup.executionId({
+        yield* ReplicaWorkflow.CompactReplica.executionId({
           ...payload,
-          operationId: ReplicaWorkflow.OperationId.make("backup-2026-07-22")
+          operationId: ReplicaWorkflow.OperationId.make("compact-2026-07-22")
         })
-      )
-    }))
-
-  it.effect("keeps projection rebuild identities specific to the projection", () =>
-    Effect.gen(function*() {
-      const payload = {
-        replicaIncarnation: Identity.ReplicaIncarnation.make(1),
-        operationId: ReplicaWorkflow.OperationId.make("rebuild"),
-        projection: "Tasks"
-      }
-      assert.notStrictEqual(
-        yield* ReplicaWorkflow.ProjectionRebuild.executionId(payload),
-        yield* ReplicaWorkflow.ProjectionRebuild.executionId({ ...payload, projection: "Labels" })
       )
     }))
 })

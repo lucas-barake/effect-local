@@ -55,8 +55,11 @@ export const InvalidationMessage = Schema.Union([
 ])
 export type InvalidationMessage = typeof InvalidationMessage.Type
 
-export const QueryError = Schema.TaggedStruct("ReplicaQueryError", { error: Schema.Json })
-export type QueryError = typeof QueryError.Type
+export class ReplicaQueryError extends Schema.TaggedErrorClass<ReplicaQueryError>(
+  "@lucas-barake/effect-local-browser/ReplicaQueryError"
+)("ReplicaQueryError", {
+  error: Schema.Json
+}) {}
 
 export const group = RpcGroup.make(
   Rpc.make("OpenSession", {
@@ -112,7 +115,7 @@ export const group = RpcGroup.make(
   Rpc.make("Query", {
     payload: { sessionId: Identity.SessionId, query: Schema.String, payload: Schema.Json },
     success: Schema.Json,
-    error: Schema.Union([QueryError, ReplicaError.ReplicaError])
+    error: Schema.Union([ReplicaQueryError, ReplicaError.ReplicaError])
   }),
   Rpc.make("LookupMutation", {
     payload: { sessionId: Identity.SessionId, mutation: Schema.String, commandId: Identity.CommandId },

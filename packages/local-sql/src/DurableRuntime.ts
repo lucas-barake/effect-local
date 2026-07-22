@@ -9,7 +9,7 @@ import * as PeerSync from "./PeerSync.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
 import * as ReplicaWorkflow from "./ReplicaWorkflow.js"
 
-export const layer = <A, E, R,>(
+export const layerWith = <A, E, R,>(
   definition: ReplicaDefinition.Any,
   workflowRegistrations: Layer.Layer<A, E, R>
 ) =>
@@ -21,8 +21,8 @@ export const layer = <A, E, R,>(
       Layer.provide(Layer.succeed(SqlClient.SqlClient, sql))
     )
     const workflows = Layer.mergeAll(
-      ReplicaWorkflow.registrationLayer(definition),
-      ReplicaWorkflow.runtimeLayer,
+      ReplicaWorkflow.layerRegistration(definition),
+      ReplicaWorkflow.layerRuntime,
       workflowRegistrations
     )
     return Layer.merge(DocumentEntity.layer(definition).pipe(Layer.provideMerge(PeerSync.layer)), workflows)
@@ -30,3 +30,5 @@ export const layer = <A, E, R,>(
         Layer.provideMerge(cluster)
       )
   }))
+
+export const layer = (definition: ReplicaDefinition.Any) => layerWith(definition, Layer.empty)

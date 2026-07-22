@@ -10,7 +10,7 @@ import * as Stream from "effect/Stream"
 import { AddLabel, definition, RenameTask, SyncTestLive, Task } from "./domain.ts"
 
 interface Side {
-  readonly replica: Replica.Service
+  readonly replica: Replica.Replica["Service"]
   readonly sync: PeerSync.PeerSync["Service"]
   session: PeerSync.Session
 }
@@ -95,7 +95,7 @@ const program = Effect.scoped(Effect.gen(function*() {
   const leftBuilt = yield* buildSide
   const rightBuilt = yield* buildSide
   const created = yield* leftBuilt.replica.create(Task, {
-    commandId: Identity.makeCommandId(),
+    commandId: (yield* Identity.makeCommandId),
     value: { title: "Shared task", completed: false, labels: [] }
   })
   const documentId = yield* CommandOutcome.committedOrFail(created)
@@ -120,16 +120,16 @@ const program = Effect.scoped(Effect.gen(function*() {
 
   yield* Effect.all([
     left.replica.mutate(RenameTask, {
-      commandId: Identity.makeCommandId(),
+      commandId: (yield* Identity.makeCommandId),
       documentId,
       payload: "Edited on the left"
     }).pipe(Effect.andThen(left.replica.mutate(AddLabel, {
-      commandId: Identity.makeCommandId(),
+      commandId: (yield* Identity.makeCommandId),
       documentId,
       payload: "left"
     }))),
     right.replica.mutate(AddLabel, {
-      commandId: Identity.makeCommandId(),
+      commandId: (yield* Identity.makeCommandId),
       documentId,
       payload: "right"
     })
@@ -152,4 +152,5 @@ const program = Effect.scoped(Effect.gen(function*() {
   })
 }))
 
-await Effect.runPromise(program)
+await Effect.runPromise(program.pipe(Effect.provide(NodeCrypto.layer)))
+import { NodeCrypto } from "@effect/platform-node"

@@ -58,10 +58,12 @@ export const evaluate = <P extends Any,>(
     },
     catch: (cause) =>
       new ReplicaError.ReplicaError({
-        reason: {
-          _tag: "ProjectionBlocked",
+        reason: new ReplicaError.ProjectionBlocked({
           projection: self.name,
-          cause: { _tag: "SchemaCause", message: String(cause), path: [] }
-        }
+          cause: new ReplicaError.SchemaCause({
+            message: String(cause),
+            path: []
+          })
+        })
       })
   })

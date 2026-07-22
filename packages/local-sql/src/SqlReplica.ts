@@ -7,6 +7,7 @@ import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import type { ConfigError } from "effect/Config"
+import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
@@ -30,7 +31,7 @@ import * as QueryExecutor from "./QueryExecutor.js"
 import * as Recovery from "./Recovery.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
 import * as ReplicaGate from "./ReplicaGate.js"
-import * as ReplicaWorkflow from "./ReplicaWorkflow.js"
+import type * as ReplicaWorkflow from "./ReplicaWorkflow.js"
 import type * as SqlProjection from "./SqlProjection.js"
 
 export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Layer<
@@ -42,6 +43,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
   | DocumentStore.DocumentStore
   | QueryExecutor.QueryExecutor
   | ReplicaGate.ReplicaGate
+  | Crypto.Crypto
 > =>
   Layer.effect(
     Replica.Replica,
@@ -52,11 +54,12 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
       const documents = yield* DocumentStore.DocumentStore
       const queries = yield* QueryExecutor.QueryExecutor
       const gate = yield* ReplicaGate.ReplicaGate
+      const crypto = yield* Crypto.Crypto
 
       const withPermit = <A, E, R,>(f: (permit: ReplicaGate.Permit) => Effect.Effect<A, E, R>) =>
-        Effect.scoped(Effect.flatMap(gate.shared, f))
+        gate.shared.pipe(Effect.flatMap(f), Effect.scoped)
 
-      const service: Replica.Service = {
+      const service: Replica.Replica["Service"] = {
         create: (document, options) =>
           withPermit((permit) =>
             Effect.gen(function*() {
@@ -68,7 +71,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
                 document,
                 documentId,
                 encoded
-              })
+              }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               const outcome = yield* commands.create(document, { ...options, documentId, permit, requestHash })
               yield* publisher.publishPending
               return outcome
@@ -85,19 +88,21 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
         mutate: <M extends Mutation.Any,>(mutation: M, options: {
           readonly commandId: Identity.CommandId
           readonly documentId: Identity.DocumentId
-          readonly payload?: M["payload"]["Type"]
+          readonly payload?: M["payloadSchema"]["Type"]
         }) =>
           withPermit((permit) =>
             Effect.gen(function*() {
-              const payload = options.payload as M["payload"]["Type"]
-              const encoded = yield* Schema.encodeEffect(mutation.payload)(payload).pipe(
+              const payload = options.payload as M["payloadSchema"]["Type"]
+              const encoded = yield* Schema.encodeEffect(mutation.payloadSchema)(payload).pipe(
                 Effect.mapError((cause) =>
                   new ReplicaError.ReplicaError({
-                    reason: {
-                      _tag: "DocumentDecodeError",
+                    reason: new ReplicaError.DocumentDecodeError({
                       documentId: options.documentId,
-                      cause: { _tag: "SchemaCause", message: String(cause), path: [] }
-                    }
+                      cause: new ReplicaError.SchemaCause({
+                        message: String(cause),
+                        path: []
+                      })
+                    })
                   })
                 )
               )
@@ -107,7 +112,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
                 documentId: options.documentId,
                 mutation,
                 payload: encoded
-              })
+              }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               const outcome = yield* commands.mutate(mutation, { ...options, payload, permit, requestHash })
               yield* publisher.publishPending
               return outcome
@@ -121,7 +126,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
                 commandId: options.commandId,
                 document,
                 documentId: options.documentId
-              })
+              }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               const outcome = yield* commands.delete(document, { ...options, permit, requestHash })
               yield* publisher.publishPending
               return outcome
@@ -129,8 +134,9 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
           ),
         query: <Q extends Query.Any,>(
           query: Q,
-          ...payload: [Q["payload"]["Type"]] extends [void] ? readonly [] : readonly [payload: Q["payload"]["Type"]]
-        ) => withPermit(() => queries.execute(query, payload[0] as Q["payload"]["Type"])),
+          ...payload: [Q["payloadSchema"]["Type"]] extends [void] ? readonly []
+            : readonly [payload: Q["payloadSchema"]["Type"]]
+        ) => withPermit(() => queries.execute(query, payload[0] as Q["payloadSchema"]["Type"])),
         lookupMutation: (mutation, commandId) =>
           withPermit((permit) => commands.lookupMutation(mutation, commandId, permit)),
         lookupCreate: (_document, commandId) => withPermit((permit) => commands.lookupCreate(commandId, permit)),
@@ -159,10 +165,12 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
           Effect.gen(function*() {
             if (options.value.documentName !== document.name || options.value.schemaVersion !== document.version) {
               return yield* new ReplicaError.ReplicaError({
-                reason: {
-                  _tag: "BackupInvalid",
-                  cause: { _tag: "SchemaCause", message: "Portable document definition mismatch", path: [] }
-                }
+                reason: new ReplicaError.BackupInvalid({
+                  cause: new ReplicaError.SchemaCause({
+                    message: "Portable document definition mismatch",
+                    path: []
+                  })
+                })
               })
             }
             const documentId = Identity.documentIdFromCommandId(options.commandId)
@@ -182,13 +190,14 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   | PeerSync.PeerSync
   | Replica.Replica
   | ReplicaGate.ReplicaGate
-  | ReplicaWorkflow.WorkflowRuntime
+  | ReplicaWorkflow.CompactionWorkflow
   | Sharding.Sharding,
   ConfigError | Migrator.MigrationError | ReplicaError.ReplicaError | SqlError.SqlError,
   | CommandExecutor.MutationHandlers<D>
   | ProjectionStore.BindingServices<Bindings>
   | QueryExecutor.QueryHandlers<D>
   | ReplicaLimits.ReplicaLimits
+  | Crypto.Crypto
   | SqlClient.SqlClient
 > => {
   const expected = new Set(definition.projections)
@@ -208,11 +217,8 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   )
   const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
   const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
-  const durable = DurableRuntime.layer(definition, Layer.empty).pipe(
+  const durable = DurableRuntime.layer(definition).pipe(
     Layer.provideMerge(Layer.merge(backups, compaction))
   )
-  return Layer.merge(
-    EntityReplica.layer(definition),
-    Layer.effect(ReplicaWorkflow.WorkflowRuntime, ReplicaWorkflow.WorkflowRuntime)
-  ).pipe(Layer.provideMerge(durable))
+  return EntityReplica.layer(definition).pipe(Layer.provideMerge(durable))
 }

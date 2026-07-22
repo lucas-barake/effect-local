@@ -1,8 +1,10 @@
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Schema from "effect/Schema"
 import * as Migrator from "effect/unstable/sql/Migrator"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
+import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 
 export const canonicalStoreChecksum = "sha256:effect-local-canonical-store-v1"
 export const peerSyncChecksum = "sha256:effect-local-peer-sync-v3"
@@ -185,38 +187,38 @@ const durabilityIndexesMigration = Effect.gen(function*() {
     VALUES (3, 'durability_indexes', ${durabilityIndexesChecksum})`
 })
 
-export const loader = Effect.succeed([
-  [1, "canonical_store", Effect.succeed(migration)] as const,
-  [2, "peer_sync", Effect.succeed(peerSyncMigration)] as const,
-  [3, "durability_indexes", Effect.succeed(durabilityIndexesMigration)] as const
-])
+export const loader = Migrator.fromRecord({
+  "1_canonical_store": migration,
+  "2_peer_sync": peerSyncMigration,
+  "3_durability_indexes": durabilityIndexesMigration
+})
 
 const migrate = Migrator.make({})({ loader, table: "effect_local_migrations" })
 
 export const run = Effect.gen(function*() {
   const applied = yield* migrate
   const sql = yield* SqlClient.SqlClient
-  const rows = yield* sql<{ readonly checksum: string; readonly name: string }>`
-    SELECT name, checksum FROM effect_local_migration_catalog WHERE migration_id = 1
-  `
+  const findCatalog = SqlSchema.findAll({
+    Request: Schema.Int,
+    Result: Schema.Struct({ checksum: Schema.String, name: Schema.String }),
+    execute: (migrationId) =>
+      sql`SELECT name, checksum FROM effect_local_migration_catalog WHERE migration_id = ${migrationId}`
+  })
+  const rows = yield* findCatalog(1)
   if (rows[0]?.name !== "canonical_store" || rows[0]?.checksum !== canonicalStoreChecksum) {
     return yield* new Migrator.MigrationError({
       kind: "BadState",
       message: "Canonical store migration checksum mismatch"
     })
   }
-  const peerRows = yield* sql<{ readonly checksum: string; readonly name: string }>`
-    SELECT name, checksum FROM effect_local_migration_catalog WHERE migration_id = 2
-  `
+  const peerRows = yield* findCatalog(2)
   if (peerRows[0]?.name !== "peer_sync" || peerRows[0]?.checksum !== peerSyncChecksum) {
     return yield* new Migrator.MigrationError({
       kind: "BadState",
       message: "Peer sync migration checksum mismatch"
     })
   }
-  const durabilityRows = yield* sql<{ readonly checksum: string; readonly name: string }>`
-    SELECT name, checksum FROM effect_local_migration_catalog WHERE migration_id = 3
-  `
+  const durabilityRows = yield* findCatalog(3)
   if (
     durabilityRows[0]?.name !== "durability_indexes" ||
     durabilityRows[0]?.checksum !== durabilityIndexesChecksum
@@ -227,7 +229,15 @@ export const run = Effect.gen(function*() {
     })
   }
   return applied
-})
+}).pipe(
+  Effect.catchTag("SchemaError", (cause) =>
+    Effect.fail(
+      new Migrator.MigrationError({
+        kind: "BadState",
+        message: `Invalid migration catalog: ${cause}`
+      })
+    ))
+)
 
 export const layer: Layer.Layer<never, Migrator.MigrationError | SqlError.SqlError, SqlClient.SqlClient> = Layer
   .effectDiscard(run)

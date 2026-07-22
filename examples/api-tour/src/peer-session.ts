@@ -1,3 +1,4 @@
+import { NodeCrypto } from "@effect/platform-node"
 import * as PeerSession from "@lucas-barake/effect-local-browser/PeerSession"
 import * as FaultInjection from "@lucas-barake/effect-local-test/FaultInjection"
 import * as TestPeer from "@lucas-barake/effect-local-test/TestPeer"
@@ -36,7 +37,7 @@ const program = Effect.scoped(Effect.gen(function*() {
   if (leftReplica === rightReplica) return yield* Effect.die("Peer engines must be isolated")
 
   const created = yield* leftReplica.create(Task, {
-    commandId: Identity.makeCommandId(),
+    commandId: (yield* Identity.makeCommandId),
     value: { title: "PeerSession", completed: false, labels: [] }
   })
   const documentId = yield* CommandOutcome.committedOrFail(created)
@@ -48,7 +49,7 @@ const program = Effect.scoped(Effect.gen(function*() {
     expectedDefinitionHash: definition.hash
   })
   yield* leftReplica.mutate(RenameTask, {
-    commandId: Identity.makeCommandId(),
+    commandId: (yield* Identity.makeCommandId),
     documentId,
     payload: "Synchronized through PeerSession"
   })
@@ -100,4 +101,4 @@ const program = Effect.scoped(Effect.gen(function*() {
   })
 }))
 
-await Effect.runPromise(program)
+await Effect.runPromise(program.pipe(Effect.provide(NodeCrypto.layer)))

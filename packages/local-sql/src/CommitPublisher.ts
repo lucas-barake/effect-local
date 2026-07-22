@@ -3,8 +3,10 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as PubSub from "effect/PubSub"
 import * as Ref from "effect/Ref"
+import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
@@ -18,6 +20,8 @@ const OutboxRow = Schema.Struct({
   document_id: Identity.DocumentId,
   invalidation_keys: Schema.fromJsonString(Schema.Array(Schema.String))
 })
+
+const WatermarkRow = Schema.Struct({ watermark: Identity.CommitSequence })
 
 export type CommitEvent =
   | {
@@ -56,6 +60,13 @@ export const layer: Layer.Layer<CommitPublisher, never, Reactivity.Reactivity | 
         sql`SELECT commit_sequence, document_id, invalidation_keys
           FROM effect_local_commit_outbox WHERE published = 0 ORDER BY commit_sequence`
     })
+    const findWatermark = SqlSchema.findOneOption({
+      Request: Schema.Void,
+      Result: WatermarkRow,
+      execute: () =>
+        sql`SELECT COALESCE(MAX(commit_sequence), 0) AS watermark
+          FROM effect_local_commit_outbox WHERE published = 1`
+    })
     const invalidate = (keys: ReadonlyArray<unknown>) =>
       lock.withPermit(
         reactivity.invalidate(keys).pipe(
@@ -91,19 +102,23 @@ export const layer: Layer.Layer<CommitPublisher, never, Reactivity.Reactivity | 
         SqlError: (cause) =>
           Effect.fail(
             new ReplicaError.ReplicaError({
-              reason: {
-                _tag: "StorageUnavailable",
-                cause: { _tag: "SqlCause", message: String(cause), code: null }
-              }
+              reason: new ReplicaError.StorageUnavailable({
+                cause: new ReplicaError.SqlCause({
+                  message: String(cause),
+                  code: null
+                })
+              })
             })
           ),
         SchemaError: (cause) =>
           Effect.fail(
             new ReplicaError.ReplicaError({
-              reason: {
-                _tag: "StorageUnavailable",
-                cause: { _tag: "SqlCause", message: String(cause), code: null }
-              }
+              reason: new ReplicaError.StorageCorrupt({
+                cause: new ReplicaError.SchemaCause({
+                  message: String(cause),
+                  path: []
+                })
+              })
             })
           )
       })
@@ -111,19 +126,37 @@ export const layer: Layer.Layer<CommitPublisher, never, Reactivity.Reactivity | 
     const subscribe = lock.withPermit(Effect.gen(function*() {
       const subscription = yield* PubSub.subscribe(events)
       const generation = yield* Ref.get(refreshGeneration)
-      const rows = yield* sql<{ readonly watermark: number }>`SELECT COALESCE(MAX(commit_sequence), 0) AS watermark
-        FROM effect_local_commit_outbox WHERE published = 1`.pipe(
-        Effect.mapError((cause) =>
-          new ReplicaError.ReplicaError({
-            reason: {
-              _tag: "StorageUnavailable",
-              cause: { _tag: "SqlCause", message: String(cause), code: null }
-            }
-          })
-        )
+      const watermark = yield* findWatermark(undefined).pipe(
+        Effect.catchTags({
+          SqlError: (cause) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: new ReplicaError.SqlCause({
+                    message: String(cause),
+                    code: null
+                  })
+                })
+              })
+            ),
+          SchemaError: (cause) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({
+                  cause: new ReplicaError.SchemaCause({
+                    message: String(cause),
+                    path: []
+                  })
+                })
+              })
+            )
+        })
       )
       return {
-        watermark: Identity.CommitSequence.make(rows[0]?.watermark ?? 0),
+        watermark: Option.match(watermark, {
+          onNone: () => Identity.CommitSequence.make(0),
+          onSome: (row) => row.watermark
+        }),
         refreshGeneration: generation,
         events: Stream.fromSubscription(subscription).pipe(
           Stream.mapAccum(
@@ -141,8 +174,7 @@ export const layer: Layer.Layer<CommitPublisher, never, Reactivity.Reactivity | 
     }))
     yield* publishPending.pipe(
       Effect.catchTag("ReplicaError", () => Effect.void),
-      Effect.andThen(Effect.sleep("1 second")),
-      Effect.forever,
+      Effect.repeat(Schedule.spaced("1 second")),
       Effect.forkScoped({ startImmediately: true })
     )
     return CommitPublisher.of({ invalidate, publishPending, subscribe })

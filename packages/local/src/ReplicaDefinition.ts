@@ -82,10 +82,10 @@ export const make = <
       })),
       mutations: options.mutations.map((mutation) => ({
         document: mutation.document.name,
-        error: schemaDescriptor(mutation.error),
+        error: schemaDescriptor(mutation.errorSchema),
         name: mutation.name,
-        payload: schemaDescriptor(mutation.payload),
-        success: schemaDescriptor(mutation.success),
+        payload: schemaDescriptor(mutation.payloadSchema),
+        success: schemaDescriptor(mutation.successSchema),
         version: mutation.version
       })),
       projections: options.projections.map((projection) => ({
@@ -96,10 +96,10 @@ export const make = <
       })),
       queries: options.queries.map((query) => ({
         dependencies: query.dependsOn.map((projection: Projection.Any) => projection.name),
-        error: schemaDescriptor(query.error),
+        error: schemaDescriptor(query.errorSchema),
         name: query.name,
-        payload: schemaDescriptor(query.payload),
-        success: schemaDescriptor(query.success),
+        payload: schemaDescriptor(query.payloadSchema),
+        success: schemaDescriptor(query.successSchema),
         version: query.version
       }))
     })

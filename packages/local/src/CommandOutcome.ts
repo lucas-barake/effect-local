@@ -21,6 +21,12 @@ export interface OutcomeUnknown {
   readonly commandId: Identity.CommandId
 }
 
+export class CommandOutcomeUnknown extends Schema.TaggedErrorClass<CommandOutcomeUnknown>(
+  "@lucas-barake/effect-local/CommandOutcome/CommandOutcomeUnknown"
+)("CommandOutcomeUnknown", {
+  commandId: Identity.CommandId
+}) {}
+
 export type CommandOutcome<A, E = never,> = Rejected<E> | DurablyCommittedLocal<A> | OutcomeUnknown
 
 export const schema = <A extends Document.WireSchema, E extends Document.WireSchema,>(success: A, error: E) =>
@@ -60,5 +66,9 @@ export const match = <A, E, B,>(
 
 export const committedOrFail = <A, E,>(
   self: CommandOutcome<A, E>
-): Effect.Effect<A, Rejected<E> | OutcomeUnknown> =>
-  self._tag === "DurablyCommittedLocal" ? Effect.succeed(self.value) : Effect.fail(self)
+): Effect.Effect<A, E | CommandOutcomeUnknown> =>
+  self._tag === "DurablyCommittedLocal" ?
+    Effect.succeed(self.value)
+    : self._tag === "Rejected" ?
+    Effect.fail(self.error)
+    : Effect.fail(new CommandOutcomeUnknown({ commandId: self.commandId }))

@@ -33,7 +33,7 @@ crash after publish leaves enough history to recover.
 `ClusterWorkflowEngine` uses the same SQL backed single runner composition as document entities. Message and runner
 storage use private `effect_local_cluster` and `effect_local_runner` table prefixes. The registered
 compaction workflow derives its execution identity from replica incarnation and operation identity. It journals a
-document listing activity and one compact and prune activity per document. `WorkflowRuntime` exposes execute, poll,
+document listing activity and one compact and prune activity per document. `CompactionWorkflow` exposes execute, poll,
 and resume while rejecting handles from a prior replica incarnation.
 
 Projection rebuild, backup, and restore definitions reserve stable identities but are not registered operations in

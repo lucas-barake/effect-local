@@ -12,4 +12,4 @@ export const layer = DatabasePort.pipe(
   Layer.unwrap
 )
 
-export const layerPort = (port: MessagePort) => layer.pipe(Layer.provide(Layer.succeed(DatabasePort, port)))
+export const layerMessagePort = (port: MessagePort) => layer.pipe(Layer.provide(Layer.succeed(DatabasePort, port)))

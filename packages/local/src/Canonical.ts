@@ -1,4 +1,8 @@
+import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
+import * as Encoding from "effect/Encoding"
+import * as Schema from "effect/Schema"
+import * as ReplicaError from "./ReplicaError.js"
 
 const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   if (typeof value === "function" || typeof value === "symbol") return String(value)
@@ -19,7 +23,8 @@ const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   return result
 }
 
-export const stringify = (value: unknown): string => JSON.stringify(normalize(value, new WeakSet()))
+export const stringify = (value: unknown): string =>
+  Schema.encodeSync(Schema.UnknownFromJsonString)(normalize(value, new WeakSet()))
 
 export const hash = (value: unknown): string => {
   const input = stringify(value)
@@ -31,7 +36,12 @@ export const hash = (value: unknown): string => {
   return current.toString(16).padStart(16, "0")
 }
 
-export const digest = (value: unknown): Effect.Effect<string> =>
-  Effect.promise(() => globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(stringify(value)))).pipe(
-    Effect.map((bytes) => Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join(""))
+export const digest = (value: unknown) =>
+  Crypto.Crypto.use((crypto) => crypto.digest("SHA-256", new TextEncoder().encode(stringify(value)))).pipe(
+    Effect.map(Encoding.encodeHex),
+    Effect.mapError((cause) =>
+      new ReplicaError.ReplicaError({
+        reason: new ReplicaError.StorageUnavailable({ cause: new ReplicaError.CryptoCause({ message: String(cause) }) })
+      })
+    )
   )

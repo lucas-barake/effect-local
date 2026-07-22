@@ -1,3 +1,4 @@
+import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
@@ -8,14 +9,18 @@ import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
 import * as TestClock from "effect/testing/TestClock"
 import * as MessageStorage from "effect/unstable/cluster/MessageStorage"
 import * as Runners from "effect/unstable/cluster/Runners"
 import * as Sharding from "effect/unstable/cluster/Sharding"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as DurableClock from "effect/unstable/workflow/DurableClock"
+import * as Workflow from "effect/unstable/workflow/Workflow"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
 import { rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -36,6 +41,10 @@ describe("DurableRuntime", () => {
     version: 1
   })
   const Rename = Mutation.make("Rename", { document: Task, payload: Schema.String })
+  const RestartWorkflow = Workflow.make("EffectLocal/TestRestartWorkflow", {
+    payload: { operationId: Schema.String },
+    idempotencyKey: ({ operationId }) => operationId
+  })
   const definition = ReplicaDefinition.make({
     name: "tasks",
     documents: DocumentSet.make(Task),
@@ -43,7 +52,10 @@ describe("DurableRuntime", () => {
     projections: [],
     queries: []
   })
-  const Database = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+  const Database = Layer.merge(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer
+  )
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Executor = Layer.succeed(
     CommandExecutor.CommandExecutor,
@@ -87,19 +99,20 @@ describe("DurableRuntime", () => {
   const RecoveryService = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate)))
   const CompactionService = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate, RecoveryService)))
   const Inputs = Layer.mergeAll(Database, Bootstrap, Executor, Limits, Gate, Store, RecoveryService, CompactionService)
-  const Live = DurableRuntime.layer(definition, Layer.empty).pipe(Layer.provide(Inputs))
+  const Live = DurableRuntime.layer(definition).pipe(Layer.provide(Inputs))
   const Services = Layer.merge(Inputs, Live)
 
-  const servicesAt = (filename: string) => {
-    const database = SqliteClient.layer({ filename, disableWAL: true })
+  const servicesAtWith = <A, E, R,>(filename: string, workflowRegistrations: Layer.Layer<A, E, R>) => {
+    const database = Layer.merge(SqliteClient.layer({ filename, disableWAL: true }), NodeCrypto.layer)
     const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(database))
     const gate = ReplicaGate.layer.pipe(Layer.provide(Layer.merge(database, bootstrap)))
     const store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(database, gate)))
     const recovery = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(database, gate)))
     const compaction = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(database, gate, recovery)))
     const inputs = Layer.mergeAll(database, bootstrap, Executor, Limits, gate, store, recovery, compaction)
-    return Layer.merge(inputs, DurableRuntime.layer(definition, Layer.empty).pipe(Layer.provide(inputs)))
+    return Layer.merge(inputs, DurableRuntime.layerWith(definition, workflowRegistrations).pipe(Layer.provide(inputs)))
   }
+  const servicesAt = (filename: string) => servicesAtWith(filename, Layer.empty)
 
   it.effect("activates the SQL runner, entity, message storage, and workflow engine", () =>
     Effect.gen(function*() {
@@ -120,10 +133,10 @@ describe("DurableRuntime", () => {
 
   it.effect("executes and polls an incarnation-scoped compaction operation", () =>
     Effect.gen(function*() {
-      const runtime = yield* ReplicaWorkflow.WorkflowRuntime
+      const runtime = yield* ReplicaWorkflow.CompactionWorkflow
       const store = yield* DocumentStore.DocumentStore
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const stored = yield* store.create(Task, documentId, { title: "compact me" })
       InternalAutomerge.free(stored.automerge)
 
@@ -138,7 +151,6 @@ describe("DurableRuntime", () => {
       const result = yield* runtime.poll(execution)
       assert.isTrue(Option.isSome(result))
       if (Option.isSome(result)) assert.strictEqual(result.value._tag, "Complete")
-      yield* runtime.resume(execution)
       const checkpoints = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
         FROM effect_local_checkpoints WHERE document_id = ${documentId}`
       assert.strictEqual(checkpoints[0]?.count, 1)
@@ -147,9 +159,9 @@ describe("DurableRuntime", () => {
   it.effect("fences workflow handles from a prior replica incarnation", () =>
     Effect.gen(function*() {
       const gate = yield* ReplicaGate.ReplicaGate
-      const runtime = yield* ReplicaWorkflow.WorkflowRuntime
+      const runtime = yield* ReplicaWorkflow.CompactionWorkflow
       const execution = yield* runtime.execute(ReplicaWorkflow.OperationId.make("before-restore"))
-      yield* Effect.scoped(gate.exclusive)
+      yield* gate.claim(() => Effect.void)
       const result = yield* Effect.exit(runtime.poll(execution))
       assert.strictEqual(result._tag, "Failure")
     }).pipe(Effect.provide(Services)))
@@ -157,14 +169,14 @@ describe("DurableRuntime", () => {
   it.effect("rejects resuming a stale incarnation without compacting documents", () =>
     Effect.gen(function*() {
       const gate = yield* ReplicaGate.ReplicaGate
-      const runtime = yield* ReplicaWorkflow.WorkflowRuntime
+      const runtime = yield* ReplicaWorkflow.CompactionWorkflow
       const store = yield* DocumentStore.DocumentStore
       const sql = yield* SqlClient.SqlClient
-      const documentId = Identity.makeDocumentId()
+      const documentId = yield* Identity.makeDocumentId
       const stored = yield* store.create(Task, documentId, { title: "stale" })
       InternalAutomerge.free(stored.automerge)
       const execution = yield* runtime.execute(ReplicaWorkflow.OperationId.make("stale-resume"))
-      yield* Effect.scoped(gate.exclusive)
+      yield* gate.claim(() => Effect.void)
 
       assert.strictEqual((yield* Effect.exit(runtime.resume(execution)))._tag, "Failure")
       const checkpoints = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
@@ -174,7 +186,7 @@ describe("DurableRuntime", () => {
 
   it.effect("rejects workflow handles whose execution id does not match the operation", () =>
     Effect.gen(function*() {
-      const runtime = yield* ReplicaWorkflow.WorkflowRuntime
+      const runtime = yield* ReplicaWorkflow.CompactionWorkflow
       const first = yield* runtime.execute(ReplicaWorkflow.OperationId.make("first-operation"))
       const second = yield* runtime.execute(ReplicaWorkflow.OperationId.make("second-operation"))
       const forged = { ...first, executionId: second.executionId }
@@ -188,10 +200,10 @@ describe("DurableRuntime", () => {
       yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(filename, { force: true })))
       const execution = yield* Effect.scoped(
         Effect.gen(function*() {
-          const runtime = yield* ReplicaWorkflow.WorkflowRuntime
+          const runtime = yield* ReplicaWorkflow.CompactionWorkflow
           const sharding = yield* Sharding.Sharding
           const store = yield* DocumentStore.DocumentStore
-          const stored = yield* store.create(Task, Identity.makeDocumentId(), { title: "restart" })
+          const stored = yield* store.create(Task, yield* Identity.makeDocumentId, { title: "restart" })
           InternalAutomerge.free(stored.automerge)
           const execution = yield* runtime.execute(ReplicaWorkflow.OperationId.make("restart-compaction"))
           for (let round = 0; round < 4; round++) {
@@ -205,11 +217,64 @@ describe("DurableRuntime", () => {
 
       yield* Effect.scoped(
         Effect.gen(function*() {
-          const runtime = yield* ReplicaWorkflow.WorkflowRuntime
+          const runtime = yield* ReplicaWorkflow.CompactionWorkflow
           const result = yield* runtime.poll(execution)
           assert.isTrue(Option.isSome(result))
           if (Option.isSome(result)) assert.strictEqual(result.value._tag, "Complete")
         }).pipe(Effect.provide(servicesAt(filename)))
+      )
+    }))
+
+  it.effect("reconciles a suspended in-flight workflow after the SQL runtime restarts", () =>
+    Effect.gen(function*() {
+      const filename = join(tmpdir(), `effect-local-workflow-${globalThis.crypto.randomUUID()}.sqlite`)
+      yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(filename, { force: true })))
+      const attempts = yield* Ref.make(0)
+      const registration = RestartWorkflow.toLayer(Effect.fn(function*() {
+        yield* Ref.update(attempts, (value) => value + 1)
+        yield* DurableClock.sleep({
+          name: "RestartDelay",
+          duration: "1 hour",
+          inMemoryThreshold: 0
+        })
+      }))
+      const executionId = yield* Effect.scoped(
+        Effect.gen(function*() {
+          const sharding = yield* Sharding.Sharding
+          const executionId = yield* RestartWorkflow.execute(
+            { operationId: "restart-interrupted" },
+            { discard: true }
+          )
+          for (let round = 0; round < 4; round++) {
+            yield* sharding.pollStorage
+            yield* TestClock.adjust(5_000)
+          }
+          const suspended = yield* RestartWorkflow.poll(executionId)
+          assert.isTrue(Option.isSome(suspended))
+          if (Option.isSome(suspended)) assert.strictEqual(suspended.value._tag, "Suspended")
+          assert.strictEqual(yield* Ref.get(attempts), 1)
+          return executionId
+        }).pipe(Effect.provide(servicesAtWith(filename, registration)))
+      )
+
+      yield* Effect.scoped(
+        Effect.gen(function*() {
+          const sharding = yield* Sharding.Sharding
+          yield* RestartWorkflow.resume(executionId)
+          yield* sharding.pollStorage
+          yield* TestClock.adjust("1 hour")
+          for (let round = 0; round < 4; round++) {
+            yield* sharding.pollStorage
+            yield* TestClock.adjust(5_000)
+          }
+          const reconciled = yield* RestartWorkflow.poll(executionId)
+          assert.isTrue(Option.isSome(reconciled))
+          if (Option.isSome(reconciled)) {
+            assert.strictEqual(reconciled.value._tag, "Complete")
+            if (reconciled.value._tag === "Complete") assert.isTrue(Exit.isSuccess(reconciled.value.exit))
+          }
+          assert.isAtLeast(yield* Ref.get(attempts), 2)
+        }).pipe(Effect.provide(servicesAtWith(filename, registration)))
       )
     }))
 })

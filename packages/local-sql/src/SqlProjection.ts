@@ -4,12 +4,12 @@ import * as Context from "effect/Context"
 import type * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
+import type * as SqlError from "effect/unstable/sql/SqlError"
 
 export interface Migration {
   readonly id: number
   readonly name: string
-  readonly checksum: string
-  readonly run: (sql: SqlClient.SqlClient, destinationTable: string) => Effect.Effect<void, unknown>
+  readonly run: (sql: SqlClient.SqlClient, destinationTable: string) => Effect.Effect<void, SqlError.SqlError>
 }
 
 export interface SqlProjection<P extends Projection.Any,> {
@@ -20,12 +20,12 @@ export interface SqlProjection<P extends Projection.Any,> {
     sql: SqlClient.SqlClient,
     destinationTable: string,
     documentId: Identity.DocumentId
-  ) => Effect.Effect<void, unknown>
+  ) => Effect.Effect<void, SqlError.SqlError>
   readonly insert: (
     sql: SqlClient.SqlClient,
     destinationTable: string,
     row: P["Row"]["Type"]
-  ) => Effect.Effect<void, unknown>
+  ) => Effect.Effect<void, SqlError.SqlError>
   readonly service: Context.Service<BindingService<P>, SqlProjection<P>>
   readonly layer: Layer.Layer<BindingService<P>>
 }
@@ -33,8 +33,6 @@ export interface SqlProjection<P extends Projection.Any,> {
 export interface BindingService<P extends Projection.Any,> {
   readonly projection: P
 }
-
-let bindingId = 0
 
 export const make = <P extends Projection.Any,>(
   projection: P,
@@ -52,7 +50,7 @@ export const make = <P extends Projection.Any,>(
     ids.add(migration.id)
   }
   const service = Context.Service<BindingService<P>, SqlProjection<P>>(
-    `@lucas-barake/effect-local-sql/SqlProjection/${projection.name}/${++bindingId}`
+    `@lucas-barake/effect-local-sql/SqlProjection/${projection.name}`
   )
   const binding = { projection, service, ...options } as SqlProjection<P>
   return Object.assign(binding, { layer: Layer.succeed(service, binding) })
