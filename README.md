@@ -813,6 +813,7 @@ Run commands from the repository root.
 
 | Script                  | Purpose                                                              |
 | ----------------------- | -------------------------------------------------------------------- |
+| `pnpm bench`            | Run reproducible library benchmarks once                             |
 | `pnpm build`            | Build all publishable packages with TypeScript project references    |
 | `pnpm build:examples`   | Build every example package                                          |
 | `pnpm check`            | Type check packages, tests, and examples                             |

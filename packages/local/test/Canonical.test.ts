@@ -9,6 +9,15 @@ describe("Canonical", () => {
     assert.strictEqual(Canonical.hash({ b: 2, a: 1 }), Canonical.hash({ a: 1, b: 2 }))
   })
 
+  it("preserves the canonical Uint8Array representation", () => {
+    const value = { attachment: new Uint8Array([0, 1, 15, 16, 254, 255]) }
+    assert.strictEqual(
+      Canonical.stringify(value),
+      "{\"attachment\":{\"_tag\":\"Uint8Array\",\"value\":\"00010f10feff\"}}"
+    )
+    assert.strictEqual(Canonical.hash(value), "75637f61f92444be")
+  })
+
   it.effect("computes a stable SHA-256 digest", () =>
     Effect.gen(function*() {
       const first = yield* Canonical.digest({ b: 2, a: 1 })

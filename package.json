@@ -8,6 +8,7 @@
   ],
   "scripts": {
     "clean": "node scripts/clean.mjs",
+    "bench": "vitest bench --run",
     "build": "tsc -b tsconfig.packages.json",
     "build:examples": "pnpm --dir examples/browser-spike build && pnpm --dir examples/tasks build && pnpm --dir examples/api-tour build && pnpm --dir examples/advanced-api build",
     "build:tsgo": "tsgo -b tsconfig.packages.json",

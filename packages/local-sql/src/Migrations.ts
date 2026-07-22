@@ -9,6 +9,7 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 export const canonicalStoreChecksum = "sha256:effect-local-canonical-store-v1"
 export const peerSyncChecksum = "sha256:effect-local-peer-sync-v3"
 export const durabilityIndexesChecksum = "sha256:effect-local-durability-indexes-v1"
+export const projectionReadinessChecksum = "sha256:effect-local-projection-readiness-v1"
 
 const migration = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
@@ -187,10 +188,20 @@ const durabilityIndexesMigration = Effect.gen(function*() {
     VALUES (3, 'durability_indexes', ${durabilityIndexesChecksum})`
 })
 
+const projectionReadinessMigration = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`CREATE INDEX effect_local_document_projections_not_ready
+    ON effect_local_document_projections(projection_name)
+    WHERE status != 'Ready'`
+  yield* sql`INSERT INTO effect_local_migration_catalog (migration_id, name, checksum)
+    VALUES (4, 'projection_readiness', ${projectionReadinessChecksum})`
+})
+
 export const loader = Migrator.fromRecord({
   "1_canonical_store": migration,
   "2_peer_sync": peerSyncMigration,
-  "3_durability_indexes": durabilityIndexesMigration
+  "3_durability_indexes": durabilityIndexesMigration,
+  "4_projection_readiness": projectionReadinessMigration
 })
 
 const migrate = Migrator.make({})({ loader, table: "effect_local_migrations" })
@@ -226,6 +237,16 @@ export const run = Effect.gen(function*() {
     return yield* new Migrator.MigrationError({
       kind: "BadState",
       message: "Durability indexes migration checksum mismatch"
+    })
+  }
+  const projectionReadinessRows = yield* findCatalog(4)
+  if (
+    projectionReadinessRows[0]?.name !== "projection_readiness" ||
+    projectionReadinessRows[0]?.checksum !== projectionReadinessChecksum
+  ) {
+    return yield* new Migrator.MigrationError({
+      kind: "BadState",
+      message: "Projection readiness migration checksum mismatch"
     })
   }
   return applied

@@ -10,7 +10,7 @@ const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   if (value === null || typeof value !== "object") return value
   if (value instanceof Date) return { _tag: "Date", value: value.toISOString() }
   if (value instanceof Uint8Array) {
-    return { _tag: "Uint8Array", value: Array.from(value, (byte) => byte.toString(16).padStart(2, "0")).join("") }
+    return { _tag: "Uint8Array", value: Encoding.encodeHex(value) }
   }
   if (ancestors.has(value)) return "[Circular]"
   ancestors.add(value)
