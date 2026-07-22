@@ -35,7 +35,7 @@ export const SetTaskCompleted = Mutation.make("SetTaskCompleted", {
   payload: { completed: Schema.Boolean }
 })
 
-export const TaskRow = Schema.Struct({
+const TaskRow = Schema.Struct({
   sourceDocumentId: Identity.DocumentId,
   title: Title,
   completed: Schema.Boolean,

@@ -74,5 +74,3 @@ export const client = {
     engineWorkers.clear()
   }
 }
-
-export type Stage0Client = typeof client

@@ -10,7 +10,7 @@ export const CommandResult = Schema.Struct({
   value: Schema.String
 })
 
-export const CommandSnapshot = Schema.Struct({
+const CommandSnapshot = Schema.Struct({
   commandId: Schema.String,
   eventCount: Schema.Number,
   latestValue: Schema.String,
@@ -19,7 +19,7 @@ export const CommandSnapshot = Schema.Struct({
   storedReplyPayload: Schema.String
 })
 
-export const RollbackSnapshot = Schema.Struct({
+const RollbackSnapshot = Schema.Struct({
   commandId: Schema.String,
   eventCount: Schema.Number,
   messageCount: Schema.Number,
@@ -29,18 +29,18 @@ export const RollbackSnapshot = Schema.Struct({
   triggerCount: Schema.Number
 })
 
-export const Pulse = Schema.Struct({
+const Pulse = Schema.Struct({
   emittedAt: Schema.Number,
   index: Schema.Number
 })
 
-export const DatabaseWork = Schema.Struct({
+const DatabaseWork = Schema.Struct({
   finishedAt: Schema.Number,
   startedAt: Schema.Number,
   total: Schema.Number
 })
 
-export const WorkflowSnapshot = Schema.Struct({
+const WorkflowSnapshot = Schema.Struct({
   beginCount: Schema.Number,
   completeCount: Schema.Number,
   executionId: Schema.String,
@@ -53,7 +53,7 @@ export const RecoveryWorkflow = Workflow.make("Stage0RecoveryWorkflow", {
   idempotencyKey: ({ id }) => id
 })
 
-export const Commit = Rpc.make("Commit", {
+const Commit = Rpc.make("Commit", {
   success: CommandResult,
   payload: {
     commandId: Schema.String,
@@ -67,7 +67,7 @@ export const Commit = Rpc.make("Commit", {
   (rpc) => rpc.annotate(ClusterSchema.Uninterruptible, "client")
 )
 
-export const Rollback = Rpc.make("Rollback", {
+const Rollback = Rpc.make("Rollback", {
   success: CommandResult,
   payload: {
     commandId: Schema.String,

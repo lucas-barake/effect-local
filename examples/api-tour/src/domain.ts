@@ -27,12 +27,12 @@ export const Task = Document.make("ApiTourTask", {
   version: 1
 })
 
-export class TitleEmpty extends Schema.TaggedErrorClass<TitleEmpty>("@effect-local/api-tour/TitleEmpty")(
+class TitleEmpty extends Schema.TaggedErrorClass<TitleEmpty>("@effect-local/api-tour/TitleEmpty")(
   "TitleEmpty",
   {}
 ) {}
 
-export class UnboundedTaskQuery extends Schema.TaggedErrorClass<UnboundedTaskQuery>(
+class UnboundedTaskQuery extends Schema.TaggedErrorClass<UnboundedTaskQuery>(
   "@effect-local/api-tour/UnboundedTaskQuery"
 )("UnboundedTaskQuery", {}) {}
 
@@ -89,7 +89,7 @@ export const definition = ReplicaDefinition.make({
   queries: [ListTasks]
 })
 
-export const TaskListSql = SqlProjection.make(TaskList, {
+const TaskListSql = SqlProjection.make(TaskList, {
   table: "api_tour_task_list_v1",
   migrations: [{
     id: 1,
@@ -125,7 +125,7 @@ const ListTasksSql = SqlSchema.findAll({
     )
 })
 
-export const MutationLive = Layer.mergeAll(
+const MutationLive = Layer.mergeAll(
   RenameTask.toLayer(({ draft, payload }) => {
     const title = payload.trim()
     if (title.length === 0) return Result.fail(new TitleEmpty())

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://unpkg.com/knip@6.27.0/schema.json",
+  "includeEntryExports": false,
+  "workspaces": {
+    "packages/local-browser": {
+      "ignoreDependencies": ["@effect/platform-browser"]
+    },
+    "examples/tasks": {
+      "entry": ["src/replica-client.ts", "public/service-worker.js"]
+    }
+  }
+}

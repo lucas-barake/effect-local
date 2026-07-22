@@ -124,7 +124,7 @@ const WorkerLive = BrowserWorker.layer(() => {
   return rpcChannel.port2
 })
 
-export const runtime = Atom.runtime(
+const runtime = Atom.runtime(
   Layer.merge(
     BrowserReplica.layerWithReactivity(definition).pipe(Layer.provide(Layer.merge(WorkerLive, BrowserCrypto.layer))),
     BrowserCrypto.layer
@@ -133,8 +133,6 @@ export const runtime = Atom.runtime(
 
 export const tasks = ReplicaAtom.queryFamily(runtime, ListTasks)
 export const task = ReplicaAtom.documentFamily(runtime, TaskDocument)
-export const renameTaskCommand = ReplicaAtom.mutation(runtime, RenameTask)
-export const setTaskCompletedCommand = ReplicaAtom.mutation(runtime, SetTaskCompleted)
 
 export const createTask = runtime.fn<{ readonly title: string }>()(
   ({ title }) =>

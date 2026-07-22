@@ -4,7 +4,13 @@
   "description": "SQLite persistence and durable execution for Effect Local",
   "homepage": "https://github.com/lucas-barake/effect-local#readme",
   "bugs": "https://github.com/lucas-barake/effect-local/issues",
-  "keywords": ["effect", "local-first", "sqlite", "automerge", "workflow"],
+  "keywords": [
+    "effect",
+    "local-first",
+    "sqlite",
+    "automerge",
+    "workflow"
+  ],
   "type": "module",
   "license": "MIT",
   "sideEffects": [],
@@ -55,8 +61,6 @@
     "@automerge/automerge": "3.3.2",
     "@effect/platform-node": "4.0.0-beta.99",
     "@effect/sql-sqlite-node": "4.0.0-beta.99",
-    "@effect/sql-sqlite-wasm": "4.0.0-beta.99",
-    "@effect/wa-sqlite": "0.2.1",
     "effect": "4.0.0-beta.99"
   }
 }
