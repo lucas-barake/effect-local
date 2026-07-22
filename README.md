@@ -100,15 +100,38 @@ schema checked command.
 
 ## Installation
 
-Install only the packages used by the application surface. All four packages are ESM.
+Install only the packages used by the application surface. All four packages are ESM. Start with the core model and
+protocol types:
 
 ```sh
-pnpm add effect@4.0.0-beta.99 @automerge/automerge@3.3.2
-pnpm add @lucas-barake/effect-local @lucas-barake/effect-local-sql
-pnpm add @lucas-barake/effect-local-browser @effect/platform-browser@4.0.0-beta.99
-pnpm add @effect/sql-sqlite-wasm@4.0.0-beta.99 @effect/wa-sqlite@0.2.1
+pnpm add @lucas-barake/effect-local effect@4.0.0-beta.99 @automerge/automerge@3.3.2
+```
+
+For a durable Node replica, add the SQL engine and Node providers:
+
+```sh
+pnpm add @lucas-barake/effect-local-sql @effect/platform-node@4.0.0-beta.99 @effect/sql-sqlite-node@4.0.0-beta.99
+```
+
+For a durable browser replica, add the SQL and browser packages plus the OPFS driver:
+
+```sh
+pnpm add @lucas-barake/effect-local-sql @lucas-barake/effect-local-browser
+pnpm add @effect/platform-browser@4.0.0-beta.99 @effect/sql-sqlite-wasm@4.0.0-beta.99 @effect/wa-sqlite@0.2.1
+```
+
+Effect Atom React bindings are optional:
+
+```sh
 pnpm add @effect/atom-react@4.0.0-beta.99
-pnpm add -D @lucas-barake/effect-local-test @effect/platform-node@4.0.0-beta.99 @effect/sql-sqlite-node@4.0.0-beta.99
+```
+
+For tests, add the production shaped test package and the Effect Vitest integration. Add the Node platform package
+when tests create command or peer IDs directly.
+
+```sh
+pnpm add -D @lucas-barake/effect-local-test @effect/vitest@4.0.0-beta.99 vitest@4.1.10
+pnpm add -D @effect/platform-node@4.0.0-beta.99
 ```
 
 Package roles:
@@ -200,7 +223,7 @@ export const MutationLive = Layer.mergeAll(
     if (title.length === 0) return Result.fail(new TitleEmpty())
     draft.title = title
     draft.updatedAt = Date.now()
-    return Result.succeed(undefined)
+    return Result.void
   }),
   SetTaskCompleted.toLayer(({ draft, payload }) => {
     draft.completed = payload.completed
@@ -266,6 +289,9 @@ export const definition = ReplicaDefinition.make({
 
 `definition.hash` covers names, versions, schemas, and query dependencies. The current beta requires an exact hash
 match when opening or restoring a replica.
+
+`mutations`, `projections`, and `queries` may be omitted when they are empty. The returned definition still exposes
+all three collections as readonly empty tuples.
 
 ### 4. Use `Replica` and handle command outcomes
 
@@ -370,6 +396,9 @@ export const TaskListSql = SqlProjection.make(TaskList, {
 })
 ```
 
+`Identity.makeCommandId` and the other identity constructors require Effect's `Crypto` service. Browser applications
+provide `BrowserCrypto.layer`. Node applications and tests provide `NodeCrypto.layer`.
+
 `committedOrFail` returns the committed value, fails directly with a declared mutation error for `Rejected`, and fails
 with `CommandOutcomeUnknown` when durability cannot be established. Both failure paths are tagged and work with
 `Effect.catchTag`.
@@ -425,14 +454,17 @@ import * as Layer from "effect/Layer"
 import { definition, MutationLive, QueryLive, TaskListSql } from "./domain.js"
 
 const DomainLive = Layer.mergeAll(MutationLive, QueryLive)
+const DomainDependencies = DomainLive.pipe(Layer.provideMerge(DatabaseLive))
+const EngineDependencies = Layer.mergeAll(
+  DomainDependencies,
+  BrowserCrypto.layer,
+  ReplicaLimits.layer(limits)
+)
 
 export const EngineLive = SqlReplica.layerWithBindings(definition, {
   projections: [TaskListSql]
 }).pipe(
-  Layer.provideMerge(DomainLive),
-  Layer.provideMerge(BrowserCrypto.layer),
-  Layer.provideMerge(ReplicaLimits.layer(limits)),
-  Layer.provideMerge(DatabaseLive)
+  Layer.provide(EngineDependencies)
 )
 ```
 
@@ -442,13 +474,21 @@ service. In the browser these come from `BrowserSqlite.layer` or `BrowserSqlite.
 `TestReplica.defaultLimits` for tests and in
 [`examples/tasks/src/domain.ts`](examples/tasks/src/domain.ts) for a browser configuration.
 
-Use the lower level `SqlReplica.layer` when an application intentionally wants to provide or override projection
-binding services itself.
+Choose the constructor by assembly level:
+
+| Constructor         | Use                                                                                       |
+| ------------------- | ----------------------------------------------------------------------------------------- |
+| `layerWithBindings` | Application default. Installs one declared SQL binding for every projection.              |
+| `layer`             | Lower level composition that receives projection binding services from another Layer.     |
+| `layerFromServices` | Framework assembly from already constructed durable services. It provides only `Replica`. |
 
 ### 7. Provide the official Effect Worker layer
 
 `BrowserReplica.layer(definition)` intentionally requires Effect's `WorkerPlatform` and `Spawner`. It does not create
 or hide a `SharedWorker`.
+
+The following snippet shows only the RPC attachment. A durable first launch also needs the application ownership
+protocol described immediately after it.
 
 ```ts
 import { BrowserCrypto, BrowserWorker } from "@effect/platform-browser"
@@ -525,9 +565,13 @@ React applications provide an `AtomRegistry` through `@effect/atom-react` and co
 | `Restoring`         | A restore is active and reports progress                             |
 | `Failed`            | Startup or runtime ownership failed                                  |
 
-Runtime ownership is scoped. Dispose the Atom runtime and close application worker ports when the page integration is
-finished. Call `replica.flush` before an intentional shutdown when the application wants pending invalidations
-published. It is not a substitute for browser lifecycle guarantees.
+Runtime ownership is scoped. `Atom.runtime` does not own a dispose operation. React applications release mounted
+atoms when `RegistryProvider` unmounts. Non React applications dispose their `AtomRegistry`. Applications separately
+close control ports and terminate workers they created. Call `replica.flush` before an intentional shutdown when the
+application wants pending invalidations published. It is not a substitute for browser lifecycle guarantees.
+
+The current SQL composition emits `Ready` after startup. Other status variants are public protocol values for
+compositions that publish richer startup, restore, or failure state.
 
 ### 10. Export backups and portable documents
 
@@ -662,6 +706,7 @@ Backup and restore streams do not become durable merely because a Workflow is us
 composition.
 
 ```ts
+import { NodeCrypto } from "@effect/platform-node"
 import { assert, it } from "@effect/vitest"
 import * as TestReplica from "@lucas-barake/effect-local-test/TestReplica"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
@@ -674,26 +719,31 @@ import { definition, ListTasks, MutationLive, Task, TaskListSql } from "./domain
 
 const TestDomain = Layer.mergeAll(
   MutationLive,
-  ListTasks.toLayer(() => Effect.succeed([])),
-  TaskListSql.layer
+  ListTasks.toLayer(() => Effect.succeed([]))
 )
 
 const TestLive = TestReplica.layer(definition, { projections: [TaskListSql] }).pipe(
   Layer.provide(TestDomain)
 )
 
-it.effect("commits locally", () =>
-  Effect.gen(function*() {
-    const replica = yield* Replica.Replica
-    const now = Date.now()
-    const outcome = yield* replica.create(Task, {
-      commandId: yield* Identity.makeCommandId,
-      value: { title: "test", completed: false, createdAt: now, updatedAt: now }
-    })
-    assert.strictEqual(outcome._tag, "DurablyCommittedLocal")
-    yield* CommandOutcome.committedOrFail(outcome)
-  }).pipe(Effect.provide(TestLive)))
+it.layer(NodeCrypto.layer)("replica", (it) => {
+  it.effect("commits locally", () =>
+    Effect.gen(function*() {
+      const replica = yield* Replica.Replica
+      const now = Date.now()
+      const outcome = yield* replica.create(Task, {
+        commandId: yield* Identity.makeCommandId,
+        value: { title: "test", completed: false, createdAt: now, updatedAt: now }
+      })
+      assert.strictEqual(outcome._tag, "DurablyCommittedLocal")
+      yield* CommandOutcome.committedOrFail(outcome)
+    }).pipe(Effect.provide(TestLive)))
+})
 ```
+
+Every `TestReplica` constructor installs the SQL binding Layers passed in `projections`. Consumer Layers provide only
+mutation and query handlers. `layer` and `layerWithLimits` use the full durable runtime. `layerWithSync` and
+`layerWithSyncAndLimits` use the direct protocol graph for deterministic peer tests.
 
 For sync tests use `TestReplica.layerWithSync`, `TestPeer.layer`, and `FaultInjection.layerSequence`. Fault decisions
 can deterministically drop, duplicate, delay, reorder, partition, heal, and flush bounded peer traffic. Effect's

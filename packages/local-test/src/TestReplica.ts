@@ -50,7 +50,7 @@ export const layerWithLimits = <
   definition: D,
   options: { readonly projections: Bindings; readonly limits: ReplicaLimits.Values }
 ) =>
-  SqlReplica.layer(definition, { projections: options.projections }).pipe(
+  SqlReplica.layerWithBindings(definition, { projections: options.projections }).pipe(
     Layer.provide(Layer.mergeAll(
       SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
       NodeCrypto.layer,
@@ -84,7 +84,10 @@ export const layerWithSyncAndLimits = <
   const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
   const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
   const sync = PeerSync.layer.pipe(Layer.provideMerge(backups))
-  return SqlReplica.layerFromServices(definition).pipe(Layer.provideMerge(sync))
+  return SqlReplica.layerFromServices(definition).pipe(
+    Layer.provideMerge(sync),
+    Layer.provide(Layer.mergeAll(Layer.empty, ...options.projections.map((binding) => binding.layer)))
+  )
 }
 
 export const layerWithSync = <

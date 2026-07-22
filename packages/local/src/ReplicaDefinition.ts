@@ -41,35 +41,40 @@ const schemaDescriptor = (schema: Document.WireSchema) => Schema.toJsonSchemaDoc
 export const make = <
   const Name extends string,
   const Documents extends ReadonlyArray<Document.Any>,
-  const Mutations extends ReadonlyArray<Mutation.Any>,
-  const Projections extends ReadonlyArray<Projection.Any>,
-  const Queries extends ReadonlyArray<Query.Any>,
+  const Mutations extends ReadonlyArray<Mutation.Any> = readonly [],
+  const Projections extends ReadonlyArray<Projection.Any> = readonly [],
+  const Queries extends ReadonlyArray<Query.Any> = readonly [],
 >(options: {
   readonly name: Name
   readonly documents: DocumentSet.DocumentSet<Documents>
-  readonly mutations: Mutations
-  readonly projections: Projections
-  readonly queries: Queries
+  readonly mutations?: Mutations
+  readonly projections?: Projections
+  readonly queries?: Queries
 }): ReplicaDefinition<Name, Documents, Mutations, Projections, Queries> => {
   if (options.name.length === 0) throw new TypeError("Replica definition name must be nonempty")
-  assertUnique("mutation", options.mutations)
-  assertUnique("projection", options.projections)
-  assertUnique("query", options.queries)
+  const mutations = options.mutations ?? ([] as unknown as Mutations)
+  const projections = options.projections ?? ([] as unknown as Projections)
+  const queries = options.queries ?? ([] as unknown as Queries)
+  assertUnique("mutation", mutations)
+  assertUnique("projection", projections)
+  assertUnique("query", queries)
   const documents = new Set(options.documents.documents)
-  const projections = new Set(options.projections)
-  for (const mutation of options.mutations) {
+  const registeredProjections = new Set(projections)
+  for (const mutation of mutations) {
     if (!documents.has(mutation.document)) {
       throw new TypeError(`Mutation references an unknown document: ${mutation.name}`)
     }
   }
-  for (const projection of options.projections) {
+  for (const projection of projections) {
     if (!documents.has(projection.document)) {
       throw new TypeError(`Projection references an unknown document: ${projection.name}`)
     }
   }
-  for (const query of options.queries) {
+  for (const query of queries) {
     for (const dependency of query.dependsOn) {
-      if (!projections.has(dependency)) throw new TypeError(`Query references an unknown projection: ${query.name}`)
+      if (!registeredProjections.has(dependency)) {
+        throw new TypeError(`Query references an unknown projection: ${query.name}`)
+      }
     }
   }
   const definitionHash = `def_${
@@ -80,7 +85,7 @@ export const make = <
         schema: schemaDescriptor(document.schema),
         version: document.version
       })),
-      mutations: options.mutations.map((mutation) => ({
+      mutations: mutations.map((mutation) => ({
         document: mutation.document.name,
         error: schemaDescriptor(mutation.errorSchema),
         name: mutation.name,
@@ -88,13 +93,13 @@ export const make = <
         success: schemaDescriptor(mutation.successSchema),
         version: mutation.version
       })),
-      projections: options.projections.map((projection) => ({
+      projections: projections.map((projection) => ({
         document: projection.document.name,
         name: projection.name,
         row: schemaDescriptor(projection.Row),
         version: projection.version
       })),
-      queries: options.queries.map((query) => ({
+      queries: queries.map((query) => ({
         dependencies: query.dependsOn.map((projection: Projection.Any) => projection.name),
         error: schemaDescriptor(query.errorSchema),
         name: query.name,
@@ -104,5 +109,5 @@ export const make = <
       }))
     })
   }`
-  return { ...options, hash: definitionHash }
+  return { ...options, mutations, projections, queries, hash: definitionHash }
 }

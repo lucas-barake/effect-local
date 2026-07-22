@@ -165,9 +165,9 @@ export const EngineLive = SqlReplica.layerWithBindings(definition, { projections
 const TestQueryLive = ListTasks.toLayer(() => Effect.succeed([]))
 
 export const InMemoryTestLive = TestReplica.layer(definition, { projections: [TaskListSql] }).pipe(
-  Layer.provide(Layer.mergeAll(MutationLive, TestQueryLive, TaskListSql.layer))
+  Layer.provide(Layer.merge(MutationLive, TestQueryLive))
 )
 
 export const SyncTestLive = TestReplica.layerWithSync(definition, { projections: [TaskListSql] }).pipe(
-  Layer.provide(Layer.mergeAll(MutationLive, TestQueryLive, TaskListSql.layer))
+  Layer.provide(Layer.merge(MutationLive, TestQueryLive))
 )

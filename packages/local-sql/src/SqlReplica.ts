@@ -196,7 +196,10 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
 > => {
   const expected = new Set(definition.projections)
   const actual = new Set(options.projections.map((binding) => binding.projection))
-  if (expected.size !== actual.size || [...expected].some((projection) => !actual.has(projection))) {
+  if (
+    options.projections.length !== expected.size ||
+    [...expected].some((projection) => !actual.has(projection))
+  ) {
     throw new TypeError("SqlReplica requires exactly one SQL binding for every projection")
   }
   const bootstrap = ReplicaBootstrap.layer(definition)

@@ -98,18 +98,26 @@ describe("SqlReplica", () => {
   const Live = SqlReplica.layerWithBindings(definition, { projections: [] }).pipe(
     Layer.provide(Layer.mergeAll(Database, Handler, Limits))
   )
+  const projectedDefinition = ReplicaDefinition.make({
+    name: "projected-sql-replica",
+    documents: DocumentSet.make(Task),
+    mutations: [Rename, Noop],
+    projections: [TaskTitle],
+    queries: []
+  })
   const ProjectedLive = SqlReplica.layerWithBindings(
-    ReplicaDefinition.make({
-      name: "projected-sql-replica",
-      documents: DocumentSet.make(Task),
-      mutations: [Rename, Noop],
-      projections: [TaskTitle],
-      queries: []
-    }),
+    projectedDefinition,
     { projections: [TaskTitleSql] }
   ).pipe(
     Layer.provide(Layer.mergeAll(Database, Handler, Limits))
   )
+
+  it("rejects duplicate bindings for one projection", () => {
+    assert.throws(
+      () => SqlReplica.layerWithBindings(projectedDefinition, { projections: [TaskTitleSql, TaskTitleSql] }),
+      /exactly one SQL binding/
+    )
+  })
 
   it.effect("creates, reads, mutates, tombstones, and resolves receipts", () =>
     Effect.gen(function*() {

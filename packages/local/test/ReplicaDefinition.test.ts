@@ -55,6 +55,28 @@ describe("ReplicaDefinition", () => {
     )
   })
 
+  it("defaults omitted collections to empty tuples", () => {
+    const fixture = makeFixture()
+    const minimal = ReplicaDefinition.make({
+      name: "tasks",
+      documents: DocumentSet.make(fixture.Task)
+    })
+    const explicit = ReplicaDefinition.make({
+      name: "tasks",
+      documents: DocumentSet.make(fixture.Task),
+      mutations: [],
+      projections: [],
+      queries: []
+    })
+    const mutations: readonly [] = minimal.mutations
+    const projections: readonly [] = minimal.projections
+    const queries: readonly [] = minimal.queries
+    assert.deepStrictEqual(mutations, [])
+    assert.deepStrictEqual(projections, [])
+    assert.deepStrictEqual(queries, [])
+    assert.strictEqual(minimal.hash, explicit.hash)
+  })
+
   it("rejects foreign references and duplicate names", () => {
     const fixture = makeFixture()
     const Foreign = Document.make("Foreign", { schema: Schema.String, version: 1 })
