@@ -43,7 +43,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
       Effect.mapError((cause) =>
         new ReplicaError.ReplicaError({
           reason: new ReplicaError.StorageUnavailable({
-            cause: new ReplicaError.CryptoCause({ message: String(cause) })
+            cause
           })
         })
       )
@@ -59,8 +59,8 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
     )
     const allInvalidationKeys = ReplicaDefinition.invalidationKeys(definition)
     return ReplicaRpc.group.of({
-      OpenSession: ({ definitionHash, sessionId }, { client }) =>
-        definitionHash === definition.hash
+      OpenSession: ({ definitionHash, protocolVersion, sessionId }, { client }) =>
+        protocolVersion === ReplicaRpc.protocolVersion && definitionHash === definition.hash
           ? sessions.open(sessionId, client.id).pipe(Effect.as({
             leaseMillis: SessionManager.leaseDurationMillis,
             protocolVersion: ReplicaRpc.protocolVersion,
@@ -70,8 +70,8 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           : Effect.fail(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.ProtocolMismatch({
-                expected: definition.hash,
-                observed: definitionHash
+                expected: `${ReplicaRpc.protocolVersion}:${definition.hash}`,
+                observed: `${protocolVersion ?? "missing"}:${definitionHash}`
               })
             })
           ),

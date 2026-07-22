@@ -120,10 +120,7 @@ const encodeEnvelopeJson = (envelope: Envelope) =>
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
         reason: new ReplicaError.BackupInvalid({
-          cause: new ReplicaError.SchemaCause({
-            message: String(cause),
-            path: []
-          })
+          cause
         })
       })
     )
@@ -134,10 +131,7 @@ const decodeBytes = (encoded: string) =>
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
         reason: new ReplicaError.BackupInvalid({
-          cause: new ReplicaError.SchemaCause({
-            message: String(cause),
-            path: []
-          })
+          cause
         })
       })
     )
@@ -348,7 +342,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageCorrupt({
-                      cause: new ReplicaError.SchemaCause({ message: String(cause), path: [] })
+                      cause
                     })
                   })
                 ),
@@ -356,7 +350,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageUnavailable({
-                      cause: new ReplicaError.SqlCause({ message: String(cause), code: null })
+                      cause
                     })
                   })
                 )
@@ -413,10 +407,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   () =>
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.BackupInvalid({
-                        cause: new ReplicaError.SchemaCause({
-                          message: `Backup JSON exceeds maximum depth ${limits.maxJsonDepth}`,
-                          path: []
-                        })
+                        cause: new Error(`Backup JSON exceeds maximum depth ${limits.maxJsonDepth}`)
                       })
                     })
                 ),
@@ -425,10 +416,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   Effect.fail(
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.BackupInvalid({
-                        cause: new ReplicaError.SchemaCause({
-                          message: String(cause),
-                          path: []
-                        })
+                        cause
                       })
                     })
                   ))
@@ -450,10 +438,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           if (manifestEnvelope?.kind !== "Manifest" || endEnvelope?.kind !== "End") {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.BackupInvalid({
-                cause: new ReplicaError.SchemaCause({
-                  message: "Backup manifest or ending record is missing",
-                  path: []
-                })
+                cause: new Error("Backup manifest or ending record is missing")
               })
             })
           }
@@ -461,10 +446,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             Effect.mapError((cause) =>
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new ReplicaError.SchemaCause({
-                    message: String(cause),
-                    path: []
-                  })
+                  cause
                 })
               })
             )
@@ -473,10 +455,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             Effect.mapError((cause) =>
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new ReplicaError.SchemaCause({
-                    message: String(cause),
-                    path: []
-                  })
+                  cause
                 })
               })
             )
@@ -488,10 +467,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           ) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.BackupInvalid({
-                cause: new ReplicaError.SchemaCause({
-                  message: "Backup manifest does not match this replica",
-                  path: []
-                })
+                cause: new Error("Backup manifest does not match this replica")
               })
             })
           }
@@ -499,10 +475,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           if (manifest.recordCount !== records.length || end.recordCount !== records.length) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.BackupInvalid({
-                cause: new ReplicaError.SchemaCause({
-                  message: "Backup record count mismatch",
-                  path: []
-                })
+                cause: new Error("Backup record count mismatch")
               })
             })
           }
@@ -510,10 +483,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             if ((yield* digest(envelope.value)) !== envelope.checksum) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new ReplicaError.SchemaCause({
-                    message: `Backup checksum mismatch: ${envelope.kind}`,
-                    path: []
-                  })
+                  cause: new Error(`Backup checksum mismatch: ${envelope.kind}`)
                 })
               })
             }
@@ -521,10 +491,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           if ((yield* digest(records.map((record) => record.checksum))) !== end.recordsChecksum) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.BackupInvalid({
-                cause: new ReplicaError.SchemaCause({
-                  message: "Backup records checksum mismatch",
-                  path: []
-                })
+                cause: new Error("Backup records checksum mismatch")
               })
             })
           }
@@ -558,10 +525,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 default:
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.BackupInvalid({
-                      cause: new ReplicaError.SchemaCause({
-                        message: `Unknown backup record: ${record.kind}`,
-                        path: []
-                      })
+                      cause: new Error(`Unknown backup record: ${record.kind}`)
                     })
                   })
               }
@@ -572,10 +536,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.BackupInvalid({
-                    cause: new ReplicaError.SchemaCause({
-                      message: String(cause),
-                      path: []
-                    })
+                    cause
                   })
                 })
               ))
@@ -589,10 +550,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 ) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.BackupInvalid({
-                      cause: new ReplicaError.SchemaCause({
-                        message: `Invalid document record: ${record.value.document_id}`,
-                        path: []
-                      })
+                      cause: new Error(`Invalid document record: ${record.value.document_id}`)
                     })
                   })
                 }
@@ -604,10 +562,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   catch: (cause) =>
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.BackupInvalid({
-                        cause: new ReplicaError.SchemaCause({
-                          message: String(cause),
-                          path: []
-                        })
+                        cause
                       })
                     })
                 })
@@ -621,10 +576,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 ) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.BackupInvalid({
-                      cause: new ReplicaError.SchemaCause({
-                        message: `Invalid change record: ${record.value.change_hash}`,
-                        path: []
-                      })
+                      cause: new Error(`Invalid change record: ${record.value.change_hash}`)
                     })
                   })
                 }
@@ -641,10 +593,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 ) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.BackupInvalid({
-                      cause: new ReplicaError.SchemaCause({
-                        message: `Invalid checkpoint record: ${record.value.checkpoint_hash}`,
-                        path: []
-                      })
+                      cause: new Error(`Invalid checkpoint record: ${record.value.checkpoint_hash}`)
                     })
                   })
                 }
@@ -657,7 +606,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               Effect.mapError((cause) =>
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageUnavailable({
-                    cause: new ReplicaError.CryptoCause({ message: String(cause) })
+                    cause
                   })
                 })
               )
@@ -717,10 +666,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   Effect.mapError((cause) =>
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.BackupInvalid({
-                        cause: new ReplicaError.SchemaCause({
-                          message: String(cause),
-                          path: []
-                        })
+                        cause
                       })
                     })
                   )
@@ -733,10 +679,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               if (foreignKeys.length > 0) {
                 return yield* new ReplicaError.ReplicaError({
                   reason: new ReplicaError.BackupInvalid({
-                    cause: new ReplicaError.SchemaCause({
-                      message: "Backup violates SQLite foreign keys",
-                      path: []
-                    })
+                    cause: new Error("Backup violates SQLite foreign keys")
                   })
                 })
               }
@@ -749,10 +692,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageCorrupt({
-                    cause: new ReplicaError.SchemaCause({
-                      message: String(cause),
-                      path: []
-                    })
+                    cause
                   })
                 })
               ),
@@ -762,10 +702,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   reason: !cause.isRetryable &&
                       (cause.reason._tag === "UniqueViolation" || cause.reason._tag === "ConstraintError")
                     ? new ReplicaError.BackupInvalid({
-                      cause: new ReplicaError.SqlCause({ message: String(cause), code: null })
+                      cause
                     })
                     : new ReplicaError.StorageUnavailable({
-                      cause: new ReplicaError.SqlCause({ message: String(cause), code: null })
+                      cause
                     })
                 })
               )

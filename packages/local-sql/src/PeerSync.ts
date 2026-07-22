@@ -515,10 +515,7 @@ export const layer: Layer.Layer<
         Effect.fail(
           new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageUnavailable({
-              cause: new ReplicaError.SqlCause({
-                message: String(cause),
-                code: null
-              })
+              cause
             })
           })
         ))
@@ -715,10 +712,7 @@ export const layer: Layer.Layer<
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageUnavailable({
-                    cause: new ReplicaError.SqlCause({
-                      message: String(cause),
-                      code: null
-                    })
+                    cause
                   })
                 })
               ),
@@ -726,10 +720,7 @@ export const layer: Layer.Layer<
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageCorrupt({
-                    cause: new ReplicaError.SchemaCause({
-                      message: String(cause),
-                      path: []
-                    })
+                    cause
                   })
                 })
               )
@@ -753,10 +744,7 @@ export const layer: Layer.Layer<
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageUnavailable({
-                    cause: new ReplicaError.SqlCause({
-                      message: String(cause),
-                      code: null
-                    })
+                    cause
                   })
                 })
               ),
@@ -764,10 +752,7 @@ export const layer: Layer.Layer<
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageCorrupt({
-                    cause: new ReplicaError.SchemaCause({
-                      message: String(cause),
-                      path: []
-                    })
+                    cause
                   })
                 })
               )
@@ -798,10 +783,7 @@ export const layer: Layer.Layer<
                   Effect.fail(
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.StorageUnavailable({
-                        cause: new ReplicaError.SqlCause({
-                          message: String(cause),
-                          code: null
-                        })
+                        cause
                       })
                     })
                   ),
@@ -809,10 +791,7 @@ export const layer: Layer.Layer<
                   Effect.fail(
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.StorageCorrupt({
-                        cause: new ReplicaError.SchemaCause({
-                          message: String(cause),
-                          path: []
-                        })
+                        cause
                       })
                     })
                   )
@@ -866,10 +845,7 @@ export const layer: Layer.Layer<
                         Effect.fail(
                           new ReplicaError.ReplicaError({
                             reason: new ReplicaError.StorageUnavailable({
-                              cause: new ReplicaError.SqlCause({
-                                message: String(cause),
-                                code: null
-                              })
+                              cause
                             })
                           })
                         ),
@@ -877,10 +853,7 @@ export const layer: Layer.Layer<
                         Effect.fail(
                           new ReplicaError.ReplicaError({
                             reason: new ReplicaError.StorageCorrupt({
-                              cause: new ReplicaError.SchemaCause({
-                                message: String(cause),
-                                path: []
-                              })
+                              cause
                             })
                           })
                         )
@@ -943,10 +916,7 @@ export const layer: Layer.Layer<
                       Effect.fail(
                         new ReplicaError.ReplicaError({
                           reason: new ReplicaError.StorageUnavailable({
-                            cause: new ReplicaError.SqlCause({
-                              message: String(cause),
-                              code: null
-                            })
+                            cause
                           })
                         })
                       ))
@@ -983,10 +953,7 @@ export const layer: Layer.Layer<
                       Effect.fail(
                         new ReplicaError.ReplicaError({
                           reason: new ReplicaError.StorageUnavailable({
-                            cause: new ReplicaError.SqlCause({
-                              message: String(cause),
-                              code: null
-                            })
+                            cause
                           })
                         })
                       ),
@@ -994,10 +961,7 @@ export const layer: Layer.Layer<
                       Effect.fail(
                         new ReplicaError.ReplicaError({
                           reason: new ReplicaError.StorageCorrupt({
-                            cause: new ReplicaError.SchemaCause({
-                              message: String(cause),
-                              path: []
-                            })
+                            cause
                           })
                         })
                       )
@@ -1020,10 +984,7 @@ export const layer: Layer.Layer<
                         Effect.fail(
                           new ReplicaError.ReplicaError({
                             reason: new ReplicaError.StorageUnavailable({
-                              cause: new ReplicaError.SqlCause({
-                                message: String(cause),
-                                code: null
-                              })
+                              cause
                             })
                           })
                         ),
@@ -1031,10 +992,7 @@ export const layer: Layer.Layer<
                         Effect.fail(
                           new ReplicaError.ReplicaError({
                             reason: new ReplicaError.StorageCorrupt({
-                              cause: new ReplicaError.SchemaCause({
-                                message: String(cause),
-                                path: []
-                              })
+                              cause
                             })
                           })
                         )
@@ -1188,10 +1146,7 @@ export const layer: Layer.Layer<
                             Effect.fail(
                               new ReplicaError.ReplicaError({
                                 reason: new ReplicaError.StorageUnavailable({
-                                  cause: new ReplicaError.SqlCause({
-                                    message: String(cause),
-                                    code: null
-                                  })
+                                  cause
                                 })
                               })
                             ),
@@ -1199,10 +1154,7 @@ export const layer: Layer.Layer<
                             Effect.fail(
                               new ReplicaError.ReplicaError({
                                 reason: new ReplicaError.StorageCorrupt({
-                                  cause: new ReplicaError.SchemaCause({
-                                    message: String(cause),
-                                    path: []
-                                  })
+                                  cause
                                 })
                               })
                             )
@@ -1222,10 +1174,7 @@ export const layer: Layer.Layer<
                               Effect.fail(
                                 new ReplicaError.ReplicaError({
                                   reason: new ReplicaError.StorageUnavailable({
-                                    cause: new ReplicaError.SqlCause({
-                                      message: String(cause),
-                                      code: null
-                                    })
+                                    cause
                                   })
                                 })
                               ),
@@ -1233,10 +1182,7 @@ export const layer: Layer.Layer<
                               Effect.fail(
                                 new ReplicaError.ReplicaError({
                                   reason: new ReplicaError.StorageCorrupt({
-                                    cause: new ReplicaError.SchemaCause({
-                                      message: String(cause),
-                                      path: []
-                                    })
+                                    cause
                                   })
                                 })
                               )
@@ -1251,10 +1197,7 @@ export const layer: Layer.Layer<
                               Effect.fail(
                                 new ReplicaError.ReplicaError({
                                   reason: new ReplicaError.StorageUnavailable({
-                                    cause: new ReplicaError.SqlCause({
-                                      message: String(cause),
-                                      code: null
-                                    })
+                                    cause
                                   })
                                 })
                               ),
@@ -1262,10 +1205,7 @@ export const layer: Layer.Layer<
                               Effect.fail(
                                 new ReplicaError.ReplicaError({
                                   reason: new ReplicaError.StorageCorrupt({
-                                    cause: new ReplicaError.SchemaCause({
-                                      message: String(cause),
-                                      path: []
-                                    })
+                                    cause
                                   })
                                 })
                               )
@@ -1311,10 +1251,7 @@ export const layer: Layer.Layer<
                               Effect.fail(
                                 new ReplicaError.ReplicaError({
                                   reason: new ReplicaError.StorageUnavailable({
-                                    cause: new ReplicaError.SqlCause({
-                                      message: String(cause),
-                                      code: null
-                                    })
+                                    cause
                                   })
                                 })
                               ),
@@ -1322,10 +1259,7 @@ export const layer: Layer.Layer<
                               Effect.fail(
                                 new ReplicaError.ReplicaError({
                                   reason: new ReplicaError.StorageCorrupt({
-                                    cause: new ReplicaError.SchemaCause({
-                                      message: String(cause),
-                                      path: []
-                                    })
+                                    cause
                                   })
                                 })
                               )
@@ -1340,10 +1274,7 @@ export const layer: Layer.Layer<
                               Effect.fail(
                                 new ReplicaError.ReplicaError({
                                   reason: new ReplicaError.StorageUnavailable({
-                                    cause: new ReplicaError.SqlCause({
-                                      message: String(cause),
-                                      code: null
-                                    })
+                                    cause
                                   })
                                 })
                               ),
@@ -1351,10 +1282,7 @@ export const layer: Layer.Layer<
                               Effect.fail(
                                 new ReplicaError.ReplicaError({
                                   reason: new ReplicaError.StorageCorrupt({
-                                    cause: new ReplicaError.SchemaCause({
-                                      message: String(cause),
-                                      path: []
-                                    })
+                                    cause
                                   })
                                 })
                               )
@@ -1400,10 +1328,7 @@ export const layer: Layer.Layer<
                               Effect.fail(
                                 new ReplicaError.ReplicaError({
                                   reason: new ReplicaError.StorageUnavailable({
-                                    cause: new ReplicaError.SqlCause({
-                                      message: String(cause),
-                                      code: null
-                                    })
+                                    cause
                                   })
                                 })
                               ),
@@ -1411,10 +1336,7 @@ export const layer: Layer.Layer<
                               Effect.fail(
                                 new ReplicaError.ReplicaError({
                                   reason: new ReplicaError.StorageCorrupt({
-                                    cause: new ReplicaError.SchemaCause({
-                                      message: String(cause),
-                                      path: []
-                                    })
+                                    cause
                                   })
                                 })
                               )
@@ -1428,10 +1350,7 @@ export const layer: Layer.Layer<
                               Effect.fail(
                                 new ReplicaError.ReplicaError({
                                   reason: new ReplicaError.StorageUnavailable({
-                                    cause: new ReplicaError.SqlCause({
-                                      message: String(cause),
-                                      code: null
-                                    })
+                                    cause
                                   })
                                 })
                               ),
@@ -1439,10 +1358,7 @@ export const layer: Layer.Layer<
                               Effect.fail(
                                 new ReplicaError.ReplicaError({
                                   reason: new ReplicaError.StorageCorrupt({
-                                    cause: new ReplicaError.SchemaCause({
-                                      message: String(cause),
-                                      path: []
-                                    })
+                                    cause
                                   })
                                 })
                               )
@@ -1500,10 +1416,7 @@ export const layer: Layer.Layer<
                             Effect.fail(
                               new ReplicaError.ReplicaError({
                                 reason: new ReplicaError.StorageUnavailable({
-                                  cause: new ReplicaError.SqlCause({
-                                    message: String(cause),
-                                    code: null
-                                  })
+                                  cause
                                 })
                               })
                             ),
@@ -1511,10 +1424,7 @@ export const layer: Layer.Layer<
                             Effect.fail(
                               new ReplicaError.ReplicaError({
                                 reason: new ReplicaError.StorageCorrupt({
-                                  cause: new ReplicaError.SchemaCause({
-                                    message: String(cause),
-                                    path: []
-                                  })
+                                  cause
                                 })
                               })
                             )
@@ -1685,10 +1595,7 @@ export const layer: Layer.Layer<
                               Effect.fail(
                                 new ReplicaError.ReplicaError({
                                   reason: new ReplicaError.StorageUnavailable({
-                                    cause: new ReplicaError.SqlCause({
-                                      message: String(cause),
-                                      code: null
-                                    })
+                                    cause
                                   })
                                 })
                               ),
@@ -1696,10 +1603,7 @@ export const layer: Layer.Layer<
                               Effect.fail(
                                 new ReplicaError.ReplicaError({
                                   reason: new ReplicaError.StorageCorrupt({
-                                    cause: new ReplicaError.SchemaCause({
-                                      message: String(cause),
-                                      path: []
-                                    })
+                                    cause
                                   })
                                 })
                               )
@@ -1732,10 +1636,7 @@ export const layer: Layer.Layer<
                   Effect.fail(
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.StorageUnavailable({
-                        cause: new ReplicaError.SqlCause({
-                          message: "Document remained busy while applying peer sync",
-                          code: "CONCURRENT_DOCUMENT_WRITE"
-                        })
+                        cause: new Error("Document remained busy while applying peer sync")
                       })
                     })
                   ))
@@ -1752,7 +1653,7 @@ export const layer: Layer.Layer<
             Effect.mapError((cause) =>
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
-                  cause: new ReplicaError.CryptoCause({ message: String(cause) })
+                  cause
                 })
               })
             )
@@ -1777,10 +1678,7 @@ export const layer: Layer.Layer<
                 Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageUnavailable({
-                      cause: new ReplicaError.SqlCause({
-                        message: String(cause),
-                        code: null
-                      })
+                      cause
                     })
                   })
                 ))
@@ -1814,10 +1712,7 @@ export const layer: Layer.Layer<
                 Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageUnavailable({
-                      cause: new ReplicaError.SqlCause({
-                        message: String(cause),
-                        code: null
-                      })
+                      cause
                     })
                   })
                 ),
@@ -1825,10 +1720,7 @@ export const layer: Layer.Layer<
                 Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageCorrupt({
-                      cause: new ReplicaError.SchemaCause({
-                        message: String(cause),
-                        path: []
-                      })
+                      cause
                     })
                   })
                 )
@@ -1861,10 +1753,7 @@ export const layer: Layer.Layer<
                 Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageUnavailable({
-                      cause: new ReplicaError.SqlCause({
-                        message: String(cause),
-                        code: null
-                      })
+                      cause
                     })
                   })
                 ),
@@ -1872,10 +1761,7 @@ export const layer: Layer.Layer<
                 Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageCorrupt({
-                      cause: new ReplicaError.SchemaCause({
-                        message: String(cause),
-                        path: []
-                      })
+                      cause
                     })
                   })
                 )

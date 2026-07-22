@@ -66,10 +66,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.ProjectionBlocked({
               projection: binding.projection.name,
-              cause: new ReplicaError.SchemaCause({
-                message: `Duplicate projection table: ${binding.table}`,
-                path: []
-              })
+              cause: new Error(`Duplicate projection table: ${binding.table}`)
             })
           })
         }
@@ -86,10 +83,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.ProjectionBlocked({
                   projection: binding.projection.name,
-                  cause: new ReplicaError.SchemaCause({
-                    message: String(cause),
-                    path: []
-                  })
+                  cause
                 })
               })
             ))
@@ -102,10 +96,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.ProjectionBlocked({
                 projection: binding.projection.name,
-                cause: new ReplicaError.SchemaCause({
-                  message: String(cause),
-                  path: []
-                })
+                cause
               })
             })
           )
@@ -119,10 +110,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.ProjectionBlocked({
               projection: binding.projection.name,
-              cause: new ReplicaError.SchemaCause({
-                message: "Projection registry mismatch",
-                path: []
-              })
+              cause: new Error("Projection registry mismatch")
             })
           })
         }
@@ -135,10 +123,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.ProjectionBlocked({
                   projection: binding.projection.name,
-                  cause: new ReplicaError.SchemaCause({
-                    message: String(cause),
-                    path: []
-                  })
+                  cause
                 })
               })
             ))
@@ -159,10 +144,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.ProjectionBlocked({
                   projection: binding.projection.name,
-                  cause: new ReplicaError.SchemaCause({
-                    message: "Projection row must contain its source document ID",
-                    path: []
-                  })
+                  cause: new Error("Projection row must contain its source document ID")
                 })
               })
             }
@@ -183,10 +165,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.ProjectionBlocked({
                 projection: binding.projection.name,
-                cause: new ReplicaError.SchemaCause({
-                  message: String(cause),
-                  path: []
-                })
+                cause
               })
             })
           )))
@@ -201,10 +180,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.ProjectionBlocked({
                 projection: "$all",
-                cause: new ReplicaError.SchemaCause({
-                  message: String(cause),
-                  path: []
-                })
+                cause
               })
             })
           )
@@ -227,10 +203,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.ProjectionBlocked({
                     projection: document.name,
-                    cause: new ReplicaError.SchemaCause({
-                      message: String(cause),
-                      path: []
-                    })
+                    cause
                   })
                 })
               ))

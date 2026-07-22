@@ -68,10 +68,7 @@ export const decode = <Name extends string, S extends DocumentSchema,>(
       new ReplicaError.ReplicaError({
         reason: new ReplicaError.DocumentDecodeError({
           documentId,
-          cause: new ReplicaError.SchemaCause({
-            message: String(cause),
-            path: []
-          })
+          cause
         })
       })
     )
@@ -87,10 +84,7 @@ export const encode = <Name extends string, S extends DocumentSchema,>(
       new ReplicaError.ReplicaError({
         reason: new ReplicaError.DocumentEncodeError({
           documentId,
-          cause: new ReplicaError.SchemaCause({
-            message: String(cause),
-            path: []
-          })
+          cause
         })
       })
     )

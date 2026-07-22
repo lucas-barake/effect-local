@@ -1001,10 +1001,9 @@ describe("PeerSync", () => {
           assert.strictEqual(result.failure._tag, "ReplicaError")
           assert.strictEqual(result.failure.reason._tag, "StorageUnavailable")
           if (result.failure.reason._tag === "StorageUnavailable") {
-            assert.strictEqual(result.failure.reason.cause._tag, "SqlCause")
-            if (result.failure.reason.cause._tag === "SqlCause") {
-              assert.strictEqual(result.failure.reason.cause.code, "CONCURRENT_DOCUMENT_WRITE")
-            }
+            assert.isTrue(Schema.is(Schema.Error())(result.failure.reason.cause))
+            if (!Schema.is(Schema.Error())(result.failure.reason.cause)) return
+            assert.strictEqual(result.failure.reason.cause.message, "Document remained busy while applying peer sync")
           }
         }
         const rows = yield* sql<{

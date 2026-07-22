@@ -104,7 +104,7 @@ describe("Recovery", () => {
       if (Result.isFailure(result)) {
         assert.strictEqual(result.failure.reason._tag, "StorageCorrupt")
         if (result.failure.reason._tag === "StorageCorrupt") {
-          assert.strictEqual(result.failure.reason.cause._tag, "SchemaCause")
+          assert.isTrue(Schema.is(Schema.Error())(result.failure.reason.cause))
         }
       }
       InternalAutomerge.free(created.automerge)

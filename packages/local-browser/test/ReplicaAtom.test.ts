@@ -222,7 +222,7 @@ describe("ReplicaAtom", () => {
             ? Stream.fail(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
-                  cause: new ReplicaError.RpcCause({ message: "disconnected" })
+                  cause: new Error("disconnected")
                 })
               })
             )

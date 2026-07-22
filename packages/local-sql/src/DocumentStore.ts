@@ -78,7 +78,7 @@ export const layer: Layer.Layer<
           Effect.fail(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new ReplicaError.SchemaCause({ message: String(cause), path: [] })
+                cause
               })
             })
           )
@@ -93,10 +93,7 @@ export const layer: Layer.Layer<
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.DocumentDecodeError({
                 documentId,
-                cause: new ReplicaError.SchemaCause({
-                  message: "Encoded value is not Automerge compatible",
-                  path: []
-                })
+                cause: new Error("Encoded value is not Automerge compatible")
               })
             })
           }
@@ -107,7 +104,7 @@ export const layer: Layer.Layer<
             catch: (cause) =>
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({
-                  cause: new ReplicaError.AutomergeCause({ message: String(cause) })
+                  cause
                 })
               })
           })
@@ -142,10 +139,7 @@ export const layer: Layer.Layer<
             Effect.fail(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
-                  cause: new ReplicaError.SqlCause({
-                    message: String(cause),
-                    code: null
-                  })
+                  cause
                 })
               })
             ))
@@ -176,10 +170,7 @@ export const layer: Layer.Layer<
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.DocumentDecodeError({
                 documentId,
-                cause: new ReplicaError.SchemaCause({
-                  message: "Encoded value is not Automerge compatible",
-                  path: []
-                })
+                cause: new Error("Encoded value is not Automerge compatible")
               })
             })
           }
@@ -212,10 +203,7 @@ export const layer: Layer.Layer<
             Effect.fail(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
-                  cause: new ReplicaError.SqlCause({
-                    message: String(cause),
-                    code: null
-                  })
+                  cause
                 })
               })
             ))

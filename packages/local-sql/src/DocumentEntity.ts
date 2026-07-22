@@ -128,10 +128,7 @@ const decode = <S extends Document.WireSchema,>(
         new ReplicaError.ReplicaError({
           reason: new ReplicaError.DocumentDecodeError({
             documentId,
-            cause: new ReplicaError.SchemaCause({
-              message: String(cause),
-              path: []
-            })
+            cause
           })
         })
       ))
@@ -144,10 +141,7 @@ const encode = <S extends Document.WireSchema,>(schema: S, value: S["Type"]) =>
       Effect.fail(
         new ReplicaError.ReplicaError({
           reason: new ReplicaError.StorageCorrupt({
-            cause: new ReplicaError.SchemaCause({
-              message: String(cause),
-              path: []
-            })
+            cause
           })
         })
       ))

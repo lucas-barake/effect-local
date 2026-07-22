@@ -295,9 +295,7 @@ export const make = (
                   Effect.mapError((error) =>
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.StorageUnavailable({
-                        cause: new ReplicaError.RpcCause({
-                          message: `${error._tag}: ${"reason" in error ? error.reason : "route unavailable"}`
-                        })
+                        cause: error
                       })
                     })
                   )

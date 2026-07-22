@@ -41,7 +41,7 @@ export const digest = (value: unknown) =>
     Effect.map(Encoding.encodeHex),
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
-        reason: new ReplicaError.StorageUnavailable({ cause: new ReplicaError.CryptoCause({ message: String(cause) }) })
+        reason: new ReplicaError.StorageUnavailable({ cause })
       })
     )
   )

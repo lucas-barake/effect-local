@@ -192,10 +192,7 @@ export const layer: Layer.Layer<
                 Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageUnavailable({
-                      cause: new ReplicaError.SqlCause({
-                        message: String(cause),
-                        code: null
-                      })
+                      cause
                     })
                   })
                 ),
@@ -203,10 +200,7 @@ export const layer: Layer.Layer<
                 Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageCorrupt({
-                      cause: new ReplicaError.SchemaCause({
-                        message: String(cause),
-                        path: []
-                      })
+                      cause
                     })
                   })
                 )
@@ -218,7 +212,7 @@ export const layer: Layer.Layer<
           ) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new ReplicaError.AutomergeCause({ message: "Cannot compact an incomplete canonical history" })
+                cause: new Error("Cannot compact an incomplete canonical history")
               })
             })
           }
@@ -245,7 +239,7 @@ export const layer: Layer.Layer<
         if (checkpoint.checkpointHash !== checkpointHash || checkpoint.checksum !== checksum) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new ReplicaError.AutomergeCause({ message: "Prepared checkpoint checksum mismatch" })
+              cause: new Error("Prepared checkpoint checksum mismatch")
             })
           })
         }
@@ -255,7 +249,7 @@ export const layer: Layer.Layer<
             catch: (cause) =>
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({
-                  cause: new ReplicaError.AutomergeCause({ message: String(cause) })
+                  cause
                 })
               })
           }),
@@ -265,7 +259,7 @@ export const layer: Layer.Layer<
         if (!verified) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new ReplicaError.AutomergeCause({ message: "Prepared checkpoint heads mismatch" })
+              cause: new Error("Prepared checkpoint heads mismatch")
             })
           })
         }
@@ -299,7 +293,7 @@ export const layer: Layer.Layer<
           if (installed.length !== 1) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new ReplicaError.AutomergeCause({ message: "Checkpoint identity collision" })
+                cause: new Error("Checkpoint identity collision")
               })
             })
           }
@@ -315,10 +309,7 @@ export const layer: Layer.Layer<
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageUnavailable({
-                    cause: new ReplicaError.SqlCause({
-                      message: String(cause),
-                      code: null
-                    })
+                    cause
                   })
                 })
               ),
@@ -326,10 +317,7 @@ export const layer: Layer.Layer<
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageCorrupt({
-                    cause: new ReplicaError.SchemaCause({
-                      message: String(cause),
-                      path: []
-                    })
+                    cause
                   })
                 })
               )
@@ -352,10 +340,7 @@ export const layer: Layer.Layer<
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageUnavailable({
-                    cause: new ReplicaError.SqlCause({
-                      message: String(cause),
-                      code: null
-                    })
+                    cause
                   })
                 })
               ),
@@ -363,10 +348,7 @@ export const layer: Layer.Layer<
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageCorrupt({
-                    cause: new ReplicaError.SchemaCause({
-                      message: String(cause),
-                      path: []
-                    })
+                    cause
                   })
                 })
               )
@@ -388,7 +370,7 @@ export const layer: Layer.Layer<
           ) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new ReplicaError.AutomergeCause({ message: "Cannot prune from a corrupt checkpoint" })
+                cause: new Error("Cannot prune from a corrupt checkpoint")
               })
             })
           }
@@ -398,7 +380,7 @@ export const layer: Layer.Layer<
               catch: (cause) =>
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageCorrupt({
-                    cause: new ReplicaError.AutomergeCause({ message: String(cause) })
+                    cause
                   })
                 })
             }),
@@ -410,7 +392,7 @@ export const layer: Layer.Layer<
               catch: (cause) =>
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageCorrupt({
-                    cause: new ReplicaError.AutomergeCause({ message: String(cause) })
+                    cause
                   })
                 })
             }),
@@ -422,9 +404,7 @@ export const layer: Layer.Layer<
           ) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new ReplicaError.AutomergeCause({
-                  message: "Cannot prune from checkpoint head metadata mismatch"
-                })
+                cause: new Error("Cannot prune from checkpoint head metadata mismatch")
               })
             })
           }
@@ -434,10 +414,7 @@ export const layer: Layer.Layer<
                 Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageUnavailable({
-                      cause: new ReplicaError.SqlCause({
-                        message: String(cause),
-                        code: null
-                      })
+                      cause
                     })
                   })
                 ),
@@ -445,10 +422,7 @@ export const layer: Layer.Layer<
                 Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageCorrupt({
-                      cause: new ReplicaError.SchemaCause({
-                        message: String(cause),
-                        path: []
-                      })
+                      cause
                     })
                   })
                 )
@@ -493,10 +467,7 @@ export const layer: Layer.Layer<
                 Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageUnavailable({
-                      cause: new ReplicaError.SqlCause({
-                        message: String(cause),
-                        code: null
-                      })
+                      cause
                     })
                   })
                 ),
@@ -504,10 +475,7 @@ export const layer: Layer.Layer<
                 Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageCorrupt({
-                      cause: new ReplicaError.SchemaCause({
-                        message: String(cause),
-                        path: []
-                      })
+                      cause
                     })
                   })
                 )

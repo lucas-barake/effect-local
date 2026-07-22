@@ -103,10 +103,7 @@ export const layer: Layer.Layer<CommitPublisher, never, Reactivity.Reactivity | 
           Effect.fail(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageUnavailable({
-                cause: new ReplicaError.SqlCause({
-                  message: String(cause),
-                  code: null
-                })
+                cause
               })
             })
           ),
@@ -114,10 +111,7 @@ export const layer: Layer.Layer<CommitPublisher, never, Reactivity.Reactivity | 
           Effect.fail(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new ReplicaError.SchemaCause({
-                  message: String(cause),
-                  path: []
-                })
+                cause
               })
             })
           )
@@ -132,10 +126,7 @@ export const layer: Layer.Layer<CommitPublisher, never, Reactivity.Reactivity | 
             Effect.fail(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
-                  cause: new ReplicaError.SqlCause({
-                    message: String(cause),
-                    code: null
-                  })
+                  cause
                 })
               })
             ),
@@ -143,10 +134,7 @@ export const layer: Layer.Layer<CommitPublisher, never, Reactivity.Reactivity | 
             Effect.fail(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({
-                  cause: new ReplicaError.SchemaCause({
-                    message: String(cause),
-                    path: []
-                  })
+                  cause
                 })
               })
             )

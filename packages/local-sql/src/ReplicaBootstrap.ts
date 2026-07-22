@@ -73,10 +73,7 @@ export const make = (definition: ReplicaDefinition.Any) =>
         if (populated._tag === "Some" && populated.value.populated === 1) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new ReplicaError.SchemaCause({
-                message: "Replica metadata is missing",
-                path: []
-              })
+              cause: new Error("Replica metadata is missing")
             })
           })
         }
@@ -92,7 +89,7 @@ export const make = (definition: ReplicaDefinition.Any) =>
           Effect.mapError((cause) =>
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageUnavailable({
-                cause: new ReplicaError.CryptoCause({ message: String(cause) })
+                cause
               })
             })
           )
@@ -127,7 +124,7 @@ export const make = (definition: ReplicaDefinition.Any) =>
         Effect.fail(
           new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new ReplicaError.SchemaCause({ message: String(cause), path: [] })
+              cause
             })
           })
         ))

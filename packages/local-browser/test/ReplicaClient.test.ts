@@ -10,6 +10,7 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
 import { Headers } from "effect/unstable/http"
@@ -160,6 +161,37 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       const error = yield* Effect.flip(ReplicaClient.fromRpcClient({ ...definition, hash: "different" }, rpc))
+      assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("decodes and rejects owners using an older protocol", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const open = ReplicaRpc.group.requests.get("OpenSession")
+      if (open?._tag !== "OpenSession") return yield* Effect.die(new Error("OpenSession RPC not found"))
+      yield* Schema.decodeUnknownEffect(open.successSchema)({
+        leaseMillis: 1_000,
+        protocolVersion: ReplicaRpc.protocolVersion - 1,
+        definitionHash: definition.hash,
+        ownerEpoch: "owner"
+      })
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const older = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property !== "OpenSession") return value
+          return (payload: never) =>
+            value(payload).pipe(Effect.map((lease) => ({
+              ...(lease as {
+                readonly leaseMillis: number
+                readonly protocolVersion: number
+                readonly definitionHash: string
+                readonly ownerEpoch: string
+              }),
+              protocolVersion: ReplicaRpc.protocolVersion - 1
+            })))
+        }
+      })
+      const error = yield* Effect.flip(ReplicaClient.fromRpcClient(definition, older))
       assert.strictEqual(error.reason._tag, "ProtocolMismatch")
     })).pipe(Effect.provide(Owner)))
 
@@ -690,10 +722,27 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         Effect.flatMap(effect, (value) =>
           Deferred.isDeferred<A, E>(value) ? Deferred.await(value) : Effect.succeed(value))
 
-      yield* unary(open({ sessionId, definitionHash: definition.hash }, options(owner, "open")))
+      const legacySessionId = yield* Identity.makeSessionId
+      assert.strictEqual(
+        (yield* Effect.flip(unary(open({
+          sessionId: legacySessionId,
+          definitionHash: definition.hash
+        }, options(owner, "open-legacy"))))).reason._tag,
+        "ProtocolMismatch"
+      )
+
+      yield* unary(open({
+        sessionId,
+        protocolVersion: ReplicaRpc.protocolVersion,
+        definitionHash: definition.hash
+      }, options(owner, "open")))
 
       assert.strictEqual(
-        (yield* Effect.flip(unary(open({ sessionId, definitionHash: definition.hash }, options(other, "open-other")))))
+        (yield* Effect.flip(unary(open({
+          sessionId,
+          protocolVersion: ReplicaRpc.protocolVersion,
+          definitionHash: definition.hash
+        }, options(other, "open-other")))))
           .reason._tag,
         "ProtocolMismatch"
       )

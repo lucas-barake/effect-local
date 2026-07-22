@@ -34,10 +34,7 @@ const encodeResult = (schema: Document.WireSchema, value: unknown) =>
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
         reason: new ReplicaError.StorageCorrupt({
-          cause: new ReplicaError.SchemaCause({
-            message: String(cause),
-            path: []
-          })
+          cause
         })
       })
     )
@@ -50,10 +47,7 @@ const decodeResult = (schema: Document.WireSchema, bytes: Uint8Array) =>
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
         reason: new ReplicaError.StorageCorrupt({
-          cause: new ReplicaError.SchemaCause({
-            message: String(cause),
-            path: []
-          })
+          cause
         })
       })
     )
@@ -223,10 +217,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageUnavailable({
-                    cause: new ReplicaError.SqlCause({
-                      message: String(cause),
-                      code: null
-                    })
+                    cause
                   })
                 })
               ),
@@ -234,10 +225,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageCorrupt({
-                    cause: new ReplicaError.SchemaCause({
-                      message: String(cause),
-                      path: []
-                    })
+                    cause
                   })
                 })
               )
@@ -264,10 +252,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
             Effect.mapError((cause) =>
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
-                  cause: new ReplicaError.SqlCause({
-                    message: String(cause),
-                    code: null
-                  })
+                  cause
                 })
               })
             ),
@@ -334,10 +319,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageUnavailable({
-                    cause: new ReplicaError.SqlCause({
-                      message: String(cause),
-                      code: null
-                    })
+                    cause
                   })
                 })
               ))
@@ -351,10 +333,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.DocumentDecodeError({
                       documentId: options.documentId,
-                      cause: new ReplicaError.SchemaCause({
-                        message: String(cause),
-                        path: []
-                      })
+                      cause
                     })
                   })
                 )
@@ -445,10 +424,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageUnavailable({
-                    cause: new ReplicaError.SqlCause({
-                      message: String(cause),
-                      code: null
-                    })
+                    cause
                   })
                 })
               ))
@@ -504,10 +480,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageUnavailable({
-                    cause: new ReplicaError.SqlCause({
-                      message: String(cause),
-                      code: null
-                    })
+                    cause
                   })
                 })
               ))

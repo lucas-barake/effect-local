@@ -69,10 +69,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.ProjectionBlocked({
                     projection: projection.name,
-                    cause: new ReplicaError.SchemaCause({
-                      message: String(cause),
-                      path: []
-                    })
+                    cause
                   })
                 })
               )
@@ -81,10 +78,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.ProjectionBlocked({
                   projection: projection.name,
-                  cause: new ReplicaError.SchemaCause({
-                    message: "Projection is not ready",
-                    path: []
-                  })
+                  cause: new Error("Projection is not ready")
                 })
               })
             }
@@ -93,10 +87,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.ProjectionBlocked({
                     projection: projection.name,
-                    cause: new ReplicaError.SchemaCause({
-                      message: String(cause),
-                      path: []
-                    })
+                    cause
                   })
                 })
               )
@@ -105,10 +96,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.ProjectionBlocked({
                   projection: projection.name,
-                  cause: new ReplicaError.SchemaCause({
-                    message: "A source document projection is not ready",
-                    path: []
-                  })
+                  cause: new Error("A source document projection is not ready")
                 })
               })
             }
@@ -117,10 +105,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.ProjectionBlocked({
                     projection: projection.name,
-                    cause: new ReplicaError.SchemaCause({
-                      message: String(cause),
-                      path: []
-                    })
+                    cause
                   })
                 })
               )
@@ -129,10 +114,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.ProjectionBlocked({
                   projection: projection.name,
-                  cause: new ReplicaError.SchemaCause({
-                    message: "A document projection is not ready",
-                    path: []
-                  })
+                  cause: new Error("A document projection is not ready")
                 })
               })
             }
@@ -141,10 +123,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(
             Effect.mapError((cause) =>
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({
-                  cause: new ReplicaError.SchemaCause({
-                    message: String(cause),
-                    path: []
-                  })
+                  cause
                 })
               })
             )
@@ -153,10 +132,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(
             Effect.mapError((cause) =>
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({
-                  cause: new ReplicaError.SchemaCause({
-                    message: String(cause),
-                    path: []
-                  })
+                  cause
                 })
               })
             )
@@ -168,10 +144,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(
             Effect.mapError((cause) =>
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({
-                  cause: new ReplicaError.SchemaCause({
-                    message: String(cause),
-                    path: []
-                  })
+                  cause
                 })
               })
             )

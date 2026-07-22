@@ -317,7 +317,7 @@ describe("BackupStore", () => {
       if (Result.isFailure(result)) {
         assert.strictEqual(result.failure.reason._tag, "StorageCorrupt")
         if (result.failure.reason._tag === "StorageCorrupt") {
-          assert.strictEqual(result.failure.reason.cause._tag, "SchemaCause")
+          assert.isTrue(Schema.is(Schema.Error())(result.failure.reason.cause))
         }
       }
       InternalAutomerge.free(created.automerge)
@@ -405,7 +405,7 @@ describe("BackupStore", () => {
       if (Result.isFailure(restored)) {
         assert.strictEqual(restored.failure.reason._tag, "BackupInvalid")
         if (restored.failure.reason._tag === "BackupInvalid") {
-          assert.strictEqual(restored.failure.reason.cause._tag, "SqlCause")
+          assert.isTrue(Schema.is(Schema.Error())(restored.failure.reason.cause))
         }
       }
       const after = yield* sql<{

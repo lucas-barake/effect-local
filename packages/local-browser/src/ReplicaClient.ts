@@ -55,20 +55,24 @@ export const fromRpcClient = (
       Effect.mapError((cause) =>
         new ReplicaError.ReplicaError({
           reason: new ReplicaError.StorageUnavailable({
-            cause: new ReplicaError.CryptoCause({ message: String(cause) })
+            cause
           })
         })
       ),
       Effect.provideService(Crypto.Crypto, crypto)
     )
     const openSession = Effect.fnUntraced(function*(sessionId: Identity.SessionId) {
-      const lease = yield* rpc.OpenSession({ sessionId, definitionHash: definition.hash }).pipe(
+      const lease = yield* rpc.OpenSession({
+        sessionId,
+        protocolVersion: ReplicaRpc.protocolVersion,
+        definitionHash: definition.hash
+      }).pipe(
         Effect.tapError(() => Effect.ignore(rpc.CloseSession({ sessionId }))),
         Effect.catchTag("RpcClientError", (error) =>
           Effect.fail(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageUnavailable({
-                cause: new ReplicaError.RpcCause({ message: error.message })
+                cause: error
               })
             })
           )),
@@ -168,7 +172,7 @@ export const fromRpcClient = (
           Effect.fail(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageUnavailable({
-                cause: new ReplicaError.RpcCause({ message: error.message })
+                cause: error
               })
             })
           )),
@@ -208,7 +212,7 @@ export const fromRpcClient = (
               Stream.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageUnavailable({
-                    cause: new ReplicaError.RpcCause({ message: error.message })
+                    cause: error
                   })
                 })
               )),
@@ -336,7 +340,7 @@ export const fromRpcClient = (
             Effect.fail(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
-                  cause: new ReplicaError.RpcCause({ message: error.message })
+                  cause: error
                 })
               })
             )),
@@ -389,7 +393,7 @@ export const fromRpcClient = (
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageUnavailable({
-                    cause: new ReplicaError.RpcCause({ message: error.message })
+                    cause: error
                   })
                 })
               ),
@@ -405,7 +409,7 @@ export const fromRpcClient = (
             Effect.fail(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
-                  cause: new ReplicaError.RpcCause({ message: error.message })
+                  cause: error
                 })
               })
             )),
@@ -418,7 +422,7 @@ export const fromRpcClient = (
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageUnavailable({
-                    cause: new ReplicaError.RpcCause({ message: error.message })
+                    cause: error
                   })
                 })
               ))
@@ -430,7 +434,7 @@ export const fromRpcClient = (
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageUnavailable({
-                    cause: new ReplicaError.RpcCause({ message: error.message })
+                    cause: error
                   })
                 })
               )),
@@ -441,7 +445,7 @@ export const fromRpcClient = (
           Effect.fail(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageUnavailable({
-                cause: new ReplicaError.RpcCause({ message: error.message })
+                cause: error
               })
             })
           ))
@@ -451,7 +455,7 @@ export const fromRpcClient = (
           Stream.fail(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageUnavailable({
-                cause: new ReplicaError.RpcCause({ message: error.message })
+                cause: error
               })
             })
           ))
@@ -462,7 +466,7 @@ export const fromRpcClient = (
             Stream.fail(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
-                  cause: new ReplicaError.RpcCause({ message: error.message })
+                  cause: error
                 })
               })
             ))
@@ -503,7 +507,7 @@ export const fromRpcClient = (
             Effect.fail(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
-                  cause: new ReplicaError.RpcCause({ message: error.message })
+                  cause: error
                 })
               })
             ))
@@ -516,7 +520,7 @@ export const fromRpcClient = (
             Effect.fail(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
-                  cause: new ReplicaError.RpcCause({ message: error.message })
+                  cause: error
                 })
               })
             )),
@@ -541,7 +545,7 @@ export const fromRpcClient = (
                 Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageUnavailable({
-                      cause: new ReplicaError.RpcCause({ message: error.message })
+                      cause: error
                     })
                   })
                 ))

@@ -916,7 +916,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                     ? Effect.fail(
                       new ReplicaError.ReplicaError({
                         reason: new ReplicaError.StorageUnavailable({
-                          cause: new ReplicaError.RpcCause({ message: "offline" })
+                          cause: new Error("offline")
                         })
                       })
                     )

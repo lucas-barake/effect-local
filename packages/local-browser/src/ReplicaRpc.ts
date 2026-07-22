@@ -23,11 +23,11 @@ const ExportedDocument = Schema.Struct({
 
 const JsonOutcome = CommandOutcome.schema(Schema.Json, Schema.Json)
 const DocumentIdOutcome = CommandOutcome.schema(Identity.DocumentId, Schema.Never)
-export const protocolVersion = 2
+export const protocolVersion = 3
 const SessionLease = Schema.Struct({ leaseMillis: Schema.Int })
 const SessionHandshake = Schema.Struct({
   leaseMillis: Schema.Int,
-  protocolVersion: Schema.Literal(protocolVersion),
+  protocolVersion: Schema.Int,
   definitionHash: Schema.String,
   ownerEpoch: Schema.String
 })
@@ -63,7 +63,11 @@ export class ReplicaQueryError extends Schema.TaggedErrorClass<ReplicaQueryError
 
 export const group = RpcGroup.make(
   Rpc.make("OpenSession", {
-    payload: { sessionId: Identity.SessionId, definitionHash: Schema.String },
+    payload: {
+      sessionId: Identity.SessionId,
+      protocolVersion: Schema.optional(Schema.Int),
+      definitionHash: Schema.String
+    },
     success: SessionHandshake,
     error: ReplicaError.ReplicaError
   }),

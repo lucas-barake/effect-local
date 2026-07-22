@@ -31,10 +31,7 @@ const encode = <S extends Document.WireSchema,>(schema: S, value: S["Type"]) =>
       Effect.fail(
         new ReplicaError.ReplicaError({
           reason: new ReplicaError.StorageCorrupt({
-            cause: new ReplicaError.SchemaCause({
-              message: String(cause),
-              path: []
-            })
+            cause
           })
         })
       ))
@@ -48,10 +45,7 @@ const decode = <S extends Document.WireSchema,>(schema: S, bytes: Uint8Array) =>
       Effect.fail(
         new ReplicaError.ReplicaError({
           reason: new ReplicaError.StorageCorrupt({
-            cause: new ReplicaError.SchemaCause({
-              message: String(cause),
-              path: []
-            })
+            cause
           })
         })
       ))
@@ -134,7 +128,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   Effect.fail(
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.StorageUnavailable({
-                        cause: new ReplicaError.RpcCause({ message: String(cause) })
+                        cause
                       })
                     })
                   ))
@@ -164,10 +158,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.DocumentDecodeError({
                         documentId: options.documentId,
-                        cause: new ReplicaError.SchemaCause({
-                          message: String(cause),
-                          path: []
-                        })
+                        cause
                       })
                     })
                   ))
@@ -192,7 +183,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   Effect.fail(
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.StorageUnavailable({
-                        cause: new ReplicaError.RpcCause({ message: String(cause) })
+                        cause
                       })
                     })
                   ))
@@ -226,7 +217,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   Effect.fail(
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.StorageUnavailable({
-                        cause: new ReplicaError.RpcCause({ message: String(cause) })
+                        cause
                       })
                     })
                   ))
@@ -268,10 +259,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             if (options.value.documentName !== document.name || options.value.schemaVersion !== document.version) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new ReplicaError.SchemaCause({
-                    message: "Portable document definition mismatch",
-                    path: []
-                  })
+                  cause: new Error("Portable document definition mismatch")
                 })
               })
             }

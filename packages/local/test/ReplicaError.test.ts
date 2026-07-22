@@ -14,28 +14,19 @@ describe("ReplicaError", () => {
     assert.deepStrictEqual(Schema.decodeUnknownSync(ReplicaError.ReplicaError)(encoded), error)
   })
 
-  it("preserves structured causes without arbitrary exception objects", () => {
+  it("round trips arbitrary defect causes", () => {
     const error = new ReplicaError.ReplicaError({
       reason: new ReplicaError.StorageUnavailable({
-        cause: new ReplicaError.SqlCause({
-          message: "database closed",
-          code: "SQLITE_CANTOPEN"
-        })
+        cause: new Error("database closed")
       })
     })
     const encoded = Schema.encodeSync(ReplicaError.ReplicaError)(error)
     assert.strictEqual(encoded.reason._tag, "StorageUnavailable")
     if (encoded.reason._tag !== "StorageUnavailable") return
-    assert.deepStrictEqual(encoded.reason.cause, {
-      _tag: "SqlCause",
-      message: "database closed",
-      code: "SQLITE_CANTOPEN"
-    })
-    assert.throws(() =>
-      Schema.decodeUnknownSync(ReplicaError.ReplicaError)({
-        _tag: "ReplicaError",
-        reason: { _tag: "StorageUnavailable", cause: new Error("no") }
-      })
-    )
+    assert.deepStrictEqual(encoded.reason.cause, { name: "Error", message: "database closed" })
+    const decoded = Schema.decodeUnknownSync(ReplicaError.ReplicaError)(encoded)
+    assert.isTrue(Schema.is(Schema.Error())(decoded.reason.cause))
+    if (!Schema.is(Schema.Error())(decoded.reason.cause)) return
+    assert.strictEqual(decoded.reason.cause.message, "database closed")
   })
 })

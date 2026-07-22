@@ -164,7 +164,7 @@ export const makeTestClient = (
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageUnavailable({
-                    cause: new ReplicaError.RpcCause({ message: String(cause) })
+                    cause
                   })
                 })
               ))
@@ -267,7 +267,7 @@ export const makeTestClient = (
                 Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageUnavailable({
-                      cause: new ReplicaError.RpcCause({ message: String(cause) })
+                      cause
                     })
                   })
                 )
@@ -311,7 +311,7 @@ export const makeTestClient = (
         Effect.fail(
           new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageUnavailable({
-              cause: new ReplicaError.RpcCause({ message: "Peer connection receive stream ended" })
+              cause: new Error("Peer connection receive stream ended")
             })
           })
         )

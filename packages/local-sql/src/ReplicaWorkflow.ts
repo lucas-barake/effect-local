@@ -110,10 +110,7 @@ export const layerRegistration = (
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageUnavailable({
-                    cause: new ReplicaError.SqlCause({
-                      message: String(cause),
-                      code: null
-                    })
+                    cause
                   })
                 })
               ),
@@ -121,10 +118,7 @@ export const layerRegistration = (
               Effect.fail(
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageCorrupt({
-                    cause: new ReplicaError.SchemaCause({
-                      message: String(cause),
-                      path: []
-                    })
+                    cause
                   })
                 })
               )

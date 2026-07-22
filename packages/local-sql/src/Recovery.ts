@@ -157,10 +157,7 @@ export const make = Effect.gen(function*() {
           Effect.fail(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new ReplicaError.SchemaCause({
-                  message: String(cause),
-                  path: []
-                })
+                cause
               })
             })
           ),
@@ -168,10 +165,7 @@ export const make = Effect.gen(function*() {
           Effect.fail(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageUnavailable({
-                cause: new ReplicaError.SqlCause({
-                  message: String(cause),
-                  code: null
-                })
+                cause
               })
             })
           )
@@ -204,10 +198,7 @@ export const make = Effect.gen(function*() {
         Effect.fail(
           new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageUnavailable({
-              cause: new ReplicaError.SqlCause({
-                message: String(cause),
-                code: null
-              })
+              cause
             })
           })
         ))
@@ -228,10 +219,7 @@ export const make = Effect.gen(function*() {
         Effect.fail(
           new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageUnavailable({
-              cause: new ReplicaError.SqlCause({
-                message: String(cause),
-                code: null
-              })
+              cause
             })
           })
         ))
@@ -255,10 +243,7 @@ export const make = Effect.gen(function*() {
             Effect.fail(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
-                  cause: new ReplicaError.SqlCause({
-                    message: String(cause),
-                    code: null
-                  })
+                  cause
                 })
               })
             ),
@@ -266,10 +251,7 @@ export const make = Effect.gen(function*() {
             Effect.fail(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({
-                  cause: new ReplicaError.SchemaCause({
-                    message: String(cause),
-                    path: []
-                  })
+                  cause
                 })
               })
             )
@@ -283,7 +265,7 @@ export const make = Effect.gen(function*() {
         yield* quarantine(documentId, [], `Stored document type does not match ${document.name}`, permit)
         return yield* new ReplicaError.ReplicaError({
           reason: new ReplicaError.StorageCorrupt({
-            cause: new ReplicaError.AutomergeCause({ message: `Stored document type does not match ${document.name}` })
+            cause: new Error(`Stored document type does not match ${document.name}`)
           })
         })
       }
@@ -305,7 +287,7 @@ export const make = Effect.gen(function*() {
         catch: (cause) =>
           new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new ReplicaError.AutomergeCause({ message: String(cause) })
+              cause
             })
           })
       }))
@@ -328,7 +310,7 @@ export const make = Effect.gen(function*() {
               catch: (cause) =>
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageCorrupt({
-                    cause: new ReplicaError.AutomergeCause({ message: String(cause) })
+                    cause
                   })
                 })
             })
@@ -348,7 +330,7 @@ export const make = Effect.gen(function*() {
                 catch: (cause) =>
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageCorrupt({
-                      cause: new ReplicaError.AutomergeCause({ message: String(cause) })
+                      cause
                     })
                   })
               })
@@ -374,7 +356,7 @@ export const make = Effect.gen(function*() {
               catch: (cause) =>
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageCorrupt({
-                    cause: new ReplicaError.AutomergeCause({ message: String(cause) })
+                    cause
                   })
                 })
             })
@@ -427,7 +409,7 @@ export const make = Effect.gen(function*() {
       yield* quarantine(documentId, invalidCheckpoints, "Canonical recovery failed", permit)
       return yield* new ReplicaError.ReplicaError({
         reason: new ReplicaError.StorageCorrupt({
-          cause: new ReplicaError.AutomergeCause({ message: `No complete verified history for document ${documentId}` })
+          cause: new Error(`No complete verified history for document ${documentId}`)
         })
       })
     })

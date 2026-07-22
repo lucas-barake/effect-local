@@ -98,10 +98,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.DocumentDecodeError({
                       documentId: options.documentId,
-                      cause: new ReplicaError.SchemaCause({
-                        message: String(cause),
-                        path: []
-                      })
+                      cause
                     })
                   })
                 )
@@ -166,10 +163,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
             if (options.value.documentName !== document.name || options.value.schemaVersion !== document.version) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new ReplicaError.SchemaCause({
-                    message: "Portable document definition mismatch",
-                    path: []
-                  })
+                  cause: new Error("Portable document definition mismatch")
                 })
               })
             }

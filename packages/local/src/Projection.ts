@@ -60,10 +60,7 @@ export const evaluate = <P extends Any,>(
       new ReplicaError.ReplicaError({
         reason: new ReplicaError.ProjectionBlocked({
           projection: self.name,
-          cause: new ReplicaError.SchemaCause({
-            message: String(cause),
-            path: []
-          })
+          cause
         })
       })
   })
