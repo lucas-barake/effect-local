@@ -19,12 +19,15 @@ describe("public API types", () => {
   })
   const Rename = Mutation.make("Rename", {
     document: Task,
-    payload: Schema.Struct({ title: Schema.String }),
+    payload: { title: Schema.String },
     success: Schema.Boolean,
     error: RenameError
   })
   const Read = Query.make("Read", {
-    payload: Schema.String,
+    payload: {
+      id: Schema.NumberFromString,
+      label: Schema.optionalKey(Schema.String)
+    },
     success: Schema.Array(Task.schema),
     error: ReadError,
     dependsOn: []
@@ -45,7 +48,14 @@ describe("public API types", () => {
     const mutationPayload: Equal<typeof Rename.payloadSchema.Type, { readonly title: string }> = true
     const mutationSuccess: Equal<typeof Rename.successSchema.Type, boolean> = true
     const mutationError: Equal<typeof Rename.errorSchema.Type, RenameError> = true
-    const queryPayload: Equal<typeof Read.payloadSchema.Type, string> = true
+    const queryPayload: Equal<
+      typeof Read.payloadSchema.Type,
+      { readonly id: number; readonly label?: string }
+    > = true
+    const queryPayloadEncoded: Equal<
+      typeof Read.payloadSchema.Encoded,
+      { readonly id: string; readonly label?: string }
+    > = true
     const querySuccess: Equal<typeof Read.successSchema.Type, ReadonlyArray<{ readonly title: string }>> = true
     const queryError: Equal<typeof Read.errorSchema.Type, ReadError> = true
     const mutationErrorUnion: Equal<typeof RenameWithUnion.errorSchema.Type, ReadError | RenameError> = true
@@ -55,6 +65,7 @@ describe("public API types", () => {
     assert.isTrue(mutationSuccess)
     assert.isTrue(mutationError)
     assert.isTrue(queryPayload)
+    assert.isTrue(queryPayloadEncoded)
     assert.isTrue(querySuccess)
     assert.isTrue(queryError)
     assert.isTrue(mutationErrorUnion)

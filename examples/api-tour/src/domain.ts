@@ -75,7 +75,7 @@ export const TaskList = Projection.make("ApiTourTaskList", {
 })
 
 export const ListTasks = Query.make("ApiTourListTasks", {
-  payload: Schema.Struct({ state: Schema.NullOr(Schema.Literals(["open", "done"])) }),
+  payload: { state: Schema.NullOr(Schema.Literals(["open", "done"])) },
   success: Schema.Array(TaskList.Row),
   error: UnboundedTaskQuery,
   dependsOn: [TaskList]

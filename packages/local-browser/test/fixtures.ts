@@ -22,7 +22,7 @@ export class RenameError extends Schema.TaggedErrorClass<RenameError>()("RenameE
 
 export const Rename = Mutation.make("Rename", {
   document: Task,
-  payload: Schema.Struct({ title: Schema.String }),
+  payload: { title: Schema.String },
   success: Schema.String,
   error: RenameError
 })

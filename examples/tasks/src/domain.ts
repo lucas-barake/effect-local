@@ -27,12 +27,12 @@ export const TaskDocument = Document.make("Task", {
 
 export const RenameTask = Mutation.make("RenameTask", {
   document: TaskDocument,
-  payload: Schema.Struct({ title: Title })
+  payload: { title: Title }
 })
 
 export const SetTaskCompleted = Mutation.make("SetTaskCompleted", {
   document: TaskDocument,
-  payload: Schema.Struct({ completed: Schema.Boolean })
+  payload: { completed: Schema.Boolean }
 })
 
 export const TaskRow = Schema.Struct({
@@ -52,10 +52,10 @@ export const TaskList = Projection.make("TaskList", {
 })
 
 export const ListTasks = Query.make("ListTasks", {
-  payload: Schema.Struct({
+  payload: {
     filter: Schema.Literals(["all", "active", "completed"]),
     search: Schema.String
-  }),
+  },
   success: Schema.Array(TaskRow),
   dependsOn: [TaskList]
 })

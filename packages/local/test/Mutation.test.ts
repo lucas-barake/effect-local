@@ -17,10 +17,11 @@ describe("Mutation", () => {
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
   const Rename = Mutation.make("Rename", {
     document: Task,
-    payload: Schema.Struct({ title: Schema.String })
+    payload: { title: Schema.String }
   })
 
   it("uses void and never defaults", () => {
+    assert.isTrue(Schema.isSchema(Rename.payloadSchema))
     assert.strictEqual(Rename.successSchema, Schema.Void)
     assert.strictEqual(Rename.errorSchema, Schema.Never)
   })

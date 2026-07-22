@@ -169,9 +169,10 @@ The supported encoded shape consists of Automerge scalar values, arrays, and pla
 
 ### 2. Define mutations and inject handlers
 
-Mutation definitions expose `payloadSchema`, `successSchema`, and `errorSchema`. Implementations are separate Layer
-services. A mutation handler is synchronous because it runs inside an Automerge change and a durable SQL command
-transaction. `toLayer` accepts a handler directly or an Effect that constructs one.
+Mutation definitions expose `payloadSchema`, `successSchema`, and `errorSchema`. Payloads accept either a schema or
+`Schema.Struct` fields directly, matching Effect RPC. Implementations are separate Layer services. A mutation handler
+is synchronous because it runs inside an Automerge change and a durable SQL command transaction. `toLayer` accepts a
+handler directly or an Effect that constructs one.
 
 ```ts
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
@@ -184,13 +185,13 @@ export class TitleEmpty extends Schema.TaggedErrorClass<TitleEmpty>()("TitleEmpt
 
 export const RenameTask = Mutation.make("RenameTask", {
   document: Task,
-  payload: Schema.Struct({ title: Schema.String }),
+  payload: { title: Schema.String },
   error: TitleEmpty
 })
 
 export const SetTaskCompleted = Mutation.make("SetTaskCompleted", {
   document: Task,
-  payload: Schema.Struct({ completed: Schema.Boolean })
+  payload: { completed: Schema.Boolean }
 })
 
 export const MutationLive = Layer.mergeAll(
@@ -249,7 +250,7 @@ export const TaskList = Projection.make("TaskList", {
 })
 
 export const ListTasks = Query.make("ListTasks", {
-  payload: Schema.Struct({ search: Schema.String }),
+  payload: { search: Schema.String },
   success: Schema.Array(TaskRow),
   dependsOn: [TaskList]
 })

@@ -4,6 +4,7 @@ import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import type * as Document from "./Document.js"
+import * as SchemaInput from "./internal/schemaInput.js"
 import type * as TaggedError from "./internal/taggedError.js"
 import type * as Projection from "./Projection.js"
 
@@ -63,20 +64,20 @@ export interface Any {
 
 export const make = <
   const Name extends string,
-  P extends Document.WireSchema = typeof Schema.Void,
+  P extends SchemaInput.Input = typeof Schema.Void,
   A extends Document.WireSchema = typeof Schema.Void,
   E extends TaggedError.Schema = typeof Schema.Never,
   const Dependencies extends ReadonlyArray<Projection.Any> = readonly [],
 >(
   name: Name,
   options: {
-    readonly payload?: P
+    readonly payload?: SchemaInput.Valid<P>
     readonly version?: number
     readonly success?: A
     readonly error?: E
     readonly dependsOn: Dependencies
   }
-): Query<Name, P, A, E, Dependencies> => {
+): Query<Name, SchemaInput.Wire<P>, A, E, Dependencies> => {
   if (name.length === 0) throw new TypeError("Query name must be nonempty")
   const version = options.version ?? 1
   if (!Number.isSafeInteger(version) || version < 1) throw new TypeError("Query version must be a positive integer")
@@ -86,26 +87,32 @@ export const make = <
     names.add(projection.name)
   }
   const handler = Context.Service<
-    HandlerService<Name, P, A, E, Dependencies>,
-    Handler<P["Type"], A["Type"], E["Type"], never>
+    HandlerService<Name, SchemaInput.Wire<P>, A, E, Dependencies>,
+    Handler<SchemaInput.Wire<P>["Type"], A["Type"], E["Type"], never>
   >(`@lucas-barake/effect-local/Query/${name}/${handlerId++}`)
   const toLayer = <R, EX = never, RX = never,>(
     build:
-      | Handler<P["Type"], A["Type"], E["Type"], R>
-      | Effect.Effect<Handler<P["Type"], A["Type"], E["Type"], R>, EX, RX>
-  ): Layer.Layer<HandlerService<Name, P, A, E, Dependencies>, EX, R | Exclude<RX, Scope.Scope>> =>
+      | Handler<SchemaInput.Wire<P>["Type"], A["Type"], E["Type"], R>
+      | Effect.Effect<Handler<SchemaInput.Wire<P>["Type"], A["Type"], E["Type"], R>, EX, RX>
+  ): Layer.Layer<
+    HandlerService<Name, SchemaInput.Wire<P>, A, E, Dependencies>,
+    EX,
+    R | Exclude<RX, Scope.Scope>
+  > =>
     Layer.effect(
       handler,
       Effect.gen(function*() {
         const context = yield* Effect.context<R>()
         const implementation = Effect.isEffect(build) ? yield* build : build
-        return (payload: P["Type"]) => implementation(payload).pipe(Effect.provide(context))
+        return (payload: SchemaInput.Wire<P>["Type"]) => implementation(payload).pipe(Effect.provide(context))
       })
     )
   return {
     name,
     version,
-    payloadSchema: (options.payload ?? Schema.Void) as unknown as P,
+    payloadSchema: options.payload === undefined
+      ? Schema.Void as SchemaInput.Wire<P>
+      : SchemaInput.normalize(options.payload),
     successSchema: (options.success ?? Schema.Void) as unknown as A,
     errorSchema: (options.error ?? Schema.Never) as unknown as E,
     dependsOn: options.dependsOn,

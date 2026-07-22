@@ -51,7 +51,7 @@ describe("QueryExecutor", () => {
       VALUES (${row.sourceDocumentId}, ${row.label})`.pipe(Effect.asVoid)
   })
   const ListLabels = Query.make("ListLabels", {
-    payload: Schema.Struct({ prefix: Schema.String }),
+    payload: { prefix: Schema.String },
     success: Schema.Array(Labels.Row),
     dependsOn: [Labels]
   })

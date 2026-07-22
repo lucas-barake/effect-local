@@ -6,6 +6,7 @@ import type * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import type * as Document from "./Document.js"
+import * as SchemaInput from "./internal/schemaInput.js"
 import type * as TaggedError from "./internal/taggedError.js"
 
 export type DraftValue<A,> = A extends Automerge.ScalarValue ? A
@@ -84,7 +85,7 @@ export interface Any {
 export const make = <
   const Name extends string,
   D extends Document.Any,
-  P extends Document.WireSchema = typeof Schema.Void,
+  P extends SchemaInput.Input = typeof Schema.Void,
   A extends Document.WireSchema = typeof Schema.Void,
   E extends TaggedError.Schema = typeof Schema.Never,
 >(
@@ -92,23 +93,25 @@ export const make = <
   options: {
     readonly document: D
     readonly version?: number
-    readonly payload?: P
+    readonly payload?: SchemaInput.Valid<P>
     readonly success?: A
     readonly error?: E
   }
-): Mutation<Name, D, P, A, E> => {
+): Mutation<Name, D, SchemaInput.Wire<P>, A, E> => {
   if (name.length === 0) throw new TypeError("Mutation name must be nonempty")
   const version = options.version ?? 1
   if (!Number.isSafeInteger(version) || version < 1) throw new TypeError("Mutation version must be a positive integer")
   const handler = Context.Service<
-    HandlerService<Name, D, P, A, E>,
-    Handler<D, P["Type"], A["Type"], E["Type"]>
+    HandlerService<Name, D, SchemaInput.Wire<P>, A, E>,
+    Handler<D, SchemaInput.Wire<P>["Type"], A["Type"], E["Type"]>
   >(`@lucas-barake/effect-local/Mutation/${options.document.name}/${name}/${handlerId++}`)
   return {
     name,
     version,
     document: options.document,
-    payloadSchema: (options.payload ?? Schema.Void) as unknown as P,
+    payloadSchema: options.payload === undefined
+      ? Schema.Void as SchemaInput.Wire<P>
+      : SchemaInput.normalize(options.payload),
     successSchema: (options.success ?? Schema.Void) as unknown as A,
     errorSchema: (options.error ?? Schema.Never) as unknown as E,
     handler,
