@@ -4,7 +4,7 @@ import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
-import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -346,7 +346,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       }])
     })).pipe(Effect.provide(Owner)))
 
-  it.effect("bounds invalidation reconnect attempts after ready messages", () =>
+  it.effect("resets invalidation reconnect attempts after each ready message", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       let subscriptions = 0
@@ -356,21 +356,33 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           return ({ ownerEpoch }: { readonly ownerEpoch: string }) =>
             Stream.unwrap(Effect.sync(() => {
               subscriptions++
-              return Stream.make({
+              const ready = Stream.make({
                 _tag: "InvalidationsReady" as const,
                 ownerEpoch,
                 watermark: Identity.CommitSequence.make(0),
                 refreshGeneration: 0
-              }).pipe(Stream.concat(Stream.fail(disconnected())))
+              })
+              return subscriptions < 5
+                ? ready.pipe(Stream.concat(Stream.fail(disconnected())))
+                : ready.pipe(Stream.concat(Stream.make({
+                  _tag: "Invalidation" as const,
+                  ownerEpoch,
+                  sequence: Identity.CommitSequence.make(1),
+                  keys: [Task.name]
+                })))
             }))
         }
       })
       const client = yield* ReplicaClient.fromRpcClient(definition, disconnectedAfterReady)
-      const fiber = yield* client.invalidations.pipe(Stream.runDrain, Effect.flip, Effect.forkChild)
-      yield* TestClock.adjust(2_000)
-      const error = yield* Fiber.join(fiber)
-      assert.strictEqual(error.reason._tag, "StorageUnavailable")
-      assert.strictEqual(subscriptions, 4)
+      const fiber = yield* client.invalidations.pipe(Stream.take(1), Stream.runCollect, Effect.forkChild)
+      yield* TestClock.adjust(10_000)
+      assert.deepStrictEqual(Array.from(yield* Fiber.join(fiber)), [{
+        _tag: "Invalidation",
+        ownerEpoch: client.ownerEpoch,
+        sequence: Identity.CommitSequence.make(1),
+        keys: [Task.name]
+      }])
+      assert.strictEqual(subscriptions, 5)
     })).pipe(Effect.provide(Owner)))
 
   it.effect("retries transient lease renewal failures", () =>
@@ -389,8 +401,200 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         }
       })
       yield* ReplicaClient.fromRpcClient(definition, reconnecting)
-      yield* TestClock.adjust(SessionManager.leaseDurationMillis / 2 + 1_000)
+      yield* TestClock.adjust(SessionManager.leaseDurationMillis / 2 + 2_000)
       assert.strictEqual(renewals, 3)
+      assert.strictEqual(yield* sessions.activeCount, 1)
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("continues renewing after a transient failure burst", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sessions = yield* SessionManager.SessionManager
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      let renewals = 0
+      const reconnecting = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property !== "RenewSession") return value
+          return (payload: never) =>
+            Effect.sync(() => ++renewals).pipe(
+              Effect.flatMap((attempt) => attempt < 5 ? Effect.fail(disconnected()) : value(payload))
+            )
+        }
+      })
+      yield* ReplicaClient.fromRpcClient(definition, reconnecting)
+      yield* TestClock.adjust(SessionManager.leaseDurationMillis + 1)
+      assert.strictEqual(renewals, 5)
+      assert.strictEqual(yield* sessions.activeCount, 1)
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("reopens after an owner restart and refreshes invalidations", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sessions = yield* SessionManager.SessionManager
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const invalidationsStarted = yield* Deferred.make<void>()
+      const ownerRestarted = yield* Deferred.make<void>()
+      let openSessions = 0
+      let restarted = false
+      const restarting = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property === "OpenSession") {
+            return (payload: never) =>
+              Effect.sync(() => ++openSessions).pipe(
+                Effect.flatMap((generation) =>
+                  value(payload).pipe(Effect.map((lease: object) => ({ ...lease, ownerEpoch: `owner-${generation}` })))
+                )
+              )
+          }
+          if (property === "Get") {
+            return (payload: { readonly sessionId: Identity.SessionId }) =>
+              restarted && openSessions === 1
+                ? Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.ProtocolMismatch({
+                      expected: "active session",
+                      observed: payload.sessionId
+                    })
+                  })
+                )
+                : value(payload)
+          }
+          if (property === "Invalidations") {
+            return ({ ownerEpoch }: { readonly ownerEpoch: string }) =>
+              Stream.make({
+                _tag: "InvalidationsReady" as const,
+                ownerEpoch,
+                watermark: Identity.CommitSequence.make(0),
+                refreshGeneration: 0
+              }).pipe(
+                Stream.tap(() => Deferred.succeed(invalidationsStarted, undefined)),
+                Stream.concat(
+                  ownerEpoch === "owner-1"
+                    ? Stream.fromEffect(Deferred.await(ownerRestarted)).pipe(
+                      Stream.flatMap(() =>
+                        Stream.fail(
+                          new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.ProtocolMismatch({
+                              expected: "active session",
+                              observed: "owner restarted"
+                            })
+                          })
+                        )
+                      )
+                    )
+                    : Stream.never
+                )
+              )
+          }
+          return value
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, restarting)
+      const initialOwnerEpoch = client.ownerEpoch
+      const invalidation = yield* client.invalidations.pipe(Stream.take(1), Stream.runCollect, Effect.forkChild)
+      yield* Deferred.await(invalidationsStarted)
+      restarted = true
+      assert.deepStrictEqual(yield* client.get(Task, documentId), yield* replica.get(Task, documentId))
+      yield* Deferred.succeed(ownerRestarted, undefined)
+      assert.strictEqual(openSessions, 2)
+      assert.notStrictEqual(client.ownerEpoch, initialOwnerEpoch)
+      assert.deepStrictEqual(Array.from(yield* Fiber.join(invalidation)), [{
+        _tag: "FullRefreshRequired",
+        ownerEpoch: client.ownerEpoch,
+        keys: [Task.name]
+      }])
+      assert.strictEqual(yield* sessions.activeCount, 1)
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("serializes concurrent session reopen attempts", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const staleRequests = yield* Deferred.make<void>()
+      let initialSessionId: Identity.SessionId | undefined
+      let openSessions = 0
+      let staleGets = 0
+      let restarted = false
+      const restarting = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property === "OpenSession") {
+            return (payload: { readonly sessionId: Identity.SessionId }) => {
+              openSessions++
+              if (initialSessionId === undefined) initialSessionId = payload.sessionId
+              return value(payload)
+            }
+          }
+          if (property === "Get") {
+            return (payload: { readonly sessionId: Identity.SessionId }) => {
+              if (!restarted || payload.sessionId !== initialSessionId) return value(payload)
+              staleGets++
+              return (staleGets === 2 ? Deferred.succeed(staleRequests, undefined) : Effect.void).pipe(
+                Effect.andThen(Deferred.await(staleRequests)),
+                Effect.andThen(Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.ProtocolMismatch({
+                      expected: "active session",
+                      observed: payload.sessionId
+                    })
+                  })
+                ))
+              )
+            }
+          }
+          return value
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, restarting)
+      restarted = true
+      const snapshots = yield* Effect.all([
+        client.get(Task, documentId),
+        client.get(Task, documentId)
+      ], { concurrency: "unbounded" })
+      assert.strictEqual(snapshots[0].documentId, documentId)
+      assert.strictEqual(snapshots[1].documentId, documentId)
+      assert.strictEqual(openSessions, 2)
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("reuses a session id across ambiguous reopen attempts", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sessions = yield* SessionManager.SessionManager
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      let initialSessionId: Identity.SessionId | undefined
+      let openSessions = 0
+      const reconnecting = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property === "OpenSession") {
+            return (payload: { readonly sessionId: Identity.SessionId }) => {
+              openSessions++
+              if (initialSessionId === undefined) initialSessionId = payload.sessionId
+              const opened = value(payload)
+              return openSessions === 2 || openSessions === 3
+                ? opened.pipe(Effect.andThen(Effect.fail(disconnected())))
+                : opened
+            }
+          }
+          if (property === "Get") {
+            return (payload: { readonly sessionId: Identity.SessionId }) =>
+              payload.sessionId === initialSessionId
+                ? Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.ProtocolMismatch({
+                      expected: "active session",
+                      observed: payload.sessionId
+                    })
+                  })
+                )
+                : value(payload)
+          }
+          return value
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, reconnecting)
+      const snapshot = yield* client.get(Task, documentId).pipe(Effect.forkChild)
+      yield* TestClock.adjust("2 seconds")
+      assert.strictEqual((yield* Fiber.join(snapshot)).documentId, documentId)
+      assert.strictEqual(openSessions, 4)
       assert.strictEqual(yield* sessions.activeCount, 1)
     })).pipe(Effect.provide(Owner)))
 

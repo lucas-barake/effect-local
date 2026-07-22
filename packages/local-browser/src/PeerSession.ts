@@ -286,11 +286,6 @@ export const makeTestClient = (
         }
       })
 
-    yield* Stream.runForEach(connection.receive, receive).pipe(
-      Effect.tapError((error) => Deferred.fail(receiveFailure, error)),
-      Effect.ensuring(connection.close),
-      Effect.forkScoped
-    )
     yield* Effect.addFinalizer(() =>
       Effect.gen(function*() {
         yield* Ref.set(active, false)
@@ -310,6 +305,20 @@ export const makeTestClient = (
         Effect.ensuring(connection.close),
         Effect.orDie
       )
+    )
+    yield* Stream.runForEach(connection.receive, receive).pipe(
+      Effect.andThen(
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageUnavailable({
+              cause: new ReplicaError.RpcCause({ message: "Peer connection receive stream ended" })
+            })
+          })
+        )
+      ),
+      Effect.tapError((error) => Deferred.fail(receiveFailure, error)),
+      Effect.ensuring(connection.close),
+      Effect.forkScoped
     )
     yield* Ref.set(dirty, new Map(options.documents.map((entry) => [entry.documentId, 0])))
     yield* Effect.raceFirst(flush, Deferred.await(receiveFailure))

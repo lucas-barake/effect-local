@@ -56,6 +56,126 @@ describe("ReplicaGate", () => {
       yield* gate.validate(permit)
     }).pipe(Effect.provide(Gate)))
 
+  it.effect("does not admit new shared work ahead of a waiting restore", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const firstAcquired = yield* Deferred.make<void>()
+      const releaseFirst = yield* Deferred.make<void>()
+      const restoreAcquired = yield* Deferred.make<void>()
+      const releaseRestore = yield* Deferred.make<void>()
+      const lateReaderAcquired = yield* Deferred.make<void>()
+      const releaseLateReader = yield* Deferred.make<void>()
+      const first = yield* Effect.forkChild(Effect.scoped(Effect.gen(function*() {
+        yield* gate.shared
+        yield* Deferred.succeed(firstAcquired, undefined)
+        yield* Deferred.await(releaseFirst)
+      })))
+      yield* Deferred.await(firstAcquired)
+      const restore = yield* Effect.forkChild(gate.claim(() =>
+        Deferred.succeed(restoreAcquired, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseRestore))
+        )
+      ))
+      yield* Effect.yieldNow
+      const lateReader = yield* Effect.forkChild(Effect.scoped(Effect.gen(function*() {
+        yield* gate.shared
+        yield* Deferred.succeed(lateReaderAcquired, undefined)
+        yield* Deferred.await(releaseLateReader)
+      })))
+      yield* Effect.yieldNow
+      assert.isTrue(Option.isNone(yield* Deferred.poll(lateReaderAcquired)))
+      yield* Deferred.succeed(releaseFirst, undefined)
+      yield* Deferred.await(restoreAcquired)
+      assert.isTrue(Option.isNone(yield* Deferred.poll(lateReaderAcquired)))
+      yield* Deferred.succeed(releaseRestore, undefined)
+      yield* Deferred.await(lateReaderAcquired)
+      yield* Deferred.succeed(releaseLateReader, undefined)
+      yield* Fiber.join(first)
+      yield* Fiber.join(restore)
+      yield* Fiber.join(lateReader)
+    }).pipe(Effect.provide(Gate)))
+
+  it.effect("preserves fiber reentrancy inside an exclusive claim", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const claimed = yield* gate.claim(() => Effect.scoped(gate.shared))
+      assert.strictEqual(claimed.incarnation, 0)
+      assert.strictEqual((yield* gate.current).incarnation, 1)
+    }).pipe(Effect.provide(Gate)))
+
+  it.effect("allows concurrent shared scopes", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const firstAcquired = yield* Deferred.make<void>()
+      const releaseFirst = yield* Deferred.make<void>()
+      const secondAcquired = yield* Deferred.make<void>()
+      const first = yield* Effect.forkChild(Effect.scoped(Effect.gen(function*() {
+        yield* gate.shared
+        yield* Deferred.succeed(firstAcquired, undefined)
+        yield* Deferred.await(releaseFirst)
+      })))
+      yield* Deferred.await(firstAcquired)
+      const second = yield* Effect.forkChild(Effect.scoped(
+        gate.shared.pipe(Effect.andThen(Deferred.succeed(secondAcquired, undefined)))
+      ))
+      yield* Deferred.await(secondAcquired)
+      yield* Deferred.succeed(releaseFirst, undefined)
+      yield* Fiber.join(first)
+      yield* Fiber.join(second)
+    }).pipe(Effect.provide(Gate)))
+
+  it.effect("preserves nested exclusive reentrancy", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const nested = yield* gate.claim(() => gate.claim(Effect.succeed))
+      assert.strictEqual(nested.incarnation, 2)
+      assert.strictEqual((yield* gate.current).incarnation, 2)
+    }).pipe(Effect.provide(Gate)))
+
+  it.effect("removes an interrupted request waiting for admission", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const claimAcquired = yield* Deferred.make<void>()
+      const claim = yield* gate.claim(() =>
+        Deferred.succeed(claimAcquired, undefined).pipe(Effect.andThen(Effect.never))
+      ).pipe(Effect.forkChild)
+      yield* Deferred.await(claimAcquired)
+      const waiting = yield* Effect.scoped(gate.shared).pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      yield* Fiber.interrupt(waiting)
+      yield* Fiber.interrupt(claim)
+      yield* Effect.scoped(gate.shared)
+    }).pipe(Effect.provide(Gate)))
+
+  it.effect("retires an interrupted writer before admitting later readers", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const firstAcquired = yield* Deferred.make<void>()
+      const releaseFirst = yield* Deferred.make<void>()
+      const lateReaderAcquired = yield* Deferred.make<void>()
+      const releaseLateReader = yield* Deferred.make<void>()
+      const first = yield* Effect.forkChild(Effect.scoped(Effect.gen(function*() {
+        yield* gate.shared
+        yield* Deferred.succeed(firstAcquired, undefined)
+        yield* Deferred.await(releaseFirst)
+      })))
+      yield* Deferred.await(firstAcquired)
+      const writer = yield* Effect.forkChild(gate.claim(() => Effect.never))
+      yield* Effect.yieldNow
+      const lateReader = yield* Effect.forkChild(Effect.scoped(Effect.gen(function*() {
+        yield* gate.shared
+        yield* Deferred.succeed(lateReaderAcquired, undefined)
+        yield* Deferred.await(releaseLateReader)
+      })))
+      yield* Effect.yieldNow
+      yield* Fiber.interrupt(writer)
+      yield* Deferred.await(lateReaderAcquired)
+      yield* Deferred.succeed(releaseFirst, undefined)
+      yield* Deferred.succeed(releaseLateReader, undefined)
+      yield* Fiber.join(first)
+      yield* Fiber.join(lateReader)
+    }).pipe(Effect.provide(Gate)))
+
   it.effect("releases exclusive permits when epoch advancement fails", () =>
     Effect.scoped(Effect.gen(function*() {
       const gate = yield* ReplicaGate.ReplicaGate

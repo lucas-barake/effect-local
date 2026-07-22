@@ -60,6 +60,10 @@ export interface Received {
 
 const Heads = Schema.fromJsonString(Schema.Array(Schema.String))
 
+class ConcurrentDocumentWrite extends Schema.TaggedErrorClass<ConcurrentDocumentWrite>(
+  "@lucas-barake/effect-local-sql/ConcurrentDocumentWrite"
+)("ConcurrentDocumentWrite", {}) {}
+
 const ReceiptRow = Schema.Struct({
   commit_sequence: Schema.Number,
   accepted_heads: Heads,
@@ -312,6 +316,32 @@ export const layer: Layer.Layer<
       execute: () =>
         sql`UPDATE effect_local_metadata SET commit_sequence = commit_sequence + 1
           WHERE singleton = 1 RETURNING commit_sequence`
+    })
+    const updateDocument = SqlSchema.findAll({
+      Request: Schema.Struct({
+        acceptedHeads: Schema.String,
+        checkpointHash: Schema.NullOr(Schema.String),
+        documentId: Identity.DocumentId,
+        expectedAcceptedHeads: Schema.String,
+        expectedMaterializedHeads: Schema.String,
+        expectedProjectionStatus: Schema.Literals(["Ready", "Blocked", "Rebuilding"]),
+        materializedHeads: Schema.String,
+        projectionStatus: Schema.Literals(["Ready", "Blocked", "Rebuilding"]),
+        tombstone: Schema.Int
+      }),
+      Result: Schema.Struct({ document_id: Identity.DocumentId }),
+      execute: (request) =>
+        sql`UPDATE effect_local_documents SET
+          materialized_heads = ${request.materializedHeads},
+          accepted_heads = ${request.acceptedHeads},
+          tombstone = ${request.tombstone},
+          projection_status = ${request.projectionStatus},
+          checkpoint_hash = COALESCE(${request.checkpointHash}, checkpoint_hash)
+          WHERE document_id = ${request.documentId}
+            AND materialized_heads = ${request.expectedMaterializedHeads}
+            AND accepted_heads = ${request.expectedAcceptedHeads}
+            AND projection_status = ${request.expectedProjectionStatus}
+          RETURNING document_id`
     })
     const findOutboxTotals = SqlSchema.findAll({
       Request: Schema.Struct({
@@ -874,283 +904,116 @@ export const layer: Layer.Layer<
       }
     ) =>
       withSessionGeneration(session, (generation) =>
-        withStateLock(
-          documentId,
-          Effect.scoped(Effect.gen(function*() {
-            const receiptSession = { ...session, connectionEpoch: input.remoteConnectionEpoch }
-            const { message, receiveSequence } = input
-            if (!Number.isSafeInteger(receiveSequence) || receiveSequence < 0) {
-              return yield* new ReplicaError.ReplicaError({
-                reason: new ReplicaError.ProtocolMismatch({
-                  expected: "nonnegative safe receive sequence",
-                  observed: String(receiveSequence)
-                })
-              })
-            }
-            if (message.byteLength > limits.maxSyncMessageBytes) {
-              return yield* new ReplicaError.ReplicaError({
-                reason: new ReplicaError.ProtocolMismatch({
-                  expected: `sync message at most ${limits.maxSyncMessageBytes} bytes`,
-                  observed: String(message.byteLength)
-                })
-              })
-            }
-            const permit = yield* gate.shared
-            yield* validateSession(permit, session)
-            const sessionGeneration = yield* Ref.get(generation)
-            const nowMillis = yield* Clock.currentTimeMillis
-            const acceptedAt = new Date(nowMillis).toISOString()
-            yield* quotaLock.withPermit(Effect.gen(function*() {
-              yield* validateSessionGeneration(generation, sessionGeneration)
-              yield* expirePending(
-                receiptSession,
-                documentId,
-                acceptedAt,
-                new Date(nowMillis - limits.maxPendingAgeMillis).toISOString()
-              ).pipe(
-                Effect.catchTag("SqlError", (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageUnavailable({
-                        cause: new ReplicaError.SqlCause({
-                          message: String(cause),
-                          code: null
-                        })
-                      })
-                    })
-                  ))
-              )
-            }))
-            const messageHash = yield* digest(message)
-            const validateReceipt = (receipt: typeof ReceiptRow.Type) =>
-              Effect.gen(function*() {
-                if (receipt.document_id !== documentId) {
+        Ref.get(generation).pipe(
+          Effect.flatMap((sessionGeneration) =>
+            withStateLock(
+              documentId,
+              Effect.scoped(Effect.gen(function*() {
+                const receiptSession = { ...session, connectionEpoch: input.remoteConnectionEpoch }
+                const { message, receiveSequence } = input
+                if (!Number.isSafeInteger(receiveSequence) || receiveSequence < 0) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.ProtocolMismatch({
-                      expected: receipt.document_id,
-                      observed: documentId
+                      expected: "nonnegative safe receive sequence",
+                      observed: String(receiveSequence)
                     })
                   })
                 }
-                if (receipt.message_hash !== messageHash) {
+                if (message.byteLength > limits.maxSyncMessageBytes) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.ProtocolMismatch({
-                      expected: receipt.message_hash,
-                      observed: messageHash
+                      expected: `sync message at most ${limits.maxSyncMessageBytes} bytes`,
+                      observed: String(message.byteLength)
                     })
                   })
                 }
-              })
-            const receiptRows = yield* findReceipts({
-              replicaIncarnation: receiptSession.replicaIncarnation,
-              peerId: receiptSession.peerId,
-              connectionEpoch: receiptSession.connectionEpoch,
-              receiveSequence
-            }).pipe(
-              Effect.catchTags({
-                SqlError: (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageUnavailable({
-                        cause: new ReplicaError.SqlCause({
-                          message: String(cause),
-                          code: null
+                const permit = yield* gate.shared
+                yield* validateSession(permit, session)
+                const nowMillis = yield* Clock.currentTimeMillis
+                const acceptedAt = new Date(nowMillis).toISOString()
+                yield* quotaLock.withPermit(Effect.gen(function*() {
+                  yield* validateSessionGeneration(generation, sessionGeneration)
+                  yield* expirePending(
+                    receiptSession,
+                    documentId,
+                    acceptedAt,
+                    new Date(nowMillis - limits.maxPendingAgeMillis).toISOString()
+                  ).pipe(
+                    Effect.catchTag("SqlError", (cause) =>
+                      Effect.fail(
+                        new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.StorageUnavailable({
+                            cause: new ReplicaError.SqlCause({
+                              message: String(cause),
+                              code: null
+                            })
+                          })
                         })
-                      })
-                    })
-                  ),
-                SchemaError: (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageCorrupt({
-                        cause: new ReplicaError.SchemaCause({
-                          message: String(cause),
-                          path: []
-                        })
-                      })
-                    })
+                      ))
                   )
-              })
-            )
-            const receipt = receiptRows[0]
-            if (receipt !== undefined) {
-              yield* validateReceipt(receipt)
-              yield* quotaLock.withPermit(validateSessionGeneration(generation, sessionGeneration))
-              return receivedFromReceipt(documentId, receipt)
-            }
-            const validateReceiptQuota = Effect.gen(function*() {
-              const receiptTotals = yield* findReceiptTotals({
-                replicaIncarnation: receiptSession.replicaIncarnation,
-                peerId: receiptSession.peerId,
-                documentId
-              }).pipe(
-                Effect.catchTags({
-                  SqlError: (cause) =>
-                    Effect.fail(
-                      new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.StorageUnavailable({
-                          cause: new ReplicaError.SqlCause({
-                            message: String(cause),
-                            code: null
-                          })
-                        })
-                      })
-                    ),
-                  SchemaError: (cause) =>
-                    Effect.fail(
-                      new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.StorageCorrupt({
-                          cause: new ReplicaError.SchemaCause({
-                            message: String(cause),
-                            path: []
-                          })
-                        })
-                      })
-                    )
-                })
-              )
-              const receiptTotal = receiptTotals[0]
-              if ((receiptTotal?.document_count ?? 0) >= limits.maxPendingChangesPerDocument) {
-                return yield* new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.QuotaExceeded({
-                    resource: "document sync receipts",
-                    limit: limits.maxPendingChangesPerDocument
-                  })
-                })
-              }
-              if ((receiptTotal?.peer_count ?? 0) >= limits.maxPendingChangesPerPeer) {
-                return yield* new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.QuotaExceeded({
-                    resource: "peer sync receipts",
-                    limit: limits.maxPendingChangesPerPeer
-                  })
-                })
-              }
-              if ((receiptTotal?.replica_count ?? 0) >= limits.maxPendingChangesPerReplica) {
-                return yield* new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.QuotaExceeded({
-                    resource: "replica sync receipts",
-                    limit: limits.maxPendingChangesPerReplica
-                  })
-                })
-              }
-            })
-            const decoded = yield* Effect.try({
-              try: () => Automerge.decodeSyncMessage(message),
-              catch: (cause) =>
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.ProtocolMismatch({
-                    expected: "valid Automerge sync message",
-                    observed: String(cause)
-                  })
-                })
-            })
-            return yield* Effect.acquireUseRelease(
-              store.load(document, documentId),
-              (durable) =>
-                Effect.gen(function*() {
-                  const { changeBytes, changes, unresolvedBytes } = yield* Effect.try({
-                    try: () => {
-                      let current = Automerge.clone(durable.automerge)
-                      try {
-                        for (const chunk of decoded.changes) current = Automerge.loadIncremental(current, chunk)
-                        const changeBytes = Automerge.getChangesSince(current, [...durable.materializedHeads])
-                        return {
-                          changeBytes,
-                          changes: changeBytes.map((bytes) => Automerge.decodeChange(bytes)),
-                          unresolvedBytes: Automerge.hasHeads(current, decoded.heads)
-                            ? 0
-                            : decoded.changes.reduce((total, bytes) => total + bytes.byteLength, 0)
-                        }
-                      } finally {
-                        InternalAutomerge.free(current)
-                      }
-                    },
-                    catch: (cause) =>
-                      new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.ProtocolMismatch({
-                          expected: "valid Automerge change chunks",
-                          observed: String(cause)
-                        })
-                      })
-                  })
-                  if (changes.length > limits.maxSyncChangesPerMessage) {
-                    return yield* new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.ProtocolMismatch({
-                        expected: `at most ${limits.maxSyncChangesPerMessage} sync changes`,
-                        observed: String(changes.length)
-                      })
-                    })
-                  }
-                  const dependencyEdges = changes.reduce((total, change) => total + change.deps.length, 0)
-                  const operations = changes.reduce((total, change) => total + change.ops.length, 0)
-                  if (dependencyEdges > limits.maxSyncDependencyEdgesPerMessage) {
-                    return yield* new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.ProtocolMismatch({
-                        expected: `at most ${limits.maxSyncDependencyEdgesPerMessage} dependency edges`,
-                        observed: String(dependencyEdges)
-                      })
-                    })
-                  }
-                  if (operations > limits.maxSyncOperationsPerMessage) {
-                    return yield* new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.ProtocolMismatch({
-                        expected: `at most ${limits.maxSyncOperationsPerMessage} operations`,
-                        observed: String(operations)
-                      })
-                    })
-                  }
-                  const identities = new Map<string, string>()
-                  for (const change of changes) {
-                    const key = `${change.actor}:${change.seq}`
-                    const existing = identities.get(key)
-                    if (existing !== undefined && existing !== change.hash) {
+                }))
+                const messageHash = yield* digest(message)
+                const validateReceipt = (receipt: typeof ReceiptRow.Type) =>
+                  Effect.gen(function*() {
+                    if (receipt.document_id !== documentId) {
                       return yield* new ReplicaError.ReplicaError({
                         reason: new ReplicaError.ProtocolMismatch({
-                          expected: existing,
-                          observed: change.hash
+                          expected: receipt.document_id,
+                          observed: documentId
                         })
                       })
                     }
-                    identities.set(key, change.hash)
-                  }
-                  const validateExistingChanges = (rows: ReadonlyArray<typeof ExistingChangeRow.Type>) =>
-                    Effect.gen(function*() {
-                      const hashes = new Map(rows.map((row) => [row.change_hash, row]))
-                      const storedIdentities = new Map(rows.map((row) => [`${row.actor}:${row.sequence}`, row]))
-                      for (const change of changes) {
-                        const hash = hashes.get(change.hash)
-                        if (
-                          hash !== undefined &&
-                          (hash.document_id !== documentId || hash.actor !== change.actor ||
-                            hash.sequence !== change.seq)
-                        ) {
-                          return yield* new ReplicaError.ReplicaError({
-                            reason: new ReplicaError.ProtocolMismatch({
-                              expected: `${hash.document_id}:${hash.actor}:${hash.sequence}`,
-                              observed: `${documentId}:${change.actor}:${change.seq}`
+                    if (receipt.message_hash !== messageHash) {
+                      return yield* new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.ProtocolMismatch({
+                          expected: receipt.message_hash,
+                          observed: messageHash
+                        })
+                      })
+                    }
+                  })
+                const receiptRows = yield* findReceipts({
+                  replicaIncarnation: receiptSession.replicaIncarnation,
+                  peerId: receiptSession.peerId,
+                  connectionEpoch: receiptSession.connectionEpoch,
+                  receiveSequence
+                }).pipe(
+                  Effect.catchTags({
+                    SqlError: (cause) =>
+                      Effect.fail(
+                        new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.StorageUnavailable({
+                            cause: new ReplicaError.SqlCause({
+                              message: String(cause),
+                              code: null
                             })
                           })
-                        }
-                        const identity = storedIdentities.get(`${change.actor}:${change.seq}`)
-                        if (identity !== undefined && identity.change_hash !== change.hash) {
-                          return yield* new ReplicaError.ReplicaError({
-                            reason: new ReplicaError.ProtocolMismatch({
-                              expected: identity.change_hash,
-                              observed: change.hash
+                        })
+                      ),
+                    SchemaError: (cause) =>
+                      Effect.fail(
+                        new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.StorageCorrupt({
+                            cause: new ReplicaError.SchemaCause({
+                              message: String(cause),
+                              path: []
                             })
                           })
-                        }
-                      }
-                      return hashes
-                    })
-                  const existingChanges = changes.length === 0 ? [] : yield* findExistingChanges({
-                    documentId,
-                    changes: changes.map((change) => ({
-                      actor: change.actor,
-                      changeHash: change.hash,
-                      sequence: change.seq
-                    }))
+                        })
+                      )
+                  })
+                )
+                const receipt = receiptRows[0]
+                if (receipt !== undefined) {
+                  yield* validateReceipt(receipt)
+                  yield* quotaLock.withPermit(validateSessionGeneration(generation, sessionGeneration))
+                  return receivedFromReceipt(documentId, receipt)
+                }
+                const validateReceiptQuota = Effect.gen(function*() {
+                  const receiptTotals = yield* findReceiptTotals({
+                    replicaIncarnation: receiptSession.replicaIncarnation,
+                    peerId: receiptSession.peerId,
+                    documentId
                   }).pipe(
                     Effect.catchTags({
                       SqlError: (cause) =>
@@ -1177,397 +1040,565 @@ export const layer: Layer.Layer<
                         )
                     })
                   )
-                  const hashes = yield* validateExistingChanges(existingChanges)
-                  const incoming = changeBytes.filter((_, index) => !hashes.has(changes[index]!.hash))
-                  const incomingBytes = incoming.reduce((total, bytes) => total + bytes.byteLength, 0)
-                  const incomingDependencies = changes.filter((change) => !hashes.has(change.hash)).reduce(
-                    (total, change) => total + change.deps.length,
-                    0
-                  )
-                  const validatePendingQuota = Effect.gen(function*() {
-                    const pendingTotals = yield* findDocumentPendingChangeTotals(documentId).pipe(
-                      Effect.catchTags({
-                        SqlError: (cause) =>
-                          Effect.fail(
-                            new ReplicaError.ReplicaError({
-                              reason: new ReplicaError.StorageUnavailable({
-                                cause: new ReplicaError.SqlCause({
-                                  message: String(cause),
-                                  code: null
-                                })
-                              })
-                            })
-                          ),
-                        SchemaError: (cause) =>
-                          Effect.fail(
-                            new ReplicaError.ReplicaError({
-                              reason: new ReplicaError.StorageCorrupt({
-                                cause: new ReplicaError.SchemaCause({
-                                  message: String(cause),
-                                  path: []
-                                })
-                              })
-                            })
-                          )
-                      })
-                    )
-                    const receiptPending = yield* findDocumentPendingReceiptTotals({
-                      replicaIncarnation: receiptSession.replicaIncarnation,
-                      documentId
-                    }).pipe(
-                      Effect.catchTags({
-                        SqlError: (cause) =>
-                          Effect.fail(
-                            new ReplicaError.ReplicaError({
-                              reason: new ReplicaError.StorageUnavailable({
-                                cause: new ReplicaError.SqlCause({
-                                  message: String(cause),
-                                  code: null
-                                })
-                              })
-                            })
-                          ),
-                        SchemaError: (cause) =>
-                          Effect.fail(
-                            new ReplicaError.ReplicaError({
-                              reason: new ReplicaError.StorageCorrupt({
-                                cause: new ReplicaError.SchemaCause({
-                                  message: String(cause),
-                                  path: []
-                                })
-                              })
-                            })
-                          )
-                      })
-                    )
-                    if (
-                      (pendingTotals[0]?.bytes ?? 0) + (receiptPending[0]?.bytes ?? 0) +
-                          incomingBytes + unresolvedBytes >
-                        limits.maxPendingBytesPerDocument
-                    ) {
-                      return yield* new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.QuotaExceeded({
-                          resource: "pending document bytes",
-                          limit: limits.maxPendingBytesPerDocument
-                        })
-                      })
-                    }
-                    if (
-                      (pendingTotals[0]?.count ?? 0) + (receiptPending[0]?.count ?? 0) + incoming.length +
-                          (unresolvedBytes === 0 ? 0 : 1) > limits.maxPendingChangesPerDocument
-                    ) {
-                      return yield* new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.QuotaExceeded({
-                          resource: "pending document changes",
-                          limit: limits.maxPendingChangesPerDocument
-                        })
-                      })
-                    }
-                    if (
-                      (pendingTotals[0]?.dependencies ?? 0) + incomingDependencies >
-                        limits.maxPendingDependencyEdgesPerDocument
-                    ) {
-                      return yield* new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.QuotaExceeded({
-                          resource: "pending document dependency edges",
-                          limit: limits.maxPendingDependencyEdgesPerDocument
-                        })
-                      })
-                    }
-                    const peerTotals = yield* findPeerPendingChangeTotals(receiptSession.peerId).pipe(
-                      Effect.catchTags({
-                        SqlError: (cause) =>
-                          Effect.fail(
-                            new ReplicaError.ReplicaError({
-                              reason: new ReplicaError.StorageUnavailable({
-                                cause: new ReplicaError.SqlCause({
-                                  message: String(cause),
-                                  code: null
-                                })
-                              })
-                            })
-                          ),
-                        SchemaError: (cause) =>
-                          Effect.fail(
-                            new ReplicaError.ReplicaError({
-                              reason: new ReplicaError.StorageCorrupt({
-                                cause: new ReplicaError.SchemaCause({
-                                  message: String(cause),
-                                  path: []
-                                })
-                              })
-                            })
-                          )
-                      })
-                    )
-                    const peerReceiptPending = yield* findPeerPendingReceiptTotals({
-                      replicaIncarnation: receiptSession.replicaIncarnation,
-                      peerId: receiptSession.peerId
-                    }).pipe(
-                      Effect.catchTags({
-                        SqlError: (cause) =>
-                          Effect.fail(
-                            new ReplicaError.ReplicaError({
-                              reason: new ReplicaError.StorageUnavailable({
-                                cause: new ReplicaError.SqlCause({
-                                  message: String(cause),
-                                  code: null
-                                })
-                              })
-                            })
-                          ),
-                        SchemaError: (cause) =>
-                          Effect.fail(
-                            new ReplicaError.ReplicaError({
-                              reason: new ReplicaError.StorageCorrupt({
-                                cause: new ReplicaError.SchemaCause({
-                                  message: String(cause),
-                                  path: []
-                                })
-                              })
-                            })
-                          )
-                      })
-                    )
-                    if (
-                      (peerTotals[0]?.bytes ?? 0) + (peerReceiptPending[0]?.bytes ?? 0) +
-                          incomingBytes + unresolvedBytes >
-                        limits.maxPendingBytesPerPeer
-                    ) {
-                      return yield* new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.QuotaExceeded({
-                          resource: "pending peer bytes",
-                          limit: limits.maxPendingBytesPerPeer
-                        })
-                      })
-                    }
-                    if (
-                      (peerTotals[0]?.count ?? 0) + (peerReceiptPending[0]?.count ?? 0) + incoming.length +
-                          (unresolvedBytes === 0 ? 0 : 1) > limits.maxPendingChangesPerPeer
-                    ) {
-                      return yield* new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.QuotaExceeded({
-                          resource: "pending peer changes",
-                          limit: limits.maxPendingChangesPerPeer
-                        })
-                      })
-                    }
-                    if (
-                      (peerTotals[0]?.dependencies ?? 0) + incomingDependencies >
-                        limits.maxPendingDependencyEdgesPerPeer
-                    ) {
-                      return yield* new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.QuotaExceeded({
-                          resource: "pending peer dependency edges",
-                          limit: limits.maxPendingDependencyEdgesPerPeer
-                        })
-                      })
-                    }
-                    const replicaTotals = yield* findReplicaPendingChangeTotals(undefined).pipe(
-                      Effect.catchTags({
-                        SqlError: (cause) =>
-                          Effect.fail(
-                            new ReplicaError.ReplicaError({
-                              reason: new ReplicaError.StorageUnavailable({
-                                cause: new ReplicaError.SqlCause({
-                                  message: String(cause),
-                                  code: null
-                                })
-                              })
-                            })
-                          ),
-                        SchemaError: (cause) =>
-                          Effect.fail(
-                            new ReplicaError.ReplicaError({
-                              reason: new ReplicaError.StorageCorrupt({
-                                cause: new ReplicaError.SchemaCause({
-                                  message: String(cause),
-                                  path: []
-                                })
-                              })
-                            })
-                          )
-                      })
-                    )
-                    const replicaReceiptPending = yield* findReplicaPendingReceiptTotals(
-                      receiptSession.replicaIncarnation
-                    ).pipe(
-                      Effect.catchTags({
-                        SqlError: (cause) =>
-                          Effect.fail(
-                            new ReplicaError.ReplicaError({
-                              reason: new ReplicaError.StorageUnavailable({
-                                cause: new ReplicaError.SqlCause({
-                                  message: String(cause),
-                                  code: null
-                                })
-                              })
-                            })
-                          ),
-                        SchemaError: (cause) =>
-                          Effect.fail(
-                            new ReplicaError.ReplicaError({
-                              reason: new ReplicaError.StorageCorrupt({
-                                cause: new ReplicaError.SchemaCause({
-                                  message: String(cause),
-                                  path: []
-                                })
-                              })
-                            })
-                          )
-                      })
-                    )
-                    if (
-                      (replicaTotals[0]?.bytes ?? 0) + (replicaReceiptPending[0]?.bytes ?? 0) +
-                          incomingBytes + unresolvedBytes >
-                        limits.maxPendingBytesPerReplica
-                    ) {
-                      return yield* new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.QuotaExceeded({
-                          resource: "pending replica bytes",
-                          limit: limits.maxPendingBytesPerReplica
-                        })
-                      })
-                    }
-                    if (
-                      (replicaTotals[0]?.count ?? 0) + (replicaReceiptPending[0]?.count ?? 0) + incoming.length +
-                          (unresolvedBytes === 0 ? 0 : 1) > limits.maxPendingChangesPerReplica
-                    ) {
-                      return yield* new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.QuotaExceeded({
-                          resource: "pending replica changes",
-                          limit: limits.maxPendingChangesPerReplica
-                        })
-                      })
-                    }
-                    if (
-                      (replicaTotals[0]?.dependencies ?? 0) + incomingDependencies >
-                        limits.maxPendingDependencyEdgesPerReplica
-                    ) {
-                      return yield* new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.QuotaExceeded({
-                          resource: "pending replica dependency edges",
-                          limit: limits.maxPendingDependencyEdgesPerReplica
-                        })
-                      })
-                    }
-                  })
-                  const state = yield* readState(session, documentId)
-                  const received = yield* Effect.try({
-                    try: () => Automerge.receiveSyncMessage(durable.automerge, state, message),
-                    catch: (cause) =>
-                      new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.ProtocolMismatch({
-                          expected: "applicable Automerge sync message",
-                          observed: String(cause)
-                        })
-                      })
-                  })
-                  const pendingRows = yield* findPendingChanges(documentId).pipe(
-                    Effect.catchTags({
-                      SqlError: (cause) =>
-                        Effect.fail(
-                          new ReplicaError.ReplicaError({
-                            reason: new ReplicaError.StorageUnavailable({
-                              cause: new ReplicaError.SqlCause({
-                                message: String(cause),
-                                code: null
-                              })
-                            })
-                          })
-                        ),
-                      SchemaError: (cause) =>
-                        Effect.fail(
-                          new ReplicaError.ReplicaError({
-                            reason: new ReplicaError.StorageCorrupt({
-                              cause: new ReplicaError.SchemaCause({
-                                message: String(cause),
-                                path: []
-                              })
-                            })
-                          })
-                        )
-                    })
-                  )
-                  let staged = received[0]
-                  if (pendingRows.length > 0) {
-                    staged = yield* Effect.try({
-                      try: () => InternalAutomerge.replay(staged, pendingRows.map((row) => row.bytes)),
-                      catch: (cause) =>
-                        new ReplicaError.ReplicaError({
-                          reason: new ReplicaError.ProtocolMismatch({
-                            expected: "applicable pending Automerge changes",
-                            observed: String(cause)
-                          })
-                        })
-                    })
-                  }
-                  const generated = yield* Effect.try({
-                    try: () => Automerge.generateSyncMessage(staged, received[1]),
-                    catch: (cause) =>
-                      new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.ProtocolMismatch({
-                          expected: "valid Automerge sync response",
-                          observed: String(cause)
-                        })
-                      })
-                  })
-                  if (generated[1] !== null && generated[1].byteLength > limits.maxSyncMessageBytes) {
+                  const receiptTotal = receiptTotals[0]
+                  if ((receiptTotal?.document_count ?? 0) >= limits.maxPendingChangesPerDocument) {
                     return yield* new ReplicaError.ReplicaError({
                       reason: new ReplicaError.QuotaExceeded({
-                        resource: "sync response bytes",
-                        limit: limits.maxSyncMessageBytes
+                        resource: "document sync receipts",
+                        limit: limits.maxPendingChangesPerDocument
                       })
                     })
                   }
-                  const materializedHeads = InternalAutomerge.heads(staged)
-                  const acceptedHeads = Automerge.hasHeads(staged, decoded.heads)
-                    ? materializedHeads
-                    : [...new Set([...durable.acceptedHeads, ...materializedHeads, ...decoded.heads])].toSorted()
-                  const transition = !sameHeads(materializedHeads, durable.materializedHeads)
-                  const checkpoint = decoded.changes.length === 0 ?
-                    null :
-                    yield* Effect.sync(() => InternalAutomerge.save(staged)).pipe(
-                      Effect.flatMap((bytes) =>
-                        Effect.all({
-                          bytes: Effect.succeed(bytes),
-                          checksum: digest(bytes),
-                          checkpointHash: digest({ documentId, bytes })
-                        })
-                      )
-                    )
-                  const result = yield* quotaLock.withPermit(Effect.gen(function*() {
-                    const result = yield* sql.withTransaction(Effect.gen(function*() {
-                      yield* validateSessionGeneration(generation, sessionGeneration)
-                      const receiptRows = yield* findReceipts({
-                        replicaIncarnation: receiptSession.replicaIncarnation,
-                        peerId: receiptSession.peerId,
-                        connectionEpoch: receiptSession.connectionEpoch,
-                        receiveSequence
+                  if ((receiptTotal?.peer_count ?? 0) >= limits.maxPendingChangesPerPeer) {
+                    return yield* new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.QuotaExceeded({
+                        resource: "peer sync receipts",
+                        limit: limits.maxPendingChangesPerPeer
                       })
-                      const receipt = receiptRows[0]
-                      if (receipt !== undefined) {
-                        yield* validateReceipt(receipt)
-                        return { _tag: "Duplicate" as const, received: receivedFromReceipt(documentId, receipt) }
+                    })
+                  }
+                  if ((receiptTotal?.replica_count ?? 0) >= limits.maxPendingChangesPerReplica) {
+                    return yield* new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.QuotaExceeded({
+                        resource: "replica sync receipts",
+                        limit: limits.maxPendingChangesPerReplica
+                      })
+                    })
+                  }
+                })
+                const decoded = yield* Effect.try({
+                  try: () => Automerge.decodeSyncMessage(message),
+                  catch: (cause) =>
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.ProtocolMismatch({
+                        expected: "valid Automerge sync message",
+                        observed: String(cause)
+                      })
+                    })
+                })
+                return yield* Effect.acquireUseRelease(
+                  store.load(document, documentId),
+                  (durable) =>
+                    Effect.gen(function*() {
+                      const { changeBytes, changes, unresolvedBytes } = yield* Effect.try({
+                        try: () => {
+                          let current = Automerge.clone(durable.automerge)
+                          try {
+                            for (const chunk of decoded.changes) current = Automerge.loadIncremental(current, chunk)
+                            const changeBytes = Automerge.getChangesSince(current, [...durable.materializedHeads])
+                            return {
+                              changeBytes,
+                              changes: changeBytes.map((bytes) => Automerge.decodeChange(bytes)),
+                              unresolvedBytes: Automerge.hasHeads(current, decoded.heads)
+                                ? 0
+                                : decoded.changes.reduce((total, bytes) => total + bytes.byteLength, 0)
+                            }
+                          } finally {
+                            InternalAutomerge.free(current)
+                          }
+                        },
+                        catch: (cause) =>
+                          new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.ProtocolMismatch({
+                              expected: "valid Automerge change chunks",
+                              observed: String(cause)
+                            })
+                          })
+                      })
+                      if (changes.length > limits.maxSyncChangesPerMessage) {
+                        return yield* new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.ProtocolMismatch({
+                            expected: `at most ${limits.maxSyncChangesPerMessage} sync changes`,
+                            observed: String(changes.length)
+                          })
+                        })
                       }
-                      const committedChanges = changes.length === 0 ? [] : yield* findExistingChanges({
+                      const dependencyEdges = changes.reduce((total, change) => total + change.deps.length, 0)
+                      const operations = changes.reduce((total, change) => total + change.ops.length, 0)
+                      if (dependencyEdges > limits.maxSyncDependencyEdgesPerMessage) {
+                        return yield* new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.ProtocolMismatch({
+                            expected: `at most ${limits.maxSyncDependencyEdgesPerMessage} dependency edges`,
+                            observed: String(dependencyEdges)
+                          })
+                        })
+                      }
+                      if (operations > limits.maxSyncOperationsPerMessage) {
+                        return yield* new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.ProtocolMismatch({
+                            expected: `at most ${limits.maxSyncOperationsPerMessage} operations`,
+                            observed: String(operations)
+                          })
+                        })
+                      }
+                      const identities = new Map<string, string>()
+                      for (const change of changes) {
+                        const key = `${change.actor}:${change.seq}`
+                        const existing = identities.get(key)
+                        if (existing !== undefined && existing !== change.hash) {
+                          return yield* new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.ProtocolMismatch({
+                              expected: existing,
+                              observed: change.hash
+                            })
+                          })
+                        }
+                        identities.set(key, change.hash)
+                      }
+                      const validateExistingChanges = (rows: ReadonlyArray<typeof ExistingChangeRow.Type>) =>
+                        Effect.gen(function*() {
+                          const hashes = new Map(rows.map((row) => [row.change_hash, row]))
+                          const storedIdentities = new Map(rows.map((row) => [`${row.actor}:${row.sequence}`, row]))
+                          for (const change of changes) {
+                            const hash = hashes.get(change.hash)
+                            if (
+                              hash !== undefined &&
+                              (hash.document_id !== documentId || hash.actor !== change.actor ||
+                                hash.sequence !== change.seq)
+                            ) {
+                              return yield* new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.ProtocolMismatch({
+                                  expected: `${hash.document_id}:${hash.actor}:${hash.sequence}`,
+                                  observed: `${documentId}:${change.actor}:${change.seq}`
+                                })
+                              })
+                            }
+                            const identity = storedIdentities.get(`${change.actor}:${change.seq}`)
+                            if (identity !== undefined && identity.change_hash !== change.hash) {
+                              return yield* new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.ProtocolMismatch({
+                                  expected: identity.change_hash,
+                                  observed: change.hash
+                                })
+                              })
+                            }
+                          }
+                          return hashes
+                        })
+                      const existingChanges = changes.length === 0 ? [] : yield* findExistingChanges({
                         documentId,
                         changes: changes.map((change) => ({
                           actor: change.actor,
                           changeHash: change.hash,
                           sequence: change.seq
                         }))
+                      }).pipe(
+                        Effect.catchTags({
+                          SqlError: (cause) =>
+                            Effect.fail(
+                              new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.StorageUnavailable({
+                                  cause: new ReplicaError.SqlCause({
+                                    message: String(cause),
+                                    code: null
+                                  })
+                                })
+                              })
+                            ),
+                          SchemaError: (cause) =>
+                            Effect.fail(
+                              new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.StorageCorrupt({
+                                  cause: new ReplicaError.SchemaCause({
+                                    message: String(cause),
+                                    path: []
+                                  })
+                                })
+                              })
+                            )
+                        })
+                      )
+                      const hashes = yield* validateExistingChanges(existingChanges)
+                      const incoming = changeBytes.filter((_, index) => !hashes.has(changes[index]!.hash))
+                      const incomingBytes = incoming.reduce((total, bytes) => total + bytes.byteLength, 0)
+                      const incomingDependencies = changes.filter((change) => !hashes.has(change.hash)).reduce(
+                        (total, change) => total + change.deps.length,
+                        0
+                      )
+                      const validatePendingQuota = Effect.gen(function*() {
+                        const pendingTotals = yield* findDocumentPendingChangeTotals(documentId).pipe(
+                          Effect.catchTags({
+                            SqlError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageUnavailable({
+                                    cause: new ReplicaError.SqlCause({
+                                      message: String(cause),
+                                      code: null
+                                    })
+                                  })
+                                })
+                              ),
+                            SchemaError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageCorrupt({
+                                    cause: new ReplicaError.SchemaCause({
+                                      message: String(cause),
+                                      path: []
+                                    })
+                                  })
+                                })
+                              )
+                          })
+                        )
+                        const receiptPending = yield* findDocumentPendingReceiptTotals({
+                          replicaIncarnation: receiptSession.replicaIncarnation,
+                          documentId
+                        }).pipe(
+                          Effect.catchTags({
+                            SqlError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageUnavailable({
+                                    cause: new ReplicaError.SqlCause({
+                                      message: String(cause),
+                                      code: null
+                                    })
+                                  })
+                                })
+                              ),
+                            SchemaError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageCorrupt({
+                                    cause: new ReplicaError.SchemaCause({
+                                      message: String(cause),
+                                      path: []
+                                    })
+                                  })
+                                })
+                              )
+                          })
+                        )
+                        if (
+                          (pendingTotals[0]?.bytes ?? 0) + (receiptPending[0]?.bytes ?? 0) +
+                              incomingBytes + unresolvedBytes >
+                            limits.maxPendingBytesPerDocument
+                        ) {
+                          return yield* new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.QuotaExceeded({
+                              resource: "pending document bytes",
+                              limit: limits.maxPendingBytesPerDocument
+                            })
+                          })
+                        }
+                        if (
+                          (pendingTotals[0]?.count ?? 0) + (receiptPending[0]?.count ?? 0) + incoming.length +
+                              (unresolvedBytes === 0 ? 0 : 1) > limits.maxPendingChangesPerDocument
+                        ) {
+                          return yield* new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.QuotaExceeded({
+                              resource: "pending document changes",
+                              limit: limits.maxPendingChangesPerDocument
+                            })
+                          })
+                        }
+                        if (
+                          (pendingTotals[0]?.dependencies ?? 0) + incomingDependencies >
+                            limits.maxPendingDependencyEdgesPerDocument
+                        ) {
+                          return yield* new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.QuotaExceeded({
+                              resource: "pending document dependency edges",
+                              limit: limits.maxPendingDependencyEdgesPerDocument
+                            })
+                          })
+                        }
+                        const peerTotals = yield* findPeerPendingChangeTotals(receiptSession.peerId).pipe(
+                          Effect.catchTags({
+                            SqlError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageUnavailable({
+                                    cause: new ReplicaError.SqlCause({
+                                      message: String(cause),
+                                      code: null
+                                    })
+                                  })
+                                })
+                              ),
+                            SchemaError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageCorrupt({
+                                    cause: new ReplicaError.SchemaCause({
+                                      message: String(cause),
+                                      path: []
+                                    })
+                                  })
+                                })
+                              )
+                          })
+                        )
+                        const peerReceiptPending = yield* findPeerPendingReceiptTotals({
+                          replicaIncarnation: receiptSession.replicaIncarnation,
+                          peerId: receiptSession.peerId
+                        }).pipe(
+                          Effect.catchTags({
+                            SqlError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageUnavailable({
+                                    cause: new ReplicaError.SqlCause({
+                                      message: String(cause),
+                                      code: null
+                                    })
+                                  })
+                                })
+                              ),
+                            SchemaError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageCorrupt({
+                                    cause: new ReplicaError.SchemaCause({
+                                      message: String(cause),
+                                      path: []
+                                    })
+                                  })
+                                })
+                              )
+                          })
+                        )
+                        if (
+                          (peerTotals[0]?.bytes ?? 0) + (peerReceiptPending[0]?.bytes ?? 0) +
+                              incomingBytes + unresolvedBytes >
+                            limits.maxPendingBytesPerPeer
+                        ) {
+                          return yield* new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.QuotaExceeded({
+                              resource: "pending peer bytes",
+                              limit: limits.maxPendingBytesPerPeer
+                            })
+                          })
+                        }
+                        if (
+                          (peerTotals[0]?.count ?? 0) + (peerReceiptPending[0]?.count ?? 0) + incoming.length +
+                              (unresolvedBytes === 0 ? 0 : 1) > limits.maxPendingChangesPerPeer
+                        ) {
+                          return yield* new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.QuotaExceeded({
+                              resource: "pending peer changes",
+                              limit: limits.maxPendingChangesPerPeer
+                            })
+                          })
+                        }
+                        if (
+                          (peerTotals[0]?.dependencies ?? 0) + incomingDependencies >
+                            limits.maxPendingDependencyEdgesPerPeer
+                        ) {
+                          return yield* new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.QuotaExceeded({
+                              resource: "pending peer dependency edges",
+                              limit: limits.maxPendingDependencyEdgesPerPeer
+                            })
+                          })
+                        }
+                        const replicaTotals = yield* findReplicaPendingChangeTotals(undefined).pipe(
+                          Effect.catchTags({
+                            SqlError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageUnavailable({
+                                    cause: new ReplicaError.SqlCause({
+                                      message: String(cause),
+                                      code: null
+                                    })
+                                  })
+                                })
+                              ),
+                            SchemaError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageCorrupt({
+                                    cause: new ReplicaError.SchemaCause({
+                                      message: String(cause),
+                                      path: []
+                                    })
+                                  })
+                                })
+                              )
+                          })
+                        )
+                        const replicaReceiptPending = yield* findReplicaPendingReceiptTotals(
+                          receiptSession.replicaIncarnation
+                        ).pipe(
+                          Effect.catchTags({
+                            SqlError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageUnavailable({
+                                    cause: new ReplicaError.SqlCause({
+                                      message: String(cause),
+                                      code: null
+                                    })
+                                  })
+                                })
+                              ),
+                            SchemaError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageCorrupt({
+                                    cause: new ReplicaError.SchemaCause({
+                                      message: String(cause),
+                                      path: []
+                                    })
+                                  })
+                                })
+                              )
+                          })
+                        )
+                        if (
+                          (replicaTotals[0]?.bytes ?? 0) + (replicaReceiptPending[0]?.bytes ?? 0) +
+                              incomingBytes + unresolvedBytes >
+                            limits.maxPendingBytesPerReplica
+                        ) {
+                          return yield* new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.QuotaExceeded({
+                              resource: "pending replica bytes",
+                              limit: limits.maxPendingBytesPerReplica
+                            })
+                          })
+                        }
+                        if (
+                          (replicaTotals[0]?.count ?? 0) + (replicaReceiptPending[0]?.count ?? 0) + incoming.length +
+                              (unresolvedBytes === 0 ? 0 : 1) > limits.maxPendingChangesPerReplica
+                        ) {
+                          return yield* new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.QuotaExceeded({
+                              resource: "pending replica changes",
+                              limit: limits.maxPendingChangesPerReplica
+                            })
+                          })
+                        }
+                        if (
+                          (replicaTotals[0]?.dependencies ?? 0) + incomingDependencies >
+                            limits.maxPendingDependencyEdgesPerReplica
+                        ) {
+                          return yield* new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.QuotaExceeded({
+                              resource: "pending replica dependency edges",
+                              limit: limits.maxPendingDependencyEdgesPerReplica
+                            })
+                          })
+                        }
                       })
-                      yield* validateExistingChanges(committedChanges)
-                      yield* validateReceiptQuota
-                      yield* validatePendingQuota
-                      yield* gate.validate(permit)
-                      const commitSequence = transition ? yield* nextSequence : yield* currentSequence
-                      for (let index = 0; index < changes.length; index++) {
-                        const change = changes[index]!
-                        const bytes = changeBytes[index]!
-                        const applied = Automerge.hasHeads(staged, [change.hash]) ? 1 : 0
-                        yield* sql`INSERT INTO effect_local_changes (
+                      const state = yield* readState(session, documentId)
+                      const received = yield* Effect.try({
+                        try: () => Automerge.receiveSyncMessage(durable.automerge, state, message),
+                        catch: (cause) =>
+                          new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.ProtocolMismatch({
+                              expected: "applicable Automerge sync message",
+                              observed: String(cause)
+                            })
+                          })
+                      })
+                      const pendingRows = yield* findPendingChanges(documentId).pipe(
+                        Effect.catchTags({
+                          SqlError: (cause) =>
+                            Effect.fail(
+                              new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.StorageUnavailable({
+                                  cause: new ReplicaError.SqlCause({
+                                    message: String(cause),
+                                    code: null
+                                  })
+                                })
+                              })
+                            ),
+                          SchemaError: (cause) =>
+                            Effect.fail(
+                              new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.StorageCorrupt({
+                                  cause: new ReplicaError.SchemaCause({
+                                    message: String(cause),
+                                    path: []
+                                  })
+                                })
+                              })
+                            )
+                        })
+                      )
+                      let staged = received[0]
+                      if (pendingRows.length > 0) {
+                        staged = yield* Effect.try({
+                          try: () => InternalAutomerge.replay(staged, pendingRows.map((row) => row.bytes)),
+                          catch: (cause) =>
+                            new ReplicaError.ReplicaError({
+                              reason: new ReplicaError.ProtocolMismatch({
+                                expected: "applicable pending Automerge changes",
+                                observed: String(cause)
+                              })
+                            })
+                        })
+                      }
+                      const generated = yield* Effect.try({
+                        try: () => Automerge.generateSyncMessage(staged, received[1]),
+                        catch: (cause) =>
+                          new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.ProtocolMismatch({
+                              expected: "valid Automerge sync response",
+                              observed: String(cause)
+                            })
+                          })
+                      })
+                      if (generated[1] !== null && generated[1].byteLength > limits.maxSyncMessageBytes) {
+                        return yield* new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.QuotaExceeded({
+                            resource: "sync response bytes",
+                            limit: limits.maxSyncMessageBytes
+                          })
+                        })
+                      }
+                      const materializedHeads = InternalAutomerge.heads(staged)
+                      const acceptedHeads = Automerge.hasHeads(staged, decoded.heads)
+                        ? materializedHeads
+                        : [...new Set([...durable.acceptedHeads, ...materializedHeads, ...decoded.heads])].toSorted()
+                      const transition = !sameHeads(materializedHeads, durable.materializedHeads)
+                      const checkpoint = decoded.changes.length === 0 ?
+                        null :
+                        yield* Effect.sync(() => InternalAutomerge.save(staged)).pipe(
+                          Effect.flatMap((bytes) =>
+                            Effect.all({
+                              bytes: Effect.succeed(bytes),
+                              checksum: digest(bytes),
+                              checkpointHash: digest({ documentId, bytes })
+                            })
+                          )
+                        )
+                      const result = yield* quotaLock.withPermit(Effect.gen(function*() {
+                        const result = yield* sql.withTransaction(Effect.gen(function*() {
+                          yield* validateSessionGeneration(generation, sessionGeneration)
+                          const receiptRows = yield* findReceipts({
+                            replicaIncarnation: receiptSession.replicaIncarnation,
+                            peerId: receiptSession.peerId,
+                            connectionEpoch: receiptSession.connectionEpoch,
+                            receiveSequence
+                          })
+                          const receipt = receiptRows[0]
+                          if (receipt !== undefined) {
+                            yield* validateReceipt(receipt)
+                            return { _tag: "Duplicate" as const, received: receivedFromReceipt(documentId, receipt) }
+                          }
+                          const committedChanges = changes.length === 0 ? [] : yield* findExistingChanges({
+                            documentId,
+                            changes: changes.map((change) => ({
+                              actor: change.actor,
+                              changeHash: change.hash,
+                              sequence: change.seq
+                            }))
+                          })
+                          yield* validateExistingChanges(committedChanges)
+                          yield* validateReceiptQuota
+                          yield* validatePendingQuota
+                          yield* gate.validate(permit)
+                          const commitSequence = transition ? yield* nextSequence : yield* currentSequence
+                          for (let index = 0; index < changes.length; index++) {
+                            const change = changes[index]!
+                            const bytes = changeBytes[index]!
+                            const applied = Automerge.hasHeads(staged, [change.hash]) ? 1 : 0
+                            yield* sql`INSERT INTO effect_local_changes (
               change_hash, document_id, document_type, writer_schema_version, writer_definition_hash,
               actor, sequence, dependencies, bytes, applied, peer_id, accepted_at, commit_sequence
             ) VALUES (
@@ -1575,34 +1606,34 @@ export const layer: Layer.Layer<
               ${change.actor}, ${change.seq}, ${Schema.encodeSync(Heads)(change.deps)}, ${bytes}, ${applied},
               ${receiptSession.peerId}, ${acceptedAt}, ${commitSequence}
             ) ON CONFLICT(change_hash) DO NOTHING`
-                      }
-                      for (const row of pendingRows) {
-                        if (Automerge.hasHeads(staged, [row.change_hash])) {
-                          yield* sql`UPDATE effect_local_changes SET applied = 1, commit_sequence = ${commitSequence}
+                          }
+                          for (const row of pendingRows) {
+                            if (Automerge.hasHeads(staged, [row.change_hash])) {
+                              yield* sql`UPDATE effect_local_changes SET applied = 1, commit_sequence = ${commitSequence}
                 WHERE change_hash = ${row.change_hash}`
-                        }
-                      }
-                      const pendingReceipts = yield* findPendingReceipts({
-                        replicaIncarnation: receiptSession.replicaIncarnation,
-                        documentId
-                      })
-                      for (const row of pendingReceipts) {
-                        if (Automerge.hasHeads(staged, [...row.accepted_heads])) {
-                          yield* sql`UPDATE effect_local_peer_receipts SET pending_message = NULL
+                            }
+                          }
+                          const pendingReceipts = yield* findPendingReceipts({
+                            replicaIncarnation: receiptSession.replicaIncarnation,
+                            documentId
+                          })
+                          for (const row of pendingReceipts) {
+                            if (Automerge.hasHeads(staged, [...row.accepted_heads])) {
+                              yield* sql`UPDATE effect_local_peer_receipts SET pending_message = NULL
                 WHERE replica_incarnation = ${receiptSession.replicaIncarnation}
                   AND peer_id = ${row.peer_id}
                   AND connection_epoch = ${row.connection_epoch}
                   AND receive_sequence = ${row.receive_sequence}`
-                        }
-                      }
-                      if (checkpoint !== null) {
-                        yield* sql`INSERT INTO effect_local_checkpoints (
+                            }
+                          }
+                          if (checkpoint !== null) {
+                            yield* sql`INSERT INTO effect_local_checkpoints (
               checkpoint_hash, document_id, heads, bytes, checksum, commit_sequence, verified
             ) VALUES (
               ${checkpoint.checkpointHash}, ${documentId}, ${Schema.encodeSync(Heads)(materializedHeads)},
               ${checkpoint.bytes}, ${checkpoint.checksum}, ${commitSequence}, 1
             ) ON CONFLICT(checkpoint_hash) DO NOTHING`
-                        yield* sql`DELETE FROM effect_local_checkpoints
+                            yield* sql`DELETE FROM effect_local_checkpoints
                 WHERE document_id = ${documentId}
                   AND checkpoint_hash NOT IN (
                     SELECT checkpoint_hash FROM effect_local_checkpoints
@@ -1610,28 +1641,33 @@ export const layer: Layer.Layer<
                     ORDER BY verified DESC, commit_sequence DESC, checkpoint_hash DESC
                     LIMIT 2
                   )`
-                      }
-                      yield* sql`UPDATE effect_local_documents SET
-            materialized_heads = ${Schema.encodeSync(Heads)(materializedHeads)},
-            accepted_heads = ${Schema.encodeSync(Heads)(acceptedHeads)},
-            tombstone = ${InternalAutomerge.tombstone(staged) ? 1 : 0},
-            projection_status = ${transition ? "Blocked" : durable.snapshot.projection},
-            checkpoint_hash = COALESCE(${checkpoint?.checkpointHash ?? null}, checkpoint_hash)
-            WHERE document_id = ${documentId}`
-                      if (transition) {
-                        yield* sql`INSERT INTO effect_local_commit_outbox (
+                          }
+                          const updated = yield* updateDocument({
+                            acceptedHeads: Schema.encodeSync(Heads)(acceptedHeads),
+                            checkpointHash: checkpoint?.checkpointHash ?? null,
+                            documentId,
+                            expectedAcceptedHeads: Schema.encodeSync(Heads)(durable.acceptedHeads),
+                            expectedMaterializedHeads: Schema.encodeSync(Heads)(durable.materializedHeads),
+                            expectedProjectionStatus: durable.snapshot.projection,
+                            materializedHeads: Schema.encodeSync(Heads)(materializedHeads),
+                            projectionStatus: transition ? "Blocked" : durable.snapshot.projection,
+                            tombstone: InternalAutomerge.tombstone(staged) ? 1 : 0
+                          })
+                          if (updated.length === 0) return yield* new ConcurrentDocumentWrite()
+                          if (transition) {
+                            yield* sql`INSERT INTO effect_local_commit_outbox (
               commit_sequence, document_id, invalidation_keys, published
             ) VALUES (${commitSequence}, ${documentId}, ${Schema.encodeSync(Heads)([document.name])}, 0)`
-                      }
-                      const reply = generated[1] === null
-                        ? null
-                        : {
-                          documentId,
-                          message: generated[1],
-                          messageHash: yield* digest(generated[1]),
-                          heads: materializedHeads
-                        }
-                      yield* sql`INSERT INTO effect_local_peer_receipts (
+                          }
+                          const reply = generated[1] === null
+                            ? null
+                            : {
+                              documentId,
+                              message: generated[1],
+                              messageHash: yield* digest(generated[1]),
+                              heads: materializedHeads
+                            }
+                          yield* sql`INSERT INTO effect_local_peer_receipts (
             replica_incarnation, peer_id, connection_epoch, receive_sequence,
             document_id, message_hash, reply, reply_hash, pending_message,
             heads, accepted_heads, commit_sequence, accepted_at
@@ -1642,52 +1678,70 @@ export const layer: Layer.Layer<
             ${unresolvedBytes === 0 ? null : message}, ${Schema.encodeSync(Heads)(materializedHeads)},
             ${Schema.encodeSync(Heads)(acceptedHeads)}, ${commitSequence}, ${acceptedAt}
           )`
-                      return { _tag: "Committed" as const, commitSequence, reply }
-                    })).pipe(
-                      Effect.catchTags({
-                        SqlError: (cause) =>
-                          Effect.fail(
-                            new ReplicaError.ReplicaError({
-                              reason: new ReplicaError.StorageUnavailable({
-                                cause: new ReplicaError.SqlCause({
-                                  message: String(cause),
-                                  code: null
+                          return { _tag: "Committed" as const, commitSequence, reply }
+                        })).pipe(
+                          Effect.catchTags({
+                            SqlError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageUnavailable({
+                                    cause: new ReplicaError.SqlCause({
+                                      message: String(cause),
+                                      code: null
+                                    })
+                                  })
                                 })
-                              })
-                            })
-                          ),
-                        SchemaError: (cause) =>
-                          Effect.fail(
-                            new ReplicaError.ReplicaError({
-                              reason: new ReplicaError.StorageCorrupt({
-                                cause: new ReplicaError.SchemaCause({
-                                  message: String(cause),
-                                  path: []
+                              ),
+                            SchemaError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageCorrupt({
+                                    cause: new ReplicaError.SchemaCause({
+                                      message: String(cause),
+                                      path: []
+                                    })
+                                  })
                                 })
-                              })
-                            })
-                          )
-                      })
-                    )
-                    if (result._tag === "Committed") {
-                      yield* writeState(session, documentId, generated[0])
-                    }
-                    return result
-                  }))
-                  if (result._tag === "Duplicate") return result.received
-                  return {
-                    reply: result.reply,
-                    heads: materializedHeads,
-                    acceptedHeads,
-                    commitSequence: result.commitSequence,
-                    observedByPeer: Automerge.hasOurChanges(staged, generated[0]),
-                    durableConfirmation: false as const,
-                    duplicate: false
-                  }
+                              )
+                          })
+                        )
+                        if (result._tag === "Committed") {
+                          yield* writeState(session, documentId, generated[0])
+                        }
+                        return result
+                      }))
+                      if (result._tag === "Duplicate") return result.received
+                      return {
+                        reply: result.reply,
+                        heads: materializedHeads,
+                        acceptedHeads,
+                        commitSequence: result.commitSequence,
+                        observedByPeer: Automerge.hasOurChanges(staged, generated[0]),
+                        durableConfirmation: false as const,
+                        duplicate: false
+                      }
+                    }),
+                  (durable) => Effect.sync(() => InternalAutomerge.free(durable.automerge))
+                )
+              })).pipe(
+                Effect.retry({
+                  times: 8,
+                  while: (error) => error._tag === "ConcurrentDocumentWrite"
                 }),
-              (durable) => Effect.sync(() => InternalAutomerge.free(durable.automerge))
+                Effect.catchTag("ConcurrentDocumentWrite", () =>
+                  Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageUnavailable({
+                        cause: new ReplicaError.SqlCause({
+                          message: "Document remained busy while applying peer sync",
+                          code: "CONCURRENT_DOCUMENT_WRITE"
+                        })
+                      })
+                    })
+                  ))
+              )
             )
-          }))
+          )
         ))
 
     return PeerSync.of({

@@ -27,11 +27,13 @@ const Live = TestPeer.transportLayer(leftPeerId).pipe(Layer.provideMerge(Network
 const program = Effect.scoped(Effect.gen(function*() {
   const network = yield* TestPeer.TestPeer
   const transport = yield* PeerTransport.PeerTransport
-  const left = yield* transport.connect({
-    replicaId: (yield* Identity.makeReplicaId),
-    peerId: rightPeerId
-  })
-  const right = yield* network.connect(rightPeerId, leftPeerId)
+  const [left, right] = yield* Effect.all([
+    transport.connect({
+      replicaId: (yield* Identity.makeReplicaId),
+      peerId: rightPeerId
+    }),
+    network.connect(rightPeerId, leftPeerId)
+  ], { concurrency: "unbounded" })
 
   yield* left.send(Uint8Array.of(1))
   yield* left.send(Uint8Array.of(2))

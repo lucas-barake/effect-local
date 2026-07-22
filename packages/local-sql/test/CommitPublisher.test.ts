@@ -180,4 +180,24 @@ describe("CommitPublisher", () => {
         assert.strictEqual(retained[1].refreshGeneration, 1)
       }
     })).pipe(Effect.provide(Live)))
+
+  it.effect("signals a full refresh when a slow subscriber misses commits", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const publisher = yield* CommitPublisher.CommitPublisher
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const subscription = yield* publisher.subscribe
+      yield* sql`WITH RECURSIVE sequence(commit_sequence) AS (
+        VALUES (1) UNION ALL SELECT commit_sequence + 1 FROM sequence WHERE commit_sequence < 257
+      ) INSERT INTO effect_local_commit_outbox (
+        commit_sequence, document_id, invalidation_keys, published
+      ) SELECT commit_sequence, ${documentId}, '["Items"]', 0 FROM sequence`
+      assert.strictEqual(yield* publisher.publishPending, 257)
+      const retained = [...yield* subscription.events.pipe(Stream.take(2), Stream.runCollect)]
+      assert.deepStrictEqual(retained[0], { _tag: "FullRefreshRequired", refreshGeneration: 0 })
+      assert.strictEqual(retained[1]?._tag, "Commit")
+      if (retained[1]?._tag === "Commit") {
+        assert.strictEqual(retained[1].commitSequence, 2)
+      }
+    })).pipe(Effect.provide(Live)))
 })

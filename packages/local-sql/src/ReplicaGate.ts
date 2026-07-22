@@ -2,8 +2,10 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as DateTime from "effect/DateTime"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
@@ -35,8 +37,53 @@ export const layer: Layer.Layer<ReplicaGate, never, ReplicaBootstrap.ReplicaBoot
     Effect.gen(function*() {
       const bootstrap = yield* ReplicaBootstrap.ReplicaBootstrap
       const sql = yield* SqlClient.SqlClient
-      const lock = yield* TxReentrantLock.make()
       const state = yield* Ref.make<Permit>(bootstrap)
+      const lock = yield* TxReentrantLock.make()
+      const writer = yield* Ref.make<number | null>(null)
+      const requests = yield* Effect.acquireRelease(
+        Queue.unbounded<
+          | {
+            readonly _tag: "Acquire"
+            readonly granted: Deferred.Deferred<boolean>
+          }
+          | { readonly _tag: "Release" }
+        >(),
+        Queue.shutdown
+      )
+      yield* Effect.gen(function*() {
+        const pending: Array<Deferred.Deferred<boolean>> = []
+        let occupied = false
+        while (true) {
+          const request = yield* Queue.take(requests)
+          if (request._tag === "Acquire") pending.push(request.granted)
+          else occupied = false
+          while (!occupied && pending.length > 0) {
+            occupied = yield* Deferred.succeed(pending.shift()!, true)
+          }
+        }
+      }).pipe(Effect.forkScoped({ startImmediately: true }))
+      const release = Queue.offer(requests, { _tag: "Release" }).pipe(Effect.asVoid)
+      const acquire = Effect.gen(function*() {
+        const granted = yield* Deferred.make<boolean>()
+        yield* Queue.offer(requests, { _tag: "Acquire", granted })
+        yield* Deferred.await(granted).pipe(
+          Effect.onInterrupt(() =>
+            Deferred.succeed(granted, false).pipe(
+              Effect.flatMap((cancelled) => cancelled ? Effect.void : release)
+            )
+          )
+        )
+      }).pipe(Effect.interruptible)
+      const readLock = Effect.acquireRelease(
+        TxReentrantLock.acquireRead(lock),
+        () => TxReentrantLock.releaseRead(lock),
+        { interruptible: true }
+      )
+      const writeLock = Effect.acquireRelease(
+        TxReentrantLock.acquireWrite(lock),
+        () => TxReentrantLock.releaseWrite(lock),
+        { interruptible: true }
+      )
       const findState = SqlSchema.findOne({
         Request: Schema.Void,
         Result: Schema.Struct({
@@ -93,29 +140,55 @@ export const layer: Layer.Layer<ReplicaGate, never, ReplicaBootstrap.ReplicaBoot
       return {
         current: Ref.get(state),
         refresh: readState.pipe(Effect.tap((next) => Ref.set(state, next))),
-        shared: TxReentrantLock.readLock(lock).pipe(Effect.andThen(Ref.get(state))),
+        shared: Effect.withFiber((fiber) =>
+          Ref.get(writer).pipe(
+            Effect.flatMap((writer) =>
+              writer === fiber.id
+                ? readLock
+                : Effect.acquireUseRelease(
+                  acquire,
+                  () => readLock,
+                  () => release
+                )
+            ),
+            Effect.andThen(Ref.get(state))
+          )
+        ),
         claim: (use) =>
-          Effect.scoped(
-            TxReentrantLock.writeLock(lock).pipe(
-              Effect.andThen(
-                Effect.uninterruptibleMask((restore) =>
-                  sql.withTransaction(Effect.gen(function*() {
-                    yield* sql`UPDATE effect_local_metadata SET
+          Effect.withFiber((fiber) => {
+            const run = Effect.scoped(
+              writeLock.pipe(
+                Effect.andThen(
+                  Effect.uninterruptibleMask((restore) =>
+                    sql.withTransaction(Effect.gen(function*() {
+                      yield* sql`UPDATE effect_local_metadata SET
                       replica_incarnation = replica_incarnation + 1,
                       writer_generation = writer_generation + 1
                       WHERE singleton = 1`
-                    const permit = yield* readState
-                    yield* sql`INSERT INTO effect_local_writer_generations (generation, claimed_at)
+                      const permit = yield* readState
+                      yield* sql`INSERT INTO effect_local_writer_generations (generation, claimed_at)
                       VALUES (${permit.writerGeneration}, ${DateTime.formatIso(yield* DateTime.now)})`
-                    const result = yield* restore(use(permit))
-                    return [result, yield* readState] as const
-                  })).pipe(
-                    Effect.flatMap(([result, permit]) => Ref.set(state, permit).pipe(Effect.as(result)))
+                      const result = yield* restore(use(permit))
+                      return [result, yield* readState] as const
+                    })).pipe(
+                      Effect.flatMap(([result, permit]) => Ref.set(state, permit).pipe(Effect.as(result)))
+                    )
                   )
                 )
               )
             )
-          ),
+            return Ref.get(writer).pipe(
+              Effect.flatMap((owner) =>
+                owner === fiber.id
+                  ? run
+                  : Effect.acquireUseRelease(
+                    acquire,
+                    () => Ref.set(writer, fiber.id).pipe(Effect.andThen(run)),
+                    () => Ref.set(writer, null).pipe(Effect.andThen(release))
+                  )
+              )
+            )
+          }),
         validate: (expected) =>
           validateState(expected).pipe(
             Effect.flatMap((rows) =>

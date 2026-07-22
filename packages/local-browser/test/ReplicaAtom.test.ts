@@ -218,7 +218,7 @@ describe("ReplicaAtom", () => {
         ownerEpoch: "owner",
         invalidations: Stream.unwrap(Effect.sync(() => {
           subscriptions++
-          return subscriptions === 1
+          return subscriptions < 4
             ? Stream.fail(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
@@ -237,10 +237,10 @@ describe("ReplicaAtom", () => {
       yield* Effect.scoped(
         Effect.gen(function*() {
           yield* Layer.build(ReplicaAtom.layerReactivity)
-          yield* TestClock.adjust(1_000)
+          yield* TestClock.adjust(3_000)
           yield* Deferred.await(consumed)
           yield* Effect.yieldNow
-          assert.strictEqual(subscriptions, 2)
+          assert.strictEqual(subscriptions, 4)
           assert.strictEqual(invalidations, 1)
         }).pipe(
           Effect.provideService(ReplicaClient.ReplicaClient, client),

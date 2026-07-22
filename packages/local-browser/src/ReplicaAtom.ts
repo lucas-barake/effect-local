@@ -22,7 +22,6 @@ export const layerReactivity = Layer.effectDiscard(Effect.gen(function*() {
   yield* replica.invalidations.pipe(
     Stream.runForEach((event) => reactivity.invalidate(event.keys)),
     Effect.retry({
-      times: 1,
       schedule: Schedule.spaced(1_000),
       while: (error) => error.reason._tag === "StorageUnavailable"
     }),

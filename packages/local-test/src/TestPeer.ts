@@ -10,6 +10,7 @@ import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
+import * as SubscriptionRef from "effect/SubscriptionRef"
 import * as FaultInjection from "./FaultInjection.js"
 
 export class InvalidFault extends Schema.TaggedErrorClass<InvalidFault>(
@@ -71,6 +72,8 @@ export class TestPeer extends Context.Service<TestPeer, {
 interface Scheduled {
   readonly packet: FaultInjection.Packet
   readonly decision: FaultInjection.Decision
+  readonly queue: Queue.Queue<ReadonlyArray<Uint8Array>>
+  readonly sourceActive: Ref.Ref<boolean>
 }
 
 const route = (from: Identity.PeerId, to: Identity.PeerId) => `${from}\u0000${to}`
@@ -90,24 +93,15 @@ export const make = (
       return yield* new InvalidOptions({ reason: "maxDelay must be finite and nonnegative" })
     }
     const faults = yield* FaultInjection.FaultInjection
-    const routes = yield* Ref.make<ReadonlyMap<string, Queue.Queue<ReadonlyArray<Uint8Array>>>>(new Map())
+    const routes = yield* SubscriptionRef.make<
+      ReadonlyMap<string, {
+        readonly active: Ref.Ref<boolean>
+        readonly queue: Queue.Queue<ReadonlyArray<Uint8Array>>
+      }>
+    >(new Map())
     const partitions = yield* Ref.make<ReadonlySet<string>>(new Set())
     const held = yield* Ref.make<ReadonlyMap<string, Scheduled>>(new Map())
     const sequence = yield* Ref.make(0)
-
-    const queueFor = Effect.fnUntraced(function*(from: Identity.PeerId, to: Identity.PeerId) {
-      const key = route(from, to)
-      const existing = (yield* Ref.get(routes)).get(key)
-      if (existing !== undefined) return existing
-      const candidate = yield* Queue.dropping<ReadonlyArray<Uint8Array>>(options.queueCapacity)
-      return yield* Ref.modify(routes, (current) => {
-        const currentQueue = current.get(key)
-        if (currentQueue !== undefined) return [currentQueue, current]
-        const next = new Map(current)
-        next.set(key, candidate)
-        return [candidate, next]
-      })
-    })
 
     const validate = (packet: FaultInjection.Packet, decision: FaultInjection.Decision) => {
       const delay = Duration.toMillis(decision.delay)
@@ -134,23 +128,32 @@ export const make = (
       const delay = yield* validate(scheduled.packet, scheduled.decision)
       yield* Effect.sleep(delay)
       if ((yield* Ref.get(partitions)).has(route(scheduled.packet.from, scheduled.packet.to))) return
-      const queue = yield* queueFor(scheduled.packet.from, scheduled.packet.to)
-      const offered = yield* Queue.offer(
-        queue,
-        Array.from({ length: scheduled.decision.copies }, () => scheduled.packet.payload.slice())
-      )
-      if (offered) return
-      const size = yield* Queue.size(queue)
-      return yield* size >= options.queueCapacity
-        ? new QueueFull({
-          from: scheduled.packet.from,
-          to: scheduled.packet.to,
-          capacity: options.queueCapacity
-        })
-        : new ConnectionClosed({ from: scheduled.packet.from, to: scheduled.packet.to })
+      const failure = yield* Effect.sync(() => {
+        if (!Ref.getUnsafe(scheduled.sourceActive)) {
+          return new ConnectionClosed({ from: scheduled.packet.from, to: scheduled.packet.to })
+        }
+        const offered = Queue.offerUnsafe(
+          scheduled.queue,
+          Array.from({ length: scheduled.decision.copies }, () => scheduled.packet.payload.slice())
+        )
+        if (offered) return null
+        return scheduled.queue.state._tag === "Open"
+          ? new QueueFull({
+            from: scheduled.packet.from,
+            to: scheduled.packet.to,
+            capacity: options.queueCapacity
+          })
+          : new ConnectionClosed({ from: scheduled.packet.from, to: scheduled.packet.to })
+      })
+      if (failure !== null) return yield* failure
     })
 
-    const send = Effect.fnUntraced(function*(from: Identity.PeerId, to: Identity.PeerId, payload: Uint8Array) {
+    const send = Effect.fnUntraced(function*(
+      from: Identity.PeerId,
+      to: Identity.PeerId,
+      sourceActive: Ref.Ref<boolean>,
+      payload: Uint8Array
+    ) {
       const packet: FaultInjection.Packet = {
         sequence: yield* Ref.getAndUpdate(sequence, (current) => current + 1),
         from,
@@ -159,21 +162,26 @@ export const make = (
       }
       const decision = yield* faults.decide(packet)
       yield* validate(packet, decision)
+      const connection = (yield* SubscriptionRef.get(routes)).get(route(from, to))
+      if (connection === undefined) return yield* new ConnectionClosed({ from, to })
       if ((yield* Ref.get(partitions)).has(route(from, to)) || decision.drop) return
-      const scheduled = { packet, decision }
+      const scheduled = { packet, decision, queue: connection.queue, sourceActive }
       const pending = yield* Ref.modify(held, (current): readonly [
         ReadonlyArray<Scheduled> | undefined,
         ReadonlyMap<string, Scheduled>
       ] => {
         const key = route(from, to)
-        const previous = current.get(key)
+        const candidate = current.get(key)
+        const previous = candidate?.queue === scheduled.queue && candidate.sourceActive === scheduled.sourceActive
+          ? candidate
+          : undefined
+        const next = new Map(current)
+        if (previous !== candidate) next.delete(key)
         if (decision.reorder && previous === undefined) {
-          const next = new Map(current)
           next.set(key, scheduled)
           return [undefined, next]
         }
-        if (previous === undefined) return [[scheduled], current]
-        const next = new Map(current)
+        if (previous === undefined) return [[scheduled], next]
         next.delete(key)
         return [[scheduled, previous], next]
       })
@@ -186,23 +194,59 @@ export const make = (
     )
 
     const connect = Effect.fnUntraced(function*(from: Identity.PeerId, to: Identity.PeerId) {
-      const inbound = yield* queueFor(to, from)
-      const close = Effect.all([
-        Ref.update(routes, (current) => {
+      const inbound = yield* Queue.dropping<ReadonlyArray<Uint8Array>>(options.queueCapacity)
+      const active = yield* Ref.make(true)
+      const close = Ref.getAndSet(active, false).pipe(
+        Effect.flatMap((wasActive) =>
+          wasActive
+            ? Effect.all([
+              SubscriptionRef.update(routes, (current) => {
+                const key = route(to, from)
+                if (current.get(key)?.queue !== inbound) return current
+                const next = new Map(current)
+                next.delete(key)
+                return next
+              }),
+              Ref.update(held, (current) => {
+                const key = route(to, from)
+                if (current.get(key)?.queue !== inbound) return current
+                const next = new Map(current)
+                next.delete(key)
+                return next
+              }),
+              Queue.shutdown(inbound)
+            ], { discard: true })
+            : Effect.void
+        )
+      )
+      yield* Effect.addFinalizer(() => close)
+      const previous = yield* SubscriptionRef.modify(routes, (current) => {
+        const key = route(to, from)
+        const next = new Map(current)
+        next.set(key, { active, queue: inbound })
+        return [current.get(key), next]
+      })
+      if (previous !== undefined) {
+        yield* Ref.update(held, (current) => {
           const key = route(to, from)
-          if (current.get(key) !== inbound) return current
+          if (current.get(key)?.queue !== previous.queue) return current
           const next = new Map(current)
           next.delete(key)
           return next
-        }),
-        Queue.shutdown(inbound)
-      ], { discard: true })
-      yield* Effect.addFinalizer(() => close)
+        })
+        yield* Ref.set(previous.active, false)
+        yield* Queue.shutdown(previous.queue)
+      }
       return {
         from,
         to,
         receive: Stream.fromQueue(inbound).pipe(Stream.flatMap(Stream.fromIterable)),
-        send: (message: Uint8Array) => send(from, to, message),
+        send: (message: Uint8Array) =>
+          Ref.get(active).pipe(
+            Effect.flatMap((isActive) =>
+              isActive ? send(from, to, active, message) : Effect.fail(new ConnectionClosed({ from, to }))
+            )
+          ),
         queued: Queue.size(inbound),
         close
       }
@@ -236,6 +280,12 @@ export const make = (
         capabilities: { storeAndForward: false },
         connect: ({ peerId: remotePeerId }) =>
           connect(peerId, remotePeerId).pipe(
+            Effect.tap(() =>
+              SubscriptionRef.changes(routes).pipe(
+                Stream.filter((current) => current.has(route(peerId, remotePeerId))),
+                Stream.runHead
+              )
+            ),
             Effect.map((connection) => ({
               peerId: remotePeerId,
               capabilities: { storeAndForward: false },
