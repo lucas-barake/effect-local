@@ -1,13 +1,15 @@
 # Effect Local
 
-Effect Local is a frontend only local first engine for Effect v4. Application reads and writes complete against a
-durable browser replica. Automerge owns causal history and convergence. SQLite WASM in OPFS owns durable bytes and
-rebuildable query projections. Effect Cluster serializes document commands and stores their replies. Effect Workflow
-resumes long running maintenance. Effect Atom exposes reactive views without becoming another source of truth.
+Effect Local is a local first engine for browser and Node local processes built on Effect v4. Application reads and
+writes complete against a local replica. Automerge defines document state, causal history, and convergence. SQLite
+persists the local representation and rebuildable query projections. In browsers, SQLite WASM stores its database in
+OPFS. Effect Cluster serializes document commands and stores their replies. Effect Workflow resumes long running
+maintenance. Effect Atom exposes reactive views without becoming another source of truth.
 
 The design follows the ownership, longevity, and offline principles in
-[Local first software](https://www.inkandswitch.com/essay/local-first/). This repository contains client code only. It
-does not provide a backend, relay, authentication, encryption, or a prescribed server protocol.
+[Local first software](https://www.inkandswitch.com/essay/local-first/). This repository provides local process
+libraries. It does not provide a hosted backend, relay, authentication service, encryption service, or prescribed
+server protocol. The browser package adds tab and worker ownership. The SQL package also supports a local Node host.
 
 > **Beta:** The library targets Effect `4.0.0-beta.99` and Automerge `3.3.2`. Durable formats,
 > worker protocols, and public APIs can still change. Read [Limits and security](#limits-and-security) before adopting
@@ -19,45 +21,142 @@ does not provide a backend, relay, authentication, encryption, or a prescribed s
 - Every public boundary uses Effect Schema codecs.
 - Mutation handlers, query handlers, SQL projections, workers, transports, and limits are Effect services or Layers.
 - Command IDs make retries explicit and distinguish a durable commit from an unknown outcome.
-- Canonical Automerge state is separate from disposable SQLite projections and Atom caches.
+- Canonical Automerge state is separate from rebuildable SQL projections and ephemeral Atom caches.
 - Cluster and Workflow provide durable execution without replacing Automerge merge semantics.
 - Production shaped in memory layers and deterministic peer faults keep tests fast and reproducible.
 
 ## Mental model
 
-Effect Local is easiest to understand as one durable local database with several replaceable views and execution
-systems around it. The canonical document history is the authority. SQL projections, Atom values, RPC sessions, and
-presence are ways to use or observe that authority. They never become a second source of truth.
+Effect Local is easiest to understand as one local database with several replaceable views and execution systems
+around it. The local replica is the primary copy for interactive work, following the
+[local first model](https://www.inkandswitch.com/essay/local-first/local-first.pdf). Automerge defines the logical
+document state and merge rules. SQLite provides the local database commit boundary. OPFS is the browser file
+storage substrate. SQL projections and Atom values let applications read the same facts in useful forms. RPC
+sessions, peer sessions, and presence connect processes without becoming another source of truth.
 
-The engine separates four concerns that are often collapsed into one client state library:
+This separates concerns that are often collapsed into one client state library:
 
-| Concern           | Responsibility                                                                   | What it does not own                           |
-| ----------------- | -------------------------------------------------------------------------------- | ---------------------------------------------- |
-| Canonical storage | Automerge changes, document heads, checkpoints, tombstones, and command receipts | UI cache state or remote availability          |
-| Local execution   | Serialized commands, durable replies, maintenance workflows, and recovery        | Replicated merge semantics                     |
-| Derived views     | SQLite projections and Effect Atom values optimized for reads                    | Canonical history                              |
-| Connectivity      | Worker RPC, peer sessions, presence, and application supplied transports         | Authentication, routing, or a backend protocol |
+| Concern                  | Responsibility                                                            | What it does not own                           |
+| ------------------------ | ------------------------------------------------------------------------- | ---------------------------------------------- |
+| Canonical recovery state | Automerge changes, heads, checkpoints, tombstones, and command receipts   | Physical storage bytes or UI cache state       |
+| Physical persistence     | SQLite transactions and database bytes, stored in OPFS in the browser     | Merge semantics or permanent browser retention |
+| Local execution          | Serialized commands, durable replies, maintenance workflows, and recovery | Replicated convergence                         |
+| Derived durable views    | SQL projection tables optimized for application queries                   | Canonical history                              |
+| Ephemeral views          | Atom caches, RPC leases, and presence                                     | Durable facts                                  |
+| Connectivity             | Worker RPC, peer sessions, and application supplied transports            | Authentication, routing, or a backend protocol |
+
+The distinction follows Automerge's separation between a
+[CRDT document and its storage adapter](https://automerge.org/docs/reference/repositories/storage/) and SQLite's
+[transactional guarantees](https://www.sqlite.org/transactional.html). Automerge does not persist bytes by itself.
+SQLite does not decide how concurrent document changes merge. Automerge `save` encodes compressed document bytes and
+`load` reconstructs a document from those bytes. Neither operation writes the bytes to durable storage.
 
 ### Core terminology
 
-| Term                   | Meaning                                                                                                                                                                         |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Replica definition** | The schema checked blueprint for one application data model. It names the documents, mutations, projections, and queries that must agree on a durable protocol hash.            |
-| **Replica**            | One running local instance of a replica definition. It exposes commands, reads, queries, status, backup, and restore operations as an Effect service.                           |
-| **Document**           | The unit of canonical state, causal history, merge, compaction, and peer synchronization. A document normally represents one aggregate whose invariants must change together.   |
-| **Snapshot**           | A decoded point in a document's history with its identity, version, heads, tombstone state, and value. A snapshot is a read result, not a mutable store object.                 |
-| **Mutation**           | A named, schema checked command that changes exactly one document. Its handler runs against an Automerge draft and can return a declared tagged domain error.                   |
-| **Command ID**         | The stable identity of a create, mutate, or delete request. It turns retry from guesswork into an idempotent protocol. Reuse it only for the same logical input.                |
-| **Command receipt**    | The durable record that connects a command ID to its committed or rejected result. Receipts let a caller resolve an ambiguous transport outcome later.                          |
-| **Command outcome**    | Proof of a local durable commit, a declared rejection, or `OutcomeUnknown` when the caller cannot prove which occurred. It is stronger than an RPC success response.            |
-| **Projection**         | A deterministic, rebuildable SQL representation of canonical snapshots. Projections make local queries efficient but can always be discarded and rebuilt.                       |
-| **Query**              | A schema checked read over projections. Its declared dependencies are also the keys used to invalidate reactive Atom computations.                                              |
-| **Owner**              | The single browser runtime currently allowed to open the durable SQLite replica. Other tabs are clients of that owner rather than competing database writers.                   |
-| **Session**            | A leased RPC capability bound to one client and one owner epoch. Sessions fence stale tabs and force clients to reopen after an owner restart.                                  |
-| **Cluster entity**     | The per document durable command executor. It serializes local commands and stores replies atomically with application state. It does not decide CRDT convergence.              |
-| **Workflow**           | Durable orchestration for work that spans retries, activities, or multiple steps. Use it for maintenance and coordination, not as a replacement for a single document mutation. |
-| **Peer session**       | A scoped synchronization relationship over an application supplied `PeerTransport`. It exchanges bounded Automerge changes and resets safely when either side disconnects.      |
-| **Presence**           | Expiring best effort metadata about connected peers or tabs. Presence is never durable state and must never authorize an operation.                                             |
+| Term                       | Meaning                                                                                                                                                                                                            |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Replica definition**     | The schema checked protocol blueprint for one application model. It names the document definitions, mutations, projections, and queries that must agree on a definition hash.                                      |
+| **Replica service**        | The running Effect service for commands, canonical reads, projection queries, status, backup, and restore.                                                                                                         |
+| **Document definition**    | The inert name, schema, and version descriptor returned by `Document.make`. It is not stored document data.                                                                                                        |
+| **Document instance**      | One `DocumentId` with its Automerge state and causal history. It normally represents one aggregate whose invariants must change together.                                                                          |
+| **Snapshot**               | Effect Local's decoded read result for one document instance. It contains identity, version, current heads, tombstone state, projection state, and value.                                                          |
+| **Heads**                  | The frontier change hashes that identify a point in Automerge document history. Heads are not revision numbers, storage bytes, or acknowledgements.                                                                |
+| **Mutation definition**    | A named, schema checked domain operation for one document definition. Its handler changes an Automerge draft and can return a declared tagged domain error.                                                        |
+| **Command**                | One idempotent create, mutate, or delete request. Its stable command ID must be reused only for the same logical input.                                                                                            |
+| **Automerge change**       | A causal group of CRDT operations produced or accepted by a document instance. A command can produce no new change, so commands and changes are not one to one.                                                    |
+| **Local database commit**  | The successful SQLite transaction that makes canonical state, projections, command evidence, and sequence metadata durable together. The default Cluster runtime also stores its reply in that transaction.        |
+| **Commit event**           | Postcommit metadata used to invalidate dependent reads. It reports local durable work but is not itself the durability boundary.                                                                                   |
+| **Command receipt**        | Internal durable evidence that connects a command ID to a committed or rejected result. Public lookup methods expose the `CommandOutcome` proven by that evidence.                                                 |
+| **Command outcome**        | `DurablyCommittedLocal`, a declared `Rejected` result, or `OutcomeUnknown` when the caller cannot prove what occurred. Operational and protocol failures remain `ReplicaError` values in the Effect error channel. |
+| **Projection definition**  | A deterministic mapping from canonical snapshots to a rebuildable read model.                                                                                                                                      |
+| **SQL projection binding** | The projection table name, table migrations, delete operation, and row insertion operation. A projection table is a read model. A SQLite index is a separate query planner structure on that table.                |
+| **Projection state**       | `Ready`, `Blocked`, or `Rebuilding` for a snapshot. Queries require their declared projection dependencies to be ready.                                                                                            |
+| **Query definition**       | A named, schema checked read whose declared projection dependencies drive readiness and reactive invalidation. SQL is the standard handler implementation, not a requirement of the core type.                     |
+| **Invalidation key**       | Notification metadata for refreshing a document or projection read. It is not canonical data or a durability acknowledgement.                                                                                      |
+| **Presence**               | Expiring best effort metadata about connected peers or tabs. Presence is never durable state and must never authorize an operation.                                                                                |
+
+Automerge calls the document the unit of change and defines a change as a group of operations. See its
+[concepts](https://automerge.org/docs/reference/concepts/) and
+[binary format specification](https://automerge.org/automerge-binary-format-spec/). Effect Local adds definition,
+identity, schema, projection, command, and transaction boundaries around that CRDT model.
+
+### Identity and fencing
+
+Identities answer different questions. They are not interchangeable version counters.
+
+| Identity or generation | Meaning                                                                                                                                                           |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ReplicaId`            | Identity of the currently installed logical replica. Clone restore creates a new ID. Replace restore adopts the archive ID.                                       |
+| `ReplicaIncarnation`   | Generation of the canonical contents. Replace restore advances it so stale sync state cannot enter the replacement.                                               |
+| `WriterGeneration`     | Persisted, increasing fencing token for the current durable writer. Old writers fail validation before they write.                                                |
+| Owner epoch            | Opaque identity of one browser owner runtime. It detects restart and stale invalidation streams. It is not the durable writer fence.                              |
+| `SessionId`            | Renewable RPC lease for one client attached to one owner epoch.                                                                                                   |
+| `PeerId`               | Identity of an application selected synchronization peer.                                                                                                         |
+| Connection epoch       | Identity of one peer sync connection. Reconnect creates a new epoch while durable outbox state remains explicitly managed.                                        |
+| `DocumentId`           | Stable identity of one document instance.                                                                                                                         |
+| `CommandId`            | Stable identity and idempotency key of one logical command.                                                                                                       |
+| `CommitSequence`       | Local sequence used for invalidation watermarks. It increases within an installed incarnation but can change on restore. It is not an Automerge history position. |
+
+The client session lease authorizes ordinary RPC calls. The browser owner epoch distinguishes invalidation
+generations. The writer generation fences durable database writes. Only the writer generation mirrors the fencing
+token pattern in the [Chubby lock service](https://storage.googleapis.com/gweb-research2023-media/pubtools/4444.pdf),
+where an older acquisition count cannot authorize a newer write.
+
+### Effect composition model
+
+The public model forms one composition ladder:
+
+`definitions` to `handler Layers` to `SQL bindings` to `durable runtime Layer` to `Replica service`
+
+Definitions are inert values. Mutation and query Layers provide behavior. SQL bindings provide physical read model
+operations. `SqlReplica.layerWithBindings` constructs the durable services. Application effects consume
+`Replica.Replica` from the Effect environment.
+
+Effect concepts retain their normal meanings:
+
+| Effect concept    | Role in Effect Local                                                                                                                                                                  |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Service           | A typed capability such as `Replica`, `PeerTransport`, `ReplicaLimits`, or a mutation handler.                                                                                        |
+| Layer             | Construction and dependency wiring for services, including scoped resources.                                                                                                          |
+| Scope             | Lifetime and cleanup boundary for resources. Scope does not mean persistence.                                                                                                         |
+| Cluster entity    | Addressable RPC protocol routed by shard. Effect Local's configured document entity serializes local commands and stores their replies. It is not peer discovery or CRDT replication. |
+| Workflow          | Durable orchestration for retries and multiple steps. Effect Local ships compaction orchestration and lets advanced runtimes register more workflows.                                 |
+| Atom and registry | Reactive view and cache lifetime. Atom values rebuild from `Replica` reads and queries.                                                                                               |
+
+These definitions follow the Effect source contracts for
+[Context](https://github.com/Effect-TS/effect/blob/6184a7dc53cb9310e299b65ad6d6c712c2cbf202/packages/effect/src/Context.ts),
+[Layer](https://github.com/Effect-TS/effect/blob/6184a7dc53cb9310e299b65ad6d6c712c2cbf202/packages/effect/src/Layer.ts),
+[Scope](https://github.com/Effect-TS/effect/blob/6184a7dc53cb9310e299b65ad6d6c712c2cbf202/packages/effect/src/Scope.ts),
+[Cluster Entity](https://github.com/Effect-TS/effect/blob/6184a7dc53cb9310e299b65ad6d6c712c2cbf202/packages/effect/src/unstable/cluster/Entity.ts),
+[Workflow](https://github.com/Effect-TS/effect/blob/6184a7dc53cb9310e299b65ad6d6c712c2cbf202/packages/effect/src/unstable/workflow/Workflow.ts),
+and [Atom](https://github.com/Effect-TS/effect/blob/6184a7dc53cb9310e299b65ad6d6c712c2cbf202/packages/effect/src/unstable/reactivity/Atom.ts).
+
+### Connectivity and browser ownership
+
+Synchronization has three layers:
+
+| Layer           | Responsibility                                                                                                                      |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `PeerTransport` | Application supplied connection, peer identity, routing, security, receive stream, send operation, and close operation.             |
+| `PeerSync`      | Durable protocol state, bounded outbox, sequencing, replay, and received change application.                                        |
+| `PeerSession`   | Scoped orchestration that binds one transport connection to one replica incarnation and a selected set of whole document instances. |
+
+`observedByPeer` means Automerge's per peer sync state indicates that the peer has all local changes. It does not prove
+remote storage durability. Effect Local therefore keeps durable confirmation separate and currently reports it as
+false.
+
+The browser topology also assigns distinct roles:
+
+| Role                    | Responsibility                                                                          |
+| ----------------------- | --------------------------------------------------------------------------------------- |
+| RPC client              | Page code using `BrowserReplica` and a leased client session.                           |
+| Provisioning provider   | Page that creates the dedicated OPFS worker and transfers its database port capability. |
+| Replica owner runtime   | SharedWorker runtime that hosts RPC and serves one open database.                       |
+| Durable database worker | Dedicated worker that owns the SQLite WASM connection and OPFS access.                  |
+
+SharedWorker is the rendezvous and RPC host. The Web Lock elects one live browser holder. The OPFS access handle
+provides file exclusivity. The persisted writer generation fences stale writes. A transferred `MessagePort` is a
+capability, not a shared database handle.
 
 ### The write path
 
@@ -65,14 +164,17 @@ The engine separates four concerns that are often collapsed into one client stat
 2. Effect Cluster routes that command to the document entity and serializes it with other commands for the same
    document.
 3. The mutation handler changes an Automerge draft or returns its declared tagged domain error.
-4. One SQLite transaction commits canonical changes, heads, projections, the command receipt, the commit sequence,
-   and the stored Cluster reply.
+4. One SQLite transaction commits any produced Automerge changes, heads, projections, the command receipt, and the
+   commit sequence. The default `SqlReplica.layer` and `layerWithBindings` runtime stores the Cluster reply in the same
+   transaction.
 5. Commit invalidations refresh dependent Atom queries. They are notifications after durability, not the durability
    boundary itself.
 6. Peer sync later exchanges the canonical Automerge changes. Remote connectivity never blocks the local commit.
 
-This ordering explains why `DurablyCommittedLocal` is precise. It proves the local transaction and durable reply. It
-does not claim that another device has received the change.
+This ordering explains why `DurablyCommittedLocal` is precise. It proves that SQLite reported a committed transaction
+through the configured VFS and that the receipt evidence is available. The default Cluster runtime also stores its
+reply in that transaction. The outcome does not prove peer delivery, remote persistence, permanent browser retention,
+or protection from site data deletion.
 
 ### The read path
 
@@ -94,9 +196,22 @@ always recover by reading the replica again because Atom is not part of the pers
 | Show cursors or online state              | Presence                                             |
 | Move or recover all local data            | Backup and restore                                   |
 
-The main design rule is simple: durable facts flow outward from canonical storage into projections and reactive
+The main design rule is simple: durable facts flow outward from canonical recovery state into projections and reactive
 views. They never flow back from a cache, presence record, or transport connection into canonical history without a
 schema checked command.
+
+### Terms that require qualifiers
+
+Some familiar words refer to multiple operations. The README uses the qualified form when the distinction matters.
+
+| Qualified term               | Meaning                                                                                                                          |
+| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Canonical encoding utilities | Deterministic `Canonical.stringify`, `Canonical.hash`, and `Canonical.digest`. This module is not the canonical storage service. |
+| Storage compaction           | Publish a verified Automerge save checkpoint and prune redundant SQL change rows while preserving logical document history.      |
+| History truncation           | Deliberately discard causal history. Effect Local storage compaction does not make this promise.                                 |
+| Library storage migration    | Library controlled migration of the internal SQL format.                                                                         |
+| Projection table migration   | Application supplied DDL for one rebuildable projection table.                                                                   |
+| Document schema evolution    | Change to a document definition version and value schema. In place evolution is not implemented yet.                             |
 
 ## Installation
 
@@ -365,7 +480,9 @@ The full service surface is:
 
 ### 5. Bind projections to SQLite
 
-The projection table is a disposable index. Canonical Automerge history remains the source of truth.
+The projection table is a rebuildable, query optimized read model. It is durable so reads remain fast after restart,
+but canonical Automerge recovery state remains the source of truth. SQLite indexes are separate query planner
+structures on this table.
 
 ```ts
 import * as SqlProjection from "@lucas-barake/effect-local-sql/SqlProjection"
@@ -754,7 +871,7 @@ validate their bounds in the Effect error channel with the tagged `InvalidOption
 
 | State                                      | Owner                    | Durable | Replicated                          | Rebuildable                                         |
 | ------------------------------------------ | ------------------------ | ------- | ----------------------------------- | --------------------------------------------------- |
-| Automerge changes and verified checkpoints | SQLite canonical store   | Yes     | Yes, through selected peer sessions | No, this is the source of truth                     |
+| Automerge changes and verified checkpoints | Canonical recovery store | Yes     | Yes, through selected peer sessions | No, this is the logical source of truth             |
 | Document heads and command receipts        | SQLite canonical store   | Yes     | Heads travel in sync messages       | Derived from committed history and protocol records |
 | Projection tables                          | SQL projection bindings  | Yes     | No                                  | Yes, from canonical snapshots                       |
 | Cluster mailbox and replies                | Durable Cluster runtime  | Yes     | No                                  | No, they resolve local execution ambiguity          |
@@ -782,10 +899,12 @@ This beta deliberately does not promise a complete collaboration product.
 
 - No backend, relay, peer discovery, or asynchronous store and forward collaboration is included.
 - Authentication, authorization, peer identity, routing, and end to end encryption belong to the application transport.
-- OPFS is origin scoped and may be evicted unless the browser grants persistent storage.
+- OPFS is origin scoped. Browser storage starts as best effort, can be evicted unless persistence is granted, and is
+  deleted when the user clears the site's storage.
 - Existing secondary tabs do not yet promote themselves when the provisioning tab disappears. A new attachment can
   reprovision the owner.
-- Schema evolution is not implemented in place. The exact replica definition hash is pinned.
+- Document schema evolution is not implemented in place. The exact replica definition hash is pinned. Library storage
+  migrations and projection table migrations are separate supported mechanisms.
 - An old backup can require a matching application build until versioned migration support exists.
 - One mutation targets one document. There is no replicated transaction across documents.
 - Whole document sync is the only sync granularity. Subtree sync is not implemented.
@@ -836,6 +955,21 @@ Run commands from the repository root.
 
 Every root package exports module namespaces. Every module is also available through its public subpath, such as
 `@lucas-barake/effect-local/Replica`. `internal/*` is explicitly private.
+
+The export surface supports several assembly levels. Most applications start with everyday domain and composition
+modules. Feature and advanced services remain public for products that need direct control.
+
+| Level                      | Modules                                                                                                                                                                  |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Everyday domain            | `Document`, `DocumentSet`, `Mutation`, `Projection`, `Query`, `ReplicaDefinition`, `Replica`, `CommandOutcome`, `Snapshot`, `Identity`, `ReplicaStatus`, `Backup`        |
+| Durable runtime            | `SqlProjection`, `SqlReplica`, `BrowserReplica`, `BrowserSqlite`                                                                                                         |
+| Reactive and test adapters | `ReplicaAtom`, `TestReplica`                                                                                                                                             |
+| Optional features          | `PeerTransport`, `PeerSession`, `Presence`, `ReplicaWorkflow`, `TestPeer`, `FaultInjection`                                                                              |
+| Advanced assembly          | `CommitPublisher`, `Compaction`, `Recovery`, `PeerSync`, `DurableRuntime`, `ReplicaClient`, `ReplicaOwner`, `SessionManager`                                             |
+| Runtime internals          | `CommandExecutor`, `DocumentEntity`, `DocumentStore`, `EntityReplica`, `Migrations`, `ProjectionStore`, `QueryExecutor`, `ReplicaBootstrap`, `ReplicaGate`, `ReplicaRpc` |
+
+Runtime internals are public for framework assembly and diagnostics. They are not required for the normal application
+path shown in the cookbook.
 
 ### `@lucas-barake/effect-local`
 
