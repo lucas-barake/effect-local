@@ -761,22 +761,25 @@ Read [architecture](docs/architecture.md), [durability](docs/durability.md), [sy
 
 Run commands from the repository root.
 
-| Script                | Purpose                                                              |
-| --------------------- | -------------------------------------------------------------------- |
-| `pnpm build`          | Build all publishable packages with TypeScript project references    |
-| `pnpm build:examples` | Build every example package                                          |
-| `pnpm check`          | Type check packages, tests, and examples                             |
-| `pnpm check:tsgo`     | Type check with the TypeScript native preview                        |
-| `pnpm lint`           | Run oxlint and check dprint formatting                               |
-| `pnpm lint-fix`       | Apply lint fixes and dprint formatting                               |
-| `pnpm test --run`     | Run the unit and integration suite once                              |
-| `pnpm test:examples`  | Run every Node example                                               |
-| `pnpm test:browser`   | Run the Chromium suites for `browser-spike` and `tasks`              |
-| `pnpm coverage`       | Run Vitest with V8 coverage                                          |
-| `pnpm circular`       | Check package sources for circular imports                           |
-| `pnpm codegen`        | Regenerate package barrel modules                                    |
-| `pnpm docgen`         | Compile documentation and examples through the root TypeScript graph |
-| `pnpm clean`          | Remove generated build artifacts                                     |
+| Script                  | Purpose                                                              |
+| ----------------------- | -------------------------------------------------------------------- |
+| `pnpm build`            | Build all publishable packages with TypeScript project references    |
+| `pnpm build:examples`   | Build every example package                                          |
+| `pnpm check`            | Type check packages, tests, and examples                             |
+| `pnpm check:all`        | Add the native TypeScript preview check to local commit checks       |
+| `pnpm check:pre-commit` | Run nonmodifying local commit checks once                            |
+| `pnpm check:tsgo`       | Type check with the TypeScript native preview                        |
+| `pnpm dead-code`        | Find unused private files, exports, and dependencies                 |
+| `pnpm lint`             | Run oxlint and check dprint formatting                               |
+| `pnpm lint-fix`         | Apply lint fixes and dprint formatting                               |
+| `pnpm test --run`       | Run the unit and integration suite once                              |
+| `pnpm test:examples`    | Run every Node example                                               |
+| `pnpm test:browser`     | Run the Chromium suites for `browser-spike` and `tasks`              |
+| `pnpm coverage`         | Run Vitest with V8 coverage                                          |
+| `pnpm circular`         | Check package sources for circular imports                           |
+| `pnpm codegen`          | Regenerate package barrel modules                                    |
+| `pnpm docgen`           | Compile documentation and examples through the root TypeScript graph |
+| `pnpm clean`            | Remove generated build artifacts                                     |
 
 ## Public API inventory
 
