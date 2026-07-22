@@ -152,13 +152,12 @@ const QueryLive = ListTasks.toLayer((request) =>
   Layer.provide(DatabaseLive)
 )
 
-export const EngineLive = SqlReplica.layer(definition, { projections: [TaskListSql] }).pipe(
+export const EngineLive = SqlReplica.layerWithBindings(definition, { projections: [TaskListSql] }).pipe(
   Layer.provide(Layer.mergeAll(
     DatabaseLive,
     NodeCrypto.layer,
     MutationLive,
-    QueryLive,
-    TaskListSql.layer
+    QueryLive
   )),
   Layer.provideMerge(ReplicaLimits.layer(TestReplica.defaultLimits))
 )

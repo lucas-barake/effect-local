@@ -152,22 +152,16 @@ export const layer: Layer.Layer<CommitPublisher, never, Reactivity.Reactivity | 
             )
         })
       )
+      const initialWatermark = Option.match(watermark, {
+        onNone: () => Identity.CommitSequence.make(0),
+        onSome: (row) => row.watermark
+      })
       return {
-        watermark: Option.match(watermark, {
-          onNone: () => Identity.CommitSequence.make(0),
-          onSome: (row) => row.watermark
-        }),
+        watermark: initialWatermark,
         refreshGeneration: generation,
         events: Stream.fromSubscription(subscription).pipe(
           Stream.mapAccum(
-            () =>
-              [
-                generation,
-                Option.match(watermark, {
-                  onNone: () => Identity.CommitSequence.make(0),
-                  onSome: (row) => row.watermark
-                })
-              ] as const,
+            () => [generation, initialWatermark] as const,
             ([observedGeneration, observedSequence], event): readonly [
               readonly [number, Identity.CommitSequence],
               ReadonlyArray<CommitEvent>

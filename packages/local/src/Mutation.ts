@@ -112,7 +112,7 @@ export const make = <
     successSchema: (options.success ?? Schema.Void) as unknown as A,
     errorSchema: (options.error ?? Schema.Never) as unknown as E,
     handler,
-    of: (implementation) => implementation,
+    of: handler.of,
     toLayer: (build) => Layer.effect(handler, Effect.isEffect(build) ? build : Effect.succeed(build))
   }
 }

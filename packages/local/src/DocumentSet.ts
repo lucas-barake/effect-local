@@ -16,7 +16,20 @@ export const make = <const Documents extends ReadonlyArray<Document.Any>,>(
   return { documents, byName }
 }
 
-export const get = <Documents extends ReadonlyArray<Document.Any>,>(
+export function get<
+  Documents extends ReadonlyArray<Document.Any>,
+  Name extends Documents[number]["name"],
+>(
+  self: DocumentSet<Documents>,
+  name: Name
+): Extract<Documents[number], { readonly name: Name }> | undefined
+export function get<Documents extends ReadonlyArray<Document.Any>,>(
   self: DocumentSet<Documents>,
   name: string
-): Documents[number] | undefined => self.byName.get(name)
+): Documents[number] | undefined
+export function get(
+  self: DocumentSet<ReadonlyArray<Document.Any>>,
+  name: string
+): Document.Any | undefined {
+  return self.byName.get(name)
+}

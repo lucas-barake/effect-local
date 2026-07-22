@@ -222,3 +222,14 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   )
   return EntityReplica.layer(definition).pipe(Layer.provideMerge(durable))
 }
+
+export const layerWithBindings = <
+  D extends ReplicaDefinition.Any,
+  const Bindings extends ReadonlyArray<SqlProjection.Any>,
+>(
+  definition: D,
+  options: { readonly projections: Bindings }
+) =>
+  layer(definition, options).pipe(
+    Layer.provide(Layer.mergeAll(Layer.empty, ...options.projections.map((binding) => binding.layer)))
+  )

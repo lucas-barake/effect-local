@@ -152,22 +152,18 @@ export const layer: Layer.Layer<
         ),
       load: recovery.recover,
       stage: (stored, change) =>
-        gate.current.pipe(Effect.flatMap((epoch) =>
-          Effect.sync(() =>
-            InternalAutomerge.stage(
-              stored.automerge,
-              InternalAutomerge.actorId(epoch.replicaId, epoch.writerGeneration, stored.snapshot.documentId),
-              change
-            )
+        gate.current.pipe(Effect.map((epoch) =>
+          InternalAutomerge.stage(
+            stored.automerge,
+            InternalAutomerge.actorId(epoch.replicaId, epoch.writerGeneration, stored.snapshot.documentId),
+            change
           )
         )),
       tombstone: (stored) =>
-        gate.current.pipe(Effect.flatMap((epoch) =>
-          Effect.sync(() =>
-            InternalAutomerge.stageTombstone(
-              stored.automerge,
-              InternalAutomerge.actorId(epoch.replicaId, epoch.writerGeneration, stored.snapshot.documentId)
-            )
+        gate.current.pipe(Effect.map((epoch) =>
+          InternalAutomerge.stageTombstone(
+            stored.automerge,
+            InternalAutomerge.actorId(epoch.replicaId, epoch.writerGeneration, stored.snapshot.documentId)
           )
         )),
       persist: (document, documentId, durable, staged) =>

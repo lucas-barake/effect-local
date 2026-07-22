@@ -143,33 +143,20 @@ export const fromRpcClient = (
         session: Effect.Success<ReturnType<typeof openSession>>
       ) => Stream.Stream<A, E | ReplicaError.ReplicaError, R>
     ) =>
-      Stream.unwrap(
-        SubscriptionRef.get(sessions).pipe(
-          Effect.map((session) =>
-            Stream.unwrap(
-              Ref.make(false).pipe(
-                Effect.map((emitted) =>
-                  use(session).pipe(
-                    Stream.tap(() => Ref.set(emitted, true)),
-                    Stream.catchTag("ReplicaError", (error) =>
-                      Schema.is(ReplicaError.ReplicaError)(error) && error.reason._tag === "ProtocolMismatch"
-                        ? Stream.unwrap(
-                          reopen(session).pipe(
-                            Effect.flatMap((next) =>
-                              Ref.get(emitted).pipe(
-                                Effect.map((wasEmitted) => wasEmitted ? Stream.fail(error) : use(next))
-                              )
-                            )
-                          )
-                        )
-                        : Stream.fail(error))
-                  )
-                )
-              )
-            )
-          )
+      Stream.unwrap(Effect.gen(function*() {
+        const session = yield* SubscriptionRef.get(sessions)
+        const emitted = yield* Ref.make(false)
+        return use(session).pipe(
+          Stream.tap(() => Ref.set(emitted, true)),
+          Stream.catchTag("ReplicaError", (error) =>
+            Schema.is(ReplicaError.ReplicaError)(error) && error.reason._tag === "ProtocolMismatch"
+              ? Stream.unwrap(Effect.gen(function*() {
+                const next = yield* reopen(session)
+                return (yield* Ref.get(emitted)) ? Stream.fail(error) : use(next)
+              }))
+              : Stream.fail(error))
         )
-      )
+      }))
     const retrySchedule = Schedule.spaced("1 second")
     const sessionFailure = yield* Deferred.make<never, ReplicaError.ReplicaError>()
     yield* Effect.gen(function*() {

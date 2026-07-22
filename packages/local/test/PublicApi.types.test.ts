@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Schema from "effect/Schema"
-import { Document, Mutation, Query } from "../src/index.js"
+import { Document, DocumentSet, Mutation, Query } from "../src/index.js"
 
 type Equal<A, B,> = (<T,>() => T extends A ? 1 : 2) extends <T,>() => T extends B ? 1 : 2 ? true : false
 
@@ -11,6 +11,10 @@ describe("public API types", () => {
 
   const Task = Document.make("Task", {
     schema: Schema.Struct({ title: Schema.String }),
+    version: 1
+  })
+  const Note = Document.make("Note", {
+    schema: Schema.Struct({ body: Schema.String }),
     version: 1
   })
   const Rename = Mutation.make("Rename", {
@@ -55,5 +59,16 @@ describe("public API types", () => {
     assert.isTrue(queryError)
     assert.isTrue(mutationErrorUnion)
     assert.isTrue(queryErrorUnion)
+  })
+
+  it("narrows document lookup by literal name", () => {
+    const documents = DocumentSet.make(Task, Note)
+    const task = DocumentSet.get(documents, "Task")
+    const name: string = "Task"
+    const dynamic = DocumentSet.get(documents, name)
+    const literalLookup: Equal<typeof task, typeof Task | undefined> = true
+    const dynamicLookup: Equal<typeof dynamic, typeof Task | typeof Note | undefined> = true
+    assert.isTrue(literalLookup)
+    assert.isTrue(dynamicLookup)
   })
 })

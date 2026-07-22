@@ -9,7 +9,7 @@ The design follows the ownership, longevity, and offline principles in
 [Local first software](https://www.inkandswitch.com/essay/local-first/). This repository contains client code only. It
 does not provide a backend, relay, authentication, encryption, or a prescribed server protocol.
 
-> **Beta:** The current release is `0.1.0` and targets Effect `4.0.0-beta.99` and Automerge `3.3.2`. Durable formats,
+> **Beta:** The library targets Effect `4.0.0-beta.99` and Automerge `3.3.2`. Durable formats,
 > worker protocols, and public APIs can still change. Read [Limits and security](#limits-and-security) before adopting
 > it for user data.
 
@@ -22,6 +22,81 @@ does not provide a backend, relay, authentication, encryption, or a prescribed s
 - Canonical Automerge state is separate from disposable SQLite projections and Atom caches.
 - Cluster and Workflow provide durable execution without replacing Automerge merge semantics.
 - Production shaped in memory layers and deterministic peer faults keep tests fast and reproducible.
+
+## Mental model
+
+Effect Local is easiest to understand as one durable local database with several replaceable views and execution
+systems around it. The canonical document history is the authority. SQL projections, Atom values, RPC sessions, and
+presence are ways to use or observe that authority. They never become a second source of truth.
+
+The engine separates four concerns that are often collapsed into one client state library:
+
+| Concern           | Responsibility                                                                   | What it does not own                           |
+| ----------------- | -------------------------------------------------------------------------------- | ---------------------------------------------- |
+| Canonical storage | Automerge changes, document heads, checkpoints, tombstones, and command receipts | UI cache state or remote availability          |
+| Local execution   | Serialized commands, durable replies, maintenance workflows, and recovery        | Replicated merge semantics                     |
+| Derived views     | SQLite projections and Effect Atom values optimized for reads                    | Canonical history                              |
+| Connectivity      | Worker RPC, peer sessions, presence, and application supplied transports         | Authentication, routing, or a backend protocol |
+
+### Core terminology
+
+| Term                   | Meaning                                                                                                                                                                         |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Replica definition** | The schema checked blueprint for one application data model. It names the documents, mutations, projections, and queries that must agree on a durable protocol hash.            |
+| **Replica**            | One running local instance of a replica definition. It exposes commands, reads, queries, status, backup, and restore operations as an Effect service.                           |
+| **Document**           | The unit of canonical state, causal history, merge, compaction, and peer synchronization. A document normally represents one aggregate whose invariants must change together.   |
+| **Snapshot**           | A decoded point in a document's history with its identity, version, heads, tombstone state, and value. A snapshot is a read result, not a mutable store object.                 |
+| **Mutation**           | A named, schema checked command that changes exactly one document. Its handler runs against an Automerge draft and can return a declared tagged domain error.                   |
+| **Command ID**         | The stable identity of a create, mutate, or delete request. It turns retry from guesswork into an idempotent protocol. Reuse it only for the same logical input.                |
+| **Command receipt**    | The durable record that connects a command ID to its committed or rejected result. Receipts let a caller resolve an ambiguous transport outcome later.                          |
+| **Command outcome**    | Proof of a local durable commit, a declared rejection, or `OutcomeUnknown` when the caller cannot prove which occurred. It is stronger than an RPC success response.            |
+| **Projection**         | A deterministic, rebuildable SQL representation of canonical snapshots. Projections make local queries efficient but can always be discarded and rebuilt.                       |
+| **Query**              | A schema checked read over projections. Its declared dependencies are also the keys used to invalidate reactive Atom computations.                                              |
+| **Owner**              | The single browser runtime currently allowed to open the durable SQLite replica. Other tabs are clients of that owner rather than competing database writers.                   |
+| **Session**            | A leased RPC capability bound to one client and one owner epoch. Sessions fence stale tabs and force clients to reopen after an owner restart.                                  |
+| **Cluster entity**     | The per document durable command executor. It serializes local commands and stores replies atomically with application state. It does not decide CRDT convergence.              |
+| **Workflow**           | Durable orchestration for work that spans retries, activities, or multiple steps. Use it for maintenance and coordination, not as a replacement for a single document mutation. |
+| **Peer session**       | A scoped synchronization relationship over an application supplied `PeerTransport`. It exchanges bounded Automerge changes and resets safely when either side disconnects.      |
+| **Presence**           | Expiring best effort metadata about connected peers or tabs. Presence is never durable state and must never authorize an operation.                                             |
+
+### The write path
+
+1. The caller creates one command ID and sends a create, mutate, or delete command to `Replica`.
+2. Effect Cluster routes that command to the document entity and serializes it with other commands for the same
+   document.
+3. The mutation handler changes an Automerge draft or returns its declared tagged domain error.
+4. One SQLite transaction commits canonical changes, heads, projections, the command receipt, the commit sequence,
+   and the stored Cluster reply.
+5. Commit invalidations refresh dependent Atom queries. They are notifications after durability, not the durability
+   boundary itself.
+6. Peer sync later exchanges the canonical Automerge changes. Remote connectivity never blocks the local commit.
+
+This ordering explains why `DurablyCommittedLocal` is precise. It proves the local transaction and durable reply. It
+does not claim that another device has received the change.
+
+### The read path
+
+`get` decodes the canonical snapshot for one document. `query` reads rebuildable SQL projections. Effect Atom wraps
+those operations with reactive caching and invalidates them from commit events. A stale or empty Atom registry can
+always recover by reading the replica again because Atom is not part of the persistence model.
+
+### Choosing the right abstraction
+
+| Need                                      | Use                                                  |
+| ----------------------------------------- | ---------------------------------------------------- |
+| Change one aggregate atomically           | One document mutation                                |
+| Read one aggregate with causal metadata   | `Replica.get`                                        |
+| Filter, sort, or join local data          | Projection plus query                                |
+| Keep React views current                  | `ReplicaAtom` builders                               |
+| Retry a command after losing the response | The same command ID, then the matching lookup method |
+| Coordinate several durable steps          | Effect Workflow                                      |
+| Exchange changes with another replica     | `PeerSession` and an application supplied transport  |
+| Show cursors or online state              | Presence                                             |
+| Move or recover all local data            | Backup and restore                                   |
+
+The main design rule is simple: durable facts flow outward from canonical storage into projections and reactive
+views. They never flow back from a cache, presence record, or transport connection into canonical history without a
+schema checked command.
 
 ## Installation
 
@@ -335,7 +410,8 @@ export const QueryLive = ListTasks.toLayer((payload) => ListTasksSql(payload).pi
 
 ### 6. Compose the durable engine
 
-`SqlReplica.layer` requires exactly one SQL binding per declared projection plus every mutation and query handler,
+`SqlReplica.layerWithBindings` accepts exactly one SQL binding per declared projection and provides those binding
+services automatically. It still requires every mutation and query handler,
 `ReplicaLimits`, `Crypto`, and `SqlClient`. It provides `Replica`, `CommitPublisher`, `ReplicaWorkflow.CompactionWorkflow`,
 `PeerSync`, `ReplicaGate`, and Effect Cluster `Sharding`. The owner side peer services stay available so
 `PeerSession.make` can share the same durable runtime and fencing gate.
@@ -347,9 +423,9 @@ import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Layer from "effect/Layer"
 import { definition, MutationLive, QueryLive, TaskListSql } from "./domain.js"
 
-const DomainLive = Layer.mergeAll(MutationLive, QueryLive, TaskListSql.layer)
+const DomainLive = Layer.mergeAll(MutationLive, QueryLive)
 
-export const EngineLive = SqlReplica.layer(definition, {
+export const EngineLive = SqlReplica.layerWithBindings(definition, {
   projections: [TaskListSql]
 }).pipe(
   Layer.provideMerge(DomainLive),
@@ -359,11 +435,14 @@ export const EngineLive = SqlReplica.layer(definition, {
 )
 ```
 
-`DatabaseLive` is any Effect v4 `SqlClient.SqlClient` Layer. `SqlReplica.layer` also requires the Effect `Crypto`
+`DatabaseLive` is any Effect v4 `SqlClient.SqlClient` Layer. `SqlReplica.layerWithBindings` also requires the Effect `Crypto`
 service. In the browser these come from `BrowserSqlite.layer` or `BrowserSqlite.layerMessagePort` and
 `BrowserCrypto.layer`. Node programs provide `NodeCrypto.layer`. The complete limits object is available as
 `TestReplica.defaultLimits` for tests and in
 [`examples/tasks/src/domain.ts`](examples/tasks/src/domain.ts) for a browser configuration.
+
+Use the lower level `SqlReplica.layer` when an application intentionally wants to provide or override projection
+binding services itself.
 
 ### 7. Provide the official Effect Worker layer
 
@@ -746,7 +825,7 @@ Every root package exports module namespaces. Every module is also available thr
 | `ReplicaGate`      | `Permit`, `ReplicaGate` service, `layer`                                                                                |
 | `ReplicaWorkflow`  | `OperationId`, `CompactReplica`, `Execution`, `CompactionWorkflow`, `layerRegistration`, `layerRuntime`                 |
 | `SqlProjection`    | `Migration`, `SqlProjection`, `BindingService`, `make`, `Any`                                                           |
-| `SqlReplica`       | `layerFromServices`, `layer`                                                                                            |
+| `SqlReplica`       | `layerFromServices`, `layer`, `layerWithBindings`                                                                       |
 
 ### `@lucas-barake/effect-local-browser`
 

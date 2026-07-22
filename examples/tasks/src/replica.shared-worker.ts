@@ -19,11 +19,10 @@ const makeEngine = (databasePort: MessagePort, providerPort: MessagePort) => {
     DatabaseLive,
     BrowserCrypto.layer,
     DomainLive.pipe(Layer.provide(DatabaseLive)),
-    ReplicaLimits.layer(limits),
-    TaskListSql.layer
+    ReplicaLimits.layer(limits)
   )
   const EngineLive = Layer.merge(
-    SqlReplica.layer(definition, { projections: [TaskListSql] }),
+    SqlReplica.layerWithBindings(definition, { projections: [TaskListSql] }),
     SessionManager.layer
   ).pipe(Layer.provideMerge(DependenciesLive))
   return {

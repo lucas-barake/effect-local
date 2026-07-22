@@ -5,7 +5,7 @@ import { RpcClient } from "effect/unstable/rpc"
 import * as ReplicaAtom from "./ReplicaAtom.js"
 import * as ReplicaClient from "./ReplicaClient.js"
 
-export type WorkerOptions = Parameters<typeof RpcClient.layerProtocolWorker>[0]
+type WorkerOptions = Parameters<typeof RpcClient.layerProtocolWorker>[0]
 
 export const layerWith = (definition: ReplicaDefinition.Any, options: WorkerOptions) =>
   Layer.effect(
@@ -18,14 +18,14 @@ export const layerWith = (definition: ReplicaDefinition.Any, options: WorkerOpti
 
 export const layer = (definition: ReplicaDefinition.Any) => layerWith(definition, { size: 1, concurrency: 32 })
 
-export const layerWithReactivityOptions = (definition: ReplicaDefinition.Any, options: WorkerOptions) => {
-  const protocol = RpcClient.layerProtocolWorker(options)
-  const client = ReplicaClient.layer(definition).pipe(Layer.provide(protocol))
-  return Layer.merge(
-    Layer.effect(Replica.Replica, ReplicaClient.ReplicaClient).pipe(Layer.provide(client)),
-    ReplicaAtom.layerReactivity.pipe(Layer.provide(client))
+export const layerWithReactivityOptions = (definition: ReplicaDefinition.Any, options: WorkerOptions) =>
+  Layer.merge(
+    Layer.effect(Replica.Replica, ReplicaClient.ReplicaClient),
+    ReplicaAtom.layerReactivity
+  ).pipe(
+    Layer.provide(ReplicaClient.layer(definition)),
+    Layer.provide(RpcClient.layerProtocolWorker(options))
   )
-}
 
 export const layerWithReactivity = (definition: ReplicaDefinition.Any) =>
   layerWithReactivityOptions(definition, { size: 1, concurrency: 32 })

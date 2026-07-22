@@ -6,6 +6,7 @@ import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
+import * as Projection from "@lucas-barake/effect-local/Projection"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
@@ -16,12 +17,40 @@ import { TestClock } from "effect/testing"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as ClusterStorage from "../src/internal/clusterStorage.js"
 import * as ReplicaWorkflow from "../src/ReplicaWorkflow.js"
+import * as SqlProjection from "../src/SqlProjection.js"
 import * as SqlReplica from "../src/SqlReplica.js"
 
 describe("SqlReplica", () => {
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
   const Rename = Mutation.make("Rename", { document: Task, payload: Schema.String })
   const Noop = Mutation.make("Noop", { document: Task })
+  const TaskTitle = Projection.make("TaskTitle", {
+    document: Task,
+    version: 1,
+    Row: Schema.Struct({ sourceDocumentId: Identity.DocumentId, title: Schema.String }),
+    key: (row) => row.sourceDocumentId,
+    project: (snapshot) =>
+      snapshot.tombstone
+        ? []
+        : [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title }]
+  })
+  const TaskTitleSql = SqlProjection.make(TaskTitle, {
+    table: "task_title_v1",
+    migrations: [{
+      id: 1,
+      name: "task_title_v1",
+      run: (sql, table) =>
+        sql`CREATE TABLE IF NOT EXISTS ${sql(table)} (
+          source_document_id TEXT PRIMARY KEY,
+          title TEXT NOT NULL
+        )`.pipe(Effect.asVoid)
+    }],
+    deleteByDocument: (sql, table, documentId) =>
+      sql`DELETE FROM ${sql(table)} WHERE source_document_id = ${documentId}`.pipe(Effect.asVoid),
+    insert: (sql, table, row) =>
+      sql`INSERT INTO ${sql(table)} (source_document_id, title)
+        VALUES (${row.sourceDocumentId}, ${row.title})`.pipe(Effect.asVoid)
+  })
   const definition = ReplicaDefinition.make({
     name: "sql-replica",
     documents: DocumentSet.make(Task),
@@ -66,7 +95,19 @@ describe("SqlReplica", () => {
     Noop.toLayer(() => undefined)
   )
   const Limits = ReplicaLimits.layer(limits)
-  const Live = SqlReplica.layer(definition, { projections: [] }).pipe(
+  const Live = SqlReplica.layerWithBindings(definition, { projections: [] }).pipe(
+    Layer.provide(Layer.mergeAll(Database, Handler, Limits))
+  )
+  const ProjectedLive = SqlReplica.layerWithBindings(
+    ReplicaDefinition.make({
+      name: "projected-sql-replica",
+      documents: DocumentSet.make(Task),
+      mutations: [Rename, Noop],
+      projections: [TaskTitle],
+      queries: []
+    }),
+    { projections: [TaskTitleSql] }
+  ).pipe(
     Layer.provide(Layer.mergeAll(Database, Handler, Limits))
   )
 
@@ -154,4 +195,21 @@ describe("SqlReplica", () => {
         (SELECT COUNT(*) FROM effect_local_command_receipts) AS receipts`
       assert.deepStrictEqual(rows[0], { changes: 6, clusterMessages: 8, documents: 4, receipts: 7 })
     }).pipe(Effect.provide(Live), Effect.provide(Database), TestClock.withLive))
+
+  it.effect("provides nonempty projection bindings", () =>
+    Effect.gen(function*() {
+      const replica = yield* Replica.Replica
+      const created = yield* replica.create(Task, {
+        commandId: yield* Identity.makeCommandId,
+        value: { title: "projected" }
+      })
+      assert.strictEqual(created._tag, "DurablyCommittedLocal")
+      if (created._tag !== "DurablyCommittedLocal") return
+      const sql = yield* SqlClient.SqlClient
+      const rows = yield* sql<{ readonly sourceDocumentId: string; readonly title: string }>`SELECT
+        source_document_id AS sourceDocumentId,
+        title
+      FROM task_title_v1`
+      assert.deepStrictEqual(rows, [{ sourceDocumentId: created.value, title: "projected" }])
+    }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive))
 })
