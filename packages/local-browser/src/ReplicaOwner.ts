@@ -235,11 +235,17 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
             Stream.map((chunk) => new Uint8Array(chunk))
           )
         ),
-      RestoreBackup: ({ chunks, expectedDefinitionHash, maxBytes, mode, sessionId }, { client }) =>
+      RestoreBackup: ({ chunks, expectedDefinitionHash, installationId, maxBytes, mode, sessionId }, { client }) =>
         sessions.run(
           sessionId,
           client.id,
-          replica.restoreBackup({ source: Stream.fromIterable(chunks), expectedDefinitionHash, maxBytes, mode })
+          replica.restoreBackup({
+            source: Stream.fromIterable(chunks),
+            expectedDefinitionHash,
+            installationId,
+            maxBytes,
+            mode
+          })
         ),
       ExportDocument: ({ document, documentId, sessionId }, { client }) =>
         sessions.run(

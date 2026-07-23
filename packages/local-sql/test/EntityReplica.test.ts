@@ -115,6 +115,7 @@ describe("EntityReplica", () => {
         armed = true
         const restore = yield* replica.restoreBackup({
           expectedDefinitionHash: definition.hash,
+          installationId: yield* Identity.makeBackupInstallationId,
           maxBytes: limits.maxBackupBytes,
           mode: "replace",
           source: Stream.fromIterable(backup)

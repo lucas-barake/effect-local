@@ -496,7 +496,8 @@ export const fromRpcClient = (
                 chunks,
                 mode: options.mode,
                 maxBytes: options.maxBytes,
-                expectedDefinitionHash: options.expectedDefinitionHash
+                expectedDefinitionHash: options.expectedDefinitionHash,
+                installationId: options.installationId
               })
             )
           ),

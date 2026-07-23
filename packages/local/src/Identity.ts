@@ -36,6 +36,9 @@ export type CommitSequence = typeof CommitSequence.Type
 export const PeerId = identifier("PeerId", "peer")
 export type PeerId = typeof PeerId.Type
 
+export const BackupInstallationId = identifier("BackupInstallationId", "bak")
+export type BackupInstallationId = typeof BackupInstallationId.Type
+
 export const ProjectionVersion = Schema.Int.check(Schema.isGreaterThan(0)).pipe(
   Schema.brand("@lucas-barake/effect-local/ProjectionVersion")
 )
@@ -55,6 +58,9 @@ export const makeCommandId = Crypto.Crypto.use((crypto) =>
 )
 export const makePeerId = Crypto.Crypto.use((crypto) =>
   crypto.randomUUIDv4.pipe(Effect.map((uuid) => PeerId.make(`peer_${uuid}`)))
+)
+export const makeBackupInstallationId = Crypto.Crypto.use((crypto) =>
+  crypto.randomUUIDv4.pipe(Effect.map((uuid) => BackupInstallationId.make(`bak_${uuid}`)))
 )
 
 export const documentIdFromCommandId = (commandId: CommandId): DocumentId =>

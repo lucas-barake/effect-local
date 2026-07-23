@@ -97,7 +97,8 @@ describe("PeerRpc WebSocket", () => {
           source: Stream.fromIterable(archive),
           mode: "clone",
           maxBytes: TestReplica.defaultLimits.maxBackupBytes,
-          expectedDefinitionHash: definition.hash
+          expectedDefinitionHash: definition.hash,
+          installationId: yield* Identity.makeBackupInstallationId
         })
 
         const credentials: Array<string> = []

@@ -158,6 +158,7 @@ describe("BackupStore", () => {
       InternalAutomerge.free(staged)
       InternalAutomerge.free(created.automerge)
       yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
         source: Stream.fromIterable(chunks),
         mode: "replace",
         maxBytes: limits.maxBackupBytes,
@@ -188,6 +189,7 @@ describe("BackupStore", () => {
       InternalAutomerge.free(staged)
       InternalAutomerge.free(created.automerge)
       yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
         source: Stream.fromIterable(chunks),
         mode: "replace",
         maxBytes: limits.maxBackupBytes,
@@ -240,6 +242,7 @@ describe("BackupStore", () => {
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
 
       yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
         source: Stream.fromIterable(chunks),
         mode: "replace",
         maxBytes: limits.maxBackupBytes,
@@ -298,6 +301,7 @@ describe("BackupStore", () => {
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
 
       yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
         source: Stream.fromIterable(chunks),
         mode: "replace",
         maxBytes: limits.maxBackupBytes,
@@ -351,6 +355,7 @@ describe("BackupStore", () => {
         END`
 
       const result = yield* Effect.exit(backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
         source: Stream.fromIterable(chunks),
         mode: "replace",
         maxBytes: limits.maxBackupBytes,
@@ -359,10 +364,79 @@ describe("BackupStore", () => {
       assert.strictEqual(result._tag, "Failure")
       const preserved = yield* store.load(Task, documentId)
       assert.strictEqual(preserved.snapshot.value.title, "preserved")
+      const installations = yield* sql<{ readonly installation_id: string }>`
+        SELECT installation_id FROM effect_local_backup_installations
+      `
+      assert.strictEqual(installations.length, 0)
       InternalAutomerge.free(preserved.automerge)
       InternalAutomerge.free(current.automerge)
       InternalAutomerge.free(staged)
       InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Live)))
+
+  it.effect("no-ops a retried restore that reuses an installed installation id", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const archivedId = yield* Identity.makeDocumentId
+      const archived = yield* store.create(Task, archivedId, { title: "archived" })
+      InternalAutomerge.free(archived.automerge)
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      const restoreArchive = (installationId: Identity.BackupInstallationId) =>
+        backups.restore({
+          source: Stream.fromIterable(chunks),
+          mode: "replace",
+          maxBytes: limits.maxBackupBytes,
+          expectedDefinitionHash: definition.hash,
+          installationId
+        })
+      const installationId = yield* Identity.makeBackupInstallationId
+      yield* restoreArchive(installationId)
+      const interveningId = yield* Identity.makeDocumentId
+      const intervening = yield* store.create(Task, interveningId, { title: "intervening" })
+      InternalAutomerge.free(intervening.automerge)
+
+      yield* restoreArchive(installationId)
+
+      const preserved = yield* store.load(Task, interveningId)
+      assert.strictEqual(preserved.snapshot.value.title, "intervening")
+      InternalAutomerge.free(preserved.automerge)
+      const installations = yield* sql<{ readonly installation_id: string; readonly mode: string }>`
+        SELECT installation_id, mode FROM effect_local_backup_installations
+      `
+      assert.deepStrictEqual(installations, [{ installation_id: installationId, mode: "replace" }])
+
+      yield* restoreArchive(yield* Identity.makeBackupInstallationId)
+      const erased = yield* Effect.flip(store.load(Task, interveningId))
+      assert.strictEqual(erased.reason._tag, "DocumentNotFound")
+    }).pipe(Effect.provide(Live)))
+
+  it.effect("rejects an installation id reused for a different restore request", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "archived" })
+      InternalAutomerge.free(created.automerge)
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      const installationId = yield* Identity.makeBackupInstallationId
+      yield* backups.restore({
+        source: Stream.fromIterable(chunks),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash,
+        installationId
+      })
+
+      const error = yield* Effect.flip(backups.restore({
+        source: Stream.fromIterable(chunks),
+        mode: "clone",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash,
+        installationId
+      }))
+      assert.strictEqual(error.reason._tag, "BackupInvalid")
     }).pipe(Effect.provide(Live)))
 
   it.effect("rolls back the claimed generation when checksum-valid records fail insertion", () =>
@@ -404,6 +478,7 @@ describe("BackupStore", () => {
       }>`SELECT replica_incarnation, writer_generation FROM effect_local_metadata WHERE singleton = 1`
 
       const restored = yield* Effect.result(backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
         source: Stream.make(archive),
         mode: "replace",
         maxBytes: limits.maxBackupBytes,
@@ -452,6 +527,7 @@ describe("BackupStore", () => {
       const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
 
       const restored = yield* Effect.exit(backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
         source: Stream.make(archive),
         mode: "replace",
         maxBytes: limits.maxBackupBytes,
@@ -501,6 +577,7 @@ describe("BackupStore", () => {
       const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
 
       const result = yield* Effect.result(backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
         source: Stream.make(archive),
         mode: "replace",
         maxBytes: limits.maxBackupBytes,
@@ -567,6 +644,7 @@ describe("BackupStore", () => {
 
       for (const testCase of cases) {
         const result = yield* Effect.exit(backups.restore({
+          installationId: yield* Identity.makeBackupInstallationId,
           source: Stream.fromIterable(testCase.source),
           mode: "replace",
           maxBytes: testCase.maxBytes,
@@ -592,6 +670,7 @@ describe("BackupStore", () => {
     Effect.gen(function*() {
       const backups = yield* BackupStore.BackupStore
       const result = yield* Effect.exit(backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
         source: Stream.never,
         mode: "replace",
         maxBytes: limits.maxBackupBytes + 1,
@@ -640,6 +719,7 @@ describe("BackupStore", () => {
       lines[0]!.checksum = yield* Canonical.digest(lines[0]!.value)
       const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
       const result = yield* Effect.exit(backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
         source: Stream.make(archive),
         mode: "replace",
         maxBytes: limits.maxBackupBytes,
@@ -658,6 +738,7 @@ describe("BackupStore", () => {
       const initial = manifest(source)
 
       yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
         source: Stream.fromIterable(source),
         mode: "clone",
         maxBytes: limits.maxBackupBytes,
@@ -668,6 +749,7 @@ describe("BackupStore", () => {
       assert.strictEqual(cloned.incarnation, initial.incarnation + 1)
 
       yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
         source: Stream.fromIterable(source),
         mode: "replace",
         maxBytes: limits.maxBackupBytes,
@@ -684,6 +766,7 @@ describe("BackupStore", () => {
       const source = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
 
       yield* backups.restore({
+        installationId: Identity.BackupInstallationId.make("bak_9e8d7c6b-5a4f-4e3d-8c2b-1a0f9e8d7c6b"),
         source: Stream.fromIterable(source),
         mode: "clone",
         maxBytes: limits.maxBackupBytes,

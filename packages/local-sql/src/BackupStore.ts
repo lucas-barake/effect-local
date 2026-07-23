@@ -230,6 +230,16 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         Result: ForeignKeyViolationRow,
         execute: () => sql`PRAGMA foreign_key_check`
       })
+      const findInstallation = SqlSchema.findOneOption({
+        Request: Identity.BackupInstallationId,
+        Result: Schema.Struct({
+          manifest_checksum: Schema.String,
+          mode: Schema.Literals(["clone", "replace"])
+        }),
+        execute: (installationId) =>
+          sql`SELECT mode, manifest_checksum FROM effect_local_backup_installations
+            WHERE installation_id = ${installationId}`
+      })
       const recovery = yield* Recovery.make
       const digest = (value: unknown) => Canonical.digest(value).pipe(Effect.provideService(Crypto.Crypto, crypto))
       const encodeEnvelope = (kind: string, value: unknown) =>
@@ -604,6 +614,26 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             : manifest.replicaId
           yield* gate.claim((permit) =>
             Effect.gen(function*() {
+              const installed = yield* findInstallation(options.installationId)
+              if (installed._tag === "Some") {
+                if (
+                  installed.value.manifest_checksum !== manifestEnvelope.checksum ||
+                  installed.value.mode !== options.mode
+                ) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.BackupInvalid({
+                      cause: new Error("Backup installation id was already used for a different restore")
+                    })
+                  })
+                }
+                return
+              }
+              yield* sql`INSERT INTO effect_local_backup_installations (
+                installation_id, mode, manifest_checksum, installed_at, replica_incarnation
+              ) VALUES (
+                ${options.installationId}, ${options.mode}, ${manifestEnvelope.checksum},
+                ${DateTime.formatIso(yield* DateTime.now)}, ${permit.incarnation}
+              )`
               const clusterTables = yield* findClusterTables(undefined)
               if (clusterTables.some((table) => table.name === `${ClusterStorage.messagePrefix}_replies`)) {
                 yield* sql`DELETE FROM ${sql(`${ClusterStorage.messagePrefix}_replies`)}`
