@@ -186,7 +186,12 @@ export const make = (
         return [[scheduled, previous], next]
       })
       if (pending === undefined) return
-      yield* Effect.forEach(pending, deliver, { discard: true })
+      const [current, ...deferred] = pending
+      yield* deliver(current)
+      // deferred packets ride a later send; their delivery failure must not fail it
+      yield* Effect.forEach(deferred, (packet) => Effect.catchIf(deliver(packet), () => true, () => Effect.void), {
+        discard: true
+      })
     })
 
     const flush = Ref.getAndSet(held, new Map()).pipe(

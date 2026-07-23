@@ -231,4 +231,21 @@ describe("TestPeer", () => {
       { drop: false, copies: 1, delay: 0, reorder: true },
       { drop: false, copies: 1, delay: 0, reorder: false }
     ]))))
+
+  it.effect("succeeds a reordering send when only the earlier held packet overflows the queue", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const network = yield* TestPeer.make({ ...options, queueCapacity: 1 })
+      const left = yield* network.connect(leftId, rightId)
+      const right = yield* network.connect(rightId, leftId)
+      yield* left.send(bytes(1)) // reordered -> held, reported as sent
+      const outcome = yield* Effect.exit(left.send(bytes(2))) // flushes [2, 1]; 2 is enqueued, 1 overflows
+      assert.strictEqual(outcome._tag, "Success")
+      assert.deepStrictEqual(
+        Array.from(yield* Stream.runCollect(Stream.take(right.receive, 1))),
+        [bytes(2)]
+      )
+    })).pipe(Effect.provide(FaultInjection.layerSequence([
+      { drop: false, copies: 1, delay: 0, reorder: true },
+      { drop: false, copies: 1, delay: 0, reorder: false }
+    ]))))
 })
