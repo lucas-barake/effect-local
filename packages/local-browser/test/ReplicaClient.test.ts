@@ -417,27 +417,6 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.strictEqual(subscriptions, 5)
     })).pipe(Effect.provide(Owner)))
 
-  it.effect("retries transient lease renewal failures", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const sessions = yield* SessionManager.SessionManager
-      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-      let renewals = 0
-      const reconnecting = new Proxy(rpc, {
-        get(target, property, receiver) {
-          const value = Reflect.get(target, property, receiver)
-          if (property !== "RenewSession") return value
-          return (payload: never) =>
-            Effect.sync(() => ++renewals).pipe(
-              Effect.flatMap((attempt) => attempt < 3 ? Effect.fail(disconnected()) : value(payload))
-            )
-        }
-      })
-      yield* ReplicaClient.fromRpcClient(definition, reconnecting)
-      yield* TestClock.adjust(SessionManager.leaseDurationMillis / 2 + 2_000)
-      assert.strictEqual(renewals, 3)
-      assert.strictEqual(yield* sessions.activeCount, 1)
-    })).pipe(Effect.provide(Owner)))
-
   it.effect("continues renewing after a transient failure burst", () =>
     Effect.scoped(Effect.gen(function*() {
       const sessions = yield* SessionManager.SessionManager

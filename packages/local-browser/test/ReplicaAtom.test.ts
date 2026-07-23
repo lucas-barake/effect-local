@@ -43,7 +43,8 @@ describe("ReplicaAtom", () => {
       const atom = ReplicaAtom.documentFamily(atomRuntime, Task)(snapshot.documentId)
       const unmount = registry.mount(atom)
       assert.strictEqual(yield* Deferred.await(requested), snapshot.documentId)
-      yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 10)))
+      yield* Effect.yieldNow
+      yield* Effect.yieldNow
       const value = registry.get(atom)
       assert.isTrue(AsyncResult.isSuccess(value))
       if (AsyncResult.isSuccess(value)) assert.deepStrictEqual(value.value, snapshot)
@@ -77,7 +78,8 @@ describe("ReplicaAtom", () => {
       registry.set(atom, options)
       assert.deepStrictEqual(yield* Deferred.await(called), options)
       yield* Deferred.succeed(release, undefined)
-      yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 10)))
+      yield* Effect.yieldNow
+      yield* Effect.yieldNow
       const value = registry.get(atom)
       assert.isTrue(AsyncResult.isSuccess(value))
       if (AsyncResult.isSuccess(value)) assert.deepStrictEqual(value.value, outcome)
@@ -99,7 +101,8 @@ describe("ReplicaAtom", () => {
       const atom = ReplicaAtom.status(atomRuntime)
       const unmount = registry.mount(atom)
       yield* Deferred.await(consumed)
-      yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 10)))
+      yield* Effect.yieldNow
+      yield* Effect.yieldNow
       const value = registry.get(atom)
       assert.isTrue(AsyncResult.isSuccess(value))
       if (AsyncResult.isSuccess(value)) assert.deepStrictEqual(value.value, ready)
@@ -124,12 +127,16 @@ describe("ReplicaAtom", () => {
         success: Schema.Array(Task.schema),
         dependsOn: [ByTitle]
       })
+      const first = yield* Deferred.make<void>()
+      const second = yield* Deferred.make<void>()
       let executions = 0
       const atomRuntime = Atom.runtime(Layer.succeed(Replica.Replica, {
         ...replica,
         query: () =>
-          Effect.sync(() => {
+          Effect.gen(function*() {
             executions++
+            if (executions === 1) yield* Deferred.succeed(first, undefined)
+            if (executions === 2) yield* Deferred.succeed(second, undefined)
             return []
           }) as never
       }))
@@ -141,12 +148,13 @@ describe("ReplicaAtom", () => {
       const registry = AtomRegistry.make()
       const atom = query()
       const unmount = registry.mount(atom)
-      yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 10)))
+      yield* Deferred.await(first)
       assert.strictEqual(executions, 1)
       registry.set(invalidateDocument, undefined)
-      yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 10)))
+      yield* Deferred.await(second)
       assert.strictEqual(executions, 2)
       unmount()
+      registry.dispose()
     }))
 
   it.effect("refreshes native query atoms from owner invalidations", () =>
