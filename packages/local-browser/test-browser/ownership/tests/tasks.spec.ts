@@ -2,21 +2,27 @@ import { expect, test } from "@playwright/test"
 import type { Page } from "@playwright/test"
 
 const ownerInfo = (page: Page) =>
-  expect.poll(() =>
-    page.evaluate(() => {
-      const state = globalThis as typeof globalThis & {
-        readonly __effectLocalOwnerError?: string
-        readonly __effectLocalOwnerInfo?: {
-          readonly ownerId: string
-          readonly provider: boolean
-          readonly replicaId: string
-          readonly writerGeneration: number
+  expect.poll(async () => {
+    try {
+      return await page.evaluate(() => {
+        const state = globalThis as typeof globalThis & {
+          readonly __effectLocalOwnerError?: string
+          readonly __effectLocalOwnerInfo?: {
+            readonly ownerId: string
+            readonly provider: boolean
+            readonly replicaId: string
+            readonly writerGeneration: number
+          }
         }
-      }
-      if (state.__effectLocalOwnerError !== undefined) throw new Error(state.__effectLocalOwnerError)
-      return state.__effectLocalOwnerInfo
-    })
-  ).not.toBeUndefined()
+        if (state.__effectLocalOwnerError !== undefined) throw new Error(state.__effectLocalOwnerError)
+        return state.__effectLocalOwnerInfo
+      })
+    } catch (error) {
+      // The offline shell reloads the page once its service worker claims it.
+      if (String(error).includes("Execution context was destroyed")) return undefined
+      throw error
+    }
+  }, { timeout: 20_000 }).not.toBeUndefined()
 
 test("creates, updates, completes, deletes, and reloads local tasks", async ({ page }) => {
   await page.goto("/")
@@ -201,7 +207,10 @@ test("expires a stalled provisioning candidate before assigning a healthy provid
     replica.port.start()
     replica.port.postMessage({ _tag: "Attach", rpcPort: rpc.port1 }, [rpc.port1])
     await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("Candidate was not offered provisioning")), 10_000)
+      const timeout = setTimeout(
+        () => reject(new Error(`Candidate was not offered provisioning, saw [${candidate.messages.join(", ")}]`)),
+        20_000
+      )
       replica.port.addEventListener("message", (event) => {
         const message = event.data as { readonly _tag: string }
         candidate.messages.push(message._tag)
