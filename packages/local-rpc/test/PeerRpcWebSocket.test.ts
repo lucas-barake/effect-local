@@ -79,6 +79,48 @@ const serverPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-00000000
 const clientPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000002")
 const missingSessionId = Identity.SessionId.make("ses_00000000-0000-4000-8000-000000000001")
 
+const makeWebSocketServer = (
+  documentId: Identity.DocumentId,
+  document: Document.Any = Task,
+  definitionHash: string = definition.hash
+) => {
+  const ServerDependencies = Layer.mergeAll(
+    PeerRpcLimits.layerDefaults,
+    Layer.succeed(PeerAuthenticator.PeerAuthenticator)({
+      authenticate: () =>
+        Effect.succeed({
+          principal: PeerAuthentication.PeerPrincipal.make({
+            tenantId: "tenant",
+            subjectId: "websocket-client",
+            peerId: clientPeerId
+          }),
+          validUntil: Number.MAX_SAFE_INTEGER,
+          invalidated: Effect.never
+        })
+    }),
+    PeerAuthorization.layer(() =>
+      Effect.succeed({
+        documents: [{ document, documentId }],
+        validUntil: Number.MAX_SAFE_INTEGER,
+        invalidated: Effect.never
+      })
+    )
+  )
+  const AuthenticationLive = PeerAuthentication.layerServer.pipe(Layer.provide(ServerDependencies))
+  const PeerHandlersLive = PeerRpcServer.layerHandlers({ tenantId: "tenant", peerId: serverPeerId, definitionHash })
+    .pipe(
+      Layer.provide(ServerDependencies)
+    )
+  const WsProtocol = RpcServer.layerProtocolWebsocket({ path: "/rpc" }).pipe(Layer.provide(HttpRouter.layer))
+  const RpcLive = RpcServer.layer(PeerRpc.Rpcs, { disableFatalDefects: true }).pipe(
+    Layer.provide([PeerHandlersLive, AuthenticationLive])
+  )
+  return RpcLive.pipe(
+    Layer.provideMerge(WsProtocol),
+    Layer.provide(HttpRouter.serve(WsProtocol, { disableListenLog: true, disableLogger: true }))
+  )
+}
+
 describe("PeerRpc WebSocket", () => {
   it.live(
     "synchronizes two replicas through the application owned WebSocket server",
@@ -306,48 +348,12 @@ describe("PeerRpc WebSocket", () => {
           installationId: yield* Identity.makeBackupInstallationId
         })
 
-        const ServerDependencies = Layer.mergeAll(
-          PeerRpcLimits.layerDefaults,
-          Layer.succeed(PeerAuthenticator.PeerAuthenticator)({
-            authenticate: () =>
-              Effect.succeed({
-                principal: PeerAuthentication.PeerPrincipal.make({
-                  tenantId: "tenant",
-                  subjectId: "websocket-client",
-                  peerId: clientPeerId
-                }),
-                validUntil: Number.MAX_SAFE_INTEGER,
-                invalidated: Effect.never
-              })
-          }),
-          PeerAuthorization.layer(() =>
-            Effect.succeed({
-              documents: [{ document: Task, documentId }],
-              validUntil: Number.MAX_SAFE_INTEGER,
-              invalidated: Effect.never
-            })
-          )
-        )
-        const AuthenticationLive = PeerAuthentication.layerServer.pipe(Layer.provide(ServerDependencies))
-        const PeerHandlersLive = PeerRpcServer.layerHandlers({
-          tenantId: "tenant",
-          peerId: serverPeerId,
-          definitionHash: definition.hash
-        }).pipe(
-          Layer.provide(ServerDependencies)
-        )
-        const WsProtocol = RpcServer.layerProtocolWebsocket({ path: "/rpc" }).pipe(Layer.provide(HttpRouter.layer))
-        const RpcLive = RpcServer.layer(PeerRpc.Rpcs, { disableFatalDefects: true }).pipe(
-          Layer.provide([PeerHandlersLive, AuthenticationLive])
-        )
-        const WebSocketServerLive = RpcLive.pipe(
-          Layer.provideMerge(WsProtocol),
-          Layer.provide(HttpRouter.serve(WsProtocol, { disableListenLog: true, disableLogger: true }))
-        )
+        const WebSocketServerLive = makeWebSocketServer(documentId)
 
         const buildServer = (port: number) =>
           Effect.gen(function*() {
             const scope = yield* Scope.make()
+            yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
             const context = yield* Layer.build(
               WebSocketServerLive.pipe(
                 Layer.provideMerge(NodeHttpServer.layer(() => Http.createServer(), { port })),
@@ -406,9 +412,9 @@ describe("PeerRpc WebSocket", () => {
         const assignedPort = server1.port
 
         const session1Scope = yield* Scope.make()
+        yield* Effect.addFinalizer(() => Scope.close(session1Scope, Exit.void))
         yield* connectSession(assignedPort).pipe(Effect.provideService(Scope.Scope, session1Scope))
 
-        // Converge one mutation so the server durably holds it before the restart.
         yield* addLabel("committed-before-restart")
         const serverHoldsFirst = yield* pollUntil(
           Effect.map(
@@ -418,7 +424,6 @@ describe("PeerRpc WebSocket", () => {
         )
         assert.isTrue(serverHoldsFirst)
 
-        // Leave a second mutation un-acked, then take the server down mid-session.
         yield* addLabel("pending-at-restart")
         // Releasing the client scope severs the upgraded socket so closing the node http
         // server does not block on the still-open connection during graceful shutdown.
@@ -426,7 +431,6 @@ describe("PeerRpc WebSocket", () => {
         yield* Scope.close(session1Scope, Exit.void)
         yield* Fiber.join(killing)
 
-        // A mutation applied while disconnected is also pending outbound work.
         yield* addLabel("committed-while-offline")
 
         // Reclaim the same port the client still targets; a fresh listener can briefly
@@ -444,6 +448,7 @@ describe("PeerRpc WebSocket", () => {
         assert.strictEqual(server2.port, assignedPort)
 
         const session2Scope = yield* Scope.make()
+        yield* Effect.addFinalizer(() => Scope.close(session2Scope, Exit.void))
         yield* connectSession(assignedPort).pipe(Effect.provideService(Scope.Scope, session2Scope))
 
         const converged = yield* pollUntil(Effect.gen(function*() {
@@ -503,48 +508,12 @@ describe("PeerRpc WebSocket", () => {
           installationId: yield* Identity.makeBackupInstallationId
         })
 
-        const ServerDependencies = Layer.mergeAll(
-          PeerRpcLimits.layerDefaults,
-          Layer.succeed(PeerAuthenticator.PeerAuthenticator)({
-            authenticate: () =>
-              Effect.succeed({
-                principal: PeerAuthentication.PeerPrincipal.make({
-                  tenantId: "tenant",
-                  subjectId: "websocket-client",
-                  peerId: clientPeerId
-                }),
-                validUntil: Number.MAX_SAFE_INTEGER,
-                invalidated: Effect.never
-              })
-          }),
-          PeerAuthorization.layer(() =>
-            Effect.succeed({
-              documents: [{ document: Task, documentId }],
-              validUntil: Number.MAX_SAFE_INTEGER,
-              invalidated: Effect.never
-            })
+        const serverContext = yield* Layer.build(
+          makeWebSocketServer(documentId).pipe(
+            Layer.provideMerge(NodeHttpServer.layerTest),
+            Layer.provide(RpcSerialization.layerMsgPack)
           )
-        )
-        const AuthenticationLive = PeerAuthentication.layerServer.pipe(Layer.provide(ServerDependencies))
-        const PeerHandlersLive = PeerRpcServer.layerHandlers({
-          tenantId: "tenant",
-          peerId: serverPeerId,
-          definitionHash: definition.hash
-        }).pipe(
-          Layer.provide(ServerDependencies)
-        )
-        const WsProtocol = RpcServer.layerProtocolWebsocket({ path: "/rpc" }).pipe(Layer.provide(HttpRouter.layer))
-        const RpcLive = RpcServer.layer(PeerRpc.Rpcs, { disableFatalDefects: true }).pipe(
-          Layer.provide([PeerHandlersLive, AuthenticationLive])
-        )
-        const WebSocketServerLive = RpcLive.pipe(
-          Layer.provideMerge(WsProtocol),
-          Layer.provide(HttpRouter.serve(WsProtocol, { disableListenLog: true, disableLogger: true }))
-        )
-        const serverContext = yield* Layer.build(WebSocketServerLive.pipe(
-          Layer.provideMerge(NodeHttpServer.layerTest),
-          Layer.provide(RpcSerialization.layerMsgPack)
-        )).pipe(Effect.provide(serverEngineContext))
+        ).pipe(Effect.provide(serverEngineContext))
         const address = Context.get(serverContext, HttpServer.HttpServer).address
         if (address._tag !== "TcpAddress") return yield* Effect.die("Expected a TCP test server address")
 
@@ -563,7 +532,6 @@ describe("PeerRpc WebSocket", () => {
           return yield* PeerRpc.makeRpcClient.pipe(Effect.provide(clientContext))
         })
 
-        // Establish a matched-build session and converge a mutation so there is real data to protect.
         yield* Effect.scoped(Effect.gen(function*() {
           const client = yield* buildClient
           yield* RpcPeerTransport.makeSession(client, {
@@ -601,7 +569,6 @@ describe("PeerRpc WebSocket", () => {
           assert.strictEqual(error._tag, "UnsupportedVersion")
         }))
 
-        // The rejected handshake left no session and applied nothing.
         yield* Effect.all([serverSharding.pollStorage, clientSharding.pollStorage], { discard: true })
         const afterSkew = yield* serverReplica.get(Task, documentId)
         assert.deepStrictEqual(afterSkew.value, baseline.value)
@@ -704,48 +671,12 @@ describe("PeerRpc WebSocket", () => {
         })
         assert.strictEqual(documentId, yield* CommandOutcome.committedOrFail(createdClient))
 
-        const ServerDependencies = Layer.mergeAll(
-          PeerRpcLimits.layerDefaults,
-          Layer.succeed(PeerAuthenticator.PeerAuthenticator)({
-            authenticate: () =>
-              Effect.succeed({
-                principal: PeerAuthentication.PeerPrincipal.make({
-                  tenantId: "tenant",
-                  subjectId: "websocket-client",
-                  peerId: clientPeerId
-                }),
-                validUntil: Number.MAX_SAFE_INTEGER,
-                invalidated: Effect.never
-              })
-          }),
-          PeerAuthorization.layer(() =>
-            Effect.succeed({
-              documents: [{ document: SkewTask, documentId }],
-              validUntil: Number.MAX_SAFE_INTEGER,
-              invalidated: Effect.never
-            })
+        const serverContext = yield* Layer.build(
+          makeWebSocketServer(documentId, SkewTask, serverDefinition.hash).pipe(
+            Layer.provideMerge(NodeHttpServer.layerTest),
+            Layer.provide(RpcSerialization.layerMsgPack)
           )
-        )
-        const AuthenticationLive = PeerAuthentication.layerServer.pipe(Layer.provide(ServerDependencies))
-        const PeerHandlersLive = PeerRpcServer.layerHandlers({
-          tenantId: "tenant",
-          peerId: serverPeerId,
-          definitionHash: serverDefinition.hash
-        }).pipe(
-          Layer.provide(ServerDependencies)
-        )
-        const WsProtocol = RpcServer.layerProtocolWebsocket({ path: "/rpc" }).pipe(Layer.provide(HttpRouter.layer))
-        const RpcLive = RpcServer.layer(PeerRpc.Rpcs, { disableFatalDefects: true }).pipe(
-          Layer.provide([PeerHandlersLive, AuthenticationLive])
-        )
-        const WebSocketServerLive = RpcLive.pipe(
-          Layer.provideMerge(WsProtocol),
-          Layer.provide(HttpRouter.serve(WsProtocol, { disableListenLog: true, disableLogger: true }))
-        )
-        const serverContext = yield* Layer.build(WebSocketServerLive.pipe(
-          Layer.provideMerge(NodeHttpServer.layerTest),
-          Layer.provide(RpcSerialization.layerMsgPack)
-        )).pipe(Effect.provide(serverEngineContext))
+        ).pipe(Effect.provide(serverEngineContext))
         const address = Context.get(serverContext, HttpServer.HttpServer).address
         if (address._tag !== "TcpAddress") return yield* Effect.die("Expected a TCP test server address")
 
