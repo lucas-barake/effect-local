@@ -29,7 +29,7 @@ export const layerReactivity = Layer.effectDiscard(Effect.gen(function*() {
     Effect.ignore,
     Effect.forkScoped
   )
-}))
+})).pipe(Layer.fresh)
 
 class QueryKey<P,> implements Equal.Equal {
   readonly key: string

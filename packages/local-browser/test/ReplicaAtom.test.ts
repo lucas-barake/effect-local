@@ -214,6 +214,40 @@ describe("ReplicaAtom", () => {
       unmount()
     }))
 
+  it.effect("bridges invalidations from independently provided replica clients", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const reactivity = yield* Reactivity.make
+      const seen: Array<string> = []
+      reactivity.registerUnsafe(["left"], () => seen.push("left"))
+      reactivity.registerUnsafe(["right"], () => seen.push("right"))
+
+      const client = (ownerEpoch: string, key: string): ReplicaClient.ReplicaClient["Service"] => ({
+        ...replica,
+        ownerEpoch,
+        invalidations: Stream.make({
+          _tag: "Invalidation" as const,
+          ownerEpoch,
+          sequence: Identity.CommitSequence.make(1),
+          keys: [key]
+        })
+      })
+      const bridge = (service: ReplicaClient.ReplicaClient["Service"]) =>
+        ReplicaAtom.layerReactivity.pipe(
+          Layer.provide(Layer.succeed(ReplicaClient.ReplicaClient, service))
+        )
+
+      yield* Layer.build(
+        Layer.merge(
+          bridge(client("left-owner", "left")),
+          bridge(client("right-owner", "right"))
+        )
+      ).pipe(Effect.provideService(Reactivity.Reactivity, reactivity))
+      yield* Effect.yieldNow
+      yield* Effect.yieldNow
+
+      assert.deepStrictEqual(Array.from(seen).sort(), ["left", "right"])
+    })))
+
   it.effect("retries transient invalidation failures", () =>
     Effect.gen(function*() {
       const reactivity = yield* Reactivity.make
