@@ -303,9 +303,7 @@ describe("QueryExecutor", () => {
     const failingBootstrap = ReplicaBootstrap.layer(failingDefinition).pipe(
       Layer.provide(failingDatabase)
     )
-    const failingHandler = FailingQuery.toLayer(() =>
-      Effect.fail(new DeclaredSqlError({ detail: "expected" }))
-    )
+    const failingHandler = FailingQuery.toLayer(() => Effect.fail(new DeclaredSqlError({ detail: "expected" })))
     const failingExecutor = QueryExecutor.layer(failingDefinition).pipe(
       Layer.provide(Layer.mergeAll(failingDatabase, failingHandler, Reactive))
     )

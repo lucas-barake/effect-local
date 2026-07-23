@@ -137,7 +137,7 @@ it.layer(NodeCrypto.layer)("PeerSession coverage", (it) => {
           assert.strictEqual(error.reason.observed, "2")
         }
       }
-      assert.isAbove(yield* Ref.get(closed), 0)
+      assert.strictEqual(yield* Ref.get(closed), 0)
     }))
 
   it.effect("fails when the opened session incarnation does not match the gate permit", () =>
