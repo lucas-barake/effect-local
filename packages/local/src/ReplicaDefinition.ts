@@ -62,7 +62,7 @@ export const make = <
   assertUnique("mutation", mutations)
   assertUnique("projection", projections)
   assertUnique("query", queries)
-  const documents = new Set(options.documents.documents)
+  const documents = new Set(documentSet.documents)
   const registeredProjections = new Set(projections)
   for (const mutation of mutations) {
     if (!documents.has(mutation.document)) {
@@ -84,7 +84,7 @@ export const make = <
   const definitionHash = `def_${
     Canonical.hash({
       name: options.name,
-      documents: options.documents.documents.map((document) => ({
+      documents: documentSet.documents.map((document) => ({
         name: document.name,
         schema: schemaDescriptor(document.schema),
         version: document.version
