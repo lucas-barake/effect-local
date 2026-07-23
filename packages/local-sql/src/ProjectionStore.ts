@@ -8,6 +8,7 @@ import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Predicate from "effect/Predicate"
 import * as Schema from "effect/Schema"
 import * as Migrator from "effect/unstable/sql/Migrator"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
@@ -78,6 +79,18 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
           ]))),
           table: `${binding.table}_effect_sql_migrations`
         }).pipe(
+          Effect.catchDefect((cause) =>
+            Predicate.isTagged("MigrationError")(cause)
+              ? Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.ProjectionBlocked({
+                    projection: binding.projection.name,
+                    cause
+                  })
+                })
+              )
+              : Effect.die(cause)
+          ),
           Effect.catchTag(["SqlError", "MigrationError"], (cause) =>
             Effect.fail(
               new ReplicaError.ReplicaError({

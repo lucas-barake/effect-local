@@ -93,6 +93,32 @@ describe("ProjectionStore", () => {
     assert.throws(() => makeBinding([migration(1, "")]), TypeError)
   })
 
+  it.effect("translates projection migration execution failures", () => {
+    const BrokenLabelsSql = SqlProjection.make(Labels, {
+      table: "broken_task_labels_v1",
+      migrations: [{
+        id: 1,
+        name: "broken",
+        run: (sql) =>
+          sql`SELECT * FROM definitely_missing_projection_table`.pipe(Effect.asVoid)
+      }],
+      deleteByDocument: () => Effect.void,
+      insert: () => Effect.void
+    })
+    const BrokenStore = ProjectionStore.layer([BrokenLabelsSql]).pipe(
+      Layer.provide(Layer.merge(Base, BrokenLabelsSql.layer))
+    )
+
+    return Effect.gen(function*() {
+      const error = yield* ProjectionStore.ProjectionStore.pipe(
+        Effect.provide(BrokenStore),
+        Effect.flip
+      )
+      assert.strictEqual(error.reason._tag, "ProjectionBlocked")
+      assert.strictEqual(error.reason.projection, Labels.name)
+    })
+  })
+
   it.effect("validates all rows before replacing a source document", () =>
     Effect.gen(function*() {
       const store = yield* ProjectionStore.ProjectionStore
