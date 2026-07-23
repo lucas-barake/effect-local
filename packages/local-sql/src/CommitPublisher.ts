@@ -148,12 +148,9 @@ export const layer: Layer.Layer<CommitPublisher, never, Reactivity.Reactivity | 
         watermark: initialWatermark,
         refreshGeneration: generation,
         events: Stream.fromSubscription(subscription).pipe(
-          Stream.mapAccum(
-            () => [generation, initialWatermark] as const,
-            ([observedGeneration, observedSequence], event): readonly [
-              readonly [number, Identity.CommitSequence],
-              ReadonlyArray<CommitEvent>
-            ] => {
+          Stream.mapAccum<readonly [number, Identity.CommitSequence], CommitEvent, CommitEvent>(
+            () => [generation, initialWatermark],
+            ([observedGeneration, observedSequence], event) => {
               if (event._tag === "FullRefreshRequired") {
                 return [[Math.max(observedGeneration, event.refreshGeneration), observedSequence], [event]]
               }
