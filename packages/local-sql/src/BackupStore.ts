@@ -34,7 +34,7 @@ const Manifest = Schema.Struct({
 })
 
 const DocumentRecord = Schema.Struct({
-  document_id: Schema.String,
+  document_id: Identity.DocumentId,
   document_type: Schema.String,
   schema_version: Schema.Int,
   observed_versions: Schema.String,
@@ -661,7 +661,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 const document = definition.documents.byName.get(record.value.document_type)!
                 const stored = yield* recovery.recoverWithPermit(
                   document,
-                  Identity.DocumentId.make(record.value.document_id),
+                  record.value.document_id,
                   permit
                 ).pipe(
                   Effect.mapError((cause) =>

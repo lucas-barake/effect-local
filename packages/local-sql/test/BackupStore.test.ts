@@ -454,6 +454,57 @@ describe("BackupStore", () => {
       InternalAutomerge.free(preserved.automerge)
     }).pipe(Effect.provide(Live)))
 
+  it.effect("reports invalid archive document ids as BackupInvalid", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "preserved" })
+      InternalAutomerge.free(created.automerge)
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      const lines = new TextDecoder()
+        .decode(Uint8Array.from(chunks.flatMap((chunk) => [...chunk])))
+        .trimEnd()
+        .split("\n")
+        .map((line) => JSON.parse(line))
+      const records = lines.slice(1, -1)
+
+      for (const record of records) {
+        if ("document_id" in record.value) {
+          record.value.document_id = "invalid-document-id"
+          record.checksum = yield* Canonical.digest(record.value)
+        }
+      }
+
+      const end = lines.at(-1)!
+      end.value.recordsChecksum = yield* Canonical.digest(records.map((record) => record.checksum))
+      end.checksum = yield* Canonical.digest(end.value)
+      const manifest = lines[0]!
+
+      for (let attempt = 0; attempt < 8; attempt++) {
+        manifest.checksum = yield* Canonical.digest(manifest.value)
+        const bytes = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+        if (manifest.value.declaredBytes === bytes.byteLength) break
+        manifest.value.declaredBytes = bytes.byteLength
+      }
+
+      manifest.checksum = yield* Canonical.digest(manifest.value)
+      const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+
+      const result = yield* Effect.result(backups.restore({
+        source: Stream.make(archive),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      }))
+
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) assert.strictEqual(result.failure.reason._tag, "BackupInvalid")
+      const preserved = yield* store.load(Task, documentId)
+      assert.strictEqual(preserved.snapshot.value.title, "preserved")
+      InternalAutomerge.free(preserved.automerge)
+    }).pipe(Effect.provide(Live)))
+
   it.effect("rejects malformed and oversized archives without modifying the replica", () =>
     Effect.gen(function*() {
       const backups = yield* BackupStore.BackupStore
