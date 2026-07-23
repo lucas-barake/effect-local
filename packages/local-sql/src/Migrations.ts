@@ -207,7 +207,6 @@ export const loader = Migrator.fromRecord({
 const migrate = Migrator.make({})({ loader, table: "effect_local_migrations" })
 
 export const run = Effect.gen(function*() {
-  const applied = yield* migrate
   const sql = yield* SqlClient.SqlClient
   const findCatalog = SqlSchema.findAll({
     Request: Schema.Int,
@@ -221,16 +220,21 @@ export const run = Effect.gen(function*() {
     { id: 3, name: "durability_indexes", checksum: durabilityIndexesChecksum, label: "Durability indexes" },
     { id: 4, name: "projection_readiness", checksum: projectionReadinessChecksum, label: "Projection readiness" }
   ] as const
-  for (const expected of expectedCatalog) {
-    const row = (yield* findCatalog(expected.id))[0]
-    if (row?.name !== expected.name || row?.checksum !== expected.checksum) {
-      return yield* new Migrator.MigrationError({
-        kind: "BadState",
-        message: `${expected.label} migration checksum mismatch`
-      })
+  // One transaction over migrate + validation so a rejected catalog rolls back
+  // the freshly applied migrations instead of leaving a partial schema.
+  return yield* sql.withTransaction(Effect.gen(function*() {
+    const applied = yield* migrate
+    for (const expected of expectedCatalog) {
+      const row = (yield* findCatalog(expected.id))[0]
+      if (row?.name !== expected.name || row?.checksum !== expected.checksum) {
+        return yield* new Migrator.MigrationError({
+          kind: "BadState",
+          message: `${expected.label} migration checksum mismatch`
+        })
+      }
     }
-  }
-  return applied
+    return applied
+  }))
 }).pipe(
   Effect.catchTag("SchemaError", (cause) =>
     Effect.fail(

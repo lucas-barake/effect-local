@@ -53,6 +53,34 @@ describe("Migrations", () => {
       assert.strictEqual((yield* Effect.exit(Migrations.run))._tag, "Failure")
     }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
 
+  it.effect("rejects a corrupt catalog without committing pending migrations", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrator.make({})({
+        loader: Effect.map(Migrations.loader, (migrations) => migrations.slice(0, 3)),
+        table: "effect_local_migrations"
+      })
+      yield* sql`UPDATE effect_local_migration_catalog SET checksum = 'corrupt' WHERE migration_id = 1`
+
+      const error = yield* Effect.flip(Migrations.run)
+      assert.strictEqual(error._tag, "MigrationError")
+      assert.include(error.message, "Canonical store")
+
+      const index = yield* sql<{ readonly name: string }>`
+        SELECT name FROM sqlite_master
+        WHERE type = 'index' AND name = 'effect_local_document_projections_not_ready'
+      `
+      assert.strictEqual(index.length, 0)
+      const recorded = yield* sql<{ readonly migration_id: number }>`
+        SELECT migration_id FROM effect_local_migrations WHERE migration_id = 4
+      `
+      assert.strictEqual(recorded.length, 0)
+      const catalog = yield* sql<{ readonly migration_id: number }>`
+        SELECT migration_id FROM effect_local_migration_catalog WHERE migration_id = 4
+      `
+      assert.strictEqual(catalog.length, 0)
+    }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
+
   it.effect("upgrades populated version two storage without losing durability state", () =>
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
