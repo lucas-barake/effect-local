@@ -134,4 +134,24 @@ describe("Recovery", () => {
       assert.strictEqual(documents[0]?.projection_status, "Ready")
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(Services)))
+
+  it.effect("fails with DocumentNotFound when recovering an unknown document", () =>
+    Effect.gen(function*() {
+      const recovery = yield* Recovery.Recovery
+      const result = yield* Effect.flip(recovery.recover(Task, yield* Identity.makeDocumentId))
+      assert.strictEqual(result.reason._tag, "DocumentNotFound")
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("rejects a stored schema version newer than the definition", () =>
+    Effect.gen(function*() {
+      const recovery = yield* Recovery.Recovery
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one" })
+      InternalAutomerge.free(created.automerge)
+      yield* sql`UPDATE effect_local_documents SET schema_version = 999 WHERE document_id = ${documentId}`
+      const result = yield* Effect.flip(recovery.recover(Task, documentId))
+      assert.strictEqual(result.reason._tag, "UnsupportedDocumentVersion")
+    }).pipe(Effect.provide(Services)))
 })

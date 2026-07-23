@@ -373,4 +373,64 @@ describe("DocumentEntity", () => {
         assert.strictEqual(yield* Ref.get(syncCalls), 1)
       }).pipe(Effect.provide(TestShardingConfig))
     ))
+
+  it.effect("rejects unregistered document types, unregistered mutations, and tampered sync hashes", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const permit = {
+          replicaId: (yield* Identity.makeReplicaId),
+          incarnation: Identity.ReplicaIncarnation.make(1),
+          writerGeneration: Identity.WriterGeneration.make(2)
+        }
+        const executor = CommandExecutor.CommandExecutor.of({
+          create: (_document, _options) => Effect.die("create should not run"),
+          mutate: (_mutation, _options) => Effect.die("mutate should not run"),
+          delete: (_document, _options) => Effect.die("delete should not run"),
+          lookupCreate: (id) => Effect.succeed(CommandOutcome.unknown(id)),
+          lookupMutation: (_mutation, id) => Effect.succeed(CommandOutcome.unknown(id)),
+          lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id))
+        })
+        const makeClient = yield* Entity.makeTestClient(
+          DocumentEntity.DocumentEntity,
+          DocumentEntity.layer(definition).pipe(
+            Layer.provide(Layer.succeed(CommandExecutor.CommandExecutor, executor)),
+            Layer.provide(Layer.succeed(ReplicaGate.ReplicaGate, replicaGate(permit))),
+            Layer.provide(Layer.succeed(PeerSync.PeerSync, peerSync(() => Effect.die("receive should not run")))),
+            Layer.provide(ReplicaLimits.layer(limits))
+          )
+        )
+        const client = yield* makeClient(yield* Identity.makeDocumentId)
+        const unregisteredDocument = yield* Effect.flip(client.Create({
+          replicaIncarnation: permit.incarnation,
+          writerGeneration: permit.writerGeneration,
+          commandId: yield* Identity.makeCommandId,
+          documentType: "Ghost",
+          payload: new TextEncoder().encode(JSON.stringify({ title: "x" })),
+          requestHash: "hash"
+        }))
+        assert.strictEqual(unregisteredDocument.reason._tag, "ProtocolMismatch")
+        const unregisteredMutation = yield* Effect.flip(client.Mutate({
+          replicaIncarnation: permit.incarnation,
+          writerGeneration: permit.writerGeneration,
+          commandId: yield* Identity.makeCommandId,
+          documentType: Task.name,
+          mutationTag: "Ghost",
+          payload: new TextEncoder().encode(JSON.stringify("x")),
+          requestHash: "hash"
+        }))
+        assert.strictEqual(unregisteredMutation.reason._tag, "ProtocolMismatch")
+        const message = new Uint8Array([9, 9, 9])
+        const tamperedHash = yield* Effect.flip(client.ApplySync({
+          replicaIncarnation: permit.incarnation,
+          peerId: (yield* Identity.makePeerId),
+          connectionEpoch: "connection",
+          localConnectionEpoch: "local-connection",
+          receiveSequence: 0,
+          documentType: Task.name,
+          messageHash: "not-the-real-hash",
+          message
+        }))
+        assert.strictEqual(tamperedHash.reason._tag, "ProtocolMismatch")
+      }).pipe(Effect.provide(TestShardingConfig))
+    ))
 })

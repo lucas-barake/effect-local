@@ -220,4 +220,26 @@ describe("SqlReplica", () => {
       FROM task_title_v1`
       assert.deepStrictEqual(rows, [{ sourceDocumentId: created.value, title: "projected" }])
     }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive))
+
+  it.effect("rejects importing a document whose portable definition does not match", () =>
+    Effect.gen(function*() {
+      const replica = yield* Replica.Replica
+      const created = yield* replica.create(Task, {
+        commandId: yield* Identity.makeCommandId,
+        value: { title: "source" }
+      })
+      assert.strictEqual(created._tag, "DurablyCommittedLocal")
+      if (created._tag !== "DurablyCommittedLocal") return
+      const exported = yield* replica.exportDocument(Task, created.value)
+      const wrongName = yield* Effect.flip(replica.importDocument(Task, {
+        commandId: yield* Identity.makeCommandId,
+        value: { ...exported, documentName: "Other" }
+      }))
+      assert.strictEqual(wrongName.reason._tag, "BackupInvalid")
+      const wrongVersion = yield* Effect.flip(replica.importDocument(Task, {
+        commandId: yield* Identity.makeCommandId,
+        value: { ...exported, schemaVersion: 999 }
+      }))
+      assert.strictEqual(wrongVersion.reason._tag, "BackupInvalid")
+    }).pipe(Effect.provide(Live), Effect.provide(Database), TestClock.withLive))
 })
