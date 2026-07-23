@@ -348,7 +348,8 @@ export const make = Effect.gen(function*() {
                   if (change.applied !== 1 || Automerge.hasHeads(current!, [change.change_hash])) continue
                   const decoded = InternalAutomerge.decode(change.bytes)
                   if (
-                    decoded.hash !== change.change_hash || decoded.actor !== change.actor ||
+                    change.document_type !== row.document_type || decoded.hash !== change.change_hash ||
+                    decoded.actor !== change.actor ||
                     decoded.sequence !== change.sequence ||
                     encodeHeads(decoded.dependencies) !== change.dependencies
                   ) throw new TypeError(`Invalid stored change: ${change.change_hash}`)
