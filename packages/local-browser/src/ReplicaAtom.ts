@@ -65,7 +65,7 @@ export const queryFamily = <R, E, Q extends Query.Any,>(
 ) => {
   const family = Atom.family((entry: QueryKey<Q["payloadSchema"]["Type"]>) =>
     runtime.atom(Replica.Replica.use((replica) => {
-      const execute = replica.query as unknown as (
+      const execute = replica.query as (
         query: Q,
         payload: Q["payloadSchema"]["Type"]
       ) => Effect.Effect<Q["successSchema"]["Type"], Q["errorSchema"]["Type"] | ReplicaError.ReplicaError>
@@ -80,7 +80,7 @@ export const queryFamily = <R, E, Q extends Query.Any,>(
     ...payload: [Q["payloadSchema"]["Type"]] extends [void] ? readonly []
       : readonly [payload: Q["payloadSchema"]["Type"]]
   ) => {
-    const value = payload[0] as Q["payloadSchema"]["Type"]
+    const value = payload[0]
     const encoded = Schema.encodeSync(query.payloadSchema)(value)
     const key = `${query.name}:${query.version}:${payload.length === 0 ? "void" : Canonical.hash(encoded)}`
     return family(new QueryKey(key, value))

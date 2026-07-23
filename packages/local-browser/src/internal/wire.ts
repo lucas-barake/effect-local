@@ -4,7 +4,10 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 
-export const encode = <S extends Document.WireSchema,>(schema: S, value: S["Type"]) =>
+export const encode = <S extends Document.WireSchema,>(
+  schema: S,
+  value: S["Type"]
+): Effect.Effect<Schema.Json, ReplicaError.ReplicaError> =>
   Schema.encodeUnknownEffect(Schema.toCodecJson(schema))(value).pipe(
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
@@ -14,9 +17,12 @@ export const encode = <S extends Document.WireSchema,>(schema: S, value: S["Type
         })
       })
     )
-  ) as Effect.Effect<Schema.Json, ReplicaError.ReplicaError>
+  )
 
-export const decode = <S extends Document.WireSchema,>(schema: S, value: Schema.Json) =>
+export const decode = <S extends Document.WireSchema,>(
+  schema: S,
+  value: Schema.Json
+): Effect.Effect<S["Type"], ReplicaError.ReplicaError> =>
   Schema.decodeUnknownEffect(Schema.toCodecJson(schema))(value).pipe(
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
@@ -26,7 +32,7 @@ export const decode = <S extends Document.WireSchema,>(schema: S, value: Schema.
         })
       })
     )
-  ) as Effect.Effect<S["Type"], ReplicaError.ReplicaError>
+  )
 
 export const encodeOutcome = <A extends Document.WireSchema, E extends Document.WireSchema,>(
   success: A,
