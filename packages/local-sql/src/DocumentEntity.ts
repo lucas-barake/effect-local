@@ -40,7 +40,13 @@ const syncPrimaryKey = (payload: {
   readonly receiveSequence: number
   readonly messageHash: string
 }) =>
-  `${payload.replicaIncarnation}:${payload.peerId}:${payload.connectionEpoch}:${payload.receiveSequence}:${payload.messageHash}`
+  JSON.stringify([
+    payload.replicaIncarnation,
+    payload.peerId,
+    payload.connectionEpoch,
+    payload.receiveSequence,
+    payload.messageHash
+  ])
 
 export const Create = Rpc.make("Create", {
   payload: { ...commandFields, payload: Schema.Uint8ArrayFromBase64 },

@@ -169,7 +169,7 @@ describe("DocumentEntity", () => {
       return PrimaryKey.value(payload)
     }
     const key = keyOf(DocumentEntity.ApplySync.payloadSchema.make(base))
-    assert.strictEqual(key, `1:${peerId}:connection:2:hash-a`)
+    assert.strictEqual(key, JSON.stringify([1, peerId, "connection", 2, "hash-a"]))
     assert.notStrictEqual(
       key,
       keyOf(DocumentEntity.ApplySync.payloadSchema.make({
@@ -184,6 +184,36 @@ describe("DocumentEntity", () => {
         messageHash: "hash-b"
       }))
     )
+  })
+
+  it("keeps sync primary keys collision free for opaque wire fields", () => {
+    const peerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001")
+    const validHash = "a".repeat(64)
+    const base = {
+      replicaIncarnation: Identity.ReplicaIncarnation.make(1),
+      peerId,
+      localConnectionEpoch: "local",
+      documentType: Task.name,
+      message: new Uint8Array([1])
+    }
+    const keyOf = (payload: unknown) => {
+      if (!PrimaryKey.isPrimaryKey(payload)) throw new TypeError("Expected a primary key payload")
+      return PrimaryKey.value(payload)
+    }
+    const first = keyOf(DocumentEntity.ApplySync.payloadSchema.make({
+      ...base,
+      connectionEpoch: "epoch",
+      receiveSequence: 1,
+      messageHash: `2:${validHash}`
+    }))
+    const second = keyOf(DocumentEntity.ApplySync.payloadSchema.make({
+      ...base,
+      connectionEpoch: "epoch:1",
+      receiveSequence: 2,
+      messageHash: validHash
+    }))
+
+    assert.notStrictEqual(first, second)
   })
 
   it("persists RPCs in the shared SQL transaction without server interruption", () => {
