@@ -194,7 +194,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
               SET invalidation_keys = ${
               Schema.encodeSync(StringArrayJson)([document.name, ...matching.map((binding) => binding.projection.name)])
             }
-              WHERE commit_sequence = ${commitSequence}`
+              WHERE commit_sequence = ${commitSequence} AND document_id = ${snapshot.documentId}`
           })).pipe(
             Effect.catchTag("SqlError", (cause) => Effect.fail(toProjectionBlocked(document.name)(cause)))
           )
