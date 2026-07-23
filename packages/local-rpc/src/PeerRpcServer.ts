@@ -902,9 +902,7 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
               }
             }))
             return yield* Effect.gen(function*() {
-              // Revoke on each branch individually rather than after the whole race settles: a
-              // race's own interrupt-then-await-losers step (Effect internals) must not gate the
-              // admission-control flip behind however long a losing monitor's teardown takes.
+              // Per-branch so revocation is not gated on the race awaiting the losing monitors' finalizers.
               const revokeOnInvalidation = revoke(entry, new PeerRpcError.SessionUnavailable(), true, true)
               const leaseWatcher = Effect.raceAllFirst([
                 authenticated.invalidated,
