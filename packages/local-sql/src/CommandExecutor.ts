@@ -28,8 +28,8 @@ const ReceiptRow = Schema.Struct({
 
 type ReceiptRow = typeof ReceiptRow.Type
 
-const encodeResult = (schema: Document.WireSchema, value: unknown) =>
-  Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.toCodecJson(schema)))(value).pipe(
+const encodeResult = <S extends Document.WireSchema,>(schema: S, value: S["Type"]) =>
+  Schema.encodeEffect(Schema.fromJsonString(Schema.toCodecJson(schema)))(value).pipe(
     Effect.map((encoded) => new TextEncoder().encode(encoded)),
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
@@ -40,8 +40,8 @@ const encodeResult = (schema: Document.WireSchema, value: unknown) =>
     )
   )
 
-const decodeResult = (schema: Document.WireSchema, bytes: Uint8Array) =>
-  Schema.decodeUnknownEffect(
+const decodeResult = <S extends Document.WireSchema,>(schema: S, bytes: Uint8Array) =>
+  Schema.decodeEffect(
     Schema.fromJsonString(Schema.toCodecJson(schema))
   )(new TextDecoder().decode(bytes)).pipe(
     Effect.mapError((cause) =>
@@ -170,11 +170,8 @@ export class CommandExecutor extends Context.Service<CommandExecutor, {
   ) => Effect.Effect<CommandOutcome.CommandOutcome<void>, ReplicaError.ReplicaError>
 }>()("@lucas-barake/effect-local-sql/CommandExecutor") {}
 
-export type MutationHandlers<D extends ReplicaDefinition.Any,> = D["mutations"][number] extends infer M
-  ? M extends Mutation.Mutation<infer Name, infer Doc, infer Payload, infer Success, infer Error>
-    ? Mutation.HandlerService<Name, Doc, Payload, Success, Error>
-  : never
-  : never
+export type MutationHandlers<D extends ReplicaDefinition.Any,> =
+  Context.Service.Identifier<D["mutations"][number]["handler"]>
 
 export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.Layer<
   CommandExecutor,
@@ -263,11 +260,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
         success: A,
         error: E,
         receipt: ReceiptRow
-      ) =>
-        decodeResult(CommandOutcome.schema(success, error), receipt.result) as Effect.Effect<
-          CommandOutcome.CommandOutcome<A["Type"], E["Type"]>,
-          ReplicaError.ReplicaError
-        >
+      ) => decodeResult(CommandOutcome.schema(success, error), receipt.result)
 
       return CommandExecutor.of({
         create: (document, options) =>
@@ -375,16 +368,13 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                   const result = handler({ draft, payload: options.payload, current: durable.snapshot.value })
                   handlerResult = mutation.errorSchema === Schema.Never
                     ? Result.succeed(result)
-                    : result as Result.Result<
-                      (typeof mutation)["successSchema"]["Type"],
-                      (typeof mutation)["errorSchema"]["Type"]
-                    >
+                    : result
                 })
               )
               if (Result.isFailure(handlerResult)) {
                 const outcome = CommandOutcome.rejected(options.commandId, handlerResult.failure)
                 const result = yield* encodeResult(
-                  CommandOutcome.schema(mutation.successSchema, mutation.errorSchema) as unknown as Document.WireSchema,
+                  CommandOutcome.schema(mutation.successSchema, mutation.errorSchema),
                   outcome
                 )
                 yield* persistReceipt({
@@ -405,7 +395,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
               yield* projections.replaceDocument(mutation.document, persisted.snapshot, persisted.commitSequence)
               const outcome = CommandOutcome.durablyCommitted(options.commandId, handlerResult.success)
               const result = yield* encodeResult(
-                CommandOutcome.schema(mutation.successSchema, mutation.errorSchema) as unknown as Document.WireSchema,
+                CommandOutcome.schema(mutation.successSchema, mutation.errorSchema),
                 outcome
               )
               yield* persistReceipt({
