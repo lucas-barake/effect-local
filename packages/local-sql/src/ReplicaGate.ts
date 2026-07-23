@@ -176,35 +176,44 @@ export const layer: Layer.Layer<ReplicaGate, never, ReplicaBootstrap.ReplicaBoot
         ),
         claim: (use) =>
           Effect.withFiber((fiber) => {
-            const run = Effect.scoped(
-              writeLock.pipe(
-                Effect.andThen(
-                  Effect.uninterruptibleMask((restore) =>
-                    sql.withTransaction(Effect.gen(function*() {
-                      yield* sql`UPDATE effect_local_metadata SET
+            const run = (publish: boolean) =>
+              Effect.scoped(
+                writeLock.pipe(
+                  Effect.andThen(
+                    Effect.uninterruptibleMask((restore) =>
+                      sql.withTransaction(Effect.gen(function*() {
+                        yield* sql`UPDATE effect_local_metadata SET
                       replica_incarnation = replica_incarnation + 1,
                       writer_generation = writer_generation + 1
                       WHERE singleton = 1`
-                      const permit = yield* readState
-                      yield* sql`INSERT INTO effect_local_writer_generations (generation, claimed_at)
+                        const permit = yield* readState
+                        yield* sql`INSERT INTO effect_local_writer_generations (generation, claimed_at)
                       VALUES (${permit.writerGeneration}, ${DateTime.formatIso(yield* DateTime.now)})`
-                      const result = yield* restore(use(permit))
-                      return [result, yield* readState] as const
-                    })).pipe(
-                      Effect.flatMap(([result, permit]) => Ref.set(state, permit).pipe(Effect.as(result)))
+                        const result = yield* restore(use(permit))
+                        return [result, yield* readState] as const
+                      })).pipe(
+                        Effect.flatMap(([result, permit]) =>
+                          publish ? Ref.set(state, permit).pipe(Effect.as(result)) : Effect.succeed(result)
+                        )
+                      )
                     )
                   )
                 )
               )
-            )
             return Ref.get(writer).pipe(
               Effect.flatMap((owner) =>
                 owner === fiber.id
-                  ? run
-                  : Effect.acquireUseRelease(
-                    acquire,
-                    () => Ref.set(writer, fiber.id).pipe(Effect.andThen(run)),
-                    () => Ref.set(writer, null).pipe(Effect.andThen(release))
+                  ? run(false)
+                  : Effect.serviceOption(sql.transactionService).pipe(
+                    Effect.flatMap((transaction) =>
+                      transaction._tag === "Some"
+                        ? Effect.die(new Error("ReplicaGate.claim cannot run inside an existing SQL transaction"))
+                        : Effect.acquireUseRelease(
+                          acquire,
+                          () => Ref.set(writer, fiber.id).pipe(Effect.andThen(run(true))),
+                          () => Ref.set(writer, null).pipe(Effect.andThen(release))
+                        )
+                    )
                   )
               )
             )
@@ -212,7 +221,7 @@ export const layer: Layer.Layer<ReplicaGate, never, ReplicaBootstrap.ReplicaBoot
         validate: (expected) =>
           validateState(expected).pipe(
             Effect.flatMap((rows) =>
-              rows.length === 1 ? Effect.void : Ref.get(state).pipe(
+              rows.length === 1 ? Effect.void : readState.pipe(
                 Effect.flatMap((observed) =>
                   Effect.fail(
                     new ReplicaError.ReplicaError({
