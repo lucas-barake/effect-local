@@ -215,39 +215,20 @@ export const run = Effect.gen(function*() {
     execute: (migrationId) =>
       sql`SELECT name, checksum FROM effect_local_migration_catalog WHERE migration_id = ${migrationId}`
   })
-  const rows = yield* findCatalog(1)
-  if (rows[0]?.name !== "canonical_store" || rows[0]?.checksum !== canonicalStoreChecksum) {
-    return yield* new Migrator.MigrationError({
-      kind: "BadState",
-      message: "Canonical store migration checksum mismatch"
-    })
-  }
-  const peerRows = yield* findCatalog(2)
-  if (peerRows[0]?.name !== "peer_sync" || peerRows[0]?.checksum !== peerSyncChecksum) {
-    return yield* new Migrator.MigrationError({
-      kind: "BadState",
-      message: "Peer sync migration checksum mismatch"
-    })
-  }
-  const durabilityRows = yield* findCatalog(3)
-  if (
-    durabilityRows[0]?.name !== "durability_indexes" ||
-    durabilityRows[0]?.checksum !== durabilityIndexesChecksum
-  ) {
-    return yield* new Migrator.MigrationError({
-      kind: "BadState",
-      message: "Durability indexes migration checksum mismatch"
-    })
-  }
-  const projectionReadinessRows = yield* findCatalog(4)
-  if (
-    projectionReadinessRows[0]?.name !== "projection_readiness" ||
-    projectionReadinessRows[0]?.checksum !== projectionReadinessChecksum
-  ) {
-    return yield* new Migrator.MigrationError({
-      kind: "BadState",
-      message: "Projection readiness migration checksum mismatch"
-    })
+  const expectedCatalog = [
+    { id: 1, name: "canonical_store", checksum: canonicalStoreChecksum, label: "Canonical store" },
+    { id: 2, name: "peer_sync", checksum: peerSyncChecksum, label: "Peer sync" },
+    { id: 3, name: "durability_indexes", checksum: durabilityIndexesChecksum, label: "Durability indexes" },
+    { id: 4, name: "projection_readiness", checksum: projectionReadinessChecksum, label: "Projection readiness" }
+  ] as const
+  for (const expected of expectedCatalog) {
+    const row = (yield* findCatalog(expected.id))[0]
+    if (row?.name !== expected.name || row?.checksum !== expected.checksum) {
+      return yield* new Migrator.MigrationError({
+        kind: "BadState",
+        message: `${expected.label} migration checksum mismatch`
+      })
+    }
   }
   return applied
 }).pipe(

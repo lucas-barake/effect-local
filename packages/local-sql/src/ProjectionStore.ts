@@ -114,20 +114,21 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
             })
           )
         )
-        const row = registry._tag === "Some" ? registry.value : undefined
-        if (
-          row !== undefined &&
-          (row.table_name !== binding.table || row.projection_version !== binding.projection.version ||
-            row.schema_checksum !== checksum)
-        ) {
-          return yield* new ReplicaError.ReplicaError({
-            reason: new ReplicaError.ProjectionBlocked({
-              projection: binding.projection.name,
-              cause: new Error("Projection registry mismatch")
+        if (registry._tag === "Some") {
+          const row = registry.value
+          if (
+            row.table_name !== binding.table ||
+            row.projection_version !== binding.projection.version ||
+            row.schema_checksum !== checksum
+          ) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ProjectionBlocked({
+                projection: binding.projection.name,
+                cause: new Error("Projection registry mismatch")
+              })
             })
-          })
-        }
-        if (row === undefined) {
+          }
+        } else {
           yield* sql`INSERT INTO effect_local_projection_registry (
           projection_name, table_name, projection_version, schema_checksum, status
         ) VALUES (

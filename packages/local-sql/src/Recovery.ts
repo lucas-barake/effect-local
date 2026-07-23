@@ -408,7 +408,7 @@ export const make = Effect.gen(function*() {
             version: row.schema_version,
             heads: materializedHeads,
             tombstone: row.tombstone === 1,
-            projection: row.projection_status as Snapshot.ProjectionState
+            projection: row.projection_status
           },
           materializedHeads,
           acceptedHeads,
