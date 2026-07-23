@@ -838,6 +838,13 @@ export const layer: Layer.Layer<
                   }
                   const outbound = yield* quotaLock.withPermit(Effect.gen(function*() {
                     yield* validateSessionGeneration(generation, sessionGeneration)
+                    const existing = yield* findPendingOutboxCount({
+                      replicaIncarnation: session.replicaIncarnation,
+                      peerId: session.peerId,
+                      connectionEpoch: session.connectionEpoch,
+                      documentId
+                    })
+                    if ((existing[0]?.count ?? 0) > 0) return null
                     const outbound = yield* sql.withTransaction(
                       persistOutbound(session, documentId, generated[1]!, durable.materializedHeads)
                     )
@@ -863,7 +870,9 @@ export const layer: Layer.Layer<
                         )
                     })
                   )
-                  return { outbound, observedByPeer, dirty: false }
+                  return outbound === null
+                    ? { outbound: null, observedByPeer: false, dirty: true }
+                    : { outbound, observedByPeer, dirty: false }
                 }),
               (durable) => Effect.sync(() => InternalAutomerge.free(durable.automerge))
             )

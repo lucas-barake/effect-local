@@ -1278,6 +1278,78 @@ describe("PeerSync", () => {
         )
       )
     }).pipe(Effect.provide(TestLayer)))
+
+  it.effect("rechecks the document outbox after a concurrent enqueue", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, {
+        title: "one",
+        labels: []
+      })
+      const loadStarted = yield* Deferred.make<void>()
+      const releaseLoad = yield* Deferred.make<void>()
+      const blockingStore = new Proxy(store, {
+        get(target, property, receiver) {
+          if (property !== "load") return Reflect.get(target, property, receiver)
+          const load: typeof store.load = (document, documentId) =>
+            Deferred.succeed(loadStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseLoad)),
+              Effect.andThen(store.load(document, documentId))
+            )
+          return load
+        }
+      })
+
+      yield* Effect.gen(function*() {
+        const sync = yield* PeerSync.PeerSync
+        const session = yield* sync.open(yield* Identity.makePeerId)
+        const syncMessage = Automerge.generateSyncMessage(
+          created.automerge,
+          Automerge.initSyncState()
+        )[1]
+        assert.isNotNull(syncMessage)
+        const messageHash = yield* Canonical.digest(syncMessage!)
+
+        const generating = yield* sync.generate(
+          Task,
+          documentId,
+          session
+        ).pipe(Effect.forkChild)
+
+        yield* Deferred.await(loadStarted)
+
+        const enqueued = yield* sync.enqueue(session, {
+          documentId,
+          message: syncMessage!,
+          messageHash,
+          heads: created.materializedHeads
+        })
+
+        yield* Deferred.succeed(releaseLoad, undefined)
+        const generated = yield* Fiber.join(generating)
+        const pending = yield* sync.pending(session)
+
+        assert.isNull(generated.outbound)
+        assert.isTrue(generated.dirty)
+        assert.deepStrictEqual(
+          pending.map((outbound) => outbound.sendSequence),
+          [enqueued.sendSequence]
+        )
+      }).pipe(
+        Effect.provide(
+          PeerSync.layer.pipe(
+            Layer.provide(
+              Layer.succeed(DocumentStore.DocumentStore, blockingStore)
+            )
+          )
+        ),
+        Effect.ensuring(Deferred.succeed(releaseLoad, undefined)),
+        Effect.ensuring(
+          Effect.sync(() => InternalAutomerge.free(created.automerge))
+        )
+      )
+    }).pipe(Effect.provide(Services)))
 })
 
 const sameHeadsForTest = (left: ReadonlyArray<string>, right: ReadonlyArray<string>) =>
