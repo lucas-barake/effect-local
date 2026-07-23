@@ -70,6 +70,22 @@ describe("Canonical injectivity", () => {
     assert.notStrictEqual(Canonical.hash(foreign), Canonical.hash({ 0: 0, 1: 1, 2: 255 }))
   })
 
+  it("distinguishes non-Uint8Array views from plain objects and from each other", () => {
+    const view = new Uint16Array([1, 2])
+    assert.notStrictEqual(Canonical.hash(view), Canonical.hash({ 0: 1, 1: 2 }))
+    assert.notStrictEqual(Canonical.hash(view), Canonical.hash(new Int8Array([1, 2])))
+    assert.notStrictEqual(Canonical.hash(view), Canonical.hash(new Float64Array([1, 2])))
+    assert.notStrictEqual(Canonical.hash(view), Canonical.hash(new Uint8Array([1, 0, 2, 0])))
+  })
+
+  it("distinguishes DataView contents from the empty object and other DataViews", () => {
+    const first = new DataView(new ArrayBuffer(4))
+    first.setUint8(0, 255)
+    const second = new DataView(new ArrayBuffer(8))
+    assert.notStrictEqual(Canonical.hash(first), Canonical.hash({}))
+    assert.notStrictEqual(Canonical.hash(first), Canonical.hash(second))
+  })
+
   it("distinguishes an absent property from an undefined property", () => {
     assert.notStrictEqual(Canonical.hash({}), Canonical.hash({ value: undefined }))
   })

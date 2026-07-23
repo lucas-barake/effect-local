@@ -32,6 +32,11 @@ const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   if (value === null || typeof value !== "object") return value
   if (isDate(value)) return `${sentinel}date:${value.toISOString()}`
   if (isUint8Array(value)) return `${sentinel}bytes:${Encoding.encodeHex(value)}`
+  if (ArrayBuffer.isView(value)) {
+    return `${sentinel}view:${Object.prototype.toString.call(value).slice(8, -1)}:${
+      Encoding.encodeHex(new Uint8Array(value.buffer, value.byteOffset, value.byteLength))
+    }`
+  }
   if (ancestors.has(value)) return `${sentinel}circular`
   ancestors.add(value)
   const result = Array.isArray(value)
