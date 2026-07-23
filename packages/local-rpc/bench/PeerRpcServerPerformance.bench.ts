@@ -1,5 +1,7 @@
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
+import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -15,6 +17,13 @@ import * as PeerRpcLimits from "../src/PeerRpcLimits.js"
 import * as PeerRpcServer from "../src/PeerRpcServer.js"
 
 const sizes = [0, 1_000, 10_000] as const
+const benchDefinition = ReplicaDefinition.make({
+  name: "peer-rpc-server-bench",
+  documents: DocumentSet.make(),
+  mutations: [],
+  projections: [],
+  queries: []
+})
 const now = 1
 const limits = PeerRpcLimits.Values.make({
   ...PeerRpcLimits.defaults,
@@ -103,7 +112,7 @@ await Effect.runPromise(Effect.gen(function*() {
     yield* Layer.build(PeerRpcServer.layerHandlers({
       tenantId: "tenant",
       peerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001"),
-      definitionHash: "def_00000000000000000000000000000000"
+      definition: benchDefinition
     })).pipe(
       Effect.provideService(Scope.Scope, scope),
       Effect.provideService(CommitPublisher.CommitPublisher, publisher),
