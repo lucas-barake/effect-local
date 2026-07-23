@@ -11,7 +11,7 @@ import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import * as PeerAuthentication from "./PeerAuthentication.js"
 import * as PeerRpcError from "./PeerRpcError.js"
 
-export const protocolVersion = 1 as const
+export const protocolVersion = 1
 
 export const RequestedDocument = Schema.Struct({
   documentType: Schema.NonEmptyString,
