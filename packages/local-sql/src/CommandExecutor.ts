@@ -12,6 +12,7 @@ import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
+import * as SchemaAST from "effect/SchemaAST"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as DocumentStore from "./DocumentStore.js"
@@ -367,7 +368,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
               const staged = track(
                 yield* store.stage(durable, (draft) => {
                   const result = handler({ draft, payload: options.payload, current: durable.snapshot.value })
-                  handlerResult = mutation.errorSchema === Schema.Never
+                  handlerResult = SchemaAST.isNever(mutation.errorSchema.ast)
                     ? Result.succeed(result)
                     : result
                 })
