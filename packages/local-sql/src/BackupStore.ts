@@ -624,9 +624,12 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             : manifest.replicaId
           yield* gate.claim((permit) =>
             Effect.gen(function*() {
-              const restoredPermit: ReplicaGate.Permit = permit.incarnation > manifest.incarnation
-                ? permit
-                : { ...permit, incarnation: Identity.ReplicaIncarnation.make(manifest.incarnation + 1) }
+              const restoredPermit: ReplicaGate.Permit = {
+                ...permit,
+                incarnation: Identity.ReplicaIncarnation.make(
+                  Math.max(permit.incarnation, manifest.incarnation + 1)
+                )
+              }
               const installed = yield* findInstallation(options.installationId)
               if (installed._tag === "Some") {
                 if (
