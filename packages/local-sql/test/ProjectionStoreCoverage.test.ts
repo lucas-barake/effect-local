@@ -73,18 +73,20 @@ describe("ProjectionStore coverage probes", () => {
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Base = Layer.merge(Database, Bootstrap)
 
-  it.effect("blocks a projection whose registered schema checksum no longer matches", () =>
+  it.effect("reconciles a projection whose registered schema checksum no longer matches for rebuild", () =>
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
       yield* sql`INSERT INTO effect_local_projection_registry (
         projection_name, table_name, projection_version, schema_checksum, status
       ) VALUES ('Labels', 'cov_labels_v1', 1, 'stale-checksum', 'Ready')`
-      const error = yield* Effect.flip(
-        ProjectionStore.ProjectionStore.pipe(
-          Effect.provide(ProjectionStore.layer([LabelsSql]).pipe(Layer.provide(LabelsSql.layer)))
-        )
+      yield* ProjectionStore.ProjectionStore.pipe(
+        Effect.provide(ProjectionStore.layer([LabelsSql]).pipe(Layer.provide(LabelsSql.layer)))
       )
-      assert.strictEqual(error.reason._tag, "ProjectionBlocked")
+      const registry = yield* sql<{ readonly schema_checksum: string; readonly status: string }>`
+        SELECT schema_checksum, status FROM effect_local_projection_registry WHERE projection_name = 'Labels'
+      `
+      assert.strictEqual(registry[0]?.status, "Rebuilding")
+      assert.notStrictEqual(registry[0]?.schema_checksum, "stale-checksum")
     }).pipe(Effect.provide(Base)))
 
   it.effect("blocks construction when two projections target the same table", () =>

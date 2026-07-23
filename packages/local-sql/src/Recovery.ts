@@ -269,7 +269,7 @@ export const make = Effect.gen(function*() {
           })
         })
       }
-      if (row.schema_version > document.version) {
+      if (!Document.supportsStoredVersion(document, row.schema_version)) {
         return yield* new ReplicaError.ReplicaError({
           reason: new ReplicaError.UnsupportedDocumentVersion({
             documentId,
@@ -388,7 +388,9 @@ export const make = Effect.gen(function*() {
           if (checkpoint !== null) invalidCheckpoints.push(checkpoint.checkpoint_hash)
           continue
         }
-        const decoded = yield* Effect.result(Document.decode(document, documentId, encoded)).pipe(
+        const decoded = yield* Effect.result(
+          Document.decodeStored(document, documentId, row.schema_version, encoded)
+        ).pipe(
           Effect.onError(() => Effect.sync(() => InternalAutomerge.free(automerge)))
         )
         if (Result.isFailure(decoded)) {

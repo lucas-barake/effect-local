@@ -29,6 +29,7 @@ import * as ProjectionStore from "./ProjectionStore.js"
 import * as QueryExecutor from "./QueryExecutor.js"
 import * as Recovery from "./Recovery.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
+import * as ReplicaEvolution from "./ReplicaEvolution.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 import type * as ReplicaWorkflow from "./ReplicaWorkflow.js"
 import type * as SqlProjection from "./SqlProjection.js"
@@ -178,6 +179,7 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   | CommitPublisher.CommitPublisher
   | PeerSync.PeerSync
   | Replica.Replica
+  | ReplicaEvolution.ReplicaEvolution
   | ReplicaGate.ReplicaGate
   | ReplicaWorkflow.CompactionWorkflow
   | Sharding.Sharding,
@@ -203,7 +205,8 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
   const compaction = Compaction.layer.pipe(Layer.provideMerge(recovery))
   const projections = ProjectionStore.layer(options.projections).pipe(Layer.provideMerge(store))
-  const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(projections))
+  const evolution = ReplicaEvolution.layer(definition).pipe(Layer.provideMerge(projections))
+  const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(evolution))
   const queries = QueryExecutor.layer(definition).pipe(
     Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
   )

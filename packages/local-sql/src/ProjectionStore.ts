@@ -17,6 +17,14 @@ import type * as SqlProjection from "./SqlProjection.js"
 
 const StringArrayJson = Schema.fromJsonString(Schema.Array(Schema.String))
 
+const toProjectionBlocked = (projection: string) => (cause: unknown) =>
+  new ReplicaError.ReplicaError({
+    reason: new ReplicaError.ProjectionBlocked({
+      projection,
+      cause
+    })
+  })
+
 export class ProjectionStore extends Context.Service<ProjectionStore, {
   readonly clear: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly replace: <P extends Projection.Any,>(
@@ -81,38 +89,17 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
         }).pipe(
           Effect.catchDefect((cause) =>
             Predicate.isTagged("MigrationError")(cause)
-              ? Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.ProjectionBlocked({
-                    projection: binding.projection.name,
-                    cause
-                  })
-                })
-              )
+              ? Effect.fail(toProjectionBlocked(binding.projection.name)(cause))
               : Effect.die(cause)
           ),
           Effect.catchTag(["SqlError", "MigrationError"], (cause) =>
-            Effect.fail(
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.ProjectionBlocked({
-                  projection: binding.projection.name,
-                  cause
-                })
-              })
-            ))
+            Effect.fail(toProjectionBlocked(binding.projection.name)(cause)))
         )
         const checksum = yield* Canonical.digest(Schema.toJsonSchemaDocument(binding.projection.Row)).pipe(
           Effect.provideService(Crypto.Crypto, crypto)
         )
         const registry = yield* findRegistry(binding.projection.name).pipe(
-          Effect.mapError((cause) =>
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.ProjectionBlocked({
-                projection: binding.projection.name,
-                cause
-              })
-            })
-          )
+          Effect.mapError(toProjectionBlocked(binding.projection.name))
         )
         if (registry._tag === "Some") {
           const row = registry.value
@@ -121,26 +108,35 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
             row.projection_version !== binding.projection.version ||
             row.schema_checksum !== checksum
           ) {
-            return yield* new ReplicaError.ReplicaError({
-              reason: new ReplicaError.ProjectionBlocked({
-                projection: binding.projection.name,
-                cause: new Error("Projection registry mismatch")
-              })
-            })
+            yield* sql.withTransaction(Effect.gen(function*() {
+              yield* sql`DELETE FROM ${sql(binding.table)}`
+              yield* sql`DELETE FROM effect_local_document_projections
+                WHERE projection_name = ${binding.projection.name}`
+              yield* sql`UPDATE effect_local_projection_registry SET
+                table_name = ${binding.table},
+                projection_version = ${binding.projection.version},
+                schema_checksum = ${checksum},
+                status = 'Rebuilding'
+                WHERE projection_name = ${binding.projection.name}`
+            })).pipe(Effect.mapError(toProjectionBlocked(binding.projection.name)))
           }
         } else {
+          const populated = yield* SqlSchema.findOne({
+            Request: Schema.String,
+            Result: Schema.Struct({ populated: Schema.Int }),
+            execute: (documentType) =>
+              sql`SELECT EXISTS (
+                SELECT 1 FROM effect_local_documents WHERE document_type = ${documentType}
+              ) AS populated`
+          })(binding.projection.document.name).pipe(
+            Effect.mapError(toProjectionBlocked(binding.projection.name))
+          )
+          const status = populated.populated === 1 ? "Rebuilding" : "Ready"
           yield* sql`INSERT INTO effect_local_projection_registry (
           projection_name, table_name, projection_version, schema_checksum, status
         ) VALUES (
-          ${binding.projection.name}, ${binding.table}, ${binding.projection.version}, ${checksum}, 'Ready'
-        )`.pipe(Effect.mapError((cause) =>
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.ProjectionBlocked({
-                  projection: binding.projection.name,
-                  cause
-                })
-              })
-            ))
+          ${binding.projection.name}, ${binding.table}, ${binding.projection.version}, ${checksum}, ${status}
+        )`.pipe(Effect.mapError(toProjectionBlocked(binding.projection.name)))
         }
       }
       const replace = <P extends Projection.Any,>(
@@ -164,7 +160,8 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
             }
           }
           yield* binding.deleteByDocument(sql, destinationTable, snapshot.documentId)
-          yield* Effect.forEach(rows, (row) => binding.insert(sql, destinationTable, row), { discard: true })
+          yield* Effect.forEach(rows, (row) =>
+            binding.insert(sql, destinationTable, row), { discard: true })
           yield* sql`INSERT INTO effect_local_document_projections (
             document_id, projection_name, projected_heads, status
           ) VALUES (
@@ -174,15 +171,9 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
           ) ON CONFLICT(document_id, projection_name) DO UPDATE SET
             projected_heads = excluded.projected_heads,
             status = excluded.status`
-        })).pipe(Effect.catchTag("SqlError", (cause) =>
-          Effect.fail(
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.ProjectionBlocked({
-                projection: binding.projection.name,
-                cause
-              })
-            })
-          )))
+        })).pipe(
+          Effect.catchTag("SqlError", (cause) => Effect.fail(toProjectionBlocked(binding.projection.name)(cause)))
+        )
       return ProjectionStore.of({
         clear: sql.withTransaction(Effect.gen(function*() {
           for (const binding of resolved) {
@@ -190,14 +181,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
           }
           yield* sql`DELETE FROM effect_local_document_projections`
         })).pipe(
-          Effect.mapError((cause) =>
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.ProjectionBlocked({
-                projection: "$all",
-                cause
-              })
-            })
-          )
+          Effect.mapError(toProjectionBlocked("$all"))
         ),
         replace,
         replaceDocument: (document, snapshot, commitSequence) =>
@@ -210,17 +194,9 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
               SET invalidation_keys = ${
               Schema.encodeSync(StringArrayJson)([document.name, ...matching.map((binding) => binding.projection.name)])
             }
-              WHERE commit_sequence = ${commitSequence}`
+              WHERE commit_sequence = ${commitSequence} AND document_id = ${snapshot.documentId}`
           })).pipe(
-            Effect.catchTag("SqlError", (cause) =>
-              Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.ProjectionBlocked({
-                    projection: document.name,
-                    cause
-                  })
-                })
-              ))
+            Effect.catchTag("SqlError", (cause) => Effect.fail(toProjectionBlocked(document.name)(cause)))
           )
       })
     })

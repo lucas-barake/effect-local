@@ -68,6 +68,11 @@ describe("ReplicaBootstrap", () => {
   it.effect("rejects an incompatible replica definition without modifying metadata", () =>
     Effect.gen(function*() {
       const first = yield* ReplicaBootstrap.make(definition)
+      const sql = yield* SqlClient.SqlClient
+      yield* sql`INSERT INTO effect_local_documents (
+        document_id, document_type, schema_version, observed_versions, materialized_heads,
+        accepted_heads, tombstone, projection_status, checkpoint_hash
+      ) VALUES ('doc_1', 'Task', 1, '[1]', '["first"]', '["first"]', 0, 'Ready', NULL)`
       const TaskV2 = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 2 })
       const incompatible = ReplicaDefinition.make({
         name: "tasks",
@@ -82,7 +87,6 @@ describe("ReplicaBootstrap", () => {
       if (Result.isFailure(result) && result.failure._tag === "ReplicaError") {
         assert.strictEqual(result.failure.reason._tag, "ProtocolMismatch")
       }
-      const sql = yield* SqlClient.SqlClient
       const metadata = yield* sql<{ readonly definition_hash: string; readonly writer_generation: number }>`
         SELECT definition_hash, writer_generation FROM effect_local_metadata WHERE singleton = 1
       `
