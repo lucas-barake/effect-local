@@ -125,6 +125,55 @@ describe("ProjectionStore", () => {
     })
   })
 
+  it.effect("rolls back earlier binding setup when a later binding is rejected", () => {
+    const Titles = Projection.make("Titles", {
+      document: Task,
+      version: 1,
+      Row: Schema.Struct({ sourceDocumentId: Identity.DocumentId }),
+      key: (row) => row.sourceDocumentId,
+      project: (snapshot) => [{ sourceDocumentId: snapshot.documentId }]
+    })
+    const BrokenTitlesSql = SqlProjection.make(Titles, {
+      table: "broken_task_titles_v1",
+      migrations: [{
+        id: 1,
+        name: "broken",
+        run: (sql) => sql`SELECT * FROM definitely_missing_projection_table`.pipe(Effect.asVoid)
+      }],
+      deleteByDocument: () => Effect.void,
+      insert: () => Effect.void
+    })
+    const PartialStore = ProjectionStore.layer([LabelsSql, BrokenTitlesSql]).pipe(
+      Layer.provide(Layer.merge(LabelsSql.layer, BrokenTitlesSql.layer))
+    )
+
+    return Effect.gen(function*() {
+      const error = yield* ProjectionStore.ProjectionStore.pipe(
+        Effect.provide(PartialStore),
+        Effect.flip
+      )
+      assert.strictEqual(error._tag, "ReplicaError")
+      if (error._tag === "ReplicaError") {
+        assert.strictEqual(error.reason._tag, "ProjectionBlocked")
+        if (error.reason._tag === "ProjectionBlocked") {
+          assert.strictEqual(error.reason.projection, Titles.name)
+        }
+      }
+
+      const sql = yield* SqlClient.SqlClient
+      const tables = yield* sql<{ readonly name: string }>`
+        SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (
+          'task_labels_v1', 'task_labels_v1_effect_sql_migrations'
+        )
+      `
+      assert.strictEqual(tables.length, 0)
+      const registry = yield* sql<{ readonly projection_name: string }>`
+        SELECT projection_name FROM effect_local_projection_registry
+      `
+      assert.strictEqual(registry.length, 0)
+    }).pipe(Effect.provide(Base))
+  })
+
   it.effect("validates all rows before replacing a source document", () =>
     Effect.gen(function*() {
       const store = yield* ProjectionStore.ProjectionStore
