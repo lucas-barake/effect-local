@@ -228,11 +228,7 @@ const makeWithTerminal = (
       )
 
     const schedule = (outbound: PeerSync.Outbound) =>
-      Ref.update(scheduled, (current) => {
-        const next = new Map(current)
-        next.set(outbound.sendSequence, outbound)
-        return next
-      })
+      Ref.update(scheduled, (current) => new Map(current).set(outbound.sendSequence, outbound))
 
     const withSyncLock = <A, E, R,>(
       documentId: Identity.DocumentId,
@@ -289,9 +285,10 @@ const makeWithTerminal = (
                   yield* Ref.update(observed, (values) => {
                     const current = values.get(entry.documentId)
                     if ((current?.revision ?? 0) !== observationRevision) return values
-                    const next = new Map(values)
-                    next.set(entry.documentId, { value: result.observedByPeer, revision: observationRevision })
-                    return next
+                    return new Map(values).set(entry.documentId, {
+                      value: result.observedByPeer,
+                      revision: observationRevision
+                    })
                   })
                   return result
                 }).pipe(
@@ -418,9 +415,10 @@ const makeWithTerminal = (
             yield* Ref.update(observed, (values) => {
               const current = values.get(envelope.documentId)
               if ((current?.revision ?? 0) !== observationRevision) return values
-              const next = new Map(values)
-              next.set(envelope.documentId, { value: result.observedByPeer, revision: observationRevision })
-              return next
+              return new Map(values).set(envelope.documentId, {
+                value: result.observedByPeer,
+                revision: observationRevision
+              })
             })
             return result
           })
@@ -505,16 +503,16 @@ const makeWithTerminal = (
       markDirty: (documentId) =>
         guardTerminal(
           selectedById(documentId).pipe(
-            Effect.andThen(Ref.update(dirty, (current) => {
-              const next = new Map(current)
-              next.set(documentId, (current.get(documentId) ?? 0) + 1)
-              return next
-            })),
+            Effect.andThen(Ref.update(
+              dirty,
+              (current) => new Map(current).set(documentId, (current.get(documentId) ?? 0) + 1)
+            )),
             Effect.andThen(Ref.update(observed, (current) => {
-              const next = new Map(current)
               const value = current.get(documentId)
-              next.set(documentId, { value: false, revision: (value?.revision ?? 0) + 1 })
-              return next
+              return new Map(current).set(documentId, {
+                value: false,
+                revision: (value?.revision ?? 0) + 1
+              })
             })),
             Effect.tapError((error) => Deferred.fail(terminalFailure, error))
           )
@@ -522,7 +520,7 @@ const makeWithTerminal = (
       flush: guardedFlush,
       observedByPeer: (documentId) =>
         Ref.get(observed).pipe(Effect.map((values) => values.get(documentId)?.value ?? false)),
-      durableConfirmation: () => Effect.succeed(false as const),
+      durableConfirmation: () => Effect.succeed(false),
       awaitDisconnect: Deferred.await(terminalFailure)
     }
   })
@@ -565,15 +563,15 @@ export const makeSupervised = (options: {
   | ReplicaLimits.ReplicaLimits
   | Sharding.Sharding
 > =>
-  DocumentEntity.DocumentEntity.client.pipe(
-    Effect.flatMap((entity) =>
-      Deferred.make<never, ReplicaError.ReplicaError>().pipe(
-        Effect.flatMap((terminalFailure) =>
-          makeWithTerminal(options, (documentId) => Effect.succeed(entity(documentId)), terminalFailure)
-        )
-      )
+  Effect.gen(function*() {
+    const entity = yield* DocumentEntity.DocumentEntity.client
+    const terminalFailure = yield* Deferred.make<never, ReplicaError.ReplicaError>()
+    return yield* makeWithTerminal(
+      options,
+      (documentId) => Effect.succeed(entity(documentId)),
+      terminalFailure
     )
-  )
+  })
 
 export const make = (options: {
   readonly peerId: Identity.PeerId
