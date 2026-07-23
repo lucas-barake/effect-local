@@ -43,6 +43,8 @@ describe("Document codec", () => {
     assert.isTrue(Document.isAutomergeValue({ a: { b: [1, "x", true, null] } }))
     assert.isFalse(Document.isAutomergeValue({ v: Number.NaN }))
     assert.isFalse(Document.isAutomergeValue({ v: 1n }))
+    assert.isFalse(Document.isAutomergeValue(new Date(Number.NaN)))
+    assert.isFalse(Document.isAutomergeValue(new Automerge.Counter(1.5)))
     assert.isFalse(Document.isAutomergeValue(
       new (class Point {
         x = 1

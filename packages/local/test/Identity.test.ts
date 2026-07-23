@@ -25,6 +25,17 @@ describe("Identity", () => {
     assert.throws(() => Schema.decodeUnknownSync(Identity.DocumentId)("not-a-uuid"))
   })
 
+  it("rejects an uppercase prefix", () => {
+    assert.throws(() => Schema.decodeUnknownSync(Identity.DocumentId)("DOC_00000000-0000-4000-8000-00000000000a"))
+  })
+
+  it("rejects uppercase hex so a UUID cannot decode as two distinct identifiers", () => {
+    const canonical = "doc_00000000-0000-4000-8000-00000000000a"
+    const upperHex = "doc_00000000-0000-4000-8000-00000000000A"
+    assert.strictEqual(Schema.decodeUnknownSync(Identity.DocumentId)(canonical), canonical)
+    assert.throws(() => Schema.decodeUnknownSync(Identity.DocumentId)(upperHex))
+  })
+
   it("rejects unsafe commit sequences", () => {
     assert.throws(() => Schema.decodeUnknownSync(Identity.CommitSequence)(Number.MAX_SAFE_INTEGER + 1))
     assert.strictEqual(Schema.decodeUnknownSync(Identity.CommitSequence)(0), 0)

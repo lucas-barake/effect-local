@@ -5,7 +5,7 @@ import * as Schema from "effect/Schema"
 const identifier = <const Name extends string,>(name: Name, prefix: string) =>
   Schema.String.check(
     Schema.isPattern(
-      new RegExp(`^${prefix}_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`, "i")
+      new RegExp(`^${prefix}_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
     )
   ).pipe(Schema.brand(`@lucas-barake/effect-local/${name}`))
 

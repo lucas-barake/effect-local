@@ -62,11 +62,21 @@ export const hash = (value: unknown): string => {
 }
 
 export const digest = (value: unknown) =>
-  Crypto.Crypto.use((crypto) => crypto.digest("SHA-256", new TextEncoder().encode(stringify(value)))).pipe(
-    Effect.map(Encoding.encodeHex),
-    Effect.mapError((cause) =>
+  Effect.try({
+    try: () => stringify(value),
+    catch: (cause) =>
       new ReplicaError.ReplicaError({
-        reason: new ReplicaError.StorageUnavailable({ cause })
+        reason: new ReplicaError.CanonicalEncodeError({ cause })
       })
+  }).pipe(
+    Effect.flatMap((input) =>
+      Crypto.Crypto.use((crypto) => crypto.digest("SHA-256", new TextEncoder().encode(input))).pipe(
+        Effect.map(Encoding.encodeHex),
+        Effect.mapError((cause) =>
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageUnavailable({ cause })
+          })
+        )
+      )
     )
   )

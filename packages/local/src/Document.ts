@@ -94,10 +94,9 @@ export const isAutomergeValue = (value: unknown): boolean => {
       case "number":
         return Number.isFinite(current)
       case "object": {
-        if (
-          current instanceof Date || current instanceof Uint8Array || Automerge.isCounter(current) ||
-          Automerge.isImmutableString(current)
-        ) return true
+        if (current instanceof Date) return !Number.isNaN(current.getTime())
+        if (Automerge.isCounter(current)) return Number.isInteger(current.value)
+        if (current instanceof Uint8Array || Automerge.isImmutableString(current)) return true
         if (Automerge.isAutomerge(current)) return false
         if (seen.has(current)) return false
         seen.add(current)
