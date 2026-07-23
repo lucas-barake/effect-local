@@ -8,8 +8,17 @@ export class DatabasePort extends Context.Service<DatabasePort, MessagePort>()(
 ) {}
 
 export const layer = DatabasePort.pipe(
-  Effect.map((port) => SqliteClient.layer({ worker: Effect.succeed(port) })),
-  Layer.unwrap
+  Effect.map((port) =>
+    SqliteClient.layer({
+      // A MessagePort from `new MessageChannel()` only dispatches queued messages once started.
+      worker: Effect.sync(() => {
+        port.start()
+        return port
+      })
+    })
+  ),
+  Layer.unwrap,
+  Layer.fresh
 )
 
 export const layerMessagePort = (port: MessagePort) => layer.pipe(Layer.provide(Layer.succeed(DatabasePort, port)))
