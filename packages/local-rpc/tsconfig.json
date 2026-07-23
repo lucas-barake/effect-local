@@ -1,0 +1,9 @@
+{
+  "$schema": "http://json.schemastore.org/tsconfig",
+  "extends": "../../tsconfig.base.json",
+  "include": ["src"],
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM"]
+  },
+  "references": [{ "path": "../local" }, { "path": "../local-sql" }]
+}

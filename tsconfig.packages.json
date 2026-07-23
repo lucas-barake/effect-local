@@ -6,10 +6,7 @@
     { "path": "packages/local" },
     { "path": "packages/local-sql" },
     { "path": "packages/local-browser" },
-    { "path": "packages/local-test" },
-    { "path": "examples/api-tour" },
-    { "path": "examples/advanced-api" },
-    { "path": "examples/browser-spike" },
-    { "path": "examples/tasks" }
+    { "path": "packages/local-rpc" },
+    { "path": "packages/local-test" }
   ]
 }

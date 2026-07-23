@@ -1,17 +1,17 @@
 {
-  "name": "@lucas-barake/effect-local-browser",
-  "version": "0.1.0",
-  "description": "Browser workers, RPC, and Atom integration for Effect Local",
+  "name": "@lucas-barake/effect-local-rpc",
+  "version": "0.0.0",
+  "description": "Effect RPC peer synchronization for Effect Local",
   "homepage": "https://github.com/lucas-barake/effect-local#readme",
   "bugs": "https://github.com/lucas-barake/effect-local/issues",
-  "keywords": ["effect", "local-first", "effect-atom", "shared-worker", "opfs"],
+  "keywords": ["effect", "local-first", "rpc", "websocket", "automerge"],
   "type": "module",
   "license": "MIT",
   "sideEffects": [],
   "repository": {
     "type": "git",
     "url": "https://github.com/lucas-barake/effect-local.git",
-    "directory": "packages/local-browser"
+    "directory": "packages/local-rpc"
   },
   "exports": {
     "./package.json": "./package.json",
@@ -42,34 +42,18 @@
     "build": "tsc -b tsconfig.json",
     "build:tsgo": "tsgo -b tsconfig.json",
     "check": "tsc -b tsconfig.json",
-    "test": "vitest --config vitest.config.ts",
-    "test:browser": "pnpm run test:browser:durability && pnpm run test:browser:ownership",
-    "test:browser:durability": "playwright test --config test-browser/durability/playwright.config.ts",
-    "test:browser:ownership": "playwright test --config test-browser/ownership/playwright.config.ts"
+    "test": "vitest --config vitest.config.ts"
   },
   "dependencies": {
     "@lucas-barake/effect-local": "workspace:^",
     "@lucas-barake/effect-local-sql": "workspace:^"
   },
   "peerDependencies": {
-    "@effect/platform-browser": "^4.0.0-beta.99",
-    "@effect/sql-sqlite-wasm": "^4.0.0-beta.99",
     "effect": ">=4.0.0-beta.99 <4.0.1"
   },
   "devDependencies": {
-    "@effect/atom-react": "4.0.0-beta.99",
-    "@effect/platform-browser": "4.0.0-beta.99",
     "@effect/platform-node": "4.0.0-beta.99",
-    "@effect/sql-sqlite-wasm": "4.0.0-beta.99",
-    "@effect/wa-sqlite": "0.2.1",
-    "@playwright/test": "^1.61.1",
-    "@types/react": "^19.2.0",
-    "@types/react-dom": "^19.2.0",
-    "effect": "4.0.0-beta.99",
-    "lucide-react": "^0.468.0",
-    "react": "19.2.7",
-    "react-dom": "19.2.7",
-    "vite": "^7.2.7",
-    "vite-plugin-wasm": "^3.5.0"
+    "@lucas-barake/effect-local-test": "workspace:^",
+    "effect": "4.0.0-beta.99"
   }
 }

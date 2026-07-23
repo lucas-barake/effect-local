@@ -1,7 +1,7 @@
 import { readdir, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
-await Promise.all(["local", "local-sql", "local-browser", "local-test"].map(async (directory) => {
+await Promise.all(["local", "local-sql", "local-browser", "local-rpc", "local-test"].map(async (directory) => {
   const source = join("packages", directory, "src")
   const files = (await readdir(source))
     .filter((file) => file.endsWith(".ts") && file !== "index.ts" && !file.startsWith("internal"))

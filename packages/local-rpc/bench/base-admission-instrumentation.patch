@@ -1,0 +1,51 @@
+diff --git a/packages/local-rpc/src/PeerAuthentication.ts b/packages/local-rpc/src/PeerAuthentication.ts
+index a0a4b7e..e28303d 100644
+--- a/packages/local-rpc/src/PeerAuthentication.ts
++++ b/packages/local-rpc/src/PeerAuthentication.ts
+@@ -10,0 +11 @@ import * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
++import * as PeerRpcAdmissionBenchmark from "./internal/peerRpcAdmissionBenchmark.js"
+@@ -107,0 +109,2 @@ export const layerServer = Layer.effect(
++    PeerRpcAdmissionBenchmark.captureAuthentication({ admit, release })
++
+diff --git a/packages/local-rpc/src/PeerRpcServer.ts b/packages/local-rpc/src/PeerRpcServer.ts
+index e20efd5..060466d 100644
+--- a/packages/local-rpc/src/PeerRpcServer.ts
++++ b/packages/local-rpc/src/PeerRpcServer.ts
+@@ -19,0 +20 @@ import * as Stream from "effect/Stream"
++import * as PeerRpcAdmissionBenchmark from "./internal/peerRpcAdmissionBenchmark.js"
+@@ -369,0 +371,2 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
++    PeerRpcAdmissionBenchmark.captureSubject({ acquire: acquireSubject, release: releaseSubject })
++
+diff --git a/packages/local-rpc/src/internal/peerRpcAdmissionBenchmark.ts b/packages/local-rpc/src/internal/peerRpcAdmissionBenchmark.ts
+new file mode 100644
+index 0000000..989e7b9
+--- /dev/null
++++ b/packages/local-rpc/src/internal/peerRpcAdmissionBenchmark.ts
+@@ -0,0 +1,27 @@
++import type * as Effect from "effect/Effect"
++
++let authenticationCapture = (_operations: {
++  readonly admit: (clientId: number, now: number) => Effect.Effect<boolean>
++  readonly release: (clientId: number, now: number) => Effect.Effect<void>
++}) => undefined
++
++let subjectCapture = (_operations: {
++  readonly acquire: (
++    subjectId: string,
++    operation: "Open" | "Push",
++    now: number
++  ) => Effect.Effect<"Unavailable" | "Capacity" | "Acquired">
++  readonly release: (subjectId: string, operation: "Open" | "Push") => Effect.Effect<void>
++}) => undefined
++
++export const installAuthenticationCapture = (capture: typeof authenticationCapture) => {
++  authenticationCapture = capture
++}
++
++export const installSubjectCapture = (capture: typeof subjectCapture) => {
++  subjectCapture = capture
++}
++
++export const captureAuthentication: typeof authenticationCapture = (operations) => authenticationCapture(operations)
++
++export const captureSubject: typeof subjectCapture = (operations) => subjectCapture(operations)

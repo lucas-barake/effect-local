@@ -26,9 +26,7 @@ jobs:
       - run: pnpm check
       - run: pnpm test
       - run: pnpm build
-      - run: pnpm build:examples
-      - run: pnpm test:examples
       - run: pnpm circular
       - run: pnpm docgen
-      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm --filter @lucas-barake/effect-local-browser exec playwright install --with-deps chromium
       - run: pnpm test:browser

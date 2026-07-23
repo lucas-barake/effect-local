@@ -33,9 +33,8 @@
       "rules": { "eslint/no-console": "off" }
     },
     {
-      "files": ["examples/browser-spike/**"],
+      "files": ["packages/local-browser/test-browser/durability/**"],
       "rules": {
-        "eslint/no-console": "off",
         "oxc/no-async-endpoint-handlers": "off",
         "unicorn/prefer-add-event-listener": "off"
       }

@@ -2,11 +2,17 @@
   "$schema": "https://unpkg.com/knip@6.27.0/schema.json",
   "includeEntryExports": false,
   "workspaces": {
-    "packages/local-browser": {
-      "ignoreDependencies": ["@effect/platform-browser"]
+    "packages/local-rpc": {
+      "ignore": ["bench/PeerRpcServerPerformance.bench.ts", "bench/vitest.admission.config.ts"]
     },
-    "examples/tasks": {
-      "entry": ["src/replica-client.ts", "public/service-worker.js"]
+    "packages/local-browser": {
+      "entry": [
+        "test-browser/*/src/*.{ts,tsx}",
+        "test-browser/*/tests/*.spec.ts",
+        "test-browser/*/vite.config.ts",
+        "test-browser/*/public/service-worker.js"
+      ],
+      "ignoreDependencies": ["@effect/platform-browser"]
     }
   }
 }

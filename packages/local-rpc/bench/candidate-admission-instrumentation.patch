@@ -1,0 +1,75 @@
+diff --git a/packages/local-rpc/src/PeerAuthentication.ts b/packages/local-rpc/src/PeerAuthentication.ts
+index 6e359df..dc90708 100644
+--- a/packages/local-rpc/src/PeerAuthentication.ts
++++ b/packages/local-rpc/src/PeerAuthentication.ts
+@@ -8,6 +8,7 @@ import * as Redacted from "effect/Redacted"
+ import * as Schema from "effect/Schema"
+ import * as Semaphore from "effect/Semaphore"
+ import * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
++import * as PeerRpcAdmissionBenchmark from "./internal/peerRpcAdmissionBenchmark.js"
+ import * as PeerRpcObservability from "./internal/peerRpcObservability.js"
+ import * as PeerAuthenticator from "./PeerAuthenticator.js"
+ import * as PeerCredentials from "./PeerCredentials.js"
+@@ -128,6 +129,8 @@ export const layerServer = Layer.effect(
+         if (entry.inFlight === 0) retainInactive(clientId, entry)
+       }))
+
++    PeerRpcAdmissionBenchmark.captureAuthentication({ admit, release })
++
+     return PeerAuthentication.of((effect, options) =>
+       PeerRpcObservability.observe({
+         effect: Effect.gen(function*() {
+diff --git a/packages/local-rpc/src/PeerRpcServer.ts b/packages/local-rpc/src/PeerRpcServer.ts
+index 75be7ea..269aa95 100644
+--- a/packages/local-rpc/src/PeerRpcServer.ts
++++ b/packages/local-rpc/src/PeerRpcServer.ts
+@@ -16,6 +16,7 @@ import * as Queue from "effect/Queue"
+ import * as Scope from "effect/Scope"
+ import * as Semaphore from "effect/Semaphore"
+ import * as Stream from "effect/Stream"
++import * as PeerRpcAdmissionBenchmark from "./internal/peerRpcAdmissionBenchmark.js"
+ import * as PeerAuthorizationValidation from "./internal/peerAuthorization.js"
+ import * as PeerRpcObservability from "./internal/peerRpcObservability.js"
+ import * as PeerAuthentication from "./PeerAuthentication.js"
+@@ -487,6 +488,8 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
+         retainInactiveSubject(subjectId, subject)
+       }))
+
++    PeerRpcAdmissionBenchmark.captureSubject({ acquire: acquireSubject, release: releaseSubject })
++
+     const admitted = <A, E, R,>(
+       subjectId: string,
+       operation: "Open" | "Push",
+diff --git a/packages/local-rpc/src/internal/peerRpcAdmissionBenchmark.ts b/packages/local-rpc/src/internal/peerRpcAdmissionBenchmark.ts
+new file mode 100644
+index 0000000..989e7b9
+--- /dev/null
++++ b/packages/local-rpc/src/internal/peerRpcAdmissionBenchmark.ts
+@@ -0,0 +1,27 @@
++import type * as Effect from "effect/Effect"
++
++let authenticationCapture = (_operations: {
++  readonly admit: (clientId: number, now: number) => Effect.Effect<boolean>
++  readonly release: (clientId: number, now: number) => Effect.Effect<void>
++}) => undefined
++
++let subjectCapture = (_operations: {
++  readonly acquire: (
++    subjectId: string,
++    operation: "Open" | "Push",
++    now: number
++  ) => Effect.Effect<"Unavailable" | "Capacity" | "Acquired">
++  readonly release: (subjectId: string, operation: "Open" | "Push") => Effect.Effect<void>
++}) => undefined
++
++export const installAuthenticationCapture = (capture: typeof authenticationCapture) => {
++  authenticationCapture = capture
++}
++
++export const installSubjectCapture = (capture: typeof subjectCapture) => {
++  subjectCapture = capture
++}
++
++export const captureAuthentication: typeof authenticationCapture = (operations) => authenticationCapture(operations)
++
++export const captureSubject: typeof subjectCapture = (operations) => subjectCapture(operations)

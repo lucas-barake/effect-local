@@ -23,12 +23,6 @@ importers:
       '@effect/vitest':
         specifier: 4.0.0-beta.99
         version: 4.0.0-beta.99(effect@4.0.0-beta.99)(vitest@4.1.10)
-      '@effect/wa-sqlite':
-        specifier: 0.2.1
-        version: 0.2.1
-      '@playwright/test':
-        specifier: ^1.61.1
-        version: 1.61.1
       '@types/node':
         specifier: ^25.7.0
         version: 25.9.5
@@ -59,130 +53,9 @@ importers:
       typescript:
         specifier: ^6.0.3
         version: 6.0.3
-      vite:
-        specifier: ^7.2.7
-        version: 7.3.6(@types/node@25.9.5)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0)
       vitest:
         specifier: 4.1.10
         version: 4.1.10(@types/node@25.9.5)(@vitest/coverage-v8@4.1.10)(vite@7.3.6(@types/node@25.9.5)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0))
-
-  examples/advanced-api:
-    dependencies:
-      '@effect/platform-node':
-        specifier: 4.0.0-beta.99
-        version: 4.0.0-beta.99(effect@4.0.0-beta.99)(ioredis@5.11.1)
-      '@lucas-barake/effect-local':
-        specifier: workspace:^
-        version: link:../../packages/local
-      '@lucas-barake/effect-local-browser':
-        specifier: workspace:^
-        version: link:../../packages/local-browser
-      '@lucas-barake/effect-local-sql':
-        specifier: workspace:^
-        version: link:../../packages/local-sql
-      effect:
-        specifier: 4.0.0-beta.99
-        version: 4.0.0-beta.99
-    devDependencies:
-      '@types/node':
-        specifier: ^25.7.0
-        version: 25.9.5
-      tsx:
-        specifier: ^4.20.6
-        version: 4.20.6
-      typescript:
-        specifier: ^6.0.3
-        version: 6.0.3
-
-  examples/api-tour:
-    dependencies:
-      '@effect/platform-node':
-        specifier: 4.0.0-beta.99
-        version: 4.0.0-beta.99(effect@4.0.0-beta.99)(ioredis@5.11.1)
-      '@effect/sql-sqlite-node':
-        specifier: 4.0.0-beta.99
-        version: 4.0.0-beta.99(effect@4.0.0-beta.99)
-      '@lucas-barake/effect-local':
-        specifier: workspace:^
-        version: link:../../packages/local
-      '@lucas-barake/effect-local-browser':
-        specifier: workspace:^
-        version: link:../../packages/local-browser
-      '@lucas-barake/effect-local-sql':
-        specifier: workspace:^
-        version: link:../../packages/local-sql
-      '@lucas-barake/effect-local-test':
-        specifier: workspace:^
-        version: link:../../packages/local-test
-      effect:
-        specifier: 4.0.0-beta.99
-        version: 4.0.0-beta.99
-    devDependencies:
-      tsx:
-        specifier: 4.20.6
-        version: 4.20.6
-
-  examples/browser-spike:
-    dependencies:
-      '@effect/platform-browser':
-        specifier: 4.0.0-beta.99
-        version: 4.0.0-beta.99(effect@4.0.0-beta.99)
-      '@effect/sql-sqlite-wasm':
-        specifier: 4.0.0-beta.99
-        version: 4.0.0-beta.99(@effect/wa-sqlite@0.2.1)(effect@4.0.0-beta.99)
-      effect:
-        specifier: 4.0.0-beta.99
-        version: 4.0.0-beta.99
-    devDependencies:
-      vite:
-        specifier: ^7.2.7
-        version: 7.3.6(@types/node@25.9.5)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0)
-
-  examples/tasks:
-    dependencies:
-      '@effect/atom-react':
-        specifier: 4.0.0-beta.99
-        version: 4.0.0-beta.99(effect@4.0.0-beta.99)(react@19.2.7)(scheduler@0.27.0)
-      '@effect/platform-browser':
-        specifier: 4.0.0-beta.99
-        version: 4.0.0-beta.99(effect@4.0.0-beta.99)
-      '@effect/sql-sqlite-wasm':
-        specifier: 4.0.0-beta.99
-        version: 4.0.0-beta.99(@effect/wa-sqlite@0.2.1)(effect@4.0.0-beta.99)
-      '@lucas-barake/effect-local':
-        specifier: workspace:^
-        version: link:../../packages/local
-      '@lucas-barake/effect-local-browser':
-        specifier: workspace:^
-        version: link:../../packages/local-browser
-      '@lucas-barake/effect-local-sql':
-        specifier: workspace:^
-        version: link:../../packages/local-sql
-      effect:
-        specifier: 4.0.0-beta.99
-        version: 4.0.0-beta.99
-      lucide-react:
-        specifier: ^0.468.0
-        version: 0.468.0(react@19.2.7)
-      react:
-        specifier: 19.2.7
-        version: 19.2.7
-      react-dom:
-        specifier: 19.2.7
-        version: 19.2.7(react@19.2.7)
-    devDependencies:
-      '@types/react':
-        specifier: ^19.2.0
-        version: 19.2.17
-      '@types/react-dom':
-        specifier: ^19.2.0
-        version: 19.2.3(@types/react@19.2.17)
-      vite:
-        specifier: ^7.2.7
-        version: 7.3.6(@types/node@25.9.5)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0)
-      vite-plugin-wasm:
-        specifier: ^3.5.0
-        version: 3.6.0(vite@7.3.6(@types/node@25.9.5)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0))
 
   packages/local:
     devDependencies:
@@ -205,6 +78,9 @@ importers:
         specifier: workspace:^
         version: link:../local-sql
     devDependencies:
+      '@effect/atom-react':
+        specifier: 4.0.0-beta.99
+        version: 4.0.0-beta.99(effect@4.0.0-beta.99)(react@19.2.7)(scheduler@0.27.0)
       '@effect/platform-browser':
         specifier: 4.0.0-beta.99
         version: 4.0.0-beta.99(effect@4.0.0-beta.99)
@@ -214,6 +90,52 @@ importers:
       '@effect/sql-sqlite-wasm':
         specifier: 4.0.0-beta.99
         version: 4.0.0-beta.99(@effect/wa-sqlite@0.2.1)(effect@4.0.0-beta.99)
+      '@effect/wa-sqlite':
+        specifier: 0.2.1
+        version: 0.2.1
+      '@playwright/test':
+        specifier: ^1.61.1
+        version: 1.61.1
+      '@types/react':
+        specifier: ^19.2.0
+        version: 19.2.17
+      '@types/react-dom':
+        specifier: ^19.2.0
+        version: 19.2.3(@types/react@19.2.17)
+      effect:
+        specifier: 4.0.0-beta.99
+        version: 4.0.0-beta.99
+      lucide-react:
+        specifier: ^0.468.0
+        version: 0.468.0(react@19.2.7)
+      react:
+        specifier: 19.2.7
+        version: 19.2.7
+      react-dom:
+        specifier: 19.2.7
+        version: 19.2.7(react@19.2.7)
+      vite:
+        specifier: ^7.2.7
+        version: 7.3.6(@types/node@25.9.5)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0)
+      vite-plugin-wasm:
+        specifier: ^3.5.0
+        version: 3.6.0(vite@7.3.6(@types/node@25.9.5)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0))
+
+  packages/local-rpc:
+    dependencies:
+      '@lucas-barake/effect-local':
+        specifier: workspace:^
+        version: link:../local
+      '@lucas-barake/effect-local-sql':
+        specifier: workspace:^
+        version: link:../local-sql
+    devDependencies:
+      '@effect/platform-node':
+        specifier: 4.0.0-beta.99
+        version: 4.0.0-beta.99(effect@4.0.0-beta.99)(ioredis@5.11.1)
+      '@lucas-barake/effect-local-test':
+        specifier: workspace:^
+        version: link:../local-test
       effect:
         specifier: 4.0.0-beta.99
         version: 4.0.0-beta.99
@@ -3835,6 +3757,7 @@ snapshots:
       '@esbuild/win32-arm64': 0.25.12
       '@esbuild/win32-ia32': 0.25.12
       '@esbuild/win32-x64': 0.25.12
+    optional: true
 
   esbuild@0.28.1:
     optionalDependencies:
@@ -4638,6 +4561,7 @@ snapshots:
       get-tsconfig: 4.14.0
     optionalDependencies:
       fsevents: 2.3.3
+    optional: true
 
   typescript@5.9.3: {}
 

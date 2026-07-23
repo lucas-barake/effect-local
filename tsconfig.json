@@ -7,6 +7,9 @@
     { "path": "packages/local/tsconfig.test.json" },
     { "path": "packages/local-sql/tsconfig.test.json" },
     { "path": "packages/local-browser/tsconfig.test.json" },
+    { "path": "packages/local-browser/test-browser/durability" },
+    { "path": "packages/local-browser/test-browser/ownership" },
+    { "path": "packages/local-rpc/tsconfig.test.json" },
     { "path": "packages/local-test/tsconfig.test.json" }
   ]
 }
