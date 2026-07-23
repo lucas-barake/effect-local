@@ -34,6 +34,22 @@ describe("Query", () => {
     )
   })
 
+  it("is immune to post-make mutation of the caller's dependsOn array", () => {
+    const dependsOn: Array<Projection.Any> = [TaskRows]
+    const query = Query.make("Immutable", { success: Schema.Array(TaskRows.Row), dependsOn })
+    const OtherProjection = Projection.make("OtherRows", {
+      document: Task,
+      version: 1,
+      Row: Schema.Struct({ title: Schema.String }),
+      key: (row) => row.title,
+      project: (snapshot) => [{ title: snapshot.value.title }]
+    })
+    dependsOn.push(OtherProjection)
+    assert.strictEqual(query.dependsOn.length, 1)
+    assert.deepStrictEqual(query.dependsOn, [TaskRows])
+    assert.throws(() => (query.dependsOn as Array<Projection.Any>).push(OtherProjection))
+  })
+
   it.effect("provides its effectful handler", () =>
     Effect.gen(function*() {
       const handler = yield* ListTasks.handler

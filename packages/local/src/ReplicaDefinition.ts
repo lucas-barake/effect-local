@@ -52,13 +52,17 @@ export const make = <
   readonly queries?: Queries
 }): ReplicaDefinition<Name, Documents, Mutations, Projections, Queries> => {
   if (options.name.length === 0) throw new TypeError("Replica definition name must be nonempty")
-  const mutations = options.mutations ?? ([] as unknown as Mutations)
-  const projections = options.projections ?? ([] as unknown as Projections)
-  const queries = options.queries ?? ([] as unknown as Queries)
+  const mutations = Object.freeze([...(options.mutations ?? [])]) as unknown as Mutations
+  const projections = Object.freeze([...(options.projections ?? [])]) as unknown as Projections
+  const queries = Object.freeze([...(options.queries ?? [])]) as unknown as Queries
+  const documentSet: DocumentSet.DocumentSet<Documents> = {
+    documents: Object.freeze([...options.documents.documents]) as unknown as Documents,
+    byName: new Map(options.documents.byName)
+  }
   assertUnique("mutation", mutations)
   assertUnique("projection", projections)
   assertUnique("query", queries)
-  const documents = new Set(options.documents.documents)
+  const documents = new Set(documentSet.documents)
   const registeredProjections = new Set(projections)
   for (const mutation of mutations) {
     if (!documents.has(mutation.document)) {
@@ -80,7 +84,7 @@ export const make = <
   const definitionHash = `def_${
     Canonical.hash({
       name: options.name,
-      documents: options.documents.documents.map((document) => ({
+      documents: documentSet.documents.map((document) => ({
         name: document.name,
         schema: schemaDescriptor(document.schema),
         version: document.version
@@ -109,5 +113,5 @@ export const make = <
       }))
     })
   }`
-  return { ...options, mutations, projections, queries, hash: definitionHash }
+  return { ...options, documents: documentSet, mutations, projections, queries, hash: definitionHash }
 }

@@ -121,7 +121,7 @@ export const make = <
       : SchemaInput.normalize(options.payload),
     successSchema: (options.success ?? Schema.Void) as unknown as A,
     errorSchema: (options.error ?? Schema.Never) as unknown as E,
-    dependsOn: options.dependsOn,
+    dependsOn: Object.freeze([...options.dependsOn]) as unknown as Dependencies,
     handler,
     of: (implementation) => implementation,
     toLayer

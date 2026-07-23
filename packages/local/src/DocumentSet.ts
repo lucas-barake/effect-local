@@ -13,7 +13,7 @@ export const make = <const Documents extends ReadonlyArray<Document.Any>,>(
     if (byName.has(document.name)) throw new TypeError(`Duplicate document name: ${document.name}`)
     byName.set(document.name, document)
   }
-  return { documents, byName }
+  return { documents: Object.freeze(documents), byName }
 }
 
 export function get<
