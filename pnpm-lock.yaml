@@ -161,6 +161,9 @@ importers:
       effect:
         specifier: 4.0.0-beta.99
         version: 4.0.0-beta.99
+      tsx:
+        specifier: 4.20.6
+        version: 4.20.6
 
   packages/local-test:
     dependencies:
@@ -3763,7 +3766,6 @@ snapshots:
       '@esbuild/win32-arm64': 0.25.12
       '@esbuild/win32-ia32': 0.25.12
       '@esbuild/win32-x64': 0.25.12
-    optional: true
 
   esbuild@0.28.1:
     optionalDependencies:
@@ -4567,7 +4569,6 @@ snapshots:
       get-tsconfig: 4.14.0
     optionalDependencies:
       fsevents: 2.3.3
-    optional: true
 
   typescript@5.9.3: {}
 
