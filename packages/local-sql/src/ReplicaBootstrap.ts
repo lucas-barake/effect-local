@@ -1,3 +1,5 @@
+import * as Document from "@lucas-barake/effect-local/Document"
+import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -58,6 +60,17 @@ export const make = (definition: ReplicaDefinition.Any) =>
       Result: Schema.Struct({ definition_hash: Schema.String, storage_format_version: Schema.Int }),
       execute: () => sql`SELECT definition_hash, storage_format_version FROM effect_local_metadata WHERE singleton = 1`
     })
+    const findStoredVersions = SqlSchema.findAll({
+      Request: Schema.Void,
+      Result: Schema.Struct({
+        document_type: Schema.String,
+        min_version: Schema.Int,
+        max_version: Schema.Int
+      }),
+      execute: () =>
+        sql`SELECT document_type, MIN(schema_version) AS min_version, MAX(schema_version) AS max_version
+          FROM effect_local_documents GROUP BY document_type`
+    })
     const findPermit = SqlSchema.findOne({
       Request: Schema.Void,
       Result: Schema.Struct({
@@ -103,12 +116,22 @@ export const make = (definition: ReplicaDefinition.Any) =>
         return yield* Effect.die(new Error("Unsupported storage format version"))
       }
       if (format.definition_hash !== definition.hash) {
-        return yield* new ReplicaError.ReplicaError({
-          reason: new ReplicaError.ProtocolMismatch({
-            expected: format.definition_hash,
-            observed: definition.hash
-          })
+        const stored = yield* findStoredVersions(undefined)
+        const migratable = stored.every((row) => {
+          const document = DocumentSet.get(definition.documents, row.document_type)
+          return document !== undefined &&
+            Document.supportsStoredVersion(document, row.min_version) &&
+            Document.supportsStoredVersion(document, row.max_version)
         })
+        if (!migratable) {
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: format.definition_hash,
+              observed: definition.hash
+            })
+          })
+        }
+        yield* sql`UPDATE effect_local_metadata SET definition_hash = ${definition.hash} WHERE singleton = 1`
       }
       yield* sql`UPDATE effect_local_metadata SET writer_generation = writer_generation + 1 WHERE singleton = 1`
       const row = yield* findPermit(undefined).pipe(
