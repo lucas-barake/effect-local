@@ -4,6 +4,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Arr from "effect/Array"
 import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Deferred from "effect/Deferred"
@@ -565,7 +566,7 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
           }
           const item = yield* Queue.take(entry.inbound)
           currentInbound = item.id
-          return [item.payload] as const
+          return Arr.of(item.payload)
         })
       )).pipe(
         Stream.ensuring(
@@ -774,13 +775,13 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
                 return yield* Effect.uninterruptible(Effect.gen(function*() {
                   yield* requireDelivery
                   opened = true
-                  return [PeerRpc.Opened.make({
+                  return Arr.of<PeerRpc.OpenEvent>(PeerRpc.Opened.make({
                     _tag: "Opened",
                     protocolVersion: PeerRpc.protocolVersion,
                     sessionId: entry.sessionId,
                     peerId: options.peerId,
                     capabilities: { storeAndForward: false }
-                  })] as readonly [PeerRpc.OpenEvent]
+                  }))
                 }))
               }
               const item = yield* Effect.raceFirst(
@@ -791,9 +792,7 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
                 const delivery = yield* checkDelivery
                 if (delivery._tag === "Active") {
                   currentOutbound = item.id
-                  return [PeerRpc.Message.make({ _tag: "Message", payload: item.payload })] as readonly [
-                    PeerRpc.OpenEvent
-                  ]
+                  return Arr.of<PeerRpc.OpenEvent>(PeerRpc.Message.make({ _tag: "Message", payload: item.payload }))
                 }
                 yield* releaseOutbound(entry, item.id)
                 if (delivery._tag === "Expired" && delivery.cleanup !== undefined) {
