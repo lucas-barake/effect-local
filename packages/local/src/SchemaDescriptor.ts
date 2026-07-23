@@ -53,6 +53,9 @@ const fromAnnotations = (
     result.brands = annotations.brands.map((brand) => String(brand))
   }
   if (annotations.meta !== undefined) result.meta = fromUnknown(annotations.meta, state)
+  if (annotations.typeConstructor !== undefined) {
+    result.typeConstructor = fromUnknown(annotations.typeConstructor, state)
+  }
   return Object.keys(result).length === 0 ? undefined : result
 }
 
@@ -119,11 +122,25 @@ const fromAST = (ast: SchemaAST.AST, state: State): Descriptor => {
       break
     }
     case "Objects": {
+      const properties = new Map<string, Array<Descriptor>>()
+      for (const property of ast.propertySignatures) {
+        const name = String(property.name)
+        const descriptor = fromAST(property.type, state)
+        const bucket = properties.get(name)
+        if (bucket === undefined) properties.set(name, [descriptor])
+        else bucket.push(descriptor)
+      }
       node.propertySignatures = Object.fromEntries(
-        ast.propertySignatures.map((property) => [
-          String(property.name),
-          fromAST(property.type, state)
-        ])
+        Array.from(properties, ([name, descriptors]) =>
+          descriptors.length === 1
+            ? [name, descriptors[0]]
+            : [
+              name,
+              descriptors
+                .map((descriptor) => [JSON.stringify(descriptor), descriptor] as const)
+                .toSorted(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+                .map(([, descriptor]) => descriptor)
+            ])
       )
       if (ast.indexSignatures.length > 0) {
         node.indexSignatures = ast.indexSignatures.map((signature) => ({

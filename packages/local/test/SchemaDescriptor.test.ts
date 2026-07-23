@@ -74,6 +74,30 @@ describe("SchemaDescriptor", () => {
     assert.notStrictEqual(hash(first), hash(recoded))
   })
 
+  it("distinguishes built-in declared types", () => {
+    assert.notStrictEqual(hash(Schema.Date), hash(Schema.URL))
+    assert.notStrictEqual(
+      hash(Schema.Struct({ at: Schema.Date })),
+      hash(Schema.Struct({ at: Schema.URL }))
+    )
+  })
+
+  it("keeps struct properties whose symbol keys share a description", () => {
+    const first = Symbol("id")
+    const second = Symbol("id")
+    assert.notStrictEqual(
+      hash(Schema.Struct({ [first]: Schema.String, [second]: Schema.Number })),
+      hash(Schema.Struct({ [first]: Schema.Boolean, [second]: Schema.Number }))
+    )
+  })
+
+  it("keeps reordered struct fields equal", () => {
+    assert.strictEqual(
+      hash(Schema.Struct({ title: Schema.String, done: Schema.Boolean })),
+      hash(Schema.Struct({ done: Schema.Boolean, title: Schema.String }))
+    )
+  })
+
   it("keeps shared subtrees structurally equal to duplicated ones", () => {
     const shared = Schema.String.check(Schema.isMinLength(1))
     const duplicated = Schema.Struct({
