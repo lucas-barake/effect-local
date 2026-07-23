@@ -59,6 +59,15 @@ export const stage = <E,>(
 ): Automerge.Doc<Root<E>> =>
   Automerge.change(Automerge.clone(durable, { actor }), (draft) => change(draft.value as Mutation.DraftValue<E>))
 
+export const stageValue = <E,>(
+  durable: Automerge.Doc<Root<E>>,
+  actor: string,
+  value: E
+): Automerge.Doc<Root<E>> =>
+  Automerge.change(Automerge.clone(durable, { actor }), (draft) => {
+    draft.value = value
+  })
+
 export const stageTombstone = <E,>(
   durable: Automerge.Doc<Root<E>>,
   actor: string

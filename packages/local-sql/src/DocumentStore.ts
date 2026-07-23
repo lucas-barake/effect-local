@@ -51,6 +51,10 @@ export class DocumentStore extends Context.Service<DocumentStore, {
     durable: Stored<D>,
     staged: Automerge.Doc<InternalAutomerge.Root<D["schema"]["Encoded"]>>
   ) => Effect.Effect<Stored<D>, ReplicaError.ReplicaError>
+  readonly materialize: <D extends Document.Any,>(
+    document: D,
+    documentId: Identity.DocumentId
+  ) => Effect.Effect<Stored<D>, ReplicaError.ReplicaError>
 }>()("@lucas-barake/effect-local-sql/DocumentStore") {}
 
 export const layer: Layer.Layer<
@@ -84,6 +88,106 @@ export const layer: Layer.Layer<
           )
       })
     )
+
+    const persist = <D extends Document.Any,>(
+      document: D,
+      documentId: Identity.DocumentId,
+      durable: Stored<D>,
+      staged: Automerge.Doc<InternalAutomerge.Root<D["schema"]["Encoded"]>>
+    ): Effect.Effect<Stored<D>, ReplicaError.ReplicaError> =>
+      sql.withTransaction(Effect.gen(function*() {
+        const changes = InternalAutomerge.changesSince(staged, durable.materializedHeads)
+        if (changes.length === 0) return durable
+        const encoded = InternalAutomerge.value(staged)
+        yield* Document.decode(document, documentId, encoded)
+        if (!Document.isAutomergeValue(encoded)) {
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.DocumentDecodeError({
+              documentId,
+              cause: new Error("Encoded value is not Automerge compatible")
+            })
+          })
+        }
+        const heads = InternalAutomerge.heads(staged)
+        const sequence = yield* nextSequence
+        const acceptedAt = DateTime.formatIso(yield* DateTime.now)
+        for (const change of changes) {
+          yield* sql`INSERT INTO effect_local_changes (
+            change_hash, document_id, document_type, writer_schema_version, writer_definition_hash,
+            actor, sequence, dependencies, bytes, applied, peer_id, accepted_at, commit_sequence
+          ) VALUES (
+            ${change.hash}, ${documentId}, ${document.name}, ${document.version}, 'local',
+            ${change.actor}, ${change.sequence}, ${Schema.encodeSync(Heads)(change.dependencies)}, ${change.bytes}, 1,
+            NULL, ${acceptedAt}, ${sequence}
+          )`
+        }
+        yield* sql`UPDATE effect_local_documents SET
+          schema_version = ${document.version},
+          observed_versions = ${Schema.encodeSync(Versions)([document.version])},
+          materialized_heads = ${Schema.encodeSync(Heads)(heads)},
+          accepted_heads = ${Schema.encodeSync(Heads)(heads)}
+          , tombstone = ${InternalAutomerge.tombstone(staged) ? 1 : 0}
+          WHERE document_id = ${documentId}`
+        yield* sql`INSERT INTO effect_local_commit_outbox (
+          commit_sequence, document_id, invalidation_keys, published
+        ) VALUES (${sequence}, ${documentId}, ${Schema.encodeSync(Heads)([document.name])}, 0)`
+        return yield* recovery.recover(document, documentId)
+      })).pipe(
+        Effect.catchTag("SqlError", (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({
+                cause
+              })
+            })
+          ))
+      )
+
+    const materialize = <D extends Document.Any,>(
+      document: D,
+      documentId: Identity.DocumentId
+    ): Effect.Effect<Stored<D>, ReplicaError.ReplicaError> =>
+      sql.withTransaction(Effect.gen(function*() {
+        const durable = yield* recovery.recover(document, documentId)
+        if (durable.snapshot.version === document.version) return durable
+        return yield* Effect.gen(function*() {
+          const encoded = yield* Document.encode(document, documentId, durable.snapshot.value)
+          if (!Document.isAutomergeValue(encoded)) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.DocumentDecodeError({
+                documentId,
+                cause: new Error("Encoded value is not Automerge compatible")
+              })
+            })
+          }
+          const epoch = yield* gate.current
+          const actor = InternalAutomerge.actorId(epoch.replicaId, epoch.writerGeneration, documentId)
+          const staged = InternalAutomerge.stageValue(durable.automerge, actor, encoded)
+          return yield* Effect.gen(function*() {
+            if (InternalAutomerge.changesSince(staged, durable.materializedHeads).length === 0) {
+              yield* sql`UPDATE effect_local_documents SET
+                schema_version = ${document.version},
+                observed_versions = ${Schema.encodeSync(Versions)([document.version])}
+                WHERE document_id = ${documentId}`
+              return yield* recovery.recover(document, documentId)
+            }
+            return yield* persist(document, documentId, durable, staged)
+          }).pipe(
+            Effect.ensuring(Effect.sync(() => InternalAutomerge.free(staged)))
+          )
+        }).pipe(
+          Effect.ensuring(Effect.sync(() => InternalAutomerge.free(durable.automerge)))
+        )
+      })).pipe(
+        Effect.catchTag("SqlError", (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({
+                cause
+              })
+            })
+          ))
+      )
 
     return DocumentStore.of({
       create: (document, documentId, value) =>
@@ -164,54 +268,8 @@ export const layer: Layer.Layer<
             InternalAutomerge.actorId(epoch.replicaId, epoch.writerGeneration, stored.snapshot.documentId)
           )
         )),
-      persist: (document, documentId, durable, staged) =>
-        sql.withTransaction(Effect.gen(function*() {
-          const changes = InternalAutomerge.changesSince(staged, durable.materializedHeads)
-          if (changes.length === 0) return durable
-          const encoded = InternalAutomerge.value(staged)
-          yield* Document.decode(document, documentId, encoded)
-          if (!Document.isAutomergeValue(encoded)) {
-            return yield* new ReplicaError.ReplicaError({
-              reason: new ReplicaError.DocumentDecodeError({
-                documentId,
-                cause: new Error("Encoded value is not Automerge compatible")
-              })
-            })
-          }
-          const heads = InternalAutomerge.heads(staged)
-          const sequence = yield* nextSequence
-          const acceptedAt = DateTime.formatIso(yield* DateTime.now)
-          for (const change of changes) {
-            yield* sql`INSERT INTO effect_local_changes (
-              change_hash, document_id, document_type, writer_schema_version, writer_definition_hash,
-              actor, sequence, dependencies, bytes, applied, peer_id, accepted_at, commit_sequence
-            ) VALUES (
-              ${change.hash}, ${documentId}, ${document.name}, ${document.version}, 'local',
-              ${change.actor}, ${change.sequence}, ${Schema.encodeSync(Heads)(change.dependencies)}, ${change.bytes}, 1,
-              NULL, ${acceptedAt}, ${sequence}
-            )`
-          }
-          yield* sql`UPDATE effect_local_documents SET
-            schema_version = ${document.version},
-            observed_versions = ${Schema.encodeSync(Versions)([document.version])},
-            materialized_heads = ${Schema.encodeSync(Heads)(heads)},
-            accepted_heads = ${Schema.encodeSync(Heads)(heads)}
-            , tombstone = ${InternalAutomerge.tombstone(staged) ? 1 : 0}
-            WHERE document_id = ${documentId}`
-          yield* sql`INSERT INTO effect_local_commit_outbox (
-            commit_sequence, document_id, invalidation_keys, published
-          ) VALUES (${sequence}, ${documentId}, ${Schema.encodeSync(Heads)([document.name])}, 0)`
-          return yield* recovery.recover(document, documentId)
-        })).pipe(
-          Effect.catchTag("SqlError", (cause) =>
-            Effect.fail(
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.StorageUnavailable({
-                  cause
-                })
-              })
-            ))
-        )
+      persist,
+      materialize
     })
   })
 )
