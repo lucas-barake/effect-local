@@ -54,6 +54,10 @@ export class StorageUnavailable extends Schema.TaggedErrorClass<StorageUnavailab
   "@lucas-barake/effect-local/ReplicaError/StorageUnavailable"
 )("StorageUnavailable", { cause: Schema.Defect() }) {}
 
+export class CanonicalEncodeError extends Schema.TaggedErrorClass<CanonicalEncodeError>(
+  "@lucas-barake/effect-local/ReplicaError/CanonicalEncodeError"
+)("CanonicalEncodeError", { cause: Schema.Defect() }) {}
+
 export class StorageCorrupt extends Schema.TaggedErrorClass<StorageCorrupt>(
   "@lucas-barake/effect-local/ReplicaError/StorageCorrupt"
 )("StorageCorrupt", { cause: Schema.Defect() }) {}
@@ -114,6 +118,7 @@ export const Reason = Schema.Union([
   CommandIdConflict,
   ReceiptOperationMismatch,
   StorageUnavailable,
+  CanonicalEncodeError,
   StorageCorrupt,
   QuotaExceeded,
   MigrationFailed,

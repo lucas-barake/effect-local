@@ -26,6 +26,12 @@ describe("Canonical", () => {
       assert.strictEqual(first, second)
       assert.strictEqual(first.length, 64)
     }).pipe(Effect.provide(NodeCrypto.layer)))
+
+  it.effect("fails digest with a tagged CanonicalEncodeError instead of an unhandled defect for an invalid Date", () =>
+    Effect.gen(function*() {
+      const error = yield* Canonical.digest(new Date(Number.NaN)).pipe(Effect.flip)
+      assert.strictEqual(error.reason._tag, "CanonicalEncodeError")
+    }).pipe(Effect.provide(NodeCrypto.layer)))
 })
 
 describe("Canonical injectivity", () => {
