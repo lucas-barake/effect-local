@@ -3,6 +3,7 @@ import type * as Document from "@lucas-barake/effect-local/Document"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Projection from "@lucas-barake/effect-local/Projection"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as SchemaDescriptor from "@lucas-barake/effect-local/SchemaDescriptor"
 import type * as Snapshot from "@lucas-barake/effect-local/Snapshot"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
@@ -99,7 +100,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
             Effect.catchTag(["SqlError", "MigrationError"], (cause) =>
               Effect.fail(toProjectionBlocked(binding.projection.name)(cause)))
           )
-          const checksum = yield* Canonical.digest(Schema.toJsonSchemaDocument(binding.projection.Row)).pipe(
+          const checksum = yield* Canonical.digest(SchemaDescriptor.make(binding.projection.Row)).pipe(
             Effect.provideService(Crypto.Crypto, crypto)
           )
           const registry = yield* findRegistry(binding.projection.name).pipe(
