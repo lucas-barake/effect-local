@@ -130,14 +130,17 @@ export const fromRpcClient = (
     const withSession = <A, E, R,>(
       use: (
         session: Effect.Success<ReturnType<typeof openSession>>
-      ) => Effect.Effect<A, E | ReplicaError.ReplicaError, R>
+      ) => Effect.Effect<A, E | ReplicaError.ReplicaError, R>,
+      options?: { readonly replayAfterReopen?: boolean }
     ) =>
       SubscriptionRef.get(sessions).pipe(
         Effect.flatMap((session) =>
           use(session).pipe(
             Effect.catchTag("ReplicaError", (error) =>
               Schema.is(ReplicaError.ReplicaError)(error) && error.reason._tag === "ProtocolMismatch"
-                ? reopen(session).pipe(Effect.flatMap(use))
+                ? options?.replayAfterReopen === false
+                  ? reopen(session).pipe(Effect.andThen(Effect.fail(error)))
+                  : reopen(session).pipe(Effect.flatMap(use))
                 : Effect.fail(error))
           )
         )
@@ -493,15 +496,17 @@ export const fromRpcClient = (
             )
           ),
           Effect.flatMap(({ chunks }) =>
-            withSession((session) =>
-              rpc.RestoreBackup({
-                sessionId: session.sessionId,
-                chunks,
-                mode: options.mode,
-                maxBytes: options.maxBytes,
-                expectedDefinitionHash: options.expectedDefinitionHash,
-                installationId: options.installationId
-              })
+            withSession(
+              (session) =>
+                rpc.RestoreBackup({
+                  sessionId: session.sessionId,
+                  chunks,
+                  mode: options.mode,
+                  maxBytes: options.maxBytes,
+                  expectedDefinitionHash: options.expectedDefinitionHash,
+                  installationId: options.installationId
+                }),
+              { replayAfterReopen: false }
             )
           ),
           Effect.catchTag("RpcClientError", (error) =>
@@ -534,13 +539,15 @@ export const fromRpcClient = (
       importDocument: (document, options) =>
         Wire.encode(Schema.toEncoded(document.schema), options.value.value).pipe(
           Effect.flatMap((value) =>
-            withSession((session) =>
-              rpc.ImportDocument({
-                sessionId: session.sessionId,
-                document: document.name,
-                commandId: options.commandId,
-                value: { ...options.value, value }
-              })
+            withSession(
+              (session) =>
+                rpc.ImportDocument({
+                  sessionId: session.sessionId,
+                  document: document.name,
+                  commandId: options.commandId,
+                  value: { ...options.value, value }
+                }),
+              { replayAfterReopen: false }
             ).pipe(
               Effect.catchTag("RpcClientError", (error) =>
                 Effect.fail(
