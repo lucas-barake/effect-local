@@ -256,4 +256,55 @@ describe("ReplicaAtom", () => {
         )
       )
     }))
+
+  it.effect("recovers reactivity after a transient quota rejection", () =>
+    Effect.gen(function*() {
+      const reactivity = yield* Reactivity.make
+      const firstAttempted = yield* Deferred.make<void>()
+      const consumed = yield* Deferred.make<void>()
+      let subscriptions = 0
+      let invalidations = 0
+      reactivity.registerUnsafe(["retry-key"], () => invalidations++)
+      const client: ReplicaClient.ReplicaClient["Service"] = {
+        ...replica,
+        ownerEpoch: "owner",
+        invalidations: Stream.unwrap(Effect.sync(() => {
+          subscriptions++
+          return subscriptions < 2
+            ? Stream.fromEffect(Deferred.succeed(firstAttempted, undefined)).pipe(
+              Stream.flatMap(() =>
+                Stream.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.QuotaExceeded({
+                      resource: "queued RPCs",
+                      limit: 1
+                    })
+                  })
+                )
+              )
+            )
+            : Stream.make({
+              _tag: "Invalidation" as const,
+              ownerEpoch: "owner",
+              sequence: Identity.CommitSequence.make(1),
+              keys: ["retry-key"]
+            }).pipe(Stream.tap(() => Deferred.succeed(consumed, undefined)))
+        }))
+      }
+      yield* Effect.scoped(
+        Effect.gen(function*() {
+          yield* Layer.build(ReplicaAtom.layerReactivity)
+          yield* Deferred.await(firstAttempted)
+          yield* Effect.yieldNow
+          yield* TestClock.adjust(1_000)
+          yield* Effect.yieldNow
+          assert.strictEqual(subscriptions, 2)
+          yield* Deferred.await(consumed)
+          assert.strictEqual(invalidations, 1)
+        }).pipe(
+          Effect.provideService(ReplicaClient.ReplicaClient, client),
+          Effect.provideService(Reactivity.Reactivity, reactivity)
+        )
+      )
+    }))
 })

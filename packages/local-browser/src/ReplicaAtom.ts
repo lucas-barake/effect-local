@@ -23,7 +23,7 @@ export const layerReactivity = Layer.effectDiscard(Effect.gen(function*() {
     Stream.runForEach((event) => reactivity.invalidate(event.keys)),
     Effect.retry({
       schedule: Schedule.spaced(1_000),
-      while: (error) => error.reason._tag === "StorageUnavailable"
+      while: (error) => error.reason._tag === "StorageUnavailable" || error.reason._tag === "QuotaExceeded"
     }),
     Effect.tapCause(Effect.logError),
     Effect.ignore,
