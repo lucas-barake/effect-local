@@ -321,11 +321,6 @@ describe("DurableRuntime", () => {
       const releaseGate = yield* Latch.make()
       const claimRan = yield* Deferred.make<void>()
       let armed = false
-      const database = Layer.merge(
-        SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
-        NodeCrypto.layer
-      )
-      const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(database))
       const gateLayer = Layer.effect(
         ReplicaGate.ReplicaGate,
         Effect.gen(function*() {
@@ -342,11 +337,11 @@ describe("DurableRuntime", () => {
             })
           })
         })
-      ).pipe(Layer.provide(ReplicaGate.layer.pipe(Layer.provide(Layer.merge(database, bootstrap)))))
-      const store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(database, gateLayer)))
-      const recovery = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(database, gateLayer)))
-      const compaction = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(database, gateLayer, recovery)))
-      const inputs = Layer.mergeAll(database, bootstrap, Executor, Limits, gateLayer, store, recovery, compaction)
+      ).pipe(Layer.provide(Gate))
+      const store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Database, gateLayer)))
+      const recovery = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(Database, gateLayer)))
+      const compaction = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Database, gateLayer, recovery)))
+      const inputs = Layer.mergeAll(Database, Bootstrap, Executor, Limits, gateLayer, store, recovery, compaction)
       const live = Layer.merge(inputs, DurableRuntime.layer(definition).pipe(Layer.provide(inputs)))
 
       yield* Effect.gen(function*() {
