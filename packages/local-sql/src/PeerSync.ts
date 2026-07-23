@@ -415,12 +415,15 @@ export const layer: Layer.Layer<
         sql`SELECT
           (SELECT COUNT(*) FROM effect_local_peer_receipts
             WHERE replica_incarnation = ${request.replicaIncarnation}
-              AND document_id = ${request.documentId}) AS document_count,
+              AND document_id = ${request.documentId}
+              AND pending_message IS NOT NULL) AS document_count,
           (SELECT COUNT(*) FROM effect_local_peer_receipts
             WHERE replica_incarnation = ${request.replicaIncarnation}
-              AND peer_id = ${request.peerId}) AS peer_count,
+              AND peer_id = ${request.peerId}
+              AND pending_message IS NOT NULL) AS peer_count,
           (SELECT COUNT(*) FROM effect_local_peer_receipts
-            WHERE replica_incarnation = ${request.replicaIncarnation}) AS replica_count`
+            WHERE replica_incarnation = ${request.replicaIncarnation}
+              AND pending_message IS NOT NULL) AS replica_count`
     })
     const findDocumentPendingChangeTotals = SqlSchema.findAll({
       Request: Identity.DocumentId,

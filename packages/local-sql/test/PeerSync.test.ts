@@ -360,7 +360,38 @@ describe("PeerSync", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(TestLayer)))
 
-  it.effect("retains replay receipts and rejects a session that exhausts its receipt quota", () =>
+  it.effect("keeps accepting resolved sync receipts past the peer receipt quota", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      const remote = Automerge.change(Automerge.clone(created.automerge, { actor: "6".repeat(32) }), (draft) => {
+        ;(draft.value as { title: string }).title = "two"
+      })
+      const message = Automerge.generateSyncMessage(remote, Automerge.initSyncState())[1]!
+      for (const sequence of [0, 1, 2, 3]) {
+        const received = yield* sync.receive(Task, documentId, session, {
+          remoteConnectionEpoch: session.connectionEpoch,
+          receiveSequence: sequence,
+          message
+        })
+        if (received.reply !== null) {
+          const outbound = yield* sync.enqueue(session, received.reply)
+          yield* sync.markSent(session, outbound.sendSequence, outbound.messageHash)
+        }
+      }
+      const rows = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+        FROM effect_local_peer_receipts
+        WHERE peer_id = ${session.peerId} AND connection_epoch = ${session.connectionEpoch}`
+      assert.strictEqual(rows[0]?.count, 4)
+      InternalAutomerge.free(remote)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(ReceiptLayer)))
+
+  it.effect("rejects a session once genuinely pending receipts exhaust the quota", () =>
     Effect.gen(function*() {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
@@ -373,15 +404,14 @@ describe("PeerSync", () => {
       })
       const message = Automerge.generateSyncMessage(remote, Automerge.initSyncState())[1]!
       for (const sequence of [0, 1]) {
-        const received = yield* sync.receive(Task, documentId, session, {
-          remoteConnectionEpoch: session.connectionEpoch,
-          receiveSequence: sequence,
-          message
-        })
-        if (received.reply !== null) {
-          const outbound = yield* sync.enqueue(session, received.reply)
-          yield* sync.markSent(session, outbound.sendSequence, outbound.messageHash)
-        }
+        yield* sql`INSERT INTO effect_local_peer_receipts (
+          replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id,
+          message_hash, reply, reply_hash, pending_message, heads,
+          accepted_heads, commit_sequence, accepted_at
+        ) VALUES (
+          ${session.replicaIncarnation}, ${session.peerId}, ${session.connectionEpoch}, ${sequence}, ${documentId},
+          ${`pending-${sequence}`}, NULL, NULL, ${message}, '[]', '[]', 0, ${new Date(0).toISOString()}
+        )`
       }
       const exhausted = yield* Effect.exit(sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
