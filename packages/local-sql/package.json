@@ -11,6 +11,9 @@
     "automerge",
     "workflow"
   ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "type": "module",
   "license": "MIT",
   "sideEffects": [],
