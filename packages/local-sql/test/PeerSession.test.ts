@@ -208,6 +208,79 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       Effect.map((value) => new TextEncoder().encode(value))
     )
 
+  it.effect("rejects one document id selected with conflicting document types before opening transport", () =>
+    Effect.gen(function*() {
+      const Note = Document.make("Note", { schema: Schema.Struct({ body: Schema.String }), version: 1 })
+      const documentId = yield* Identity.makeDocumentId
+      const peerId = yield* Identity.makePeerId
+      const connectCalls = yield* Ref.make(0)
+      const sync = PeerSync.PeerSync.of({
+        open: (id) =>
+          Effect.succeed({
+            peerId: id,
+            connectionEpoch: "local-epoch",
+            replicaIncarnation: permit.incarnation
+          }),
+        reset: () => Effect.void,
+        generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
+        receive: () => Effect.succeed(result),
+        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+        pending: () => Effect.succeed([]),
+        markSent: () => Effect.succeed(true)
+      })
+      const transport = PeerTransport.PeerTransport.of({
+        capabilities: { storeAndForward: false },
+        connect: () =>
+          Ref.updateAndGet(connectCalls, (count) => count + 1).pipe(
+            Effect.as({
+              peerId,
+              capabilities: { storeAndForward: false },
+              receive: Stream.never,
+              send: () => Effect.void,
+              close: Effect.void
+            })
+          )
+      })
+      const exit = yield* Effect.exit(Effect.scoped(
+        PeerSession.makeTestClient(
+          {
+            peerId,
+            documents: [
+              { document: Task, documentId },
+              { document: Note, documentId }
+            ]
+          },
+          () => Effect.die("unexpected entity request")
+        ).pipe(
+          Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provideService(PeerSync.PeerSync, sync),
+          Effect.provideService(ReplicaGate.ReplicaGate, gate),
+          Effect.provideService(
+            CommitPublisher.CommitPublisher,
+            CommitPublisher.CommitPublisher.of({
+              publishPending: Effect.succeed(0),
+              invalidate: () => Effect.void,
+              subscribe: Effect.succeed({
+                watermark: Identity.CommitSequence.make(0),
+                refreshGeneration: 0,
+                events: Stream.never
+              })
+            })
+          ),
+          Effect.provideService(ReplicaLimits.ReplicaLimits, limits)
+        )
+      ))
+      assert.isTrue(Exit.isFailure(exit))
+      if (Exit.isFailure(exit)) {
+        const failure = Cause.findErrorOption(exit.cause)
+        assert.strictEqual(failure._tag, "Some")
+        if (failure._tag === "Some") {
+          assert.strictEqual(failure.value.reason._tag, "ProtocolMismatch")
+        }
+      }
+      assert.strictEqual(yield* Ref.get(connectCalls), 0)
+    }))
+
   it.effect("does not let a completed inbound apply overwrite newer observed state", () =>
     Effect.scoped(
       Effect.gen(function*() {

@@ -121,6 +121,19 @@ const makeWithTerminal = (
     const transport = yield* PeerTransport.PeerTransport
     const sync = yield* PeerSync.PeerSync
     const crypto = yield* Crypto.Crypto
+    const selected = new Set(options.documents.map((entry) => key(entry.document.name, entry.documentId)))
+    const selectedDocumentIds = new Set(options.documents.map((entry) => entry.documentId))
+    if (
+      selected.size !== options.documents.length ||
+      selectedDocumentIds.size !== options.documents.length
+    ) {
+      return yield* new ReplicaError.ReplicaError({
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: "unique selected documents",
+          observed: String(options.documents.length)
+        })
+      })
+    }
     const { connection, session } = yield* Effect.acquireUseRelease(
       Scope.make(),
       (scope) =>
@@ -140,15 +153,6 @@ const makeWithTerminal = (
         }),
       Scope.close
     )
-    const selected = new Set(options.documents.map((entry) => key(entry.document.name, entry.documentId)))
-    if (selected.size !== options.documents.length) {
-      return yield* new ReplicaError.ReplicaError({
-        reason: new ReplicaError.ProtocolMismatch({
-          expected: "unique selected documents",
-          observed: String(options.documents.length)
-        })
-      })
-    }
     const dirty = yield* Ref.make(new Map<Identity.DocumentId, number>())
     const observed = yield* Ref.make(
       new Map(
