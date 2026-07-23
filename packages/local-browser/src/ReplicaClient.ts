@@ -8,6 +8,7 @@ import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
@@ -32,6 +33,14 @@ export class ReplicaClient extends Context.Service<
 >()(
   "@lucas-barake/effect-local-browser/ReplicaClient"
 ) {}
+
+export interface TimeoutOptions {
+  readonly sessionTimeout?: Duration.Input | undefined
+  readonly operationTimeout?: Duration.Input | undefined
+}
+
+export const defaultSessionTimeout: Duration.Duration = Duration.seconds(10)
+export const defaultOperationTimeout: Duration.Duration = Duration.seconds(30)
 
 const isTransient = (error: ReplicaError.ReplicaError) => error.reason._tag === "StorageUnavailable"
 
@@ -74,9 +83,31 @@ const recoverCommand = <A,>(
 
 export const fromRpcClient = (
   definition: ReplicaDefinition.Any,
-  rpc: RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>
+  rpc: RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>,
+  options?: TimeoutOptions
 ): Effect.Effect<ReplicaClient["Service"], ReplicaError.ReplicaError, Scope.Scope | Crypto.Crypto> =>
   Effect.gen(function*() {
+    const sessionTimeout = options?.sessionTimeout ?? defaultSessionTimeout
+    const operationTimeout = options?.operationTimeout ?? defaultOperationTimeout
+    const boundBy =
+      (operation: string, duration: Duration.Input) =>
+      <A, E, R,>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E | ReplicaError.ReplicaError, R> =>
+        Effect.timeoutOrElse(effect, {
+          duration,
+          orElse: () =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.OperationTimeout({
+                  operation,
+                  timeoutMillis: Math.trunc(Duration.toMillis(duration))
+                })
+              })
+            )
+        })
+    const boundSession = (operation: string) => boundBy(operation, sessionTimeout)
+    const boundOperation = (operation: string) => boundBy(operation, operationTimeout)
+    const closeSession = (sessionId: Identity.SessionId) =>
+      rpc.CloseSession({ sessionId }).pipe(boundSession("CloseSession"))
     const crypto = yield* Crypto.Crypto
     const makeSessionId = Identity.makeSessionId.pipe(
       Effect.mapError((cause) =>
@@ -94,7 +125,8 @@ export const fromRpcClient = (
         protocolVersion: ReplicaRpc.protocolVersion,
         definitionHash: definition.hash
       }).pipe(
-        Effect.tapError(() => Effect.ignore(rpc.CloseSession({ sessionId }))),
+        boundSession("OpenSession"),
+        Effect.tapError(() => Effect.ignore(closeSession(sessionId))),
         Effect.catchTag("RpcClientError", (error) =>
           Effect.fail(
             new ReplicaError.ReplicaError({
@@ -103,10 +135,10 @@ export const fromRpcClient = (
               })
             })
           )),
-        Effect.onInterrupt(() => Effect.ignore(rpc.CloseSession({ sessionId })))
+        Effect.onInterrupt(() => Effect.ignore(closeSession(sessionId)))
       )
       if (lease.protocolVersion !== ReplicaRpc.protocolVersion || lease.definitionHash !== definition.hash) {
-        yield* Effect.ignore(rpc.CloseSession({ sessionId }))
+        yield* Effect.ignore(closeSession(sessionId))
         return yield* new ReplicaError.ReplicaError({
           reason: new ReplicaError.ProtocolMismatch({
             expected: `${ReplicaRpc.protocolVersion}:${definition.hash}`,
@@ -121,7 +153,7 @@ export const fromRpcClient = (
       newSession.pipe(Effect.flatMap(SubscriptionRef.make)),
       (sessions) =>
         SubscriptionRef.get(sessions).pipe(
-          Effect.flatMap((session) => Effect.ignore(rpc.CloseSession({ sessionId: session.sessionId })))
+          Effect.flatMap((session) => Effect.ignore(closeSession(session.sessionId)))
         )
     )
     type Session = Effect.Success<ReturnType<typeof openSession>>
@@ -145,7 +177,7 @@ export const fromRpcClient = (
                   PubSub.publishUnsafe(sessions.pubsub, next)
                 })
               ),
-              Effect.tap(() => Effect.ignore(rpc.CloseSession({ sessionId: current.sessionId })))
+              Effect.tap(() => Effect.ignore(closeSession(current.sessionId)))
             )
           })
         )
@@ -196,23 +228,27 @@ export const fromRpcClient = (
     const reopen = (stale: Session) => replace(stale, true)
     const reopenStatus = (stale: Session) => replace(stale, false)
     const withSession = <A, E, R,>(
+      operation: string,
       use: (
         session: Session
       ) => Effect.Effect<A, E | ReplicaError.ReplicaError, R>,
       options?: { readonly replayAfterReopen?: boolean }
-    ) =>
-      SubscriptionRef.get(sessions).pipe(
+    ) => {
+      const bounded = (session: Session) =>
+        use(session).pipe(boundOperation(operation))
+      return SubscriptionRef.get(sessions).pipe(
         Effect.flatMap((session) =>
-          use(session).pipe(
+          bounded(session).pipe(
             Effect.catchTag("ReplicaError", (error) =>
               Schema.is(ReplicaError.ReplicaError)(error) && error.reason._tag === "ProtocolMismatch"
                 ? options?.replayAfterReopen === false
                   ? reopen(session).pipe(Effect.andThen(Effect.fail(error)))
-                  : reopen(session).pipe(Effect.flatMap(use))
+                  : reopen(session).pipe(Effect.flatMap(bounded))
                 : Effect.fail(error))
           )
         )
       )
+    }
     const withSessionStream = <A, E, R,>(
       use: (
         session: Session
@@ -263,6 +299,7 @@ export const fromRpcClient = (
       yield* Effect.sleep(current.lease.leaseMillis / 2)
       const session = yield* SubscriptionRef.get(sessions)
       const renewed = yield* rpc.RenewSession({ sessionId: session.sessionId }).pipe(
+        boundSession("RenewSession"),
         Effect.catchTag("RpcClientError", (error) =>
           Effect.fail(
             new ReplicaError.ReplicaError({
@@ -408,7 +445,7 @@ export const fromRpcClient = (
       create: (document, options) =>
         Wire.encode(document.schema, options.value).pipe(
           Effect.flatMap((value) =>
-            withSession((session) =>
+            withSession("Create", (session) =>
               recoverCommand(
                 options.commandId,
                 rpc.Create({
@@ -422,30 +459,30 @@ export const fromRpcClient = (
                   document: document.name,
                   commandId: options.commandId
                 })
-              )
-            )
+              ))
           )
         ),
       get: (document, documentId) =>
-        withSession((session) => rpc.Get({ sessionId: session.sessionId, document: document.name, documentId })).pipe(
-          Effect.catchTag("RpcClientError", (error) =>
-            Effect.fail(
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.StorageUnavailable({
-                  cause: error
+        withSession("Get", (session) => rpc.Get({ sessionId: session.sessionId, document: document.name, documentId }))
+          .pipe(
+            Effect.catchTag("RpcClientError", (error) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause: error
+                  })
                 })
-              })
-            )),
-          Effect.flatMap((snapshot) =>
-            Wire.decode(document.schema, snapshot.value).pipe(
-              Effect.map((value) => ({ ...snapshot, value }))
+              )),
+            Effect.flatMap((snapshot) =>
+              Wire.decode(document.schema, snapshot.value).pipe(
+                Effect.map((value) => ({ ...snapshot, value }))
+              )
             )
-          )
-        ),
+          ),
       mutate: (mutation, options) =>
         Wire.encode(mutation.payloadSchema, "payload" in options ? options.payload : undefined).pipe(
           Effect.flatMap((payload) =>
-            withSession((session) =>
+            withSession("Mutate", (session) =>
               recoverCommand(
                 options.commandId,
                 rpc.Mutate({
@@ -460,25 +497,24 @@ export const fromRpcClient = (
                   mutation: mutation.name,
                   commandId: options.commandId
                 })
-              )
-            )
+              ))
           ),
           Effect.flatMap((outcome) => Wire.decodeOutcome(mutation.successSchema, mutation.errorSchema, outcome))
         ),
       delete: (document, options) =>
-        withSession((session) =>
+        withSession("Delete", (session) =>
           recoverCommand(
             options.commandId,
             rpc.Delete({ sessionId: session.sessionId, document: document.name, ...options }),
             rpc.LookupDelete({ sessionId: session.sessionId, document: document.name, commandId: options.commandId })
-          )
-        ).pipe(
-          Effect.flatMap((outcome) => Wire.decodeOutcome(Schema.Void, Schema.Never, outcome))
-        ),
+          )).pipe(
+            Effect.flatMap((outcome) => Wire.decodeOutcome(Schema.Void, Schema.Never, outcome))
+          ),
       query: (query, ...payload) =>
         Wire.encode(query.payloadSchema, payload[0]).pipe(
           Effect.flatMap((encoded) =>
-            withSession((session) => rpc.Query({ sessionId: session.sessionId, query: query.name, payload: encoded }))
+            withSession("Query", (session) =>
+              rpc.Query({ sessionId: session.sessionId, query: query.name, payload: encoded }))
           ),
           Effect.catchTags({
             RpcClientError: (error) =>
@@ -489,13 +525,15 @@ export const fromRpcClient = (
                   })
                 })
               ),
-            ReplicaQueryError: (error) => Wire.decode(query.errorSchema, error.error).pipe(Effect.flatMap(Effect.fail))
+            ReplicaQueryError: (error) =>
+              Wire.decode(query.errorSchema, error.error).pipe(Effect.flatMap(Effect.fail))
           }),
           Effect.flatMap((encoded) => Wire.decode(query.successSchema, encoded))
         ),
       lookupMutation: (mutation, commandId) =>
-        withSession((session) =>
-          rpc.LookupMutation({ sessionId: session.sessionId, mutation: mutation.name, commandId })
+        withSession(
+          "LookupMutation",
+          (session) => rpc.LookupMutation({ sessionId: session.sessionId, mutation: mutation.name, commandId })
         ).pipe(
           Effect.catchTag("RpcClientError", (error) =>
             Effect.fail(
@@ -508,7 +546,10 @@ export const fromRpcClient = (
           Effect.flatMap((outcome) => Wire.decodeOutcome(mutation.successSchema, mutation.errorSchema, outcome))
         ),
       lookupCreate: (document, commandId) =>
-        withSession((session) => rpc.LookupCreate({ sessionId: session.sessionId, document: document.name, commandId }))
+        withSession(
+          "LookupCreate",
+          (session) => rpc.LookupCreate({ sessionId: session.sessionId, document: document.name, commandId })
+        )
           .pipe(
             Effect.catchTag("RpcClientError", (error) =>
               Effect.fail(
@@ -520,7 +561,10 @@ export const fromRpcClient = (
               ))
           ),
       lookupDelete: (document, commandId) =>
-        withSession((session) => rpc.LookupDelete({ sessionId: session.sessionId, document: document.name, commandId }))
+        withSession(
+          "LookupDelete",
+          (session) => rpc.LookupDelete({ sessionId: session.sessionId, document: document.name, commandId })
+        )
           .pipe(
             Effect.catchTag("RpcClientError", (error) =>
               Effect.fail(
@@ -532,7 +576,7 @@ export const fromRpcClient = (
               )),
             Effect.flatMap((outcome) => Wire.decodeOutcome(Schema.Void, Schema.Never, outcome))
           ),
-      flush: withSession((session) => rpc.Flush({ sessionId: session.sessionId })).pipe(
+      flush: withSession("Flush", (session) => rpc.Flush({ sessionId: session.sessionId })).pipe(
         Effect.catchTag("RpcClientError", (error) =>
           Effect.fail(
             new ReplicaError.ReplicaError({
@@ -610,6 +654,7 @@ export const fromRpcClient = (
           ),
           Effect.flatMap(({ chunks }) =>
             withSession(
+              "RestoreBackup",
               (session) =>
                 rpc.RestoreBackup({
                   sessionId: session.sessionId,
@@ -632,8 +677,9 @@ export const fromRpcClient = (
             ))
         ),
       exportDocument: (document, documentId) =>
-        withSession((session) =>
-          rpc.ExportDocument({ sessionId: session.sessionId, document: document.name, documentId })
+        withSession(
+          "ExportDocument",
+          (session) => rpc.ExportDocument({ sessionId: session.sessionId, document: document.name, documentId })
         ).pipe(
           Effect.catchTag("RpcClientError", (error) =>
             Effect.fail(
@@ -653,6 +699,7 @@ export const fromRpcClient = (
         Wire.encode(Schema.toEncoded(document.schema), options.value.value).pipe(
           Effect.flatMap((value) =>
             withSession(
+              "ImportDocument",
               (session) =>
                 rpc.ImportDocument({
                   sessionId: session.sessionId,
@@ -668,16 +715,15 @@ export const fromRpcClient = (
                     reason: new ReplicaError.StorageUnavailable({
                       cause: error
                     })
-                  })
-                ))
-            )
+                  ))
+              )
           )
         )
     }
   })
 
-export const layer = (definition: ReplicaDefinition.Any) =>
+export const layer = (definition: ReplicaDefinition.Any, options?: TimeoutOptions) =>
   Layer.effect(
     ReplicaClient,
-    RpcClient.make(ReplicaRpc.group).pipe(Effect.flatMap((rpc) => fromRpcClient(definition, rpc)))
+    RpcClient.make(ReplicaRpc.group).pipe(Effect.flatMap((rpc) => fromRpcClient(definition, rpc, options)))
   )
