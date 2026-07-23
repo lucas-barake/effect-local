@@ -9,6 +9,7 @@ import * as ProjectionStore from "@lucas-barake/effect-local-sql/ProjectionStore
 import * as QueryExecutor from "@lucas-barake/effect-local-sql/QueryExecutor"
 import * as Recovery from "@lucas-barake/effect-local-sql/Recovery"
 import * as ReplicaBootstrap from "@lucas-barake/effect-local-sql/ReplicaBootstrap"
+import * as ReplicaEvolution from "@lucas-barake/effect-local-sql/ReplicaEvolution"
 import * as ReplicaGate from "@lucas-barake/effect-local-sql/ReplicaGate"
 import type * as SqlProjection from "@lucas-barake/effect-local-sql/SqlProjection"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
@@ -79,7 +80,8 @@ export const layerWithSyncAndLimits = <
   const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
   const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
   const projections = ProjectionStore.layer(options.projections).pipe(Layer.provideMerge(store))
-  const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(projections))
+  const evolution = ReplicaEvolution.layer(definition).pipe(Layer.provideMerge(projections))
+  const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(evolution))
   const queries = QueryExecutor.layer(definition).pipe(
     Layer.provideMerge([commands, Reactivity.layer])
   )
