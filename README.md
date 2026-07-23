@@ -277,7 +277,7 @@ For a durable browser replica, add the SQL and browser packages plus the OPFS dr
 
 ```sh
 pnpm add @lucas-barake/effect-local-sql @lucas-barake/effect-local-browser
-pnpm add @effect/platform-browser@4.0.0-beta.99 @effect/sql-sqlite-wasm@4.0.0-beta.99 @effect/wa-sqlite@0.2.1
+pnpm add @effect/platform-browser@4.0.0-beta.99 @effect/sql-sqlite-wasm@4.0.0-beta.99 @effect/wa-sqlite@0.1.2
 ```
 
 Effect Atom React bindings are optional:

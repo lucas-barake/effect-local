@@ -64,7 +64,7 @@
     "@effect/platform-browser": "4.0.0-beta.99",
     "@effect/platform-node": "4.0.0-beta.99",
     "@effect/sql-sqlite-wasm": "4.0.0-beta.99",
-    "@effect/wa-sqlite": "0.2.1",
+    "@effect/wa-sqlite": "0.1.2",
     "@playwright/test": "^1.61.1",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",

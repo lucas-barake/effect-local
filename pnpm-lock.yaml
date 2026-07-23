@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+overrides:
+  '@effect/platform-node-shared': 4.0.0-beta.99
+
 importers:
 
   .:
@@ -89,10 +92,10 @@ importers:
         version: 4.0.0-beta.99(effect@4.0.0-beta.99)(ioredis@5.11.1)
       '@effect/sql-sqlite-wasm':
         specifier: 4.0.0-beta.99
-        version: 4.0.0-beta.99(@effect/wa-sqlite@0.2.1)(effect@4.0.0-beta.99)
+        version: 4.0.0-beta.99(@effect/wa-sqlite@0.1.2)(effect@4.0.0-beta.99)
       '@effect/wa-sqlite':
-        specifier: 0.2.1
-        version: 0.2.1
+        specifier: 0.1.2
+        version: 0.1.2
       '@playwright/test':
         specifier: ^1.61.1
         version: 1.61.1
@@ -368,11 +371,11 @@ packages:
     peerDependencies:
       effect: ^4.0.0-beta.99
 
-  '@effect/platform-node-shared@4.0.0-beta.100':
-    resolution: {integrity: sha512-PMsCXQeK2wnlmnqGCc79oqK9CX8ipZvoHxAy/CRojMF+zHIluxh61L3pzWAYEbMb19Be4Bxgqs7gK2hiV8H8Pg==}
+  '@effect/platform-node-shared@4.0.0-beta.99':
+    resolution: {integrity: sha512-POBAowafsAAb3bH1x1rJlWnv32yMAazFgEuRW5LhkW/JJA5VGoEk9OnuoUkIH1OW6K/X6IrdNpqcO+5e9lPQJA==}
     engines: {node: '>=18.0.0'}
     peerDependencies:
-      effect: ^4.0.0-beta.100
+      effect: ^4.0.0-beta.99
 
   '@effect/platform-node@4.0.0-beta.99':
     resolution: {integrity: sha512-jnK2KMW4W50AEOKK+Tgvab3YPHBxa3ApLQE8BCad+LH57JOziKzOjqtEpAgJgmao3t77x1UESK4JraaHJDHaYA==}
@@ -398,8 +401,8 @@ packages:
       effect: ^4.0.0-beta.99
       vitest: ^3.0.0 || ^4.0.0
 
-  '@effect/wa-sqlite@0.2.1':
-    resolution: {integrity: sha512-vMnGIHKWSIFnDf7+n7lP2vyXPzORJotkaRI8LKyJw3eNjsvFopHYVaaGSeMSSVTm/w45pC5T4JdLrD6nxSR4oQ==}
+  '@effect/wa-sqlite@0.1.2':
+    resolution: {integrity: sha512-2JvJ9BDkBOwfeY/gXsC0XwEKC0AwisP2W5ABJ6mx14QyXTK12MGDIybDlHieuZt1TEFSMiKfpg7yyqyRWRooJQ==}
 
   '@emnapi/core@1.11.0':
     resolution: {integrity: sha512-l9Oo58x0HOP5znGzVhYW9U3e5wVuA4LAZU2AGezTmkhO1CgQRFDhDg4nneHsu/t3WniXg9QrG2nIXL/ZS8ln8Q==}
@@ -2764,7 +2767,7 @@ snapshots:
       effect: 4.0.0-beta.99
       multipasta: 0.2.8
 
-  '@effect/platform-node-shared@4.0.0-beta.100(effect@4.0.0-beta.99)':
+  '@effect/platform-node-shared@4.0.0-beta.99(effect@4.0.0-beta.99)':
     dependencies:
       '@types/ws': 8.18.1
       effect: 4.0.0-beta.99
@@ -2775,7 +2778,7 @@ snapshots:
 
   '@effect/platform-node@4.0.0-beta.99(effect@4.0.0-beta.99)(ioredis@5.11.1)':
     dependencies:
-      '@effect/platform-node-shared': 4.0.0-beta.100(effect@4.0.0-beta.99)
+      '@effect/platform-node-shared': 4.0.0-beta.99(effect@4.0.0-beta.99)
       effect: 4.0.0-beta.99
       ioredis: 5.11.1
       mime: 4.1.0
@@ -2788,9 +2791,9 @@ snapshots:
     dependencies:
       effect: 4.0.0-beta.99
 
-  '@effect/sql-sqlite-wasm@4.0.0-beta.99(@effect/wa-sqlite@0.2.1)(effect@4.0.0-beta.99)':
+  '@effect/sql-sqlite-wasm@4.0.0-beta.99(@effect/wa-sqlite@0.1.2)(effect@4.0.0-beta.99)':
     dependencies:
-      '@effect/wa-sqlite': 0.2.1
+      '@effect/wa-sqlite': 0.1.2
       effect: 4.0.0-beta.99
 
   '@effect/vitest@4.0.0-beta.99(effect@4.0.0-beta.99)(vitest@4.1.10)':
@@ -2798,7 +2801,7 @@ snapshots:
       effect: 4.0.0-beta.99
       vitest: 4.1.10(@types/node@25.9.5)(@vitest/coverage-v8@4.1.10)(vite@7.3.6(@types/node@25.9.5)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0))
 
-  '@effect/wa-sqlite@0.2.1': {}
+  '@effect/wa-sqlite@0.1.2': {}
 
   '@emnapi/core@1.11.0':
     dependencies:
