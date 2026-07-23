@@ -907,18 +907,12 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
               // admission-control flip behind however long a losing monitor's teardown takes.
               const revokeOnInvalidation = revoke(entry, new PeerRpcError.SessionUnavailable(), true, true)
               const leaseWatcher = Effect.raceAllFirst([
-                authenticated.invalidated.pipe(Effect.ensuring(revokeOnInvalidation)),
-                authorized.invalidated.pipe(Effect.ensuring(revokeOnInvalidation)),
-                Effect.sleep(Duration.millis(Math.max(0, authenticated.validUntil - now))).pipe(
-                  Effect.ensuring(revokeOnInvalidation)
-                ),
-                Effect.sleep(Duration.millis(Math.max(0, authorized.validUntil - now))).pipe(
-                  Effect.ensuring(revokeOnInvalidation)
-                ),
-                Effect.sleep(Duration.millis(limits.maximumReauthorizationInterval)).pipe(
-                  Effect.ensuring(revokeOnInvalidation)
-                )
-              ])
+                authenticated.invalidated,
+                authorized.invalidated,
+                Effect.sleep(Duration.millis(Math.max(0, authenticated.validUntil - now))),
+                Effect.sleep(Duration.millis(Math.max(0, authorized.validUntil - now))),
+                Effect.sleep(Duration.millis(limits.maximumReauthorizationInterval))
+              ].map((trigger) => trigger.pipe(Effect.ensuring(revokeOnInvalidation))))
               entry.watcher = yield* Effect.forkIn(leaseWatcher, runtimeScope, { startImmediately: true })
               const registered = yield* register(entry)
               if (registered._tag !== "Registered") {
