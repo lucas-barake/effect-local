@@ -44,8 +44,13 @@ export const make = <P extends Projection.Any,>(
   }
 ): SqlProjection<P> => {
   if (options.table.length === 0) throw new TypeError("Projection table must be nonempty")
+  if (options.migrations.length === 0) throw new TypeError("Projection requires at least one migration")
   const ids = new Set<number>()
   for (const migration of options.migrations) {
+    if (!Number.isSafeInteger(migration.id) || migration.id < 1) {
+      throw new TypeError("Projection migration ID must be a positive integer")
+    }
+    if (migration.name.length === 0) throw new TypeError("Projection migration name must be nonempty")
     if (ids.has(migration.id)) throw new TypeError(`Duplicate projection migration: ${migration.id}`)
     ids.add(migration.id)
   }
