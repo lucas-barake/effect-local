@@ -242,14 +242,14 @@ schema checked command.
 
 Some familiar words refer to multiple operations. The README uses the qualified form when the distinction matters.
 
-| Qualified term               | Meaning                                                                                                                          |
-| ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| Canonical encoding utilities | Deterministic `Canonical.stringify`, `Canonical.hash`, and `Canonical.digest`. This module is not the canonical storage service. |
-| Storage compaction           | Publish a verified Automerge save checkpoint and prune redundant SQL change rows while preserving logical document history.      |
-| History truncation           | Deliberately discard causal history. Effect Local storage compaction does not make this promise.                                 |
-| Library storage migration    | Library controlled migration of the internal SQL format.                                                                         |
-| Projection table migration   | Application supplied DDL for one rebuildable projection table.                                                                   |
-| Document schema evolution    | Change to a document definition version and value schema. In place evolution is not implemented yet.                             |
+| Qualified term               | Meaning                                                                                                                                                |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Canonical encoding utilities | Deterministic `Canonical.stringify`, `Canonical.hash`, and `Canonical.digest`. This module is not the canonical storage service.                       |
+| Storage compaction           | Publish a verified Automerge save checkpoint and prune redundant SQL change rows while preserving logical document history.                            |
+| History truncation           | Deliberately discard causal history. Effect Local storage compaction does not make this promise.                                                       |
+| Library storage migration    | Library controlled migration of the internal SQL format.                                                                                               |
+| Projection table migration   | Application supplied DDL for one rebuildable projection table.                                                                                         |
+| Document schema evolution    | Change to a document definition version and value schema. Stored documents migrate in place at startup through the registered versioned decoder chain. |
 
 ## Installation
 
@@ -372,6 +372,39 @@ export const Documents = DocumentSet.make(Task)
 The supported encoded shape consists of Automerge scalar values, arrays, and plain records. `Document.encode` and
 `Document.decode` expose the checked conversion when an application needs it directly.
 
+When a document schema changes meaning, increment `version` and register a migration for every prior version that may
+still be stored. Each migration decodes its source version with that version's schema and returns the next version's
+value. The chain must be stepwise and gap free, which `Document.make` validates eagerly.
+
+```ts
+export const TaskV2 = Document.make("Task", {
+  schema: Schema.Struct({
+    title: Title,
+    completed: Schema.Boolean,
+    priority: Schema.Int,
+    createdAt: Schema.Number,
+    updatedAt: Schema.Number
+  }),
+  version: 2,
+  migrations: [
+    Document.migration({
+      from: 1,
+      schema: Schema.Struct({
+        title: Title,
+        completed: Schema.Boolean,
+        createdAt: Schema.Number,
+        updatedAt: Schema.Number
+      }),
+      migrate: (value) => ({ ...value, priority: 0 })
+    })
+  ]
+})
+```
+
+Migrations are local decode capability, not protocol surface: registering one does not change `definition.hash`. On
+startup the replica migrates every stored document to the current version by appending a normal Automerge change —
+history is never rewritten. See [docs/schema-evolution.md](docs/schema-evolution.md) for the full rules.
+
 ### 2. Define mutations and inject handlers
 
 Mutation definitions expose `payloadSchema`, `successSchema`, and `errorSchema`. Payloads accept either a schema or
@@ -469,8 +502,11 @@ export const definition = ReplicaDefinition.make({
 })
 ```
 
-`definition.hash` covers names, versions, schemas, and query dependencies. The current beta requires an exact hash
-match when opening or restoring a replica.
+`definition.hash` covers names, versions, schemas, and query dependencies. Opening an existing replica under a changed
+hash is allowed when every stored document version reaches the current version through its registered migration chain;
+the stored hash is then updated and a startup workflow migrates stale documents and rebuilds changed projections. A
+change that strands stored data — a removed document type with rows, or a version bump without a migration — still
+fails bootstrap with `ProtocolMismatch`. Peer sync and restore continue to require an exact hash match.
 
 `mutations`, `projections`, and `queries` may be omitted when they are empty. The returned definition still exposes
 all three collections as readonly empty tuples.
