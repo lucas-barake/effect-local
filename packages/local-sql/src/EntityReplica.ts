@@ -2,7 +2,6 @@ import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
-import type * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -96,8 +95,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 })
               })
             ),
-            Effect.flatMap((lock) => lock.withPermit(f(permit))),
-            Effect.scoped
+            Effect.flatMap((lock) => lock.withPermit(f(permit)))
           )
         )
 
@@ -149,7 +147,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         }) =>
           withCommandPermit(options.commandId, (permit) =>
             Effect.gen(function*() {
-              const payload = options.payload as M["payloadSchema"]["Type"]
+              const payload = options.payload
               const encoded = yield* Schema.encodeEffect(mutation.payloadSchema)(payload).pipe(
                 Effect.mapError((cause) =>
                   new ReplicaError.ReplicaError({
@@ -216,11 +214,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               yield* publisher.publishPending
               return yield* decode(CommandOutcome.schema(Schema.Void, Schema.Never), result)
             })),
-        query: <Q extends Query.Any,>(
-          query: Q,
-          ...payload: [Q["payloadSchema"]["Type"]] extends [void] ? readonly []
-            : readonly [payload: Q["payloadSchema"]["Type"]]
-        ) => withPermit(() => queries.execute(query, payload[0] as Q["payloadSchema"]["Type"])),
+        query: (query, ...payload) => withPermit(() => queries.execute(query, payload[0])),
         lookupMutation: (mutation, commandId) =>
           withPermit((permit) => commands.lookupMutation(mutation, commandId, permit)),
         lookupCreate: (_document, commandId) => withPermit((permit) => commands.lookupCreate(commandId, permit)),
