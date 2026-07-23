@@ -599,4 +599,17 @@ describe("BackupStore", () => {
       assert.strictEqual(replaced.replicaId, initial.replicaId)
       assert.strictEqual(replaced.incarnation, cloned.incarnation + 1)
     }).pipe(Effect.provide(Live)))
+
+  it.effect("uses the Crypto service captured by the BackupStore layer for clone restores", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const source = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+
+      yield* backups.restore({
+        source: Stream.fromIterable(source),
+        mode: "clone",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      })
+    }).pipe(Effect.provide(Backup)))
 })

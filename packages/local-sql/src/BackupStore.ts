@@ -603,6 +603,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           }
           const nextReplicaId = options.mode === "clone"
             ? yield* Identity.makeReplicaId.pipe(
+              Effect.provideService(Crypto.Crypto, crypto),
               Effect.mapError((cause) =>
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageUnavailable({
@@ -711,7 +712,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               )
           }),
           Effect.asVoid
-        ) as Effect.Effect<void, ReplicaError.ReplicaError, R>
+        )
 
       return BackupStore.of({ export: exportBackup, restore })
     })
