@@ -109,6 +109,13 @@ export class ReplicaFenced extends Schema.TaggedErrorClass<ReplicaFenced>(
   observedGeneration: Identity.WriterGeneration
 }) {}
 
+export class OperationTimeout extends Schema.TaggedErrorClass<OperationTimeout>(
+  "@lucas-barake/effect-local/ReplicaError/OperationTimeout"
+)("OperationTimeout", {
+  operation: Schema.String,
+  timeoutMillis: Schema.Int
+}) {}
+
 export const Reason = Schema.Union([
   DocumentNotFound,
   DocumentDecodeError,
@@ -127,7 +134,8 @@ export const Reason = Schema.Union([
   RestoreBusy,
   RestoreFailed,
   ProtocolMismatch,
-  ReplicaFenced
+  ReplicaFenced,
+  OperationTimeout
 ])
 export type Reason = typeof Reason.Type
 
