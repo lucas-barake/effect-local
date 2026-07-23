@@ -69,8 +69,6 @@ const fromCheck = (check: SchemaAST.Check<any>, state: State): Descriptor => {
 const fromChecks = (checks: SchemaAST.Checks | undefined, state: State): Descriptor | undefined =>
   checks === undefined ? undefined : checks.map((check) => fromCheck(check, state))
 
-const propertyName = (name: PropertyKey): string => typeof name === "string" ? name : String(name)
-
 const fromAST = (ast: SchemaAST.AST, state: State): Descriptor => {
   const ancestor = state.stack.get(ast)
   if (ancestor !== undefined) return { _tag: "Cycle", back: state.stack.size - ancestor }
@@ -123,7 +121,7 @@ const fromAST = (ast: SchemaAST.AST, state: State): Descriptor => {
     case "Objects": {
       node.propertySignatures = Object.fromEntries(
         ast.propertySignatures.map((property) => [
-          propertyName(property.name),
+          String(property.name),
           fromAST(property.type, state)
         ])
       )
