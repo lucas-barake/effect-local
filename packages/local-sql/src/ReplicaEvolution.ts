@@ -106,6 +106,12 @@ export const make = (
           Effect.catchReason("ReplicaError", "StorageCorrupt", (reason) =>
             Effect.logWarning("Skipping unrecoverable document during replica evolution", reason).pipe(
               Effect.annotateLogs({ documentId: row.document_id, documentType: row.document_type }),
+              // recovery's quarantine rolled back with the per-document transaction, so re-mark durably
+              Effect.andThen(sql.withTransaction(Effect.gen(function*() {
+                yield* sql`UPDATE effect_local_documents SET projection_status = 'Blocked'
+                  WHERE document_id = ${row.document_id}`
+                yield* gate.validate(permit)
+              }))),
               Effect.as(false)
             ))
         )
