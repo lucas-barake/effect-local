@@ -103,9 +103,9 @@ export const fromRpcClient = (
           current.sessionId !== stale.sessionId
             ? Effect.succeed(
               [
-                { session: current, stale: Option.none<typeof current>() },
-                Option.none<typeof current>()
-              ] as const
+                { session: current, stale: Option.none() },
+                Option.none()
+              ]
             )
             : restore(
               makeSessionId.pipe(
@@ -116,7 +116,7 @@ export const fromRpcClient = (
                 )
               )
             ).pipe(
-              Effect.map((next) => [{ session: next, stale: Option.some(current) }, Option.some(next)] as const)
+              Effect.map((next) => [{ session: next, stale: Option.some(current) }, Option.some(next)])
             )).pipe(
             Effect.tap(({ stale }) =>
               Option.match(stale, {
@@ -197,7 +197,7 @@ export const fromRpcClient = (
     )
     const allInvalidationKeys = ReplicaDefinition.invalidationKeys(definition)
     const fullRefresh = (ownerEpoch: string): ReplicaRpc.Invalidation => ({
-      _tag: "FullRefreshRequired" as const,
+      _tag: "FullRefreshRequired",
       ownerEpoch,
       keys: [...allInvalidationKeys]
     })
@@ -252,14 +252,7 @@ export const fromRpcClient = (
           watermark: undefined,
           refreshGeneration: undefined
         }),
-        (state, event): readonly [
-          {
-            readonly ownerEpoch: string
-            readonly watermark: Identity.CommitSequence | undefined
-            readonly refreshGeneration: number | undefined
-          },
-          ReadonlyArray<ReplicaRpc.Invalidation>
-        ] => {
+        (state, event) => {
           if (event.ownerEpoch !== state.ownerEpoch) {
             if (event._tag === "InvalidationsReady") {
               return [
