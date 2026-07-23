@@ -28,7 +28,11 @@ describe("migration fixtures", () => {
             Effect.provide(SqliteClient.layer({ filename: staging, disableWAL: true })),
             Effect.scoped
           )
-          yield* fs.copyFile(staging, fixturePath(spec.file))
+          // Publish atomically: same-directory rename so a concurrent reader never sees a torn copy.
+          const published = fixturePath(spec.file)
+          const pending = `${published}.tmp`
+          yield* fs.copyFile(staging, pending)
+          yield* fs.rename(pending, published)
         }
       }).pipe(Effect.provide(NodeFileSystem.layer))
   )

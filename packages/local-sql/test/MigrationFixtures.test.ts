@@ -11,7 +11,7 @@ import * as Migrations from "../src/Migrations.js"
 import type { FixtureSpec } from "./fixtures/versions.js"
 import { documentId, fixturePath, fixtures, outboxMessageHash } from "./fixtures/versions.js"
 
-const readinessIndexes = [
+const readinessIndexes: ReadonlyArray<string> = [
   "effect_local_checkpoints_document_verified_sequence",
   "effect_local_commit_outbox_published_sequence",
   "effect_local_document_projections_not_ready",
@@ -19,17 +19,14 @@ const readinessIndexes = [
   "effect_local_peer_outbox_incarnation_created",
   "effect_local_peer_receipts_incarnation_accepted",
   "effect_local_projection_registry_name_status"
-] as const
+]
 
 const assertUpgradesToCurrentSchema = (spec: FixtureSpec) =>
   Effect.gen(function*() {
     const sql = yield* SqlClient.SqlClient
 
     const applied = yield* Migrations.run
-    assert.deepStrictEqual(
-      applied.map(([id, name]) => [id, name]),
-      spec.expectedApplied.map(([id, name]) => [id, name])
-    )
+    assert.deepStrictEqual(applied, spec.expectedApplied)
 
     const presentTables = new Set(
       (yield* sql<{ readonly name: string }>`
@@ -41,7 +38,7 @@ const assertUpgradesToCurrentSchema = (spec: FixtureSpec) =>
     const indexes = yield* sql<{ readonly name: string }>`
       SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ${sql.in(readinessIndexes)}
     `
-    assert.deepStrictEqual(indexes.map((row) => row.name).toSorted(), [...readinessIndexes])
+    assert.deepStrictEqual(indexes.map((row) => row.name).toSorted(), readinessIndexes)
 
     const catalog = yield* SqlSchema.findAll({
       Request: Schema.Void,
@@ -66,7 +63,7 @@ const assertUpgradesToCurrentSchema = (spec: FixtureSpec) =>
       SELECT checkpoint_hash FROM effect_local_checkpoints WHERE document_id = ${documentId}
       ORDER BY checkpoint_hash
     `
-    assert.deepStrictEqual(checkpoints.map((row) => row.checkpoint_hash), [...spec.expectedCheckpoints])
+    assert.deepStrictEqual(checkpoints.map((row) => row.checkpoint_hash), spec.expectedCheckpoints)
 
     const outbox = yield* sql<{ readonly created_at: string }>`
       SELECT created_at FROM effect_local_peer_outbox WHERE message_hash = ${outboxMessageHash}
