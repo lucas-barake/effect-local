@@ -56,7 +56,7 @@ export const make = <
   const projections = Object.freeze([...(options.projections ?? [])]) as unknown as Projections
   const queries = Object.freeze([...(options.queries ?? [])]) as unknown as Queries
   const documentSet: DocumentSet.DocumentSet<Documents> = {
-    documents: options.documents.documents,
+    documents: Object.freeze([...options.documents.documents]) as unknown as Documents,
     byName: new Map(options.documents.byName)
   }
   assertUnique("mutation", mutations)
