@@ -2078,9 +2078,6 @@ describe("PeerRpcServer", () => {
       yield* fixture.directPush({ sessionId: session.opened.sessionId, payload: yield* fixture.encode(0) })
       assert.strictEqual(yield* Queue.take(fixture.received), 0)
 
-      // acquireSubject is always called under one mutex, so a stale acquisition landing after a
-      // fresher one is just an out of order `now` reaching that mutex. Rewinding the manual clock
-      // reproduces exactly that ordering without needing genuine fiber interleaving.
       yield* fixture.setCurrentTime(0)
       const stale = yield* fixture.directPush({
         sessionId: session.opened.sessionId,
@@ -2088,8 +2085,6 @@ describe("PeerRpcServer", () => {
       }).pipe(Effect.flip)
       assert.instanceOf(stale, PeerRpcError.RequestCapacityExceeded)
 
-      // 1 token/sec budget, 500ms elapsed since the fresh t=500 update. A stale update that
-      // rewound the bucket to t=0 would wrongly mint a full token by t=1000.
       yield* fixture.setCurrentTime(1_000)
       const laterExit = yield* fixture.directPush({
         sessionId: session.opened.sessionId,
