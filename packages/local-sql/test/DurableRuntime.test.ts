@@ -1,6 +1,8 @@
+import * as Automerge from "@automerge/automerge"
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
@@ -8,8 +10,11 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import * as Fiber from "effect/Fiber"
+import * as Latch from "effect/Latch"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Ref from "effect/Ref"
@@ -27,6 +32,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as Compaction from "../src/Compaction.js"
+import * as DocumentEntity from "../src/DocumentEntity.js"
 import * as DocumentStore from "../src/DocumentStore.js"
 import * as DurableRuntime from "../src/DurableRuntime.js"
 import * as InternalAutomerge from "../src/internal/automerge.js"
@@ -308,4 +314,81 @@ describe("DurableRuntime", () => {
       const forged = { ...first, executionId: second.executionId }
       assert.strictEqual((yield* Effect.exit(runtime.interrupt(forged)))._tag, "Failure")
     }).pipe(Effect.provide(Services)))
+
+  it.effect("serves ApplySync without holding the connection across the gate", () =>
+    Effect.gen(function*() {
+      const atGate = yield* Deferred.make<void>()
+      const releaseGate = yield* Latch.make()
+      const claimRan = yield* Deferred.make<void>()
+      let armed = false
+      const gateLayer = Layer.effect(
+        ReplicaGate.ReplicaGate,
+        Effect.gen(function*() {
+          const gate = yield* ReplicaGate.ReplicaGate
+          return ReplicaGate.ReplicaGate.of({
+            ...gate,
+            current: Effect.suspend(() => {
+              if (!armed) return gate.current
+              armed = false
+              return Deferred.succeed(atGate, undefined).pipe(
+                Effect.andThen(releaseGate.await),
+                Effect.andThen(gate.current)
+              )
+            })
+          })
+        })
+      ).pipe(Layer.provide(Gate))
+      const store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Database, gateLayer)))
+      const recovery = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(Database, gateLayer)))
+      const compaction = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Database, gateLayer, recovery)))
+      const inputs = Layer.mergeAll(Database, Bootstrap, Executor, Limits, gateLayer, store, recovery, compaction)
+      const live = Layer.merge(inputs, DurableRuntime.layer(definition).pipe(Layer.provide(inputs)))
+
+      yield* Effect.gen(function*() {
+        const gate = yield* ReplicaGate.ReplicaGate
+        const documents = yield* DocumentStore.DocumentStore
+        const documentId = yield* Identity.makeDocumentId
+        const peerId = yield* Identity.makePeerId
+        const created = yield* documents.create(Task, documentId, { title: "local" })
+        const remote = Automerge.change(
+          Automerge.clone(created.automerge, { actor: "1".repeat(32) }),
+          (draft) => {
+            ;(draft.value as { title: string }).title = "remote"
+          }
+        )
+        InternalAutomerge.free(created.automerge)
+        const generated = Automerge.generateSyncMessage(remote, Automerge.initSyncState())
+        InternalAutomerge.free(remote)
+        assert.isNotNull(generated[1])
+        const message = generated[1]!
+        const messageHash = yield* Canonical.digest(message)
+        const permit = yield* gate.current
+        const entity = yield* DocumentEntity.DocumentEntity.client
+
+        armed = true
+        const victim = yield* entity(documentId).ApplySync({
+          replicaIncarnation: permit.incarnation,
+          peerId,
+          connectionEpoch: "remote-epoch",
+          localConnectionEpoch: "local-epoch",
+          receiveSequence: 0,
+          documentType: Task.name,
+          messageHash,
+          message
+        }).pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Deferred.await(atGate)
+
+        const claimant = yield* gate.claim(() => Deferred.succeed(claimRan, undefined)).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        for (let index = 0; index < 200; index++) yield* Effect.yieldNow
+        yield* releaseGate.open
+
+        const applied = yield* Fiber.join(victim)
+        assert.strictEqual(applied.duplicate, false)
+        assert.isNotNull(applied.reply)
+        yield* Fiber.join(claimant)
+        assert.isTrue(Option.isSome(yield* Deferred.poll(claimRan)))
+      }).pipe(Effect.scoped, Effect.provide(live), TestClock.withLive)
+    }), 20_000)
 })

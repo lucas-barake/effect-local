@@ -860,7 +860,10 @@ export const layer: Layer.Layer<
                     })
                   })
                 }
-                const permit = yield* gate.shared
+                // Use current, not shared: the cluster serves ApplySync inside sql.withTransaction,
+                // so acquiring the gate here inverts claim's gate-then-SQL lock order (restore-vs-
+                // ApplySync deadlock). Fencing still holds via gate.validate in the write tx below.
+                const permit = yield* gate.current
                 yield* validateSession(permit, session)
                 const nowMillis = yield* Clock.currentTimeMillis
                 const acceptedAt = new Date(nowMillis).toISOString()
