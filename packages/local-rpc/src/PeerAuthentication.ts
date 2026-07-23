@@ -101,12 +101,13 @@ export const layerServer = Layer.effect(
           rateState.set(clientId, entry)
         }
 
+        const effectiveNow = Math.max(now, entry.updatedAt, entry.lastUsedAt)
         entry.tokens = Math.min(
           limits.authenticationBurst,
-          entry.tokens + (Math.max(0, now - entry.updatedAt) / 1_000) * limits.authenticationRatePerSecond
+          entry.tokens + (Math.max(0, effectiveNow - entry.updatedAt) / 1_000) * limits.authenticationRatePerSecond
         )
-        entry.updatedAt = now
-        entry.lastUsedAt = now
+        entry.updatedAt = effectiveNow
+        entry.lastUsedAt = effectiveNow
         if (entry.tokens < 1) {
           if (entry.inFlight === 0) retainInactive(clientId, entry)
           return false
@@ -121,7 +122,7 @@ export const layerServer = Layer.effect(
         const entry = rateState.get(clientId)
         if (entry === undefined) return
         entry.inFlight -= 1
-        entry.lastUsedAt = now
+        entry.lastUsedAt = Math.max(now, entry.lastUsedAt)
         if (entry.inFlight === 0) retainInactive(clientId, entry)
       }))
 

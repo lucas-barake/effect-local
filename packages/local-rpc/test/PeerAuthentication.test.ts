@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Cause from "effect/Cause"
+import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -220,6 +221,60 @@ describe("PeerAuthentication", () => {
       assert.instanceOf(rejected, PeerRpcError.RequestCapacityExceeded)
       yield* Deferred.succeed(release, undefined)
       yield* Fiber.join(first)
+    }))
+
+  it.effect("does not restore rate tokens when concurrent requests acquire the state lock out of timestamp order", () =>
+    Effect.gen(function*() {
+      const firstTimeRead = yield* Deferred.make<void>()
+      const releaseFirstTimeRead = yield* Deferred.make<void>()
+      const authenticatedOnce = yield* Deferred.make<void>()
+      let currentTime = 0
+      let timeReads = 0
+      const clock = {
+        currentTimeMillisUnsafe: () => currentTime,
+        currentTimeMillis: Effect.suspend(() => {
+          timeReads += 1
+          return timeReads === 1
+            ? Deferred.succeed(firstTimeRead, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseFirstTimeRead)),
+              Effect.as(0)
+            )
+            : Effect.succeed(currentTime)
+        }),
+        currentTimeNanosUnsafe: () => BigInt(currentTime) * 1_000_000n,
+        currentTimeNanos: Effect.sync(() => BigInt(currentTime) * 1_000_000n),
+        sleep: () => Effect.never
+      } satisfies Clock.Clock
+      const middleware = yield* PeerAuthentication.PeerAuthentication.pipe(
+        Effect.provide(PeerAuthentication.layerServer),
+        Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
+          authenticate: () => Deferred.succeed(authenticatedOnce, undefined).pipe(Effect.as(authenticated))
+        }),
+        Effect.provideService(PeerRpcLimits.PeerRpcLimits, {
+          ...PeerRpcLimits.defaults,
+          authenticationRatePerSecond: 1,
+          authenticationBurst: 1
+        })
+      )
+      const invokeWithClock = (credential: string) =>
+        invoke(middleware, { credential: Redacted.make(credential) }, 1).pipe(
+          Effect.provideService(Clock.Clock, clock)
+        )
+
+      const earlier = yield* invokeWithClock("earlier").pipe(
+        Effect.result,
+        Effect.forkChild
+      )
+      yield* Deferred.await(firstTimeRead)
+      currentTime = 1_000
+      yield* invokeWithClock("later")
+      yield* Deferred.await(authenticatedOnce)
+      yield* Deferred.succeed(releaseFirstTimeRead, undefined)
+      yield* Fiber.join(earlier)
+
+      const third = yield* invokeWithClock("third").pipe(Effect.result)
+      assert.isTrue(Result.isFailure(third))
+      if (Result.isFailure(third)) assert.instanceOf(third.failure, PeerRpcError.RequestCapacityExceeded)
     }))
 
   it.effect("preserves authentication interruption", () =>
