@@ -279,4 +279,49 @@ describe("QueryExecutor", () => {
       assert.deepStrictEqual(first, [1])
     }).pipe(Effect.provide(combinedLive))
   })
+
+  it.effect("preserves declared SqlError query failures", () => {
+    class DeclaredSqlError extends Schema.TaggedErrorClass<DeclaredSqlError>(
+      "@lucas-barake/effect-local-sql/test/DeclaredSqlError"
+    )("SqlError", {
+      detail: Schema.String
+    }) {}
+
+    const FailingQuery = Query.make("FailingQuery", {
+      error: DeclaredSqlError,
+      dependsOn: []
+    })
+    const failingDefinition = ReplicaDefinition.make({
+      name: "declared-sql-error",
+      documents: DocumentSet.make(Task),
+      queries: [FailingQuery]
+    })
+    const failingDatabase = Layer.merge(
+      SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+      NodeCrypto.layer
+    )
+    const failingBootstrap = ReplicaBootstrap.layer(failingDefinition).pipe(
+      Layer.provide(failingDatabase)
+    )
+    const failingHandler = FailingQuery.toLayer(() =>
+      Effect.fail(new DeclaredSqlError({ detail: "expected" }))
+    )
+    const failingExecutor = QueryExecutor.layer(failingDefinition).pipe(
+      Layer.provide(Layer.mergeAll(failingDatabase, failingHandler, Reactive))
+    )
+    const failingLive = Layer.mergeAll(
+      failingDatabase,
+      failingBootstrap,
+      failingHandler,
+      Reactive,
+      failingExecutor
+    )
+
+    return Effect.gen(function*() {
+      const executor = yield* QueryExecutor.QueryExecutor
+      const error = yield* executor.execute(FailingQuery, undefined).pipe(Effect.flip)
+      assert.strictEqual(error._tag, "SqlError")
+      if (error._tag === "SqlError") assert.strictEqual(error.detail, "expected")
+    }).pipe(Effect.provide(failingLive))
+  })
 })

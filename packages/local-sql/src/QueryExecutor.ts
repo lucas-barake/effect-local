@@ -8,6 +8,7 @@ import * as Schema from "effect/Schema"
 import type * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 
 export class QueryExecutor extends Context.Service<QueryExecutor, {
@@ -150,7 +151,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(
             )
           )
         })).pipe(
-          Effect.catchTag("SqlError", (cause) =>
+          Effect.catchIf(SqlError.isSqlError, (cause) =>
             Effect.fail(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
