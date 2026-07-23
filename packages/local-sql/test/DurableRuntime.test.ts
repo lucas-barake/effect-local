@@ -374,7 +374,9 @@ describe("DurableRuntime", () => {
           receiveSequence: 0,
           documentType: Task.name,
           messageHash,
-          message
+          message,
+          writerSchemaVersion: Task.version,
+          writerDefinitionHash: definition.hash
         }).pipe(Effect.forkChild({ startImmediately: true }))
         yield* Deferred.await(atGate)
 

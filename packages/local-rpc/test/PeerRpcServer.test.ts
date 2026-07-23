@@ -232,6 +232,7 @@ const makeFixture = (options: {
       validate: () => Effect.void
     })
     const sync = PeerSync.PeerSync.of({
+      definitionHash: "test-definition-hash",
       open: (peerId) =>
         failSessionOpen
           ? Effect.fail(
@@ -452,7 +453,9 @@ const makeFixture = (options: {
           documentId,
           documentType,
           messageHash: yield* Canonical.digest(message).pipe(Effect.provideService(Crypto.Crypto, crypto)),
-          message
+          message,
+          writerSchemaVersion: 1,
+          writerDefinitionHash: "remote-definition-hash"
         })
         return new TextEncoder().encode(value)
       })

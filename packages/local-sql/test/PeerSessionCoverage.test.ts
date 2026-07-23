@@ -66,6 +66,7 @@ it.layer(NodeCrypto.layer)("PeerSession coverage", (it) => {
   }
   const makeSync = (incarnation: Identity.ReplicaIncarnation) =>
     PeerSync.PeerSync.of({
+      definitionHash: permit.definitionHash,
       open: (id) => Effect.succeed({ peerId: id, connectionEpoch: "local-epoch", replicaIncarnation: incarnation }),
       reset: () => Effect.void,
       generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),

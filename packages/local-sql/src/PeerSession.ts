@@ -44,7 +44,9 @@ export const SyncEnvelope = Schema.Struct({
   documentId: Identity.DocumentId,
   documentType: Schema.String,
   messageHash: Schema.String,
-  message: Schema.Uint8ArrayFromBase64
+  message: Schema.Uint8ArrayFromBase64,
+  writerSchemaVersion: Schema.Int,
+  writerDefinitionHash: Schema.NonEmptyString
 })
 export const maximumSyncEnvelopeBytes = (maxSyncMessageBytes: number) => maxSyncMessageBytes * 2 + 4_096
 const SyncEnvelopeJson = Schema.fromJsonString(Schema.toCodecJson(SyncEnvelope))
@@ -194,7 +196,9 @@ const makeWithTerminal = (
             documentId: outbound.documentId,
             documentType: entry.document.name,
             messageHash: outbound.messageHash,
-            message: outbound.message
+            message: outbound.message,
+            writerSchemaVersion: entry.document.version,
+            writerDefinitionHash: sync.definitionHash
           })
           yield* Effect.scoped(Effect.gen(function*() {
             const permit = yield* gate.shared
@@ -398,7 +402,9 @@ const makeWithTerminal = (
               receiveSequence: envelope.sequence,
               documentType: envelope.documentType,
               messageHash: envelope.messageHash,
-              message: envelope.message
+              message: envelope.message,
+              writerSchemaVersion: envelope.writerSchemaVersion,
+              writerDefinitionHash: envelope.writerDefinitionHash
             }).pipe(
               Effect.catchTag(
                 ["MailboxFull", "AlreadyProcessingMessage", "PersistenceError"],

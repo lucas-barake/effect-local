@@ -87,6 +87,7 @@ describe("DocumentEntity", () => {
   }
   const peerSync = (receive: PeerSync.PeerSync["Service"]["receive"] = () => Effect.succeed(syncResult)) =>
     PeerSync.PeerSync.of({
+      definitionHash: definition.hash,
       open: (peerId) =>
         Effect.succeed({
           peerId,
@@ -162,7 +163,9 @@ describe("DocumentEntity", () => {
       receiveSequence: 2,
       documentType: Task.name,
       messageHash: "hash-a",
-      message: new Uint8Array([1])
+      message: new Uint8Array([1]),
+      writerSchemaVersion: Task.version,
+      writerDefinitionHash: definition.hash
     }
     const keyOf = (payload: unknown) => {
       if (!PrimaryKey.isPrimaryKey(payload)) throw new TypeError("Expected a primary key payload")
@@ -194,7 +197,9 @@ describe("DocumentEntity", () => {
       peerId,
       localConnectionEpoch: "local",
       documentType: Task.name,
-      message: new Uint8Array([1])
+      message: new Uint8Array([1]),
+      writerSchemaVersion: Task.version,
+      writerDefinitionHash: definition.hash
     }
     const keyOf = (payload: unknown) => {
       if (!PrimaryKey.isPrimaryKey(payload)) throw new TypeError("Expected a primary key payload")
@@ -313,7 +318,9 @@ describe("DocumentEntity", () => {
           receiveSequence: 0,
           documentType: Task.name,
           messageHash: yield* Canonical.digest(message),
-          message
+          message,
+          writerSchemaVersion: Task.version,
+          writerDefinitionHash: definition.hash
         })
         assert.deepStrictEqual(applied, syncResult)
         const stale = yield* Effect.exit(client.ApplySync({
@@ -324,7 +331,9 @@ describe("DocumentEntity", () => {
           receiveSequence: 0,
           documentType: Task.name,
           messageHash: yield* Canonical.digest(message),
-          message
+          message,
+          writerSchemaVersion: Task.version,
+          writerDefinitionHash: definition.hash
         }))
         assert.strictEqual(stale._tag, "Failure")
       }).pipe(Effect.provide(TestShardingConfig))
@@ -391,7 +400,9 @@ describe("DocumentEntity", () => {
           receiveSequence: 0,
           documentType: Task.name,
           messageHash: yield* Canonical.digest(message),
-          message
+          message,
+          writerSchemaVersion: Task.version,
+          writerDefinitionHash: definition.hash
         }))
         yield* Effect.yieldNow
         assert.strictEqual(yield* Ref.get(calls), 1)
@@ -458,7 +469,9 @@ describe("DocumentEntity", () => {
           receiveSequence: 0,
           documentType: Task.name,
           messageHash: "not-the-real-hash",
-          message
+          message,
+          writerSchemaVersion: Task.version,
+          writerDefinitionHash: definition.hash
         }))
         assert.strictEqual(tamperedHash.reason._tag, "ProtocolMismatch")
       }).pipe(Effect.provide(TestShardingConfig))

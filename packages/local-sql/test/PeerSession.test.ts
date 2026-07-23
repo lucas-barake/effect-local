@@ -128,6 +128,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         reason: new ReplicaError.StorageUnavailable({ cause: new Error("generate failed") })
       })
       const sync = PeerSync.PeerSync.of({
+        definitionHash: permit.definitionHash,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -215,6 +216,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const peerId = yield* Identity.makePeerId
       const connectCalls = yield* Ref.make(0)
       const sync = PeerSync.PeerSync.of({
+        definitionHash: permit.definitionHash,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -296,6 +298,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const message = Uint8Array.of(1)
         const messageHash = yield* Canonical.digest(message)
         const sync = PeerSync.PeerSync.of({
+          definitionHash: permit.definitionHash,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -370,7 +373,9 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             documentId,
             documentType: Task.name,
             messageHash,
-            message
+            message,
+            writerSchemaVersion: Task.version,
+            writerDefinitionHash: definition.hash
           })
         yield* Queue.offer(inbound, yield* envelope(0))
         yield* Deferred.await(applyCompleted)
@@ -412,6 +417,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const permit = yield* gate.current
         let generateCalls = 0
         const sync = PeerSync.PeerSync.of({
+          definitionHash: definition.hash,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -495,7 +501,9 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             documentId,
             documentType: Task.name,
             messageHash,
-            message
+            message,
+            writerSchemaVersion: Task.version,
+            writerDefinitionHash: definition.hash
           })
         )
         yield* Deferred.await(inboundDigested)
@@ -553,6 +561,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           heads: []
         }
         const sync = PeerSync.PeerSync.of({
+          definitionHash: permit.definitionHash,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -641,7 +650,9 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             documentId,
             documentType: Task.name,
             messageHash: yield* Canonical.digest(message),
-            message
+            message,
+            writerSchemaVersion: Task.version,
+            writerDefinitionHash: definition.hash
           })
         )
         yield* Deferred.await(firstReceived)
@@ -654,7 +665,9 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             documentId,
             documentType: Task.name,
             messageHash: yield* Canonical.digest(message),
-            message
+            message,
+            writerSchemaVersion: Task.version,
+            writerDefinitionHash: definition.hash
           })
         )
         yield* Deferred.await(secondReceived)
@@ -706,6 +719,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           heads: []
         }
         const sync = PeerSync.PeerSync.of({
+          definitionHash: permit.definitionHash,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -808,7 +822,9 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             documentId,
             documentType: Task.name,
             messageHash: yield* Canonical.digest(inboundMessage),
-            message: inboundMessage
+            message: inboundMessage,
+            writerSchemaVersion: Task.version,
+            writerDefinitionHash: definition.hash
           })
         )
         yield* Deferred.await(enqueued)
@@ -831,6 +847,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const nextSequence = yield* Ref.make(0)
         const sentDocuments = yield* Ref.make<ReadonlyArray<Identity.DocumentId>>([])
         const sync = PeerSync.PeerSync.of({
+          definitionHash: permit.definitionHash,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -926,6 +943,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const generateCalls = yield* Ref.make(0)
         const sendCalls = yield* Ref.make(0)
         const sync = PeerSync.PeerSync.of({
+          definitionHash: permit.definitionHash,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -1017,6 +1035,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           heads: []
         }
         const sync = PeerSync.PeerSync.of({
+          definitionHash: permit.definitionHash,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -1082,7 +1101,9 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             documentId,
             documentType: Task.name,
             messageHash: yield* Canonical.digest(message),
-            message
+            message,
+            writerSchemaVersion: Task.version,
+            writerDefinitionHash: definition.hash
           })
         )
         yield* Deferred.await(closed)
@@ -1110,7 +1131,9 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             documentId,
             documentType: Task.name,
             messageHash: "incorrect-hash",
-            message
+            message,
+            writerSchemaVersion: Task.version,
+            writerDefinitionHash: definition.hash
           })
         },
         {
@@ -1121,7 +1144,9 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             documentId: otherDocumentId,
             documentType: Task.name,
             messageHash,
-            message
+            message,
+            writerSchemaVersion: Task.version,
+            writerDefinitionHash: definition.hash
           })
         }
       ]
@@ -1134,6 +1159,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           const publications = yield* Ref.make(0)
           const peerId = yield* Identity.makePeerId
           const sync = PeerSync.PeerSync.of({
+            definitionHash: permit.definitionHash,
             open: (id) =>
               Effect.succeed({
                 peerId: id,
@@ -1204,6 +1230,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         )
       })
       const sync = PeerSync.PeerSync.of({
+        definitionHash: permit.definitionHash,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -1287,6 +1314,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         validate: () => Effect.void
       })
       const sync = PeerSync.PeerSync.of({
+        definitionHash: permit.definitionHash,
         open: (id) =>
           Ref.get(current).pipe(
             Effect.map((current) => ({
@@ -1347,6 +1375,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const peerId = yield* Identity.makePeerId
       const closed = yield* Ref.make(false)
       const sync = PeerSync.PeerSync.of({
+        definitionHash: permit.definitionHash,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -1414,6 +1443,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const releaseClose = yield* Deferred.make<void>()
         yield* Effect.addFinalizer(() => Deferred.succeed(releaseClose, undefined).pipe(Effect.asVoid))
         const sync = PeerSync.PeerSync.of({
+          definitionHash: permit.definitionHash,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -1482,6 +1512,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const peerId = yield* Identity.makePeerId
       const message = Uint8Array.of(1)
       const sync = PeerSync.PeerSync.of({
+        definitionHash: permit.definitionHash,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -1560,7 +1591,9 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                 documentId,
                 documentType: Task.name,
                 messageHash: yield* Canonical.digest(message),
-                message
+                message,
+                writerSchemaVersion: Task.version,
+                writerDefinitionHash: definition.hash
               })
             )
             yield* Deferred.await(receiveStarted)
@@ -1596,6 +1629,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         )
       })
       const sync = PeerSync.PeerSync.of({
+        definitionHash: permit.definitionHash,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -1673,6 +1707,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const peerId = yield* Identity.makePeerId
       const generateCalls = yield* Ref.make(0)
       const sync = PeerSync.PeerSync.of({
+        definitionHash: permit.definitionHash,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -1818,6 +1853,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         heads: []
       }
       const sync = PeerSync.PeerSync.of({
+        definitionHash: permit.definitionHash,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -1909,6 +1945,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const peerId = yield* Identity.makePeerId
         const generated = { outbound: null, observedByPeer: false, dirty: false } as const
         const sync = PeerSync.PeerSync.of({
+          definitionHash: permit.definitionHash,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -2012,6 +2049,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const message = new Uint8Array([1])
       const messageHash = yield* Canonical.digest(message)
       const sync = PeerSync.PeerSync.of({
+        definitionHash: permit.definitionHash,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -2060,7 +2098,9 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                     {
                       remoteConnectionEpoch: "remote-epoch",
                       receiveSequence: 0,
-                      message
+                      message,
+                      writerSchemaVersion: Task.version,
+                      writerDefinitionHash: definition.hash
                     }
                   )
               } as never)
@@ -2072,7 +2112,9 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
               documentId,
               documentType: Task.name,
               messageHash,
-              message
+              message,
+              writerSchemaVersion: Task.version,
+              writerDefinitionHash: definition.hash
             })
           yield* Queue.offer(inbound, yield* envelope("remote-epoch"))
           yield* Deferred.await(firstReceived)
@@ -2113,6 +2155,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const sends = yield* Ref.make(0)
       const sentSequences = yield* Ref.make<ReadonlyArray<number>>([])
       const sync = PeerSync.PeerSync.of({
+        definitionHash: permit.definitionHash,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -2456,6 +2499,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         )
       const inbound = yield* Queue.unbounded<Uint8Array>()
       const sync = PeerSync.PeerSync.of({
+        definitionHash: permit.definitionHash,
         open: (id) =>
           Effect.succeed({ peerId: id, connectionEpoch: "local-epoch", replicaIncarnation: initial.incarnation }),
         reset: () => Effect.void,
@@ -2502,7 +2546,9 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           documentId,
           documentType: Task.name,
           messageHash,
-          message
+          message,
+          writerSchemaVersion: Task.version,
+          writerDefinitionHash: definition.hash
         })
       )
       yield* Deferred.await(applyReady)

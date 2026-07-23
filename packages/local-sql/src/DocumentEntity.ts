@@ -102,7 +102,9 @@ export const ApplySync = Rpc.make("ApplySync", {
     receiveSequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
     documentType: Schema.String,
     messageHash: Schema.String,
-    message: Schema.Uint8ArrayFromBase64
+    message: Schema.Uint8ArrayFromBase64,
+    writerSchemaVersion: Schema.Int,
+    writerDefinitionHash: Schema.NonEmptyString
   },
   success: ApplySyncResult,
   error: ReplicaError.ReplicaError,
@@ -296,7 +298,9 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 {
                   remoteConnectionEpoch: request.payload.connectionEpoch,
                   receiveSequence: request.payload.receiveSequence,
-                  message: request.payload.message
+                  message: request.payload.message,
+                  writerSchemaVersion: request.payload.writerSchemaVersion,
+                  writerDefinitionHash: request.payload.writerDefinitionHash
                 }
               )
             })

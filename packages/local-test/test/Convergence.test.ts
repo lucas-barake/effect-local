@@ -139,7 +139,9 @@ const drain = (documentId: Identity.DocumentId, left: Side, right: Side, reverse
           {
             remoteConnectionEpoch: packet.from.session.connectionEpoch,
             receiveSequence: packet.outbound.sendSequence,
-            message: packet.outbound.message
+            message: packet.outbound.message,
+            writerSchemaVersion: Task.version,
+            writerDefinitionHash: packet.from.sync.definitionHash
           }
         )
         yield* packet.from.sync.markSent(

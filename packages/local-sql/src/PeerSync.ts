@@ -174,6 +174,7 @@ const failStorageCorrupt = (cause: unknown) =>
   )
 
 export class PeerSync extends Context.Service<PeerSync, {
+  readonly definitionHash: string
   readonly open: (peerId: Identity.PeerId) => Effect.Effect<Session, ReplicaError.ReplicaError>
   readonly reset: (session: Session) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly generate: <D extends Document.Any,>(
@@ -189,6 +190,8 @@ export class PeerSync extends Context.Service<PeerSync, {
       readonly remoteConnectionEpoch: string
       readonly receiveSequence: number
       readonly message: Uint8Array
+      readonly writerSchemaVersion: number
+      readonly writerDefinitionHash: string
     }
   ) => Effect.Effect<Received, ReplicaError.ReplicaError>
   readonly enqueue: (session: Session, reply: Reply) => Effect.Effect<Outbound, ReplicaError.ReplicaError>
@@ -837,6 +840,8 @@ export const layer: Layer.Layer<
         readonly remoteConnectionEpoch: string
         readonly receiveSequence: number
         readonly message: Uint8Array
+        readonly writerSchemaVersion: number
+        readonly writerDefinitionHash: string
       }
     ) =>
       withSessionGeneration(session, (generation) =>
@@ -846,7 +851,7 @@ export const layer: Layer.Layer<
               documentId,
               Effect.scoped(Effect.gen(function*() {
                 const receiptSession = { ...session, connectionEpoch: input.remoteConnectionEpoch }
-                const { message, receiveSequence } = input
+                const { message, receiveSequence, writerDefinitionHash, writerSchemaVersion } = input
                 if (!Number.isSafeInteger(receiveSequence) || receiveSequence < 0) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.ProtocolMismatch({
@@ -1323,7 +1328,7 @@ export const layer: Layer.Layer<
               change_hash, document_id, document_type, writer_schema_version, writer_definition_hash,
               actor, sequence, dependencies, bytes, applied, peer_id, accepted_at, commit_sequence
             ) VALUES (
-              ${change.hash}, ${documentId}, ${document.name}, ${document.version}, ${bootstrap.definitionHash},
+              ${change.hash}, ${documentId}, ${document.name}, ${writerSchemaVersion}, ${writerDefinitionHash},
               ${change.actor}, ${change.seq}, ${Schema.encodeSync(Heads)(change.deps)}, ${bytes}, ${applied},
               ${receiptSession.peerId}, ${acceptedAt}, ${commitSequence}
             ) ON CONFLICT(change_hash) DO NOTHING`
@@ -1447,6 +1452,7 @@ export const layer: Layer.Layer<
         ))
 
     return PeerSync.of({
+      definitionHash: bootstrap.definitionHash,
       open: (peerId) =>
         Effect.scoped(Effect.gen(function*() {
           const permit = yield* gate.shared
