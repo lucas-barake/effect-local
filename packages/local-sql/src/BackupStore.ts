@@ -72,7 +72,7 @@ const CheckpointRecord = Schema.Struct({
 })
 
 const ReceiptRecord = Schema.Struct({
-  replica_incarnation: Schema.Int,
+  replica_incarnation: Identity.ReplicaIncarnation,
   command_id: Schema.String,
   request_hash: Schema.String,
   mutation_name: Schema.String,
@@ -598,6 +598,16 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 }
                 break
               }
+              case "Receipt": {
+                if (record.value.replica_incarnation > manifest.incarnation) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.BackupInvalid({
+                      cause: new Error(`Invalid receipt record: ${record.value.command_id}`)
+                    })
+                  })
+                }
+                break
+              }
             }
           }
           const nextReplicaId = options.mode === "clone"
@@ -614,6 +624,9 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             : manifest.replicaId
           yield* gate.claim((permit) =>
             Effect.gen(function*() {
+              const restoredPermit: ReplicaGate.Permit = permit.incarnation > manifest.incarnation
+                ? permit
+                : { ...permit, incarnation: Identity.ReplicaIncarnation.make(manifest.incarnation + 1) }
               const installed = yield* findInstallation(options.installationId)
               if (installed._tag === "Some") {
                 if (
@@ -632,7 +645,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 installation_id, mode, manifest_checksum, installed_at, replica_incarnation
               ) VALUES (
                 ${options.installationId}, ${options.mode}, ${manifestEnvelope.checksum},
-                ${DateTime.formatIso(yield* DateTime.now)}, ${permit.incarnation}
+                ${DateTime.formatIso(yield* DateTime.now)}, ${restoredPermit.incarnation}
               )`
               const clusterTables = yield* findClusterTables(undefined)
               if (clusterTables.some((table) => table.name === `${ClusterStorage.messagePrefix}_replies`)) {
@@ -671,7 +684,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               const commitSequence = sequences.length === 0 ? 0 : Math.max(...sequences)
               yield* sql`UPDATE effect_local_metadata SET
             replica_id = ${nextReplicaId},
-            replica_incarnation = ${permit.incarnation},
+            replica_incarnation = ${restoredPermit.incarnation},
             definition_hash = ${definition.hash},
             commit_sequence = ${commitSequence}
             WHERE singleton = 1`
@@ -681,7 +694,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 const stored = yield* recovery.recoverWithPermit(
                   document,
                   record.value.document_id,
-                  permit
+                  restoredPermit
                 ).pipe(
                   Effect.mapError((cause) =>
                     new ReplicaError.ReplicaError({
@@ -703,7 +716,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   })
                 })
               }
-              yield* gate.validate(permit)
+              yield* gate.validate(restoredPermit)
             })
           )
         }).pipe(

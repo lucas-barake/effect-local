@@ -142,6 +142,8 @@ describe("BackupStore", () => {
     ProjectedCompaction,
     ProjectedExecutor
   )
+  const Executor = CommandExecutor.layer(definition).pipe(Layer.provide(Live))
+  const BatchLive = Layer.mergeAll(Live, Executor)
 
   it.effect("exports and restores canonical history as projection ready when no projections are registered", () =>
     Effect.gen(function*() {
@@ -764,6 +766,123 @@ describe("BackupStore", () => {
       assert.strictEqual(replaced.replicaId, initial.replicaId)
       assert.strictEqual(replaced.incarnation, cloned.incarnation + 1)
     }).pipe(Effect.provide(Live)))
+
+  it.effect("orphans archived receipts when restoring onto a replica with a lower incarnation", () =>
+    Effect.gen(function*() {
+      const archive = yield* Effect.gen(function*() {
+        const backups = yield* BackupStore.BackupStore
+        const executor = yield* CommandExecutor.CommandExecutor
+        const gate = yield* ReplicaGate.ReplicaGate
+        yield* gate.claim(() => Effect.void)
+        const permit = yield* gate.current
+        const documentId = yield* Identity.makeDocumentId
+        const commandId = yield* Identity.makeCommandId
+        const encoded = yield* Document.encode(Task, documentId, { title: "archived" })
+        const requestHash = yield* CommandExecutor.createRequestHash({
+          incarnation: permit.incarnation,
+          commandId,
+          document: Task,
+          documentId,
+          encoded
+        })
+        const outcome = yield* executor.create(Task, {
+          commandId,
+          documentId,
+          permit,
+          requestHash,
+          value: { title: "archived" }
+        })
+        assert.deepStrictEqual(outcome, CommandOutcome.durablyCommitted(commandId, documentId))
+        const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+        return { chunks, commandId, incarnation: permit.incarnation }
+      }).pipe(Effect.provide(BatchLive))
+
+      yield* Effect.gen(function*() {
+        const backups = yield* BackupStore.BackupStore
+        const executor = yield* CommandExecutor.CommandExecutor
+        const gate = yield* ReplicaGate.ReplicaGate
+        yield* backups.restore({
+          installationId: yield* Identity.makeBackupInstallationId,
+          source: Stream.fromIterable(archive.chunks),
+          mode: "replace",
+          maxBytes: limits.maxBackupBytes,
+          expectedDefinitionHash: definition.hash
+        })
+        const permit = yield* gate.current
+        assert.deepStrictEqual(
+          yield* executor.lookupCreate(archive.commandId, permit),
+          CommandOutcome.unknown(archive.commandId)
+        )
+        assert.isAbove(permit.incarnation, archive.incarnation)
+      }).pipe(Effect.provide(BatchLive))
+    }))
+
+  it.effect("rejects archived receipts recorded above the manifest incarnation", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const executor = yield* CommandExecutor.CommandExecutor
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      const permit = yield* gate.current
+      const documentId = yield* Identity.makeDocumentId
+      const commandId = yield* Identity.makeCommandId
+      const encoded = yield* Document.encode(Task, documentId, { title: "archived" })
+      const requestHash = yield* CommandExecutor.createRequestHash({
+        incarnation: permit.incarnation,
+        commandId,
+        document: Task,
+        documentId,
+        encoded
+      })
+      yield* executor.create(Task, {
+        commandId,
+        documentId,
+        permit,
+        requestHash,
+        value: { title: "archived" }
+      })
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      const lines = new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n")
+        .map((line) => JSON.parse(line))
+      const manifest = lines[0]!
+      const receipt = lines.find((line) => line.kind === "Receipt")!
+      receipt.value.replica_incarnation = manifest.value.incarnation + 5
+      receipt.checksum = yield* Canonical.digest(receipt.value)
+      const end = lines.at(-1)!
+      end.value.recordsChecksum = yield* Canonical.digest(lines.slice(1, -1).map((line) => line.checksum))
+      end.checksum = yield* Canonical.digest(end.value)
+      for (let attempt = 0; attempt < 8; attempt++) {
+        manifest.checksum = yield* Canonical.digest(manifest.value)
+        const bytes = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+        if (manifest.value.declaredBytes === bytes.byteLength) break
+        manifest.value.declaredBytes = bytes.byteLength
+      }
+      manifest.checksum = yield* Canonical.digest(manifest.value)
+      const tampered = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+      const before = yield* sql<{
+        readonly replica_incarnation: number
+        readonly writer_generation: number
+      }>`SELECT replica_incarnation, writer_generation FROM effect_local_metadata WHERE singleton = 1`
+
+      const error = yield* Effect.flip(backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.make(tampered),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      }))
+
+      assert.strictEqual(error.reason._tag, "BackupInvalid")
+      const after = yield* sql<{
+        readonly replica_incarnation: number
+        readonly writer_generation: number
+      }>`SELECT replica_incarnation, writer_generation FROM effect_local_metadata WHERE singleton = 1`
+      assert.deepStrictEqual(after, before)
+      const receipts = yield* sql<{ readonly replica_incarnation: number }>`
+        SELECT replica_incarnation FROM effect_local_command_receipts
+      `
+      assert.deepStrictEqual(receipts, [{ replica_incarnation: permit.incarnation }])
+    }).pipe(Effect.provide(BatchLive)))
 
   it.effect("uses the Crypto service captured by the BackupStore layer for clone restores", () =>
     Effect.gen(function*() {
