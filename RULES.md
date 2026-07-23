@@ -57,6 +57,7 @@ Read this file before any work. Treat these rules as required for every package.
 
 ## Persistence And Validation
 
+- Never trust an external boundary. Decode every value that crosses into the program — SQL rows, wire payloads, archives, file contents — with a Schema. For SQL reads use `SqlSchema` request and result decoding; never assert row shapes with a bare `sql<T>` type parameter in library code.
 - Decode external, archive, and durable values with their domain Schemas before calling branded constructors.
 - Validate redundant persisted metadata, types, hashes, and sequence fields before replay.
 - Encode composite durable keys with an unambiguous structured representation.
