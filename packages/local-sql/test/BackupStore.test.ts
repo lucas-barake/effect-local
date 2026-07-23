@@ -8,6 +8,7 @@ import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Projection from "@lucas-barake/effect-local/Projection"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -670,6 +671,83 @@ describe("BackupStore", () => {
         const preserved = yield* store.load(Task, documentId)
         assert.strictEqual(preserved.snapshot.value.title, "preserved", testCase.name)
         InternalAutomerge.free(preserved.automerge)
+      }
+    }).pipe(Effect.provide(Live)))
+
+  it.effect("bounds export chunks to maxChunkBytes and restores records larger than one chunk", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      let seed = 7
+      const characters: Array<string> = []
+      for (let index = 0; index < 60_000; index++) {
+        seed = (seed * 48271) % 2147483647
+        characters.push(String.fromCharCode(0xc0 + (seed % 0x300)))
+      }
+      const title = characters.join("")
+      const created = yield* store.create(Task, documentId, { title })
+      InternalAutomerge.free(created.automerge)
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      for (const chunk of chunks) {
+        assert.isAtMost(chunk.byteLength, limits.maxChunkBytes)
+      }
+      yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.fromIterable(chunks),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      })
+      const restored = yield* store.load(Task, documentId)
+      assert.strictEqual(restored.snapshot.value.title, title)
+      InternalAutomerge.free(restored.automerge)
+    }).pipe(Effect.provide(Live)))
+
+  it.effect("rejects maxBytes values that are not positive integers", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "kept" })
+      InternalAutomerge.free(created.automerge)
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      for (const maxBytes of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1, 1.5]) {
+        const exported = yield* Effect.flip(backups.export({ maxBytes }).pipe(Stream.runCollect))
+        assert.strictEqual(exported.reason._tag, "BackupInvalid", `export maxBytes=${maxBytes}`)
+        const restored = yield* Effect.flip(backups.restore({
+          installationId: yield* Identity.makeBackupInstallationId,
+          source: Stream.fromIterable(chunks),
+          mode: "replace",
+          maxBytes,
+          expectedDefinitionHash: definition.hash
+        }))
+        assert.strictEqual(restored.reason._tag, "BackupInvalid", `restore maxBytes=${maxBytes}`)
+      }
+    }).pipe(Effect.provide(Live)))
+
+  it.effect("rejects archives beyond the record limit while streaming", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const line = new TextEncoder().encode(`{"kind":"Padding","checksum":"0","value":0}\n`)
+      const error = yield* Effect.flip(backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.fromIterable(
+          Array.from({ length: limits.maxArchiveRecords + 10 }, () => line)
+        ).pipe(
+          Stream.concat(Stream.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause: new Error("source tail was pulled") })
+            })
+          ))
+        ),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      }))
+      assert.strictEqual(error.reason._tag, "BackupTooLarge")
+      if (error.reason._tag === "BackupTooLarge") {
+        assert.strictEqual(error.reason.limit, limits.maxArchiveRecords)
       }
     }).pipe(Effect.provide(Live)))
 

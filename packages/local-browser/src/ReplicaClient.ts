@@ -1,4 +1,4 @@
-import type * as Backup from "@lucas-barake/effect-local/Backup"
+import * as Backup from "@lucas-barake/effect-local/Backup"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
@@ -469,26 +469,29 @@ export const fromRpcClient = (
             ))
         ),
       restoreBackup: <R,>(options: Backup.RestoreOptions<R>) =>
-        Stream.runFoldEffect(
-          options.source,
-          () => ({ bytes: 0, chunks: [] as Array<Uint8Array<ArrayBuffer>> }),
-          (accumulator, chunk) => {
-            const bytes = accumulator.bytes + chunk.byteLength
-            if (bytes > options.maxBytes) {
-              return Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.BackupTooLarge({
-                    limit: options.maxBytes,
-                    observed: bytes
-                  })
-                })
-              )
-            }
-            accumulator.chunks.push(new Uint8Array(chunk))
-            accumulator.bytes = bytes
-            return Effect.succeed(accumulator)
-          }
-        ).pipe(
+        Backup.validateMaxBytes(options.maxBytes).pipe(
+          Effect.flatMap((maxBytes) =>
+            Stream.runFoldEffect(
+              options.source,
+              () => ({ bytes: 0, chunks: [] as Array<Uint8Array<ArrayBuffer>> }),
+              (accumulator, chunk) => {
+                const bytes = accumulator.bytes + chunk.byteLength
+                if (bytes > maxBytes) {
+                  return Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.BackupTooLarge({
+                        limit: maxBytes,
+                        observed: bytes
+                      })
+                    })
+                  )
+                }
+                accumulator.chunks.push(new Uint8Array(chunk))
+                accumulator.bytes = bytes
+                return Effect.succeed(accumulator)
+              }
+            )
+          ),
           Effect.flatMap(({ chunks }) =>
             withSession((session) =>
               rpc.RestoreBackup({
