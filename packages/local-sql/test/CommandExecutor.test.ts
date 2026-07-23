@@ -12,8 +12,10 @@ import * as Layer from "effect/Layer"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import { vi } from "vitest"
 import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as DocumentStore from "../src/DocumentStore.js"
+import * as InternalAutomerge from "../src/internal/automerge.js"
 import * as ProjectionStore from "../src/ProjectionStore.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
@@ -184,6 +186,53 @@ describe("CommandExecutor", () => {
         SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1
       `
       assert.strictEqual(rows[0]?.commit_sequence, 1)
+    })).pipe(Effect.provide(Live)))
+
+  it.effect("frees the staged automerge document when a mutation is rejected", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const executor = yield* CommandExecutor.CommandExecutor
+      const gate = yield* ReplicaGate.ReplicaGate
+      const permit = yield* gate.shared
+      const documentId = yield* Identity.makeDocumentId
+      const createCommandId = yield* Identity.makeCommandId
+      const encoded = yield* Document.encode(Task, documentId, { title: "one" })
+      const createHash = yield* CommandExecutor.createRequestHash({
+        incarnation: permit.incarnation,
+        commandId: createCommandId,
+        document: Task,
+        documentId,
+        encoded
+      })
+      yield* executor.create(Task, {
+        commandId: createCommandId,
+        documentId,
+        permit,
+        requestHash: createHash,
+        value: { title: "one" }
+      })
+      const stageSpy = vi.spyOn(InternalAutomerge, "stage")
+      const commandId = yield* Identity.makeCommandId
+      const requestHash = yield* CommandExecutor.mutationRequestHash({
+        incarnation: permit.incarnation,
+        commandId,
+        documentId,
+        mutation: Checked,
+        payload: "no"
+      })
+      const outcome = yield* executor.mutate(Checked, {
+        commandId,
+        documentId,
+        payload: "no",
+        permit,
+        requestHash
+      })
+      assert.deepStrictEqual(outcome, CommandOutcome.rejected(commandId, new CheckedRejected()))
+      const staged = stageSpy.mock.results.at(-1)?.value as InternalAutomerge.AnyDocument | undefined
+      stageSpy.mockRestore()
+      assert.isDefined(staged)
+      // A rejected mutation must free the staged Automerge document it created.
+      // A freed document throws on any access; a leaked one is still usable.
+      assert.throws(() => InternalAutomerge.heads(staged!))
     })).pipe(Effect.provide(Live)))
 
   it.effect("round trips void delete receipts", () =>

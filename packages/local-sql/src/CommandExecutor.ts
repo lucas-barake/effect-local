@@ -370,15 +370,17 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 (typeof mutation)["successSchema"]["Type"],
                 (typeof mutation)["errorSchema"]["Type"]
               >
-              const staged = yield* store.stage(durable, (draft) => {
-                const result = handler({ draft, payload: options.payload, current: durable.snapshot.value })
-                handlerResult = mutation.errorSchema === Schema.Never
-                  ? Result.succeed(result)
-                  : result as Result.Result<
-                    (typeof mutation)["successSchema"]["Type"],
-                    (typeof mutation)["errorSchema"]["Type"]
-                  >
-              })
+              const staged = track(
+                yield* store.stage(durable, (draft) => {
+                  const result = handler({ draft, payload: options.payload, current: durable.snapshot.value })
+                  handlerResult = mutation.errorSchema === Schema.Never
+                    ? Result.succeed(result)
+                    : result as Result.Result<
+                      (typeof mutation)["successSchema"]["Type"],
+                      (typeof mutation)["errorSchema"]["Type"]
+                    >
+                })
+              )
               if (Result.isFailure(handlerResult)) {
                 const outcome = CommandOutcome.rejected(options.commandId, handlerResult.failure)
                 const result = yield* encodeResult(
@@ -397,7 +399,6 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 })
                 return outcome
               }
-              track(staged)
               const persisted = yield* store.persist(mutation.document, options.documentId, durable, staged).pipe(
                 Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
               )
