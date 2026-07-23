@@ -2100,6 +2100,114 @@ describe("PeerRpcServer", () => {
       yield* Fiber.interrupt(session.fiber)
     })))
 
+  it.effect("keeps the subject Open bucket monotonic when a stale update lands after a fresher one", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const fixture = yield* makeFixture({
+        ...baseOptions,
+        rpcLimits: {
+          openBurst: 1,
+          openRatePerSecond: 1,
+          maxInFlightOpenPerSubject: 100,
+          maxSessionsPerSubject: 100
+        },
+        manualClock: true
+      })
+      const documents = [{ documentType: Task.name, documentId: taskId }]
+      const attemptOpen = () =>
+        Effect.gen(function*() {
+          const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
+          const fiber = yield* Stream.runForEach(
+            fixture.directOpen(documents),
+            (event) => Queue.offer(events, event).pipe(Effect.asVoid)
+          ).pipe(Effect.forkChild)
+          return yield* Effect.raceFirst(
+            Queue.take(events).pipe(Effect.as({ _tag: "Admitted" as const, fiber })),
+            Fiber.await(fiber).pipe(Effect.map((exit) => ({ _tag: "Rejected" as const, exit })))
+          )
+        })
+
+      yield* fixture.setCurrentTime(500)
+      const first = yield* attemptOpen()
+      assert.strictEqual(first._tag, "Admitted")
+
+      yield* fixture.setCurrentTime(0)
+      const stale = yield* attemptOpen()
+      assert.strictEqual(stale._tag, "Rejected")
+      if (stale._tag === "Rejected") {
+        assert.isTrue(Exit.isFailure(stale.exit))
+        if (Exit.isFailure(stale.exit)) {
+          const failure = Cause.findErrorOption(stale.exit.cause)
+          assert.isTrue(Option.isSome(failure) && failure.value._tag === "RequestCapacityExceeded")
+        }
+      }
+
+      yield* fixture.setCurrentTime(1_000)
+      const later = yield* attemptOpen()
+      assert.strictEqual(later._tag, "Rejected")
+      if (later._tag === "Rejected") {
+        assert.isTrue(Exit.isFailure(later.exit))
+        if (Exit.isFailure(later.exit)) {
+          const failure = Cause.findErrorOption(later.exit.cause)
+          assert.isTrue(Option.isSome(failure) && failure.value._tag === "RequestCapacityExceeded")
+        }
+      }
+
+      if (first._tag === "Admitted") yield* Fiber.interrupt(first.fiber)
+    })))
+
+  it.effect("does not let a stale Push rewind the shared subject clock advanced by an Open", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const fixture = yield* makeFixture({
+        ...baseOptions,
+        rpcLimits: { pushBurst: 1, pushRatePerSecond: 1 },
+        manualClock: true
+      })
+      const documents = [{ documentType: Task.name, documentId: taskId }]
+      const openDirect = () =>
+        Effect.gen(function*() {
+          const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
+          const fiber = yield* Stream.runForEach(
+            fixture.directOpen(documents),
+            (event) => Queue.offer(events, event).pipe(Effect.asVoid)
+          ).pipe(Effect.forkChild)
+          const opened = yield* Effect.raceFirst(
+            Queue.take(events),
+            Fiber.join(fiber).pipe(Effect.andThen(Effect.die("Open stream ended before Opened")))
+          )
+          assert.strictEqual(opened._tag, "Opened")
+          return { opened: opened as PeerRpc.Opened, fiber }
+        })
+
+      yield* fixture.setCurrentTime(0)
+      const first = yield* openDirect()
+
+      yield* fixture.setCurrentTime(2_000)
+      yield* fixture.directPush({ sessionId: first.opened.sessionId, payload: yield* fixture.encode(0) })
+      assert.strictEqual(yield* Queue.take(fixture.received), 0)
+
+      yield* fixture.setCurrentTime(10_000)
+      const second = yield* openDirect()
+
+      yield* fixture.setCurrentTime(3_000)
+      yield* fixture.directPush({ sessionId: second.opened.sessionId, payload: yield* fixture.encode(1) })
+      assert.strictEqual(yield* Queue.take(fixture.received), 1)
+
+      yield* fixture.setCurrentTime(4_000)
+      const laterExit = yield* fixture.directPush({
+        sessionId: second.opened.sessionId,
+        payload: yield* fixture.encode(2)
+      }).pipe(Effect.exit)
+      assert.isTrue(Exit.isFailure(laterExit), "expected the fourth push to stay capacity rejected")
+      if (Exit.isFailure(laterExit)) {
+        const failure = Cause.findErrorOption(laterExit.cause)
+        assert.isTrue(Option.isSome(failure) && failure.value._tag === "RequestCapacityExceeded")
+      }
+      assert.strictEqual((yield* Queue.poll(fixture.received))._tag, "None")
+
+      yield* Fiber.interrupt(first.fiber)
+      yield* Fiber.interrupt(second.fiber)
+    })))
+
   it.effect("rejects a Push payload beyond the sync envelope limit", () =>
     Effect.scoped(Effect.gen(function*() {
       const fixture = yield* makeFixture(baseOptions)
