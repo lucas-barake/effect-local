@@ -1326,6 +1326,33 @@ describe("PeerRpcServer", () => {
       assert.instanceOf(error, PeerRpcError.SessionUnavailable)
     })))
 
+  it.effect("revokes the session when the authorization invalidation monitor defects", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const invalidate = yield* Deferred.make<void>()
+      const fixture = yield* makeFixture({
+        ...baseOptions,
+        authorization: (request) =>
+          Effect.succeed({
+            documents: request.documents.map((document) => ({ document: Task, documentId: document.documentId })),
+            validUntil: Number.MAX_SAFE_INTEGER,
+            invalidated: Deferred.await(invalidate).pipe(
+              Effect.andThen(Effect.die("authorization invalidation monitor defect"))
+            )
+          })
+      })
+      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
+      yield* Deferred.succeed(invalidate, undefined)
+      for (let index = 0; index < 5; index++) yield* Effect.yieldNow
+      const exit = session.fiber.pollUnsafe()
+      assert.isDefined(exit)
+      assert.isTrue(Exit.isFailure(exit!))
+      if (Exit.isFailure(exit!)) {
+        const error = Cause.findErrorOption(exit!.cause)
+        assert.strictEqual(error._tag, "Some")
+        if (error._tag === "Some") assert.instanceOf(error.value, PeerRpcError.SessionUnavailable)
+      }
+    })))
+
   it.effect("revokes the active session when authentication is invalidated", () =>
     Effect.scoped(Effect.gen(function*() {
       const fixture = yield* makeFixture(baseOptions)

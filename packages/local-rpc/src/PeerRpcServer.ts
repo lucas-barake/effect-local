@@ -908,7 +908,7 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
                 Effect.sleep(Duration.millis(Math.max(0, authorized.validUntil - now))),
                 Effect.sleep(Duration.millis(limits.maximumReauthorizationInterval))
               ]).pipe(
-                Effect.andThen(revoke(entry, new PeerRpcError.SessionUnavailable(), true, true))
+                Effect.ensuring(revoke(entry, new PeerRpcError.SessionUnavailable(), true, true))
               )
               entry.watcher = yield* Effect.forkIn(leaseWatcher, runtimeScope, { startImmediately: true })
               const registered = yield* register(entry)
