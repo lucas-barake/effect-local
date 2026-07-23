@@ -157,7 +157,7 @@ const receivedFromReceipt = (documentId: Identity.DocumentId, receipt: typeof Re
 })
 
 const sameHeads = (left: ReadonlyArray<string>, right: ReadonlyArray<string>) =>
-  Equal.equals([...left].toSorted(), [...right].toSorted())
+  Equal.equals(left.toSorted(), right.toSorted())
 
 export class PeerSync extends Context.Service<PeerSync, {
   readonly open: (peerId: Identity.PeerId) => Effect.Effect<Session, ReplicaError.ReplicaError>
@@ -545,18 +545,17 @@ export const layer: Layer.Layer<
       documentId: Identity.DocumentId,
       effect: Effect.Effect<A, E, R>
     ) =>
-      Effect.scoped(
-        RcMap.get(documentLocks, documentId).pipe(
-          Effect.mapError(() =>
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.QuotaExceeded({
-                resource: "in-flight sync documents",
-                limit: limits.maxQueuedRpc
-              })
+      RcMap.get(documentLocks, documentId).pipe(
+        Effect.mapError(() =>
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.QuotaExceeded({
+              resource: "in-flight sync documents",
+              limit: limits.maxQueuedRpc
             })
-          ),
-          Effect.flatMap((lock) => lock.withPermit(effect))
-        )
+          })
+        ),
+        Effect.flatMap((lock) => lock.withPermit(effect)),
+        Effect.scoped
       )
 
     const validateSession = (permit: ReplicaGate.Permit, session: Session) =>
@@ -576,18 +575,17 @@ export const layer: Layer.Layer<
       session: Session,
       use: (generation: Ref.Ref<number>) => Effect.Effect<A, E, R>
     ) =>
-      Effect.scoped(
-        RcMap.get(sessionGenerations, sessionKey(session)).pipe(
-          Effect.mapError(() =>
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.QuotaExceeded({
-                resource: "in-flight peer sessions",
-                limit: limits.maxQueuedRpc
-              })
+      RcMap.get(sessionGenerations, sessionKey(session)).pipe(
+        Effect.mapError(() =>
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.QuotaExceeded({
+              resource: "in-flight peer sessions",
+              limit: limits.maxQueuedRpc
             })
-          ),
-          Effect.flatMap(use)
-        )
+          })
+        ),
+        Effect.flatMap(use),
+        Effect.scoped
       )
 
     const validateSessionGeneration = (generation: Ref.Ref<number>, expected: number) =>
