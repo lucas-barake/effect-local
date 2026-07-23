@@ -1,6 +1,8 @@
 import * as Document from "@lucas-barake/effect-local/Document"
+import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
+import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -27,6 +29,13 @@ const makeBytes = (size: number) => {
 const Task = Document.make("BenchmarkTask", {
   schema: Schema.Struct({ title: Schema.String }),
   version: 1
+})
+const definition = ReplicaDefinition.make({
+  name: "rpc-peer-transport-bench",
+  documents: DocumentSet.make(Task),
+  mutations: [],
+  projections: [],
+  queries: []
 })
 const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
 const replicaId = Identity.ReplicaId.make("rep_00000000-0000-4000-8000-000000000001")
@@ -80,7 +89,7 @@ const client = await Effect.runPromise(
 const transportContext = await Effect.runPromise(
   Layer.build(RpcPeerTransport.layer(client, {
     documents: [{ document: Task, documentId }],
-    definitionHash: "def_00000000000000000000000000000000"
+    definition
   })).pipe(Effect.provideService(Scope.Scope, scope))
 )
 const connection = await Effect.runPromise(

@@ -82,7 +82,7 @@ const missingSessionId = Identity.SessionId.make("ses_00000000-0000-4000-8000-00
 const makeWebSocketServer = (
   documentId: Identity.DocumentId,
   document: Document.Any = Task,
-  definitionHash: string = definition.hash
+  replicaDefinition: ReplicaDefinition.Any = definition
 ) => {
   const ServerDependencies = Layer.mergeAll(
     PeerRpcLimits.layerDefaults,
@@ -107,10 +107,13 @@ const makeWebSocketServer = (
     )
   )
   const AuthenticationLive = PeerAuthentication.layerServer.pipe(Layer.provide(ServerDependencies))
-  const PeerHandlersLive = PeerRpcServer.layerHandlers({ tenantId: "tenant", peerId: serverPeerId, definitionHash })
-    .pipe(
-      Layer.provide(ServerDependencies)
-    )
+  const PeerHandlersLive = PeerRpcServer.layerHandlers({
+    tenantId: "tenant",
+    peerId: serverPeerId,
+    definition: replicaDefinition
+  }).pipe(
+    Layer.provide(ServerDependencies)
+  )
   const WsProtocol = RpcServer.layerProtocolWebsocket({ path: "/rpc" }).pipe(Layer.provide(HttpRouter.layer))
   const RpcLive = RpcServer.layer(PeerRpc.Rpcs, { disableFatalDefects: true }).pipe(
     Layer.provide([PeerHandlersLive, AuthenticationLive])
@@ -190,7 +193,7 @@ describe("PeerRpc WebSocket", () => {
         const PeerHandlersLive = PeerRpcServer.layerHandlers({
           tenantId: "tenant",
           peerId: serverPeerId,
-          definitionHash: definition.hash
+          definition
         }).pipe(
           Layer.provide(ServerDependencies)
         )
@@ -239,7 +242,7 @@ describe("PeerRpc WebSocket", () => {
             const session = yield* RpcPeerTransport.makeSession(client, {
               peerId: serverPeerId,
               documents: [{ document: Task, documentId }],
-              definitionHash: definition.hash
+              definition
             }).pipe(Effect.provide(clientEngineContext))
 
             assert.strictEqual(session.peerId, serverPeerId)
@@ -385,7 +388,7 @@ describe("PeerRpc WebSocket", () => {
             return yield* RpcPeerTransport.makeSession(client, {
               peerId: serverPeerId,
               documents: [{ document: Task, documentId }],
-              definitionHash: definition.hash
+              definition
             }).pipe(Effect.provide(clientEngineContext))
           })
 
@@ -537,7 +540,7 @@ describe("PeerRpc WebSocket", () => {
           yield* RpcPeerTransport.makeSession(client, {
             peerId: serverPeerId,
             documents: [{ document: Task, documentId }],
-            definitionHash: definition.hash
+            definition
           }).pipe(Effect.provide(clientEngineContext))
           yield* clientReplica.mutate(AddLabel, {
             commandId: yield* Identity.makeCommandId,
@@ -580,7 +583,7 @@ describe("PeerRpc WebSocket", () => {
           yield* RpcPeerTransport.makeSession(client, {
             peerId: serverPeerId,
             documents: [{ document: Task, documentId }],
-            definitionHash: definition.hash
+            definition
           }).pipe(Effect.provide(clientEngineContext))
           yield* clientReplica.mutate(AddLabel, {
             commandId: yield* Identity.makeCommandId,
@@ -672,7 +675,7 @@ describe("PeerRpc WebSocket", () => {
         assert.strictEqual(documentId, yield* CommandOutcome.committedOrFail(createdClient))
 
         const serverContext = yield* Layer.build(
-          makeWebSocketServer(documentId, SkewTask, serverDefinition.hash).pipe(
+          makeWebSocketServer(documentId, SkewTask, serverDefinition).pipe(
             Layer.provideMerge(NodeHttpServer.layerTest),
             Layer.provide(RpcSerialization.layerMsgPack)
           )
@@ -697,7 +700,7 @@ describe("PeerRpc WebSocket", () => {
           return yield* RpcPeerTransport.makeSession(client, {
             peerId: serverPeerId,
             documents: [{ document: SkewTaskV2, documentId }],
-            definitionHash: clientDefinition.hash
+            definition: clientDefinition
           }).pipe(Effect.provide(clientEngineContext))
         })).pipe(Effect.exit)
 

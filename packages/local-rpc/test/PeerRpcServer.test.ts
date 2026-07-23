@@ -6,7 +6,9 @@ import * as PeerSync from "@lucas-barake/effect-local-sql/PeerSync"
 import * as ReplicaGate from "@lucas-barake/effect-local-sql/ReplicaGate"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Document from "@lucas-barake/effect-local/Document"
+import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
@@ -46,7 +48,14 @@ const Note = Document.make("Note", { schema: Schema.Struct({ body: Schema.String
 const taskId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
 const noteId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000002")
 const serverPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001")
-const definitionHash = "def_00000000000000000000000000000000"
+const definition = ReplicaDefinition.make({
+  name: "peer-rpc-server-test",
+  documents: DocumentSet.make(Task, Note),
+  mutations: [],
+  projections: [],
+  queries: []
+})
+const definitionHash = definition.hash
 const remotePeerA = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000002")
 const remotePeerB = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000003")
 const missingSessionId = Identity.SessionId.make("ses_00000000-0000-4000-8000-000000000001")
@@ -347,7 +356,7 @@ const makeFixture = (options: {
         recordFiberEnd: () => void (activeFibers -= 1)
       })
     )
-    const handlers = PeerRpcServer.layerHandlers({ tenantId: "tenant", peerId: serverPeerId, definitionHash }).pipe(
+    const handlers = PeerRpcServer.layerHandlers({ tenantId: "tenant", peerId: serverPeerId, definition }).pipe(
       Layer.provide(services)
     )
     const handlerScope = yield* Scope.make()
