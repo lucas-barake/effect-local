@@ -125,6 +125,47 @@ describe("QueryExecutor", () => {
       assert.strictEqual(result._tag, "Failure")
     }).pipe(Effect.provide(Live)))
 
+  it.effect("serializes readiness validation with the query handler", () =>
+    Effect.gen(function*() {
+      const handlerEntered = yield* Deferred.make<void>()
+      const releaseHandler = yield* Deferred.make<void>()
+      const projectionBlocked = yield* Deferred.make<void>()
+      const blockingHandler = ListLabels.toLayer((request) =>
+        Effect.gen(function*() {
+          yield* Deferred.succeed(handlerEntered, void 0)
+          yield* Deferred.await(releaseHandler)
+          return yield* listLabels(request).pipe(Effect.orDie)
+        })
+      ).pipe(Layer.provide(Database))
+      const blockingExecutor = QueryExecutor.layer(definition).pipe(
+        Layer.provide(Layer.mergeAll(Database, blockingHandler, Reactive))
+      )
+      const blockingLive = Layer.mergeAll(Base, Projections, blockingHandler, Reactive, blockingExecutor)
+
+      yield* Effect.gen(function*() {
+        const executor = yield* QueryExecutor.QueryExecutor
+        const sql = yield* SqlClient.SqlClient
+        const documentId = yield* Identity.makeDocumentId
+        yield* sql`INSERT INTO query_task_labels_v1 (sourceDocumentId, label)
+          VALUES (${documentId}, 'stale')`
+        const queryFiber = yield* executor.execute(ListLabels, { prefix: "" }).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(handlerEntered)
+        const blockFiber = yield* sql`UPDATE effect_local_projection_registry SET status = 'Blocked'
+          WHERE projection_name = ${Labels.name}`.pipe(
+          Effect.andThen(Deferred.succeed(projectionBlocked, void 0)),
+          Effect.forkChild({ startImmediately: true })
+        )
+        assert.isFalse(yield* Deferred.isDone(projectionBlocked))
+        yield* Deferred.succeed(releaseHandler, void 0)
+        assert.deepStrictEqual(yield* Fiber.join(queryFiber), [
+          { sourceDocumentId: documentId, label: "stale" }
+        ])
+        yield* Fiber.join(blockFiber)
+      }).pipe(Effect.provide(blockingLive))
+    }))
+
   it.effect("refreshes reactive queries when a dependency document changes", () =>
     Effect.gen(function*() {
       const executor = yield* QueryExecutor.QueryExecutor

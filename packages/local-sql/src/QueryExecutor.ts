@@ -62,7 +62,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(
             WHERE projection_name = ${projectionName} AND status != 'Ready'`
       })
       const execute = <Q extends Query.Any,>(query: Q, payload: Q["payloadSchema"]["Type"]) =>
-        Effect.gen(function*() {
+        sql.withTransaction(Effect.gen(function*() {
           for (const projection of query.dependsOn) {
             const registry = yield* findProjectionStatus(projection.name).pipe(
               Effect.mapError((cause) =>
@@ -149,7 +149,16 @@ export const layer = <D extends ReplicaDefinition.Any,>(
               })
             )
           )
-        }) as Effect.Effect<Q["successSchema"]["Type"], Q["errorSchema"]["Type"] | ReplicaError.ReplicaError>
+        })).pipe(
+          Effect.catchTag("SqlError", (cause) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({
+                  cause
+                })
+              })
+            ))
+        ) as Effect.Effect<Q["successSchema"]["Type"], Q["errorSchema"]["Type"] | ReplicaError.ReplicaError>
       const reactivityKeys = (query: Query.Any) =>
         [...new Set(query.dependsOn.flatMap((projection) => [projection.name, projection.document.name]))]
       return QueryExecutor.of({
