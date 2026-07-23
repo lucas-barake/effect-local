@@ -9,6 +9,7 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import { vi } from "vitest"
 import * as DocumentStore from "../src/DocumentStore.js"
 import * as InternalAutomerge from "../src/internal/automerge.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
@@ -54,6 +55,25 @@ describe("DocumentStore", () => {
       InternalAutomerge.free(persisted.automerge)
       InternalAutomerge.free(staged)
       InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Store)))
+
+  it.effect("frees the initialized automerge document when create fails", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      InternalAutomerge.free(created.automerge)
+      const initSpy = vi.spyOn(InternalAutomerge, "initialize")
+      // Reusing an existing documentId violates the effect_local_documents primary key,
+      // failing the insert after the Automerge document is already initialized.
+      const exit = yield* Effect.exit(store.create(Task, documentId, { title: "duplicate", labels: [] }))
+      assert.strictEqual(exit._tag, "Failure")
+      const leaked = initSpy.mock.results.at(-1)?.value as InternalAutomerge.AnyDocument | undefined
+      initSpy.mockRestore()
+      assert.isDefined(leaked)
+      // A failed create must free the document it initialized; a freed document
+      // throws on any access, a leaked one is still usable.
+      assert.throws(() => InternalAutomerge.heads(leaked!))
     }).pipe(Effect.provide(Store)))
 
   it.effect("rolls application rows back with an outer transaction", () =>

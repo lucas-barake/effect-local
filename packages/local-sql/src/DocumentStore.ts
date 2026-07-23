@@ -108,30 +108,34 @@ export const layer: Layer.Layer<
                 })
               })
           })
-          const heads = InternalAutomerge.heads(automerge)
-          const sequence = yield* nextSequence
-          const acceptedAt = DateTime.formatIso(yield* DateTime.now)
-          yield* sql`INSERT INTO effect_local_documents (
-            document_id, document_type, schema_version, observed_versions,
-            materialized_heads, accepted_heads, tombstone, projection_status, checkpoint_hash
-          ) VALUES (
-            ${documentId}, ${document.name}, ${document.version}, ${Schema.encodeSync(Versions)([document.version])},
-            ${Schema.encodeSync(Heads)(heads)}, ${Schema.encodeSync(Heads)(heads)}, 0, 'Ready', NULL
-          )`
-          for (const change of InternalAutomerge.changesSince(automerge, [])) {
-            yield* sql`INSERT INTO effect_local_changes (
-              change_hash, document_id, document_type, writer_schema_version, writer_definition_hash,
-              actor, sequence, dependencies, bytes, applied, peer_id, accepted_at, commit_sequence
+          return yield* Effect.gen(function*() {
+            const heads = InternalAutomerge.heads(automerge)
+            const sequence = yield* nextSequence
+            const acceptedAt = DateTime.formatIso(yield* DateTime.now)
+            yield* sql`INSERT INTO effect_local_documents (
+              document_id, document_type, schema_version, observed_versions,
+              materialized_heads, accepted_heads, tombstone, projection_status, checkpoint_hash
             ) VALUES (
-              ${change.hash}, ${documentId}, ${document.name}, ${document.version}, 'local',
-              ${change.actor}, ${change.sequence}, ${Schema.encodeSync(Heads)(change.dependencies)}, ${change.bytes}, 1,
-              NULL, ${acceptedAt}, ${sequence}
+              ${documentId}, ${document.name}, ${document.version}, ${Schema.encodeSync(Versions)([document.version])},
+              ${Schema.encodeSync(Heads)(heads)}, ${Schema.encodeSync(Heads)(heads)}, 0, 'Ready', NULL
             )`
-          }
-          yield* sql`INSERT INTO effect_local_commit_outbox (
-            commit_sequence, document_id, invalidation_keys, published
-          ) VALUES (${sequence}, ${documentId}, ${Schema.encodeSync(Heads)([document.name])}, 0)`
-          return yield* recovery.recover(document, documentId).pipe(
+            for (const change of InternalAutomerge.changesSince(automerge, [])) {
+              yield* sql`INSERT INTO effect_local_changes (
+                change_hash, document_id, document_type, writer_schema_version, writer_definition_hash,
+                actor, sequence, dependencies, bytes, applied, peer_id, accepted_at, commit_sequence
+              ) VALUES (
+                ${change.hash}, ${documentId}, ${document.name}, ${document.version}, 'local',
+                ${change.actor}, ${change.sequence}, ${
+                Schema.encodeSync(Heads)(change.dependencies)
+              }, ${change.bytes}, 1,
+                NULL, ${acceptedAt}, ${sequence}
+              )`
+            }
+            yield* sql`INSERT INTO effect_local_commit_outbox (
+              commit_sequence, document_id, invalidation_keys, published
+            ) VALUES (${sequence}, ${documentId}, ${Schema.encodeSync(Heads)([document.name])}, 0)`
+            return yield* recovery.recover(document, documentId)
+          }).pipe(
             Effect.ensuring(Effect.sync(() => InternalAutomerge.free(automerge)))
           )
         })).pipe(
