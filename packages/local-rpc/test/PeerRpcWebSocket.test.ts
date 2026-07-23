@@ -9,11 +9,13 @@ import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
@@ -143,7 +145,11 @@ describe("PeerRpc WebSocket", () => {
         const AuthenticationLive = PeerAuthentication.layerServer.pipe(
           Layer.provide(ServerDependencies)
         )
-        const PeerHandlersLive = PeerRpcServer.layerHandlers({ tenantId: "tenant", peerId: serverPeerId }).pipe(
+        const PeerHandlersLive = PeerRpcServer.layerHandlers({
+          tenantId: "tenant",
+          peerId: serverPeerId,
+          definitionHash: definition.hash
+        }).pipe(
           Layer.provide(ServerDependencies)
         )
         const WsProtocol = RpcServer.layerProtocolWebsocket({ path: "/rpc" }).pipe(
@@ -190,7 +196,8 @@ describe("PeerRpc WebSocket", () => {
             const client = yield* PeerRpc.makeRpcClient.pipe(Effect.provide(clientContext))
             const session = yield* RpcPeerTransport.makeSession(client, {
               peerId: serverPeerId,
-              documents: [{ document: Task, documentId }]
+              documents: [{ document: Task, documentId }],
+              definitionHash: definition.hash
             }).pipe(Effect.provide(clientEngineContext))
 
             assert.strictEqual(session.peerId, serverPeerId)
@@ -322,7 +329,11 @@ describe("PeerRpc WebSocket", () => {
           )
         )
         const AuthenticationLive = PeerAuthentication.layerServer.pipe(Layer.provide(ServerDependencies))
-        const PeerHandlersLive = PeerRpcServer.layerHandlers({ tenantId: "tenant", peerId: serverPeerId }).pipe(
+        const PeerHandlersLive = PeerRpcServer.layerHandlers({
+          tenantId: "tenant",
+          peerId: serverPeerId,
+          definitionHash: definition.hash
+        }).pipe(
           Layer.provide(ServerDependencies)
         )
         const WsProtocol = RpcServer.layerProtocolWebsocket({ path: "/rpc" }).pipe(Layer.provide(HttpRouter.layer))
@@ -367,7 +378,8 @@ describe("PeerRpc WebSocket", () => {
             const client = yield* PeerRpc.makeRpcClient.pipe(Effect.provide(clientContext))
             return yield* RpcPeerTransport.makeSession(client, {
               peerId: serverPeerId,
-              documents: [{ document: Task, documentId }]
+              documents: [{ document: Task, documentId }],
+              definitionHash: definition.hash
             }).pipe(Effect.provide(clientEngineContext))
           })
 
@@ -514,7 +526,11 @@ describe("PeerRpc WebSocket", () => {
           )
         )
         const AuthenticationLive = PeerAuthentication.layerServer.pipe(Layer.provide(ServerDependencies))
-        const PeerHandlersLive = PeerRpcServer.layerHandlers({ tenantId: "tenant", peerId: serverPeerId }).pipe(
+        const PeerHandlersLive = PeerRpcServer.layerHandlers({
+          tenantId: "tenant",
+          peerId: serverPeerId,
+          definitionHash: definition.hash
+        }).pipe(
           Layer.provide(ServerDependencies)
         )
         const WsProtocol = RpcServer.layerProtocolWebsocket({ path: "/rpc" }).pipe(Layer.provide(HttpRouter.layer))
@@ -552,7 +568,8 @@ describe("PeerRpc WebSocket", () => {
           const client = yield* buildClient
           yield* RpcPeerTransport.makeSession(client, {
             peerId: serverPeerId,
-            documents: [{ document: Task, documentId }]
+            documents: [{ document: Task, documentId }],
+            definitionHash: definition.hash
           }).pipe(Effect.provide(clientEngineContext))
           yield* clientReplica.mutate(AddLabel, {
             commandId: yield* Identity.makeCommandId,
@@ -578,6 +595,7 @@ describe("PeerRpc WebSocket", () => {
           const error = yield* client.Open({
             protocolVersion: PeerRpc.protocolVersion + 1,
             expectedPeerId: serverPeerId,
+            definitionHash: definition.hash,
             documents: [{ documentType: Task.name, documentId }]
           }).pipe(Stream.runDrain, Effect.flip)
           assert.strictEqual(error._tag, "UnsupportedVersion")
@@ -594,7 +612,8 @@ describe("PeerRpc WebSocket", () => {
           const client = yield* buildClient
           yield* RpcPeerTransport.makeSession(client, {
             peerId: serverPeerId,
-            documents: [{ document: Task, documentId }]
+            documents: [{ document: Task, documentId }],
+            definitionHash: definition.hash
           }).pipe(Effect.provide(clientEngineContext))
           yield* clientReplica.mutate(AddLabel, {
             commandId: yield* Identity.makeCommandId,
@@ -618,5 +637,161 @@ describe("PeerRpc WebSocket", () => {
         ReplicaLimits.layer(TestReplica.defaultLimits)
       ])),
     20_000
+  )
+
+  it.live(
+    "rejects a definition-hash-skewed peer at session open and syncs no data",
+    () =>
+      Effect.scoped(Effect.gen(function*() {
+        const SkewTask = Document.make("WebSocketSkewTask", {
+          schema: Schema.Struct({ title: Schema.String, labels: Schema.Array(Schema.String) }),
+          version: 1
+        })
+        const SkewAddLabel = Mutation.make("WebSocketSkewTask.AddLabel", { document: SkewTask, payload: Schema.String })
+        const serverDefinition = ReplicaDefinition.make({
+          name: "rpc-skew-test",
+          documents: DocumentSet.make(SkewTask),
+          mutations: [SkewAddLabel],
+          projections: [],
+          queries: []
+        })
+        const SkewTaskV2 = Document.make("WebSocketSkewTask", {
+          schema: Schema.Struct({ title: Schema.String, labels: Schema.Array(Schema.String) }),
+          version: 2
+        })
+        const SkewAddLabelV2 = Mutation.make("WebSocketSkewTask.AddLabel", {
+          document: SkewTaskV2,
+          payload: Schema.String
+        })
+        const clientDefinition = ReplicaDefinition.make({
+          name: "rpc-skew-test",
+          documents: DocumentSet.make(SkewTaskV2),
+          mutations: [SkewAddLabelV2],
+          projections: [],
+          queries: []
+        })
+        assert.notStrictEqual(serverDefinition.hash, clientDefinition.hash)
+
+        const ServerReplicaLive = TestReplica.layer(serverDefinition, { projections: [] }).pipe(
+          Layer.provide(SkewAddLabel.toLayer(({ draft, payload }) => {
+            draft.labels.push(payload)
+            return undefined
+          }))
+        )
+        const ClientReplicaLive = TestReplica.layer(clientDefinition, { projections: [] }).pipe(
+          Layer.provide(SkewAddLabelV2.toLayer(({ draft, payload }) => {
+            draft.labels.push(payload)
+            return undefined
+          }))
+        )
+        const serverEngineContext = yield* Layer.build(ServerReplicaLive)
+        const clientEngineContext = yield* Layer.build(ClientReplicaLive)
+        const serverReplica = Context.get(serverEngineContext, Replica.Replica)
+        const clientReplica = Context.get(clientEngineContext, Replica.Replica)
+        const serverSharding = Context.get(serverEngineContext, Sharding.Sharding)
+        const clientSharding = Context.get(clientEngineContext, Sharding.Sharding)
+
+        // Two skewed builds own the same logical document: seed the same deterministic id on both.
+        const sharedCommandId = yield* Identity.makeCommandId
+        const createdServer = yield* serverReplica.create(SkewTask, {
+          commandId: sharedCommandId,
+          value: { title: "seed", labels: [] }
+        })
+        const documentId = yield* CommandOutcome.committedOrFail(createdServer)
+        const createdClient = yield* clientReplica.create(SkewTaskV2, {
+          commandId: sharedCommandId,
+          value: { title: "seed", labels: [] }
+        })
+        assert.strictEqual(documentId, yield* CommandOutcome.committedOrFail(createdClient))
+
+        const ServerDependencies = Layer.mergeAll(
+          PeerRpcLimits.layerDefaults,
+          Layer.succeed(PeerAuthenticator.PeerAuthenticator)({
+            authenticate: () =>
+              Effect.succeed({
+                principal: PeerAuthentication.PeerPrincipal.make({
+                  tenantId: "tenant",
+                  subjectId: "websocket-client",
+                  peerId: clientPeerId
+                }),
+                validUntil: Number.MAX_SAFE_INTEGER,
+                invalidated: Effect.never
+              })
+          }),
+          PeerAuthorization.layer(() =>
+            Effect.succeed({
+              documents: [{ document: SkewTask, documentId }],
+              validUntil: Number.MAX_SAFE_INTEGER,
+              invalidated: Effect.never
+            })
+          )
+        )
+        const AuthenticationLive = PeerAuthentication.layerServer.pipe(Layer.provide(ServerDependencies))
+        const PeerHandlersLive = PeerRpcServer.layerHandlers({
+          tenantId: "tenant",
+          peerId: serverPeerId,
+          definitionHash: serverDefinition.hash
+        }).pipe(
+          Layer.provide(ServerDependencies)
+        )
+        const WsProtocol = RpcServer.layerProtocolWebsocket({ path: "/rpc" }).pipe(Layer.provide(HttpRouter.layer))
+        const RpcLive = RpcServer.layer(PeerRpc.Rpcs, { disableFatalDefects: true }).pipe(
+          Layer.provide([PeerHandlersLive, AuthenticationLive])
+        )
+        const WebSocketServerLive = RpcLive.pipe(
+          Layer.provideMerge(WsProtocol),
+          Layer.provide(HttpRouter.serve(WsProtocol, { disableListenLog: true, disableLogger: true }))
+        )
+        const serverContext = yield* Layer.build(WebSocketServerLive.pipe(
+          Layer.provideMerge(NodeHttpServer.layerTest),
+          Layer.provide(RpcSerialization.layerMsgPack)
+        )).pipe(Effect.provide(serverEngineContext))
+        const address = Context.get(serverContext, HttpServer.HttpServer).address
+        if (address._tag !== "TcpAddress") return yield* Effect.die("Expected a TCP test server address")
+
+        const CredentialsLive = Layer.succeed(PeerCredentials.PeerCredentials)({
+          get: Effect.sync(() => Redacted.make("client-payload-credential"))
+        })
+        const ClientAuthenticationLive = PeerAuthentication.layerClient.pipe(Layer.provide(CredentialsLive))
+
+        const openExit = yield* Effect.scoped(Effect.gen(function*() {
+          const ClientProtocolLive = RpcClient.layerProtocolSocket().pipe(
+            Layer.provide([
+              NodeSocket.layerWebSocket(`ws://127.0.0.1:${address.port}/rpc`),
+              RpcSerialization.layerMsgPack
+            ])
+          )
+          const clientContext = yield* Layer.build(Layer.merge(ClientProtocolLive, ClientAuthenticationLive))
+          const client = yield* PeerRpc.makeRpcClient.pipe(Effect.provide(clientContext))
+          return yield* RpcPeerTransport.makeSession(client, {
+            peerId: serverPeerId,
+            documents: [{ document: SkewTaskV2, documentId }],
+            definitionHash: clientDefinition.hash
+          }).pipe(Effect.provide(clientEngineContext))
+        })).pipe(Effect.exit)
+
+        assert.isTrue(Exit.isFailure(openExit), "skewed session must be rejected at open")
+        if (Exit.isFailure(openExit)) {
+          const error = Cause.findErrorOption(openExit.cause)
+          assert.isTrue(Option.isSome(error) && error.value.reason._tag === "ProtocolMismatch")
+        }
+
+        // No data crossed the rejected boundary: a client mutation never reaches the server.
+        yield* clientReplica.mutate(SkewAddLabelV2, {
+          commandId: yield* Identity.makeCommandId,
+          documentId,
+          payload: "from-skewed-client"
+        })
+        for (let attempt = 0; attempt < 30; attempt++) {
+          yield* Effect.all([serverSharding.pollStorage, clientSharding.pollStorage], { discard: true })
+          yield* Effect.sleep("10 millis")
+        }
+        const serverSnapshot = yield* serverReplica.get(SkewTask, documentId)
+        assert.deepStrictEqual(serverSnapshot.value.labels, [])
+      })).pipe(Effect.provide([
+        NodeCrypto.layer,
+        ReplicaLimits.layer(TestReplica.defaultLimits)
+      ])),
+    30_000
   )
 })

@@ -138,7 +138,9 @@ const authorizationFailure = (
   return Effect.fail(new PeerRpcError.ServerUnavailable())
 }
 
-export const layerHandlers = (options: { readonly tenantId: string; readonly peerId: Identity.PeerId }) =>
+export const layerHandlers = (
+  options: { readonly tenantId: string; readonly peerId: Identity.PeerId; readonly definitionHash: string }
+) =>
   PeerRpc.Rpcs.toLayer(Effect.gen(function*() {
     const serverScope = yield* Scope.Scope
     const runtimeScope = yield* Scope.fork(serverScope, "parallel")
@@ -836,6 +838,7 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
         if (authenticated.principal.tenantId !== options.tenantId) return yield* new PeerRpcError.AccessDenied()
         if (request.protocolVersion !== PeerRpc.protocolVersion) return yield* new PeerRpcError.UnsupportedVersion()
         if (request.expectedPeerId !== options.peerId) return yield* new PeerRpcError.PeerMismatch()
+        if (request.definitionHash !== options.definitionHash) return yield* new PeerRpcError.DefinitionMismatch()
         if (request.documents.length === 0) return yield* new PeerRpcError.InvalidRequest()
         const requested = new Set(request.documents.map((entry) => `${entry.documentType}:${entry.documentId}`))
         if (requested.size !== request.documents.length) return yield* new PeerRpcError.InvalidRequest()
@@ -1036,6 +1039,7 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
           return "AuthorizationDenied" as const
         case "UnsupportedVersion":
         case "PeerMismatch":
+        case "DefinitionMismatch":
         case "InvalidRequest":
         case "RequestLimitExceeded":
           return "ProtocolRejected" as const

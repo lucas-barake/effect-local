@@ -32,6 +32,7 @@ const otherPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000
 const sessionId = Identity.SessionId.make("ses_00000000-0000-4000-8000-000000000001")
 const otherSessionId = Identity.SessionId.make("ses_00000000-0000-4000-8000-000000000002")
 const documents = [{ document: Task, documentId }]
+const definitionHash = "def_00000000000000000000000000000000"
 
 const opened = (peerId: Identity.PeerId, openSessionId: Identity.SessionId) =>
   PeerRpc.Opened.make({
@@ -53,7 +54,7 @@ const makeClient = (
 
 const connect = (client: PeerRpc.RpcClient, peerId: Identity.PeerId) =>
   Effect.gen(function*() {
-    const context = yield* Layer.build(RpcPeerTransport.layer(client, { documents }))
+    const context = yield* Layer.build(RpcPeerTransport.layer(client, { documents, definitionHash }))
     return yield* Context.get(context, PeerTransport.PeerTransport).connect({ replicaId, peerId })
   })
 
@@ -464,7 +465,7 @@ describe("RpcPeerTransport", () => {
   it.effect("reports storeAndForward false", () =>
     Effect.scoped(Effect.gen(function*() {
       const client = makeClient(() => liveOpen(serverOpened), () => Effect.void)
-      const context = yield* Layer.build(RpcPeerTransport.layer(client, { documents }))
+      const context = yield* Layer.build(RpcPeerTransport.layer(client, { documents, definitionHash }))
       const transport = Context.get(context, PeerTransport.PeerTransport)
       assert.isFalse(transport.capabilities.storeAndForward)
       const connection = yield* transport.connect({ replicaId, peerId: serverPeerId })
@@ -617,7 +618,7 @@ describe("RpcPeerTransport", () => {
         () => liveOpen(serverOpened),
         (request) => Deferred.succeed(pushed, request).pipe(Effect.asVoid)
       )
-      const context = yield* Layer.build(RpcPeerTransport.layer(client, { documents }))
+      const context = yield* Layer.build(RpcPeerTransport.layer(client, { documents, definitionHash }))
       const connection = yield* Context.get(context, PeerTransport.PeerTransport).connect({
         replicaId,
         peerId: serverPeerId
