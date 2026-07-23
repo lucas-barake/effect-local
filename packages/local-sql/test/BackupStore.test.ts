@@ -437,6 +437,11 @@ describe("BackupStore", () => {
         installationId
       }))
       assert.strictEqual(error.reason._tag, "BackupInvalid")
+      const sql = yield* SqlClient.SqlClient
+      const installations = yield* sql<{ readonly installation_id: string; readonly mode: string }>`
+        SELECT installation_id, mode FROM effect_local_backup_installations
+      `
+      assert.deepStrictEqual(installations, [{ installation_id: installationId, mode: "replace" }])
     }).pipe(Effect.provide(Live)))
 
   it.effect("rolls back the claimed generation when checksum-valid records fail insertion", () =>
