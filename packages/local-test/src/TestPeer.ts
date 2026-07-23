@@ -164,12 +164,16 @@ export const make = (
       yield* validate(packet, decision)
       const connection = (yield* SubscriptionRef.get(routes)).get(route(from, to))
       if (connection === undefined) return yield* new ConnectionClosed({ from, to })
-      if ((yield* Ref.get(partitions)).has(route(from, to)) || decision.drop) return
+      if ((yield* Ref.get(partitions)).has(route(from, to)) || decision.drop) {
+        if (!Ref.getUnsafe(sourceActive)) return yield* new ConnectionClosed({ from, to })
+        return
+      }
       const scheduled = { packet, decision, queue: connection.queue, sourceActive }
       const pending = yield* Ref.modify(held, (current): readonly [
-        ReadonlyArray<Scheduled> | undefined,
+        ReadonlyArray<Scheduled> | false | undefined,
         ReadonlyMap<string, Scheduled>
       ] => {
+        if (!Ref.getUnsafe(sourceActive)) return [false, current]
         const key = route(from, to)
         const candidate = current.get(key)
         const previous = candidate?.queue === scheduled.queue && candidate.sourceActive === scheduled.sourceActive
@@ -185,6 +189,7 @@ export const make = (
         next.delete(key)
         return [[scheduled, previous], next]
       })
+      if (pending === false) return yield* new ConnectionClosed({ from, to })
       if (pending === undefined) return
       const [current, ...deferred] = pending
       yield* deliver(current)
@@ -213,10 +218,11 @@ export const make = (
                 return next
               }),
               Ref.update(held, (current) => {
-                const key = route(to, from)
-                if (current.get(key)?.queue !== inbound) return current
                 const next = new Map(current)
-                next.delete(key)
+                const inboundKey = route(to, from)
+                if (next.get(inboundKey)?.queue === inbound) next.delete(inboundKey)
+                const outboundKey = route(from, to)
+                if (next.get(outboundKey)?.sourceActive === active) next.delete(outboundKey)
                 return next
               }),
               Queue.shutdown(inbound)
@@ -225,23 +231,26 @@ export const make = (
         )
       )
       yield* Effect.addFinalizer(() => close)
-      const previous = yield* SubscriptionRef.modify(routes, (current) => {
-        const key = route(to, from)
-        const next = new Map(current)
-        next.set(key, { active, queue: inbound })
-        return [current.get(key), next]
-      })
-      if (previous !== undefined) {
-        yield* Ref.update(held, (current) => {
+      yield* Effect.uninterruptible(Effect.gen(function*() {
+        const previous = yield* SubscriptionRef.modify(routes, (current) => {
           const key = route(to, from)
-          if (current.get(key)?.queue !== previous.queue) return current
           const next = new Map(current)
-          next.delete(key)
-          return next
+          next.set(key, { active, queue: inbound })
+          return [current.get(key), next]
         })
-        yield* Ref.set(previous.active, false)
-        yield* Queue.shutdown(previous.queue)
-      }
+        if (previous !== undefined) {
+          yield* Ref.set(previous.active, false)
+          yield* Ref.update(held, (current) => {
+            const next = new Map(current)
+            const inboundKey = route(to, from)
+            if (next.get(inboundKey)?.queue === previous.queue) next.delete(inboundKey)
+            const outboundKey = route(from, to)
+            if (next.get(outboundKey)?.sourceActive === previous.active) next.delete(outboundKey)
+            return next
+          })
+          yield* Queue.shutdown(previous.queue)
+        }
+      }))
       return {
         from,
         to,
