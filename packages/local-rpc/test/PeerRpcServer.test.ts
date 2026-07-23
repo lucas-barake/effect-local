@@ -1963,4 +1963,54 @@ describe("PeerRpcServer", () => {
       Effect.provideService(Tracer.Tracer, tracer)
     )
   })
+
+  it.effect("rejects Push beyond the per subject burst", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const fixture = yield* makeFixture({
+        ...baseOptions,
+        rpcLimits: { pushBurst: 1, pushRatePerSecond: Number.MIN_VALUE }
+      })
+      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
+      yield* fixture.client.Push({ sessionId: session.opened.sessionId, payload: yield* fixture.encode(0) })
+      assert.strictEqual(yield* Queue.take(fixture.received), 0)
+      const rejected = yield* fixture.client.Push({
+        sessionId: session.opened.sessionId,
+        payload: yield* fixture.encode(1)
+      }).pipe(Effect.flip)
+      assert.instanceOf(rejected, PeerRpcError.RequestCapacityExceeded)
+      assert.strictEqual((yield* Queue.poll(fixture.received))._tag, "None")
+      yield* Fiber.interrupt(session.fiber)
+    })))
+
+  it.effect("rejects a Push payload beyond the sync envelope limit", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const fixture = yield* makeFixture(baseOptions)
+      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
+      const oversized = new Uint8Array(
+        PeerSession.maximumSyncEnvelopeBytes(replicaLimits.maxSyncMessageBytes) + 1
+      )
+      const rejected = yield* fixture.client.Push({
+        sessionId: session.opened.sessionId,
+        payload: oversized
+      }).pipe(Effect.flip)
+      assert.instanceOf(rejected, PeerRpcError.RequestLimitExceeded)
+      assert.strictEqual((yield* Queue.poll(fixture.received))._tag, "None")
+      yield* Fiber.interrupt(session.fiber)
+    })))
+
+  it.effect("marks every session dirty on a full refresh commit", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const fixture = yield* makeFixture(baseOptions)
+      const task = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
+      assert.strictEqual(yield* Queue.take(fixture.generated), taskId)
+      yield* fixture.setCredential("foreign")
+      const note = yield* fixture.open([{ documentType: Note.name, documentId: noteId }])
+      assert.strictEqual(yield* Queue.take(fixture.generated), noteId)
+      yield* Queue.offer(fixture.commits, { _tag: "FullRefreshRequired", refreshGeneration: 1 })
+      yield* Queue.take(fixture.commitProcessed)
+      const refreshed = yield* Effect.all([Queue.take(fixture.generated), Queue.take(fixture.generated)])
+      assert.deepStrictEqual(new Set(refreshed), new Set([taskId, noteId]))
+      yield* Fiber.interrupt(task.fiber)
+      yield* Fiber.interrupt(note.fiber)
+    })))
 })
