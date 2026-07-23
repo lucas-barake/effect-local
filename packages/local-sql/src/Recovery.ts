@@ -278,6 +278,13 @@ export const make = Effect.gen(function*() {
           })
         })
       }
+      const commitSequence = yield* Identity.CommitSequence.makeEffect(row.commit_sequence).pipe(
+        Effect.mapError((cause) =>
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({ cause })
+          })
+        )
+      )
       const actor = InternalAutomerge.actorId(permit.replicaId, permit.writerGeneration, documentId)
       const parsedHeads = yield* Effect.result(Effect.try({
         try: () => ({
@@ -404,7 +411,7 @@ export const make = Effect.gen(function*() {
           },
           materializedHeads,
           acceptedHeads,
-          commitSequence: Identity.CommitSequence.make(row.commit_sequence)
+          commitSequence
         }
       }
 

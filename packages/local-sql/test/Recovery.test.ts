@@ -110,6 +110,28 @@ describe("Recovery", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(Services)))
 
+  it.effect("reports invalid commit sequence metadata as storage corruption", () =>
+    Effect.gen(function*() {
+      const recovery = yield* Recovery.Recovery
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one" })
+
+      yield* sql`UPDATE effect_local_metadata
+        SET commit_sequence = -1
+        WHERE singleton = 1`
+
+      const result = yield* Effect.result(recovery.recover(Task, documentId)).pipe(
+        Effect.ensuring(Effect.sync(() => InternalAutomerge.free(created.automerge)))
+      )
+
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure.reason._tag, "StorageCorrupt")
+      }
+    }).pipe(Effect.provide(Services)))
+
   it.effect("rolls back quarantine writes when the replica permit changes", () =>
     Effect.gen(function*() {
       const recovery = yield* Recovery.Recovery
