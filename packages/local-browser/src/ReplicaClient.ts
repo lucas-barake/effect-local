@@ -281,15 +281,19 @@ export const fromRpcClient = (
           }
           if (event._tag === "InvalidationsReady") {
             const refresh = state.watermark === undefined
-              ? event.refreshGeneration > 0
+              ? event.watermark > 0 || event.refreshGeneration > 0
               : event.watermark !== state.watermark || event.refreshGeneration !== state.refreshGeneration
             return [
               { ...state, watermark: event.watermark, refreshGeneration: event.refreshGeneration },
               refresh ? [fullRefresh(event.ownerEpoch)] : []
             ]
           }
-          if (event._tag === "FullRefreshRequired") return [state, [event]]
-          if (state.watermark === undefined) return [state, [fullRefresh(event.ownerEpoch)]]
+          if (event._tag === "FullRefreshRequired") {
+            return [{ ...state, watermark: undefined, refreshGeneration: undefined }, [event]]
+          }
+          if (state.watermark === undefined) {
+            return [{ ...state, watermark: event.sequence }, [fullRefresh(event.ownerEpoch)]]
+          }
           if (event.sequence <= state.watermark) return [state, []]
           if (event.sequence === state.watermark + 1) {
             return [{ ...state, watermark: event.sequence }, [event]]
