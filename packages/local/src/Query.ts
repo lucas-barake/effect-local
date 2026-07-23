@@ -2,7 +2,7 @@ import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
-import type * as Scope from "effect/Scope"
+import * as Scope from "effect/Scope"
 import type * as Document from "./Document.js"
 import * as SchemaInput from "./internal/schemaInput.js"
 import type * as TaggedError from "./internal/taggedError.js"
@@ -49,7 +49,7 @@ export interface Query<
     build:
       | Handler<P["Type"], A["Type"], E["Type"], R>
       | Effect.Effect<Handler<P["Type"], A["Type"], E["Type"], R>, EX, RX>
-  ) => Layer.Layer<HandlerService<Name, P, A, E, Dependencies>, EX, R | Exclude<RX, Scope.Scope>>
+  ) => Layer.Layer<HandlerService<Name, P, A, E, Dependencies>, EX, Exclude<R | RX, Scope.Scope>>
 }
 
 export interface Any {
@@ -97,14 +97,20 @@ export const make = <
   ): Layer.Layer<
     HandlerService<Name, SchemaInput.Wire<P>, A, E, Dependencies>,
     EX,
-    R | Exclude<RX, Scope.Scope>
+    Exclude<R | RX, Scope.Scope>
   > =>
     Layer.effect(
       handler,
       Effect.gen(function*() {
-        const context = yield* Effect.context<R>()
+        const context = Context.omit(Scope.Scope)(
+          yield* Effect.context<R | Scope.Scope>()
+        ) as Context.Context<R>
         const implementation = Effect.isEffect(build) ? yield* build : build
-        return (payload: SchemaInput.Wire<P>["Type"]) => implementation(payload).pipe(Effect.provide(context))
+        return (payload: SchemaInput.Wire<P>["Type"]) =>
+          implementation(payload).pipe(
+            Effect.provide(context),
+            Effect.scoped
+          )
       })
     )
   return {

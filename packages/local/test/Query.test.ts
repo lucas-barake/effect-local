@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
 import * as Document from "../src/Document.js"
 import * as Projection from "../src/Projection.js"
@@ -48,6 +49,26 @@ describe("Query", () => {
         ListTasks.toLayer(Effect.succeed((title) => Effect.succeed([{ title: title.toUpperCase() }])))
       )
     ))
+
+  it.effect("releases per-call resources when the call scope closes", () =>
+    Effect.gen(function*() {
+      const released = yield* Ref.make(false)
+      const ScopedQuery = Query.make("ScopedQuery", { dependsOn: [] })
+      yield* Effect.gen(function*() {
+        const handler = yield* ScopedQuery.handler
+        yield* Effect.scoped(handler(undefined))
+        assert.isTrue(yield* Ref.get(released))
+      }).pipe(
+        Effect.provide(
+          ScopedQuery.toLayer(() =>
+            Effect.acquireRelease(
+              Effect.void,
+              () => Ref.set(released, true)
+            )
+          )
+        )
+      )
+    }))
 
   it.effect("keeps same-name handler services independent", () => {
     const OtherListTasks = Query.make("ListTasks", {
