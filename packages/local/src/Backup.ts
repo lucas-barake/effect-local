@@ -20,14 +20,13 @@ export const MaxBytes = Schema.Int.check(Schema.isGreaterThan(0))
 
 export const validateMaxBytes = (maxBytes: number): Effect.Effect<number, ReplicaError.ReplicaError> =>
   Schema.decodeEffect(MaxBytes)(maxBytes).pipe(
-    Effect.catchTag("SchemaError", (cause) =>
-      Effect.fail(
-        new ReplicaError.ReplicaError({
-          reason: new ReplicaError.BackupInvalid({
-            cause
-          })
+    Effect.mapError((cause) =>
+      new ReplicaError.ReplicaError({
+        reason: new ReplicaError.BackupInvalid({
+          cause
         })
-      ))
+      })
+    )
   )
 
 export interface ExportOptions {

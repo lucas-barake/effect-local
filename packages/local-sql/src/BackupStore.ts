@@ -309,7 +309,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             const trailerBytes = recordBytes.reduce((total, bytes) => total + bytes.byteLength, 0) +
               endBytes.byteLength
             let declaredBytes = 0
-            let manifestLine = ""
+            let manifestBytes = new Uint8Array()
             for (let attempt = 0; attempt < 8; attempt++) {
               const manifest = yield* encodeEnvelope("Manifest", {
                 formatVersion: 1,
@@ -320,8 +320,9 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 recordCount: records.length,
                 declaredBytes
               })
-              manifestLine = yield* encodeEnvelopeJson(manifest)
-              const next = encoder.encode(`${manifestLine}\n`).byteLength + trailerBytes
+              const manifestLine = yield* encodeEnvelopeJson(manifest)
+              manifestBytes = encoder.encode(`${manifestLine}\n`)
+              const next = manifestBytes.byteLength + trailerBytes
               if (next === declaredBytes) break
               declaredBytes = next
             }
@@ -334,7 +335,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               })
             }
             const chunks: Array<Uint8Array<ArrayBuffer>> = []
-            for (const bytes of [encoder.encode(`${manifestLine}\n`), ...recordBytes, endBytes]) {
+            for (const bytes of [manifestBytes, ...recordBytes, endBytes]) {
               for (let offset = 0; offset < bytes.byteLength; offset += limits.maxChunkBytes) {
                 chunks.push(bytes.slice(offset, offset + limits.maxChunkBytes))
               }
