@@ -57,6 +57,17 @@ export const make = (
       }),
       execute: () => sql`SELECT document_id, document_type, schema_version FROM effect_local_documents`
     })
+    const findVersionSummary = SqlSchema.findAll({
+      Request: Schema.Void,
+      Result: Schema.Struct({
+        document_type: Schema.String,
+        min_version: Schema.Int,
+        max_version: Schema.Int
+      }),
+      execute: () =>
+        sql`SELECT document_type, MIN(schema_version) AS min_version, MAX(schema_version) AS max_version
+          FROM effect_local_documents GROUP BY document_type`
+    })
 
     const evolveDocument = (document: Document.Any, documentId: Identity.DocumentId) =>
       sql.withTransaction(
@@ -90,7 +101,15 @@ export const make = (
           .map((projection: Projection.Any) => projection.document.name)
       )
 
-      const rows = yield* findDocuments(undefined)
+      const summary = yield* findVersionSummary(undefined)
+      const needsScan = summary.some((row) => {
+        const document = DocumentSet.get(definition.documents, row.document_type)
+        return document === undefined ||
+          rebuildTypes.has(row.document_type) ||
+          row.min_version !== document.version ||
+          row.max_version !== document.version
+      })
+      const rows = needsScan ? yield* findDocuments(undefined) : []
       const migrated = new Map<string, number>()
       for (const row of rows) {
         const document = DocumentSet.get(definition.documents, row.document_type)
