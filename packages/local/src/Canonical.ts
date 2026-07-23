@@ -4,15 +4,40 @@ import * as Encoding from "effect/Encoding"
 import * as Schema from "effect/Schema"
 import * as ReplicaError from "./ReplicaError.js"
 
+// Non-JSON values encode as sentinel-prefixed strings, and plain strings that start
+// with the sentinel gain one more, so no input can forge another value's encoding.
+const sentinel = "\u001d"
+
+// instanceof is realm-bound, so cross-realm values would silently normalize as plain
+// objects; these brand checks keep one logical value on one encoding across realms.
+const isDate = (value: object): value is Date => Object.prototype.toString.call(value) === "[object Date]"
+
+const isUint8Array = (value: object): value is Uint8Array =>
+  ArrayBuffer.isView(value) && Object.prototype.toString.call(value) === "[object Uint8Array]"
+
 const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
-  if (typeof value === "function" || typeof value === "symbol") return String(value)
-  if (typeof value === "bigint") return value.toString()
-  if (value === null || typeof value !== "object") return value
-  if (value instanceof Date) return { _tag: "Date", value: value.toISOString() }
-  if (value instanceof Uint8Array) {
-    return { _tag: "Uint8Array", value: Encoding.encodeHex(value) }
+  switch (typeof value) {
+    case "string":
+      return value.startsWith(sentinel) ? sentinel + value : value
+    case "bigint":
+      return `${sentinel}bigint:${value}`
+    case "number":
+      return Number.isFinite(value) ? value : `${sentinel}number:${value}`
+    case "undefined":
+      return `${sentinel}undefined`
+    case "function":
+    case "symbol":
+      return `${sentinel}${typeof value}:${String(value)}`
   }
-  if (ancestors.has(value)) return "[Circular]"
+  if (value === null || typeof value !== "object") return value
+  if (isDate(value)) return `${sentinel}date:${value.toISOString()}`
+  if (isUint8Array(value)) return `${sentinel}bytes:${Encoding.encodeHex(value)}`
+  if (ArrayBuffer.isView(value)) {
+    return `${sentinel}view:${Object.prototype.toString.call(value).slice(8, -1)}:${
+      Encoding.encodeHex(new Uint8Array(value.buffer, value.byteOffset, value.byteLength))
+    }`
+  }
+  if (ancestors.has(value)) return `${sentinel}circular`
   ancestors.add(value)
   const result = Array.isArray(value)
     ? value.map((item) => normalize(item, ancestors))
