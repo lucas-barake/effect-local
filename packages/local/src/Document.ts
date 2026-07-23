@@ -47,7 +47,12 @@ export const isAutomergeValue = (value: unknown): boolean => {
         if (Automerge.isAutomerge(current)) return false
         if (seen.has(current)) return false
         seen.add(current)
-        if (Array.isArray(current)) return current.every(visit)
+        if (Array.isArray(current)) {
+          for (let index = 0; index < current.length; index++) {
+            if (!visit(current[index])) return false
+          }
+          return true
+        }
         if (Object.getPrototypeOf(current) !== Object.prototype && Object.getPrototypeOf(current) !== null) return false
         return Object.values(current).every(visit)
       }

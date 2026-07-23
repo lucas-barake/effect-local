@@ -39,6 +39,16 @@ describe("Document", () => {
     assert.isTrue(Document.isAutomergeValue(immutableString))
   })
 
+  it("rejects sparse arrays that Automerge treats as undefined", () => {
+    const items = new Array<string>(1)
+
+    assert.throws(() => {
+      const document = Automerge.from({ items })
+      Automerge.free(document)
+    })
+    assert.isFalse(Document.isAutomergeValue({ items }))
+  })
+
   it("rejects duplicate document names", () => {
     assert.throws(() => DocumentSet.make(Task, Task))
     assert.strictEqual(DocumentSet.get(DocumentSet.make(Task), "Task"), Task)
