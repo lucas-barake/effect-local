@@ -2,11 +2,14 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
+import type * as Crypto from "effect/Crypto"
 import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
+import type * as Migrator from "effect/unstable/sql/Migrator"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import { storageFormatVersion } from "./internal/schema.js"
 import * as Migrations from "./Migrations.js"
@@ -131,4 +134,10 @@ export const make = (definition: ReplicaDefinition.Any) =>
     )
   })
 
-export const layer = (definition: ReplicaDefinition.Any) => Layer.effect(ReplicaBootstrap, make(definition))
+export const layer = (
+  definition: ReplicaDefinition.Any
+): Layer.Layer<
+  ReplicaBootstrap,
+  Migrator.MigrationError | SqlError.SqlError | ReplicaError.ReplicaError,
+  Crypto.Crypto | SqlClient.SqlClient
+> => Layer.effect(ReplicaBootstrap, make(definition))
