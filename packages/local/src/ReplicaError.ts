@@ -42,6 +42,14 @@ export class CommandIdConflict extends Schema.TaggedErrorClass<CommandIdConflict
   commandId: Identity.CommandId
 }) {}
 
+export class ReceiptOperationMismatch extends Schema.TaggedErrorClass<ReceiptOperationMismatch>(
+  "@lucas-barake/effect-local/ReplicaError/ReceiptOperationMismatch"
+)("ReceiptOperationMismatch", {
+  commandId: Identity.CommandId,
+  expected: Schema.String,
+  observed: Schema.String
+}) {}
+
 export class StorageUnavailable extends Schema.TaggedErrorClass<StorageUnavailable>(
   "@lucas-barake/effect-local/ReplicaError/StorageUnavailable"
 )("StorageUnavailable", { cause: Schema.Defect() }) {}
@@ -104,6 +112,7 @@ export const Reason = Schema.Union([
   UnsupportedDocumentVersion,
   ProjectionBlocked,
   CommandIdConflict,
+  ReceiptOperationMismatch,
   StorageUnavailable,
   StorageCorrupt,
   QuotaExceeded,

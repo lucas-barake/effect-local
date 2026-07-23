@@ -99,6 +99,9 @@ export const make = <
   }
 ): Mutation<Name, D, SchemaInput.Wire<P>, A, E> => {
   if (name.length === 0) throw new TypeError("Mutation name must be nonempty")
+  if (name.startsWith("$")) {
+    throw new TypeError(`Mutation name must not start with "$", it is reserved for operation sentinels: ${name}`)
+  }
   const version = options.version ?? 1
   if (!Number.isSafeInteger(version) || version < 1) throw new TypeError("Mutation version must be a positive integer")
   const handler = Context.Service<

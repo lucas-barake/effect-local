@@ -13,7 +13,8 @@ A local command is acknowledged only after these records commit:
 `DocumentEntity` marks create, mutate, and delete RPCs as persisted, transactional, and client uninterruptible. Its
 primary key includes replica incarnation, command ID, and canonical request hash. A repeated matching request returns
 the stored reply. Reusing a command ID for different input reaches receipt validation and fails with
-`CommandIdConflict`.
+`CommandIdConflict`. Receipts record the operation that produced them, and a lookup under a different operation type
+or mutation fails with `ReceiptOperationMismatch`.
 
 The page acquires the shared operation gate before Cluster dispatch. The entity validates its captured writer epoch
 inside the transaction without reacquiring the gate. Restore can therefore acquire the exclusive gate without a

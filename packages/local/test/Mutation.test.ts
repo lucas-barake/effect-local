@@ -53,6 +53,17 @@ describe("Mutation", () => {
       )
     ))
 
+  it("rejects reserved mutation names", () => {
+    assert.throws(
+      () => Mutation.make("$create", { document: Task, payload: Schema.String }),
+      TypeError
+    )
+    assert.throws(
+      () => Mutation.make("$anything", { document: Task, payload: Schema.String }),
+      TypeError
+    )
+  })
+
   it("supports typed synchronous rejection", () => {
     const Checked = Mutation.make("Checked", {
       document: Task,

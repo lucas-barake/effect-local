@@ -24,6 +24,7 @@ const Heads = Schema.fromJsonString(Schema.Array(Schema.String))
 
 const ReceiptRow = Schema.Struct({
   request_hash: Schema.String,
+  mutation_name: Schema.String,
   result: Schema.Uint8Array
 })
 
@@ -206,7 +207,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
         }),
         Result: ReceiptRow,
         execute: ({ commandId, incarnation }) =>
-          sql`SELECT request_hash, result FROM effect_local_command_receipts
+          sql`SELECT request_hash, mutation_name, result FROM effect_local_command_receipts
             WHERE replica_incarnation = ${incarnation} AND command_id = ${commandId}`
       })
       const lookup = (commandId: Identity.CommandId, permit: ReplicaGate.Permit) =>
@@ -263,6 +264,26 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
         error: E,
         receipt: ReceiptRow
       ) => decodeResult(CommandOutcome.schema(success, error), receipt.result)
+
+      const operationLabel = (mutationName: string) =>
+        mutationName === "$create" ? "create" : mutationName === "$delete" ? "delete" : mutationName
+
+      const requireOperation = (
+        commandId: Identity.CommandId,
+        receipt: ReceiptRow,
+        expected: string
+      ) =>
+        receipt.mutation_name === expected
+          ? Effect.void
+          : Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ReceiptOperationMismatch({
+                commandId,
+                expected: operationLabel(expected),
+                observed: operationLabel(receipt.mutation_name)
+              })
+            })
+          )
 
       return CommandExecutor.of({
         create: (document, options) =>
@@ -482,19 +503,25 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
           lookup(commandId, permit).pipe(Effect.flatMap((receipt) =>
             Option.isNone(receipt)
               ? Effect.succeed(CommandOutcome.unknown(commandId))
-              : decodeReceipt(Identity.DocumentId, Schema.Never, receipt.value)
+              : requireOperation(commandId, receipt.value, "$create").pipe(
+                Effect.andThen(decodeReceipt(Identity.DocumentId, Schema.Never, receipt.value))
+              )
           )),
         lookupMutation: (mutation, commandId, permit) =>
           lookup(commandId, permit).pipe(Effect.flatMap((receipt) =>
             Option.isNone(receipt)
               ? Effect.succeed(CommandOutcome.unknown(commandId))
-              : decodeReceipt(mutation.successSchema, mutation.errorSchema, receipt.value)
+              : requireOperation(commandId, receipt.value, mutation.name).pipe(
+                Effect.andThen(decodeReceipt(mutation.successSchema, mutation.errorSchema, receipt.value))
+              )
           )),
         lookupDelete: (commandId, permit) =>
           lookup(commandId, permit).pipe(Effect.flatMap((receipt) =>
             Option.isNone(receipt)
               ? Effect.succeed(CommandOutcome.unknown(commandId))
-              : decodeReceipt(Schema.Void, Schema.Never, receipt.value)
+              : requireOperation(commandId, receipt.value, "$delete").pipe(
+                Effect.andThen(decodeReceipt(Schema.Void, Schema.Never, receipt.value))
+              )
           ))
       })
     })
