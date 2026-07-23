@@ -20,6 +20,7 @@ describe("public API", () => {
       "ReplicaError",
       "ReplicaLimits",
       "ReplicaStatus",
+      "SchemaDescriptor",
       "Snapshot"
     ])
   })

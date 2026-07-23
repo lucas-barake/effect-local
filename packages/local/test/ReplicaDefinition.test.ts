@@ -55,6 +55,61 @@ describe("ReplicaDefinition", () => {
     )
   })
 
+  it("keeps the hash stable across documentation annotations", () => {
+    const plain = ReplicaDefinition.make({
+      name: "tasks",
+      documents: DocumentSet.make(
+        Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
+      )
+    })
+    const documented = ReplicaDefinition.make({
+      name: "tasks",
+      documents: DocumentSet.make(
+        Document.make("Task", {
+          schema: Schema.Struct({
+            title: Schema.String.pipe(Schema.annotate({
+              description: "The task title",
+              title: "Title",
+              examples: ["Buy milk"]
+            }))
+          }),
+          version: 1
+        })
+      )
+    })
+    assert.strictEqual(plain.hash, documented.hash)
+  })
+
+  it("changes the hash when a document field codec changes", () => {
+    const plain = ReplicaDefinition.make({
+      name: "tasks",
+      documents: DocumentSet.make(
+        Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
+      )
+    })
+    const codec = ReplicaDefinition.make({
+      name: "tasks",
+      documents: DocumentSet.make(
+        Document.make("Task", { schema: Schema.Struct({ title: Schema.NumberFromString }), version: 1 })
+      )
+    })
+    assert.notStrictEqual(plain.hash, codec.hash)
+  })
+
+  it("changes the hash when a mutation payload codec changes", () => {
+    const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
+    const definitionWith = (payload: Document.WireSchema) =>
+      ReplicaDefinition.make({
+        name: "tasks",
+        documents: DocumentSet.make(Task),
+        mutations: [Mutation.make("Rename", { document: Task, payload })]
+      })
+    assert.notStrictEqual(
+      definitionWith(Schema.String).hash,
+      definitionWith(Schema.NumberFromString).hash
+    )
+  })
+
   it("defaults omitted collections to empty tuples", () => {
     const fixture = makeFixture()
     const minimal = ReplicaDefinition.make({
