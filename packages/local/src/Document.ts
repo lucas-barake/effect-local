@@ -41,8 +41,8 @@ export const isAutomergeValue = (value: unknown): boolean => {
         return Number.isFinite(current)
       case "object": {
         if (
-          current instanceof Date || current instanceof Uint8Array || current instanceof Automerge.Counter ||
-          current instanceof Automerge.ImmutableString
+          current instanceof Date || current instanceof Uint8Array || Automerge.isCounter(current) ||
+          Automerge.isImmutableString(current)
         ) return true
         if (Automerge.isAutomerge(current)) return false
         if (seen.has(current)) return false

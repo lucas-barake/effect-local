@@ -1,4 +1,6 @@
+import * as Automerge from "@automerge/automerge"
 import { assert, describe, it } from "@effect/vitest"
+import { createRequire } from "node:module"
 import * as Schema from "effect/Schema"
 import * as Document from "../src/Document.js"
 import * as DocumentSet from "../src/DocumentSet.js"
@@ -24,6 +26,17 @@ describe("Document", () => {
     assert.isFalse(Document.isAutomergeValue({ value: undefined }))
     assert.isFalse(Document.isAutomergeValue({ value: () => undefined }))
     assert.isTrue(Document.isAutomergeValue({ value: [1, "ok", null] }))
+  })
+
+  it("accepts Automerge scalar wrappers from another module instance", () => {
+    const OtherAutomerge = createRequire(import.meta.url)("@automerge/automerge") as typeof Automerge
+    const counter = new OtherAutomerge.Counter(1)
+    const immutableString = new OtherAutomerge.ImmutableString("one")
+
+    assert.isTrue(Automerge.isCounter(counter))
+    assert.isTrue(Automerge.isImmutableString(immutableString))
+    assert.isTrue(Document.isAutomergeValue(counter))
+    assert.isTrue(Document.isAutomergeValue(immutableString))
   })
 
   it("rejects duplicate document names", () => {
