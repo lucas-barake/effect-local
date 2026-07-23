@@ -1423,6 +1423,49 @@ describe("PeerRpcServer", () => {
       assert.instanceOf(error, PeerRpcError.SessionUnavailable)
     })))
 
+  it.effect(
+    "rejects a Push admitted while the losing lease monitor is still tearing down after authentication is invalidated",
+    () =>
+      Effect.scoped(Effect.gen(function*() {
+        const authorizationNeverInvalidates = yield* Deferred.make<void>()
+        const teardownStarted = yield* Deferred.make<void>()
+        const teardownRelease = yield* Deferred.make<void>()
+        const fixture = yield* makeFixture({
+          ...baseOptions,
+          authorization: (request) =>
+            Effect.succeed({
+              documents: request.documents.map((document) => ({ document: Task, documentId: document.documentId })),
+              validUntil: Number.MAX_SAFE_INTEGER,
+              invalidated: Deferred.await(authorizationNeverInvalidates).pipe(
+                Effect.onInterrupt(() =>
+                  Deferred.succeed(teardownStarted, undefined).pipe(Effect.andThen(Deferred.await(teardownRelease)))
+                )
+              )
+            })
+        })
+        const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
+
+        yield* Deferred.succeed(fixture.authenticationInvalidated, undefined)
+        yield* Deferred.await(teardownStarted)
+
+        yield* Effect.gen(function*() {
+          const rejection = yield* fixture.directPush({
+            sessionId: session.opened.sessionId,
+            payload: Uint8Array.of(1)
+          }).pipe(Effect.exit)
+
+          assert.isTrue(Exit.isFailure(rejection))
+          if (Exit.isFailure(rejection)) {
+            const error = Cause.findErrorOption(rejection.cause)
+            assert.strictEqual(error._tag, "Some")
+            if (error._tag === "Some") assert.instanceOf(error.value, PeerRpcError.SessionUnavailable)
+          }
+        }).pipe(Effect.ensuring(Deferred.succeed(teardownRelease, undefined)))
+
+        assert.isTrue(Exit.isFailure(yield* Fiber.await(session.fiber)))
+      }))
+  )
+
   for (const lease of ["authentication", "authorization"] as const) {
     it.effect(`revokes the active session when ${lease} expires`, () =>
       Effect.scoped(Effect.gen(function*() {
