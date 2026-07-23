@@ -22,9 +22,10 @@ Read this file before any work. Treat these rules as required for every package.
 
 ## Errors
 
-- Give public domain failures a stable `_tag`.
-- Use `Schema.TaggedErrorClass<Self>(identifier)("Tag", fields)` when an error must be decoded, encoded, or used in a Schema or RPC contract. Otherwise use `Data.TaggedError("Tag")<Fields>` or an existing Effect error type.
-- Prefer `_tag` for public typed failure discrimination and serialized values. Use `instanceof` only when same realm class identity is an intentional internal contract.
+- Define every library owned typed error with `Schema.TaggedErrorClass<Self>(identifier)("Tag", fields)`.
+- Give every typed failure a stable `_tag`. Do not add untagged or `Data.TaggedError` library error types.
+- Discriminate tagged errors with `_tag`. Do not use `instanceof` for error discrimination.
+- When a consumer error can share an infrastructure `_tag`, use the infrastructure package's precise guard instead of `catchTag`.
 - Use `Effect.catchTag` or `catchTags` for `_tag` failures. Use `catchReason` or `catchReasons` for nested tagged reasons. Use `catchIf`, `catchFilter`, or a specialized combinator for other selected typed failures.
 - Use `Effect.catch` only when one handler intentionally covers the complete typed failure channel. It does not catch defects or interruption.
 - Use `Effect.catchCause` only when the full `Cause` is required. Preserve or repropagate every cause case that is not intentionally recovered.
@@ -38,6 +39,8 @@ Read this file before any work. Treat these rules as required for every package.
 - For a service that requires cleanup, acquire it with `Effect.acquireRelease` or another scoped `Effect`, and provide it with `Layer.effect`.
 - Keep Layer construction configurable. Do not hide lifecycle, persistence, concurrency, or security choices behind defaults.
 - Do not capture consumer specific runtime values in module global state. Pass them through service implementations, Layer constructors, or operation arguments.
+- A Layer must capture every service used later by its methods or expose that service as a Layer requirement.
+- Export a constructor or use `Layer.fresh` when a context sensitive Layer must build independently more than once under one memo map.
 
 ## Composition And Effects
 
@@ -49,6 +52,17 @@ Read this file before any work. Treat these rules as required for every package.
 - Use Effect concurrency primitives with explicit owner, capacity, interruption, shutdown, and finalizer behavior.
 - Prefer `Effect.forkChild`, `forkScoped`, or `forkIn`. Use `forkDetach` only when global lifetime, shutdown, and failure observation are explicit.
 - Give queues, latches, subscriptions, and scopes a documented owner and cleanup path.
+- Attach cleanup immediately after acquiring a native resource so every later failure and interruption path releases it.
+- Recheck mutable admission, quota, and idempotency state inside the same lock or transaction that performs the write.
+
+## Persistence And Validation
+
+- Decode external, archive, and durable values with their domain Schemas before calling branded constructors.
+- Validate redundant persisted metadata, types, hashes, and sequence fields before replay.
+- Encode composite durable keys with an unambiguous structured representation.
+- Enforce uniqueness under every key domain used by downstream state and routing.
+- Deduplicate reactivity and subscription keys before registration.
+- Validate migration descriptors against the installed Migrator scheduling rules.
 
 ## Consumer API And Naming
 
