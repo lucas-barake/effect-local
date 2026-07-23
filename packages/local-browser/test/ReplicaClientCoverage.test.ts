@@ -12,6 +12,7 @@ import * as Layer from "effect/Layer"
 import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
 import { RpcTest } from "effect/unstable/rpc"
+import * as RpcClientError from "effect/unstable/rpc/RpcClientError"
 import * as ReplicaClient from "../src/ReplicaClient.js"
 import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
@@ -65,6 +66,49 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
     new ReplicaError.ReplicaError({
       reason: new ReplicaError.ProtocolMismatch({ expected: "active session", observed })
     })
+  const disconnected = () =>
+    new RpcClientError.RpcClientError({
+      reason: new RpcClientError.RpcClientDefect({ message: "disconnected", cause: "disconnected" })
+    })
+
+  it.effect("recovers the status stream after a transient failure and surfaces a degraded status", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const ready = { _tag: "Ready" as const, pendingCommands: 0 }
+      let statusCalls = 0
+      let activeStatus = 0
+      let concurrentStatus = 0
+      const reconnecting = new Proxy(rpc, {
+        get(target, property, receiver) {
+          if (property !== "Status") return Reflect.get(target, property, receiver)
+          return () =>
+            Stream.unwrap(Effect.sync(() => {
+              statusCalls++
+              activeStatus++
+              concurrentStatus = Math.max(concurrentStatus, activeStatus)
+              const attempt = statusCalls
+              return (attempt === 1
+                ? Stream.make(ready).pipe(Stream.concat(Stream.fail(disconnected())))
+                : Stream.make(ready).pipe(Stream.concat(Stream.never))).pipe(
+                  Stream.ensuring(Effect.sync(() => {
+                    activeStatus--
+                  }))
+                )
+            }))
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, reconnecting)
+      const fiber = yield* client.status.pipe(Stream.take(3), Stream.runCollect, Effect.forkChild)
+      yield* TestClock.adjust("1 second")
+      const collected = Array.from(yield* Fiber.join(fiber))
+      assert.deepStrictEqual(collected, [
+        ready,
+        { _tag: "Degraded", reason: "StorageUnavailable" },
+        ready
+      ])
+      assert.strictEqual(statusCalls, 2)
+      assert.strictEqual(concurrentStatus, 1)
+    })).pipe(Effect.provide(Owner)))
 
   it.effect("drops duplicate and stale invalidation sequences", () =>
     Effect.scoped(Effect.gen(function*() {

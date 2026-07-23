@@ -4,6 +4,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
@@ -32,6 +33,9 @@ export class ReplicaClient extends Context.Service<
 ) {}
 
 const isTransient = (error: ReplicaError.ReplicaError) => error.reason._tag === "StorageUnavailable"
+
+const isTransientStream = (error: ReplicaError.ReplicaError) =>
+  error.reason._tag === "StorageUnavailable" || error.reason._tag === "QuotaExceeded"
 
 const recoverCommand = <A,>(
   commandId: Identity.CommandId,
@@ -455,7 +459,17 @@ export const fromRpcClient = (
                 cause: error
               })
             })
-          ))
+          )),
+        Stream.catchIf(isTransientStream, (error) => {
+          const degraded: ReplicaStatus.ReplicaStatus = { _tag: "Degraded", reason: error.reason._tag }
+          return Stream.make(degraded).pipe(Stream.concat(Stream.fail(error)))
+        }),
+        Stream.retry(
+          Schedule.spaced("1 second").pipe(
+            Schedule.setInputType<ReplicaError.ReplicaError>(),
+            Schedule.while(({ input }) => isTransientStream(input))
+          )
+        )
       ),
       exportBackup: ({ maxBytes }) =>
         withSessionStream((session) => rpc.ExportBackup({ sessionId: session.sessionId, maxBytes })).pipe(
