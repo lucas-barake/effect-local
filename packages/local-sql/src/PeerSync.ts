@@ -860,7 +860,12 @@ export const layer: Layer.Layer<
                     })
                   })
                 }
-                const permit = yield* gate.shared
+                // gate.current, not gate.shared: the cluster serves ApplySync inside
+                // sql.withTransaction, and acquiring the gate while holding the SQLite
+                // connection inverts ReplicaGate.claim's gate-then-SQL lock order
+                // (restore-vs-ApplySync deadlock). Fencing is enforced by
+                // gate.validate inside the write transaction below.
+                const permit = yield* gate.current
                 yield* validateSession(permit, session)
                 const nowMillis = yield* Clock.currentTimeMillis
                 const acceptedAt = new Date(nowMillis).toISOString()
