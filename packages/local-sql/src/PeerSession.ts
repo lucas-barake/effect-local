@@ -311,7 +311,7 @@ const makeWithTerminal = (
 
     const receive = (bytes: Uint8Array) =>
       Effect.gen(function*() {
-        const { envelope, result } = yield* Effect.scoped(Effect.gen(function*() {
+        const { boundEpoch, envelope, incarnation } = yield* Effect.scoped(Effect.gen(function*() {
           const permit = yield* gate.shared
           if (permit.incarnation !== session.replicaIncarnation) {
             return yield* new ReplicaError.ReplicaError({
@@ -362,31 +362,31 @@ const makeWithTerminal = (
               })
             })
           }
-          const client = yield* entity(envelope.documentId)
-          const result = yield* client.ApplySync({
-            replicaIncarnation: permit.incarnation,
-            peerId: connection.peerId,
-            connectionEpoch: boundEpoch,
-            localConnectionEpoch: session.connectionEpoch,
-            receiveSequence: envelope.sequence,
-            documentType: envelope.documentType,
-            messageHash: envelope.messageHash,
-            message: envelope.message
-          }).pipe(
-            Effect.catchTag(
-              ["MailboxFull", "AlreadyProcessingMessage", "PersistenceError"],
-              (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageUnavailable({
-                      cause
-                    })
-                  })
-                )
-            )
-          )
-          return { envelope, result }
+          return { boundEpoch, envelope, incarnation: permit.incarnation }
         }))
+        const client = yield* entity(envelope.documentId)
+        const result = yield* client.ApplySync({
+          replicaIncarnation: incarnation,
+          peerId: connection.peerId,
+          connectionEpoch: boundEpoch,
+          localConnectionEpoch: session.connectionEpoch,
+          receiveSequence: envelope.sequence,
+          documentType: envelope.documentType,
+          messageHash: envelope.messageHash,
+          message: envelope.message
+        }).pipe(
+          Effect.catchTag(
+            ["MailboxFull", "AlreadyProcessingMessage", "PersistenceError"],
+            (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause
+                  })
+                })
+              )
+          )
+        )
         yield* publisher.publishPending
         yield* Ref.update(observed, (values) => {
           const next = new Map(values)
