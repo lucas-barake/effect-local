@@ -21,4 +21,21 @@ it.layer(NodeCrypto.layer)("FaultInjection", (it) => {
       { drop: true, copies: 1, delay: 0, reorder: false },
       { drop: false, copies: 1, delay: 0, reorder: false }
     ]))))
+
+  it.effect("returns its only decision for a NaN sequence", () => {
+    const decision = { drop: false, copies: 1, delay: 0, reorder: false }
+    return Effect.gen(function*() {
+      const faults = yield* FaultInjection.FaultInjection
+      const peerId = yield* Identity.makePeerId
+      assert.deepStrictEqual(
+        yield* faults.decide({
+          sequence: Number.NaN,
+          from: peerId,
+          to: peerId,
+          payload: Uint8Array.of(1)
+        }),
+        decision
+      )
+    }).pipe(Effect.provide(FaultInjection.layerSequence([decision])))
+  })
 })
