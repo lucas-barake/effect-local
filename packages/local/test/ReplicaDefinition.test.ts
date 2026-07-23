@@ -77,6 +77,49 @@ describe("ReplicaDefinition", () => {
     assert.strictEqual(minimal.hash, explicit.hash)
   })
 
+  it("is immune to post-make mutation of the caller's arrays", () => {
+    const fixture = makeFixture()
+    const mutations: Array<Mutation.Any> = [fixture.Rename]
+    const projections: Array<Projection.Any> = [fixture.TaskRows]
+    const queries: Array<Query.Any> = [fixture.ListTasks]
+    const documents = DocumentSet.make(fixture.Task)
+    const def = ReplicaDefinition.make({
+      name: "tasks",
+      documents,
+      mutations,
+      projections,
+      queries
+    })
+    const hashBefore = def.hash
+
+    const OtherTask = Document.make("OtherTask", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
+    const Delete = Mutation.make("Delete", { document: fixture.Task })
+    const OtherProjection = Projection.make("OtherRows", {
+      document: fixture.Task,
+      version: 1,
+      Row: Schema.Struct({ title: Schema.String }),
+      key: (row) => row.title,
+      project: (snapshot) => [{ title: snapshot.value.title }]
+    })
+    const OtherQuery = Query.make("OtherQuery", { success: Schema.Array(fixture.TaskRows.Row), dependsOn: [] })
+
+    mutations.push(Delete)
+    projections.push(OtherProjection)
+    queries.push(OtherQuery)
+    assert.throws(() => (documents.documents as unknown as Array<Document.Any>).push(OtherTask))
+
+    assert.strictEqual(def.mutations.length, 1)
+    assert.strictEqual(def.projections.length, 1)
+    assert.strictEqual(def.queries.length, 1)
+    assert.strictEqual(def.documents.documents.length, 1)
+    assert.strictEqual(def.hash, hashBefore)
+    assert.deepStrictEqual(def.mutations, [fixture.Rename])
+
+    assert.throws(() => (def.mutations as Array<Mutation.Any>).push(Delete))
+    assert.throws(() => (def.projections as Array<Projection.Any>).push(OtherProjection))
+    assert.throws(() => (def.queries as Array<Query.Any>).push(OtherQuery))
+  })
+
   it("rejects foreign references and duplicate names", () => {
     const fixture = makeFixture()
     const Foreign = Document.make("Foreign", { schema: Schema.String, version: 1 })

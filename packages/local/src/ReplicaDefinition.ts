@@ -52,9 +52,9 @@ export const make = <
   readonly queries?: Queries
 }): ReplicaDefinition<Name, Documents, Mutations, Projections, Queries> => {
   if (options.name.length === 0) throw new TypeError("Replica definition name must be nonempty")
-  const mutations = options.mutations ?? ([] as unknown as Mutations)
-  const projections = options.projections ?? ([] as unknown as Projections)
-  const queries = options.queries ?? ([] as unknown as Queries)
+  const mutations = Object.freeze([...(options.mutations ?? [])]) as unknown as Mutations
+  const projections = Object.freeze([...(options.projections ?? [])]) as unknown as Projections
+  const queries = Object.freeze([...(options.queries ?? [])]) as unknown as Queries
   assertUnique("mutation", mutations)
   assertUnique("projection", projections)
   assertUnique("query", queries)
