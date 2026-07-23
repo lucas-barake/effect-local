@@ -380,7 +380,9 @@ export const make = Effect.gen(function*() {
           if (checkpoint !== null) invalidCheckpoints.push(checkpoint.checkpoint_hash)
           continue
         }
-        const decoded = yield* Effect.result(Document.decode(document, documentId, encoded))
+        const decoded = yield* Effect.result(Document.decode(document, documentId, encoded)).pipe(
+          Effect.onError(() => Effect.sync(() => InternalAutomerge.free(automerge)))
+        )
         if (Result.isFailure(decoded)) {
           InternalAutomerge.free(automerge)
           if (checkpoint !== null) invalidCheckpoints.push(checkpoint.checkpoint_hash)
