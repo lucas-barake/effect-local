@@ -102,8 +102,8 @@ export const make = <
     Layer.effect(
       handler,
       Effect.gen(function*() {
-        const context = Context.omit(Scope.Scope)(
-          yield* Effect.context<R | Scope.Scope>()
+        const context = (yield* Effect.context<R | Scope.Scope>()).pipe(
+          Context.omit(Scope.Scope)
         ) as Context.Context<R>
         const implementation = Effect.isEffect(build) ? yield* build : build
         return (payload: SchemaInput.Wire<P>["Type"]) =>
