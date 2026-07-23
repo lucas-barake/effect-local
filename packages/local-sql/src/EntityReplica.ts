@@ -239,7 +239,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         exportBackup: backups.export,
         restoreBackup: (options) =>
           backups.restore(options).pipe(
-            Effect.andThen(publisher.invalidate(ReplicaDefinition.invalidationKeys(definition)))
+            Effect.ensuring(publisher.invalidate(ReplicaDefinition.invalidationKeys(definition)))
           ),
         exportDocument: (document, documentId) =>
           withPermit(() =>

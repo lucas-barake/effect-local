@@ -10,12 +10,27 @@ import * as Projection from "@lucas-barake/effect-local/Projection"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
+import * as Latch from "effect/Latch"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
+import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
+import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as BackupStore from "../src/BackupStore.js"
+import * as CommandExecutor from "../src/CommandExecutor.js"
+import * as CommitPublisher from "../src/CommitPublisher.js"
+import * as DocumentStore from "../src/DocumentStore.js"
 import * as ClusterStorage from "../src/internal/clusterStorage.js"
+import * as ProjectionStore from "../src/ProjectionStore.js"
+import * as QueryExecutor from "../src/QueryExecutor.js"
+import * as Recovery from "../src/Recovery.js"
+import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
+import * as ReplicaGate from "../src/ReplicaGate.js"
 import * as ReplicaWorkflow from "../src/ReplicaWorkflow.js"
 import * as SqlProjection from "../src/SqlProjection.js"
 import * as SqlReplica from "../src/SqlReplica.js"
@@ -242,4 +257,89 @@ describe("SqlReplica", () => {
       }))
       assert.strictEqual(wrongVersion.reason._tag, "BackupInvalid")
     }).pipe(Effect.provide(Live), Effect.provide(Database), TestClock.withLive))
+
+  it.effect("invalidates reactive consumers when interruption arrives after a restore commits", () =>
+    Effect.gen(function*() {
+      const committed = yield* Deferred.make<void>()
+      const release = yield* Latch.make()
+      let armed = false
+      const baseDatabase = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+      const instrumentedDatabase = Layer.effect(
+        SqlClient.SqlClient,
+        Effect.gen(function*() {
+          const sql = yield* SqlClient.SqlClient
+          const instrumented = Object.assign(
+            ((...args: ReadonlyArray<unknown>) => (sql as any)(...args)) as SqlClient.SqlClient,
+            sql,
+            {
+              withTransaction: <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
+                Effect.serviceOption(sql.transactionService).pipe(
+                  Effect.flatMap((transaction) =>
+                    sql.withTransaction(effect).pipe(
+                      Effect.tap(() =>
+                        armed && Option.isNone(transaction)
+                          ? Deferred.succeed(committed, undefined).pipe(Effect.andThen(release.await))
+                          : Effect.void
+                      )
+                    )
+                  )
+                )
+            }
+          )
+          return instrumented
+        })
+      ).pipe(Layer.provideMerge(baseDatabase))
+      const database = Layer.merge(instrumentedDatabase, NodeCrypto.layer)
+      const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provideMerge(database))
+      const infrastructure = Layer.merge(bootstrap, Limits)
+      const gate = ReplicaGate.layer.pipe(Layer.provideMerge(infrastructure))
+      const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
+      const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
+      const projections = ProjectionStore.layer([]).pipe(Layer.provideMerge(store))
+      const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(projections))
+      const queries = QueryExecutor.layer(definition).pipe(
+        Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
+      )
+      const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
+      const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
+      const direct = SqlReplica.layerFromServices(definition).pipe(Layer.provideMerge(backups))
+      const services = Layer.merge(direct, Reactivity.layer).pipe(Layer.provide(Handler))
+
+      yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const reactivity = yield* Reactivity.Reactivity
+        const created = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "before" }
+        })
+        assert.strictEqual(created._tag, "DurablyCommittedLocal")
+        if (created._tag !== "DurablyCommittedLocal") return
+        const backup = yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+        yield* replica.mutate(Rename, {
+          commandId: yield* Identity.makeCommandId,
+          documentId: created.value,
+          payload: "after"
+        })
+        let invalidated = false
+        const cancel = reactivity.registerUnsafe([Task.name], () => {
+          invalidated = true
+        })
+        yield* Effect.addFinalizer(() => Effect.sync(cancel))
+        armed = true
+        const restore = yield* replica.restoreBackup({
+          expectedDefinitionHash: definition.hash,
+          maxBytes: limits.maxBackupBytes,
+          mode: "replace",
+          source: Stream.fromIterable(backup)
+        }).pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Deferred.await(committed)
+        const interrupt = yield* Fiber.interrupt(restore).pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Effect.yieldNow
+        yield* release.open
+        yield* Fiber.join(interrupt)
+
+        assert.strictEqual((yield* replica.get(Task, created.value)).value.title, "before")
+        assert.isTrue(invalidated)
+      }).pipe(Effect.scoped, Effect.provide(services))
+    }))
 })
