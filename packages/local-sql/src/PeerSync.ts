@@ -690,77 +690,79 @@ export const layer: Layer.Layer<
       })
 
     const enqueue = (session: Session, reply: Reply) =>
-      quotaLock.withPermit(Effect.scoped(Effect.gen(function*() {
+      Effect.scoped(Effect.gen(function*() {
         const permit = yield* gate.shared
         yield* validateSession(permit, session)
-        const messageHash = yield* digest(reply.message)
-        if (messageHash !== reply.messageHash) {
-          return yield* new ReplicaError.ReplicaError({
-            reason: new ReplicaError.ProtocolMismatch({
-              expected: messageHash,
-              observed: reply.messageHash
+        return yield* quotaLock.withPermit(Effect.gen(function*() {
+          const messageHash = yield* digest(reply.message)
+          if (messageHash !== reply.messageHash) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: messageHash,
+                observed: reply.messageHash
+              })
             })
-          })
-        }
-        const rows = yield* findOutboxReply({
-          replicaIncarnation: session.replicaIncarnation,
-          peerId: session.peerId,
-          connectionEpoch: session.connectionEpoch,
-          documentId: reply.documentId,
-          messageHash: reply.messageHash
-        }).pipe(
-          Effect.catchTags({
-            SqlError: (cause) =>
-              Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageUnavailable({
-                    cause
-                  })
-                })
-              ),
-            SchemaError: (cause) =>
-              Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageCorrupt({
-                    cause
-                  })
-                })
-              )
-          })
-        )
-        const existing = rows[0]
-        if (existing !== undefined) {
-          return {
-            sendSequence: existing.send_sequence,
-            documentId: reply.documentId,
-            message: existing.message,
-            messageHash: existing.message_hash,
-            heads: existing.heads
           }
-        }
-        return yield* sql.withTransaction(
-          persistOutbound(session, reply.documentId, reply.message, reply.heads)
-        ).pipe(
-          Effect.catchTags({
-            SqlError: (cause) =>
-              Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageUnavailable({
-                    cause
+          const rows = yield* findOutboxReply({
+            replicaIncarnation: session.replicaIncarnation,
+            peerId: session.peerId,
+            connectionEpoch: session.connectionEpoch,
+            documentId: reply.documentId,
+            messageHash: reply.messageHash
+          }).pipe(
+            Effect.catchTags({
+              SqlError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageUnavailable({
+                      cause
+                    })
                   })
-                })
-              ),
-            SchemaError: (cause) =>
-              Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageCorrupt({
-                    cause
+                ),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageCorrupt({
+                      cause
+                    })
                   })
-                })
-              )
-          })
-        )
-      })))
+                )
+            })
+          )
+          const existing = rows[0]
+          if (existing !== undefined) {
+            return {
+              sendSequence: existing.send_sequence,
+              documentId: reply.documentId,
+              message: existing.message,
+              messageHash: existing.message_hash,
+              heads: existing.heads
+            }
+          }
+          return yield* sql.withTransaction(
+            persistOutbound(session, reply.documentId, reply.message, reply.heads)
+          ).pipe(
+            Effect.catchTags({
+              SqlError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageUnavailable({
+                      cause
+                    })
+                  })
+                ),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageCorrupt({
+                      cause
+                    })
+                  })
+                )
+            })
+          )
+        }))
+      }))
 
     const generate = <D extends Document.Any,>(
       document: D,
@@ -1672,30 +1674,32 @@ export const layer: Layer.Layer<
         })),
       reset: (session) =>
         withSessionGeneration(session, (generation) =>
-          quotaLock.withPermit(Effect.scoped(Effect.gen(function*() {
+          Effect.scoped(Effect.gen(function*() {
             yield* gate.shared
-            yield* sql.withTransaction(Effect.gen(function*() {
-              yield* sql`DELETE FROM effect_local_peer_outbox
+            yield* quotaLock.withPermit(Effect.gen(function*() {
+              yield* sql.withTransaction(Effect.gen(function*() {
+                yield* sql`DELETE FROM effect_local_peer_outbox
               WHERE replica_incarnation = ${session.replicaIncarnation}
                 AND peer_id = ${session.peerId}
                 AND connection_epoch = ${session.connectionEpoch}`
-              yield* sql`DELETE FROM effect_local_peer_receipts
+                yield* sql`DELETE FROM effect_local_peer_receipts
               WHERE replica_incarnation = ${session.replicaIncarnation}
                 AND peer_id = ${session.peerId}
                 AND connection_epoch = ${session.connectionEpoch}`
-            })).pipe(
-              Effect.catchTag("SqlError", (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageUnavailable({
-                      cause
+              })).pipe(
+                Effect.catchTag("SqlError", (cause) =>
+                  Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageUnavailable({
+                        cause
+                      })
                     })
-                  })
-                ))
-            )
-            yield* Ref.update(generation, (current) => current + 1)
-            yield* removeState(session)
-          })))),
+                  ))
+              )
+              yield* Ref.update(generation, (current) => current + 1)
+              yield* removeState(session)
+            }))
+          }))),
       generate,
       receive,
       enqueue,
@@ -1738,46 +1742,48 @@ export const layer: Layer.Layer<
           )
         })),
       markSent: (session, sendSequence, messageHash) =>
-        quotaLock.withPermit(Effect.scoped(Effect.gen(function*() {
+        Effect.scoped(Effect.gen(function*() {
           const permit = yield* gate.shared
           yield* validateSession(permit, session)
-          return yield* sql.withTransaction(Effect.gen(function*() {
-            const rows = yield* markOutboxSent({
-              replicaIncarnation: session.replicaIncarnation,
-              peerId: session.peerId,
-              connectionEpoch: session.connectionEpoch,
-              sendSequence,
-              messageHash
-            })
-            if (rows.length === 0) return false
-            yield* sql`DELETE FROM effect_local_peer_outbox
+          return yield* quotaLock.withPermit(
+            sql.withTransaction(Effect.gen(function*() {
+              const rows = yield* markOutboxSent({
+                replicaIncarnation: session.replicaIncarnation,
+                peerId: session.peerId,
+                connectionEpoch: session.connectionEpoch,
+                sendSequence,
+                messageHash
+              })
+              if (rows.length === 0) return false
+              yield* sql`DELETE FROM effect_local_peer_outbox
               WHERE replica_incarnation = ${session.replicaIncarnation}
                 AND peer_id = ${session.peerId}
                 AND connection_epoch = ${session.connectionEpoch}
                 AND status = 'Sent'
                 AND send_sequence < ${sendSequence}`
-            return true
-          })).pipe(
-            Effect.catchTags({
-              SqlError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageUnavailable({
-                      cause
+              return true
+            })).pipe(
+              Effect.catchTags({
+                SqlError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageUnavailable({
+                        cause
+                      })
                     })
-                  })
-                ),
-              SchemaError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageCorrupt({
-                      cause
+                  ),
+                SchemaError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageCorrupt({
+                        cause
+                      })
                     })
-                  })
-                )
-            })
+                  )
+              })
+            )
           )
-        })))
+        }))
     })
   })
 )

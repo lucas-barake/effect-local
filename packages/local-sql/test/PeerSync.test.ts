@@ -610,6 +610,66 @@ describe("PeerSync", () => {
       InternalAutomerge.free(remote)
     }).pipe(Effect.provide(Services)))
 
+  it.effect("does not deadlock reset behind a claim while generation holds a read permit", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const gate = yield* ReplicaGate.ReplicaGate
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      const generateStarted = yield* Deferred.make<void>()
+      const releaseGenerate = yield* Deferred.make<void>()
+      const claimAcquired = yield* Deferred.make<void>()
+      const releaseClaim = yield* Deferred.make<void>()
+      const blockingStore = new Proxy(store, {
+        get(target, property, receiver) {
+          if (property !== "load") return Reflect.get(target, property, receiver)
+          const load: typeof store.load = (document, documentId) =>
+            Deferred.succeed(generateStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseGenerate)),
+              Effect.andThen(store.load(document, documentId))
+            )
+          return load
+        }
+      })
+      yield* Effect.gen(function*() {
+        const sync = yield* PeerSync.PeerSync
+        const session = yield* sync.open(yield* Identity.makePeerId)
+        const generating = yield* sync.generate(Task, documentId, session).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(generateStarted)
+        const claiming = yield* gate.claim(() =>
+          Deferred.succeed(claimAcquired, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseClaim))
+          )
+        ).pipe(Effect.forkChild({ startImmediately: true }))
+        const resetting = yield* sync.reset(session).pipe(Effect.forkChild({ startImmediately: true }))
+        const acquired = yield* Deferred.await(claimAcquired).pipe(
+          Effect.timeout("1 second"),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.succeed(releaseGenerate, undefined)
+        yield* Effect.yieldNow
+        yield* TestClock.adjust("1 second")
+        yield* Fiber.join(acquired)
+        yield* Deferred.succeed(releaseClaim, undefined)
+        yield* Fiber.join(claiming)
+        yield* Fiber.join(generating)
+        yield* Fiber.join(resetting)
+      }).pipe(
+        Effect.provide(PeerSync.layer.pipe(
+          Layer.provide(Layer.succeed(DocumentStore.DocumentStore, blockingStore))
+        )),
+        Effect.ensuring(
+          Deferred.succeed(releaseGenerate, undefined).pipe(
+            Effect.andThen(Deferred.succeed(releaseClaim, undefined)),
+            Effect.asVoid
+          )
+        )
+      )
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Services)))
+
   it.effect("rejects operation-heavy messages without persisting the rejected transition", () =>
     Effect.gen(function*() {
       const store = yield* DocumentStore.DocumentStore
