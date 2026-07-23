@@ -13,6 +13,7 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as DocumentStore from "./DocumentStore.js"
 import * as InternalAutomerge from "./internal/automerge.js"
 import * as ProjectionStore from "./ProjectionStore.js"
+import * as ReplicaGate from "./ReplicaGate.js"
 
 export interface State {
   readonly migratedDocuments: ReadonlyArray<{ readonly documentType: string; readonly count: number }>
@@ -28,12 +29,13 @@ export const make = (
 ): Effect.Effect<
   State,
   ReplicaError.ReplicaError,
-  DocumentStore.DocumentStore | ProjectionStore.ProjectionStore | SqlClient.SqlClient
+  DocumentStore.DocumentStore | ProjectionStore.ProjectionStore | ReplicaGate.ReplicaGate | SqlClient.SqlClient
 > =>
   Effect.gen(function*() {
     const sql = yield* SqlClient.SqlClient
     const store = yield* DocumentStore.DocumentStore
     const projections = yield* ProjectionStore.ProjectionStore
+    const gate = yield* ReplicaGate.ReplicaGate
 
     const ProjectionNameRow = Schema.Struct({ projection_name: Schema.String })
     const findRebuilding = SqlSchema.findAll({
@@ -67,12 +69,16 @@ export const make = (
 
     return yield* Effect.gen(function*() {
       const registered = new Set(definition.projections.map((projection: Projection.Any) => projection.name))
+      const permit = yield* gate.current
       const orphans = yield* findRegisteredProjections(undefined)
-      for (const orphan of orphans) {
-        if (registered.has(orphan.projection_name)) continue
-        yield* sql`DELETE FROM effect_local_document_projections WHERE projection_name = ${orphan.projection_name}`
-        yield* sql`DELETE FROM effect_local_projection_registry WHERE projection_name = ${orphan.projection_name}`
-      }
+      yield* sql.withTransaction(Effect.gen(function*() {
+        for (const orphan of orphans) {
+          if (registered.has(orphan.projection_name)) continue
+          yield* sql`DELETE FROM effect_local_document_projections WHERE projection_name = ${orphan.projection_name}`
+          yield* sql`DELETE FROM effect_local_projection_registry WHERE projection_name = ${orphan.projection_name}`
+        }
+        yield* gate.validate(permit)
+      }))
 
       const rebuilding = yield* findRebuilding(undefined)
       const rebuildNames = rebuilding
@@ -108,9 +114,12 @@ export const make = (
         }
       }
 
-      for (const name of rebuildNames) {
-        yield* sql`UPDATE effect_local_projection_registry SET status = 'Ready' WHERE projection_name = ${name}`
-      }
+      yield* sql.withTransaction(Effect.gen(function*() {
+        for (const name of rebuildNames) {
+          yield* sql`UPDATE effect_local_projection_registry SET status = 'Ready' WHERE projection_name = ${name}`
+        }
+        yield* gate.validate(permit)
+      }))
 
       return {
         migratedDocuments: [...migrated].map(([documentType, count]) => ({ documentType, count })),
@@ -143,5 +152,5 @@ export const layer = (
 ): Layer.Layer<
   ReplicaEvolution,
   ReplicaError.ReplicaError,
-  DocumentStore.DocumentStore | ProjectionStore.ProjectionStore | SqlClient.SqlClient
+  DocumentStore.DocumentStore | ProjectionStore.ProjectionStore | ReplicaGate.ReplicaGate | SqlClient.SqlClient
 > => Layer.effect(ReplicaEvolution, make(definition))

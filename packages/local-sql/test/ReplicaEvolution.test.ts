@@ -15,7 +15,12 @@ import * as Layer from "effect/Layer"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as DocumentStore from "../src/DocumentStore.js"
+import * as ProjectionStore from "../src/ProjectionStore.js"
+import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
+import * as ReplicaEvolution from "../src/ReplicaEvolution.js"
+import * as ReplicaGate from "../src/ReplicaGate.js"
 import * as SqlProjection from "../src/SqlProjection.js"
 import * as SqlReplica from "../src/SqlReplica.js"
 
@@ -168,6 +173,68 @@ describe("ReplicaEvolution", () => {
         }))
         const settled = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM effect_local_changes`
         assert.strictEqual(settled[0]!.count, after[0]!.count)
+      }).pipe(Effect.provide(environment)))
+  })
+
+  describe("fencing", () => {
+    it.effect("does not commit registry writes after the replica was superseded", () =>
+      Effect.gen(function*() {
+        const projectionRow = Schema.Struct({ sourceDocumentId: Identity.DocumentId, title: Schema.String })
+        const TaskTitle = Projection.make("TaskTitle", {
+          document: TaskV1,
+          version: 1,
+          Row: projectionRow,
+          key: (row) => row.sourceDocumentId,
+          project: (snapshot) =>
+            snapshot.tombstone ? [] : [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title }]
+        })
+        const TaskTitleSql = SqlProjection.make(TaskTitle, {
+          table: "task_title_fencing",
+          migrations: [{
+            id: 1,
+            name: "task_title_fencing",
+            run: (sql, target) =>
+              sql`CREATE TABLE IF NOT EXISTS ${sql(target)} (
+                source_document_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL
+              )`.pipe(Effect.asVoid)
+          }],
+          deleteByDocument: (sql, target, documentId) =>
+            sql`DELETE FROM ${sql(target)} WHERE source_document_id = ${documentId}`.pipe(Effect.asVoid),
+          insert: (sql, target, row) =>
+            sql`INSERT INTO ${sql(target)} (source_document_id, title)
+              VALUES (${row.sourceDocumentId}, ${row.title})`.pipe(Effect.asVoid)
+        })
+        const definition = ReplicaDefinition.make({
+          name: "tasks",
+          documents: DocumentSet.make(TaskV1),
+          projections: [TaskTitle]
+        })
+        const sql = yield* SqlClient.SqlClient
+        const bootstrap = ReplicaBootstrap.layer(definition)
+        const gate = ReplicaGate.layer.pipe(Layer.provideMerge(bootstrap))
+        const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
+        const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
+        const projections = ProjectionStore.layer([TaskTitleSql]).pipe(
+          Layer.provideMerge(store),
+          Layer.provide(TaskTitleSql.layer)
+        )
+        yield* Effect.scoped(Effect.gen(function*() {
+          const context = yield* Layer.build(projections)
+          yield* sql`UPDATE effect_local_projection_registry SET status = 'Rebuilding'
+            WHERE projection_name = 'TaskTitle'`
+          yield* sql`UPDATE effect_local_metadata SET writer_generation = writer_generation + 1
+            WHERE singleton = 1`
+          const result = yield* Effect.result(ReplicaEvolution.make(definition).pipe(Effect.provide(context)))
+          assert.isTrue(Result.isFailure(result))
+          if (Result.isFailure(result) && result.failure._tag === "ReplicaError") {
+            assert.strictEqual(result.failure.reason._tag, "ReplicaFenced")
+          }
+          const registry = yield* sql<{ readonly status: string }>`
+            SELECT status FROM effect_local_projection_registry WHERE projection_name = 'TaskTitle'
+          `
+          assert.strictEqual(registry[0]?.status, "Rebuilding")
+        }))
       }).pipe(Effect.provide(environment)))
   })
 
