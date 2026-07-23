@@ -1,7 +1,8 @@
+import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import type * as Stream from "effect/Stream"
 import * as Identity from "./Identity.js"
-import type * as ReplicaError from "./ReplicaError.js"
+import * as ReplicaError from "./ReplicaError.js"
 
 export const FormatVersion = Schema.Literal(1)
 export type FormatVersion = typeof FormatVersion.Type
@@ -14,6 +15,20 @@ export const Header = Schema.Struct({
   createdAt: Schema.String
 })
 export type Header = typeof Header.Type
+
+export const MaxBytes = Schema.Int.check(Schema.isGreaterThan(0))
+
+export const validateMaxBytes = (maxBytes: number): Effect.Effect<number, ReplicaError.ReplicaError> =>
+  Schema.decodeEffect(MaxBytes)(maxBytes).pipe(
+    Effect.catchTag("SchemaError", (cause) =>
+      Effect.fail(
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.BackupInvalid({
+            cause
+          })
+        })
+      ))
+  )
 
 export interface ExportOptions {
   readonly maxBytes: number

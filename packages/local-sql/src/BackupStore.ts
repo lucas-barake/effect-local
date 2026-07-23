@@ -128,8 +128,6 @@ const decodeBytes = (encoded: string) =>
     )
   )
 
-const byteLength = (value: string) => new TextEncoder().encode(value).byteLength
-
 const exceedsJsonDepth = (value: unknown, limit: number) => {
   const pending: Array<readonly [unknown, number]> = [[value, 1]]
   while (pending.length > 0) {
@@ -248,11 +246,12 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       const exportBackup = (options: Backup.ExportOptions) =>
         Stream.unwrap(
           Effect.scoped(Effect.gen(function*() {
-            if (options.maxBytes > limits.maxBackupBytes) {
+            const maxBytes = yield* Backup.validateMaxBytes(options.maxBytes)
+            if (maxBytes > limits.maxBackupBytes) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupTooLarge({
                   limit: limits.maxBackupBytes,
-                  observed: options.maxBytes
+                  observed: maxBytes
                 })
               })
             }
@@ -272,10 +271,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 })
               }
               const estimatedBytes = rawBytes * 2 + recordCount * 512 + 4096
-              if (estimatedBytes > options.maxBytes) {
+              if (estimatedBytes > maxBytes) {
                 return yield* new ReplicaError.ReplicaError({
                   reason: new ReplicaError.BackupTooLarge({
-                    limit: options.maxBytes,
+                    limit: maxBytes,
                     observed: estimatedBytes
                   })
                 })
@@ -304,6 +303,11 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             const recordLines = yield* Effect.forEach(records, encodeEnvelopeJson)
             const endLine = yield* encodeEnvelopeJson(end)
             const createdAt = DateTime.formatIso(yield* DateTime.now)
+            const encoder = new TextEncoder()
+            const recordBytes = recordLines.map((line) => encoder.encode(`${line}\n`))
+            const endBytes = encoder.encode(`${endLine}\n`)
+            const trailerBytes = recordBytes.reduce((total, bytes) => total + bytes.byteLength, 0) +
+              endBytes.byteLength
             let declaredBytes = 0
             let manifestLine = ""
             for (let attempt = 0; attempt < 8; attempt++) {
@@ -317,24 +321,25 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 declaredBytes
               })
               manifestLine = yield* encodeEnvelopeJson(manifest)
-              const next = byteLength(`${manifestLine}\n`) +
-                recordLines.reduce((total, line) => total + byteLength(`${line}\n`), 0) +
-                byteLength(`${endLine}\n`)
+              const next = encoder.encode(`${manifestLine}\n`).byteLength + trailerBytes
               if (next === declaredBytes) break
               declaredBytes = next
             }
-            if (declaredBytes > options.maxBytes) {
+            if (declaredBytes > maxBytes) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupTooLarge({
-                  limit: options.maxBytes,
+                  limit: maxBytes,
                   observed: declaredBytes
                 })
               })
             }
-            return Stream.fromIterable([manifestLine, ...recordLines, endLine]).pipe(
-              Stream.map((line) => `${line}\n`),
-              Stream.encodeText
-            )
+            const chunks: Array<Uint8Array<ArrayBuffer>> = []
+            for (const bytes of [encoder.encode(`${manifestLine}\n`), ...recordBytes, endBytes]) {
+              for (let offset = 0; offset < bytes.byteLength; offset += limits.maxChunkBytes) {
+                chunks.push(bytes.slice(offset, offset + limits.maxChunkBytes))
+              }
+            }
+            return Stream.fromIterable(chunks)
           })).pipe(
             Effect.catchTags({
               SchemaError: (cause) =>
@@ -361,11 +366,12 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         options: Backup.RestoreOptions<R>
       ): Effect.Effect<void, ReplicaError.ReplicaError, R> =>
         Effect.gen(function*() {
-          if (options.maxBytes > limits.maxBackupBytes) {
+          const maxBytes = yield* Backup.validateMaxBytes(options.maxBytes)
+          if (maxBytes > limits.maxBackupBytes) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.BackupTooLarge({
                 limit: limits.maxBackupBytes,
-                observed: options.maxBytes
+                observed: maxBytes
               })
             })
           }
@@ -384,11 +390,11 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                       })
                     )
                   }
-                  return bytes > options.maxBytes
+                  return bytes > maxBytes
                     ? Effect.fail(
                       new ReplicaError.ReplicaError({
                         reason: new ReplicaError.BackupTooLarge({
-                          limit: options.maxBytes,
+                          limit: maxBytes,
                           observed: bytes
                         })
                       })
@@ -399,39 +405,40 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             ),
             Stream.decodeText(),
             Stream.splitLines,
-            Stream.mapEffect((line) =>
-              Schema.decodeUnknownEffect(JsonString)(line).pipe(
-                Effect.filterOrFail(
-                  (value) => !exceedsJsonDepth(value, limits.maxJsonDepth),
-                  () =>
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.BackupInvalid({
-                        cause: new Error(`Backup JSON exceeds maximum depth ${limits.maxJsonDepth}`)
-                      })
+            Stream.mapEffect((line, index) =>
+              index >= limits.maxArchiveRecords + 2
+                ? Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.BackupTooLarge({
+                      limit: limits.maxArchiveRecords,
+                      observed: index - 1
                     })
-                ),
-                Effect.flatMap(Schema.decodeUnknownEffect(Envelope)),
-                Effect.catchTag("SchemaError", (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.BackupInvalid({
-                        cause
+                  })
+                )
+                : Schema.decodeUnknownEffect(JsonString)(line).pipe(
+                  Effect.filterOrFail(
+                    (value) => !exceedsJsonDepth(value, limits.maxJsonDepth),
+                    () =>
+                      new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.BackupInvalid({
+                          cause: new Error(`Backup JSON exceeds maximum depth ${limits.maxJsonDepth}`)
+                        })
                       })
-                    })
-                  ))
-              )
+                  ),
+                  Effect.flatMap(Schema.decodeUnknownEffect(Envelope)),
+                  Effect.catchTag("SchemaError", (cause) =>
+                    Effect.fail(
+                      new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.BackupInvalid({
+                          cause
+                        })
+                      })
+                    ))
+                )
             ),
             Stream.runCollect
           )
           const observedByteCount = yield* Ref.get(observedBytes)
-          if (envelopes.length > limits.maxArchiveRecords + 2) {
-            return yield* new ReplicaError.ReplicaError({
-              reason: new ReplicaError.BackupTooLarge({
-                limit: limits.maxArchiveRecords,
-                observed: envelopes.length - 2
-              })
-            })
-          }
           const manifestEnvelope = envelopes[0]
           const endEnvelope = envelopes.at(-1)
           if (manifestEnvelope?.kind !== "Manifest" || endEnvelope?.kind !== "End") {

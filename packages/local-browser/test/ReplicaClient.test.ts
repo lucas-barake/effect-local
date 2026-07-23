@@ -886,6 +886,22 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       }))
       assert.strictEqual(oversized.reason._tag, "BackupTooLarge")
       assert.deepStrictEqual(restored, [])
+
+      const invalid = yield* Effect.flip(client.restoreBackup({
+        source: Stream.make(Uint8Array.of(1)).pipe(
+          Stream.concat(Stream.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause: new Error("source tail was pulled") })
+            })
+          ))
+        ),
+        mode: "replace",
+        maxBytes: Number.NaN,
+        expectedDefinitionHash: definition.hash,
+        installationId: Identity.BackupInstallationId.make("bak_2a9c4e17-8d3b-4f6a-b5e8-9c0d1e2f3a4b")
+      }))
+      assert.strictEqual(invalid.reason._tag, "BackupInvalid")
+      assert.deepStrictEqual(restored, [])
     })).pipe(Effect.provide(BackupOwner))
   })
 })
