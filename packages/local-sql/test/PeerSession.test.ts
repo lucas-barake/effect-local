@@ -209,6 +209,32 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       Effect.map((value) => new TextEncoder().encode(value))
     )
 
+  it.effect("rejects an oversized writer definition hash within an otherwise valid envelope", () =>
+    Effect.gen(function*() {
+      const documentId = yield* Identity.makeDocumentId
+      const message = Uint8Array.of(1, 2, 3)
+      const messageHash = yield* Canonical.digest(message)
+      const valid = yield* encode({
+        connectionEpoch: "remote-epoch",
+        sequence: 0,
+        documentId,
+        documentType: Task.name,
+        messageHash,
+        message,
+        writerSchemaVersion: Task.version,
+        writerDefinitionHash: definition.hash
+      })
+      const tampered = JSON.parse(new TextDecoder().decode(valid))
+      tampered.writerDefinitionHash = "a".repeat(130_000)
+      const json = JSON.stringify(tampered)
+      assert.isBelow(
+        new TextEncoder().encode(json).byteLength,
+        PeerSession.maximumSyncEnvelopeBytes(limits.maxSyncMessageBytes)
+      )
+      const exit = yield* Effect.exit(Schema.decodeUnknownEffect(SyncEnvelopeJson)(json))
+      assert.strictEqual(exit._tag, "Failure")
+    }))
+
   it.effect("rejects one document id selected with conflicting document types before opening transport", () =>
     Effect.gen(function*() {
       const Note = Document.make("Note", { schema: Schema.Struct({ body: Schema.String }), version: 1 })
@@ -1164,6 +1190,45 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             Effect.map((valid) => {
               const tampered = JSON.parse(new TextDecoder().decode(valid))
               tampered.writerSchemaVersion = 0
+              return new TextEncoder().encode(JSON.stringify(tampered))
+            })
+          )
+        },
+        {
+          name: "empty writer definition hash",
+          bytes: yield* encode({
+            connectionEpoch: "remote-epoch",
+            sequence: 0,
+            documentId,
+            documentType: Task.name,
+            messageHash,
+            message,
+            writerSchemaVersion: Task.version,
+            writerDefinitionHash: definition.hash
+          }).pipe(
+            Effect.map((valid) => {
+              const tampered = JSON.parse(new TextDecoder().decode(valid))
+              tampered.writerDefinitionHash = ""
+              return new TextEncoder().encode(JSON.stringify(tampered))
+            })
+          )
+        },
+        {
+          name: "missing writer provenance fields",
+          bytes: yield* encode({
+            connectionEpoch: "remote-epoch",
+            sequence: 0,
+            documentId,
+            documentType: Task.name,
+            messageHash,
+            message,
+            writerSchemaVersion: Task.version,
+            writerDefinitionHash: definition.hash
+          }).pipe(
+            Effect.map((valid) => {
+              const tampered = JSON.parse(new TextDecoder().decode(valid))
+              delete tampered.writerSchemaVersion
+              delete tampered.writerDefinitionHash
               return new TextEncoder().encode(JSON.stringify(tampered))
             })
           )

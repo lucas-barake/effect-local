@@ -104,7 +104,7 @@ export const ApplySync = Rpc.make("ApplySync", {
     messageHash: Schema.String,
     message: Schema.Uint8ArrayFromBase64,
     writerSchemaVersion: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
-    writerDefinitionHash: Schema.NonEmptyString
+    writerDefinitionHash: Schema.NonEmptyString.check(Schema.isMaxLength(256))
   },
   success: ApplySyncResult,
   error: ReplicaError.ReplicaError,
