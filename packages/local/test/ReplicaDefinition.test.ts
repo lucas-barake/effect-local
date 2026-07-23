@@ -77,6 +77,25 @@ describe("ReplicaDefinition", () => {
     assert.strictEqual(minimal.hash, explicit.hash)
   })
 
+  it("is immune to post-make mutation of the caller's documents.byName map", () => {
+    const fixture = makeFixture()
+    const documents = DocumentSet.make(fixture.Task)
+    const def = ReplicaDefinition.make({
+      name: "tasks",
+      documents,
+      mutations: [fixture.Rename],
+      projections: [fixture.TaskRows],
+      queries: [fixture.ListTasks]
+    })
+    const hashBefore = def.hash
+    const Extra = Document.make("Extra", { schema: Schema.String, version: 1 })
+    ;(documents.byName as unknown as Map<string, Document.Any>).set("Extra", Extra)
+
+    assert.strictEqual(DocumentSet.get(def.documents, "Extra"), undefined)
+    assert.strictEqual(def.documents.byName.size, 1)
+    assert.strictEqual(def.hash, hashBefore)
+  })
+
   it("is immune to post-make mutation of the caller's arrays", () => {
     const fixture = makeFixture()
     const mutations: Array<Mutation.Any> = [fixture.Rename]
