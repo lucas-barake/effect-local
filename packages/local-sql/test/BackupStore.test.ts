@@ -591,6 +591,24 @@ describe("BackupStore", () => {
       assert.strictEqual(result._tag, "Failure")
     }).pipe(Effect.provide(Live)))
 
+  it.effect("rejects an export after another writer fences the local replica", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const sql = yield* SqlClient.SqlClient
+      const nextReplicaId = yield* Identity.makeReplicaId
+      yield* sql`UPDATE effect_local_metadata
+        SET replica_id = ${nextReplicaId},
+            replica_incarnation = replica_incarnation + 1,
+            writer_generation = writer_generation + 1
+        WHERE singleton = 1`
+
+      const result = yield* Effect.exit(
+        backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      )
+
+      assert.strictEqual(result._tag, "Failure")
+    }).pipe(Effect.provide(Live)))
+
   it.effect("rejects archive JSON deeper than the configured limit", () =>
     Effect.gen(function*() {
       const backups = yield* BackupStore.BackupStore

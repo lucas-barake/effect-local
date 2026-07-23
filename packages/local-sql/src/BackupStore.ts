@@ -286,6 +286,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               const changes = yield* findChanges(undefined)
               const checkpoints = yield* findCheckpoints(undefined)
               const receipts = yield* findReceipts(undefined)
+              yield* gate.validate(identity)
               return { documents, changes, checkpoints, receipts }
             }))
             const records = yield* Effect.forEach([
