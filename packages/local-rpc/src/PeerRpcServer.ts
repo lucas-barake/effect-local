@@ -447,13 +447,15 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
         if (!registry.accepting) return "Unavailable" as const
         const subject = subjectState(subjectId, now)
         if (subject === undefined) return "Capacity" as const
-        const elapsed = Math.max(0, now - (operation === "Open" ? subject.openUpdatedAt : subject.pushUpdatedAt))
+        const storedUpdatedAt = operation === "Open" ? subject.openUpdatedAt : subject.pushUpdatedAt
+        const effectiveNow = Math.max(now, storedUpdatedAt, subject.lastUsedAt)
+        const elapsed = effectiveNow - storedUpdatedAt
         if (operation === "Open") {
           subject.openTokens = Math.min(
             limits.openBurst,
             subject.openTokens + elapsed / 1_000 * limits.openRatePerSecond
           )
-          subject.openUpdatedAt = now
+          subject.openUpdatedAt = effectiveNow
           if (subject.openTokens < 1 || subject.openInFlight >= limits.maxInFlightOpenPerSubject) {
             retainInactiveSubject(subjectId, subject)
             return "Capacity" as const
@@ -465,7 +467,7 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
             limits.pushBurst,
             subject.pushTokens + elapsed / 1_000 * limits.pushRatePerSecond
           )
-          subject.pushUpdatedAt = now
+          subject.pushUpdatedAt = effectiveNow
           if (subject.pushTokens < 1 || subject.pushInFlight >= limits.maxInFlightPushPerSubject) {
             retainInactiveSubject(subjectId, subject)
             return "Capacity" as const
@@ -473,7 +475,7 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
           subject.pushTokens -= 1
           subject.pushInFlight += 1
         }
-        subject.lastUsedAt = now
+        subject.lastUsedAt = effectiveNow
         return "Acquired" as const
       }))
 

@@ -19,6 +19,7 @@ import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Metric from "effect/Metric"
+import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Redacted from "effect/Redacted"
 import * as Ref from "effect/Ref"
@@ -2062,6 +2063,45 @@ describe("PeerRpcServer", () => {
       }).pipe(Effect.flip)
       assert.instanceOf(rejected, PeerRpcError.RequestCapacityExceeded)
       assert.strictEqual((yield* Queue.poll(fixture.received))._tag, "None")
+      yield* Fiber.interrupt(session.fiber)
+    })))
+
+  it.effect("keeps the subject Push bucket monotonic when a stale update lands after a fresher one", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const fixture = yield* makeFixture({
+        ...baseOptions,
+        rpcLimits: { pushBurst: 1, pushRatePerSecond: 1 },
+        manualClock: true
+      })
+      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
+      yield* fixture.setCurrentTime(500)
+      yield* fixture.directPush({ sessionId: session.opened.sessionId, payload: yield* fixture.encode(0) })
+      assert.strictEqual(yield* Queue.take(fixture.received), 0)
+
+      // acquireSubject is always called under one mutex, so a stale acquisition landing after a
+      // fresher one is just an out of order `now` reaching that mutex. Rewinding the manual clock
+      // reproduces exactly that ordering without needing genuine fiber interleaving.
+      yield* fixture.setCurrentTime(0)
+      const stale = yield* fixture.directPush({
+        sessionId: session.opened.sessionId,
+        payload: yield* fixture.encode(1)
+      }).pipe(Effect.flip)
+      assert.instanceOf(stale, PeerRpcError.RequestCapacityExceeded)
+
+      // 1 token/sec budget, 500ms elapsed since the fresh t=500 update. A stale update that
+      // rewound the bucket to t=0 would wrongly mint a full token by t=1000.
+      yield* fixture.setCurrentTime(1_000)
+      const laterExit = yield* fixture.directPush({
+        sessionId: session.opened.sessionId,
+        payload: yield* fixture.encode(1)
+      }).pipe(Effect.exit)
+      assert.isTrue(Exit.isFailure(laterExit), "expected the third push to stay capacity rejected")
+      if (Exit.isFailure(laterExit)) {
+        const failure = Cause.findErrorOption(laterExit.cause)
+        assert.isTrue(Option.isSome(failure) && failure.value._tag === "RequestCapacityExceeded")
+      }
+      assert.strictEqual((yield* Queue.poll(fixture.received))._tag, "None")
+
       yield* Fiber.interrupt(session.fiber)
     })))
 
