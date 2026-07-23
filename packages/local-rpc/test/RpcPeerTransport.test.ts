@@ -317,6 +317,30 @@ describe("RpcPeerTransport", () => {
       assert.strictEqual(yield* Ref.get(openFinalized), 1)
     }))
 
+  it.effect("does not complete Open after the supplied ambient scope closes during request construction", () =>
+    Effect.gen(function*() {
+      const ambient = yield* Scope.make()
+      const pulled = yield* Ref.make(0)
+      const client = makeClient(
+        () => {
+          Effect.runSync(Scope.close(ambient, Exit.void))
+          return Stream.fromEffect(
+            Ref.updateAndGet(pulled, (count) => count + 1).pipe(
+              Effect.as(serverOpened),
+              Effect.uninterruptible
+            )
+          )
+        },
+        () => Effect.void
+      )
+      const error = yield* connect(client, serverPeerId).pipe(
+        Effect.provideService(Scope.Scope, ambient),
+        Effect.flip
+      )
+      assert.strictEqual(error.reason._tag, "StorageUnavailable")
+      assert.strictEqual(yield* Ref.get(pulled), 0)
+    }))
+
   it.effect("rejects a send racing supplied ambient scope cleanup", () =>
     Effect.gen(function*() {
       const ambient = yield* Scope.make()

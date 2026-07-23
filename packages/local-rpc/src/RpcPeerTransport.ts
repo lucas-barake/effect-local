@@ -95,9 +95,6 @@ export const layer = (
                 )
               yield* Scope.addFinalizerExit(lifetimeScope, closeConnection)
               return yield* restore(Effect.gen(function*() {
-                yield* stateLock.withPermit(
-                  Effect.suspend(() => closing ? Effect.fail(unavailable()) : Effect.void)
-                )
                 const openCompleted = yield* Deferred.make<
                   Exit.Exit<
                     readonly [
@@ -107,7 +104,7 @@ export const layer = (
                     ReplicaError.ReplicaError
                   >
                 >()
-                const openFiber = yield* client.Open({
+                const openRequest = client.Open({
                   protocolVersion: PeerRpc.protocolVersion,
                   expectedPeerId: connectOptions.peerId,
                   documents: options.documents.map((entry) => ({
@@ -118,8 +115,14 @@ export const layer = (
                   Stream.mapError(mapError),
                   Stream.peel(Sink.take<PeerRpc.OpenEvent>(1)),
                   Effect.provideService(Scope.Scope, connectionScope),
-                  Effect.onExit((exit) => Deferred.succeed(openCompleted, exit).pipe(Effect.asVoid)),
-                  Effect.forkIn(connectionScope, { startImmediately: true })
+                  Effect.onExit((exit) => Deferred.succeed(openCompleted, exit).pipe(Effect.asVoid))
+                )
+                const openFiber = yield* stateLock.withPermit(
+                  Effect.suspend(() =>
+                    closing
+                      ? Effect.fail(unavailable())
+                      : Effect.forkIn(openRequest, connectionScope)
+                  )
                 )
                 const openExit = yield* Deferred.await(openCompleted).pipe(
                   Effect.onInterrupt(() => Fiber.interrupt(openFiber))
@@ -139,6 +142,9 @@ export const layer = (
                     })
                   })
                 }
+                yield* stateLock.withPermit(
+                  Effect.suspend(() => closing ? Effect.fail(unavailable()) : Effect.void)
+                )
                 const sendLock = yield* Semaphore.make(1)
                 const send = (message: Uint8Array) =>
                   PeerRpcObservability.observe({
