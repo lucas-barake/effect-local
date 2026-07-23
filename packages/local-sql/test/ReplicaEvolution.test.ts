@@ -4,6 +4,7 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Projection from "@lucas-barake/effect-local/Projection"
 import * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
@@ -134,10 +135,85 @@ describe("ReplicaEvolution", () => {
       Effect.gen(function*() {
         const initial = ReplicaDefinition.make({ name: "tasks", documents: DocumentSet.make(TaskV1) })
         yield* ReplicaBootstrap.make(initial)
+        const sql = yield* SqlClient.SqlClient
+        yield* sql`INSERT INTO effect_local_documents (
+          document_id, document_type, schema_version, observed_versions, materialized_heads,
+          accepted_heads, tombstone, projection_status, checkpoint_hash
+        ) VALUES ('doc_1', 'Task', 1, '[1]', '["first"]', '["first"]', 0, 'Ready', NULL)`
         const evolved = ReplicaDefinition.make({ name: "tasks", documents: DocumentSet.make(TaskV2) })
         yield* ReplicaBootstrap.make(evolved)
         const state = yield* ReplicaBootstrap.make(initial)
         assert.strictEqual(state.definitionHash, initial.hash)
+      }).pipe(Effect.provide(environment)))
+
+    it.effect("accepts stored rows at multiple migratable versions of one type", () =>
+      Effect.gen(function*() {
+        const TaskV3 = Document.make("Task", {
+          schema: Schema.Struct({ title: Schema.String, done: Schema.Boolean, priority: Schema.Int }),
+          version: 3,
+          migrations: [
+            Document.migration({
+              from: 1,
+              schema: Schema.Struct({ title: Schema.String }),
+              migrate: (value) => ({ ...value, done: false })
+            }),
+            Document.migration({
+              from: 2,
+              schema: Schema.Struct({ title: Schema.String, done: Schema.Boolean }),
+              migrate: (value) => ({ ...value, priority: 0 })
+            })
+          ]
+        })
+        const initial = ReplicaDefinition.make({ name: "tasks", documents: DocumentSet.make(TaskV1) })
+        yield* ReplicaBootstrap.make(initial)
+        const sql = yield* SqlClient.SqlClient
+        yield* sql`INSERT INTO effect_local_documents (
+          document_id, document_type, schema_version, observed_versions, materialized_heads,
+          accepted_heads, tombstone, projection_status, checkpoint_hash
+        ) VALUES ('doc_1', 'Task', 1, '[1]', '["first"]', '["first"]', 0, 'Ready', NULL)`
+        yield* sql`INSERT INTO effect_local_documents (
+          document_id, document_type, schema_version, observed_versions, materialized_heads,
+          accepted_heads, tombstone, projection_status, checkpoint_hash
+        ) VALUES ('doc_2', 'Task', 2, '[2]', '["second"]', '["second"]', 0, 'Ready', NULL)`
+        const evolved = ReplicaDefinition.make({ name: "tasks", documents: DocumentSet.make(TaskV3) })
+        const state = yield* ReplicaBootstrap.make(evolved)
+        assert.strictEqual(state.definitionHash, evolved.hash)
+      }).pipe(Effect.provide(environment)))
+
+    it.effect("rejects stored rows whose oldest version predates the migration chain", () =>
+      Effect.gen(function*() {
+        const TaskV3Partial = Document.make("Task", {
+          schema: Schema.Struct({ title: Schema.String, done: Schema.Boolean, priority: Schema.Int }),
+          version: 3,
+          migrations: [
+            Document.migration({
+              from: 2,
+              schema: Schema.Struct({ title: Schema.String, done: Schema.Boolean }),
+              migrate: (value) => ({ ...value, priority: 0 })
+            })
+          ]
+        })
+        const initial = ReplicaDefinition.make({ name: "tasks", documents: DocumentSet.make(TaskV1) })
+        yield* ReplicaBootstrap.make(initial)
+        const sql = yield* SqlClient.SqlClient
+        yield* sql`INSERT INTO effect_local_documents (
+          document_id, document_type, schema_version, observed_versions, materialized_heads,
+          accepted_heads, tombstone, projection_status, checkpoint_hash
+        ) VALUES ('doc_1', 'Task', 1, '[1]', '["first"]', '["first"]', 0, 'Ready', NULL)`
+        yield* sql`INSERT INTO effect_local_documents (
+          document_id, document_type, schema_version, observed_versions, materialized_heads,
+          accepted_heads, tombstone, projection_status, checkpoint_hash
+        ) VALUES ('doc_2', 'Task', 2, '[2]', '["second"]', '["second"]', 0, 'Ready', NULL)`
+        const evolved = ReplicaDefinition.make({ name: "tasks", documents: DocumentSet.make(TaskV3Partial) })
+        const result = yield* Effect.result(ReplicaBootstrap.make(evolved))
+        assert.isTrue(Result.isFailure(result))
+        if (Result.isFailure(result) && result.failure._tag === "ReplicaError") {
+          assert.strictEqual(result.failure.reason._tag, "ProtocolMismatch")
+        }
+        const metadata = yield* sql<{ readonly definition_hash: string }>`
+          SELECT definition_hash FROM effect_local_metadata WHERE singleton = 1
+        `
+        assert.strictEqual(metadata[0]?.definition_hash, initial.hash)
       }).pipe(Effect.provide(environment)))
   })
 
@@ -173,6 +249,129 @@ describe("ReplicaEvolution", () => {
         }))
         const settled = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM effect_local_changes`
         assert.strictEqual(settled[0]!.count, after[0]!.count)
+      }).pipe(Effect.provide(environment)))
+
+    it.effect("skips an unrecoverable document durably while migrating the healthy ones", () =>
+      Effect.gen(function*() {
+        const definitionV1 = ReplicaDefinition.make({ name: "tasks", documents: DocumentSet.make(TaskV1) })
+        const definitionV2 = ReplicaDefinition.make({ name: "tasks", documents: DocumentSet.make(TaskV2) })
+        const commandId = yield* Identity.makeCommandId
+        const healthyId = Identity.documentIdFromCommandId(commandId)
+        yield* Effect.scoped(Effect.gen(function*() {
+          const context = yield* Layer.build(SqlReplica.layerWithBindings(definitionV1, { projections: [] }))
+          const replica = Context.get(context, Replica.Replica)
+          yield* replica.create(TaskV1, { commandId, value: { title: "survives" } })
+        }))
+        const sql = yield* SqlClient.SqlClient
+        const corruptId = "doc_00000000-0000-4000-8000-00000000c0de"
+        yield* sql`INSERT INTO effect_local_documents (
+          document_id, document_type, schema_version, observed_versions, materialized_heads,
+          accepted_heads, tombstone, projection_status, checkpoint_hash
+        ) VALUES (${corruptId}, 'Task', 1, '[1]', '["ghost"]', '["ghost"]', 0, 'Ready', NULL)`
+        yield* Effect.scoped(Effect.gen(function*() {
+          const context = yield* Layer.build(SqlReplica.layerWithBindings(definitionV2, { projections: [] }))
+          const replica = Context.get(context, Replica.Replica)
+          const snapshot = yield* replica.get(TaskV2, healthyId)
+          assert.deepStrictEqual(snapshot.value, { title: "survives", done: false })
+        }))
+        const rows = yield* sql<{
+          readonly document_id: string
+          readonly projection_status: string
+          readonly schema_version: number
+        }>`
+          SELECT document_id, projection_status, schema_version FROM effect_local_documents
+        `
+        const corrupt = rows.find((row) => row.document_id === corruptId)
+        const healthy = rows.find((row) => row.document_id === healthyId)
+        assert.strictEqual(corrupt?.projection_status, "Blocked")
+        assert.strictEqual(corrupt?.schema_version, 1)
+        assert.strictEqual(healthy?.projection_status, "Ready")
+        assert.strictEqual(healthy?.schema_version, 2)
+      }).pipe(Effect.provide(environment)))
+
+    it.effect("reports per-type migration counts across multiple documents and types", () =>
+      Effect.gen(function*() {
+        const NoteV1 = Document.make("Note", { schema: Schema.Struct({ body: Schema.String }), version: 1 })
+        const NoteV2 = Document.make("Note", {
+          schema: Schema.Struct({ body: Schema.String, pinned: Schema.Boolean }),
+          version: 2,
+          migrations: [
+            Document.migration({
+              from: 1,
+              schema: Schema.Struct({ body: Schema.String }),
+              migrate: (value) => ({ ...value, pinned: false })
+            })
+          ]
+        })
+        const definitionV1 = ReplicaDefinition.make({ name: "tasks", documents: DocumentSet.make(TaskV1, NoteV1) })
+        const definitionV2 = ReplicaDefinition.make({ name: "tasks", documents: DocumentSet.make(TaskV2, NoteV2) })
+        yield* Effect.scoped(Effect.gen(function*() {
+          const context = yield* Layer.build(SqlReplica.layerWithBindings(definitionV1, { projections: [] }))
+          const replica = Context.get(context, Replica.Replica)
+          const first = yield* Identity.makeCommandId
+          const second = yield* Identity.makeCommandId
+          const third = yield* Identity.makeCommandId
+          yield* replica.create(TaskV1, { commandId: first, value: { title: "one" } })
+          yield* replica.create(TaskV1, { commandId: second, value: { title: "two" } })
+          yield* replica.create(NoteV1, { commandId: third, value: { body: "keep" } })
+        }))
+        const bootstrap = ReplicaBootstrap.layer(definitionV2)
+        const gate = ReplicaGate.layer.pipe(Layer.provideMerge(bootstrap))
+        const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
+        const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
+        const projections = ProjectionStore.layer([]).pipe(Layer.provideMerge(store))
+        const state = yield* Effect.scoped(Effect.gen(function*() {
+          const context = yield* Layer.build(projections)
+          return yield* ReplicaEvolution.make(definitionV2).pipe(Effect.provide(context))
+        }))
+        const counts = state.migratedDocuments.toSorted((a, b) => a.documentType.localeCompare(b.documentType))
+        assert.deepStrictEqual(counts, [
+          { documentType: "Note", count: 1 },
+          { documentType: "Task", count: 2 }
+        ])
+        assert.deepStrictEqual(state.rebuiltProjections, [])
+        const sql = yield* SqlClient.SqlClient
+        const stale = yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM effect_local_documents WHERE schema_version = 1
+        `
+        assert.strictEqual(stale[0]?.count, 0)
+      }).pipe(Effect.provide(environment)))
+
+    it.effect("mutating a migrated document produces a consistent commit", () =>
+      Effect.gen(function*() {
+        const SetDone = Mutation.make("SetDone", { document: TaskV2 })
+        const definitionV1 = ReplicaDefinition.make({ name: "tasks", documents: DocumentSet.make(TaskV1) })
+        const definitionV2 = ReplicaDefinition.make({
+          name: "tasks",
+          documents: DocumentSet.make(TaskV2),
+          mutations: [SetDone]
+        })
+        const createId = yield* Identity.makeCommandId
+        const documentId = Identity.documentIdFromCommandId(createId)
+        yield* Effect.scoped(Effect.gen(function*() {
+          const context = yield* Layer.build(SqlReplica.layerWithBindings(definitionV1, { projections: [] }))
+          const replica = Context.get(context, Replica.Replica)
+          yield* replica.create(TaskV1, { commandId: createId, value: { title: "mutate me" } })
+        }))
+        const sql = yield* SqlClient.SqlClient
+        yield* Effect.scoped(Effect.gen(function*() {
+          const context = yield* Layer.build(
+            SqlReplica.layerWithBindings(definitionV2, { projections: [] }).pipe(
+              Layer.provide(SetDone.toLayer(({ draft }) => {
+                draft.done = true
+                return undefined
+              }))
+            )
+          )
+          const replica = Context.get(context, Replica.Replica)
+          const before = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM effect_local_changes`
+          const mutateId = yield* Identity.makeCommandId
+          yield* replica.mutate(SetDone, { commandId: mutateId, documentId })
+          const snapshot = yield* replica.get(TaskV2, documentId)
+          assert.deepStrictEqual(snapshot.value, { title: "mutate me", done: true })
+          const after = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM effect_local_changes`
+          assert.strictEqual(after[0]!.count, before[0]!.count + 1)
+        }))
       }).pipe(Effect.provide(environment)))
   })
 
@@ -345,6 +544,106 @@ describe("ReplicaEvolution", () => {
           SELECT status, table_name FROM effect_local_projection_registry WHERE projection_name = 'TaskTitle'
         `
         assert.deepStrictEqual(registry, [{ status: "Ready", table_name: "task_title_v2" }])
+      }).pipe(Effect.provide(environment)))
+
+    it.effect("removes registry rows for a projection dropped from the definition", () =>
+      Effect.gen(function*() {
+        const TaskTitle = Projection.make("TaskTitle", {
+          document: TaskV1,
+          version: 1,
+          Row: projectionRow,
+          key: (row) => row.sourceDocumentId,
+          project: (snapshot) =>
+            snapshot.tombstone ? [] : [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title }]
+        })
+        const initial = ReplicaDefinition.make({
+          name: "tasks",
+          documents: DocumentSet.make(TaskV1),
+          projections: [TaskTitle]
+        })
+        const commandId = yield* Identity.makeCommandId
+        yield* Effect.scoped(Effect.gen(function*() {
+          const context = yield* Layer.build(
+            SqlReplica.layerWithBindings(initial, { projections: [binding(TaskTitle, "task_title_dropped")] })
+          )
+          const replica = Context.get(context, Replica.Replica)
+          yield* replica.create(TaskV1, { commandId, value: { title: "orphaned" } })
+        }))
+        const sql = yield* SqlClient.SqlClient
+        const seeded = yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM effect_local_projection_registry WHERE projection_name = 'TaskTitle'
+        `
+        assert.strictEqual(seeded[0]?.count, 1)
+        const evolved = ReplicaDefinition.make({ name: "tasks", documents: DocumentSet.make(TaskV1) })
+        yield* Effect.scoped(Effect.gen(function*() {
+          yield* Layer.build(SqlReplica.layerWithBindings(evolved, { projections: [] }))
+        }))
+        const registry = yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM effect_local_projection_registry WHERE projection_name = 'TaskTitle'
+        `
+        const documentProjections = yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM effect_local_document_projections WHERE projection_name = 'TaskTitle'
+        `
+        assert.strictEqual(registry[0]?.count, 0)
+        assert.strictEqual(documentProjections[0]?.count, 0)
+      }).pipe(Effect.provide(environment)))
+
+    it.effect("does not clobber an unrelated commit's outbox row when re-projecting", () =>
+      Effect.gen(function*() {
+        const Note = Document.make("Note", { schema: Schema.Struct({ body: Schema.String }), version: 1 })
+        const TaskTitle = Projection.make("TaskTitle", {
+          document: TaskV1,
+          version: 1,
+          Row: projectionRow,
+          key: (row) => row.sourceDocumentId,
+          project: (snapshot) =>
+            snapshot.tombstone ? [] : [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title }]
+        })
+        const initial = ReplicaDefinition.make({
+          name: "tasks",
+          documents: DocumentSet.make(TaskV1, Note),
+          projections: [TaskTitle]
+        })
+        const taskId = yield* Identity.makeCommandId
+        const noteId = yield* Identity.makeCommandId
+        yield* Effect.scoped(Effect.gen(function*() {
+          const context = yield* Layer.build(
+            SqlReplica.layerWithBindings(initial, { projections: [binding(TaskTitle, "task_title_v1")] })
+          )
+          const replica = Context.get(context, Replica.Replica)
+          yield* replica.create(TaskV1, { commandId: taskId, value: { title: "rebuild me" } })
+          yield* replica.create(Note, { commandId: noteId, value: { body: "unrelated" } })
+        }))
+        const sql = yield* SqlClient.SqlClient
+        const noteDocumentId = Identity.documentIdFromCommandId(noteId)
+        yield* sql`UPDATE effect_local_commit_outbox SET published = 0 WHERE document_id = ${noteDocumentId}`
+        const before = yield* sql<{ readonly invalidation_keys: string }>`
+          SELECT invalidation_keys FROM effect_local_commit_outbox WHERE document_id = ${noteDocumentId}
+        `
+        const TaskTitleV2 = Projection.make("TaskTitle", {
+          document: TaskV1,
+          version: 2,
+          Row: projectionRow,
+          key: (row) => row.sourceDocumentId,
+          project: (snapshot) =>
+            snapshot.tombstone
+              ? []
+              : [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title.toUpperCase() }]
+        })
+        const evolved = ReplicaDefinition.make({
+          name: "tasks",
+          documents: DocumentSet.make(TaskV1, Note),
+          projections: [TaskTitleV2]
+        })
+        yield* Effect.scoped(Effect.gen(function*() {
+          yield* Layer.build(
+            SqlReplica.layerWithBindings(evolved, { projections: [binding(TaskTitleV2, "task_title_v2")] })
+          )
+        }))
+        const after = yield* sql<{ readonly invalidation_keys: string }>`
+          SELECT invalidation_keys FROM effect_local_commit_outbox WHERE document_id = ${noteDocumentId}
+        `
+        assert.deepStrictEqual(after, before)
       }).pipe(Effect.provide(environment)))
   })
 })
