@@ -121,18 +121,46 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
             row.projection_version !== binding.projection.version ||
             row.schema_checksum !== checksum
           ) {
-            return yield* new ReplicaError.ReplicaError({
-              reason: new ReplicaError.ProjectionBlocked({
-                projection: binding.projection.name,
-                cause: new Error("Projection registry mismatch")
+            yield* sql.withTransaction(Effect.gen(function*() {
+              yield* sql`DELETE FROM ${sql(binding.table)}`
+              yield* sql`DELETE FROM effect_local_document_projections
+                WHERE projection_name = ${binding.projection.name}`
+              yield* sql`UPDATE effect_local_projection_registry SET
+                table_name = ${binding.table},
+                projection_version = ${binding.projection.version},
+                schema_checksum = ${checksum},
+                status = 'Rebuilding'
+                WHERE projection_name = ${binding.projection.name}`
+            })).pipe(Effect.mapError((cause) =>
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.ProjectionBlocked({
+                  projection: binding.projection.name,
+                  cause
+                })
               })
-            })
+            ))
           }
         } else {
+          const populated = yield* SqlSchema.findOne({
+            Request: Schema.String,
+            Result: Schema.Struct({ populated: Schema.Int }),
+            execute: (documentType) =>
+              sql`SELECT EXISTS (
+                SELECT 1 FROM effect_local_documents WHERE document_type = ${documentType}
+              ) AS populated`
+          })(binding.projection.document.name).pipe(Effect.mapError((cause) =>
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ProjectionBlocked({
+                projection: binding.projection.name,
+                cause
+              })
+            })
+          ))
+          const status = populated.populated === 1 ? "Rebuilding" : "Ready"
           yield* sql`INSERT INTO effect_local_projection_registry (
           projection_name, table_name, projection_version, schema_checksum, status
         ) VALUES (
-          ${binding.projection.name}, ${binding.table}, ${binding.projection.version}, ${checksum}, 'Ready'
+          ${binding.projection.name}, ${binding.table}, ${binding.projection.version}, ${checksum}, ${status}
         )`.pipe(Effect.mapError((cause) =>
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.ProjectionBlocked({
