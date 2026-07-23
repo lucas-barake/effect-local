@@ -66,9 +66,8 @@ export const match = <A, E, B,>(
 
 export const committedOrFail = <A, E,>(
   self: CommandOutcome<A, E>
-): Effect.Effect<A, E | CommandOutcomeUnknown> =>
-  self._tag === "DurablyCommittedLocal" ?
-    Effect.succeed(self.value)
-    : self._tag === "Rejected" ?
-    Effect.fail(self.error)
-    : Effect.fail(new CommandOutcomeUnknown({ commandId: self.commandId }))
+): Effect.Effect<A, E | CommandOutcomeUnknown> => {
+  if (self._tag === "DurablyCommittedLocal") return Effect.succeed(self.value)
+  if (self._tag === "Rejected") return Effect.fail(self.error)
+  return Effect.fail(new CommandOutcomeUnknown({ commandId: self.commandId }))
+}

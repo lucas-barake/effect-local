@@ -125,6 +125,47 @@ describe("QueryExecutor", () => {
       assert.strictEqual(result._tag, "Failure")
     }).pipe(Effect.provide(Live)))
 
+  it.effect("serializes readiness validation with the query handler", () =>
+    Effect.gen(function*() {
+      const handlerEntered = yield* Deferred.make<void>()
+      const releaseHandler = yield* Deferred.make<void>()
+      const projectionBlocked = yield* Deferred.make<void>()
+      const blockingHandler = ListLabels.toLayer((request) =>
+        Effect.gen(function*() {
+          yield* Deferred.succeed(handlerEntered, void 0)
+          yield* Deferred.await(releaseHandler)
+          return yield* listLabels(request).pipe(Effect.orDie)
+        })
+      ).pipe(Layer.provide(Database))
+      const blockingExecutor = QueryExecutor.layer(definition).pipe(
+        Layer.provide(Layer.mergeAll(Database, blockingHandler, Reactive))
+      )
+      const blockingLive = Layer.mergeAll(Base, Projections, blockingHandler, Reactive, blockingExecutor)
+
+      yield* Effect.gen(function*() {
+        const executor = yield* QueryExecutor.QueryExecutor
+        const sql = yield* SqlClient.SqlClient
+        const documentId = yield* Identity.makeDocumentId
+        yield* sql`INSERT INTO query_task_labels_v1 (sourceDocumentId, label)
+          VALUES (${documentId}, 'stale')`
+        const queryFiber = yield* executor.execute(ListLabels, { prefix: "" }).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(handlerEntered)
+        const blockFiber = yield* sql`UPDATE effect_local_projection_registry SET status = 'Blocked'
+          WHERE projection_name = ${Labels.name}`.pipe(
+          Effect.andThen(Deferred.succeed(projectionBlocked, void 0)),
+          Effect.forkChild({ startImmediately: true })
+        )
+        assert.isFalse(yield* Deferred.isDone(projectionBlocked))
+        yield* Deferred.succeed(releaseHandler, void 0)
+        assert.deepStrictEqual(yield* Fiber.join(queryFiber), [
+          { sourceDocumentId: documentId, label: "stale" }
+        ])
+        yield* Fiber.join(blockFiber)
+      }).pipe(Effect.provide(blockingLive))
+    }))
+
   it.effect("refreshes reactive queries when a dependency document changes", () =>
     Effect.gen(function*() {
       const executor = yield* QueryExecutor.QueryExecutor
@@ -153,4 +194,132 @@ describe("QueryExecutor", () => {
         ]
       ])
     }).pipe(Effect.provide(Live)))
+
+  it.effect("closes reactive queries whose projections share a document", () => {
+    const LabelCounts = Projection.make("LabelCounts", {
+      document: Task,
+      version: 1,
+      Row: Schema.Struct({
+        sourceDocumentId: Identity.DocumentId,
+        count: Schema.Number
+      }),
+      key: (row) => row.sourceDocumentId,
+      project: (snapshot) => [{
+        sourceDocumentId: snapshot.documentId,
+        count: snapshot.value.labels.length
+      }]
+    })
+    const LabelCountsSql = SqlProjection.make(LabelCounts, {
+      table: "query_task_label_counts_v1",
+      migrations: [{
+        id: 1,
+        name: "query_task_label_counts_v1",
+        run: (sql, table) =>
+          sql`CREATE TABLE IF NOT EXISTS ${sql(table)} (
+            sourceDocumentId TEXT NOT NULL,
+            count INTEGER NOT NULL
+          )`.pipe(Effect.asVoid)
+      }],
+      deleteByDocument: (sql, table, documentId) =>
+        sql`DELETE FROM ${sql(table)} WHERE sourceDocumentId = ${documentId}`.pipe(Effect.asVoid),
+      insert: (sql, table, row) =>
+        sql`INSERT INTO ${sql(table)} (sourceDocumentId, count)
+          VALUES (${row.sourceDocumentId}, ${row.count})`.pipe(Effect.asVoid)
+    })
+    const Combined = Query.make("Combined", {
+      success: Schema.Number,
+      dependsOn: [Labels, LabelCounts]
+    })
+    const combinedDefinition = ReplicaDefinition.make({
+      name: "shared-document-reactivity",
+      documents: DocumentSet.make(Task),
+      projections: [Labels, LabelCounts],
+      queries: [Combined]
+    })
+    const combinedDatabase = Layer.merge(
+      SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+      NodeCrypto.layer
+    )
+    const combinedBootstrap = ReplicaBootstrap.layer(combinedDefinition).pipe(
+      Layer.provide(combinedDatabase)
+    )
+    const combinedBase = Layer.merge(combinedDatabase, combinedBootstrap)
+    const combinedProjections = ProjectionStore.layer([LabelsSql, LabelCountsSql]).pipe(
+      Layer.provide(Layer.mergeAll(
+        combinedBase,
+        LabelsSql.layer,
+        LabelCountsSql.layer
+      ))
+    )
+    const combinedHandler = Combined.toLayer(() => Effect.succeed(1))
+    const combinedReactive = Reactivity.layer
+    const combinedExecutor = QueryExecutor.layer(combinedDefinition).pipe(
+      Layer.provide(Layer.mergeAll(
+        combinedDatabase,
+        combinedHandler,
+        combinedReactive
+      ))
+    )
+    const combinedLive = Layer.mergeAll(
+      combinedBase,
+      combinedProjections,
+      combinedHandler,
+      combinedReactive,
+      combinedExecutor
+    )
+
+    return Effect.gen(function*() {
+      const executor = yield* QueryExecutor.QueryExecutor
+      const first = yield* Effect.scoped(
+        Effect.gen(function*() {
+          const pull = yield* Stream.toPull(executor.reactive(Combined, undefined))
+          return yield* pull
+        })
+      )
+      assert.deepStrictEqual(first, [1])
+    }).pipe(Effect.provide(combinedLive))
+  })
+
+  it.effect("preserves declared SqlError query failures", () => {
+    class DeclaredSqlError extends Schema.TaggedErrorClass<DeclaredSqlError>(
+      "@lucas-barake/effect-local-sql/test/DeclaredSqlError"
+    )("SqlError", {
+      detail: Schema.String
+    }) {}
+
+    const FailingQuery = Query.make("FailingQuery", {
+      error: DeclaredSqlError,
+      dependsOn: []
+    })
+    const failingDefinition = ReplicaDefinition.make({
+      name: "declared-sql-error",
+      documents: DocumentSet.make(Task),
+      queries: [FailingQuery]
+    })
+    const failingDatabase = Layer.merge(
+      SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+      NodeCrypto.layer
+    )
+    const failingBootstrap = ReplicaBootstrap.layer(failingDefinition).pipe(
+      Layer.provide(failingDatabase)
+    )
+    const failingHandler = FailingQuery.toLayer(() => Effect.fail(new DeclaredSqlError({ detail: "expected" })))
+    const failingExecutor = QueryExecutor.layer(failingDefinition).pipe(
+      Layer.provide(Layer.mergeAll(failingDatabase, failingHandler, Reactive))
+    )
+    const failingLive = Layer.mergeAll(
+      failingDatabase,
+      failingBootstrap,
+      failingHandler,
+      Reactive,
+      failingExecutor
+    )
+
+    return Effect.gen(function*() {
+      const executor = yield* QueryExecutor.QueryExecutor
+      const error = yield* executor.execute(FailingQuery, undefined).pipe(Effect.flip)
+      assert.strictEqual(error._tag, "SqlError")
+      if (error._tag === "SqlError") assert.strictEqual(error.detail, "expected")
+    }).pipe(Effect.provide(failingLive))
+  })
 })

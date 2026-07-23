@@ -75,9 +75,11 @@ const ReceiptRow = Schema.Struct({
 })
 
 const PendingRow = Schema.Struct({
+  actor: Schema.String,
   bytes: Schema.Uint8Array,
   change_hash: Schema.String,
-  dependencies: Schema.String
+  dependencies: Schema.String,
+  sequence: Schema.Int
 })
 
 const PendingReceiptRow = Schema.Struct({
@@ -155,7 +157,21 @@ const receivedFromReceipt = (documentId: Identity.DocumentId, receipt: typeof Re
 })
 
 const sameHeads = (left: ReadonlyArray<string>, right: ReadonlyArray<string>) =>
-  Equal.equals([...left].toSorted(), [...right].toSorted())
+  Equal.equals(left.toSorted(), right.toSorted())
+
+const failStorageUnavailable = (cause: unknown) =>
+  Effect.fail(
+    new ReplicaError.ReplicaError({
+      reason: new ReplicaError.StorageUnavailable({ cause })
+    })
+  )
+
+const failStorageCorrupt = (cause: unknown) =>
+  Effect.fail(
+    new ReplicaError.ReplicaError({
+      reason: new ReplicaError.StorageCorrupt({ cause })
+    })
+  )
 
 export class PeerSync extends Context.Service<PeerSync, {
   readonly open: (peerId: Identity.PeerId) => Effect.Effect<Session, ReplicaError.ReplicaError>
@@ -253,7 +269,7 @@ export const layer: Layer.Layer<
       Request: Identity.DocumentId,
       Result: PendingRow,
       execute: (documentId) =>
-        sql`SELECT bytes, change_hash, dependencies FROM effect_local_changes
+        sql`SELECT actor, bytes, change_hash, dependencies, sequence FROM effect_local_changes
           WHERE document_id = ${documentId} AND applied = 0 ORDER BY accepted_at, change_hash`
     })
     const findPendingReceipts = SqlSchema.findAll({
@@ -510,16 +526,7 @@ export const layer: Layer.Layer<
         WHERE replica_incarnation != ${bootstrap.incarnation} OR accepted_at < ${startupCutoff}`
       yield* sql`DELETE FROM effect_local_peer_outbox
         WHERE replica_incarnation != ${bootstrap.incarnation} OR created_at < ${startupCutoff}`
-    })).pipe(
-      Effect.catchTag("SqlError", (cause) =>
-        Effect.fail(
-          new ReplicaError.ReplicaError({
-            reason: new ReplicaError.StorageUnavailable({
-              cause
-            })
-          })
-        ))
-    )
+    })).pipe(Effect.catchTag("SqlError", failStorageUnavailable))
 
     const readState = (session: Session, documentId: Identity.DocumentId) =>
       Ref.get(states).pipe(
@@ -543,18 +550,17 @@ export const layer: Layer.Layer<
       documentId: Identity.DocumentId,
       effect: Effect.Effect<A, E, R>
     ) =>
-      Effect.scoped(
-        RcMap.get(documentLocks, documentId).pipe(
-          Effect.mapError(() =>
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.QuotaExceeded({
-                resource: "in-flight sync documents",
-                limit: limits.maxQueuedRpc
-              })
+      RcMap.get(documentLocks, documentId).pipe(
+        Effect.mapError(() =>
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.QuotaExceeded({
+              resource: "in-flight sync documents",
+              limit: limits.maxQueuedRpc
             })
-          ),
-          Effect.flatMap((lock) => lock.withPermit(effect))
-        )
+          })
+        ),
+        Effect.flatMap((lock) => lock.withPermit(effect)),
+        Effect.scoped
       )
 
     const validateSession = (permit: ReplicaGate.Permit, session: Session) =>
@@ -574,18 +580,17 @@ export const layer: Layer.Layer<
       session: Session,
       use: (generation: Ref.Ref<number>) => Effect.Effect<A, E, R>
     ) =>
-      Effect.scoped(
-        RcMap.get(sessionGenerations, sessionKey(session)).pipe(
-          Effect.mapError(() =>
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.QuotaExceeded({
-                resource: "in-flight peer sessions",
-                limit: limits.maxQueuedRpc
-              })
+      RcMap.get(sessionGenerations, sessionKey(session)).pipe(
+        Effect.mapError(() =>
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.QuotaExceeded({
+              resource: "in-flight peer sessions",
+              limit: limits.maxQueuedRpc
             })
-          ),
-          Effect.flatMap(use)
-        )
+          })
+        ),
+        Effect.flatMap(use),
+        Effect.scoped
       )
 
     const validateSessionGeneration = (generation: Ref.Ref<number>, expected: number) =>
@@ -688,77 +693,51 @@ export const layer: Layer.Layer<
       })
 
     const enqueue = (session: Session, reply: Reply) =>
-      quotaLock.withPermit(Effect.scoped(Effect.gen(function*() {
+      Effect.scoped(Effect.gen(function*() {
         const permit = yield* gate.shared
         yield* validateSession(permit, session)
-        const messageHash = yield* digest(reply.message)
-        if (messageHash !== reply.messageHash) {
-          return yield* new ReplicaError.ReplicaError({
-            reason: new ReplicaError.ProtocolMismatch({
-              expected: messageHash,
-              observed: reply.messageHash
+        return yield* quotaLock.withPermit(Effect.gen(function*() {
+          const messageHash = yield* digest(reply.message)
+          if (messageHash !== reply.messageHash) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: messageHash,
+                observed: reply.messageHash
+              })
             })
-          })
-        }
-        const rows = yield* findOutboxReply({
-          replicaIncarnation: session.replicaIncarnation,
-          peerId: session.peerId,
-          connectionEpoch: session.connectionEpoch,
-          documentId: reply.documentId,
-          messageHash: reply.messageHash
-        }).pipe(
-          Effect.catchTags({
-            SqlError: (cause) =>
-              Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageUnavailable({
-                    cause
-                  })
-                })
-              ),
-            SchemaError: (cause) =>
-              Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageCorrupt({
-                    cause
-                  })
-                })
-              )
-          })
-        )
-        const existing = rows[0]
-        if (existing !== undefined) {
-          return {
-            sendSequence: existing.send_sequence,
-            documentId: reply.documentId,
-            message: existing.message,
-            messageHash: existing.message_hash,
-            heads: existing.heads
           }
-        }
-        return yield* sql.withTransaction(
-          persistOutbound(session, reply.documentId, reply.message, reply.heads)
-        ).pipe(
-          Effect.catchTags({
-            SqlError: (cause) =>
-              Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageUnavailable({
-                    cause
-                  })
-                })
-              ),
-            SchemaError: (cause) =>
-              Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageCorrupt({
-                    cause
-                  })
-                })
-              )
-          })
-        )
-      })))
+          const rows = yield* findOutboxReply({
+            replicaIncarnation: session.replicaIncarnation,
+            peerId: session.peerId,
+            connectionEpoch: session.connectionEpoch,
+            documentId: reply.documentId,
+            messageHash: reply.messageHash
+          }).pipe(
+            Effect.catchTags({
+              SqlError: failStorageUnavailable,
+              SchemaError: failStorageCorrupt
+            })
+          )
+          const existing = rows[0]
+          if (existing !== undefined) {
+            return {
+              sendSequence: existing.send_sequence,
+              documentId: reply.documentId,
+              message: existing.message,
+              messageHash: existing.message_hash,
+              heads: existing.heads
+            }
+          }
+          return yield* sql.withTransaction(
+            persistOutbound(session, reply.documentId, reply.message, reply.heads)
+          ).pipe(
+            Effect.catchTags({
+              SqlError: failStorageUnavailable,
+              SchemaError: failStorageCorrupt
+            })
+          )
+        }))
+      }))
 
     const generate = <D extends Document.Any,>(
       document: D,
@@ -779,22 +758,8 @@ export const layer: Layer.Layer<
               documentId
             }).pipe(
               Effect.catchTags({
-                SqlError: (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageUnavailable({
-                        cause
-                      })
-                    })
-                  ),
-                SchemaError: (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageCorrupt({
-                        cause
-                      })
-                    })
-                  )
+                SqlError: failStorageUnavailable,
+                SchemaError: failStorageCorrupt
               })
             )
             if ((existing[0]?.count ?? 0) > 0) {
@@ -834,6 +799,13 @@ export const layer: Layer.Layer<
                   }
                   const outbound = yield* quotaLock.withPermit(Effect.gen(function*() {
                     yield* validateSessionGeneration(generation, sessionGeneration)
+                    const existing = yield* findPendingOutboxCount({
+                      replicaIncarnation: session.replicaIncarnation,
+                      peerId: session.peerId,
+                      connectionEpoch: session.connectionEpoch,
+                      documentId
+                    })
+                    if ((existing[0]?.count ?? 0) > 0) return null
                     const outbound = yield* sql.withTransaction(
                       persistOutbound(session, documentId, generated[1]!, durable.materializedHeads)
                     )
@@ -841,25 +813,13 @@ export const layer: Layer.Layer<
                     return outbound
                   })).pipe(
                     Effect.catchTags({
-                      SqlError: (cause) =>
-                        Effect.fail(
-                          new ReplicaError.ReplicaError({
-                            reason: new ReplicaError.StorageUnavailable({
-                              cause
-                            })
-                          })
-                        ),
-                      SchemaError: (cause) =>
-                        Effect.fail(
-                          new ReplicaError.ReplicaError({
-                            reason: new ReplicaError.StorageCorrupt({
-                              cause
-                            })
-                          })
-                        )
+                      SqlError: failStorageUnavailable,
+                      SchemaError: failStorageCorrupt
                     })
                   )
-                  return { outbound, observedByPeer, dirty: false }
+                  return outbound === null
+                    ? { outbound: null, observedByPeer: false, dirty: true }
+                    : { outbound, observedByPeer, dirty: false }
                 }),
               (durable) => Effect.sync(() => InternalAutomerge.free(durable.automerge))
             )
@@ -911,16 +871,7 @@ export const layer: Layer.Layer<
                     documentId,
                     acceptedAt,
                     new Date(nowMillis - limits.maxPendingAgeMillis).toISOString()
-                  ).pipe(
-                    Effect.catchTag("SqlError", (cause) =>
-                      Effect.fail(
-                        new ReplicaError.ReplicaError({
-                          reason: new ReplicaError.StorageUnavailable({
-                            cause
-                          })
-                        })
-                      ))
-                  )
+                  ).pipe(Effect.catchTag("SqlError", failStorageUnavailable))
                 }))
                 const messageHash = yield* digest(message)
                 const validateReceipt = (receipt: typeof ReceiptRow.Type) =>
@@ -949,22 +900,8 @@ export const layer: Layer.Layer<
                   receiveSequence
                 }).pipe(
                   Effect.catchTags({
-                    SqlError: (cause) =>
-                      Effect.fail(
-                        new ReplicaError.ReplicaError({
-                          reason: new ReplicaError.StorageUnavailable({
-                            cause
-                          })
-                        })
-                      ),
-                    SchemaError: (cause) =>
-                      Effect.fail(
-                        new ReplicaError.ReplicaError({
-                          reason: new ReplicaError.StorageCorrupt({
-                            cause
-                          })
-                        })
-                      )
+                    SqlError: failStorageUnavailable,
+                    SchemaError: failStorageCorrupt
                   })
                 )
                 const receipt = receiptRows[0]
@@ -980,22 +917,8 @@ export const layer: Layer.Layer<
                     documentId
                   }).pipe(
                     Effect.catchTags({
-                      SqlError: (cause) =>
-                        Effect.fail(
-                          new ReplicaError.ReplicaError({
-                            reason: new ReplicaError.StorageUnavailable({
-                              cause
-                            })
-                          })
-                        ),
-                      SchemaError: (cause) =>
-                        Effect.fail(
-                          new ReplicaError.ReplicaError({
-                            reason: new ReplicaError.StorageCorrupt({
-                              cause
-                            })
-                          })
-                        )
+                      SqlError: failStorageUnavailable,
+                      SchemaError: failStorageCorrupt
                     })
                   )
                   const receiptTotal = receiptTotals[0]
@@ -1142,22 +1065,8 @@ export const layer: Layer.Layer<
                         }))
                       }).pipe(
                         Effect.catchTags({
-                          SqlError: (cause) =>
-                            Effect.fail(
-                              new ReplicaError.ReplicaError({
-                                reason: new ReplicaError.StorageUnavailable({
-                                  cause
-                                })
-                              })
-                            ),
-                          SchemaError: (cause) =>
-                            Effect.fail(
-                              new ReplicaError.ReplicaError({
-                                reason: new ReplicaError.StorageCorrupt({
-                                  cause
-                                })
-                              })
-                            )
+                          SqlError: failStorageUnavailable,
+                          SchemaError: failStorageCorrupt
                         })
                       )
                       const hashes = yield* validateExistingChanges(existingChanges)
@@ -1170,22 +1079,8 @@ export const layer: Layer.Layer<
                       const validatePendingQuota = Effect.gen(function*() {
                         const pendingTotals = yield* findDocumentPendingChangeTotals(documentId).pipe(
                           Effect.catchTags({
-                            SqlError: (cause) =>
-                              Effect.fail(
-                                new ReplicaError.ReplicaError({
-                                  reason: new ReplicaError.StorageUnavailable({
-                                    cause
-                                  })
-                                })
-                              ),
-                            SchemaError: (cause) =>
-                              Effect.fail(
-                                new ReplicaError.ReplicaError({
-                                  reason: new ReplicaError.StorageCorrupt({
-                                    cause
-                                  })
-                                })
-                              )
+                            SqlError: failStorageUnavailable,
+                            SchemaError: failStorageCorrupt
                           })
                         )
                         const receiptPending = yield* findDocumentPendingReceiptTotals({
@@ -1193,22 +1088,8 @@ export const layer: Layer.Layer<
                           documentId
                         }).pipe(
                           Effect.catchTags({
-                            SqlError: (cause) =>
-                              Effect.fail(
-                                new ReplicaError.ReplicaError({
-                                  reason: new ReplicaError.StorageUnavailable({
-                                    cause
-                                  })
-                                })
-                              ),
-                            SchemaError: (cause) =>
-                              Effect.fail(
-                                new ReplicaError.ReplicaError({
-                                  reason: new ReplicaError.StorageCorrupt({
-                                    cause
-                                  })
-                                })
-                              )
+                            SqlError: failStorageUnavailable,
+                            SchemaError: failStorageCorrupt
                           })
                         )
                         if (
@@ -1247,22 +1128,8 @@ export const layer: Layer.Layer<
                         }
                         const peerTotals = yield* findPeerPendingChangeTotals(receiptSession.peerId).pipe(
                           Effect.catchTags({
-                            SqlError: (cause) =>
-                              Effect.fail(
-                                new ReplicaError.ReplicaError({
-                                  reason: new ReplicaError.StorageUnavailable({
-                                    cause
-                                  })
-                                })
-                              ),
-                            SchemaError: (cause) =>
-                              Effect.fail(
-                                new ReplicaError.ReplicaError({
-                                  reason: new ReplicaError.StorageCorrupt({
-                                    cause
-                                  })
-                                })
-                              )
+                            SqlError: failStorageUnavailable,
+                            SchemaError: failStorageCorrupt
                           })
                         )
                         const peerReceiptPending = yield* findPeerPendingReceiptTotals({
@@ -1270,22 +1137,8 @@ export const layer: Layer.Layer<
                           peerId: receiptSession.peerId
                         }).pipe(
                           Effect.catchTags({
-                            SqlError: (cause) =>
-                              Effect.fail(
-                                new ReplicaError.ReplicaError({
-                                  reason: new ReplicaError.StorageUnavailable({
-                                    cause
-                                  })
-                                })
-                              ),
-                            SchemaError: (cause) =>
-                              Effect.fail(
-                                new ReplicaError.ReplicaError({
-                                  reason: new ReplicaError.StorageCorrupt({
-                                    cause
-                                  })
-                                })
-                              )
+                            SqlError: failStorageUnavailable,
+                            SchemaError: failStorageCorrupt
                           })
                         )
                         if (
@@ -1324,44 +1177,16 @@ export const layer: Layer.Layer<
                         }
                         const replicaTotals = yield* findReplicaPendingChangeTotals(undefined).pipe(
                           Effect.catchTags({
-                            SqlError: (cause) =>
-                              Effect.fail(
-                                new ReplicaError.ReplicaError({
-                                  reason: new ReplicaError.StorageUnavailable({
-                                    cause
-                                  })
-                                })
-                              ),
-                            SchemaError: (cause) =>
-                              Effect.fail(
-                                new ReplicaError.ReplicaError({
-                                  reason: new ReplicaError.StorageCorrupt({
-                                    cause
-                                  })
-                                })
-                              )
+                            SqlError: failStorageUnavailable,
+                            SchemaError: failStorageCorrupt
                           })
                         )
                         const replicaReceiptPending = yield* findReplicaPendingReceiptTotals(
                           receiptSession.replicaIncarnation
                         ).pipe(
                           Effect.catchTags({
-                            SqlError: (cause) =>
-                              Effect.fail(
-                                new ReplicaError.ReplicaError({
-                                  reason: new ReplicaError.StorageUnavailable({
-                                    cause
-                                  })
-                                })
-                              ),
-                            SchemaError: (cause) =>
-                              Effect.fail(
-                                new ReplicaError.ReplicaError({
-                                  reason: new ReplicaError.StorageCorrupt({
-                                    cause
-                                  })
-                                })
-                              )
+                            SqlError: failStorageUnavailable,
+                            SchemaError: failStorageCorrupt
                           })
                         )
                         if (
@@ -1412,37 +1237,31 @@ export const layer: Layer.Layer<
                       })
                       const pendingRows = yield* findPendingChanges(documentId).pipe(
                         Effect.catchTags({
-                          SqlError: (cause) =>
-                            Effect.fail(
-                              new ReplicaError.ReplicaError({
-                                reason: new ReplicaError.StorageUnavailable({
-                                  cause
-                                })
-                              })
-                            ),
-                          SchemaError: (cause) =>
-                            Effect.fail(
-                              new ReplicaError.ReplicaError({
-                                reason: new ReplicaError.StorageCorrupt({
-                                  cause
-                                })
-                              })
-                            )
+                          SqlError: failStorageUnavailable,
+                          SchemaError: failStorageCorrupt
                         })
                       )
-                      let staged = received[0]
-                      if (pendingRows.length > 0) {
-                        staged = yield* Effect.try({
-                          try: () => InternalAutomerge.replay(staged, pendingRows.map((row) => row.bytes)),
+                      const staged = pendingRows.length === 0
+                        ? received[0]
+                        : yield* Effect.try({
+                          try: () => {
+                            for (const row of pendingRows) {
+                              const pending = InternalAutomerge.decode(row.bytes)
+                              if (
+                                pending.hash !== row.change_hash || pending.actor !== row.actor ||
+                                pending.sequence !== row.sequence ||
+                                Schema.encodeSync(Heads)(pending.dependencies) !== row.dependencies
+                              ) {
+                                throw new TypeError(`Invalid stored change: ${row.change_hash}`)
+                              }
+                            }
+                            return InternalAutomerge.replay(received[0], pendingRows.map((row) => row.bytes))
+                          },
                           catch: (cause) =>
                             new ReplicaError.ReplicaError({
-                              reason: new ReplicaError.ProtocolMismatch({
-                                expected: "applicable pending Automerge changes",
-                                observed: String(cause)
-                              })
+                              reason: new ReplicaError.StorageCorrupt({ cause })
                             })
                         })
-                      }
                       const generated = yield* Effect.try({
                         try: () => Automerge.generateSyncMessage(staged, received[1]),
                         catch: (cause) =>
@@ -1591,22 +1410,8 @@ export const layer: Layer.Layer<
                           return { _tag: "Committed" as const, commitSequence, reply }
                         })).pipe(
                           Effect.catchTags({
-                            SqlError: (cause) =>
-                              Effect.fail(
-                                new ReplicaError.ReplicaError({
-                                  reason: new ReplicaError.StorageUnavailable({
-                                    cause
-                                  })
-                                })
-                              ),
-                            SchemaError: (cause) =>
-                              Effect.fail(
-                                new ReplicaError.ReplicaError({
-                                  reason: new ReplicaError.StorageCorrupt({
-                                    cause
-                                  })
-                                })
-                              )
+                            SqlError: failStorageUnavailable,
+                            SchemaError: failStorageCorrupt
                           })
                         )
                         if (result._tag === "Committed") {
@@ -1662,30 +1467,23 @@ export const layer: Layer.Layer<
         })),
       reset: (session) =>
         withSessionGeneration(session, (generation) =>
-          quotaLock.withPermit(Effect.scoped(Effect.gen(function*() {
+          Effect.scoped(Effect.gen(function*() {
             yield* gate.shared
-            yield* sql.withTransaction(Effect.gen(function*() {
-              yield* sql`DELETE FROM effect_local_peer_outbox
+            yield* quotaLock.withPermit(Effect.gen(function*() {
+              yield* sql.withTransaction(Effect.gen(function*() {
+                yield* sql`DELETE FROM effect_local_peer_outbox
               WHERE replica_incarnation = ${session.replicaIncarnation}
                 AND peer_id = ${session.peerId}
                 AND connection_epoch = ${session.connectionEpoch}`
-              yield* sql`DELETE FROM effect_local_peer_receipts
+                yield* sql`DELETE FROM effect_local_peer_receipts
               WHERE replica_incarnation = ${session.replicaIncarnation}
                 AND peer_id = ${session.peerId}
                 AND connection_epoch = ${session.connectionEpoch}`
-            })).pipe(
-              Effect.catchTag("SqlError", (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageUnavailable({
-                      cause
-                    })
-                  })
-                ))
-            )
-            yield* Ref.update(generation, (current) => current + 1)
-            yield* removeState(session)
-          })))),
+              })).pipe(Effect.catchTag("SqlError", failStorageUnavailable))
+              yield* Ref.update(generation, (current) => current + 1)
+              yield* removeState(session)
+            }))
+          }))),
       generate,
       receive,
       enqueue,
@@ -1708,66 +1506,40 @@ export const layer: Layer.Layer<
               }))
             ),
             Effect.catchTags({
-              SqlError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageUnavailable({
-                      cause
-                    })
-                  })
-                ),
-              SchemaError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageCorrupt({
-                      cause
-                    })
-                  })
-                )
+              SqlError: failStorageUnavailable,
+              SchemaError: failStorageCorrupt
             })
           )
         })),
       markSent: (session, sendSequence, messageHash) =>
-        quotaLock.withPermit(Effect.scoped(Effect.gen(function*() {
+        Effect.scoped(Effect.gen(function*() {
           const permit = yield* gate.shared
           yield* validateSession(permit, session)
-          return yield* sql.withTransaction(Effect.gen(function*() {
-            const rows = yield* markOutboxSent({
-              replicaIncarnation: session.replicaIncarnation,
-              peerId: session.peerId,
-              connectionEpoch: session.connectionEpoch,
-              sendSequence,
-              messageHash
-            })
-            if (rows.length === 0) return false
-            yield* sql`DELETE FROM effect_local_peer_outbox
+          return yield* quotaLock.withPermit(
+            sql.withTransaction(Effect.gen(function*() {
+              const rows = yield* markOutboxSent({
+                replicaIncarnation: session.replicaIncarnation,
+                peerId: session.peerId,
+                connectionEpoch: session.connectionEpoch,
+                sendSequence,
+                messageHash
+              })
+              if (rows.length === 0) return false
+              yield* sql`DELETE FROM effect_local_peer_outbox
               WHERE replica_incarnation = ${session.replicaIncarnation}
                 AND peer_id = ${session.peerId}
                 AND connection_epoch = ${session.connectionEpoch}
                 AND status = 'Sent'
                 AND send_sequence < ${sendSequence}`
-            return true
-          })).pipe(
-            Effect.catchTags({
-              SqlError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageUnavailable({
-                      cause
-                    })
-                  })
-                ),
-              SchemaError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageCorrupt({
-                      cause
-                    })
-                  })
-                )
-            })
+              return true
+            })).pipe(
+              Effect.catchTags({
+                SqlError: failStorageUnavailable,
+                SchemaError: failStorageCorrupt
+              })
+            )
           )
-        })))
+        }))
     })
   })
 )

@@ -78,11 +78,16 @@ interface Scheduled {
 
 const route = (from: Identity.PeerId, to: Identity.PeerId) => `${from}\u0000${to}`
 
+const toValidatedMillis = (input: Duration.Input) =>
+  typeof input === "number" && Number.isNaN(input)
+    ? Number.NaN
+    : Duration.toMillis(input)
+
 export const make = (
   options: Options
 ): Effect.Effect<TestPeer["Service"], InvalidOptions, FaultInjection.FaultInjection> =>
   Effect.gen(function*() {
-    const maxDelay = Duration.toMillis(options.maxDelay)
+    const maxDelay = toValidatedMillis(options.maxDelay)
     if (!Number.isSafeInteger(options.queueCapacity) || options.queueCapacity < 1) {
       return yield* new InvalidOptions({ reason: "queueCapacity must be a positive integer" })
     }
@@ -104,7 +109,7 @@ export const make = (
     const sequence = yield* Ref.make(0)
 
     const validate = (packet: FaultInjection.Packet, decision: FaultInjection.Decision) => {
-      const delay = Duration.toMillis(decision.delay)
+      const delay = toValidatedMillis(decision.delay)
       if (!Number.isSafeInteger(decision.copies) || decision.copies < 1 || decision.copies > options.maxCopies) {
         return Effect.fail(
           new InvalidFault({
@@ -164,29 +169,38 @@ export const make = (
       yield* validate(packet, decision)
       const connection = (yield* SubscriptionRef.get(routes)).get(route(from, to))
       if (connection === undefined) return yield* new ConnectionClosed({ from, to })
-      if ((yield* Ref.get(partitions)).has(route(from, to)) || decision.drop) return
+      if ((yield* Ref.get(partitions)).has(route(from, to)) || decision.drop) {
+        if (!Ref.getUnsafe(sourceActive)) return yield* new ConnectionClosed({ from, to })
+        return
+      }
       const scheduled = { packet, decision, queue: connection.queue, sourceActive }
       const pending = yield* Ref.modify(held, (current): readonly [
-        ReadonlyArray<Scheduled> | undefined,
+        ReadonlyArray<Scheduled> | false | undefined,
         ReadonlyMap<string, Scheduled>
       ] => {
+        if (!Ref.getUnsafe(sourceActive)) return [false, current]
         const key = route(from, to)
         const candidate = current.get(key)
         const previous = candidate?.queue === scheduled.queue && candidate.sourceActive === scheduled.sourceActive
           ? candidate
           : undefined
         const next = new Map(current)
-        if (previous !== candidate) next.delete(key)
+        next.delete(key)
         if (decision.reorder && previous === undefined) {
           next.set(key, scheduled)
           return [undefined, next]
         }
         if (previous === undefined) return [[scheduled], next]
-        next.delete(key)
         return [[scheduled, previous], next]
       })
+      if (pending === false) return yield* new ConnectionClosed({ from, to })
       if (pending === undefined) return
-      yield* Effect.forEach(pending, deliver, { discard: true })
+      const [current, ...deferred] = pending
+      yield* deliver(current)
+      // deferred packets ride a later send; their delivery failure must not fail it
+      yield* Effect.forEach(deferred, (packet) => Effect.catchIf(deliver(packet), () => true, () => Effect.void), {
+        discard: true
+      })
     })
 
     const flush = Ref.getAndSet(held, new Map()).pipe(
@@ -208,10 +222,11 @@ export const make = (
                 return next
               }),
               Ref.update(held, (current) => {
-                const key = route(to, from)
-                if (current.get(key)?.queue !== inbound) return current
                 const next = new Map(current)
-                next.delete(key)
+                const inboundKey = route(to, from)
+                if (next.get(inboundKey)?.queue === inbound) next.delete(inboundKey)
+                const outboundKey = route(from, to)
+                if (next.get(outboundKey)?.sourceActive === active) next.delete(outboundKey)
                 return next
               }),
               Queue.shutdown(inbound)
@@ -220,27 +235,30 @@ export const make = (
         )
       )
       yield* Effect.addFinalizer(() => close)
-      const previous = yield* SubscriptionRef.modify(routes, (current) => {
-        const key = route(to, from)
-        const next = new Map(current)
-        next.set(key, { active, queue: inbound })
-        return [current.get(key), next]
-      })
-      if (previous !== undefined) {
-        yield* Ref.update(held, (current) => {
+      yield* Effect.gen(function*() {
+        const previous = yield* SubscriptionRef.modify(routes, (current) => {
           const key = route(to, from)
-          if (current.get(key)?.queue !== previous.queue) return current
           const next = new Map(current)
-          next.delete(key)
-          return next
+          next.set(key, { active, queue: inbound })
+          return [current.get(key), next]
         })
-        yield* Ref.set(previous.active, false)
-        yield* Queue.shutdown(previous.queue)
-      }
+        if (previous !== undefined) {
+          yield* Ref.set(previous.active, false)
+          yield* Ref.update(held, (current) => {
+            const next = new Map(current)
+            const inboundKey = route(to, from)
+            if (next.get(inboundKey)?.queue === previous.queue) next.delete(inboundKey)
+            const outboundKey = route(from, to)
+            if (next.get(outboundKey)?.sourceActive === previous.active) next.delete(outboundKey)
+            return next
+          })
+          yield* Queue.shutdown(previous.queue)
+        }
+      }).pipe(Effect.uninterruptible)
       return {
         from,
         to,
-        receive: Stream.fromQueue(inbound).pipe(Stream.flatMap(Stream.fromIterable)),
+        receive: Stream.fromQueue(inbound).pipe(Stream.flattenIterable),
         send: (message: Uint8Array) =>
           Ref.get(active).pipe(
             Effect.flatMap((isActive) =>

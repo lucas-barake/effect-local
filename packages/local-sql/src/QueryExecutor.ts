@@ -8,6 +8,7 @@ import * as Schema from "effect/Schema"
 import type * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 
 export class QueryExecutor extends Context.Service<QueryExecutor, {
@@ -62,7 +63,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(
             WHERE projection_name = ${projectionName} AND status != 'Ready'`
       })
       const execute = <Q extends Query.Any,>(query: Q, payload: Q["payloadSchema"]["Type"]) =>
-        Effect.gen(function*() {
+        sql.withTransaction(Effect.gen(function*() {
           for (const projection of query.dependsOn) {
             const registry = yield* findProjectionStatus(projection.name).pipe(
               Effect.mapError((cause) =>
@@ -149,9 +150,19 @@ export const layer = <D extends ReplicaDefinition.Any,>(
               })
             )
           )
-        }) as Effect.Effect<Q["successSchema"]["Type"], Q["errorSchema"]["Type"] | ReplicaError.ReplicaError>
-      const reactivityKeys = (query: Query.Any) =>
-        query.dependsOn.flatMap((projection) => [projection.name, projection.document.name])
+        })).pipe(
+          Effect.catchIf(SqlError.isSqlError, (cause) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({
+                  cause
+                })
+              })
+            ))
+        ) as Effect.Effect<Q["successSchema"]["Type"], Q["errorSchema"]["Type"] | ReplicaError.ReplicaError>
+      const reactivityKeys = (
+        query: Query.Any
+      ) => [...new Set(query.dependsOn.flatMap((projection) => [projection.name, projection.document.name]))]
       return QueryExecutor.of({
         execute,
         reactive: (query, payload) => reactivity.stream(reactivityKeys(query), execute(query, payload))

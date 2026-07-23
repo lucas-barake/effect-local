@@ -63,6 +63,68 @@ describe("ProjectionStore", () => {
   const Store = ProjectionStore.layer([LabelsSql]).pipe(Layer.provide(Layer.merge(Base, LabelsSql.layer)))
   const Live = Layer.merge(Base, Store)
 
+  it("rejects projection migrations that cannot be scheduled", () => {
+    const migration = (id: number, name: string): SqlProjection.Migration => ({
+      id,
+      name,
+      run: () => Effect.void
+    })
+    const makeBinding = (migrations: ReadonlyArray<SqlProjection.Migration>) =>
+      SqlProjection.make(Labels, {
+        table: "invalid_projection_migrations",
+        migrations,
+        deleteByDocument: () => Effect.void,
+        insert: () => Effect.void
+      })
+
+    assert.throws(() => makeBinding([]), TypeError)
+
+    for (
+      const id of [
+        0,
+        -1,
+        1.5,
+        Number.NaN,
+        Number.POSITIVE_INFINITY,
+        Number.MAX_SAFE_INTEGER + 1
+      ]
+    ) {
+      assert.throws(() => makeBinding([migration(id, "invalid")]), TypeError)
+    }
+
+    assert.throws(() => makeBinding([migration(1, "")]), TypeError)
+  })
+
+  it.effect("translates projection migration execution failures", () => {
+    const BrokenLabelsSql = SqlProjection.make(Labels, {
+      table: "broken_task_labels_v1",
+      migrations: [{
+        id: 1,
+        name: "broken",
+        run: (sql) => sql`SELECT * FROM definitely_missing_projection_table`.pipe(Effect.asVoid)
+      }],
+      deleteByDocument: () => Effect.void,
+      insert: () => Effect.void
+    })
+    const BrokenStore = ProjectionStore.layer([BrokenLabelsSql]).pipe(
+      Layer.provide(Layer.merge(Base, BrokenLabelsSql.layer))
+    )
+
+    return Effect.gen(function*() {
+      const error = yield* ProjectionStore.ProjectionStore.pipe(
+        Effect.provide(BrokenStore),
+        Effect.flip
+      )
+      assert.strictEqual(error._tag, "ReplicaError")
+      if (error._tag === "ReplicaError") {
+        assert.strictEqual(error.reason._tag, "ProjectionBlocked")
+        if (error.reason._tag === "ProjectionBlocked") {
+          assert.strictEqual(error.reason.projection, Labels.name)
+        }
+      }
+    })
+  })
+
   it.effect("validates all rows before replacing a source document", () =>
     Effect.gen(function*() {
       const store = yield* ProjectionStore.ProjectionStore

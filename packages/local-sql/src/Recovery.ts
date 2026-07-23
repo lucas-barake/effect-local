@@ -278,6 +278,13 @@ export const make = Effect.gen(function*() {
           })
         })
       }
+      const commitSequence = yield* Identity.CommitSequence.makeEffect(row.commit_sequence).pipe(
+        Effect.mapError((cause) =>
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({ cause })
+          })
+        )
+      )
       const actor = InternalAutomerge.actorId(permit.replicaId, permit.writerGeneration, documentId)
       const parsedHeads = yield* Effect.result(Effect.try({
         try: () => ({
@@ -341,7 +348,8 @@ export const make = Effect.gen(function*() {
                   if (change.applied !== 1 || Automerge.hasHeads(current!, [change.change_hash])) continue
                   const decoded = InternalAutomerge.decode(change.bytes)
                   if (
-                    decoded.hash !== change.change_hash || decoded.actor !== change.actor ||
+                    change.document_type !== row.document_type || decoded.hash !== change.change_hash ||
+                    decoded.actor !== change.actor ||
                     decoded.sequence !== change.sequence ||
                     encodeHeads(decoded.dependencies) !== change.dependencies
                   ) throw new TypeError(`Invalid stored change: ${change.change_hash}`)
@@ -380,7 +388,9 @@ export const make = Effect.gen(function*() {
           if (checkpoint !== null) invalidCheckpoints.push(checkpoint.checkpoint_hash)
           continue
         }
-        const decoded = yield* Effect.result(Document.decode(document, documentId, encoded))
+        const decoded = yield* Effect.result(Document.decode(document, documentId, encoded)).pipe(
+          Effect.onError(() => Effect.sync(() => InternalAutomerge.free(automerge)))
+        )
         if (Result.isFailure(decoded)) {
           InternalAutomerge.free(automerge)
           if (checkpoint !== null) invalidCheckpoints.push(checkpoint.checkpoint_hash)
@@ -398,11 +408,11 @@ export const make = Effect.gen(function*() {
             version: row.schema_version,
             heads: materializedHeads,
             tombstone: row.tombstone === 1,
-            projection: row.projection_status as Snapshot.ProjectionState
+            projection: row.projection_status
           },
           materializedHeads,
           acceptedHeads,
-          commitSequence: Identity.CommitSequence.make(row.commit_sequence)
+          commitSequence
         }
       }
 

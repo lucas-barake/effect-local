@@ -103,9 +103,9 @@ export const fromRpcClient = (
           current.sessionId !== stale.sessionId
             ? Effect.succeed(
               [
-                { session: current, stale: Option.none<typeof current>() },
-                Option.none<typeof current>()
-              ] as const
+                { session: current, stale: Option.none() },
+                Option.none()
+              ]
             )
             : restore(
               makeSessionId.pipe(
@@ -116,7 +116,7 @@ export const fromRpcClient = (
                 )
               )
             ).pipe(
-              Effect.map((next) => [{ session: next, stale: Option.some(current) }, Option.some(next)] as const)
+              Effect.map((next) => [{ session: next, stale: Option.some(current) }, Option.some(next)])
             )).pipe(
             Effect.tap(({ stale }) =>
               Option.match(stale, {
@@ -197,7 +197,7 @@ export const fromRpcClient = (
     )
     const allInvalidationKeys = ReplicaDefinition.invalidationKeys(definition)
     const fullRefresh = (ownerEpoch: string): ReplicaRpc.Invalidation => ({
-      _tag: "FullRefreshRequired" as const,
+      _tag: "FullRefreshRequired",
       ownerEpoch,
       keys: [...allInvalidationKeys]
     })
@@ -252,14 +252,7 @@ export const fromRpcClient = (
           watermark: undefined,
           refreshGeneration: undefined
         }),
-        (state, event): readonly [
-          {
-            readonly ownerEpoch: string
-            readonly watermark: Identity.CommitSequence | undefined
-            readonly refreshGeneration: number | undefined
-          },
-          ReadonlyArray<ReplicaRpc.Invalidation>
-        ] => {
+        (state, event) => {
           if (event.ownerEpoch !== state.ownerEpoch) {
             if (event._tag === "InvalidationsReady") {
               return [
@@ -281,15 +274,19 @@ export const fromRpcClient = (
           }
           if (event._tag === "InvalidationsReady") {
             const refresh = state.watermark === undefined
-              ? event.refreshGeneration > 0
+              ? event.watermark > 0 || event.refreshGeneration > 0
               : event.watermark !== state.watermark || event.refreshGeneration !== state.refreshGeneration
             return [
               { ...state, watermark: event.watermark, refreshGeneration: event.refreshGeneration },
               refresh ? [fullRefresh(event.ownerEpoch)] : []
             ]
           }
-          if (event._tag === "FullRefreshRequired") return [state, [event]]
-          if (state.watermark === undefined) return [state, [fullRefresh(event.ownerEpoch)]]
+          if (event._tag === "FullRefreshRequired") {
+            return [{ ...state, watermark: undefined, refreshGeneration: undefined }, [event]]
+          }
+          if (state.watermark === undefined) {
+            return [{ ...state, watermark: event.sequence }, [fullRefresh(event.ownerEpoch)]]
+          }
           if (event.sequence <= state.watermark) return [state, []]
           if (event.sequence === state.watermark + 1) {
             return [{ ...state, watermark: event.sequence }, [event]]
@@ -333,7 +330,7 @@ export const fromRpcClient = (
               )
             )
           )
-        ) as never,
+        ),
       get: (document, documentId) =>
         withSession((session) => rpc.Get({ sessionId: session.sessionId, document: document.name, documentId })).pipe(
           Effect.catchTag("RpcClientError", (error) =>
@@ -349,7 +346,7 @@ export const fromRpcClient = (
               Effect.map((value) => ({ ...snapshot, value }))
             )
           )
-        ) as never,
+        ),
       mutate: (mutation, options) =>
         Wire.encode(mutation.payloadSchema, "payload" in options ? options.payload : undefined).pipe(
           Effect.flatMap((payload) =>
@@ -372,7 +369,7 @@ export const fromRpcClient = (
             )
           ),
           Effect.flatMap((outcome) => Wire.decodeOutcome(mutation.successSchema, mutation.errorSchema, outcome))
-        ) as never,
+        ),
       delete: (document, options) =>
         withSession((session) =>
           recoverCommand(
@@ -382,7 +379,7 @@ export const fromRpcClient = (
           )
         ).pipe(
           Effect.flatMap((outcome) => Wire.decodeOutcome(Schema.Void, Schema.Never, outcome))
-        ) as never,
+        ),
       query: (query, ...payload) =>
         Wire.encode(query.payloadSchema, payload[0]).pipe(
           Effect.flatMap((encoded) =>
@@ -400,7 +397,7 @@ export const fromRpcClient = (
             ReplicaQueryError: (error) => Wire.decode(query.errorSchema, error.error).pipe(Effect.flatMap(Effect.fail))
           }),
           Effect.flatMap((encoded) => Wire.decode(query.successSchema, encoded))
-        ) as never,
+        ),
       lookupMutation: (mutation, commandId) =>
         withSession((session) =>
           rpc.LookupMutation({ sessionId: session.sessionId, mutation: mutation.name, commandId })
@@ -414,7 +411,7 @@ export const fromRpcClient = (
               })
             )),
           Effect.flatMap((outcome) => Wire.decodeOutcome(mutation.successSchema, mutation.errorSchema, outcome))
-        ) as never,
+        ),
       lookupCreate: (document, commandId) =>
         withSession((session) => rpc.LookupCreate({ sessionId: session.sessionId, document: document.name, commandId }))
           .pipe(
@@ -426,7 +423,7 @@ export const fromRpcClient = (
                   })
                 })
               ))
-          ) as never,
+          ),
       lookupDelete: (document, commandId) =>
         withSession((session) => rpc.LookupDelete({ sessionId: session.sessionId, document: document.name, commandId }))
           .pipe(
@@ -439,7 +436,7 @@ export const fromRpcClient = (
                 })
               )),
             Effect.flatMap((outcome) => Wire.decodeOutcome(Schema.Void, Schema.Never, outcome))
-          ) as never,
+          ),
       flush: withSession((session) => rpc.Flush({ sessionId: session.sessionId })).pipe(
         Effect.catchTag("RpcClientError", (error) =>
           Effect.fail(
@@ -529,7 +526,7 @@ export const fromRpcClient = (
               Effect.map((value) => ({ ...exported, value }))
             )
           )
-        ) as never,
+        ),
       importDocument: (document, options) =>
         Wire.encode(Schema.toEncoded(document.schema), options.value.value).pipe(
           Effect.flatMap((value) =>
@@ -551,7 +548,7 @@ export const fromRpcClient = (
                 ))
             )
           )
-        ) as never
+        )
     }
   })
 

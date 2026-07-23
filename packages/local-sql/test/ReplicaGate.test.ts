@@ -152,6 +152,54 @@ describe("ReplicaGate", () => {
       assert.strictEqual((yield* gate.current).incarnation, 2)
     }).pipe(Effect.provide(Gate)))
 
+  it.effect("does not publish a nested claim when the outer transaction rolls back", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      const initial = yield* gate.current
+      const result = yield* Effect.exit(
+        gate.claim(() =>
+          gate.claim(Effect.succeed).pipe(
+            Effect.andThen(Effect.fail("rollback"))
+          )
+        )
+      )
+      assert.strictEqual(result._tag, "Failure")
+      assert.deepStrictEqual(yield* gate.current, initial)
+      const rows = yield* sql<{
+        readonly replica_incarnation: number
+        readonly writer_generation: number
+      }>`SELECT replica_incarnation, writer_generation FROM effect_local_metadata WHERE singleton = 1`
+      assert.deepStrictEqual(rows, [{
+        replica_incarnation: initial.incarnation,
+        writer_generation: initial.writerGeneration
+      }])
+    }).pipe(Effect.provide(Gate)))
+
+  it.effect("does not publish a claim nested in a caller transaction that rolls back", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      const initial = yield* gate.current
+      const result = yield* Effect.exit(
+        sql.withTransaction(
+          gate.claim(Effect.succeed).pipe(
+            Effect.andThen(Effect.fail("rollback"))
+          )
+        )
+      )
+      assert.strictEqual(result._tag, "Failure")
+      assert.deepStrictEqual(yield* gate.current, initial)
+      const rows = yield* sql<{
+        readonly replica_incarnation: number
+        readonly writer_generation: number
+      }>`SELECT replica_incarnation, writer_generation FROM effect_local_metadata WHERE singleton = 1`
+      assert.deepStrictEqual(rows, [{
+        replica_incarnation: initial.incarnation,
+        writer_generation: initial.writerGeneration
+      }])
+    }).pipe(Effect.provide(Gate)))
+
   it.effect("removes an interrupted request waiting for admission", () =>
     Effect.gen(function*() {
       const gate = yield* ReplicaGate.ReplicaGate
@@ -228,6 +276,25 @@ describe("ReplicaGate", () => {
       assert.deepStrictEqual(current, claimed)
       assert.strictEqual((yield* gate.shared).writerGeneration, 2)
     })).pipe(Effect.provide(Gate)))
+
+  it.effect("reports the generation observed from a concurrent writer", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      const initial = yield* gate.current
+      yield* sql`UPDATE effect_local_metadata
+        SET writer_generation = writer_generation + 1
+        WHERE singleton = 1`
+      const result = yield* Effect.result(gate.validate(initial))
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure.reason._tag, "ReplicaFenced")
+        if (result.failure.reason._tag === "ReplicaFenced") {
+          assert.strictEqual(result.failure.reason.expectedGeneration, initial.writerGeneration)
+          assert.strictEqual(result.failure.reason.observedGeneration, initial.writerGeneration + 1)
+        }
+      }
+    }).pipe(Effect.provide(Gate)))
 
   it.effect("rolls back a claimed epoch when the caller transaction fails", () =>
     Effect.scoped(Effect.gen(function*() {

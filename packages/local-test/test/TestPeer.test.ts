@@ -1,5 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Option from "effect/Option"
@@ -42,6 +43,19 @@ describe("TestPeer", () => {
         "maxCopies must be a positive integer",
         "maxDelay must be finite and nonnegative"
       ])
+    }).pipe(Effect.provide(FaultInjection.none)))
+
+  it.effect("rejects a NaN maximum delay in the typed error channel", () =>
+    Effect.gen(function*() {
+      const error = yield* TestPeer.make({ ...options, maxDelay: Number.NaN }).pipe(
+        Effect.flip,
+        Effect.option
+      )
+      assert.isTrue(Option.isSome(error))
+      if (Option.isSome(error)) {
+        assert.strictEqual(error.value._tag, "InvalidOptions")
+        assert.strictEqual(error.value.reason, "maxDelay must be finite and nonnegative")
+      }
     }).pipe(Effect.provide(FaultInjection.none)))
 
   it.effect("uses the test clock for deterministic delays", () =>
@@ -130,6 +144,24 @@ describe("TestPeer", () => {
       drop: false,
       copies: 4,
       delay: 0,
+      reorder: false
+    }]))))
+
+  it.effect("rejects a NaN fault delay in the typed error channel", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const network = yield* TestPeer.make(options)
+      const left = yield* network.connect(leftId, rightId)
+      yield* network.connect(rightId, leftId)
+      const error = yield* left.send(bytes(1)).pipe(
+        Effect.flip,
+        Effect.option
+      )
+      assert.isTrue(Option.isSome(error))
+      if (Option.isSome(error)) assert.strictEqual(error.value._tag, "InvalidFault")
+    })).pipe(Effect.provide(FaultInjection.layerSequence([{
+      drop: false,
+      copies: 1,
+      delay: Number.NaN,
       reorder: false
     }]))))
 
@@ -231,4 +263,122 @@ describe("TestPeer", () => {
       { drop: false, copies: 1, delay: 0, reorder: true },
       { drop: false, copies: 1, delay: 0, reorder: false }
     ]))))
+
+  it.effect("succeeds a reordering send when only the earlier held packet overflows the queue", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const network = yield* TestPeer.make({ ...options, queueCapacity: 1 })
+      const left = yield* network.connect(leftId, rightId)
+      const right = yield* network.connect(rightId, leftId)
+      yield* left.send(bytes(1)) // reordered -> held, reported as sent
+      const outcome = yield* Effect.exit(left.send(bytes(2))) // flushes [2, 1]; 2 is enqueued, 1 overflows
+      assert.strictEqual(outcome._tag, "Success")
+      assert.deepStrictEqual(
+        Array.from(yield* Stream.runCollect(Stream.take(right.receive, 1))),
+        [bytes(2)]
+      )
+    })).pipe(Effect.provide(FaultInjection.layerSequence([
+      { drop: false, copies: 1, delay: 0, reorder: true },
+      { drop: false, copies: 1, delay: 0, reorder: false }
+    ]))))
+
+  it.effect("does not flush held packets from a replaced source connection", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const network = yield* TestPeer.make(options)
+      const firstLeft = yield* network.connect(leftId, rightId)
+      const right = yield* network.connect(rightId, leftId)
+      yield* firstLeft.send(bytes(1))
+      yield* network.connect(leftId, rightId)
+      yield* network.flush
+      assert.strictEqual(yield* right.queued, 0)
+    })).pipe(Effect.provide(FaultInjection.layerSequence([
+      { drop: false, copies: 1, delay: 0, reorder: true }
+    ]))))
+
+  it.effect("retires held packets when their source connection closes", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const network = yield* TestPeer.make(options)
+      const left = yield* network.connect(leftId, rightId)
+      const right = yield* network.connect(rightId, leftId)
+      yield* left.send(bytes(1))
+      yield* left.close
+      yield* network.flush
+      assert.strictEqual(yield* right.queued, 0)
+    })).pipe(Effect.provide(FaultInjection.layerSequence([
+      { drop: false, copies: 1, delay: 0, reorder: true }
+    ]))))
+
+  it.effect("rejects an in-flight reordered send when its source closes", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const deciding = yield* Deferred.make<void>()
+      const resume = yield* Deferred.make<void>()
+      const network = yield* TestPeer.make(options).pipe(
+        Effect.provide(FaultInjection.layer(() =>
+          Deferred.succeed(deciding, void 0).pipe(
+            Effect.andThen(Deferred.await(resume)),
+            Effect.as({ drop: false, copies: 1, delay: 0, reorder: true })
+          )
+        ))
+      )
+      const left = yield* network.connect(leftId, rightId)
+      yield* network.connect(rightId, leftId)
+      const sending = yield* left.send(bytes(1)).pipe(
+        Effect.flip,
+        Effect.option,
+        Effect.forkChild
+      )
+      yield* Deferred.await(deciding)
+      yield* left.close
+      yield* Deferred.succeed(resume, void 0)
+      const error = yield* Fiber.join(sending)
+      assert.isTrue(Option.isSome(error))
+      if (Option.isSome(error)) assert.strictEqual(error.value._tag, "ConnectionClosed")
+    })))
+
+  it.effect("rejects an in-flight dropped send when its source closes", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const deciding = yield* Deferred.make<void>()
+      const resume = yield* Deferred.make<void>()
+      const network = yield* TestPeer.make(options).pipe(
+        Effect.provide(FaultInjection.layer(() =>
+          Deferred.succeed(deciding, void 0).pipe(
+            Effect.andThen(Deferred.await(resume)),
+            Effect.as({ drop: true, copies: 1, delay: 0, reorder: false })
+          )
+        ))
+      )
+      const left = yield* network.connect(leftId, rightId)
+      yield* network.connect(rightId, leftId)
+      const sending = yield* left.send(bytes(1)).pipe(
+        Effect.flip,
+        Effect.option,
+        Effect.forkChild
+      )
+      yield* Deferred.await(deciding)
+      yield* left.close
+      yield* Deferred.succeed(resume, void 0)
+      const error = yield* Fiber.join(sending)
+      assert.isTrue(Option.isSome(error))
+      if (Option.isSome(error)) assert.strictEqual(error.value._tag, "ConnectionClosed")
+    })))
+
+  it.effect("finishes retiring a displaced connection when replacement is interrupted", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const network = yield* TestPeer.make(options)
+      yield* network.connect(leftId, rightId)
+      const firstRight = yield* network.connect(rightId, leftId)
+      const replacing = yield* network.connect(rightId, leftId).pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Effect.yieldNow
+      yield* Fiber.interrupt(replacing)
+      const error = yield* firstRight.send(bytes(1)).pipe(
+        Effect.flip,
+        Effect.option
+      )
+      assert.isTrue(Option.isSome(error))
+      if (Option.isSome(error)) assert.strictEqual(error.value._tag, "ConnectionClosed")
+    })).pipe(
+      Effect.provide(FaultInjection.none),
+      Effect.provideService(Scheduler.MaxOpsBeforeYield, 12)
+    ))
 })

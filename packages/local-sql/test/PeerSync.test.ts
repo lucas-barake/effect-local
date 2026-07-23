@@ -610,6 +610,66 @@ describe("PeerSync", () => {
       InternalAutomerge.free(remote)
     }).pipe(Effect.provide(Services)))
 
+  it.effect("does not deadlock reset behind a claim while generation holds a read permit", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const gate = yield* ReplicaGate.ReplicaGate
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      const generateStarted = yield* Deferred.make<void>()
+      const releaseGenerate = yield* Deferred.make<void>()
+      const claimAcquired = yield* Deferred.make<void>()
+      const releaseClaim = yield* Deferred.make<void>()
+      const blockingStore = new Proxy(store, {
+        get(target, property, receiver) {
+          if (property !== "load") return Reflect.get(target, property, receiver)
+          const load: typeof store.load = (document, documentId) =>
+            Deferred.succeed(generateStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseGenerate)),
+              Effect.andThen(store.load(document, documentId))
+            )
+          return load
+        }
+      })
+      yield* Effect.gen(function*() {
+        const sync = yield* PeerSync.PeerSync
+        const session = yield* sync.open(yield* Identity.makePeerId)
+        const generating = yield* sync.generate(Task, documentId, session).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(generateStarted)
+        const claiming = yield* gate.claim(() =>
+          Deferred.succeed(claimAcquired, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseClaim))
+          )
+        ).pipe(Effect.forkChild({ startImmediately: true }))
+        const resetting = yield* sync.reset(session).pipe(Effect.forkChild({ startImmediately: true }))
+        const acquired = yield* Deferred.await(claimAcquired).pipe(
+          Effect.timeout("1 second"),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.succeed(releaseGenerate, undefined)
+        yield* Effect.yieldNow
+        yield* TestClock.adjust("1 second")
+        yield* Fiber.join(acquired)
+        yield* Deferred.succeed(releaseClaim, undefined)
+        yield* Fiber.join(claiming)
+        yield* Fiber.join(generating)
+        yield* Fiber.join(resetting)
+      }).pipe(
+        Effect.provide(PeerSync.layer.pipe(
+          Layer.provide(Layer.succeed(DocumentStore.DocumentStore, blockingStore))
+        )),
+        Effect.ensuring(
+          Deferred.succeed(releaseGenerate, undefined).pipe(
+            Effect.andThen(Deferred.succeed(releaseClaim, undefined)),
+            Effect.asVoid
+          )
+        )
+      )
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Services)))
+
   it.effect("rejects operation-heavy messages without persisting the rejected transition", () =>
     Effect.gen(function*() {
       const store = yield* DocumentStore.DocumentStore
@@ -1133,6 +1193,162 @@ describe("PeerSync", () => {
       )
       InternalAutomerge.free(created.automerge)
       InternalAutomerge.free(remote)
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("rejects mismatched durable pending change metadata before replay", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      const corrupted = Automerge.change(
+        Automerge.clone(created.automerge, { actor: "d".repeat(32) }),
+        (draft) => {
+          ;(draft.value as { title: string }).title = "corrupted"
+        }
+      )
+
+      yield* Effect.gen(function*() {
+        const changeBytes = Automerge.getChangesSince(
+          corrupted,
+          [...created.materializedHeads]
+        )
+        assert.strictEqual(changeBytes.length, 1)
+        const decoded = Automerge.decodeChange(changeBytes[0]!)
+        const storedHash = "0".repeat(64)
+        assert.notStrictEqual(storedHash, decoded.hash)
+
+        yield* sql`INSERT INTO effect_local_changes (
+          change_hash, document_id, document_type, writer_schema_version,
+          writer_definition_hash, actor, sequence, dependencies, bytes,
+          applied, peer_id, accepted_at, commit_sequence
+        ) VALUES (
+          ${storedHash}, ${documentId}, ${Task.name}, ${Task.version},
+          ${definition.hash}, ${decoded.actor}, ${decoded.seq},
+          ${JSON.stringify(decoded.deps)}, ${changeBytes[0]!},
+          0, ${session.peerId}, '9999-12-31T23:59:59.999Z',
+          ${created.commitSequence}
+        )`
+
+        const before = yield* sql<{
+          readonly materialized_heads: string
+          readonly receipts: number
+        }>`SELECT
+          materialized_heads,
+          (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts
+          FROM effect_local_documents
+          WHERE document_id = ${documentId}`
+
+        const generated = Automerge.generateSyncMessage(
+          created.automerge,
+          Automerge.initSyncState()
+        )
+        assert.isNotNull(generated[1])
+
+        const result = yield* Effect.result(
+          sync.receive(Task, documentId, session, {
+            remoteConnectionEpoch: "remote",
+            receiveSequence: 0,
+            message: generated[1]!
+          })
+        )
+
+        const after = yield* sql<{
+          readonly materialized_heads: string
+          readonly receipts: number
+        }>`SELECT
+          materialized_heads,
+          (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts
+          FROM effect_local_documents
+          WHERE document_id = ${documentId}`
+
+        assert.isTrue(Result.isFailure(result))
+        if (Result.isFailure(result)) {
+          assert.strictEqual(result.failure.reason._tag, "StorageCorrupt")
+        }
+        assert.deepStrictEqual(after, before)
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            InternalAutomerge.free(corrupted)
+            InternalAutomerge.free(created.automerge)
+          })
+        )
+      )
+    }).pipe(Effect.provide(TestLayer)))
+
+  it.effect("rechecks the document outbox after a concurrent enqueue", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, {
+        title: "one",
+        labels: []
+      })
+      const loadStarted = yield* Deferred.make<void>()
+      const releaseLoad = yield* Deferred.make<void>()
+      const blockingStore = new Proxy(store, {
+        get(target, property, receiver) {
+          if (property !== "load") return Reflect.get(target, property, receiver)
+          const load: typeof store.load = (document, documentId) =>
+            Deferred.succeed(loadStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseLoad)),
+              Effect.andThen(store.load(document, documentId))
+            )
+          return load
+        }
+      })
+
+      yield* Effect.gen(function*() {
+        const sync = yield* PeerSync.PeerSync
+        const session = yield* sync.open(yield* Identity.makePeerId)
+        const syncMessage = Automerge.generateSyncMessage(
+          created.automerge,
+          Automerge.initSyncState()
+        )[1]
+        assert.isNotNull(syncMessage)
+        const messageHash = yield* Canonical.digest(syncMessage!)
+
+        const generating = yield* sync.generate(
+          Task,
+          documentId,
+          session
+        ).pipe(Effect.forkChild)
+
+        yield* Deferred.await(loadStarted)
+
+        const enqueued = yield* sync.enqueue(session, {
+          documentId,
+          message: syncMessage!,
+          messageHash,
+          heads: created.materializedHeads
+        })
+
+        yield* Deferred.succeed(releaseLoad, undefined)
+        const generated = yield* Fiber.join(generating)
+        const pending = yield* sync.pending(session)
+
+        assert.isNull(generated.outbound)
+        assert.isTrue(generated.dirty)
+        assert.deepStrictEqual(
+          pending.map((outbound) => outbound.sendSequence),
+          [enqueued.sendSequence]
+        )
+      }).pipe(
+        Effect.provide(
+          PeerSync.layer.pipe(
+            Layer.provide(
+              Layer.succeed(DocumentStore.DocumentStore, blockingStore)
+            )
+          )
+        ),
+        Effect.ensuring(Deferred.succeed(releaseLoad, undefined)),
+        Effect.ensuring(
+          Effect.sync(() => InternalAutomerge.free(created.automerge))
+        )
+      )
     }).pipe(Effect.provide(Services)))
 })
 

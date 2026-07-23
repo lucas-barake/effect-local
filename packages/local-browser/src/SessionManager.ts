@@ -239,7 +239,7 @@ export const layer = Layer.effect(
               ], live]
             }
             live.set(sessionId, { ...existing, expiresAt: now + leaseDurationMillis })
-            return [[Result.succeed(undefined), expiredEntries], live]
+            return [[Result.void, expiredEntries], live]
           }
           if (live.size >= limits.maxSessions) {
             return [[
@@ -262,7 +262,7 @@ export const layer = Layer.effect(
             streams,
             expired
           })
-          return [[Result.succeed(undefined), expiredEntries], live]
+          return [[Result.void, expiredEntries], live]
         })
         yield* Effect.forEach(
           expiredEntries,
@@ -317,7 +317,7 @@ export const layer = Layer.effect(
           }
           const next = new Map(current)
           next.set(sessionId, { ...entry, expiresAt: now + leaseDurationMillis })
-          return [[Result.succeed(undefined), undefined], next]
+          return [[Result.void, undefined], next]
         })
         if (expired !== undefined) {
           yield* Deferred.fail(

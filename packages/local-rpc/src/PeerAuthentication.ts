@@ -4,7 +4,6 @@ import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
-import * as Option from "effect/Option"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
 import * as Semaphore from "effect/Semaphore"
@@ -43,18 +42,14 @@ export const layerServer = Layer.effect(
     const limits = yield* PeerRpcLimits.PeerRpcLimits
     const verifierPermits = yield* Semaphore.make(limits.maxInFlightAuthentication)
     const rateStateLock = yield* Semaphore.make(1)
-    const rateState = new Map<number, {
+    type RateState = {
       tokens: number
       updatedAt: number
       lastUsedAt: number
       inFlight: number
-    }>()
-    const inactiveRateState = new Map<number, {
-      tokens: number
-      updatedAt: number
-      lastUsedAt: number
-      inFlight: number
-    }>()
+    }
+    const rateState = new Map<number, RateState>()
+    const inactiveRateState = new Map<number, RateState>()
 
     const expireOldestInactive = (now: number) => {
       const oldest = inactiveRateState.entries().next().value
@@ -64,12 +59,7 @@ export const layerServer = Layer.effect(
       rateState.delete(oldest[0])
     }
 
-    const retainInactive = (clientId: number, entry: {
-      tokens: number
-      updatedAt: number
-      lastUsedAt: number
-      inFlight: number
-    }) => {
+    const retainInactive = (clientId: number, entry: RateState) => {
       inactiveRateState.delete(clientId)
       inactiveRateState.set(clientId, entry)
     }
@@ -101,12 +91,13 @@ export const layerServer = Layer.effect(
           rateState.set(clientId, entry)
         }
 
+        const effectiveNow = Math.max(now, entry.updatedAt, entry.lastUsedAt)
         entry.tokens = Math.min(
           limits.authenticationBurst,
-          entry.tokens + (Math.max(0, now - entry.updatedAt) / 1_000) * limits.authenticationRatePerSecond
+          entry.tokens + ((effectiveNow - entry.updatedAt) / 1_000) * limits.authenticationRatePerSecond
         )
-        entry.updatedAt = now
-        entry.lastUsedAt = now
+        entry.updatedAt = effectiveNow
+        entry.lastUsedAt = effectiveNow
         if (entry.tokens < 1) {
           if (entry.inFlight === 0) retainInactive(clientId, entry)
           return false
@@ -121,7 +112,7 @@ export const layerServer = Layer.effect(
         const entry = rateState.get(clientId)
         if (entry === undefined) return
         entry.inFlight -= 1
-        entry.lastUsedAt = now
+        entry.lastUsedAt = Math.max(now, entry.lastUsedAt)
         if (entry.inFlight === 0) retainInactive(clientId, entry)
       }))
 
@@ -141,21 +132,14 @@ export const layerServer = Layer.effect(
             return yield* new PeerRpcError.RequestCapacityExceeded()
           }
 
-          const verified = yield* verifierPermits.withPermitsIfAvailable(1)(
-            authenticator.authenticate(credential).pipe(
-              Effect.catchCause((cause) =>
-                Cause.hasInterruptsOnly(cause)
-                  ? Effect.failCause(cause)
-                  : Effect.fail(new PeerRpcError.AuthenticationFailure())
-              )
-            )
-          ).pipe(
-            Effect.flatMap(
-              Option.match({
-                onNone: () => Effect.fail(new PeerRpcError.RequestCapacityExceeded()),
-                onSome: Effect.succeed
-              })
+          const verified = yield* authenticator.authenticate(credential).pipe(
+            Effect.catchCause((cause) =>
+              Cause.hasInterruptsOnly(cause)
+                ? Effect.failCause(cause)
+                : Effect.fail(new PeerRpcError.AuthenticationFailure())
             ),
+            verifierPermits.withPermitsIfAvailable(1),
+            Effect.flatMap(Effect.fromOption(() => new PeerRpcError.RequestCapacityExceeded())),
             Effect.ensuring(Clock.currentTimeMillis.pipe(Effect.flatMap((now) => release(options.client.id, now))))
           )
           const now = yield* Clock.currentTimeMillis
@@ -169,9 +153,9 @@ export const layerServer = Layer.effect(
         attributes: {},
         result: (exit) => {
           const error = PeerRpcObservability.failure(exit)
-          return error instanceof PeerRpcError.AuthenticationFailure
+          return error?._tag === "AuthenticationFailure"
             ? "AuthenticationDenied"
-            : error instanceof PeerRpcError.RequestCapacityExceeded
+            : error?._tag === "RequestCapacityExceeded"
             ? "CapacityRejected"
             : Exit.isSuccess(exit)
             ? "Success"

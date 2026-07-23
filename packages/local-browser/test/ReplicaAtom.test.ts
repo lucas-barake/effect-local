@@ -43,7 +43,8 @@ describe("ReplicaAtom", () => {
       const atom = ReplicaAtom.documentFamily(atomRuntime, Task)(snapshot.documentId)
       const unmount = registry.mount(atom)
       assert.strictEqual(yield* Deferred.await(requested), snapshot.documentId)
-      yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 10)))
+      yield* Effect.yieldNow
+      yield* Effect.yieldNow
       const value = registry.get(atom)
       assert.isTrue(AsyncResult.isSuccess(value))
       if (AsyncResult.isSuccess(value)) assert.deepStrictEqual(value.value, snapshot)
@@ -77,7 +78,8 @@ describe("ReplicaAtom", () => {
       registry.set(atom, options)
       assert.deepStrictEqual(yield* Deferred.await(called), options)
       yield* Deferred.succeed(release, undefined)
-      yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 10)))
+      yield* Effect.yieldNow
+      yield* Effect.yieldNow
       const value = registry.get(atom)
       assert.isTrue(AsyncResult.isSuccess(value))
       if (AsyncResult.isSuccess(value)) assert.deepStrictEqual(value.value, outcome)
@@ -99,7 +101,8 @@ describe("ReplicaAtom", () => {
       const atom = ReplicaAtom.status(atomRuntime)
       const unmount = registry.mount(atom)
       yield* Deferred.await(consumed)
-      yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 10)))
+      yield* Effect.yieldNow
+      yield* Effect.yieldNow
       const value = registry.get(atom)
       assert.isTrue(AsyncResult.isSuccess(value))
       if (AsyncResult.isSuccess(value)) assert.deepStrictEqual(value.value, ready)
@@ -124,12 +127,16 @@ describe("ReplicaAtom", () => {
         success: Schema.Array(Task.schema),
         dependsOn: [ByTitle]
       })
+      const first = yield* Deferred.make<void>()
+      const second = yield* Deferred.make<void>()
       let executions = 0
       const atomRuntime = Atom.runtime(Layer.succeed(Replica.Replica, {
         ...replica,
         query: () =>
-          Effect.sync(() => {
+          Effect.gen(function*() {
             executions++
+            if (executions === 1) yield* Deferred.succeed(first, undefined)
+            if (executions === 2) yield* Deferred.succeed(second, undefined)
             return []
           }) as never
       }))
@@ -141,12 +148,13 @@ describe("ReplicaAtom", () => {
       const registry = AtomRegistry.make()
       const atom = query()
       const unmount = registry.mount(atom)
-      yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 10)))
+      yield* Deferred.await(first)
       assert.strictEqual(executions, 1)
       registry.set(invalidateDocument, undefined)
-      yield* Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 10)))
+      yield* Deferred.await(second)
       assert.strictEqual(executions, 2)
       unmount()
+      registry.dispose()
     }))
 
   it.effect("refreshes native query atoms from owner invalidations", () =>
@@ -206,6 +214,40 @@ describe("ReplicaAtom", () => {
       unmount()
     }))
 
+  it.effect("bridges invalidations from independently provided replica clients", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const reactivity = yield* Reactivity.make
+      const seen: Array<string> = []
+      reactivity.registerUnsafe(["left"], () => seen.push("left"))
+      reactivity.registerUnsafe(["right"], () => seen.push("right"))
+
+      const client = (ownerEpoch: string, key: string): ReplicaClient.ReplicaClient["Service"] => ({
+        ...replica,
+        ownerEpoch,
+        invalidations: Stream.make({
+          _tag: "Invalidation" as const,
+          ownerEpoch,
+          sequence: Identity.CommitSequence.make(1),
+          keys: [key]
+        })
+      })
+      const bridge = (service: ReplicaClient.ReplicaClient["Service"]) =>
+        ReplicaAtom.layerReactivity.pipe(
+          Layer.provide(Layer.succeed(ReplicaClient.ReplicaClient, service))
+        )
+
+      yield* Layer.build(
+        Layer.merge(
+          bridge(client("left-owner", "left")),
+          bridge(client("right-owner", "right"))
+        )
+      ).pipe(Effect.provideService(Reactivity.Reactivity, reactivity))
+      yield* Effect.yieldNow
+      yield* Effect.yieldNow
+
+      assert.deepStrictEqual(Array.from(seen).toSorted(), ["left", "right"])
+    })))
+
   it.effect("retries transient invalidation failures", () =>
     Effect.gen(function*() {
       const reactivity = yield* Reactivity.make
@@ -241,6 +283,57 @@ describe("ReplicaAtom", () => {
           yield* Deferred.await(consumed)
           yield* Effect.yieldNow
           assert.strictEqual(subscriptions, 4)
+          assert.strictEqual(invalidations, 1)
+        }).pipe(
+          Effect.provideService(ReplicaClient.ReplicaClient, client),
+          Effect.provideService(Reactivity.Reactivity, reactivity)
+        )
+      )
+    }))
+
+  it.effect("recovers reactivity after a transient quota rejection", () =>
+    Effect.gen(function*() {
+      const reactivity = yield* Reactivity.make
+      const firstAttempted = yield* Deferred.make<void>()
+      const consumed = yield* Deferred.make<void>()
+      let subscriptions = 0
+      let invalidations = 0
+      reactivity.registerUnsafe(["retry-key"], () => invalidations++)
+      const client: ReplicaClient.ReplicaClient["Service"] = {
+        ...replica,
+        ownerEpoch: "owner",
+        invalidations: Stream.unwrap(Effect.sync(() => {
+          subscriptions++
+          return subscriptions < 2
+            ? Stream.fromEffect(Deferred.succeed(firstAttempted, undefined)).pipe(
+              Stream.flatMap(() =>
+                Stream.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.QuotaExceeded({
+                      resource: "queued RPCs",
+                      limit: 1
+                    })
+                  })
+                )
+              )
+            )
+            : Stream.make({
+              _tag: "Invalidation" as const,
+              ownerEpoch: "owner",
+              sequence: Identity.CommitSequence.make(1),
+              keys: ["retry-key"]
+            }).pipe(Stream.tap(() => Deferred.succeed(consumed, undefined)))
+        }))
+      }
+      yield* Effect.scoped(
+        Effect.gen(function*() {
+          yield* Layer.build(ReplicaAtom.layerReactivity)
+          yield* Deferred.await(firstAttempted)
+          yield* Effect.yieldNow
+          yield* TestClock.adjust(1_000)
+          yield* Effect.yieldNow
+          assert.strictEqual(subscriptions, 2)
+          yield* Deferred.await(consumed)
           assert.strictEqual(invalidations, 1)
         }).pipe(
           Effect.provideService(ReplicaClient.ReplicaClient, client),

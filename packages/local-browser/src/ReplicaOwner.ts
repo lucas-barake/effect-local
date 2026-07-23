@@ -85,7 +85,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           lookup(documents, "document", document).pipe(
             Effect.flatMap((definition) =>
               Wire.decode(definition.schema, value).pipe(
-                Effect.flatMap((decoded) => replica.create(definition, { commandId, value: decoded } as never))
+                Effect.flatMap((decoded) => replica.create(definition, { commandId, value: decoded }))
               )
             )
           )
@@ -113,9 +113,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           lookup(mutations, "mutation", mutation).pipe(
             Effect.flatMap((definition) =>
               Wire.decode(definition.payloadSchema, payload).pipe(
-                Effect.flatMap((decoded) =>
-                  replica.mutate(definition, { commandId, documentId, payload: decoded } as never)
-                ),
+                Effect.flatMap((decoded) => replica.mutate(definition, { commandId, documentId, payload: decoded })),
                 Effect.flatMap((outcome) =>
                   Wire.encodeOutcome(definition.successSchema, definition.errorSchema, outcome)
                 )
@@ -142,7 +140,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           lookup(queries, "query", query).pipe(
             Effect.flatMap((definition) =>
               Wire.decode(definition.payloadSchema, payload).pipe(
-                Effect.flatMap((decoded) => replica.query(definition, decoded as never)),
+                Effect.flatMap((decoded) => replica.query(definition, decoded)),
                 Effect.matchEffect({
                   onSuccess: (result) => Wire.encode(definition.successSchema, result),
                   onFailure: (error) =>
@@ -270,7 +268,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
                   replica.importDocument(definition, {
                     commandId,
                     value: { ...value, value: decoded }
-                  } as never)
+                  })
                 )
               )
             )

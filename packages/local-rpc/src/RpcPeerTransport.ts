@@ -11,7 +11,7 @@ import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Sink from "effect/Sink"
 import * as Stream from "effect/Stream"
-import { RpcClientError } from "effect/unstable/rpc/RpcClientError"
+import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
 import * as PeerRpcObservability from "./internal/peerRpcObservability.js"
 import * as PeerRpc from "./PeerRpc.js"
 import type * as PeerRpcError from "./PeerRpcError.js"
@@ -30,7 +30,7 @@ const protocolFailure = (observed: string) =>
   })
 
 const mapError = (error: PeerRpcError.PeerRpcError | RpcClientError) => {
-  if (error instanceof RpcClientError) return unavailable()
+  if (error._tag === "RpcClientError") return unavailable()
   switch (error._tag) {
     case "RequestCapacityExceeded":
     case "SessionUnavailable":
@@ -47,7 +47,7 @@ const mapError = (error: PeerRpcError.PeerRpcError | RpcClientError) => {
   }
 }
 
-export const isRetryable = (error: ReplicaError.ReplicaError): boolean => error.reason._tag === "StorageUnavailable"
+export const isRetryable = (error: ReplicaError.ReplicaError) => error.reason._tag === "StorageUnavailable"
 
 const adapterResult = (exit: Exit.Exit<unknown, ReplicaError.ReplicaError>) => {
   if (Exit.isSuccess(exit)) return "Success" as const
@@ -75,11 +75,12 @@ export const layer = (
               const closeCompleted = yield* Deferred.make<void>()
               let closing = false
               const closeConnection = (exit: Exit.Exit<unknown, unknown>) =>
-                stateLock.withPermit(Effect.sync(() => {
+                Effect.sync(() => {
                   if (closing) return false
                   closing = true
                   return true
-                })).pipe(
+                }).pipe(
+                  stateLock.withPermit,
                   Effect.flatMap((owner) =>
                     owner
                       ? Scope.close(connectionScope, exit).pipe(
@@ -95,9 +96,6 @@ export const layer = (
                 )
               yield* Scope.addFinalizerExit(lifetimeScope, closeConnection)
               return yield* restore(Effect.gen(function*() {
-                yield* stateLock.withPermit(
-                  Effect.suspend(() => closing ? Effect.fail(unavailable()) : Effect.void)
-                )
                 const openCompleted = yield* Deferred.make<
                   Exit.Exit<
                     readonly [
@@ -107,7 +105,7 @@ export const layer = (
                     ReplicaError.ReplicaError
                   >
                 >()
-                const openFiber = yield* client.Open({
+                const openRequest = client.Open({
                   protocolVersion: PeerRpc.protocolVersion,
                   expectedPeerId: connectOptions.peerId,
                   documents: options.documents.map((entry) => ({
@@ -118,15 +116,19 @@ export const layer = (
                   Stream.mapError(mapError),
                   Stream.peel(Sink.take<PeerRpc.OpenEvent>(1)),
                   Effect.provideService(Scope.Scope, connectionScope),
-                  Effect.onExit((exit) => Deferred.succeed(openCompleted, exit).pipe(Effect.asVoid)),
-                  Effect.forkIn(connectionScope, { startImmediately: true })
+                  Effect.onExit((exit) => Deferred.succeed(openCompleted, exit).pipe(Effect.asVoid))
                 )
-                const openExit = yield* Deferred.await(openCompleted).pipe(
-                  Effect.onInterrupt(() => Fiber.interrupt(openFiber))
+                const openFiber = yield* stateLock.withPermit(
+                  Effect.suspend(() =>
+                    closing
+                      ? Effect.fail(unavailable())
+                      : Effect.forkIn(openRequest, connectionScope)
+                  )
                 )
-                const [first, remainder] = yield* Exit.isSuccess(openExit)
-                  ? Effect.succeed(openExit.value)
-                  : Effect.failCause(openExit.cause)
+                const [first, remainder] = yield* Deferred.await(openCompleted).pipe(
+                  Effect.onInterrupt(() => Fiber.interrupt(openFiber)),
+                  Effect.flatten
+                )
                 const handshake = first[0]
                 if (handshake === undefined || handshake._tag !== "Opened") {
                   return yield* protocolFailure(handshake?._tag ?? "Open stream ended before handshake")
@@ -139,6 +141,9 @@ export const layer = (
                     })
                   })
                 }
+                yield* stateLock.withPermit(
+                  Effect.suspend(() => closing ? Effect.fail(unavailable()) : Effect.void)
+                )
                 const sendLock = yield* Semaphore.make(1)
                 const send = (message: Uint8Array) =>
                   PeerRpcObservability.observe({
@@ -155,8 +160,9 @@ export const layer = (
                         return [fiber, completed] as const
                       })).pipe(
                         Effect.flatMap(([fiber, completed]) =>
-                          restoreSend(Deferred.await(completed)).pipe(
-                            Effect.flatMap((exit) => Exit.isSuccess(exit) ? Effect.void : Effect.failCause(exit.cause)),
+                          Deferred.await(completed).pipe(
+                            restoreSend,
+                            Effect.flatten,
                             Effect.onInterrupt(() => Fiber.interrupt(fiber))
                           )
                         )
@@ -180,9 +186,7 @@ export const layer = (
                   send,
                   close: closeWithExit(Exit.void)
                 }
-              })).pipe(
-                Effect.onExit((exit) => Exit.isFailure(exit) ? closeWithExit(exit) : Effect.void)
-              )
+              })).pipe(Effect.onExitIf(Exit.isFailure, closeWithExit))
             })
           )
         }),

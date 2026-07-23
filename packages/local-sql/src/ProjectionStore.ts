@@ -8,6 +8,7 @@ import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Predicate from "effect/Predicate"
 import * as Schema from "effect/Schema"
 import * as Migrator from "effect/unstable/sql/Migrator"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
@@ -78,6 +79,18 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
           ]))),
           table: `${binding.table}_effect_sql_migrations`
         }).pipe(
+          Effect.catchDefect((cause) =>
+            Predicate.isTagged("MigrationError")(cause)
+              ? Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.ProjectionBlocked({
+                    projection: binding.projection.name,
+                    cause
+                  })
+                })
+              )
+              : Effect.die(cause)
+          ),
           Effect.catchTag(["SqlError", "MigrationError"], (cause) =>
             Effect.fail(
               new ReplicaError.ReplicaError({
@@ -101,20 +114,21 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
             })
           )
         )
-        const row = registry._tag === "Some" ? registry.value : undefined
-        if (
-          row !== undefined &&
-          (row.table_name !== binding.table || row.projection_version !== binding.projection.version ||
-            row.schema_checksum !== checksum)
-        ) {
-          return yield* new ReplicaError.ReplicaError({
-            reason: new ReplicaError.ProjectionBlocked({
-              projection: binding.projection.name,
-              cause: new Error("Projection registry mismatch")
+        if (registry._tag === "Some") {
+          const row = registry.value
+          if (
+            row.table_name !== binding.table ||
+            row.projection_version !== binding.projection.version ||
+            row.schema_checksum !== checksum
+          ) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ProjectionBlocked({
+                projection: binding.projection.name,
+                cause: new Error("Projection registry mismatch")
+              })
             })
-          })
-        }
-        if (row === undefined) {
+          }
+        } else {
           yield* sql`INSERT INTO effect_local_projection_registry (
           projection_name, table_name, projection_version, schema_checksum, status
         ) VALUES (
@@ -190,7 +204,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
           sql.withTransaction(Effect.gen(function*() {
             const matching = resolved.filter((binding) => binding.projection.document.name === document.name)
             for (const binding of matching) {
-              yield* replace(binding, snapshot as never, binding.table)
+              yield* replace(binding, snapshot, binding.table)
             }
             yield* sql`UPDATE effect_local_commit_outbox
               SET invalidation_keys = ${

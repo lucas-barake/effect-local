@@ -378,6 +378,29 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       }])
     })).pipe(Effect.provide(Owner)))
 
+  it.effect("requires a full refresh when the initial invalidation baseline is already ahead", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const ahead = new Proxy(rpc, {
+        get(target, property, receiver) {
+          if (property !== "Invalidations") return Reflect.get(target, property, receiver)
+          return ({ ownerEpoch }: { readonly ownerEpoch: string }) =>
+            Stream.make({
+              _tag: "InvalidationsReady" as const,
+              ownerEpoch,
+              watermark: Identity.CommitSequence.make(1),
+              refreshGeneration: 0
+            })
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, ahead)
+      assert.deepStrictEqual(Array.from(yield* Stream.runCollect(client.invalidations)), [{
+        _tag: "FullRefreshRequired",
+        ownerEpoch: client.ownerEpoch,
+        keys: [Task.name]
+      }])
+    })).pipe(Effect.provide(Owner)))
+
   it.effect("resets invalidation reconnect attempts after each ready message", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
@@ -415,27 +438,6 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         keys: [Task.name]
       }])
       assert.strictEqual(subscriptions, 5)
-    })).pipe(Effect.provide(Owner)))
-
-  it.effect("retries transient lease renewal failures", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const sessions = yield* SessionManager.SessionManager
-      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-      let renewals = 0
-      const reconnecting = new Proxy(rpc, {
-        get(target, property, receiver) {
-          const value = Reflect.get(target, property, receiver)
-          if (property !== "RenewSession") return value
-          return (payload: never) =>
-            Effect.sync(() => ++renewals).pipe(
-              Effect.flatMap((attempt) => attempt < 3 ? Effect.fail(disconnected()) : value(payload))
-            )
-        }
-      })
-      yield* ReplicaClient.fromRpcClient(definition, reconnecting)
-      yield* TestClock.adjust(SessionManager.leaseDurationMillis / 2 + 2_000)
-      assert.strictEqual(renewals, 3)
-      assert.strictEqual(yield* sessions.activeCount, 1)
     })).pipe(Effect.provide(Owner)))
 
   it.effect("continues renewing after a transient failure burst", () =>
@@ -659,6 +661,66 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         ownerEpoch: client.ownerEpoch,
         keys: [Task.name]
       }])
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("accepts new invalidations after a full refresh resets the commit sequence", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const reset = new Proxy(rpc, {
+        get(target, property, receiver) {
+          if (property !== "Invalidations") return Reflect.get(target, property, receiver)
+          return ({ ownerEpoch }: { readonly ownerEpoch: string }) =>
+            Stream.make(
+              {
+                _tag: "InvalidationsReady" as const,
+                ownerEpoch,
+                watermark: Identity.CommitSequence.make(5),
+                refreshGeneration: 0
+              },
+              {
+                _tag: "FullRefreshRequired" as const,
+                ownerEpoch,
+                keys: [Task.name]
+              },
+              {
+                _tag: "Invalidation" as const,
+                ownerEpoch,
+                sequence: Identity.CommitSequence.make(1),
+                keys: [Task.name]
+              },
+              {
+                _tag: "Invalidation" as const,
+                ownerEpoch,
+                sequence: Identity.CommitSequence.make(2),
+                keys: [Task.name]
+              }
+            )
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, reset)
+      assert.deepStrictEqual(Array.from(yield* Stream.runCollect(client.invalidations)), [
+        {
+          _tag: "FullRefreshRequired",
+          ownerEpoch: client.ownerEpoch,
+          keys: [Task.name]
+        },
+        {
+          _tag: "FullRefreshRequired",
+          ownerEpoch: client.ownerEpoch,
+          keys: [Task.name]
+        },
+        {
+          _tag: "FullRefreshRequired",
+          ownerEpoch: client.ownerEpoch,
+          keys: [Task.name]
+        },
+        {
+          _tag: "Invalidation",
+          ownerEpoch: client.ownerEpoch,
+          sequence: Identity.CommitSequence.make(2),
+          keys: [Task.name]
+        }
+      ])
     })).pipe(Effect.provide(Owner)))
 
   it.effect("preserves a definite domain rejection", () => {

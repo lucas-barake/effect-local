@@ -110,6 +110,61 @@ describe("Recovery", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(Services)))
 
+  it.effect("reports invalid commit sequence metadata as storage corruption", () =>
+    Effect.gen(function*() {
+      const recovery = yield* Recovery.Recovery
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one" })
+
+      yield* sql`UPDATE effect_local_metadata
+        SET commit_sequence = -1
+        WHERE singleton = 1`
+
+      const result = yield* Effect.result(recovery.recover(Task, documentId)).pipe(
+        Effect.ensuring(Effect.sync(() => InternalAutomerge.free(created.automerge)))
+      )
+
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure.reason._tag, "StorageCorrupt")
+      }
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("rejects mismatched required change document type", () =>
+    Effect.gen(function*() {
+      const recovery = yield* Recovery.Recovery
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one" })
+
+      yield* sql`UPDATE effect_local_changes
+        SET document_type = 'Other'
+        WHERE document_id = ${documentId}`
+
+      const result = yield* Effect.result(recovery.recover(Task, documentId))
+      const quarantine = yield* sql<{ readonly reason: string }>`
+        SELECT reason
+        FROM effect_local_quarantine
+        WHERE document_id = ${documentId}
+      `
+
+      if (Result.isSuccess(result)) {
+        InternalAutomerge.free(result.success.automerge)
+      }
+      InternalAutomerge.free(created.automerge)
+
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure.reason._tag, "StorageCorrupt")
+      }
+      assert.deepStrictEqual(quarantine, [{
+        reason: "Canonical recovery failed"
+      }])
+    }).pipe(Effect.provide(Services)))
+
   it.effect("rolls back quarantine writes when the replica permit changes", () =>
     Effect.gen(function*() {
       const recovery = yield* Recovery.Recovery
@@ -133,5 +188,25 @@ describe("Recovery", () => {
       assert.deepStrictEqual(quarantine, [])
       assert.strictEqual(documents[0]?.projection_status, "Ready")
       InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("fails with DocumentNotFound when recovering an unknown document", () =>
+    Effect.gen(function*() {
+      const recovery = yield* Recovery.Recovery
+      const result = yield* Effect.flip(recovery.recover(Task, yield* Identity.makeDocumentId))
+      assert.strictEqual(result.reason._tag, "DocumentNotFound")
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("rejects a stored schema version newer than the definition", () =>
+    Effect.gen(function*() {
+      const recovery = yield* Recovery.Recovery
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one" })
+      InternalAutomerge.free(created.automerge)
+      yield* sql`UPDATE effect_local_documents SET schema_version = 999 WHERE document_id = ${documentId}`
+      const result = yield* Effect.flip(recovery.recover(Task, documentId))
+      assert.strictEqual(result.reason._tag, "UnsupportedDocumentVersion")
     }).pipe(Effect.provide(Services)))
 })

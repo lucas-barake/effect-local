@@ -51,11 +51,11 @@ export const layerWithLimits = <
   options: { readonly projections: Bindings; readonly limits: ReplicaLimits.Values }
 ) =>
   SqlReplica.layerWithBindings(definition, { projections: options.projections }).pipe(
-    Layer.provide(Layer.mergeAll(
+    Layer.provide([
       SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
       NodeCrypto.layer,
       ReplicaLimits.layer(options.limits)
-    ))
+    ])
   )
 
 export const layer = <D extends ReplicaDefinition.Any, const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
@@ -70,23 +70,25 @@ export const layerWithSyncAndLimits = <
   definition: D,
   options: { readonly projections: Bindings; readonly limits: ReplicaLimits.Values }
 ) => {
-  const database = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
-  const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provideMerge(database))
-  const infrastructure = Layer.mergeAll(bootstrap, ReplicaLimits.layer(options.limits), NodeCrypto.layer)
-  const gate = ReplicaGate.layer.pipe(Layer.provideMerge(infrastructure))
+  const bootstrap = ReplicaBootstrap.layer(definition).pipe(
+    Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))
+  )
+  const gate = ReplicaGate.layer.pipe(
+    Layer.provideMerge([bootstrap, ReplicaLimits.layer(options.limits), NodeCrypto.layer])
+  )
   const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
   const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
   const projections = ProjectionStore.layer(options.projections).pipe(Layer.provideMerge(store))
   const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(projections))
   const queries = QueryExecutor.layer(definition).pipe(
-    Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
+    Layer.provideMerge([commands, Reactivity.layer])
   )
   const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
   const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
   const sync = PeerSync.layer.pipe(Layer.provideMerge(backups))
   return SqlReplica.layerFromServices(definition).pipe(
     Layer.provideMerge(sync),
-    Layer.provide(Layer.mergeAll(Layer.empty, ...options.projections.map((binding) => binding.layer)))
+    Layer.provide([Layer.empty, ...options.projections.map((binding) => binding.layer)])
   )
 }
 

@@ -20,13 +20,11 @@ export const OperationId = Schema.String.check(Schema.isMinLength(1)).pipe(
 )
 export type OperationId = typeof OperationId.Type
 
-const operation = {
-  replicaIncarnation: Identity.ReplicaIncarnation,
-  operationId: OperationId
-}
-
 export const CompactReplica = Workflow.make("EffectLocal/CompactReplica", {
-  payload: operation,
+  payload: {
+    replicaIncarnation: Identity.ReplicaIncarnation,
+    operationId: OperationId
+  },
   success: Schema.Void,
   error: ReplicaError.ReplicaError,
   idempotencyKey: (payload) => `${payload.replicaIncarnation}:${payload.operationId}`

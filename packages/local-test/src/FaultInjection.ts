@@ -29,4 +29,7 @@ export const layer = (decide: FaultInjection["Service"]["decide"]) => Layer.succ
 export const none = layer(() => Effect.succeed({ drop: false, copies: 1, delay: 0, reorder: false }))
 
 export const layerSequence = (decisions: readonly [Decision, ...ReadonlyArray<Decision>]) =>
-  layer((packet) => Effect.succeed(decisions[Math.max(0, Math.min(Math.trunc(packet.sequence), decisions.length - 1))]))
+  layer((packet) => {
+    const index = Math.max(0, Math.min(Math.trunc(packet.sequence), decisions.length - 1))
+    return Effect.succeed(decisions[index] ?? decisions[0])
+  })

@@ -276,5 +276,36 @@ describe("DurableRuntime", () => {
           assert.isAtLeast(yield* Ref.get(attempts), 2)
         }).pipe(Effect.provide(servicesAtWith(filename, registration)))
       )
-    }))
+    }), 20_000)
+
+  it.effect("interrupts an in-flight compaction handle for the current incarnation", () =>
+    Effect.gen(function*() {
+      const runtime = yield* ReplicaWorkflow.CompactionWorkflow
+      const sharding = yield* Sharding.Sharding
+      const execution = yield* runtime.execute(ReplicaWorkflow.OperationId.make("interrupt-current"))
+      yield* runtime.interrupt(execution)
+      for (let round = 0; round < 4; round++) {
+        yield* sharding.pollStorage
+        yield* TestClock.adjust(5_000)
+      }
+      assert.isTrue(Option.isSome(yield* runtime.poll(execution)))
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("fences interrupt handles from a prior replica incarnation", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const runtime = yield* ReplicaWorkflow.CompactionWorkflow
+      const execution = yield* runtime.execute(ReplicaWorkflow.OperationId.make("interrupt-fence"))
+      yield* gate.claim(() => Effect.void)
+      assert.strictEqual((yield* Effect.exit(runtime.interrupt(execution)))._tag, "Failure")
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("rejects interrupt handles whose execution id does not match the operation", () =>
+    Effect.gen(function*() {
+      const runtime = yield* ReplicaWorkflow.CompactionWorkflow
+      const first = yield* runtime.execute(ReplicaWorkflow.OperationId.make("interrupt-first"))
+      const second = yield* runtime.execute(ReplicaWorkflow.OperationId.make("interrupt-second"))
+      const forged = { ...first, executionId: second.executionId }
+      assert.strictEqual((yield* Effect.exit(runtime.interrupt(forged)))._tag, "Failure")
+    }).pipe(Effect.provide(Services)))
 })

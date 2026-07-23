@@ -1,7 +1,6 @@
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
-import type * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -92,7 +91,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
         }) =>
           withPermit((permit) =>
             Effect.gen(function*() {
-              const payload = options.payload as M["payloadSchema"]["Type"]
+              const payload = options.payload
               const encoded = yield* Schema.encodeEffect(mutation.payloadSchema)(payload).pipe(
                 Effect.mapError((cause) =>
                   new ReplicaError.ReplicaError({
@@ -129,11 +128,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
               return outcome
             })
           ),
-        query: <Q extends Query.Any,>(
-          query: Q,
-          ...payload: [Q["payloadSchema"]["Type"]] extends [void] ? readonly []
-            : readonly [payload: Q["payloadSchema"]["Type"]]
-        ) => withPermit(() => queries.execute(query, payload[0] as Q["payloadSchema"]["Type"])),
+        query: (query, ...payload) => withPermit(() => queries.execute(query, payload[0])),
         lookupMutation: (mutation, commandId) =>
           withPermit((permit) => commands.lookupMutation(mutation, commandId, permit)),
         lookupCreate: (_document, commandId) => withPermit((permit) => commands.lookupCreate(commandId, permit)),
@@ -143,7 +138,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
         exportBackup: backups.export,
         restoreBackup: (options) =>
           backups.restore(options).pipe(
-            Effect.andThen(publisher.invalidate(ReplicaDefinition.invalidationKeys(definition)))
+            Effect.ensuring(publisher.invalidate(ReplicaDefinition.invalidationKeys(definition)))
           ),
         exportDocument: (document, documentId) =>
           withPermit(() =>
