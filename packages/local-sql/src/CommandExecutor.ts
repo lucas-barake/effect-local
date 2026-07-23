@@ -170,8 +170,9 @@ export class CommandExecutor extends Context.Service<CommandExecutor, {
   ) => Effect.Effect<CommandOutcome.CommandOutcome<void>, ReplicaError.ReplicaError>
 }>()("@lucas-barake/effect-local-sql/CommandExecutor") {}
 
-export type MutationHandlers<D extends ReplicaDefinition.Any,> =
-  Context.Service.Identifier<D["mutations"][number]["handler"]>
+export type MutationHandlers<D extends ReplicaDefinition.Any,> = Context.Service.Identifier<
+  D["mutations"][number]["handler"]
+>
 
 export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.Layer<
   CommandExecutor,

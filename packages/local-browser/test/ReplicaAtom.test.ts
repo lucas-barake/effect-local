@@ -245,7 +245,7 @@ describe("ReplicaAtom", () => {
       yield* Effect.yieldNow
       yield* Effect.yieldNow
 
-      assert.deepStrictEqual(Array.from(seen).sort(), ["left", "right"])
+      assert.deepStrictEqual(Array.from(seen).toSorted(), ["left", "right"])
     })))
 
   it.effect("retries transient invalidation failures", () =>
