@@ -35,10 +35,16 @@ export const make = (
     const store = yield* DocumentStore.DocumentStore
     const projections = yield* ProjectionStore.ProjectionStore
 
+    const ProjectionNameRow = Schema.Struct({ projection_name: Schema.String })
     const findRebuilding = SqlSchema.findAll({
       Request: Schema.Void,
-      Result: Schema.Struct({ projection_name: Schema.String }),
+      Result: ProjectionNameRow,
       execute: () => sql`SELECT projection_name FROM effect_local_projection_registry WHERE status = 'Rebuilding'`
+    })
+    const findRegisteredProjections = SqlSchema.findAll({
+      Request: Schema.Void,
+      Result: ProjectionNameRow,
+      execute: () => sql`SELECT projection_name FROM effect_local_projection_registry`
     })
     const findDocuments = SqlSchema.findAll({
       Request: Schema.Void,
@@ -61,11 +67,7 @@ export const make = (
 
     return yield* Effect.gen(function*() {
       const registered = new Set(definition.projections.map((projection: Projection.Any) => projection.name))
-      const orphans = yield* SqlSchema.findAll({
-        Request: Schema.Void,
-        Result: Schema.Struct({ projection_name: Schema.String }),
-        execute: () => sql`SELECT projection_name FROM effect_local_projection_registry`
-      })(undefined)
+      const orphans = yield* findRegisteredProjections(undefined)
       for (const orphan of orphans) {
         if (registered.has(orphan.projection_name)) continue
         yield* sql`DELETE FROM effect_local_document_projections WHERE projection_name = ${orphan.projection_name}`

@@ -19,6 +19,16 @@ import * as ReplicaGate from "./ReplicaGate.js"
 const Heads = Schema.fromJsonString(Schema.Array(Schema.String))
 const Versions = Schema.fromJsonString(Schema.Array(Schema.Int))
 
+const requireAutomergeValue = (documentId: Identity.DocumentId, encoded: unknown) =>
+  Document.isAutomergeValue(encoded)
+    ? Effect.void
+    : new ReplicaError.ReplicaError({
+      reason: new ReplicaError.DocumentDecodeError({
+        documentId,
+        cause: new Error("Encoded value is not Automerge compatible")
+      })
+    })
+
 export interface Stored<D extends Document.Any,> {
   readonly automerge: Automerge.Doc<InternalAutomerge.Root<D["schema"]["Encoded"]>>
   readonly encoded: D["schema"]["Encoded"]
@@ -100,14 +110,7 @@ export const layer: Layer.Layer<
         if (changes.length === 0) return durable
         const encoded = InternalAutomerge.value(staged)
         yield* Document.decode(document, documentId, encoded)
-        if (!Document.isAutomergeValue(encoded)) {
-          return yield* new ReplicaError.ReplicaError({
-            reason: new ReplicaError.DocumentDecodeError({
-              documentId,
-              cause: new Error("Encoded value is not Automerge compatible")
-            })
-          })
-        }
+        yield* requireAutomergeValue(documentId, encoded)
         const heads = InternalAutomerge.heads(staged)
         const sequence = yield* nextSequence
         const acceptedAt = DateTime.formatIso(yield* DateTime.now)
@@ -152,14 +155,7 @@ export const layer: Layer.Layer<
         if (durable.snapshot.version === document.version) return durable
         return yield* Effect.gen(function*() {
           const encoded = yield* Document.encode(document, documentId, durable.snapshot.value)
-          if (!Document.isAutomergeValue(encoded)) {
-            return yield* new ReplicaError.ReplicaError({
-              reason: new ReplicaError.DocumentDecodeError({
-                documentId,
-                cause: new Error("Encoded value is not Automerge compatible")
-              })
-            })
-          }
+          yield* requireAutomergeValue(documentId, encoded)
           const epoch = yield* gate.current
           const actor = InternalAutomerge.actorId(epoch.replicaId, epoch.writerGeneration, documentId)
           const staged = InternalAutomerge.stageValue(durable.automerge, actor, encoded)
@@ -193,14 +189,7 @@ export const layer: Layer.Layer<
       create: (document, documentId, value) =>
         sql.withTransaction(Effect.gen(function*() {
           const encoded = yield* Document.encode(document, documentId, value)
-          if (!Document.isAutomergeValue(encoded)) {
-            return yield* new ReplicaError.ReplicaError({
-              reason: new ReplicaError.DocumentDecodeError({
-                documentId,
-                cause: new Error("Encoded value is not Automerge compatible")
-              })
-            })
-          }
+          yield* requireAutomergeValue(documentId, encoded)
           const epoch = yield* gate.current
           const actor = InternalAutomerge.actorId(epoch.replicaId, epoch.writerGeneration, documentId)
           const automerge = yield* Effect.try({

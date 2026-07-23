@@ -164,29 +164,21 @@ export const decodeStored = <Name extends string, S extends DocumentSchema,>(
   input: unknown
 ): Effect.Effect<S["Type"], ReplicaError.ReplicaError> => {
   if (storedVersion === self.version) return decode(self, documentId, input)
-  const steps: Array<AnyMigration> = []
-  for (let version = storedVersion; version < self.version; version++) {
-    const step = self.migrations.find((candidate) => candidate.from === version)
-    if (step === undefined) {
-      return new ReplicaError.ReplicaError({
-        reason: new ReplicaError.UnsupportedDocumentVersion({
-          documentId,
-          observedVersion: storedVersion,
-          supportedVersion: self.version
-        })
-      })
-    }
-    steps.push(step)
-  }
-  if (steps.length === 0) {
-    return new ReplicaError.ReplicaError({
+  const unsupportedVersion = () =>
+    new ReplicaError.ReplicaError({
       reason: new ReplicaError.UnsupportedDocumentVersion({
         documentId,
         observedVersion: storedVersion,
         supportedVersion: self.version
       })
     })
+  const steps: Array<AnyMigration> = []
+  for (let version = storedVersion; version < self.version; version++) {
+    const step = self.migrations.find((candidate) => candidate.from === version)
+    if (step === undefined) return unsupportedVersion()
+    steps.push(step)
   }
+  if (steps.length === 0) return unsupportedVersion()
   return Effect.gen(function*() {
     let value: unknown = yield* Schema.decodeUnknownEffect(steps[0]!.schema)(input).pipe(
       Effect.mapError((cause) => decodeFailure(documentId, cause))
