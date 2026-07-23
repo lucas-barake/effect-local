@@ -41,6 +41,7 @@ const mapError = (error: PeerRpcError.PeerRpcError | RpcClientError) => {
     case "AccessDenied":
     case "UnsupportedVersion":
     case "PeerMismatch":
+    case "DefinitionMismatch":
     case "InvalidRequest":
     case "RequestLimitExceeded":
       return protocolFailure(error._tag)
@@ -59,7 +60,10 @@ const adapterResult = (exit: Exit.Exit<unknown, ReplicaError.ReplicaError>) => {
 
 export const layer = (
   client: PeerRpc.RpcClient,
-  options: { readonly documents: ReadonlyArray<PeerSession.SelectedDocument> }
+  options: {
+    readonly documents: ReadonlyArray<PeerSession.SelectedDocument>
+    readonly definitionHash: string
+  }
 ) =>
   Layer.succeed(PeerTransport.PeerTransport, {
     capabilities: { storeAndForward: false },
@@ -108,6 +112,7 @@ export const layer = (
                 const openRequest = client.Open({
                   protocolVersion: PeerRpc.protocolVersion,
                   expectedPeerId: connectOptions.peerId,
+                  definitionHash: options.definitionHash,
                   documents: options.documents.map((entry) => ({
                     documentType: entry.document.name,
                     documentId: entry.documentId
@@ -202,8 +207,9 @@ export const makeSession = (
   options: {
     readonly peerId: Identity.PeerId
     readonly documents: ReadonlyArray<PeerSession.SelectedDocument>
+    readonly definitionHash: string
   }
 ) =>
   PeerSession.makeLive(options).pipe(
-    Effect.provide(layer(client, { documents: options.documents }))
+    Effect.provide(layer(client, { documents: options.documents, definitionHash: options.definitionHash }))
   )

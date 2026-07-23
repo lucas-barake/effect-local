@@ -47,6 +47,7 @@ const Note = Document.make("Note", { schema: Schema.Struct({ body: Schema.String
 const taskId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
 const noteId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000002")
 const serverPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001")
+const definitionHash = "def_00000000000000000000000000000000"
 const remotePeerA = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000002")
 const remotePeerB = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000003")
 const missingSessionId = Identity.SessionId.make("ses_00000000-0000-4000-8000-000000000001")
@@ -357,7 +358,7 @@ const makeFixture = (options: {
         recordFiberEnd: () => void (activeFibers -= 1)
       })
     )
-    const handlers = PeerRpcServer.layerHandlers({ tenantId: "tenant", peerId: serverPeerId }).pipe(
+    const handlers = PeerRpcServer.layerHandlers({ tenantId: "tenant", peerId: serverPeerId, definitionHash }).pipe(
       Layer.provide(services)
     )
     const handlerScope = yield* Scope.make()
@@ -372,6 +373,7 @@ const makeFixture = (options: {
       (openHandler.handler({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents
       }, {} as never) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>).pipe(
         Stream.provideContext(Context.add(
@@ -439,7 +441,12 @@ const makeFixture = (options: {
       Effect.gen(function*() {
         const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
         const fiber = yield* Stream.runForEach(
-          client.Open({ protocolVersion: PeerRpc.protocolVersion, expectedPeerId: serverPeerId, documents }),
+          client.Open({
+            protocolVersion: PeerRpc.protocolVersion,
+            expectedPeerId: serverPeerId,
+            definitionHash,
+            documents
+          }),
           (event) => Queue.offer(events, event).pipe(Effect.asVoid)
         ).pipe(Effect.forkChild)
         const opened = yield* Effect.raceFirst(
@@ -644,6 +651,7 @@ describe("PeerRpcServer", () => {
       const error = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [{ documentType: Note.name, documentId: noteId }]
       }).pipe(Stream.runDrain, Effect.flip)
       assert.instanceOf(error, PeerRpcError.SessionOverloaded)
@@ -658,6 +666,7 @@ describe("PeerRpcServer", () => {
       const error = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [{ documentType: Note.name, documentId: noteId }]
       }).pipe(Stream.runDrain, Effect.flip)
       assert.instanceOf(error, PeerRpcError.SessionOverloaded)
@@ -681,6 +690,7 @@ describe("PeerRpcServer", () => {
             fixture.client.Open({
               protocolVersion: PeerRpc.protocolVersion,
               expectedPeerId: serverPeerId,
+              definitionHash,
               documents: [{ documentType: Task.name, documentId: taskId }]
             }).pipe(Stream.runDrain, Effect.flip)
           )
@@ -706,6 +716,7 @@ describe("PeerRpcServer", () => {
       const full = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [{ documentType: Note.name, documentId: noteId }]
       }).pipe(Stream.runDrain, Effect.flip)
       assert.instanceOf(full, PeerRpcError.RequestCapacityExceeded)
@@ -736,6 +747,7 @@ describe("PeerRpcServer", () => {
           fixture.client.Open({
             protocolVersion: PeerRpc.protocolVersion,
             expectedPeerId: serverPeerId,
+            definitionHash,
             documents: [{ documentType: Task.name, documentId: taskId }]
           }).pipe(Stream.runDrain, Effect.flip)
         assert.instanceOf(yield* attempt(), PeerRpcError.AccessDenied)
@@ -787,6 +799,7 @@ describe("PeerRpcServer", () => {
         fixture.client.Open({
           protocolVersion: PeerRpc.protocolVersion,
           expectedPeerId: serverPeerId,
+          definitionHash,
           documents: [{ documentType: Note.name, documentId: noteId }]
         }),
         (event) => event._tag === "Message" ? Queue.offer(opened, "head").pipe(Effect.asVoid) : Effect.void
@@ -808,6 +821,7 @@ describe("PeerRpcServer", () => {
         fixture.client.Open({
           protocolVersion: PeerRpc.protocolVersion,
           expectedPeerId: serverPeerId,
+          definitionHash,
           documents: [{ documentType: Task.name, documentId: taskId }]
         }),
         (event) => event._tag === "Message" ? Queue.offer(opened, "tail").pipe(Effect.asVoid) : Effect.void
@@ -959,6 +973,7 @@ describe("PeerRpcServer", () => {
           yield* fixture.client.Open({
             protocolVersion: PeerRpc.protocolVersion,
             expectedPeerId: serverPeerId,
+            definitionHash,
             documents: [{ documentType: Task.name, documentId: taskId }]
           }).pipe(Stream.runDrain, Effect.forkChild)
         )
@@ -977,6 +992,7 @@ describe("PeerRpcServer", () => {
       const rejected = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [{ documentType: Task.name, documentId: taskId }]
       }).pipe(Stream.runDrain, Effect.flip)
       assert.instanceOf(rejected, PeerRpcError.SessionOverloaded)
@@ -997,6 +1013,7 @@ describe("PeerRpcServer", () => {
       const first = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [{ documentType: Task.name, documentId: taskId }]
       }).pipe(Stream.runDrain, Effect.forkChild)
       assert.strictEqual(yield* Queue.take(fixture.authorizationStarted), "subject-a")
@@ -1004,6 +1021,7 @@ describe("PeerRpcServer", () => {
       const error = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [{ documentType: Note.name, documentId: noteId }]
       }).pipe(Stream.runDrain, Effect.flip)
       assert.instanceOf(error, PeerRpcError.RequestCapacityExceeded)
@@ -1021,6 +1039,7 @@ describe("PeerRpcServer", () => {
       const first = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [{ documentType: Task.name, documentId: taskId }]
       }).pipe(Stream.runDrain, Effect.forkChild)
       assert.strictEqual(yield* Queue.take(fixture.authorizationStarted), "subject-a")
@@ -1028,6 +1047,7 @@ describe("PeerRpcServer", () => {
       const error = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [{ documentType: Note.name, documentId: noteId }]
       }).pipe(Stream.runDrain, Effect.flip)
       assert.instanceOf(error, PeerRpcError.RequestCapacityExceeded)
@@ -1041,6 +1061,7 @@ describe("PeerRpcServer", () => {
       const error = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [
           { documentType: Task.name, documentId: taskId },
           { documentType: Note.name, documentId: noteId }
@@ -1058,6 +1079,7 @@ describe("PeerRpcServer", () => {
           request: {
             protocolVersion: 2,
             expectedPeerId: serverPeerId,
+            definitionHash,
             documents: [{ documentType: Task.name, documentId: taskId }]
           },
           tag: "UnsupportedVersion"
@@ -1066,18 +1088,34 @@ describe("PeerRpcServer", () => {
           request: {
             protocolVersion: PeerRpc.protocolVersion,
             expectedPeerId: remotePeerA,
+            definitionHash,
             documents: [{ documentType: Task.name, documentId: taskId }]
           },
           tag: "PeerMismatch"
         },
         {
-          request: { protocolVersion: PeerRpc.protocolVersion, expectedPeerId: serverPeerId, documents: [] },
+          request: {
+            protocolVersion: PeerRpc.protocolVersion,
+            expectedPeerId: serverPeerId,
+            definitionHash: "def_ffffffffffffffffffffffffffffffff",
+            documents: [{ documentType: Task.name, documentId: taskId }]
+          },
+          tag: "DefinitionMismatch"
+        },
+        {
+          request: {
+            protocolVersion: PeerRpc.protocolVersion,
+            expectedPeerId: serverPeerId,
+            definitionHash,
+            documents: []
+          },
           tag: "InvalidRequest"
         },
         {
           request: {
             protocolVersion: PeerRpc.protocolVersion,
             expectedPeerId: serverPeerId,
+            definitionHash,
             documents: [
               { documentType: Task.name, documentId: taskId },
               { documentType: Task.name, documentId: taskId }
@@ -1105,6 +1143,7 @@ describe("PeerRpcServer", () => {
       const tenantError = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [{ documentType: Task.name, documentId: taskId }]
       }).pipe(Stream.runDrain, Effect.flip)
       assert.instanceOf(tenantError, PeerRpcError.AccessDenied)
@@ -1133,6 +1172,7 @@ describe("PeerRpcServer", () => {
         const error = yield* fixture.client.Open({
           protocolVersion: PeerRpc.protocolVersion,
           expectedPeerId: serverPeerId,
+          definitionHash,
           documents: [{ documentType: Task.name, documentId: taskId }]
         }).pipe(Stream.runDrain, Effect.flip)
         assert.instanceOf(error, PeerRpcError.AccessDenied)
@@ -1153,6 +1193,7 @@ describe("PeerRpcServer", () => {
         const error = yield* fixture.client.Open({
           protocolVersion: PeerRpc.protocolVersion,
           expectedPeerId: serverPeerId,
+          definitionHash,
           documents: [{ documentType: Task.name, documentId: taskId }]
         }).pipe(Stream.runDrain, Effect.flip)
         assert.instanceOf(error, PeerRpcError.ServerUnavailable)
@@ -1170,6 +1211,7 @@ describe("PeerRpcServer", () => {
         const actual = yield* fixture.client.Open({
           protocolVersion: PeerRpc.protocolVersion,
           expectedPeerId: serverPeerId,
+          definitionHash,
           documents: [{ documentType: Task.name, documentId: taskId }]
         }).pipe(Stream.runDrain, Effect.flip)
         assert.strictEqual(actual._tag, expected._tag)
@@ -1190,6 +1232,7 @@ describe("PeerRpcServer", () => {
       const error = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [{ documentType: Task.name, documentId: taskId }]
       }).pipe(Stream.runDrain, Effect.flip)
       assert.instanceOf(error, PeerRpcError.ServerUnavailable)
@@ -1225,6 +1268,7 @@ describe("PeerRpcServer", () => {
       const error = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [{ documentType: Task.name, documentId: taskId }]
       }).pipe(Stream.runDrain, Effect.flip)
       assert.instanceOf(error, PeerRpcError.AccessDenied)
@@ -1246,6 +1290,7 @@ describe("PeerRpcServer", () => {
         const error = yield* fixture.client.Open({
           protocolVersion: PeerRpc.protocolVersion,
           expectedPeerId: serverPeerId,
+          definitionHash,
           documents: [{ documentType: Task.name, documentId: taskId }]
         }).pipe(Stream.runDrain, Effect.flip)
         assert.instanceOf(error, PeerRpcError.AccessDenied)
@@ -1676,6 +1721,7 @@ describe("PeerRpcServer", () => {
       const error = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [{ documentType: Task.name, documentId: taskId }]
       }).pipe(Stream.runDrain, Effect.flip)
       assert.instanceOf(error, PeerRpcError.SessionUnavailable)
@@ -1691,6 +1737,7 @@ describe("PeerRpcServer", () => {
       const error = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [{ documentType: Task.name, documentId: taskId }]
       }).pipe(Stream.runDrain, Effect.flip)
       assert.instanceOf(error, PeerRpcError.ServerUnavailable)
@@ -1733,6 +1780,7 @@ describe("PeerRpcServer", () => {
       const opening = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [{ documentType: Note.name, documentId: noteId }]
       }).pipe(Stream.runDrain, Effect.forkChild)
       assert.strictEqual(yield* Queue.take(fixture.pendingStarted), remotePeerB)
@@ -1805,6 +1853,7 @@ describe("PeerRpcServer", () => {
         const error = yield* fixture.client.Open({
           protocolVersion: PeerRpc.protocolVersion,
           expectedPeerId: serverPeerId,
+          definitionHash,
           documents: [{ documentType: Task.name, documentId: taskId }]
         }).pipe(Stream.runDrain, Effect.flip)
         assert.instanceOf(error, PeerRpcError.ServerUnavailable)
@@ -2093,11 +2142,13 @@ describe("PeerRpcServer", () => {
       yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [{ documentType: Note.name, documentId: noteId }]
       }).pipe(Stream.runDrain, Effect.flip)
       yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion + 1,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [{ documentType: Task.name, documentId: taskId }]
       }).pipe(Stream.runDrain, Effect.flip)
 

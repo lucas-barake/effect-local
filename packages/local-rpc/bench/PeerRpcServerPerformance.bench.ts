@@ -102,7 +102,8 @@ await Effect.runPromise(Effect.gen(function*() {
     })
     yield* Layer.build(PeerRpcServer.layerHandlers({
       tenantId: "tenant",
-      peerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001")
+      peerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001"),
+      definitionHash: "def_00000000000000000000000000000000"
     })).pipe(
       Effect.provideService(Scope.Scope, scope),
       Effect.provideService(CommitPublisher.CommitPublisher, publisher),

@@ -106,6 +106,7 @@ describe("PeerRpc", () => {
       const events = yield* client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: peerId,
+        definitionHash: "def_test",
         documents: [{ documentType: "Task", documentId }]
       }).pipe(Stream.runCollect)
       yield* client.Push({ sessionId, payload: Uint8Array.of(4, 5, 6) })
@@ -124,6 +125,7 @@ describe("PeerRpc", () => {
     const open = PeerRpc.OpenRpc.payloadSchema.make({
       protocolVersion: PeerRpc.protocolVersion,
       expectedPeerId: peerId,
+      definitionHash: "def_test",
       documents: [{ documentType: "Task", documentId }]
     })
     const opened = PeerRpc.Opened.make({
@@ -173,6 +175,7 @@ describe("PeerRpc", () => {
       Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)({
         protocolVersion: 1,
         expectedPeerId: "peer_invalid",
+        definitionHash: "def_test",
         documents: [{ documentType: "", documentId }]
       })
     )

@@ -79,7 +79,8 @@ const client = await Effect.runPromise(
 )
 const transportContext = await Effect.runPromise(
   Layer.build(RpcPeerTransport.layer(client, {
-    documents: [{ document: Task, documentId }]
+    documents: [{ document: Task, documentId }],
+    definitionHash: "def_00000000000000000000000000000000"
   })).pipe(Effect.provideService(Scope.Scope, scope))
 )
 const connection = await Effect.runPromise(
