@@ -103,7 +103,7 @@ export const ApplySync = Rpc.make("ApplySync", {
     documentType: Schema.String,
     messageHash: Schema.String,
     message: Schema.Uint8ArrayFromBase64,
-    writerSchemaVersion: Schema.Int,
+    writerSchemaVersion: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
     writerDefinitionHash: Schema.NonEmptyString
   },
   success: ApplySyncResult,

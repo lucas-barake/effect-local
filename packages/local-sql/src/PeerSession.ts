@@ -45,7 +45,7 @@ export const SyncEnvelope = Schema.Struct({
   documentType: Schema.String,
   messageHash: Schema.String,
   message: Schema.Uint8ArrayFromBase64,
-  writerSchemaVersion: Schema.Int,
+  writerSchemaVersion: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
   writerDefinitionHash: Schema.NonEmptyString
 })
 export const maximumSyncEnvelopeBytes = (maxSyncMessageBytes: number) => maxSyncMessageBytes * 2 + 4_096

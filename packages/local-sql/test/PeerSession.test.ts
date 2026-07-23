@@ -1148,6 +1148,25 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             writerSchemaVersion: Task.version,
             writerDefinitionHash: definition.hash
           })
+        },
+        {
+          name: "non-positive writer schema version",
+          bytes: yield* encode({
+            connectionEpoch: "remote-epoch",
+            sequence: 0,
+            documentId,
+            documentType: Task.name,
+            messageHash,
+            message,
+            writerSchemaVersion: Task.version,
+            writerDefinitionHash: definition.hash
+          }).pipe(
+            Effect.map((valid) => {
+              const tampered = JSON.parse(new TextDecoder().decode(valid))
+              tampered.writerSchemaVersion = 0
+              return new TextEncoder().encode(JSON.stringify(tampered))
+            })
+          )
         }
       ]
 
