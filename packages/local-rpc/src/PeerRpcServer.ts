@@ -839,6 +839,8 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
         if (request.documents.length === 0) return yield* new PeerRpcError.InvalidRequest()
         const requested = new Set(request.documents.map((entry) => `${entry.documentType}:${entry.documentId}`))
         if (requested.size !== request.documents.length) return yield* new PeerRpcError.InvalidRequest()
+        const requestedDocumentIds = new Set(request.documents.map((entry) => entry.documentId))
+        if (requestedDocumentIds.size !== request.documents.length) return yield* new PeerRpcError.InvalidRequest()
         if (request.documents.length > replicaLimits.maxStreamsPerSession) {
           return yield* new PeerRpcError.RequestLimitExceeded()
         }

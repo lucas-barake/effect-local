@@ -565,6 +565,29 @@ describe("PeerRpcServer", () => {
       yield* Fiber.interrupt(replacement.fiber)
     })))
 
+  it.effect("keeps the healthy session alive when a malformed replacement Open fails validation", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const fixture = yield* makeFixture(baseOptions)
+      const first = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
+      const authorizationCallsBeforeMalformedOpen = yield* Ref.get(fixture.authorizationCalls)
+      const malformedError = yield* fixture.client.Open({
+        protocolVersion: PeerRpc.protocolVersion,
+        expectedPeerId: serverPeerId,
+        documents: [
+          { documentType: Task.name, documentId: taskId },
+          { documentType: Note.name, documentId: taskId }
+        ]
+      }).pipe(Stream.runDrain, Effect.flip)
+      yield* fixture.client.Push({
+        sessionId: first.opened.sessionId,
+        payload: yield* fixture.encode(0)
+      })
+      assert.strictEqual(yield* Queue.take(fixture.received), 0)
+      assert.instanceOf(malformedError, PeerRpcError.InvalidRequest)
+      assert.strictEqual(yield* Ref.get(fixture.authorizationCalls), authorizationCallsBeforeMalformedOpen)
+      yield* Fiber.interrupt(first.fiber)
+    })))
+
   it.effect("enforces the global session limit", () =>
     Effect.scoped(Effect.gen(function*() {
       const fixture = yield* makeFixture({ ...baseOptions, replicaLimits: { maxSessions: 1 } })
@@ -985,6 +1008,17 @@ describe("PeerRpcServer", () => {
             documents: [
               { documentType: Task.name, documentId: taskId },
               { documentType: Task.name, documentId: taskId }
+            ]
+          },
+          tag: "InvalidRequest"
+        },
+        {
+          request: {
+            protocolVersion: PeerRpc.protocolVersion,
+            expectedPeerId: serverPeerId,
+            documents: [
+              { documentType: Task.name, documentId: taskId },
+              { documentType: Note.name, documentId: taskId }
             ]
           },
           tag: "InvalidRequest"
