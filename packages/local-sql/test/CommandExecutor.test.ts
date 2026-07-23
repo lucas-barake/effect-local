@@ -142,6 +142,62 @@ describe("CommandExecutor", () => {
       assert.deepStrictEqual(counts[0], { changes: 2, receipts: 2 })
     })).pipe(Effect.provide(Live)))
 
+  it.effect("rejects lookups that target a receipt written by a different operation", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const executor = yield* CommandExecutor.CommandExecutor
+      const gate = yield* ReplicaGate.ReplicaGate
+      const permit = yield* gate.shared
+      const documentId = yield* Identity.makeDocumentId
+      const createCommandId = yield* Identity.makeCommandId
+      const encoded = yield* Document.encode(Task, documentId, { title: "one" })
+      const createHash = yield* CommandExecutor.createRequestHash({
+        incarnation: permit.incarnation,
+        commandId: createCommandId,
+        document: Task,
+        documentId,
+        encoded
+      })
+      yield* executor.create(Task, {
+        commandId: createCommandId,
+        documentId,
+        permit,
+        requestHash: createHash,
+        value: { title: "one" }
+      })
+      const mutationOnCreate = yield* Effect.flip(executor.lookupMutation(Rename, createCommandId, permit))
+      assert.strictEqual(mutationOnCreate.reason._tag, "ReceiptOperationMismatch")
+      const deleteOnCreate = yield* Effect.flip(executor.lookupDelete(createCommandId, permit))
+      assert.strictEqual(deleteOnCreate.reason._tag, "ReceiptOperationMismatch")
+
+      const mutationCommandId = yield* Identity.makeCommandId
+      const mutationHash = yield* CommandExecutor.mutationRequestHash({
+        incarnation: permit.incarnation,
+        commandId: mutationCommandId,
+        documentId,
+        mutation: Rename,
+        payload: "two"
+      })
+      const mutated = yield* executor.mutate(Rename, {
+        commandId: mutationCommandId,
+        documentId,
+        payload: "two",
+        permit,
+        requestHash: mutationHash
+      })
+      const createOnMutation = yield* Effect.flip(executor.lookupCreate(mutationCommandId, permit))
+      assert.strictEqual(createOnMutation.reason._tag, "ReceiptOperationMismatch")
+      const deleteOnMutation = yield* Effect.flip(executor.lookupDelete(mutationCommandId, permit))
+      assert.strictEqual(deleteOnMutation.reason._tag, "ReceiptOperationMismatch")
+      const otherMutation = yield* Effect.flip(executor.lookupMutation(Checked, mutationCommandId, permit))
+      assert.strictEqual(otherMutation.reason._tag, "ReceiptOperationMismatch")
+
+      assert.deepStrictEqual(yield* executor.lookupMutation(Rename, mutationCommandId, permit), mutated)
+      assert.deepStrictEqual(
+        yield* executor.lookupCreate(createCommandId, permit),
+        CommandOutcome.durablyCommitted(createCommandId, documentId)
+      )
+    })).pipe(Effect.provide(Live)))
+
   it.effect("stores deterministic domain rejection without changing canonical state", () =>
     Effect.scoped(Effect.gen(function*() {
       const executor = yield* CommandExecutor.CommandExecutor
