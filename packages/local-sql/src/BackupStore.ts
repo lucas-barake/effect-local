@@ -102,18 +102,9 @@ const EnvelopeJson = Schema.fromJsonString(Envelope)
 type Envelope = typeof Envelope.Type
 type DecodedRecord =
   | { readonly kind: "Document"; readonly value: typeof DocumentRecord.Type }
-  | {
-    readonly kind: "Change"
-    readonly value: Omit<typeof ChangeRecord.Type, "bytes"> & { readonly bytes: Uint8Array }
-  }
-  | {
-    readonly kind: "Checkpoint"
-    readonly value: Omit<typeof CheckpointRecord.Type, "bytes"> & { readonly bytes: Uint8Array }
-  }
-  | {
-    readonly kind: "Receipt"
-    readonly value: Omit<typeof ReceiptRecord.Type, "result"> & { readonly result: Uint8Array }
-  }
+  | { readonly kind: "Change"; readonly value: typeof StoredChangeRecord.Type }
+  | { readonly kind: "Checkpoint"; readonly value: typeof StoredCheckpointRecord.Type }
+  | { readonly kind: "Receipt"; readonly value: typeof StoredReceiptRecord.Type }
 
 const encodeEnvelopeJson = (envelope: Envelope) =>
   Schema.encodeEffect(EnvelopeJson)(envelope).pipe(
@@ -258,10 +249,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             const identity = yield* gate.shared
             const snapshot = yield* sql.withTransaction(Effect.gen(function*() {
               const sizing = yield* findBackupSizing(undefined)
-              const recordCount = Option.match(sizing, {
-                onNone: () => 0,
-                onSome: (row) => row.record_count
-              })
+              const { raw_bytes: rawBytes, record_count: recordCount } = Option.getOrElse(
+                sizing,
+                () => ({ raw_bytes: 0, record_count: 0 })
+              )
               if (recordCount > limits.maxArchiveRecords) {
                 return yield* new ReplicaError.ReplicaError({
                   reason: new ReplicaError.BackupTooLarge({
@@ -270,10 +261,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   })
                 })
               }
-              const estimatedBytes = Option.match(sizing, {
-                    onNone: () => 0,
-                    onSome: (row) => row.raw_bytes
-                  }) * 2 + recordCount * 512 + 4096
+              const estimatedBytes = rawBytes * 2 + recordCount * 512 + 4096
               if (estimatedBytes > options.maxBytes) {
                 return yield* new ReplicaError.ReplicaError({
                   reason: new ReplicaError.BackupTooLarge({
@@ -372,7 +360,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             })
           }
           const observedBytes = yield* Ref.make(0)
-          const envelopes = (yield* options.source.pipe(
+          const envelopes = yield* options.source.pipe(
             Stream.mapEffect((chunk) =>
               Ref.updateAndGet(observedBytes, (bytes) => bytes + chunk.byteLength).pipe(
                 Effect.flatMap((bytes) => {
@@ -424,7 +412,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               )
             ),
             Stream.runCollect
-          )) as Array<Envelope>
+          )
           const observedByteCount = yield* Ref.get(observedBytes)
           if (envelopes.length > limits.maxArchiveRecords + 2) {
             return yield* new ReplicaError.ReplicaError({

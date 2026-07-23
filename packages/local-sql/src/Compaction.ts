@@ -208,7 +208,7 @@ export const layer: Layer.Layer<
           )
           if (
             !Equal.equals(stored.materializedHeads, stored.acceptedHeads) ||
-            Option.match(pending, { onNone: () => 0, onSome: (row) => row.count }) !== 0
+            Option.exists(pending, (row) => row.count !== 0)
           ) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
