@@ -185,13 +185,12 @@ export const make = (
           ? candidate
           : undefined
         const next = new Map(current)
-        if (previous !== candidate) next.delete(key)
+        next.delete(key)
         if (decision.reorder && previous === undefined) {
           next.set(key, scheduled)
           return [undefined, next]
         }
         if (previous === undefined) return [[scheduled], next]
-        next.delete(key)
         return [[scheduled, previous], next]
       })
       if (pending === false) return yield* new ConnectionClosed({ from, to })
@@ -236,7 +235,7 @@ export const make = (
         )
       )
       yield* Effect.addFinalizer(() => close)
-      yield* Effect.uninterruptible(Effect.gen(function*() {
+      yield* Effect.gen(function*() {
         const previous = yield* SubscriptionRef.modify(routes, (current) => {
           const key = route(to, from)
           const next = new Map(current)
@@ -255,11 +254,11 @@ export const make = (
           })
           yield* Queue.shutdown(previous.queue)
         }
-      }))
+      }).pipe(Effect.uninterruptible)
       return {
         from,
         to,
-        receive: Stream.fromQueue(inbound).pipe(Stream.flatMap(Stream.fromIterable)),
+        receive: Stream.fromQueue(inbound).pipe(Stream.flattenIterable),
         send: (message: Uint8Array) =>
           Ref.get(active).pipe(
             Effect.flatMap((isActive) =>
