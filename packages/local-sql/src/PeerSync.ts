@@ -75,9 +75,11 @@ const ReceiptRow = Schema.Struct({
 })
 
 const PendingRow = Schema.Struct({
+  actor: Schema.String,
   bytes: Schema.Uint8Array,
   change_hash: Schema.String,
-  dependencies: Schema.String
+  dependencies: Schema.String,
+  sequence: Schema.Int
 })
 
 const PendingReceiptRow = Schema.Struct({
@@ -253,7 +255,7 @@ export const layer: Layer.Layer<
       Request: Identity.DocumentId,
       Result: PendingRow,
       execute: (documentId) =>
-        sql`SELECT bytes, change_hash, dependencies FROM effect_local_changes
+        sql`SELECT actor, bytes, change_hash, dependencies, sequence FROM effect_local_changes
           WHERE document_id = ${documentId} AND applied = 0 ORDER BY accepted_at, change_hash`
     })
     const findPendingReceipts = SqlSchema.findAll({
@@ -1430,19 +1432,27 @@ export const layer: Layer.Layer<
                             )
                         })
                       )
-                      let staged = received[0]
-                      if (pendingRows.length > 0) {
-                        staged = yield* Effect.try({
-                          try: () => InternalAutomerge.replay(staged, pendingRows.map((row) => row.bytes)),
+                      const staged = pendingRows.length === 0
+                        ? received[0]
+                        : yield* Effect.try({
+                          try: () => {
+                            for (const row of pendingRows) {
+                              const pending = InternalAutomerge.decode(row.bytes)
+                              if (
+                                pending.hash !== row.change_hash || pending.actor !== row.actor ||
+                                pending.sequence !== row.sequence ||
+                                Schema.encodeSync(Heads)(pending.dependencies) !== row.dependencies
+                              ) {
+                                throw new TypeError(`Invalid stored change: ${row.change_hash}`)
+                              }
+                            }
+                            return InternalAutomerge.replay(received[0], pendingRows.map((row) => row.bytes))
+                          },
                           catch: (cause) =>
                             new ReplicaError.ReplicaError({
-                              reason: new ReplicaError.ProtocolMismatch({
-                                expected: "applicable pending Automerge changes",
-                                observed: String(cause)
-                              })
+                              reason: new ReplicaError.StorageCorrupt({ cause })
                             })
                         })
-                      }
                       const generated = yield* Effect.try({
                         try: () => Automerge.generateSyncMessage(staged, received[1]),
                         catch: (cause) =>

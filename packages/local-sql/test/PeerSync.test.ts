@@ -1134,6 +1134,90 @@ describe("PeerSync", () => {
       InternalAutomerge.free(created.automerge)
       InternalAutomerge.free(remote)
     }).pipe(Effect.provide(Services)))
+
+  it.effect("rejects mismatched durable pending change metadata before replay", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      const corrupted = Automerge.change(
+        Automerge.clone(created.automerge, { actor: "d".repeat(32) }),
+        (draft) => {
+          ;(draft.value as { title: string }).title = "corrupted"
+        }
+      )
+
+      yield* Effect.gen(function*() {
+        const changeBytes = Automerge.getChangesSince(
+          corrupted,
+          [...created.materializedHeads]
+        )
+        assert.strictEqual(changeBytes.length, 1)
+        const decoded = Automerge.decodeChange(changeBytes[0]!)
+        const storedHash = "0".repeat(64)
+        assert.notStrictEqual(storedHash, decoded.hash)
+
+        yield* sql`INSERT INTO effect_local_changes (
+          change_hash, document_id, document_type, writer_schema_version,
+          writer_definition_hash, actor, sequence, dependencies, bytes,
+          applied, peer_id, accepted_at, commit_sequence
+        ) VALUES (
+          ${storedHash}, ${documentId}, ${Task.name}, ${Task.version},
+          ${definition.hash}, ${decoded.actor}, ${decoded.seq},
+          ${JSON.stringify(decoded.deps)}, ${changeBytes[0]!},
+          0, ${session.peerId}, '9999-12-31T23:59:59.999Z',
+          ${created.commitSequence}
+        )`
+
+        const before = yield* sql<{
+          readonly materialized_heads: string
+          readonly receipts: number
+        }>`SELECT
+          materialized_heads,
+          (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts
+          FROM effect_local_documents
+          WHERE document_id = ${documentId}`
+
+        const generated = Automerge.generateSyncMessage(
+          created.automerge,
+          Automerge.initSyncState()
+        )
+        assert.isNotNull(generated[1])
+
+        const result = yield* Effect.result(
+          sync.receive(Task, documentId, session, {
+            remoteConnectionEpoch: "remote",
+            receiveSequence: 0,
+            message: generated[1]!
+          })
+        )
+
+        const after = yield* sql<{
+          readonly materialized_heads: string
+          readonly receipts: number
+        }>`SELECT
+          materialized_heads,
+          (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts
+          FROM effect_local_documents
+          WHERE document_id = ${documentId}`
+
+        assert.isTrue(Result.isFailure(result))
+        if (Result.isFailure(result)) {
+          assert.strictEqual(result.failure.reason._tag, "StorageCorrupt")
+        }
+        assert.deepStrictEqual(after, before)
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            InternalAutomerge.free(corrupted)
+            InternalAutomerge.free(created.automerge)
+          })
+        )
+      )
+    }).pipe(Effect.provide(TestLayer)))
 })
 
 const sameHeadsForTest = (left: ReadonlyArray<string>, right: ReadonlyArray<string>) =>
