@@ -78,11 +78,16 @@ interface Scheduled {
 
 const route = (from: Identity.PeerId, to: Identity.PeerId) => `${from}\u0000${to}`
 
+const toValidatedMillis = (input: Duration.Input) =>
+  typeof input === "number" && Number.isNaN(input)
+    ? Number.NaN
+    : Duration.toMillis(input)
+
 export const make = (
   options: Options
 ): Effect.Effect<TestPeer["Service"], InvalidOptions, FaultInjection.FaultInjection> =>
   Effect.gen(function*() {
-    const maxDelay = Duration.toMillis(options.maxDelay)
+    const maxDelay = toValidatedMillis(options.maxDelay)
     if (!Number.isSafeInteger(options.queueCapacity) || options.queueCapacity < 1) {
       return yield* new InvalidOptions({ reason: "queueCapacity must be a positive integer" })
     }
@@ -104,7 +109,7 @@ export const make = (
     const sequence = yield* Ref.make(0)
 
     const validate = (packet: FaultInjection.Packet, decision: FaultInjection.Decision) => {
-      const delay = Duration.toMillis(decision.delay)
+      const delay = toValidatedMillis(decision.delay)
       if (!Number.isSafeInteger(decision.copies) || decision.copies < 1 || decision.copies > options.maxCopies) {
         return Effect.fail(
           new InvalidFault({

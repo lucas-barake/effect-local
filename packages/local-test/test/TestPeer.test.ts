@@ -45,6 +45,19 @@ describe("TestPeer", () => {
       ])
     }).pipe(Effect.provide(FaultInjection.none)))
 
+  it.effect("rejects a NaN maximum delay in the typed error channel", () =>
+    Effect.gen(function*() {
+      const error = yield* TestPeer.make({ ...options, maxDelay: Number.NaN }).pipe(
+        Effect.flip,
+        Effect.option
+      )
+      assert.isTrue(Option.isSome(error))
+      if (Option.isSome(error)) {
+        assert.strictEqual(error.value._tag, "InvalidOptions")
+        assert.strictEqual(error.value.reason, "maxDelay must be finite and nonnegative")
+      }
+    }).pipe(Effect.provide(FaultInjection.none)))
+
   it.effect("uses the test clock for deterministic delays", () =>
     Effect.scoped(Effect.gen(function*() {
       const network = yield* TestPeer.make(options)
@@ -131,6 +144,24 @@ describe("TestPeer", () => {
       drop: false,
       copies: 4,
       delay: 0,
+      reorder: false
+    }]))))
+
+  it.effect("rejects a NaN fault delay in the typed error channel", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const network = yield* TestPeer.make(options)
+      const left = yield* network.connect(leftId, rightId)
+      yield* network.connect(rightId, leftId)
+      const error = yield* left.send(bytes(1)).pipe(
+        Effect.flip,
+        Effect.option
+      )
+      assert.isTrue(Option.isSome(error))
+      if (Option.isSome(error)) assert.strictEqual(error.value._tag, "InvalidFault")
+    })).pipe(Effect.provide(FaultInjection.layerSequence([{
+      drop: false,
+      copies: 1,
+      delay: Number.NaN,
       reorder: false
     }]))))
 
