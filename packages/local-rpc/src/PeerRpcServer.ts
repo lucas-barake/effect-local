@@ -131,7 +131,7 @@ const authorizationFailure = (
   if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
   if (cause.reasons.length === 1 && Cause.isFailReason(cause.reasons[0])) {
     const error = cause.reasons[0].error
-    if (error instanceof PeerRpcError.AccessDenied || error instanceof PeerRpcError.ServerUnavailable) {
+    if (error._tag === "AccessDenied" || error._tag === "ServerUnavailable") {
       return Effect.fail(error)
     }
   }
@@ -727,7 +727,7 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
 
     const revokeForSessionFailure = (entry: Entry, cause: Cause.Cause<ReplicaError.ReplicaError>) => {
       const error = sessionFailure(cause)
-      return (error instanceof PeerRpcError.SessionOverloaded
+      return (error._tag === "SessionOverloaded"
         ? PeerRpcObservability.record("Outbound", "Overloaded", 1)
         : Effect.void).pipe(
           Effect.andThen(revoke(entry, error, false, true))

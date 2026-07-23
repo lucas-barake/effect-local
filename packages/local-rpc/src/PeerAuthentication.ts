@@ -153,9 +153,9 @@ export const layerServer = Layer.effect(
         attributes: {},
         result: (exit) => {
           const error = PeerRpcObservability.failure(exit)
-          return error instanceof PeerRpcError.AuthenticationFailure
+          return error?._tag === "AuthenticationFailure"
             ? "AuthenticationDenied"
-            : error instanceof PeerRpcError.RequestCapacityExceeded
+            : error?._tag === "RequestCapacityExceeded"
             ? "CapacityRejected"
             : Exit.isSuccess(exit)
             ? "Success"

@@ -30,7 +30,7 @@ const protocolFailure = (observed: string) =>
   })
 
 const mapError = (error: PeerRpcError.PeerRpcError | RpcClientError) => {
-  if (error instanceof RpcClientError) return unavailable()
+  if (error._tag === "RpcClientError") return unavailable()
   switch (error._tag) {
     case "RequestCapacityExceeded":
     case "SessionUnavailable":
