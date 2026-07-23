@@ -153,4 +153,89 @@ describe("QueryExecutor", () => {
         ]
       ])
     }).pipe(Effect.provide(Live)))
+
+  it.effect("closes reactive queries whose projections share a document", () => {
+    const LabelCounts = Projection.make("LabelCounts", {
+      document: Task,
+      version: 1,
+      Row: Schema.Struct({
+        sourceDocumentId: Identity.DocumentId,
+        count: Schema.Number
+      }),
+      key: (row) => row.sourceDocumentId,
+      project: (snapshot) => [{
+        sourceDocumentId: snapshot.documentId,
+        count: snapshot.value.labels.length
+      }]
+    })
+    const LabelCountsSql = SqlProjection.make(LabelCounts, {
+      table: "query_task_label_counts_v1",
+      migrations: [{
+        id: 1,
+        name: "query_task_label_counts_v1",
+        run: (sql, table) =>
+          sql`CREATE TABLE IF NOT EXISTS ${sql(table)} (
+            sourceDocumentId TEXT NOT NULL,
+            count INTEGER NOT NULL
+          )`.pipe(Effect.asVoid)
+      }],
+      deleteByDocument: (sql, table, documentId) =>
+        sql`DELETE FROM ${sql(table)} WHERE sourceDocumentId = ${documentId}`.pipe(Effect.asVoid),
+      insert: (sql, table, row) =>
+        sql`INSERT INTO ${sql(table)} (sourceDocumentId, count)
+          VALUES (${row.sourceDocumentId}, ${row.count})`.pipe(Effect.asVoid)
+    })
+    const Combined = Query.make("Combined", {
+      success: Schema.Number,
+      dependsOn: [Labels, LabelCounts]
+    })
+    const combinedDefinition = ReplicaDefinition.make({
+      name: "shared-document-reactivity",
+      documents: DocumentSet.make(Task),
+      projections: [Labels, LabelCounts],
+      queries: [Combined]
+    })
+    const combinedDatabase = Layer.merge(
+      SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+      NodeCrypto.layer
+    )
+    const combinedBootstrap = ReplicaBootstrap.layer(combinedDefinition).pipe(
+      Layer.provide(combinedDatabase)
+    )
+    const combinedBase = Layer.merge(combinedDatabase, combinedBootstrap)
+    const combinedProjections = ProjectionStore.layer([LabelsSql, LabelCountsSql]).pipe(
+      Layer.provide(Layer.mergeAll(
+        combinedBase,
+        LabelsSql.layer,
+        LabelCountsSql.layer
+      ))
+    )
+    const combinedHandler = Combined.toLayer(() => Effect.succeed(1))
+    const combinedReactive = Reactivity.layer
+    const combinedExecutor = QueryExecutor.layer(combinedDefinition).pipe(
+      Layer.provide(Layer.mergeAll(
+        combinedDatabase,
+        combinedHandler,
+        combinedReactive
+      ))
+    )
+    const combinedLive = Layer.mergeAll(
+      combinedBase,
+      combinedProjections,
+      combinedHandler,
+      combinedReactive,
+      combinedExecutor
+    )
+
+    return Effect.gen(function*() {
+      const executor = yield* QueryExecutor.QueryExecutor
+      const first = yield* Effect.scoped(
+        Effect.gen(function*() {
+          const pull = yield* Stream.toPull(executor.reactive(Combined, undefined))
+          return yield* pull
+        })
+      )
+      assert.deepStrictEqual(first, [1])
+    }).pipe(Effect.provide(combinedLive))
+  })
 })
