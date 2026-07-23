@@ -28,6 +28,15 @@ import * as ReplicaGate from "../src/ReplicaGate.js"
 import * as SqlProjection from "../src/SqlProjection.js"
 
 describe("BackupStore", () => {
+  const concatenate = (chunks: ReadonlyArray<Uint8Array>) => {
+    const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.byteLength, 0))
+    let offset = 0
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    return bytes
+  }
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
   const definition = ReplicaDefinition.make({
     name: "backup-tasks",
@@ -463,7 +472,7 @@ describe("BackupStore", () => {
       InternalAutomerge.free(created.automerge)
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
       const lines = new TextDecoder()
-        .decode(Uint8Array.from(chunks.flatMap((chunk) => [...chunk])))
+        .decode(concatenate(chunks))
         .trimEnd()
         .split("\n")
         .map((line) => JSON.parse(line))
@@ -644,7 +653,7 @@ describe("BackupStore", () => {
       const backups = yield* BackupStore.BackupStore
       const source = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
       const manifest = (chunks: ReadonlyArray<Uint8Array>) =>
-        JSON.parse(new TextDecoder().decode(Uint8Array.from(chunks.flatMap((chunk) => [...chunk]))).split("\n")[0]!)
+        JSON.parse(new TextDecoder().decode(concatenate(chunks)).split("\n")[0]!)
           .value as { readonly replicaId: string; readonly incarnation: number }
       const initial = manifest(source)
 

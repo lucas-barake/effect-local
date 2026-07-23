@@ -79,14 +79,16 @@ describe("ProjectionStore", () => {
 
     assert.throws(() => makeBinding([]), TypeError)
 
-    for (const id of [
-      0,
-      -1,
-      1.5,
-      Number.NaN,
-      Number.POSITIVE_INFINITY,
-      Number.MAX_SAFE_INTEGER + 1
-    ]) {
+    for (
+      const id of [
+        0,
+        -1,
+        1.5,
+        Number.NaN,
+        Number.POSITIVE_INFINITY,
+        Number.MAX_SAFE_INTEGER + 1
+      ]
+    ) {
       assert.throws(() => makeBinding([migration(id, "invalid")]), TypeError)
     }
 
@@ -99,8 +101,7 @@ describe("ProjectionStore", () => {
       migrations: [{
         id: 1,
         name: "broken",
-        run: (sql) =>
-          sql`SELECT * FROM definitely_missing_projection_table`.pipe(Effect.asVoid)
+        run: (sql) => sql`SELECT * FROM definitely_missing_projection_table`.pipe(Effect.asVoid)
       }],
       deleteByDocument: () => Effect.void,
       insert: () => Effect.void
@@ -114,8 +115,13 @@ describe("ProjectionStore", () => {
         Effect.provide(BrokenStore),
         Effect.flip
       )
-      assert.strictEqual(error.reason._tag, "ProjectionBlocked")
-      assert.strictEqual(error.reason.projection, Labels.name)
+      assert.strictEqual(error._tag, "ReplicaError")
+      if (error._tag === "ReplicaError") {
+        assert.strictEqual(error.reason._tag, "ProjectionBlocked")
+        if (error.reason._tag === "ProjectionBlocked") {
+          assert.strictEqual(error.reason.projection, Labels.name)
+        }
+      }
     })
   })
 

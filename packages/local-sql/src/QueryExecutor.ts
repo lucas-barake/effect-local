@@ -159,8 +159,9 @@ export const layer = <D extends ReplicaDefinition.Any,>(
               })
             ))
         ) as Effect.Effect<Q["successSchema"]["Type"], Q["errorSchema"]["Type"] | ReplicaError.ReplicaError>
-      const reactivityKeys = (query: Query.Any) =>
-        [...new Set(query.dependsOn.flatMap((projection) => [projection.name, projection.document.name]))]
+      const reactivityKeys = (
+        query: Query.Any
+      ) => [...new Set(query.dependsOn.flatMap((projection) => [projection.name, projection.document.name]))]
       return QueryExecutor.of({
         execute,
         reactive: (query, payload) => reactivity.stream(reactivityKeys(query), execute(query, payload))

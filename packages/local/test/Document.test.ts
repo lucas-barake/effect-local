@@ -1,7 +1,7 @@
 import * as Automerge from "@automerge/automerge"
 import { assert, describe, it } from "@effect/vitest"
-import { createRequire } from "node:module"
 import * as Schema from "effect/Schema"
+import { createRequire } from "node:module"
 import * as Document from "../src/Document.js"
 import * as DocumentSet from "../src/DocumentSet.js"
 
@@ -40,7 +40,8 @@ describe("Document", () => {
   })
 
   it("rejects sparse arrays that Automerge treats as undefined", () => {
-    const items = new Array<string>(1)
+    const items: Array<string> = []
+    items.length = 1
 
     assert.throws(() => {
       const document = Automerge.from({ items })
