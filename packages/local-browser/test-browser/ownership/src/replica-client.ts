@@ -189,14 +189,16 @@ export const exportBackup = runtime.fn<void>()(
 
 export const restoreBackup = runtime.fn<Uint8Array>()(
   (bytes) =>
-    Replica.Replica.use((replica) =>
-      replica.restoreBackup({
+    Effect.gen(function*() {
+      const replica = yield* Replica.Replica
+      yield* replica.restoreBackup({
         source: Stream.make(bytes),
         mode: "replace",
         maxBytes: 32 * 1024 * 1024,
-        expectedDefinitionHash: definition.hash
+        expectedDefinitionHash: definition.hash,
+        installationId: yield* Identity.makeBackupInstallationId
       })
-    ),
+    }),
   { concurrent: false, reactivityKeys: [TaskList.name] }
 )
 

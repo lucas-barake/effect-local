@@ -872,7 +872,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         source: Stream.fromIterable(exported),
         mode: "replace",
         maxBytes: 1024,
-        expectedDefinitionHash: definition.hash
+        expectedDefinitionHash: definition.hash,
+        installationId: Identity.BackupInstallationId.make("bak_5f0a6f45-9be2-4c7a-8f45-1d2f3a4b5c6d")
       })
       assert.deepStrictEqual(restored, exported)
       restored = []
@@ -880,7 +881,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         source: Stream.fromIterable([new Uint8Array(700), new Uint8Array(700)]),
         mode: "replace",
         maxBytes: 1024,
-        expectedDefinitionHash: definition.hash
+        expectedDefinitionHash: definition.hash,
+        installationId: Identity.BackupInstallationId.make("bak_7c1b2d38-6e4f-4b9a-9c2d-3e4f5a6b7c8d")
       }))
       assert.strictEqual(oversized.reason._tag, "BackupTooLarge")
       assert.deepStrictEqual(restored, [])

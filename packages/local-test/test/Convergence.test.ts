@@ -92,6 +92,7 @@ const seedPair = Effect.gen(function*() {
   )
   yield* rightBuilt.replica.restoreBackup({
     expectedDefinitionHash: definition.hash,
+    installationId: yield* Identity.makeBackupInstallationId,
     maxBytes: TestReplica.defaultLimits.maxBackupBytes,
     mode: "clone",
     source: Stream.fromIterable(backup)

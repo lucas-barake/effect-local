@@ -24,6 +24,7 @@ export interface RestoreOptions<R,> {
   readonly mode: "clone" | "replace"
   readonly maxBytes: number
   readonly expectedDefinitionHash: string
+  readonly installationId: Identity.BackupInstallationId
 }
 
 export interface ExportedDocument<E,> {

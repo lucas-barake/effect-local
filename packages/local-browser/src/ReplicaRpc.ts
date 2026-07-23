@@ -161,7 +161,8 @@ export const group = RpcGroup.make(
       chunks: Schema.Array(Transferable.Uint8Array),
       mode: Schema.Literals(["clone", "replace"]),
       maxBytes: Schema.Number,
-      expectedDefinitionHash: Schema.String
+      expectedDefinitionHash: Schema.String,
+      installationId: Identity.BackupInstallationId
     },
     error: ReplicaError.ReplicaError
   }),
