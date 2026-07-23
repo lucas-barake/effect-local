@@ -204,7 +204,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
           sql.withTransaction(Effect.gen(function*() {
             const matching = resolved.filter((binding) => binding.projection.document.name === document.name)
             for (const binding of matching) {
-              yield* replace(binding, snapshot as never, binding.table)
+              yield* replace(binding, snapshot, binding.table)
             }
             yield* sql`UPDATE effect_local_commit_outbox
               SET invalidation_keys = ${
