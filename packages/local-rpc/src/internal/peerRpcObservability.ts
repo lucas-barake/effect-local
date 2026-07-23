@@ -1,4 +1,3 @@
-import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Metric from "effect/Metric"
@@ -80,9 +79,8 @@ export const observe = <A, E, R,>(options: {
   readonly spanName: string
   readonly attributes: Readonly<Record<string, string | number | boolean>>
   readonly result: (exit: Exit.Exit<A, E>) => Result
-}) => {
-  let completed: Exit.Exit<A, E> | undefined
-  return Effect.uninterruptibleMask((restore) =>
+}) =>
+  Effect.uninterruptibleMask((restore) =>
     Effect.useSpan(
       options.spanName,
       {
@@ -93,21 +91,16 @@ export const observe = <A, E, R,>(options: {
       },
       (span) =>
         record(options.operation, "Attempt", 1).pipe(
-          Effect.andThen(Effect.exit(restore(options.effect))),
+          Effect.andThen(restore(options.effect).pipe(Effect.exit)),
           Effect.tap((exit) => {
-            completed = exit
             const result = options.result(exit)
             return Effect.sync(() => span.attribute("rpc.result", result)).pipe(
               Effect.andThen(record(options.operation, result, 1))
             )
-          }),
-          Effect.asVoid
+          })
         )
-    ).pipe(
-      Effect.andThen(Effect.suspend(() => completed ?? Effect.die("RPC observability boundary did not complete")))
-    )
+    ).pipe(Effect.flatten)
   )
-}
 
 export const failure = <E,>(exit: Exit.Exit<unknown, E>): E | undefined =>
-  Exit.isFailure(exit) ? Option.getOrUndefined(Cause.findErrorOption(exit.cause)) : undefined
+  Exit.findErrorOption(exit).pipe(Option.getOrUndefined)

@@ -27,13 +27,11 @@ import * as PeerRpcLimits from "./PeerRpcLimits.js"
 interface InboundItem {
   readonly id: number
   readonly payload: Uint8Array
-  readonly bytes: number
 }
 
 interface OutboundItem {
   readonly id: number
   readonly payload: Uint8Array
-  readonly bytes: number
 }
 
 interface Entry {
@@ -99,7 +97,6 @@ interface Cleanup {
   readonly entry: Entry
   readonly activeSession: boolean
   readonly inboundItems: number
-  readonly inboundBytes: number
   readonly outboundItems: number
   readonly outboundBytes: number
   readonly watcher: Fiber.Fiber<void, unknown> | undefined
@@ -117,13 +114,15 @@ const replicaFailure = () =>
   })
 
 const sessionFailure = (cause: Cause.Cause<ReplicaError.ReplicaError>) =>
-  Option.match(Cause.findErrorOption(cause), {
-    onNone: () => new PeerRpcError.ServerUnavailable(),
-    onSome: (error) =>
-      error.reason._tag === "StorageUnavailable" && Cause.isTimeoutError(error.reason.cause)
-        ? new PeerRpcError.SessionOverloaded()
-        : new PeerRpcError.ServerUnavailable()
-  })
+  Cause.findErrorOption(cause).pipe(
+    Option.match({
+      onNone: () => new PeerRpcError.ServerUnavailable(),
+      onSome: (error) =>
+        error.reason._tag === "StorageUnavailable" && Cause.isTimeoutError(error.reason.cause)
+          ? new PeerRpcError.SessionOverloaded()
+          : new PeerRpcError.ServerUnavailable()
+    })
+  )
 
 const authorizationFailure = (
   cause: Cause.Cause<PeerRpcError.AccessDenied | PeerRpcError.ServerUnavailable>
@@ -302,7 +301,6 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
         entry,
         activeSession,
         inboundItems,
-        inboundBytes,
         outboundItems,
         outboundBytes,
         watcher: entry.watcher,
@@ -633,7 +631,7 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
               }
               return yield* replicaFailure()
             }
-            const offered = yield* restore(Queue.offer(entry.outbound, { id, payload, bytes })).pipe(
+            const offered = yield* restore(Queue.offer(entry.outbound, { id, payload })).pipe(
               Effect.onInterrupt(() => releaseOutbound(entry, id))
             )
             if (!offered) {
@@ -999,16 +997,16 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
                 entry.inboundBytes + bytes > limits.maxInboundBufferedBytesPerSession ||
                 registry.bufferedBytes + bytes > limits.maxBufferedBytes
               ) {
-                return { _tag: "Overloaded" as const, entry, cleanup: detach(entry, error, false, true) }
+                return { _tag: "Overloaded" as const, cleanup: detach(entry, error, false, true) }
               }
               const id = reservationId++
               entry.inboundReservations.set(id, bytes)
               entry.inboundBytes += bytes
               registry.bufferedBytes += bytes
               yield* PeerRpcObservability.modifyQueueItems("Inbound", 1)
-              const offered = yield* Queue.offer(entry.inbound, { id, payload: request.payload, bytes })
+              const offered = yield* Queue.offer(entry.inbound, { id, payload: request.payload })
               if (!offered) {
-                return { _tag: "Overloaded" as const, entry, cleanup: detach(entry, error, false, true) }
+                return { _tag: "Overloaded" as const, cleanup: detach(entry, error, false, true) }
               }
               yield* PeerRpcObservability.recordBytes("Inbound", bytes)
               return { _tag: "Accepted" as const }
