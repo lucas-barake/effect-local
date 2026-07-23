@@ -28,8 +28,9 @@ export const acknowledgedTitle = "survives-sigkill"
 /**
  * On-disk SQLite with WAL enabled (the driver runs `PRAGMA journal_mode = WAL`
  * whenever `disableWAL` is not `true`), composing the same DocumentStore stack
- * production uses so a write acknowledged here is acknowledged the same way a
- * consumer would observe it.
+ * production drives through CommandExecutor. Here `create`'s transaction is the
+ * top-level BEGIN/COMMIT rather than a savepoint nested inside CommandExecutor's
+ * outer transaction, which does not change what COMMIT-then-ack proves.
  */
 export const storeLayer = (filename: string) => {
   const database = Layer.merge(SqliteClient.layer({ filename }), NodeCrypto.layer)
