@@ -143,14 +143,13 @@ const decode = <S extends Document.WireSchema,>(
 const encode = <S extends Document.WireSchema,>(schema: S, value: S["Type"]) =>
   Schema.encodeEffect(Schema.fromJsonString(Schema.toCodecJson(schema)))(value).pipe(
     Effect.map((encoded) => new TextEncoder().encode(encoded)),
-    Effect.catchTag("SchemaError", (cause) =>
-      Effect.fail(
-        new ReplicaError.ReplicaError({
-          reason: new ReplicaError.StorageCorrupt({
-            cause
-          })
+    Effect.mapError((cause) =>
+      new ReplicaError.ReplicaError({
+        reason: new ReplicaError.StorageCorrupt({
+          cause
         })
-      ))
+      })
+    )
   )
 
 const resolveDocument = (definition: ReplicaDefinition.Any, name: string) => {
@@ -244,7 +243,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 requestHash: request.payload.requestHash
               })
               return yield* encode(
-                CommandOutcome.schema(mutation.successSchema, mutation.errorSchema) as unknown as Document.WireSchema,
+                CommandOutcome.schema(mutation.successSchema, mutation.errorSchema),
                 outcome
               )
             })

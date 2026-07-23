@@ -27,28 +27,26 @@ import * as ReplicaGate from "./ReplicaGate.js"
 const encode = <S extends Document.WireSchema,>(schema: S, value: S["Type"]) =>
   Schema.encodeEffect(Schema.fromJsonString(Schema.toCodecJson(schema)))(value).pipe(
     Effect.map((encoded) => new TextEncoder().encode(encoded)),
-    Effect.catchTag("SchemaError", (cause) =>
-      Effect.fail(
-        new ReplicaError.ReplicaError({
-          reason: new ReplicaError.StorageCorrupt({
-            cause
-          })
+    Effect.mapError((cause) =>
+      new ReplicaError.ReplicaError({
+        reason: new ReplicaError.StorageCorrupt({
+          cause
         })
-      ))
+      })
+    )
   )
 
 const decode = <S extends Document.WireSchema,>(schema: S, bytes: Uint8Array) =>
-  Schema.decodeUnknownEffect(
+  Schema.decodeEffect(
     Schema.fromJsonString(Schema.toCodecJson(schema))
   )(new TextDecoder().decode(bytes)).pipe(
-    Effect.catchTag("SchemaError", (cause) =>
-      Effect.fail(
-        new ReplicaError.ReplicaError({
-          reason: new ReplicaError.StorageCorrupt({
-            cause
-          })
+    Effect.mapError((cause) =>
+      new ReplicaError.ReplicaError({
+        reason: new ReplicaError.StorageCorrupt({
+          cause
         })
-      ))
+      })
+    )
   )
 
 export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
@@ -153,15 +151,14 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             Effect.gen(function*() {
               const payload = options.payload as M["payloadSchema"]["Type"]
               const encoded = yield* Schema.encodeEffect(mutation.payloadSchema)(payload).pipe(
-                Effect.catchTag("SchemaError", (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.DocumentDecodeError({
-                        documentId: options.documentId,
-                        cause
-                      })
+                Effect.mapError((cause) =>
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.DocumentDecodeError({
+                      documentId: options.documentId,
+                      cause
                     })
-                  ))
+                  })
+                )
               )
               const requestHash = yield* CommandExecutor.mutationRequestHash({
                 incarnation: permit.incarnation,
@@ -189,13 +186,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   ))
               )
               yield* publisher.publishPending
-              return yield* decode(
-                CommandOutcome.schema(mutation.successSchema, mutation.errorSchema),
-                result
-              ) as Effect.Effect<
-                CommandOutcome.CommandOutcome<M["successSchema"]["Type"], M["errorSchema"]["Type"]>,
-                ReplicaError.ReplicaError
-              >
+              return yield* decode(CommandOutcome.schema(mutation.successSchema, mutation.errorSchema), result)
             })),
         delete: (document, options) =>
           withCommandPermit(options.commandId, (permit) =>
