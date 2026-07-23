@@ -41,6 +41,7 @@ export class OpenRpc extends Rpc.make("Open", {
   payload: {
     protocolVersion: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
     expectedPeerId: Identity.PeerId,
+    definitionHash: Schema.String,
     documents: Schema.Array(RequestedDocument),
     credential: Credential
   },

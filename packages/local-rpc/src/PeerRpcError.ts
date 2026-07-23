@@ -18,6 +18,10 @@ export class PeerMismatch extends Schema.TaggedErrorClass<PeerMismatch>(
   "@lucas-barake/effect-local-rpc/PeerRpcError/PeerMismatch"
 )("PeerMismatch", {}) {}
 
+export class DefinitionMismatch extends Schema.TaggedErrorClass<DefinitionMismatch>(
+  "@lucas-barake/effect-local-rpc/PeerRpcError/DefinitionMismatch"
+)("DefinitionMismatch", {}) {}
+
 export class InvalidRequest extends Schema.TaggedErrorClass<InvalidRequest>(
   "@lucas-barake/effect-local-rpc/PeerRpcError/InvalidRequest"
 )("InvalidRequest", {}) {}
@@ -47,6 +51,7 @@ export const PeerRpcError = Schema.Union([
   AccessDenied,
   UnsupportedVersion,
   PeerMismatch,
+  DefinitionMismatch,
   InvalidRequest,
   RequestLimitExceeded,
   RequestCapacityExceeded,

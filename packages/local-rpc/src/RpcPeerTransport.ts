@@ -1,6 +1,7 @@
 import * as PeerSession from "@lucas-barake/effect-local-sql/PeerSession"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
+import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -41,6 +42,7 @@ const mapError = (error: PeerRpcError.PeerRpcError | RpcClientError) => {
     case "AccessDenied":
     case "UnsupportedVersion":
     case "PeerMismatch":
+    case "DefinitionMismatch":
     case "InvalidRequest":
     case "RequestLimitExceeded":
       return protocolFailure(error._tag)
@@ -59,7 +61,10 @@ const adapterResult = (exit: Exit.Exit<unknown, ReplicaError.ReplicaError>) => {
 
 export const layer = (
   client: PeerRpc.RpcClient,
-  options: { readonly documents: ReadonlyArray<PeerSession.SelectedDocument> }
+  options: {
+    readonly documents: ReadonlyArray<PeerSession.SelectedDocument>
+    readonly definition: ReplicaDefinition.Any
+  }
 ) =>
   Layer.succeed(PeerTransport.PeerTransport, {
     capabilities: { storeAndForward: false },
@@ -108,6 +113,7 @@ export const layer = (
                 const openRequest = client.Open({
                   protocolVersion: PeerRpc.protocolVersion,
                   expectedPeerId: connectOptions.peerId,
+                  definitionHash: options.definition.hash,
                   documents: options.documents.map((entry) => ({
                     documentType: entry.document.name,
                     documentId: entry.documentId
@@ -202,8 +208,9 @@ export const makeSession = (
   options: {
     readonly peerId: Identity.PeerId
     readonly documents: ReadonlyArray<PeerSession.SelectedDocument>
+    readonly definition: ReplicaDefinition.Any
   }
 ) =>
   PeerSession.makeLive(options).pipe(
-    Effect.provide(layer(client, { documents: options.documents }))
+    Effect.provide(layer(client, { documents: options.documents, definition: options.definition }))
   )

@@ -2,6 +2,7 @@ import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher
 import * as PeerSession from "@lucas-barake/effect-local-sql/PeerSession"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
+import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Arr from "effect/Array"
@@ -138,7 +139,13 @@ const authorizationFailure = (
   return Effect.fail(new PeerRpcError.ServerUnavailable())
 }
 
-export const layerHandlers = (options: { readonly tenantId: string; readonly peerId: Identity.PeerId }) =>
+export const layerHandlers = (
+  options: {
+    readonly tenantId: string
+    readonly peerId: Identity.PeerId
+    readonly definition: ReplicaDefinition.Any
+  }
+) =>
   PeerRpc.Rpcs.toLayer(Effect.gen(function*() {
     const serverScope = yield* Scope.Scope
     const runtimeScope = yield* Scope.fork(serverScope, "parallel")
@@ -836,6 +843,7 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
         if (authenticated.principal.tenantId !== options.tenantId) return yield* new PeerRpcError.AccessDenied()
         if (request.protocolVersion !== PeerRpc.protocolVersion) return yield* new PeerRpcError.UnsupportedVersion()
         if (request.expectedPeerId !== options.peerId) return yield* new PeerRpcError.PeerMismatch()
+        if (request.definitionHash !== options.definition.hash) return yield* new PeerRpcError.DefinitionMismatch()
         if (request.documents.length === 0) return yield* new PeerRpcError.InvalidRequest()
         const requested = new Set(request.documents.map((entry) => `${entry.documentType}:${entry.documentId}`))
         if (requested.size !== request.documents.length) return yield* new PeerRpcError.InvalidRequest()
@@ -1036,6 +1044,7 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
           return "AuthorizationDenied" as const
         case "UnsupportedVersion":
         case "PeerMismatch":
+        case "DefinitionMismatch":
         case "InvalidRequest":
         case "RequestLimitExceeded":
           return "ProtocolRejected" as const

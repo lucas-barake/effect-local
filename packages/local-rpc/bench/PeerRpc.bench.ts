@@ -38,6 +38,7 @@ for (const documentCount of [1, 16, 64] as const) {
   const decoded = PeerRpc.OpenRpc.payloadSchema.make({
     protocolVersion: PeerRpc.protocolVersion,
     expectedPeerId: peerId,
+    definitionHash: "def_00000000000000000000000000000000",
     credential,
     documents: Array.from({ length: documentCount }, (_, index) => ({
       documentType: "Task",
