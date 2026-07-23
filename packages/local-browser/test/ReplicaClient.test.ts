@@ -904,4 +904,137 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.deepStrictEqual(restored, [])
     })).pipe(Effect.provide(BackupOwner))
   })
+
+  it.effect("surfaces ProtocolMismatch without replaying an in-flight restore", () => {
+    let applications = 0
+    const CountingOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provideMerge(Sessions),
+      Layer.provide(Layer.merge(
+        Publisher,
+        Layer.succeed(Replica.Replica, {
+          ...replica,
+          restoreBackup: ({ source }) =>
+            Stream.runDrain(source).pipe(Effect.tap(() => Effect.sync(() => ++applications)))
+        })
+      ))
+    )
+    return Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      let openSessions = 0
+      const faulted = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property === "OpenSession") {
+            return (payload: never) => Effect.sync(() => ++openSessions).pipe(Effect.andThen(value(payload)))
+          }
+          if (property === "RestoreBackup") {
+            return (payload: never) =>
+              openSessions === 1
+                ? value(payload).pipe(Effect.andThen(Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.ProtocolMismatch({ expected: "active session", observed: "restore" })
+                  })
+                )))
+                : value(payload)
+          }
+          return value
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, faulted)
+      const outcome = yield* client.restoreBackup({
+        source: Stream.make(Uint8Array.of(1, 2, 3)),
+        mode: "replace",
+        maxBytes: 1024,
+        expectedDefinitionHash: definition.hash,
+        installationId: Identity.BackupInstallationId.make("bak_5f0a6f45-9be2-4c7a-8f45-1d2f3a4b5c6d")
+      }).pipe(
+        Effect.as("succeeded" as string),
+        Effect.catchTag("ReplicaError", (error) => Effect.succeed(error.reason._tag))
+      )
+      assert.strictEqual(applications, 1)
+      assert.strictEqual(outcome, "ProtocolMismatch")
+      assert.strictEqual(openSessions, 2)
+    })).pipe(Effect.provide(CountingOwner))
+  })
+
+  it.effect("surfaces ProtocolMismatch without replaying an in-flight document import", () => {
+    let imports = 0
+    const CountingOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provideMerge(Sessions),
+      Layer.provide(Layer.merge(
+        Publisher,
+        Layer.succeed(Replica.Replica, {
+          ...replica,
+          importDocument: (_document, options) =>
+            Effect.sync(() => ++imports).pipe(
+              Effect.as(CommandOutcome.durablyCommitted(options.commandId, documentId))
+            )
+        })
+      ))
+    )
+    return Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      let openSessions = 0
+      const faulted = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property === "OpenSession") {
+            return (payload: never) => Effect.sync(() => ++openSessions).pipe(Effect.andThen(value(payload)))
+          }
+          if (property === "ImportDocument") {
+            return (payload: never) =>
+              openSessions === 1
+                ? value(payload).pipe(Effect.andThen(Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.ProtocolMismatch({ expected: "active session", observed: "import" })
+                  })
+                )))
+                : value(payload)
+          }
+          return value
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, faulted)
+      const commandId = yield* Identity.makeCommandId
+      const outcome = yield* client.importDocument(Task, {
+        commandId,
+        value: { documentName: Task.name, schemaVersion: Task.version, value: { title: "stored" } }
+      }).pipe(
+        Effect.map((): string => "succeeded"),
+        Effect.catchTag("ReplicaError", (error) => Effect.succeed(error.reason._tag))
+      )
+      assert.strictEqual(imports, 1)
+      assert.strictEqual(outcome, "ProtocolMismatch")
+      assert.strictEqual(openSessions, 2)
+    })).pipe(Effect.provide(CountingOwner))
+  })
+
+  it.effect("still transparently replays an idempotent operation after ProtocolMismatch", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      let openSessions = 0
+      const faulted = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property === "OpenSession") {
+            return (payload: never) => Effect.sync(() => ++openSessions).pipe(Effect.andThen(value(payload)))
+          }
+          if (property === "Get") {
+            return (payload: never) =>
+              openSessions === 1
+                ? Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.ProtocolMismatch({ expected: "active session", observed: "get" })
+                  })
+                )
+                : value(payload)
+          }
+          return value
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, faulted)
+      const snapshot = yield* client.get(Task, documentId)
+      assert.strictEqual(snapshot.value.title, "stored")
+      assert.strictEqual(openSessions, 2)
+    })).pipe(Effect.provide(Owner)))
 })
