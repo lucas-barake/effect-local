@@ -30,3 +30,45 @@ jobs:
       - run: pnpm docgen
       - run: pnpm --filter @lucas-barake/effect-local-browser exec playwright install --with-deps chromium
       - run: pnpm test:browser
+
+  supported-node:
+    strategy:
+      matrix:
+        node-version: [22.22.2, 24.15.0]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.18.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --engine-strict
+      - run: pnpm build
+      - run: pnpm test --run
+
+  unsupported-node:
+    strategy:
+      matrix:
+        node-version: [18.20.8, 20.19.5]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.18.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+      - name: Reject unsupported Node
+        run: |
+          if pnpm install --frozen-lockfile --engine-strict >node-engine.log 2>&1
+          then
+            cat node-engine.log
+            exit 1
+          fi
+          cat node-engine.log
+          grep -q "ERR_PNPM_UNSUPPORTED_ENGINE" node-engine.log

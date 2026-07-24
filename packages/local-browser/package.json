@@ -5,6 +5,9 @@
   "homepage": "https://github.com/lucas-barake/effect-local#readme",
   "bugs": "https://github.com/lucas-barake/effect-local/issues",
   "keywords": ["effect", "local-first", "effect-atom", "shared-worker", "opfs"],
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+  },
   "type": "module",
   "license": "MIT",
   "sideEffects": [],
