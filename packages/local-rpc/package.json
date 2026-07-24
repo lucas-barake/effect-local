@@ -1,10 +1,16 @@
 {
   "name": "@lucas-barake/effect-local-rpc",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Effect RPC peer synchronization for Effect Local",
   "homepage": "https://github.com/lucas-barake/effect-local#readme",
   "bugs": "https://github.com/lucas-barake/effect-local/issues",
-  "keywords": ["effect", "local-first", "rpc", "websocket", "automerge"],
+  "keywords": [
+    "effect",
+    "local-first",
+    "rpc",
+    "websocket",
+    "automerge"
+  ],
   "engines": {
     "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
   },

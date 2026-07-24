@@ -1,10 +1,16 @@
 {
   "name": "@lucas-barake/effect-local-browser",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Browser workers, RPC, and Atom integration for Effect Local",
   "homepage": "https://github.com/lucas-barake/effect-local#readme",
   "bugs": "https://github.com/lucas-barake/effect-local/issues",
-  "keywords": ["effect", "local-first", "effect-atom", "shared-worker", "opfs"],
+  "keywords": [
+    "effect",
+    "local-first",
+    "effect-atom",
+    "shared-worker",
+    "opfs"
+  ],
   "engines": {
     "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
   },
