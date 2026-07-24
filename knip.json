@@ -13,6 +13,9 @@
         "test-browser/*/public/service-worker.js"
       ],
       "ignoreDependencies": ["@effect/platform-browser"]
+    },
+    "packages/local-test": {
+      "ignoreDependencies": ["@effect/platform-node-shared"]
     }
   }
 }

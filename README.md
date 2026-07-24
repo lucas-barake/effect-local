@@ -263,7 +263,7 @@ pnpm add @lucas-barake/effect-local effect@4.0.0-beta.99 @automerge/automerge@3.
 For a durable Node replica, add the SQL engine and Node providers:
 
 ```sh
-pnpm add @lucas-barake/effect-local-sql @effect/platform-node@4.0.0-beta.99 @effect/sql-sqlite-node@4.0.0-beta.99
+pnpm add @lucas-barake/effect-local-sql @effect/platform-node@4.0.0-beta.99 @effect/platform-node-shared@4.0.0-beta.99 @effect/sql-sqlite-node@4.0.0-beta.99
 ```
 
 For live authenticated peer synchronization over Effect RPC, add the platform neutral RPC package. The application
@@ -291,7 +291,7 @@ when tests create command or peer IDs directly.
 
 ```sh
 pnpm add -D @lucas-barake/effect-local-test @effect/vitest@4.0.0-beta.99 vitest@4.1.10
-pnpm add -D @effect/platform-node@4.0.0-beta.99
+pnpm add -D @effect/platform-node@4.0.0-beta.99 @effect/platform-node-shared@4.0.0-beta.99
 ```
 
 Package roles:
