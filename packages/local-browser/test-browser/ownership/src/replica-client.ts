@@ -6,8 +6,10 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as ManagedRuntime from "effect/ManagedRuntime"
 import * as Stream from "effect/Stream"
 import { Atom } from "effect/unstable/reactivity"
+import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import { definition, ListTasks, RenameTask, SetTaskCompleted, TaskDocument, TaskList } from "./domain.ts"
 
 declare global {
@@ -30,8 +32,12 @@ const workers = new Set<{
   } | undefined
   readonly replica: SharedWorker
 }>()
+let disposed = false
 
 const WorkerLive = BrowserWorker.layer(() => {
+  if (disposed) {
+    throw new Error("Cannot start a replica worker after page teardown")
+  }
   const replica = new SharedWorker(new URL("./replica.shared-worker.ts", import.meta.url), {
     name: "effect-local-tasks",
     type: "module"
@@ -46,10 +52,34 @@ const WorkerLive = BrowserWorker.layer(() => {
     readonly replica: SharedWorker
   } = { database: undefined, provisioning: undefined, replica }
   workers.add(connection)
+  let failed = false
+  const fail = (error: Error) => {
+    if (failed || disposed) return
+    failed = true
+    window.__effectLocalOwnerError = error.message
+    rpcChannel.port2.dispatchEvent(new MessageEvent("message", { data: [0] as const }))
+    rpcChannel.port2.dispatchEvent(new ErrorEvent("error", { error, message: error.message }))
+    rpcChannel.port2.close()
+    replica.port.close()
+    connection.provisioning?.database.terminate()
+    if (connection.database !== connection.provisioning?.database) connection.database?.terminate()
+    connection.database = undefined
+    connection.provisioning = undefined
+    workers.delete(connection)
+  }
   replica.port.addEventListener("message", (event) => {
+    if (disposed) return
     const message = event.data as
       | ({ readonly _tag: "Attached" } & NonNullable<Window["__effectLocalOwnerInfo"]>)
-      | { readonly _tag: "OwnerError"; readonly message: string }
+      | {
+        readonly _tag: "OwnerError"
+        readonly message: string
+        readonly reason?: {
+          readonly _tag: "RuntimeLoadFailure"
+          readonly message: string
+          readonly name: string
+        }
+      }
       | { readonly _tag: "Ping"; readonly nonce: string }
       | { readonly _tag: "ProvisionAccepted"; readonly nonce: string }
       | { readonly _tag: "ProvisionRejected"; readonly nonce: string }
@@ -92,7 +122,7 @@ const WorkerLive = BrowserWorker.layer(() => {
       return
     }
     if (message._tag === "OwnerError") {
-      window.__effectLocalOwnerError = message.message
+      fail(new Error(message.message, { cause: message.reason }))
       return
     }
     if (!message.provider && connection.database !== undefined) {
@@ -103,7 +133,8 @@ const WorkerLive = BrowserWorker.layer(() => {
     window.__effectLocalOwnerInfo = message
   })
   replica.addEventListener("error", (event) => {
-    window.__effectLocalOwnerError = event.message
+    const error = event.error instanceof Error ? event.error : new Error(event.message)
+    fail(error)
   })
   replica.port.postMessage({
     _tag: "Attach",
@@ -113,11 +144,13 @@ const WorkerLive = BrowserWorker.layer(() => {
   return rpcChannel.port2
 })
 
-const runtime = Atom.runtime(
-  Layer.merge(
-    BrowserReplica.layerWithReactivity(definition).pipe(Layer.provide(Layer.merge(WorkerLive, BrowserCrypto.layer))),
-    BrowserCrypto.layer
-  )
+const ReplicaLive = Layer.merge(
+  BrowserReplica.layerWithReactivity(definition).pipe(Layer.provide(Layer.merge(WorkerLive, BrowserCrypto.layer))),
+  BrowserCrypto.layer
+).pipe(Layer.provideMerge(Reactivity.layer))
+const replicaRuntime = ManagedRuntime.make(ReplicaLive)
+const runtime = Atom.context({ memoMap: replicaRuntime.memoMap })(
+  Layer.effectContext(replicaRuntime.contextEffect)
 )
 
 export const tasks = ReplicaAtom.queryFamily(runtime, ListTasks)
@@ -203,9 +236,12 @@ export const restoreBackup = runtime.fn<Uint8Array>()(
 )
 
 export const dispose = () => {
+  disposed = true
+  const disposing = replicaRuntime.dispose()
   for (const worker of workers) {
     worker.database?.terminate()
     worker.replica.port.close()
   }
   workers.clear()
+  return disposing
 }
