@@ -263,7 +263,7 @@ pnpm add @lucas-barake/effect-local effect@4.0.0-beta.99 @automerge/automerge@3.
 For a durable Node replica, add the SQL engine and Node providers:
 
 ```sh
-pnpm add @lucas-barake/effect-local-sql @effect/platform-node@4.0.0-beta.99 @effect/sql-sqlite-node@4.0.0-beta.99
+pnpm add @lucas-barake/effect-local-sql @effect/platform-node@4.0.0-beta.99 @effect/platform-node-shared@4.0.0-beta.99 @effect/sql-sqlite-node@4.0.0-beta.99
 ```
 
 For live authenticated peer synchronization over Effect RPC, add the platform neutral RPC package. The application
@@ -277,7 +277,7 @@ For a durable browser replica, add the SQL and browser packages plus the OPFS dr
 
 ```sh
 pnpm add @lucas-barake/effect-local-sql @lucas-barake/effect-local-browser
-pnpm add @effect/platform-browser@4.0.0-beta.99 @effect/sql-sqlite-wasm@4.0.0-beta.99 @effect/wa-sqlite@0.2.1
+pnpm add @effect/platform-browser@4.0.0-beta.99 @effect/sql-sqlite-wasm@4.0.0-beta.99 @effect/wa-sqlite@0.1.2
 ```
 
 Effect Atom React bindings are optional:
@@ -291,7 +291,7 @@ when tests create command or peer IDs directly.
 
 ```sh
 pnpm add -D @lucas-barake/effect-local-test @effect/vitest@4.0.0-beta.99 vitest@4.1.10
-pnpm add -D @effect/platform-node@4.0.0-beta.99
+pnpm add -D @effect/platform-node@4.0.0-beta.99 @effect/platform-node-shared@4.0.0-beta.99
 ```
 
 Package roles:
