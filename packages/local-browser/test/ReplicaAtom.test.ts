@@ -87,20 +87,38 @@ describe("ReplicaAtom", () => {
       registry.dispose()
     }))
 
-  it.effect("streams replica status through status atoms", () =>
+  it.effect("streams degraded and recovered replica status through status atoms", () =>
     Effect.gen(function*() {
-      const consumed = yield* Deferred.make<void>()
+      const degradedConsumed = yield* Deferred.make<void>()
+      const readyConsumed = yield* Deferred.make<void>()
+      const recover = yield* Deferred.make<void>()
+      const degraded = { _tag: "Degraded" as const, reason: "StorageUnavailable" as const }
       const ready = { _tag: "Ready" as const, pendingCommands: 2 }
       const atomRuntime = Atom.runtime(Layer.succeed(Replica.Replica, {
         ...replica,
-        status: Stream.make(ready).pipe(
-          Stream.tap(() => Deferred.succeed(consumed, undefined))
+        status: Stream.make(degraded).pipe(
+          Stream.tap(() => Deferred.succeed(degradedConsumed, undefined)),
+          Stream.concat(
+            Stream.fromEffect(
+              Deferred.await(recover).pipe(
+                Effect.as(ready),
+                Effect.tap(() => Deferred.succeed(readyConsumed, undefined))
+              )
+            )
+          )
         )
       }))
       const registry = AtomRegistry.make()
       const atom = ReplicaAtom.status(atomRuntime)
       const unmount = registry.mount(atom)
-      yield* Deferred.await(consumed)
+      yield* Deferred.await(degradedConsumed)
+      yield* Effect.yieldNow
+      yield* Effect.yieldNow
+      const degradedValue = registry.get(atom)
+      assert.isTrue(AsyncResult.isSuccess(degradedValue))
+      if (AsyncResult.isSuccess(degradedValue)) assert.deepStrictEqual(degradedValue.value, degraded)
+      yield* Deferred.succeed(recover, undefined)
+      yield* Deferred.await(readyConsumed)
       yield* Effect.yieldNow
       yield* Effect.yieldNow
       const value = registry.get(atom)

@@ -79,6 +79,41 @@ test("keeps local writes available while browser networking is offline", async (
   await expect(page.getByText(title, { exact: true })).toBeVisible()
 })
 
+test("shows degraded status when the replica transport is lost", async ({ page }) => {
+  await page.addInitScript(() => {
+    const addEventListener = MessagePort.prototype.addEventListener
+    MessagePort.prototype.addEventListener = function(type, listener, options) {
+      if (type !== "message" || typeof listener !== "function") {
+        return addEventListener.call(this, type, listener, options)
+      }
+      return addEventListener.call(this, type, function(this: MessagePort, event: MessageEvent) {
+        const result = listener.call(this, event)
+        const body = Array.isArray(event.data) ? event.data[1] : undefined
+        const state = globalThis as typeof globalThis & { __effectLocalStatusTransportFailed?: boolean }
+        if (
+          state.__effectLocalStatusTransportFailed !== true &&
+          body?._tag === "Chunk" &&
+          body.values?.some((value: { readonly _tag?: string }) => value?._tag === "Ready")
+        ) {
+          state.__effectLocalStatusTransportFailed = true
+          queueMicrotask(() => {
+            this.dispatchEvent(new ErrorEvent("error", { message: "forced transport loss" }))
+          })
+        }
+        return result
+      }, options)
+    } as typeof MessagePort.prototype.addEventListener
+  })
+  await page.goto("/")
+  await expect.poll(() =>
+    page.evaluate(() =>
+      (globalThis as typeof globalThis & { __effectLocalStatusTransportFailed?: boolean })
+        .__effectLocalStatusTransportFailed
+    )
+  ).toBe(true)
+  await expect(page.getByText("Local replica degraded: StorageUnavailable")).toBeVisible({ timeout: 20_000 })
+})
+
 test("does not persist arbitrary same origin responses in the offline shell cache", async ({ context, page }) => {
   const privateUrl = `/private-api-${crypto.randomUUID()}`
   await page.goto("/")

@@ -4,12 +4,14 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as PubSub from "effect/PubSub"
 import * as Ref from "effect/Ref"
 import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
@@ -17,7 +19,7 @@ import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
 import { RpcClient } from "effect/unstable/rpc"
-import type * as RpcClientError from "effect/unstable/rpc/RpcClientError"
+import * as RpcClientError from "effect/unstable/rpc/RpcClientError"
 import * as Wire from "./internal/wire.js"
 import * as ReplicaRpc from "./ReplicaRpc.js"
 
@@ -32,6 +34,31 @@ export class ReplicaClient extends Context.Service<
 ) {}
 
 const isTransient = (error: ReplicaError.ReplicaError) => error.reason._tag === "StorageUnavailable"
+
+const isTransientRpcClientError = (error: RpcClientError.RpcClientError) => {
+  switch (error.reason._tag) {
+    case "WorkerSpawnError":
+    case "WorkerSendError":
+    case "WorkerReceiveError":
+    case "WorkerUnknownError":
+    case "SocketReadError":
+    case "SocketWriteError":
+    case "SocketOpenError":
+    case "SocketCloseError":
+      return true
+    case "HttpError":
+      return error.reason.kind === "TransportError"
+    case "RpcClientDefect":
+      return false
+  }
+}
+
+const isTransientStatus = (error: ReplicaError.ReplicaError) => {
+  if (error.reason._tag === "QuotaExceeded") return error.reason.resource === "queued RPCs"
+  if (error.reason._tag !== "StorageUnavailable") return false
+  return !Schema.is(RpcClientError.RpcClientError)(error.reason.cause) ||
+    isTransientRpcClientError(error.reason.cause)
+}
 
 const recoverCommand = <A,>(
   commandId: Identity.CommandId,
@@ -97,39 +124,80 @@ export const fromRpcClient = (
           Effect.flatMap((session) => Effect.ignore(rpc.CloseSession({ sessionId: session.sessionId })))
         )
     )
-    const reopen = (stale: Effect.Success<ReturnType<typeof openSession>>) =>
-      Effect.uninterruptibleMask((restore) =>
-        SubscriptionRef.modifySomeEffect(sessions, (current) =>
-          current.sessionId !== stale.sessionId
-            ? Effect.succeed(
-              [
-                { session: current, stale: Option.none() },
-                Option.none()
-              ]
+    type Session = Effect.Success<ReturnType<typeof openSession>>
+    type PendingStreamMismatch = {
+      readonly stale: Session
+      readonly error: ReplicaError.ReplicaError
+    }
+    const reopenAttempt = (
+      stale: Session,
+      replacement: Effect.Effect<Session, ReplicaError.ReplicaError>
+    ) =>
+      sessions.semaphore.withPermit(
+        Effect.uninterruptibleMask((restore) =>
+          Effect.suspend(() => {
+            const current = sessions.value
+            if (current.sessionId !== stale.sessionId) return Effect.succeed(current)
+            return restore(replacement).pipe(
+              Effect.tap((next) =>
+                Effect.sync(() => {
+                  sessions.value = next
+                  PubSub.publishUnsafe(sessions.pubsub, next)
+                })
+              ),
+              Effect.tap(() => Effect.ignore(rpc.CloseSession({ sessionId: current.sessionId })))
             )
-            : restore(
-              makeSessionId.pipe(
-                Effect.flatMap((sessionId) =>
-                  openSession(sessionId).pipe(
-                    Effect.retry({ schedule: Schedule.spaced("1 second"), while: isTransient })
+          })
+        )
+      )
+    const replacementCandidate = yield* Ref.make<
+      Option.Option<{
+        readonly staleSessionId: Identity.SessionId
+        readonly candidateSessionId: Identity.SessionId
+      }>
+    >(Option.none())
+    const replace = (stale: Session, retryTransient: boolean) =>
+      reopenAttempt(
+        stale,
+        Ref.get(replacementCandidate).pipe(
+          Effect.flatMap((candidate) =>
+            Option.isSome(candidate) && candidate.value.staleSessionId === stale.sessionId
+              ? Effect.succeed(candidate.value.candidateSessionId)
+              : makeSessionId.pipe(
+                Effect.tap((candidateSessionId) =>
+                  Ref.set(
+                    replacementCandidate,
+                    Option.some({
+                      staleSessionId: stale.sessionId,
+                      candidateSessionId
+                    })
                   )
                 )
               )
-            ).pipe(
-              Effect.map((next) => [{ session: next, stale: Option.some(current) }, Option.some(next)])
-            )).pipe(
-            Effect.tap(({ stale }) =>
-              Option.match(stale, {
-                onNone: () => Effect.void,
-                onSome: (stale) => Effect.ignore(rpc.CloseSession({ sessionId: stale.sessionId }))
-              })
-            ),
-            Effect.map(({ session }) => session)
+          ),
+          Effect.flatMap((sessionId) => {
+            const attempt = openSession(sessionId)
+            return retryTransient
+              ? attempt.pipe(Effect.retry({ schedule: Schedule.spaced("1 second"), while: isTransient }))
+              : attempt
+          })
+        )
+      ).pipe(
+        Effect.tap(() =>
+          Ref.update(
+            replacementCandidate,
+            (candidate) =>
+              Option.isSome(candidate) && candidate.value.staleSessionId === stale.sessionId
+                ? Option.none()
+                : candidate
           )
+        )
       )
+    const reopen = (stale: Session) => replace(stale, true)
+    const reopenStatus = (stale: Session) => replace(stale, false)
     const withSession = <A, E, R,>(
       use: (
-        session: Effect.Success<ReturnType<typeof openSession>>
+        session: Session
       ) => Effect.Effect<A, E | ReplicaError.ReplicaError, R>
     ) =>
       SubscriptionRef.get(sessions).pipe(
@@ -144,19 +212,43 @@ export const fromRpcClient = (
       )
     const withSessionStream = <A, E, R,>(
       use: (
-        session: Effect.Success<ReturnType<typeof openSession>>
-      ) => Stream.Stream<A, E | ReplicaError.ReplicaError, R>
+        session: Session
+      ) => Stream.Stream<A, E | ReplicaError.ReplicaError, R>,
+      replace: (stale: Session) => Effect.Effect<Session, ReplicaError.ReplicaError> = reopen,
+      emittedRef?: Ref.Ref<boolean>,
+      pendingMismatchRef?: Ref.Ref<Option.Option<PendingStreamMismatch>>
     ) =>
       Stream.unwrap(Effect.gen(function*() {
         const session = yield* SubscriptionRef.get(sessions)
-        const emitted = yield* Ref.make(false)
-        return use(session).pipe(
-          Stream.tap(() => Ref.set(emitted, true)),
+        const emitted = emittedRef === undefined ? yield* Ref.make(false) : emittedRef
+        if (pendingMismatchRef !== undefined) {
+          const pending = yield* Ref.get(pendingMismatchRef)
+          if (Option.isSome(pending)) {
+            return Stream.unwrap(
+              replace(pending.value.stale).pipe(
+                Effect.andThen(Ref.set(pendingMismatchRef, Option.none())),
+                Effect.as(Stream.fail(pending.value.error))
+              )
+            )
+          }
+        }
+        const tracked = (session: Session) => use(session).pipe(Stream.tap(() => Ref.set(emitted, true)))
+        return tracked(session).pipe(
           Stream.catchTag("ReplicaError", (error) =>
             Schema.is(ReplicaError.ReplicaError)(error) && error.reason._tag === "ProtocolMismatch"
               ? Stream.unwrap(Effect.gen(function*() {
-                const next = yield* reopen(session)
-                return (yield* Ref.get(emitted)) ? Stream.fail(error) : use(next)
+                const hasEmitted = yield* Ref.get(emitted)
+                if (hasEmitted && pendingMismatchRef !== undefined) {
+                  yield* Ref.set(pendingMismatchRef, Option.some({ stale: session, error }))
+                }
+                const next = yield* replace(session)
+                if (!hasEmitted) {
+                  return tracked(next)
+                }
+                if (pendingMismatchRef !== undefined) {
+                  yield* Ref.set(pendingMismatchRef, Option.none())
+                }
+                return Stream.fail(error)
               }))
               : Stream.fail(error))
         )
@@ -447,15 +539,36 @@ export const fromRpcClient = (
             })
           ))
       ),
-      status: withSessionStream((session) => rpc.Status({ sessionId: session.sessionId })).pipe(
-        Stream.catchTag("RpcClientError", (error) =>
-          Stream.fail(
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.StorageUnavailable({
-                cause: error
-              })
-            })
-          ))
+      status: Stream.unwrap(
+        Effect.gen(function*() {
+          const emitted = yield* Ref.make(false)
+          const pendingMismatch = yield* Ref.make<Option.Option<PendingStreamMismatch>>(Option.none())
+          return withSessionStream(
+            (session) => rpc.Status({ sessionId: session.sessionId }),
+            reopenStatus,
+            emitted,
+            pendingMismatch
+          ).pipe(
+            Stream.catchTag("RpcClientError", (error) =>
+              Stream.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause: error
+                  })
+                })
+              )),
+            Stream.catchIf(isTransientStatus, (error) => {
+              const degraded: ReplicaStatus.ReplicaStatus = { _tag: "Degraded", reason: error.reason._tag }
+              return Stream.make(degraded).pipe(Stream.concat(Stream.fail(error)))
+            }),
+            Stream.retry(
+              Schedule.spaced("1 second").pipe(
+                Schedule.setInputType<ReplicaError.ReplicaError>(),
+                Schedule.while(({ input }) => isTransientStatus(input))
+              )
+            )
+          )
+        })
       ),
       exportBackup: ({ maxBytes }) =>
         withSessionStream((session) => rpc.ExportBackup({ sessionId: session.sessionId, maxBytes })).pipe(
