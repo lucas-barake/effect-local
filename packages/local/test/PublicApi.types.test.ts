@@ -1,6 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Schema from "effect/Schema"
-import { Document, DocumentSet, Mutation, Query } from "../src/index.js"
+import { Document, DocumentSet, Mutation, Query, SchemaDescriptor } from "../src/index.js"
 
 type Equal<A, B,> = (<T,>() => T extends A ? 1 : 2) extends <T,>() => T extends B ? 1 : 2 ? true : false
 
@@ -81,5 +81,10 @@ describe("public API types", () => {
     const dynamicLookup: Equal<typeof dynamic, typeof Task | typeof Note | undefined> = true
     assert.isTrue(literalLookup)
     assert.isTrue(dynamicLookup)
+  })
+
+  it("exports the schema descriptor contract", () => {
+    const descriptor: SchemaDescriptor.Descriptor = SchemaDescriptor.make(Schema.String)
+    assert.isDefined(descriptor)
   })
 })

@@ -100,7 +100,11 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
             Effect.catchTag(["SqlError", "MigrationError"], (cause) =>
               Effect.fail(toProjectionBlocked(binding.projection.name)(cause)))
           )
-          const checksum = yield* Canonical.digest(SchemaDescriptor.make(binding.projection.Row)).pipe(
+          const checksum = yield* Canonical.digest(
+            SchemaDescriptor.make(Schema.toType(binding.projection.Row), {
+              includeConstructorDefaults: false
+            })
+          ).pipe(
             Effect.provideService(Crypto.Crypto, crypto)
           )
           const registry = yield* findRegistry(binding.projection.name).pipe(

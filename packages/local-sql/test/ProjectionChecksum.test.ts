@@ -67,31 +67,116 @@ describe("ProjectionStore checksum", () => {
       Effect.asVoid
     )
 
-  it.effect("keeps projection data when only documentation annotations change", () => {
+  const seedProjectionState = Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    yield* sql`INSERT INTO effect_local_documents (
+      document_id, document_type, schema_version, observed_versions,
+      materialized_heads, accepted_heads, tombstone, projection_status, checkpoint_hash
+    ) VALUES ('doc-1', 'Task', 1, '[1]', '["head"]', '["head"]', 0, 'Ready', NULL)`
+    yield* sql`INSERT INTO labels_checksum (source_document_id, label) VALUES ('doc-1', 'seed')`
+    yield* sql`INSERT INTO effect_local_document_projections (
+      document_id, projection_name, projected_heads, status
+    ) VALUES ('doc-1', 'Labels', '["head"]', 'Ready')`
+  })
+
+  const readProjectionState = Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    const rows = yield* sql<{ readonly label: string }>`SELECT label FROM labels_checksum ORDER BY label`
+    const documents = yield* sql<{ readonly count: number }>`
+      SELECT COUNT(*) AS count FROM effect_local_document_projections
+      WHERE projection_name = 'Labels'
+    `
+    const registry = yield* sql<{
+      readonly schema_checksum: string
+      readonly status: string
+      readonly table_name: string
+      readonly projection_version: number
+    }>`SELECT schema_checksum, status, table_name, projection_version
+      FROM effect_local_projection_registry WHERE projection_name = 'Labels'`
+    return {
+      rows,
+      documentProjectionCount: documents[0]?.count,
+      registry: registry[0]
+    }
+  })
+
+  it.effect("keeps all projection state when only documentation annotations change", () => {
     const plain = makeBinding(Schema.String)
     const documented = makeBinding(Schema.String.pipe(Schema.annotate({ description: "The label" })))
 
     return Effect.gen(function*() {
       yield* bootstrapStore(plain)
-      const sql = yield* SqlClient.SqlClient
-      yield* sql`INSERT INTO labels_checksum (source_document_id, label) VALUES ('doc-1', 'keep')`
+      yield* seedProjectionState
+      const before = yield* readProjectionState
       yield* bootstrapStore(documented)
-      const rows = yield* sql<{ readonly label: string }>`SELECT label FROM labels_checksum`
-      assert.strictEqual(rows.length, 1)
+      const after = yield* readProjectionState
+      assert.deepStrictEqual(after, before)
+      assert.deepStrictEqual(after.rows, [{ label: "seed" }])
+      assert.strictEqual(after.documentProjectionCount, 1)
+      assert.strictEqual(after.registry?.status, "Ready")
     }).pipe(Effect.provide(Base))
   })
 
-  it.effect("invalidates projection data when the row codec changes", () => {
+  it.effect("invalidates all projection state when the row type changes", () => {
     const plain = makeBinding(Schema.String)
     const codec = makeBinding(Schema.NumberFromString)
 
     return Effect.gen(function*() {
       yield* bootstrapStore(plain)
-      const sql = yield* SqlClient.SqlClient
-      yield* sql`INSERT INTO labels_checksum (source_document_id, label) VALUES ('doc-1', 'stale')`
+      yield* seedProjectionState
+      const before = yield* readProjectionState
       yield* bootstrapStore(codec)
-      const rows = yield* sql<{ readonly label: string }>`SELECT label FROM labels_checksum`
-      assert.strictEqual(rows.length, 0)
+      const after = yield* readProjectionState
+      assert.deepStrictEqual(after.rows, [])
+      assert.strictEqual(after.documentProjectionCount, 0)
+      assert.notStrictEqual(after.registry?.schema_checksum, before.registry?.schema_checksum)
+      assert.strictEqual(after.registry?.status, "Rebuilding")
+      assert.strictEqual(after.registry?.table_name, "labels_checksum")
+      assert.strictEqual(after.registry?.projection_version, 1)
+    }).pipe(Effect.provide(Base))
+  })
+
+  it.effect("keeps projection state when only the row encoding changes", () => {
+    const base64 = makeBinding(Schema.StringFromBase64)
+    const hex = makeBinding(Schema.StringFromHex)
+
+    return Effect.gen(function*() {
+      yield* bootstrapStore(base64)
+      yield* seedProjectionState
+      const before = yield* readProjectionState
+      yield* bootstrapStore(hex)
+      assert.deepStrictEqual(yield* readProjectionState, before)
+    }).pipe(Effect.provide(Base))
+  })
+
+  it.effect("keeps projection state when only constructor behavior changes", () => {
+    const plain = makeBinding(Schema.Literal("seed"))
+    const defaulted = makeBinding(Schema.tagDefaultOmit("seed"))
+
+    return Effect.gen(function*() {
+      yield* bootstrapStore(plain)
+      yield* seedProjectionState
+      const before = yield* readProjectionState
+      yield* bootstrapStore(defaulted)
+      assert.deepStrictEqual(yield* readProjectionState, before)
+    }).pipe(Effect.provide(Base))
+  })
+
+  it.effect("rolls back checksum invalidation when registry reconciliation fails", () => {
+    const plain = makeBinding(Schema.String)
+    const codec = makeBinding(Schema.NumberFromString)
+
+    return Effect.gen(function*() {
+      yield* bootstrapStore(plain)
+      yield* seedProjectionState
+      const before = yield* readProjectionState
+      const sql = yield* SqlClient.SqlClient
+      yield* sql`CREATE TRIGGER reject_checksum_update
+        BEFORE UPDATE OF schema_checksum ON effect_local_projection_registry
+        BEGIN SELECT RAISE(ABORT, 'blocked'); END`
+      const exit = yield* Effect.exit(bootstrapStore(codec))
+      assert.strictEqual(exit._tag, "Failure")
+      assert.deepStrictEqual(yield* readProjectionState, before)
     }).pipe(Effect.provide(Base))
   })
 })
