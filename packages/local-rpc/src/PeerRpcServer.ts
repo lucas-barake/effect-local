@@ -902,15 +902,15 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
               }
             }))
             return yield* Effect.gen(function*() {
+              // Per-branch so revocation is not gated on the race awaiting the losing monitors' finalizers.
+              const revokeOnInvalidation = revoke(entry, new PeerRpcError.SessionUnavailable(), true, true)
               const leaseWatcher = Effect.raceAllFirst([
                 authenticated.invalidated,
                 authorized.invalidated,
                 Effect.sleep(Duration.millis(Math.max(0, authenticated.validUntil - now))),
                 Effect.sleep(Duration.millis(Math.max(0, authorized.validUntil - now))),
                 Effect.sleep(Duration.millis(limits.maximumReauthorizationInterval))
-              ]).pipe(
-                Effect.ensuring(revoke(entry, new PeerRpcError.SessionUnavailable(), true, true))
-              )
+              ].map((trigger) => trigger.pipe(Effect.ensuring(revokeOnInvalidation))))
               entry.watcher = yield* Effect.forkIn(leaseWatcher, runtimeScope, { startImmediately: true })
               const registered = yield* register(entry)
               if (registered._tag !== "Registered") {
