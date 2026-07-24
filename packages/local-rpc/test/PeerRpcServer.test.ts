@@ -588,6 +588,28 @@ describe("PeerRpcServer", () => {
       yield* Fiber.interrupt(first.fiber)
     })))
 
+  it.effect("does not consume Open admission for a cross type duplicate document id", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const fixture = yield* makeFixture({
+        ...baseOptions,
+        manualClock: true,
+        rpcLimits: { openRatePerSecond: Number.MIN_VALUE, openBurst: 1 }
+      })
+      const malformedError = yield* fixture.client.Open({
+        protocolVersion: PeerRpc.protocolVersion,
+        expectedPeerId: serverPeerId,
+        documents: [
+          { documentType: Task.name, documentId: taskId },
+          { documentType: Note.name, documentId: taskId }
+        ]
+      }).pipe(Stream.runDrain, Effect.flip)
+      assert.instanceOf(malformedError, PeerRpcError.InvalidRequest)
+
+      const valid = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
+      assert.strictEqual(yield* Ref.get(fixture.authorizationCalls), 1)
+      yield* Fiber.interrupt(valid.fiber)
+    })))
+
   it.effect("enforces the global session limit", () =>
     Effect.scoped(Effect.gen(function*() {
       const fixture = yield* makeFixture({ ...baseOptions, replicaLimits: { maxSessions: 1 } })
