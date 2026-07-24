@@ -130,11 +130,21 @@ describe("DurableRuntime", () => {
 
   it.effect("registers the replica compaction workflow", () =>
     Effect.gen(function*() {
-      const result = yield* Effect.exit(ReplicaWorkflow.CompactReplica.execute({
+      const sharding = yield* Sharding.Sharding
+      const executionId = yield* ReplicaWorkflow.CompactReplica.execute({
         replicaIncarnation: Identity.ReplicaIncarnation.make(0),
         operationId: ReplicaWorkflow.OperationId.make("compact")
-      }))
-      assert.strictEqual(result._tag, "Success")
+      }, { discard: true })
+      for (let round = 0; round < 4; round++) {
+        yield* sharding.pollStorage
+        yield* TestClock.adjust(5_000)
+      }
+      const result = yield* ReplicaWorkflow.CompactReplica.poll(executionId)
+      assert.isTrue(Option.isSome(result))
+      if (Option.isSome(result)) {
+        assert.strictEqual(result.value._tag, "Complete")
+        if (result.value._tag === "Complete") assert.isTrue(Exit.isSuccess(result.value.exit))
+      }
     }).pipe(Effect.provide(Live)))
 
   it.effect("executes and polls an incarnation-scoped compaction operation", () =>
