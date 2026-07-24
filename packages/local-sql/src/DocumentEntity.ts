@@ -16,6 +16,7 @@ import * as Entity from "effect/unstable/cluster/Entity"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
 import * as Rpc from "effect/unstable/rpc/Rpc"
 import * as CommandExecutor from "./CommandExecutor.js"
+import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as PeerSync from "./PeerSync.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
@@ -39,13 +40,15 @@ const syncPrimaryKey = (payload: {
   readonly connectionEpoch: string
   readonly receiveSequence: number
   readonly messageHash: string
+  readonly writerProvenance: ReadonlyArray<WriterProvenance.ChangeProvenance>
 }) =>
   JSON.stringify([
     payload.replicaIncarnation,
     payload.peerId,
     payload.connectionEpoch,
     payload.receiveSequence,
-    payload.messageHash
+    payload.messageHash,
+    WriterProvenance.canonicalize(payload.writerProvenance)
   ])
 
 export const Create = Rpc.make("Create", {
@@ -103,8 +106,7 @@ export const ApplySync = Rpc.make("ApplySync", {
     documentType: Schema.String,
     messageHash: Schema.String,
     message: Schema.Uint8ArrayFromBase64,
-    writerSchemaVersion: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
-    writerDefinitionHash: Schema.NonEmptyString.check(Schema.isMaxLength(256))
+    writerProvenance: WriterProvenance.ChangeProvenances
   },
   success: ApplySyncResult,
   error: ReplicaError.ReplicaError,
@@ -299,8 +301,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   remoteConnectionEpoch: request.payload.connectionEpoch,
                   receiveSequence: request.payload.receiveSequence,
                   message: request.payload.message,
-                  writerSchemaVersion: request.payload.writerSchemaVersion,
-                  writerDefinitionHash: request.payload.writerDefinitionHash
+                  writerProvenance: request.payload.writerProvenance
                 }
               )
             })

@@ -114,6 +114,9 @@ describe("BackupStore", () => {
   const Limits = ReplicaLimits.layer(limits)
   const Backup = BackupStore.layer(definition).pipe(Layer.provide(Layer.mergeAll(Base, Gate, Limits, Projections)))
   const Live = Layer.mergeAll(Base, Gate, Store, Limits, Projections, Backup)
+  const RecoveryService = Recovery.layer.pipe(Layer.provide(Live))
+  const CompactionService = Compaction.layer.pipe(Layer.provide(Layer.merge(Live, RecoveryService)))
+  const CompactedLive = Layer.mergeAll(Live, RecoveryService, CompactionService)
   const ProjectedBootstrap = ReplicaBootstrap.layer(projectedDefinition).pipe(Layer.provide(Database))
   const ProjectedBase = Layer.merge(Database, ProjectedBootstrap)
   const ProjectedGate = ReplicaGate.layer.pipe(Layer.provide(ProjectedBase))
@@ -150,8 +153,12 @@ describe("BackupStore", () => {
     Effect.gen(function*() {
       const backups = yield* BackupStore.BackupStore
       const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
       const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "before" })
+      yield* sql`UPDATE effect_local_changes
+        SET writer_schema_version = 7, writer_definition_hash = 'historical-definition'
+        WHERE document_id = ${documentId}`
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
       const staged = yield* store.stage(created, (draft) => {
         draft.title = "after"
@@ -170,8 +177,155 @@ describe("BackupStore", () => {
       const restored = yield* store.load(Task, documentId)
       assert.strictEqual(restored.snapshot.value.title, "before")
       assert.strictEqual(restored.snapshot.projection, "Ready")
+      assert.deepStrictEqual(
+        yield* sql<{
+          readonly writer_definition_hash: string
+          readonly writer_schema_version: number
+        }>`SELECT writer_definition_hash, writer_schema_version
+          FROM effect_local_changes
+          WHERE document_id = ${documentId}`,
+        [{ writer_definition_hash: "historical-definition", writer_schema_version: 7 }]
+      )
       InternalAutomerge.free(restored.automerge)
     }).pipe(Effect.provide(Live)))
+
+  it.effect("retains checkpoint writer provenance after pruned history is restored", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one" })
+      yield* sql`UPDATE effect_local_changes
+        SET writer_schema_version = 7, writer_definition_hash = 'historical-definition'
+        WHERE document_id = ${documentId}`
+      yield* compaction.compact(Task, documentId)
+      const staged = yield* store.stage(created, (draft) => {
+        draft.title = "two"
+      })
+      const persisted = yield* store.persist(Task, documentId, created, staged)
+      const latest = yield* compaction.compact(Task, documentId)
+      assert.strictEqual(yield* compaction.prune(documentId), 1)
+
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.fromIterable(chunks),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      })
+
+      const checkpoints = yield* sql<{ readonly writer_provenance: string }>`
+        SELECT writer_provenance FROM effect_local_checkpoints
+        WHERE checkpoint_hash = ${latest.checkpoint.checkpointHash}
+      `
+      assert.deepStrictEqual(
+        Schema.decodeSync(Schema.fromJsonString(Schema.Unknown))(checkpoints[0]!.writer_provenance),
+        latest.checkpoint.writerProvenance
+      )
+      assert.isTrue(latest.checkpoint.writerProvenance.some((entry) =>
+        entry.writerSchemaVersion === 7 && entry.writerDefinitionHash === "historical-definition"
+      ))
+      const restored = yield* store.load(Task, documentId)
+      assert.strictEqual(restored.snapshot.value.title, "two")
+
+      InternalAutomerge.free(restored.automerge)
+      InternalAutomerge.free(persisted.automerge)
+      InternalAutomerge.free(staged)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(CompactedLive)))
+
+  it.effect("restores legacy format one checkpoints without explicit writer provenance", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "legacy" })
+      yield* compaction.compact(Task, documentId)
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      const lines = new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n")
+        .map((line) => JSON.parse(line))
+      const checkpoint = lines.find((line) => line.kind === "Checkpoint")!
+      delete checkpoint.value.writer_provenance
+      checkpoint.checksum = yield* Canonical.digest(checkpoint.value)
+      const change = lines.find((line) => line.kind === "Change")!
+      change.value.writer_definition_hash = "local"
+      change.checksum = yield* Canonical.digest(change.value)
+      const end = lines.at(-1)!
+      end.value.recordsChecksum = yield* Canonical.digest(lines.slice(1, -1).map((line) => line.checksum))
+      end.checksum = yield* Canonical.digest(end.value)
+      const manifest = lines[0]!
+      for (let attempt = 0; attempt < 8; attempt++) {
+        manifest.checksum = yield* Canonical.digest(manifest.value)
+        const encoded = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+        if (manifest.value.declaredBytes === encoded.byteLength) break
+        manifest.value.declaredBytes = encoded.byteLength
+      }
+      manifest.checksum = yield* Canonical.digest(manifest.value)
+      const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+
+      yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.make(archive),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      })
+      const restored = yield* store.load(Task, documentId)
+      assert.strictEqual(restored.snapshot.value.title, "legacy")
+      const provenance = yield* sql<{ readonly writer_definition_hash: string }>`
+        SELECT writer_definition_hash FROM effect_local_changes WHERE document_id = ${documentId}
+      `
+      assert.deepStrictEqual(provenance, [{ writer_definition_hash: definition.hash }])
+      const restoredCheckpoints = yield* sql<{ readonly writer_provenance: string }>`
+        SELECT writer_provenance FROM effect_local_checkpoints WHERE document_id = ${documentId}
+      `
+      assert.deepStrictEqual(JSON.parse(restoredCheckpoints[0]!.writer_provenance), [{
+        changeHash: change.value.change_hash,
+        writerDefinitionHash: definition.hash,
+        writerSchemaVersion: change.value.writer_schema_version
+      }])
+      InternalAutomerge.free(restored.automerge)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(CompactedLive)))
+
+  it.effect("rejects checkpoint and change provenance conflicts during restore", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "preserved" })
+      yield* compaction.compact(Task, documentId)
+      yield* sql`UPDATE effect_local_changes
+        SET writer_definition_hash = 'conflicting-definition'
+        WHERE document_id = ${documentId}`
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      yield* sql`UPDATE effect_local_changes
+        SET writer_definition_hash = ${definition.hash}
+        WHERE document_id = ${documentId}`
+
+      const restored = yield* Effect.result(backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.fromIterable(chunks),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      }))
+      assert.isTrue(Result.isFailure(restored))
+      if (Result.isFailure(restored)) {
+        assert.strictEqual(restored.failure.reason._tag, "BackupInvalid")
+      }
+      const preserved = yield* store.load(Task, documentId)
+      assert.strictEqual(preserved.snapshot.value.title, "preserved")
+      InternalAutomerge.free(preserved.automerge)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(CompactedLive)))
 
   it.effect("rebuilds registered projections from restored canonical documents", () =>
     Effect.gen(function*() {

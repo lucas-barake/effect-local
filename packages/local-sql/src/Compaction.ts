@@ -13,6 +13,7 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as Recovery from "./Recovery.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
@@ -24,6 +25,7 @@ export interface PreparedCheckpoint {
   readonly documentId: Identity.DocumentId
   readonly documentType: string
   readonly heads: ReadonlyArray<string>
+  readonly writerProvenance: ReadonlyArray<WriterProvenance.ChangeProvenance>
 }
 
 export interface CompactResult {
@@ -38,10 +40,21 @@ const CheckpointRow = Schema.Struct({
   checkpoint_hash: Schema.String,
   checksum: Schema.String,
   commit_sequence: Identity.CommitSequence,
-  heads: Heads
+  heads: Heads,
+  writer_provenance: WriterProvenance.StoredChangeProvenances
 })
 
 const ChangeHashRow = Schema.Struct({ change_hash: Schema.String })
+const AppliedChangeRow = Schema.Struct({
+  change_hash: WriterProvenance.ChangeHash,
+  writer_definition_hash: WriterProvenance.WriterDefinitionHash,
+  writer_schema_version: WriterProvenance.WriterSchemaVersion
+})
+const ChangeProvenanceRow = Schema.Struct({
+  change_hash: WriterProvenance.ChangeHash,
+  writer_definition_hash: WriterProvenance.WriterDefinitionHash,
+  writer_schema_version: WriterProvenance.WriterSchemaVersion
+})
 const encodeHeads = Schema.encodeSync(Heads)
 
 const DocumentRow = Schema.Struct({ document_id: Identity.DocumentId })
@@ -51,7 +64,8 @@ const CheckpointIdentity = Schema.Struct({
   checkpointHash: Schema.String,
   checksum: Schema.String,
   commitSequence: Identity.CommitSequence,
-  heads: Heads
+  heads: Heads,
+  writerProvenance: WriterProvenance.ChangeProvenances
 })
 
 export class Compaction extends Context.Service<Compaction, {
@@ -91,18 +105,26 @@ export const layer: Layer.Layer<
       Request: Identity.DocumentId,
       Result: CheckpointRow,
       execute: (documentId) =>
-        sql`SELECT bytes, checkpoint_hash, checksum, commit_sequence, heads
+        sql`SELECT bytes, checkpoint_hash, checksum, commit_sequence, heads, writer_provenance
         FROM effect_local_checkpoints
         WHERE document_id = ${documentId} AND verified = 1
         ORDER BY commit_sequence DESC, checkpoint_hash DESC`
     })
     const appliedChanges = SqlSchema.findAll({
       Request: Identity.DocumentId,
-      Result: ChangeHashRow,
+      Result: AppliedChangeRow,
       execute: (documentId) =>
-        sql`SELECT change_hash FROM effect_local_changes
+        sql`SELECT change_hash, writer_definition_hash, writer_schema_version FROM effect_local_changes
         WHERE document_id = ${documentId} AND applied = 1
         ORDER BY commit_sequence, sequence, change_hash`
+    })
+    const changeProvenance = SqlSchema.findAll({
+      Request: Identity.DocumentId,
+      Result: ChangeProvenanceRow,
+      execute: (documentId) =>
+        sql`SELECT change_hash, writer_definition_hash, writer_schema_version
+          FROM effect_local_changes
+          WHERE document_id = ${documentId}`
     })
     const installDocumentCheckpoint = SqlSchema.findAll({
       Request: Schema.Struct({
@@ -124,18 +146,22 @@ export const layer: Layer.Layer<
     })
     const installedCheckpoint = SqlSchema.findAll({
       Request: Schema.Struct({
-        ...CheckpointIdentity.fields,
-        documentId: Identity.DocumentId
+        bytes: Schema.Uint8Array,
+        checkpointHash: Schema.String,
+        checksum: Schema.String,
+        documentId: Identity.DocumentId,
+        heads: Heads,
+        writerProvenance: WriterProvenance.ChangeProvenances
       }),
       Result: CheckpointHashRow,
-      execute: ({ bytes, checkpointHash, checksum, commitSequence, documentId, heads }) =>
+      execute: ({ bytes, checkpointHash, checksum, documentId, heads, writerProvenance }) =>
         sql`SELECT checkpoint_hash FROM effect_local_checkpoints
           WHERE checkpoint_hash = ${checkpointHash}
             AND document_id = ${documentId}
             AND heads = ${heads}
             AND bytes = ${bytes}
             AND checksum = ${checksum}
-            AND commit_sequence = ${commitSequence}
+            AND writer_provenance = ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(writerProvenance)}
             AND verified = 1`
     })
     const retainDocumentForPrune = SqlSchema.findAll({
@@ -158,6 +184,9 @@ export const layer: Layer.Layer<
                 AND bytes = ${newest.bytes}
                 AND checksum = ${newest.checksum}
                 AND heads = ${newest.heads}
+                AND writer_provenance = ${
+          Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(newest.writerProvenance)
+        }
                 AND verified = 1
             )
             AND EXISTS (
@@ -166,6 +195,9 @@ export const layer: Layer.Layer<
                 AND bytes = ${oldest.bytes}
                 AND checksum = ${oldest.checksum}
                 AND heads = ${oldest.heads}
+                AND writer_provenance = ${
+          Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(oldest.writerProvenance)
+        }
                 AND verified = 1
             )
           RETURNING document_id`
@@ -219,6 +251,56 @@ export const layer: Layer.Layer<
           const bytes = InternalAutomerge.save(stored.automerge)
           const checksum = yield* digest(bytes)
           const checkpointHash = yield* digest({ documentId, bytes })
+          const provenanceRows = yield* changeProvenance(documentId).pipe(
+            Effect.catchTags({
+              SqlError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageUnavailable({ cause })
+                  })
+                ),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageCorrupt({ cause })
+                  })
+                )
+            })
+          )
+          const checkpoints = yield* verifiedCheckpoints(documentId).pipe(
+            Effect.catchTags({
+              SqlError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageUnavailable({ cause })
+                  })
+                ),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageCorrupt({ cause })
+                  })
+                )
+            })
+          )
+          const writerProvenance = yield* Effect.try({
+            try: () =>
+              WriterProvenance.resolve(
+                WriterProvenance.changeHashes(stored.automerge),
+                [
+                  ...provenanceRows.map((row) => ({
+                    changeHash: row.change_hash,
+                    writerSchemaVersion: row.writer_schema_version,
+                    writerDefinitionHash: row.writer_definition_hash
+                  })),
+                  ...checkpoints.flatMap((checkpoint) => checkpoint.writer_provenance)
+                ]
+              ),
+            catch: (cause) =>
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause })
+              })
+          })
           return {
             bytes,
             checkpointHash,
@@ -226,7 +308,8 @@ export const layer: Layer.Layer<
             commitSequence: stored.commitSequence,
             documentId,
             documentType: document.name,
-            heads: stored.materializedHeads
+            heads: stored.materializedHeads,
+            writerProvenance
           }
         }).pipe(Effect.ensuring(Effect.sync(() => InternalAutomerge.free(stored.automerge))))
       })
@@ -243,7 +326,7 @@ export const layer: Layer.Layer<
             })
           })
         }
-        const verified = yield* Effect.acquireUseRelease(
+        const checkpointContent = yield* Effect.acquireUseRelease(
           Effect.try({
             try: () => Automerge.load<InternalAutomerge.Root<unknown>>(checkpoint.bytes),
             catch: (cause) =>
@@ -253,10 +336,24 @@ export const layer: Layer.Layer<
                 })
               })
           }),
-          (automerge) => Effect.sync(() => Equal.equals(Automerge.getHeads(automerge), checkpoint.heads)),
+          (automerge) =>
+            Effect.try({
+              try: () => {
+                const changeHashes = WriterProvenance.changeHashes(automerge)
+                WriterProvenance.validateExact(changeHashes, checkpoint.writerProvenance)
+                return {
+                  changeHashes,
+                  headsMatch: Equal.equals(Automerge.getHeads(automerge), checkpoint.heads)
+                }
+              },
+              catch: (cause) =>
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageCorrupt({ cause })
+                })
+            }),
           (automerge) => Effect.sync(() => InternalAutomerge.free(automerge))
         )
-        if (!verified) {
+        if (!checkpointContent.headsMatch) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
               cause: new Error("Prepared checkpoint heads mismatch")
@@ -276,19 +373,49 @@ export const layer: Layer.Layer<
             yield* gate.validate(permit)
             return false
           }
+          const [provenanceRows, checkpoints] = yield* Effect.all([
+            changeProvenance(checkpoint.documentId),
+            verifiedCheckpoints(checkpoint.documentId)
+          ])
+          const durableWriterProvenance = yield* Effect.try({
+            try: () =>
+              WriterProvenance.resolve(
+                checkpointContent.changeHashes,
+                [
+                  ...provenanceRows.map((row) => ({
+                    changeHash: row.change_hash,
+                    writerSchemaVersion: row.writer_schema_version,
+                    writerDefinitionHash: row.writer_definition_hash
+                  })),
+                  ...checkpoints.flatMap((stored) => stored.writer_provenance)
+                ]
+              ),
+            catch: (cause) =>
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause })
+              })
+          })
+          if (!WriterProvenance.equals(durableWriterProvenance, checkpoint.writerProvenance)) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({
+                cause: new Error("Prepared checkpoint writer provenance does not match durable history")
+              })
+            })
+          }
           yield* sql`INSERT INTO effect_local_checkpoints (
-          checkpoint_hash, document_id, heads, bytes, checksum, commit_sequence, verified
+          checkpoint_hash, document_id, heads, bytes, checksum, commit_sequence, verified, writer_provenance
         ) VALUES (
           ${checkpoint.checkpointHash}, ${checkpoint.documentId}, ${heads}, ${checkpoint.bytes},
-          ${checkpoint.checksum}, ${checkpoint.commitSequence}, 1
+          ${checkpoint.checksum}, ${checkpoint.commitSequence}, 1,
+          ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(checkpoint.writerProvenance)}
         ) ON CONFLICT(checkpoint_hash) DO NOTHING`
           const installed = yield* installedCheckpoint({
             bytes: checkpoint.bytes,
             checkpointHash: checkpoint.checkpointHash,
             checksum: checkpoint.checksum,
-            commitSequence: checkpoint.commitSequence,
             documentId: checkpoint.documentId,
-            heads: checkpoint.heads
+            heads: checkpoint.heads,
+            writerProvenance: checkpoint.writerProvenance
           })
           if (installed.length !== 1) {
             return yield* new ReplicaError.ReplicaError({
@@ -408,6 +535,23 @@ export const layer: Layer.Layer<
               })
             })
           }
+          const checkpointHashes = yield* Effect.try({
+            try: () => {
+              const newestHashes = WriterProvenance.changeHashes(newestDocument)
+              const oldestHashes = WriterProvenance.changeHashes(oldestDocument)
+              WriterProvenance.validateExact(newestHashes, newest.writer_provenance)
+              WriterProvenance.validateExact(oldestHashes, oldest.writer_provenance)
+              WriterProvenance.resolve(
+                [...new Set([...newestHashes, ...oldestHashes])],
+                [...newest.writer_provenance, ...oldest.writer_provenance]
+              )
+              return [...new Set([...newestHashes, ...oldestHashes])]
+            },
+            catch: (cause) =>
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause })
+              })
+          })
           const changes = yield* appliedChanges(documentId).pipe(
             Effect.catchTags({
               SqlError: (cause) =>
@@ -428,6 +572,25 @@ export const layer: Layer.Layer<
                 )
             })
           )
+          yield* Effect.try({
+            try: () =>
+              WriterProvenance.resolve(
+                checkpointHashes,
+                [
+                  ...newest.writer_provenance,
+                  ...oldest.writer_provenance,
+                  ...changes.map((change) => ({
+                    changeHash: change.change_hash,
+                    writerSchemaVersion: change.writer_schema_version,
+                    writerDefinitionHash: change.writer_definition_hash
+                  }))
+                ]
+              ),
+            catch: (cause) =>
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause })
+              })
+          })
           const dominated = changes.filter((change) =>
             Automerge.hasHeads(newestDocument, [change.change_hash]) &&
             Automerge.hasHeads(oldestDocument, [change.change_hash])
@@ -440,14 +603,16 @@ export const layer: Layer.Layer<
                 checkpointHash: newest.checkpoint_hash,
                 checksum: newest.checksum,
                 commitSequence: newest.commit_sequence,
-                heads: newest.heads
+                heads: newest.heads,
+                writerProvenance: newest.writer_provenance
               },
               oldest: {
                 bytes: oldest.bytes,
                 checkpointHash: oldest.checkpoint_hash,
                 checksum: oldest.checksum,
                 commitSequence: oldest.commit_sequence,
-                heads: oldest.heads
+                heads: oldest.heads,
+                writerProvenance: oldest.writer_provenance
               }
             })
             if (rows.length !== 1) {

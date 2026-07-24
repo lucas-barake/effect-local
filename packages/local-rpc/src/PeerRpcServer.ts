@@ -577,7 +577,12 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
       )
       const send = (payload: Uint8Array) => {
         const bytes = payload.byteLength
-        if (bytes > PeerSession.maximumSyncEnvelopeBytes(replicaLimits.maxSyncMessageBytes)) {
+        if (
+          bytes > PeerSession.maximumSyncEnvelopeBytes(
+            replicaLimits.maxSyncMessageBytes,
+            replicaLimits.maxSyncChangesPerMessage
+          )
+        ) {
           return PeerRpcObservability.record("Outbound", "Overloaded", 1).pipe(
             Effect.andThen(Effect.fail(replicaFailure()))
           )
@@ -969,7 +974,12 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
     const pushUnobserved = (request: typeof PeerRpc.PushRpc.payloadSchema.Type) =>
       Effect.gen(function*() {
         const authenticated = yield* PeerAuthentication.AuthenticatedPeer
-        if (request.payload.byteLength > PeerSession.maximumSyncEnvelopeBytes(replicaLimits.maxSyncMessageBytes)) {
+        if (
+          request.payload.byteLength > PeerSession.maximumSyncEnvelopeBytes(
+            replicaLimits.maxSyncMessageBytes,
+            replicaLimits.maxSyncChangesPerMessage
+          )
+        ) {
           return yield* new PeerRpcError.RequestLimitExceeded()
         }
         return yield* admitted(

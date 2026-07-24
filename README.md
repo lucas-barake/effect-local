@@ -1253,8 +1253,9 @@ Consistency guarantees:
 8. One server Layer binds one tenant ID, one stable server `PeerId`, and one canonical SQL replica. Principal tenant IDs
    must match that configured tenant.
 9. Per connection, per subject, per session, per item, and total byte limits must remain finite and positive. The
-   configured byte capacities must hold `PeerSession.maximumSyncEnvelopeBytes(maxSyncMessageBytes)`, currently twice
-   the raw sync message bound plus 4,096 bytes for the JSON envelope.
+   configured byte capacities must hold
+   `PeerSession.maximumSyncEnvelopeBytes(maxSyncMessageBytes, maxSyncChangesPerMessage)`. The bound reserves JSON
+   space for the encoded sync message and every per change writer provenance entry.
 10. All long lived connections, subscriptions, streams, queues, fibers, and server sessions must be owned by an Effect
     `Scope`. Native documents may instead use a deterministic acquisition bracket. Scope close is cleanup. It is not
     persistence.

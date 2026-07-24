@@ -61,6 +61,44 @@ describe("Compaction", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(Services)))
 
+  it.effect("rejects prepared provenance that conflicts with durable history", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      const prepared = yield* compaction.prepare(Task, documentId)
+      const result = yield* Effect.exit(compaction.publish({
+        ...prepared,
+        writerProvenance: prepared.writerProvenance.map((entry) =>
+          Object.assign({}, entry, { writerDefinitionHash: "forged-definition" })
+        )
+      }))
+      assert.strictEqual(result._tag, "Failure")
+      assert.deepStrictEqual(
+        yield* sql`SELECT checkpoint_hash FROM effect_local_checkpoints WHERE document_id = ${documentId}`,
+        []
+      )
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("reuses an unchanged checkpoint after another document advances the commit sequence", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const firstDocumentId = yield* Identity.makeDocumentId
+      const secondDocumentId = yield* Identity.makeDocumentId
+      const first = yield* store.create(Task, firstDocumentId, { title: "one", labels: [] })
+      const initial = yield* compaction.compact(Task, firstDocumentId)
+      const second = yield* store.create(Task, secondDocumentId, { title: "two", labels: [] })
+      const repeated = yield* compaction.compact(Task, firstDocumentId)
+      assert.isTrue(repeated.published)
+      assert.strictEqual(repeated.checkpoint.checkpointHash, initial.checkpoint.checkpointHash)
+      InternalAutomerge.free(second.automerge)
+      InternalAutomerge.free(first.automerge)
+    }).pipe(Effect.provide(Services)))
+
   it.effect("rolls back checkpoint publication when the replica permit changes in the transaction", () =>
     Effect.gen(function*() {
       const compaction = yield* Compaction.Compaction
@@ -133,6 +171,34 @@ describe("Compaction", () => {
       assert.isTrue(Automerge.hasHeads(recovered.automerge, [...firstHeads]))
       assert.strictEqual(Automerge.getChangesSince(recovered.automerge, [...firstHeads]).length, 1)
       InternalAutomerge.free(recovered.automerge)
+      InternalAutomerge.free(persisted.automerge)
+      InternalAutomerge.free(staged)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("does not prune a change whose provenance conflicts with retained checkpoints", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      yield* compaction.compact(Task, documentId)
+      const staged = yield* store.stage(created, (draft) => {
+        draft.title = "two"
+      })
+      const persisted = yield* store.persist(Task, documentId, created, staged)
+      yield* compaction.compact(Task, documentId)
+      yield* sql`UPDATE effect_local_changes
+        SET writer_definition_hash = 'conflicting-definition'
+        WHERE document_id = ${documentId} AND change_hash != ${persisted.materializedHeads[0]}`
+
+      const result = yield* Effect.exit(compaction.prune(documentId))
+      assert.strictEqual(result._tag, "Failure")
+      const rows = yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count FROM effect_local_changes WHERE document_id = ${documentId}
+      `
+      assert.strictEqual(rows[0]?.count, 2)
       InternalAutomerge.free(persisted.automerge)
       InternalAutomerge.free(staged)
       InternalAutomerge.free(created.automerge)

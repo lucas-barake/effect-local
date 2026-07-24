@@ -77,6 +77,11 @@ export const layer: Layer.Layer<
     const sql = yield* SqlClient.SqlClient
     const gate = yield* ReplicaGate.ReplicaGate
     const recovery = yield* Recovery.make
+    const findDefinitionHash = SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: Schema.Struct({ definition_hash: Schema.String }),
+      execute: () => sql`SELECT definition_hash FROM effect_local_metadata WHERE singleton = 1`
+    })
 
     const nextSequence = SqlSchema.findOne({
       Request: Schema.Void,
@@ -98,6 +103,18 @@ export const layer: Layer.Layer<
           )
       })
     )
+    const currentDefinitionHash = findDefinitionHash(undefined).pipe(
+      Effect.map((row) => row.definition_hash),
+      Effect.catchTags({
+        NoSuchElementError: () => Effect.die(new Error("Replica metadata was not initialized")),
+        SchemaError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+          )
+      })
+    )
 
     const persist = <D extends Document.Any,>(
       document: D,
@@ -114,12 +131,13 @@ export const layer: Layer.Layer<
         const heads = InternalAutomerge.heads(staged)
         const sequence = yield* nextSequence
         const acceptedAt = DateTime.formatIso(yield* DateTime.now)
+        const definitionHash = yield* currentDefinitionHash
         for (const change of changes) {
           yield* sql`INSERT INTO effect_local_changes (
             change_hash, document_id, document_type, writer_schema_version, writer_definition_hash,
             actor, sequence, dependencies, bytes, applied, peer_id, accepted_at, commit_sequence
           ) VALUES (
-            ${change.hash}, ${documentId}, ${document.name}, ${document.version}, 'local',
+            ${change.hash}, ${documentId}, ${document.name}, ${document.version}, ${definitionHash},
             ${change.actor}, ${change.sequence}, ${Schema.encodeSync(Heads)(change.dependencies)}, ${change.bytes}, 1,
             NULL, ${acceptedAt}, ${sequence}
           )`
@@ -205,6 +223,7 @@ export const layer: Layer.Layer<
             const heads = InternalAutomerge.heads(automerge)
             const sequence = yield* nextSequence
             const acceptedAt = DateTime.formatIso(yield* DateTime.now)
+            const definitionHash = yield* currentDefinitionHash
             yield* sql`INSERT INTO effect_local_documents (
               document_id, document_type, schema_version, observed_versions,
               materialized_heads, accepted_heads, tombstone, projection_status, checkpoint_hash
@@ -217,7 +236,7 @@ export const layer: Layer.Layer<
                 change_hash, document_id, document_type, writer_schema_version, writer_definition_hash,
                 actor, sequence, dependencies, bytes, applied, peer_id, accepted_at, commit_sequence
               ) VALUES (
-                ${change.hash}, ${documentId}, ${document.name}, ${document.version}, 'local',
+                ${change.hash}, ${documentId}, ${document.name}, ${document.version}, ${definitionHash},
                 ${change.actor}, ${change.sequence}, ${
                 Schema.encodeSync(Heads)(change.dependencies)
               }, ${change.bytes}, 1,

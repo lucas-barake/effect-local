@@ -108,6 +108,25 @@ const seedPair = Effect.gen(function*() {
   return { documentId: created.value, left, right }
 })
 
+const syncChangeHashes = (message: Uint8Array) => {
+  const hashes = new Set<string>()
+  for (const chunk of Automerge.decodeSyncMessage(message).changes) {
+    try {
+      hashes.add(Automerge.decodeChange(chunk).hash)
+    } catch {
+      const document = Automerge.load(chunk)
+      try {
+        for (const bytes of Automerge.getAllChanges(document)) {
+          hashes.add(Automerge.decodeChange(bytes).hash)
+        }
+      } finally {
+        Automerge.free(document)
+      }
+    }
+  }
+  return [...hashes].toSorted()
+}
+
 const drain = (documentId: Identity.DocumentId, left: Side, right: Side, reverse: boolean) =>
   Effect.gen(function*() {
     const pending: Array<Packet> = []
@@ -132,6 +151,14 @@ const drain = (documentId: Identity.DocumentId, left: Side, right: Side, reverse
     for (let round = 0; round < 32; round++) {
       while (pending.length > 0) {
         const packet = pending.shift()!
+        assert.deepStrictEqual(
+          packet.outbound.writerProvenance.map((entry) => entry.changeHash).toSorted(),
+          syncChangeHashes(packet.outbound.message)
+        )
+        for (const entry of packet.outbound.writerProvenance) {
+          assert.strictEqual(entry.writerSchemaVersion, Task.version)
+          assert.strictEqual(entry.writerDefinitionHash, definition.hash)
+        }
         const received = yield* packet.to.sync.receive(
           Task,
           documentId,
@@ -140,8 +167,7 @@ const drain = (documentId: Identity.DocumentId, left: Side, right: Side, reverse
             remoteConnectionEpoch: packet.from.session.connectionEpoch,
             receiveSequence: packet.outbound.sendSequence,
             message: packet.outbound.message,
-            writerSchemaVersion: Task.version,
-            writerDefinitionHash: packet.from.sync.definitionHash
+            writerProvenance: packet.outbound.writerProvenance
           }
         )
         yield* packet.from.sync.markSent(

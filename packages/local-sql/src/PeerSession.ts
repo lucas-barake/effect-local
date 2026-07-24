@@ -17,6 +17,7 @@ import * as Stream from "effect/Stream"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
 import * as CommitPublisher from "./CommitPublisher.js"
 import * as DocumentEntity from "./DocumentEntity.js"
+import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as PeerSync from "./PeerSync.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
@@ -45,10 +46,12 @@ export const SyncEnvelope = Schema.Struct({
   documentType: Schema.String,
   messageHash: Schema.String,
   message: Schema.Uint8ArrayFromBase64,
-  writerSchemaVersion: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
-  writerDefinitionHash: Schema.NonEmptyString.check(Schema.isMaxLength(256))
+  writerProvenance: WriterProvenance.ChangeProvenances
 })
-export const maximumSyncEnvelopeBytes = (maxSyncMessageBytes: number) => maxSyncMessageBytes * 2 + 4_096
+export const maximumSyncEnvelopeBytes = (
+  maxSyncMessageBytes: number,
+  maxSyncChangesPerMessage: number
+) => maxSyncMessageBytes * 2 + maxSyncChangesPerMessage * 512 + 4_096
 const SyncEnvelopeJson = Schema.fromJsonString(Schema.toCodecJson(SyncEnvelope))
 
 const key = (documentType: string, documentId: Identity.DocumentId) => `${documentType}:${documentId}`
@@ -197,8 +200,7 @@ const makeWithTerminal = (
             documentType: entry.document.name,
             messageHash: outbound.messageHash,
             message: outbound.message,
-            writerSchemaVersion: entry.document.version,
-            writerDefinitionHash: sync.definitionHash
+            writerProvenance: outbound.writerProvenance
           })
           yield* Effect.scoped(Effect.gen(function*() {
             const permit = yield* gate.shared
@@ -336,7 +338,10 @@ const makeWithTerminal = (
 
     const receive = (bytes: Uint8Array) =>
       Effect.gen(function*() {
-        const maximumBytes = maximumSyncEnvelopeBytes(limits.maxSyncMessageBytes)
+        const maximumBytes = maximumSyncEnvelopeBytes(
+          limits.maxSyncMessageBytes,
+          limits.maxSyncChangesPerMessage
+        )
         if (bytes.byteLength > maximumBytes) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.ProtocolMismatch({
@@ -403,8 +408,7 @@ const makeWithTerminal = (
               documentType: envelope.documentType,
               messageHash: envelope.messageHash,
               message: envelope.message,
-              writerSchemaVersion: envelope.writerSchemaVersion,
-              writerDefinitionHash: envelope.writerDefinitionHash
+              writerProvenance: envelope.writerProvenance
             }).pipe(
               Effect.catchTag(
                 ["MailboxFull", "AlreadyProcessingMessage", "PersistenceError"],

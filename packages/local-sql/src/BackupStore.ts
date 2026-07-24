@@ -1,3 +1,4 @@
+import * as Automerge from "@automerge/automerge"
 import * as Backup from "@lucas-barake/effect-local/Backup"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -18,6 +19,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as InternalAutomerge from "./internal/automerge.js"
 import * as ClusterStorage from "./internal/clusterStorage.js"
+import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as ProjectionStore from "./ProjectionStore.js"
 import * as Recovery from "./Recovery.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
@@ -68,7 +70,8 @@ const CheckpointRecord = Schema.Struct({
   bytes: Schema.String,
   checksum: Schema.String,
   commit_sequence: Schema.Int,
-  verified: Schema.Int
+  verified: Schema.Int,
+  writer_provenance: Schema.optionalKey(WriterProvenance.ChangeProvenances)
 })
 
 const ReceiptRecord = Schema.Struct({
@@ -83,7 +86,16 @@ const ReceiptRecord = Schema.Struct({
 })
 
 const StoredChangeRecord = Schema.Struct({ ...ChangeRecord.fields, bytes: Schema.Uint8Array })
-const StoredCheckpointRecord = Schema.Struct({ ...CheckpointRecord.fields, bytes: Schema.Uint8Array })
+const StoredCheckpointRecord = Schema.Struct({
+  ...CheckpointRecord.fields,
+  bytes: Schema.Uint8Array,
+  writer_provenance: WriterProvenance.StoredChangeProvenances
+})
+const DecodedCheckpointRecord = Schema.Struct({
+  ...CheckpointRecord.fields,
+  bytes: Schema.Uint8Array,
+  writer_provenance: WriterProvenance.ChangeProvenances
+})
 const StoredReceiptRecord = Schema.Struct({ ...ReceiptRecord.fields, result: Schema.Uint8Array })
 
 const EndRecord = Schema.Struct({ recordCount: Schema.Int, recordsChecksum: Schema.String })
@@ -100,11 +112,20 @@ const JsonString = Schema.fromJsonString(Schema.Unknown)
 const EnvelopeJson = Schema.fromJsonString(Envelope)
 
 type Envelope = typeof Envelope.Type
-type DecodedRecord =
+type RawDecodedRecord =
   | { readonly kind: "Document"; readonly value: typeof DocumentRecord.Type }
   | { readonly kind: "Change"; readonly value: typeof StoredChangeRecord.Type }
-  | { readonly kind: "Checkpoint"; readonly value: typeof StoredCheckpointRecord.Type }
+  | {
+    readonly kind: "Checkpoint"
+    readonly value: Omit<typeof DecodedCheckpointRecord.Type, "writer_provenance"> & {
+      readonly writer_provenance?: ReadonlyArray<WriterProvenance.ChangeProvenance>
+    }
+  }
   | { readonly kind: "Receipt"; readonly value: typeof StoredReceiptRecord.Type }
+
+type DecodedRecord =
+  | Exclude<RawDecodedRecord, { readonly kind: "Checkpoint" }>
+  | { readonly kind: "Checkpoint"; readonly value: typeof DecodedCheckpointRecord.Type }
 
 const encodeEnvelopeJson = (envelope: Envelope) =>
   Schema.encodeEffect(EnvelopeJson)(envelope).pipe(
@@ -206,7 +227,8 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               length(COALESCE(peer_id, '')) + length(accepted_at)
             ), 0) FROM effect_local_changes) +
             (SELECT COALESCE(SUM(
-              length(checkpoint_hash) + length(document_id) + length(heads) + length(bytes) + length(checksum)
+              length(checkpoint_hash) + length(document_id) + length(heads) + length(bytes) + length(checksum) +
+              length(writer_provenance)
             ), 0) FROM effect_local_checkpoints) +
             (SELECT COALESCE(SUM(
               length(command_id) + length(request_hash) + length(mutation_name) + length(result) +
@@ -502,8 +524,8 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               })
             })
           }
-          const decoded = yield* Effect.gen(function*() {
-            const decoded: Array<DecodedRecord> = []
+          const rawDecoded = yield* Effect.gen(function*() {
+            const decoded: Array<RawDecodedRecord> = []
             for (const record of records) {
               switch (record.kind) {
                 case "Document": {
@@ -514,7 +536,16 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 case "Change": {
                   const encoded = yield* Schema.decodeUnknownEffect(ChangeRecord)(record.value)
                   const bytes = yield* decodeBytes(encoded.bytes)
-                  decoded.push({ kind: "Change", value: { ...encoded, bytes } })
+                  decoded.push({
+                    kind: "Change",
+                    value: {
+                      ...encoded,
+                      bytes,
+                      writer_definition_hash: encoded.writer_definition_hash === "local"
+                        ? manifest.definitionHash
+                        : encoded.writer_definition_hash
+                    }
+                  })
                   break
                 }
                 case "Checkpoint": {
@@ -548,6 +579,65 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 })
               ))
           )
+          const documentById = new Map<string, typeof DocumentRecord.Type>(
+            rawDecoded.flatMap((record) =>
+              record.kind === "Document" ? [[record.value.document_id, record.value] as const] : []
+            )
+          )
+          const changeProvenanceByDocument = new Map<string, Array<WriterProvenance.ChangeProvenance>>()
+          for (const record of rawDecoded) {
+            if (record.kind !== "Change") continue
+            const entry = {
+              changeHash: record.value.change_hash,
+              writerSchemaVersion: record.value.writer_schema_version,
+              writerDefinitionHash: record.value.writer_definition_hash
+            }
+            const existing = changeProvenanceByDocument.get(record.value.document_id)
+            if (existing === undefined) changeProvenanceByDocument.set(record.value.document_id, [entry])
+            else existing.push(entry)
+          }
+          const decoded = yield* Effect.forEach(rawDecoded, (record): Effect.Effect<
+            DecodedRecord,
+            ReplicaError.ReplicaError
+          > => {
+            if (record.kind !== "Checkpoint") return Effect.succeed(record)
+            return Effect.acquireUseRelease(
+              Effect.try({
+                try: () => Automerge.load<InternalAutomerge.Root<unknown>>(record.value.bytes),
+                catch: (cause) =>
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.BackupInvalid({ cause })
+                  })
+              }),
+              (document) =>
+                Effect.try({
+                  try: () => {
+                    const changeHashes = WriterProvenance.changeHashes(document)
+                    const stored = changeProvenanceByDocument.get(record.value.document_id) ?? []
+                    const provenance = record.value.writer_provenance ??
+                      WriterProvenance.backfill(
+                        changeHashes,
+                        stored,
+                        {
+                          writerSchemaVersion: documentById.get(record.value.document_id)!.schema_version,
+                          writerDefinitionHash: manifest.definitionHash
+                        }
+                      )
+                    WriterProvenance.validateExact(changeHashes, provenance)
+                    WriterProvenance.resolve(changeHashes, [...provenance, ...stored])
+                    return {
+                      kind: "Checkpoint" as const,
+                      value: { ...record.value, writer_provenance: provenance }
+                    }
+                  },
+                  catch: (cause) =>
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.BackupInvalid({ cause })
+                    })
+                }),
+              (document) => Effect.sync(() => InternalAutomerge.free(document))
+            )
+          })
           for (const record of decoded) {
             switch (record.kind) {
               case "Document": {
@@ -604,6 +694,28 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                     })
                   })
                 }
+                yield* Effect.acquireUseRelease(
+                  Effect.try({
+                    try: () => Automerge.load<InternalAutomerge.Root<unknown>>(record.value.bytes),
+                    catch: (cause) =>
+                      new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.BackupInvalid({ cause })
+                      })
+                  }),
+                  (document) =>
+                    Effect.try({
+                      try: () =>
+                        WriterProvenance.validateExact(
+                          WriterProvenance.changeHashes(document),
+                          record.value.writer_provenance
+                        ),
+                      catch: (cause) =>
+                        new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.BackupInvalid({ cause })
+                        })
+                    }),
+                  (document) => Effect.sync(() => InternalAutomerge.free(document))
+                )
                 break
               }
               case "Receipt": {
@@ -675,7 +787,16 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 record.kind === "Document" ? [{ ...record.value, projection_status: "Ready" }] : []
               )
               const changes = decoded.flatMap((record) => record.kind === "Change" ? [record.value] : [])
-              const checkpoints = decoded.flatMap((record) => record.kind === "Checkpoint" ? [record.value] : [])
+              const checkpoints = decoded.flatMap((record) =>
+                record.kind === "Checkpoint"
+                  ? [{
+                    ...record.value,
+                    writer_provenance: Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(
+                      record.value.writer_provenance
+                    )
+                  }]
+                  : []
+              )
               const receipts = decoded.flatMap((record) => record.kind === "Receipt" ? [record.value] : [])
               for (let index = 0; index < documents.length; index += 50) {
                 yield* sql`INSERT INTO effect_local_documents ${sql.insert(documents.slice(index, index + 50))}`

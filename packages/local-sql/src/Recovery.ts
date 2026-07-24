@@ -15,6 +15,7 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
 const DocumentRow = Schema.Struct({
@@ -37,7 +38,8 @@ const CheckpointRow = Schema.Struct({
   commit_sequence: Schema.Number,
   document_id: Schema.String,
   heads: Schema.String,
-  verified: Schema.Number
+  verified: Schema.Number,
+  writer_provenance: WriterProvenance.StoredChangeProvenances
 })
 
 const ChangeRow = Schema.Struct({
@@ -45,15 +47,15 @@ const ChangeRow = Schema.Struct({
   accepted_at: Schema.String,
   applied: Schema.Number,
   bytes: Schema.Uint8Array,
-  change_hash: Schema.String,
+  change_hash: WriterProvenance.ChangeHash,
   commit_sequence: Schema.Number,
   dependencies: Schema.String,
   document_id: Schema.String,
   document_type: Schema.String,
   peer_id: Schema.NullOr(Schema.String),
   sequence: Schema.Number,
-  writer_definition_hash: Schema.String,
-  writer_schema_version: Schema.Number
+  writer_definition_hash: WriterProvenance.WriterDefinitionHash,
+  writer_schema_version: WriterProvenance.WriterSchemaVersion
 })
 
 export interface RawRecoveryExport {
@@ -115,7 +117,7 @@ export const make = Effect.gen(function*() {
     Request: Identity.DocumentId,
     Result: CheckpointRow,
     execute: (documentId) =>
-      sql`SELECT bytes, checkpoint_hash, checksum, commit_sequence, document_id, heads, verified
+      sql`SELECT bytes, checkpoint_hash, checksum, commit_sequence, document_id, heads, verified, writer_provenance
         FROM effect_local_checkpoints
         WHERE document_id = ${documentId}
         ORDER BY commit_sequence DESC, checkpoint_hash DESC
@@ -125,7 +127,7 @@ export const make = Effect.gen(function*() {
     Request: Identity.DocumentId,
     Result: CheckpointRow,
     execute: (documentId) =>
-      sql`SELECT bytes, checkpoint_hash, checksum, commit_sequence, document_id, heads, verified
+      sql`SELECT bytes, checkpoint_hash, checksum, commit_sequence, document_id, heads, verified, writer_provenance
         FROM effect_local_checkpoints
         WHERE document_id = ${documentId} AND verified = 1
         ORDER BY commit_sequence DESC, checkpoint_hash DESC
@@ -304,6 +306,30 @@ export const make = Effect.gen(function*() {
       }
       const materializedHeads = parsedHeads.success.materialized
       const acceptedHeads = parsedHeads.success.accepted
+      const provenanceConsistency = yield* Effect.result(Effect.try({
+        try: () => {
+          const checkpointProvenance = checkpoints.flatMap((checkpoint) => checkpoint.writer_provenance)
+          WriterProvenance.resolve(
+            [...new Set(checkpointProvenance.map((entry) => entry.changeHash))],
+            [
+              ...checkpointProvenance,
+              ...changes.map((change) => ({
+                changeHash: change.change_hash,
+                writerSchemaVersion: change.writer_schema_version,
+                writerDefinitionHash: change.writer_definition_hash
+              }))
+            ]
+          )
+        },
+        catch: (cause) =>
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({ cause })
+          })
+      }))
+      if (Result.isFailure(provenanceConsistency)) {
+        yield* quarantine(documentId, [], "Conflicting canonical writer provenance", permit)
+        return yield* provenanceConsistency.failure
+      }
       const invalidCheckpoints: Array<string> = []
       for (const checkpoint of [...checkpoints, null]) {
         let current: Automerge.Doc<InternalAutomerge.Root<D["schema"]["Encoded"]>> | undefined
@@ -333,6 +359,19 @@ export const make = Effect.gen(function*() {
                     checksum !== checkpoint.checksum || checkpoint.checkpoint_hash !== checkpointHash ||
                     !Equal.equals(InternalAutomerge.heads(current!), checkpointHeads)
                   ) throw new TypeError(`Invalid checkpoint: ${checkpoint.checkpoint_hash}`)
+                  const checkpointHashes = WriterProvenance.changeHashes(current!)
+                  WriterProvenance.validateExact(checkpointHashes, checkpoint.writer_provenance)
+                  WriterProvenance.resolve(
+                    checkpointHashes,
+                    [
+                      ...checkpoint.writer_provenance,
+                      ...changes.map((change) => ({
+                        changeHash: change.change_hash,
+                        writerSchemaVersion: change.writer_schema_version,
+                        writerDefinitionHash: change.writer_definition_hash
+                      }))
+                    ]
+                  )
                 },
                 catch: (cause) =>
                   new ReplicaError.ReplicaError({
