@@ -850,6 +850,7 @@ export const layerHandlers = (
         if (authenticated.principal.tenantId !== options.tenantId) return yield* new PeerRpcError.AccessDenied()
         if (request.protocolVersion !== PeerRpc.protocolVersion) return yield* new PeerRpcError.UnsupportedVersion()
         if (request.expectedPeerId !== options.peerId) return yield* new PeerRpcError.PeerMismatch()
+        if (request.definitionHash === undefined) return yield* new PeerRpcError.InvalidRequest()
         if (request.definitionHash !== options.definition.hash) return yield* new PeerRpcError.DefinitionMismatch()
         if (request.documents.length === 0) return yield* new PeerRpcError.InvalidRequest()
         const requested = new Set(request.documents.map((entry) => `${entry.documentType}:${entry.documentId}`))
@@ -872,6 +873,13 @@ export const layerHandlers = (
               Effect.flatMap((result) => PeerAuthorizationValidation.validate(authorizationRequest, result)),
               Effect.catchCause(authorizationFailure)
             )
+            if (
+              authorized.documents.some((entry) =>
+                options.definition.documents.byName.get(entry.document.name) !== entry.document
+              )
+            ) {
+              return yield* new PeerRpcError.AccessDenied()
+            }
             const sessionId = yield* Identity.makeSessionId.pipe(
               Effect.catchTag("PlatformError", () => Effect.fail(new PeerRpcError.ServerUnavailable()))
             )

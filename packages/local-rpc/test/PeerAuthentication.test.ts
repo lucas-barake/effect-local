@@ -140,7 +140,7 @@ describe("PeerAuthentication", () => {
       yield* client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: peerId,
-        definitionHash: "def_test",
+        definitionHash: "def_0000000000000000",
         documents: [],
         credential: Redacted.make("caller")
       }).pipe(Stream.runDrain)

@@ -30,6 +30,19 @@ const protocolFailure = (observed: string) =>
     })
   })
 
+const validateDocuments = (
+  documents: ReadonlyArray<PeerSession.SelectedDocument>,
+  definition: ReplicaDefinition.Any
+) =>
+  Effect.suspend(() => {
+    for (const entry of documents) {
+      if (definition.documents.byName.get(entry.document.name) !== entry.document) {
+        return Effect.fail(protocolFailure(entry.document.name))
+      }
+    }
+    return Effect.void
+  })
+
 const mapError = (error: PeerRpcError.PeerRpcError | RpcClientError) => {
   if (error._tag === "RpcClientError") return unavailable()
   switch (error._tag) {
@@ -71,6 +84,7 @@ export const layer = (
     connect: (connectOptions) =>
       PeerRpcObservability.observe({
         effect: Effect.gen(function*() {
+          yield* validateDocuments(options.documents, options.definition)
           const parentScope = yield* Scope.Scope
           return yield* Effect.uninterruptibleMask((restore) =>
             Effect.gen(function*() {

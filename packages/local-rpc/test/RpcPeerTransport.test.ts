@@ -27,6 +27,7 @@ import * as PeerRpcError from "../src/PeerRpcError.js"
 import * as RpcPeerTransport from "../src/RpcPeerTransport.js"
 
 const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
+const TaskV2 = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 2 })
 const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
 const replicaId = Identity.ReplicaId.make("rep_00000000-0000-4000-8000-000000000001")
 const serverPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001")
@@ -88,6 +89,29 @@ describe("RpcPeerTransport", () => {
       assert.strictEqual(connection.peerId, serverPeerId)
       assert.deepStrictEqual(yield* Stream.runCollect(connection.receive), [payload])
       yield* connection.close
+    })))
+
+  it.effect("rejects selected documents that do not belong to the supplied definition", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const opens = yield* Ref.make(0)
+      const client = makeClient(
+        () => Ref.update(opens, (count) => count + 1).pipe(Effect.as(liveOpen(serverOpened)), Stream.unwrap),
+        () => Effect.void
+      )
+      const context = yield* Layer.build(RpcPeerTransport.layer(client, {
+        documents: [{ document: TaskV2, documentId }],
+        definition
+      }))
+      const exit = yield* Context.get(context, PeerTransport.PeerTransport).connect({
+        replicaId,
+        peerId: serverPeerId
+      }).pipe(Effect.exit)
+      assert.isTrue(Exit.isFailure(exit))
+      if (Exit.isFailure(exit)) {
+        const error = Cause.findErrorOption(exit.cause)
+        assert.isTrue(Option.isSome(error) && error.value.reason._tag === "ProtocolMismatch")
+      }
+      assert.strictEqual(yield* Ref.get(opens), 0)
     })))
 
   it.effect("records adapter boundaries without peer session document or payload values", () => {

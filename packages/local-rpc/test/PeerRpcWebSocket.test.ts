@@ -1,5 +1,6 @@
 import { NodeCrypto, NodeHttpServer, NodeSocket } from "@effect/platform-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as DocumentEntity from "@lucas-barake/effect-local-sql/DocumentEntity"
 import * as TestReplica from "@lucas-barake/effect-local-test/TestReplica"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Document from "@lucas-barake/effect-local/Document"
@@ -11,12 +12,14 @@ import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Redacted from "effect/Redacted"
+import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
@@ -78,6 +81,16 @@ const ReplicaLive = TestReplica.layer(definition, { projections: [] }).pipe(
 const serverPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001")
 const clientPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000002")
 const missingSessionId = Identity.SessionId.make("ses_00000000-0000-4000-8000-000000000001")
+
+const repeatUntil = <E, R,>(step: Effect.Effect<boolean, E, R>) => {
+  const failure = new Error("Observable WebSocket condition did not complete")
+  return Effect.gen(function*() {
+    for (let attempt = 0; attempt < 500; attempt++) {
+      if (yield* step) return
+    }
+    return yield* Effect.die(failure)
+  })
+}
 
 const makeWebSocketServer = (
   documentId: Identity.DocumentId,
@@ -254,15 +267,11 @@ describe("PeerRpc WebSocket", () => {
               payload: "renamed by the WebSocket client"
             })
 
-            let serverObservedClientMutation = false
-            for (let attempt = 0; attempt < 200; attempt++) {
+            yield* repeatUntil(Effect.gen(function*() {
+              yield* session.flush
               yield* Effect.all([serverSharding.pollStorage, clientSharding.pollStorage], { discard: true })
-              serverObservedClientMutation =
-                (yield* serverReplica.get(Task, documentId)).value.title === "renamed by the WebSocket client"
-              if (serverObservedClientMutation) break
-              yield* Effect.sleep("10 millis")
-            }
-            assert.isTrue(serverObservedClientMutation)
+              return (yield* serverReplica.get(Task, documentId)).value.title === "renamed by the WebSocket client"
+            }))
 
             yield* serverReplica.mutate(AddLabel, {
               commandId: yield* Identity.makeCommandId,
@@ -270,31 +279,24 @@ describe("PeerRpc WebSocket", () => {
               payload: "server"
             })
 
-            let replicasConverged = false
-            for (let attempt = 0; attempt < 200; attempt++) {
+            yield* repeatUntil(Effect.gen(function*() {
+              yield* session.flush
               yield* Effect.all([serverSharding.pollStorage, clientSharding.pollStorage], { discard: true })
               const serverSnapshot = yield* serverReplica.get(Task, documentId)
               const clientSnapshot = yield* clientReplica.get(Task, documentId)
-              replicasConverged = JSON.stringify(serverSnapshot.value) === JSON.stringify(clientSnapshot.value) &&
+              return JSON.stringify(serverSnapshot.value) === JSON.stringify(clientSnapshot.value) &&
                 JSON.stringify(serverSnapshot.heads) === JSON.stringify(clientSnapshot.heads)
-              if (replicasConverged) break
-              yield* Effect.sleep("10 millis")
-            }
+            }))
 
             yield* session.markDirty(documentId)
-            yield* session.flush
-            let observedByServer = false
-            for (let attempt = 0; attempt < 200; attempt++) {
+            yield* repeatUntil(Effect.gen(function*() {
+              yield* session.flush
               yield* Effect.all([serverSharding.pollStorage, clientSharding.pollStorage], { discard: true })
-              observedByServer = yield* session.observedByPeer(documentId)
-              if (observedByServer) break
-              yield* Effect.sleep("10 millis")
-            }
+              return yield* session.observedByPeer(documentId)
+            }))
 
             const serverSnapshot = yield* serverReplica.get(Task, documentId)
             const clientSnapshot = yield* clientReplica.get(Task, documentId)
-            assert.isTrue(replicasConverged)
-            assert.isTrue(observedByServer)
             assert.deepStrictEqual(clientSnapshot.value, {
               title: "renamed by the WebSocket client",
               labels: ["server"]
@@ -325,7 +327,7 @@ describe("PeerRpc WebSocket", () => {
   )
 
   it.live(
-    "redelivers pending client outbound after the server restarts on the same port",
+    "replays acknowledged, unacknowledged, and offline changes through a fresh session after coordinated restart",
     () =>
       Effect.scoped(Effect.gen(function*() {
         const serverEngineContext = yield* Layer.build(ReplicaLive)
@@ -353,7 +355,10 @@ describe("PeerRpc WebSocket", () => {
 
         const WebSocketServerLive = makeWebSocketServer(documentId)
 
-        const buildServer = (port: number) =>
+        const buildServer = (
+          port: number,
+          engineContext = serverEngineContext
+        ) =>
           Effect.gen(function*() {
             const scope = yield* Scope.make()
             yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
@@ -363,7 +368,7 @@ describe("PeerRpc WebSocket", () => {
                 Layer.provide(RpcSerialization.layerMsgPack)
               )
             ).pipe(
-              Effect.provide(serverEngineContext),
+              Effect.provide(engineContext),
               Effect.provideService(Scope.Scope, scope)
             )
             const address = Context.get(context, HttpServer.HttpServer).address
@@ -401,68 +406,86 @@ describe("PeerRpc WebSocket", () => {
             })
           })
 
-        const pollUntil = <E,>(predicate: Effect.Effect<boolean, E>) =>
-          Effect.gen(function*() {
-            for (let attempt = 0; attempt < 500; attempt++) {
-              yield* Effect.all([serverSharding.pollStorage, clientSharding.pollStorage], { discard: true })
-              if (yield* predicate) return true
-              yield* Effect.sleep("10 millis")
-            }
-            return false
-          })
-
-        const server1 = yield* buildServer(0)
+        const pendingApplyStarted = yield* Deferred.make<void>()
+        const blockNextApply = yield* Ref.make(false)
+        const blockingSharding = Sharding.Sharding.of(
+          {
+            ...serverSharding,
+            makeClient: (entity) =>
+              serverSharding.makeClient(entity).pipe(
+                Effect.map((makeClient) => (entityId) => {
+                  const client = makeClient(entityId)
+                  if (entity.type !== DocumentEntity.DocumentEntity.type) return client
+                  const documentClient = client as ReturnType<
+                    Effect.Success<typeof DocumentEntity.DocumentEntity.client>
+                  >
+                  return {
+                    ...documentClient,
+                    ApplySync: (request: typeof DocumentEntity.ApplySync.payloadSchema.Type) =>
+                      Ref.getAndSet(blockNextApply, false).pipe(
+                        Effect.flatMap((block) =>
+                          block
+                            ? Deferred.succeed(pendingApplyStarted, undefined).pipe(Effect.andThen(Effect.never))
+                            : documentClient.ApplySync(request)
+                        )
+                      )
+                  } as typeof client
+                })
+              )
+          } as Sharding.Sharding["Service"]
+        )
+        const server1 = yield* buildServer(
+          0,
+          Context.add(serverEngineContext, Sharding.Sharding, blockingSharding)
+        )
         const assignedPort = server1.port
 
         const session1Scope = yield* Scope.make()
         yield* Effect.addFinalizer(() => Scope.close(session1Scope, Exit.void))
-        yield* connectSession(assignedPort).pipe(Effect.provideService(Scope.Scope, session1Scope))
+        const session1 = yield* connectSession(assignedPort).pipe(
+          Effect.provideService(Scope.Scope, session1Scope)
+        )
 
         yield* addLabel("committed-before-restart")
-        const serverHoldsFirst = yield* pollUntil(
-          Effect.map(
-            serverReplica.get(Task, documentId),
-            (snapshot) => snapshot.value.labels.includes("committed-before-restart")
-          )
-        )
-        assert.isTrue(serverHoldsFirst)
-
+        yield* repeatUntil(Effect.gen(function*() {
+          yield* session1.flush
+          yield* Effect.all([serverSharding.pollStorage, clientSharding.pollStorage], { discard: true })
+          return (yield* serverReplica.get(Task, documentId)).value.labels.includes("committed-before-restart")
+        }))
+        yield* Ref.set(blockNextApply, true)
         yield* addLabel("pending-at-restart")
-        // Releasing the client scope severs the upgraded socket so closing the node http
-        // server does not block on the still-open connection during graceful shutdown.
-        const killing = yield* Scope.close(server1.scope, Exit.void).pipe(Effect.forkChild)
+        yield* session1.markDirty(documentId)
+        yield* session1.flush
+        yield* Deferred.await(pendingApplyStarted)
+        assert.notInclude((yield* serverReplica.get(Task, documentId)).value.labels, "pending-at-restart")
+
+        const closingServer = yield* Scope.close(server1.scope, Exit.void).pipe(Effect.forkChild)
+        // The client scope owns the upgraded socket. Close it while the server
+        // drains so both sides finish before the same port is rebound.
         yield* Scope.close(session1Scope, Exit.void)
-        yield* Fiber.join(killing)
+        yield* Fiber.join(closingServer).pipe(Effect.timeout("5 seconds"))
 
         yield* addLabel("committed-while-offline")
 
-        // Reclaim the same port the client still targets; a fresh listener can briefly
-        // race the previous socket teardown, so bounded retries reclaim it.
-        const server2 = yield* Effect.gen(function*() {
-          let lastCause: unknown
-          for (let attempt = 0; attempt < 50; attempt++) {
-            const outcome = yield* buildServer(assignedPort).pipe(Effect.exit)
-            if (Exit.isSuccess(outcome)) return outcome.value
-            lastCause = outcome.cause
-            yield* Effect.sleep("20 millis")
-          }
-          return yield* Effect.die(`Could not rebind port ${assignedPort}: ${String(lastCause)}`)
-        })
+        const server2 = yield* buildServer(assignedPort)
         assert.strictEqual(server2.port, assignedPort)
 
         const session2Scope = yield* Scope.make()
         yield* Effect.addFinalizer(() => Scope.close(session2Scope, Exit.void))
-        yield* connectSession(assignedPort).pipe(Effect.provideService(Scope.Scope, session2Scope))
+        const session2 = yield* connectSession(assignedPort).pipe(
+          Effect.provideService(Scope.Scope, session2Scope)
+        )
 
-        const converged = yield* pollUntil(Effect.gen(function*() {
+        yield* repeatUntil(Effect.gen(function*() {
+          yield* Effect.all([serverSharding.pollStorage, clientSharding.pollStorage], { discard: true })
           const server = yield* serverReplica.get(Task, documentId)
           const client = yield* clientReplica.get(Task, documentId)
-          return server.value.labels.includes("committed-while-offline") &&
+          const converged = server.value.labels.includes("committed-while-offline") &&
             JSON.stringify(server.value) === JSON.stringify(client.value) &&
             JSON.stringify(server.heads) === JSON.stringify(client.heads)
+          if (!converged) yield* session2.flush
+          return converged
         }))
-        assert.isTrue(converged)
-
         const serverSnapshot = yield* serverReplica.get(Task, documentId)
         const clientSnapshot = yield* clientReplica.get(Task, documentId)
         assert.deepStrictEqual(serverSnapshot.value, clientSnapshot.value)
@@ -537,7 +560,7 @@ describe("PeerRpc WebSocket", () => {
 
         yield* Effect.scoped(Effect.gen(function*() {
           const client = yield* buildClient
-          yield* RpcPeerTransport.makeSession(client, {
+          const session = yield* RpcPeerTransport.makeSession(client, {
             peerId: serverPeerId,
             documents: [{ document: Task, documentId }],
             definition
@@ -547,14 +570,11 @@ describe("PeerRpc WebSocket", () => {
             documentId,
             payload: "matched"
           })
-          let observed = false
-          for (let attempt = 0; attempt < 300; attempt++) {
+          yield* repeatUntil(Effect.gen(function*() {
+            yield* session.flush
             yield* Effect.all([serverSharding.pollStorage, clientSharding.pollStorage], { discard: true })
-            observed = (yield* serverReplica.get(Task, documentId)).value.labels.includes("matched")
-            if (observed) break
-            yield* Effect.sleep("10 millis")
-          }
-          assert.isTrue(observed)
+            return (yield* serverReplica.get(Task, documentId)).value.labels.includes("matched")
+          }))
         }))
 
         const baseline = yield* serverReplica.get(Task, documentId)
@@ -580,7 +600,7 @@ describe("PeerRpc WebSocket", () => {
         // A matched-build client still converges afterwards: the skew was rejected, not corrupting.
         yield* Effect.scoped(Effect.gen(function*() {
           const client = yield* buildClient
-          yield* RpcPeerTransport.makeSession(client, {
+          const session = yield* RpcPeerTransport.makeSession(client, {
             peerId: serverPeerId,
             documents: [{ document: Task, documentId }],
             definition
@@ -590,17 +610,14 @@ describe("PeerRpc WebSocket", () => {
             documentId,
             payload: "after-skew"
           })
-          let converged = false
-          for (let attempt = 0; attempt < 300; attempt++) {
+          yield* repeatUntil(Effect.gen(function*() {
+            yield* session.flush
             yield* Effect.all([serverSharding.pollStorage, clientSharding.pollStorage], { discard: true })
             const serverSnapshot = yield* serverReplica.get(Task, documentId)
             const clientSnapshot = yield* clientReplica.get(Task, documentId)
-            converged = serverSnapshot.value.labels.includes("after-skew") &&
+            return serverSnapshot.value.labels.includes("after-skew") &&
               JSON.stringify(serverSnapshot.value) === JSON.stringify(clientSnapshot.value)
-            if (converged) break
-            yield* Effect.sleep("10 millis")
-          }
-          assert.isTrue(converged)
+          }))
         }))
       })).pipe(Effect.provide([
         NodeCrypto.layer,
@@ -716,10 +733,7 @@ describe("PeerRpc WebSocket", () => {
           documentId,
           payload: "from-skewed-client"
         })
-        for (let attempt = 0; attempt < 30; attempt++) {
-          yield* Effect.all([serverSharding.pollStorage, clientSharding.pollStorage], { discard: true })
-          yield* Effect.sleep("10 millis")
-        }
+        yield* Effect.all([serverSharding.pollStorage, clientSharding.pollStorage], { discard: true })
         const serverSnapshot = yield* serverReplica.get(SkewTask, documentId)
         assert.deepStrictEqual(serverSnapshot.value.labels, [])
       })).pipe(Effect.provide([

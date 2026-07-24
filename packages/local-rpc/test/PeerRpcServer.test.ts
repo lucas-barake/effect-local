@@ -168,6 +168,7 @@ const makeFixture = (options: {
     const authorizationRelease = yield* Deferred.make<void>()
     const authorizationStarted = yield* Queue.unbounded<string>()
     const authorizationCalls = yield* Ref.make(0)
+    const sessionOpenCalls = yield* Ref.make(0)
     const subscriptions = yield* Ref.make(0)
     const publications = yield* Ref.make(0)
     let activeFibers = 0
@@ -252,13 +253,17 @@ const makeFixture = (options: {
     })
     const sync = PeerSync.PeerSync.of({
       open: (peerId) =>
-        failSessionOpen
-          ? Effect.fail(
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.StorageUnavailable({ cause: new Error("session startup failed") })
-            })
+        Ref.update(sessionOpenCalls, (count) => count + 1).pipe(
+          Effect.andThen(
+            failSessionOpen
+              ? Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({ cause: new Error("session startup failed") })
+                })
+              )
+              : Effect.succeed({ peerId, connectionEpoch: "local-epoch", replicaIncarnation: permit.incarnation })
           )
-          : Effect.succeed({ peerId, connectionEpoch: "local-epoch", replicaIncarnation: permit.incarnation }),
+        ),
       reset: () => Effect.void,
       generate: (_document, documentId) =>
         Queue.offer(generated, documentId).pipe(
@@ -508,6 +513,7 @@ const makeFixture = (options: {
       authorizationRelease,
       authorizationStarted,
       authorizationCalls,
+      sessionOpenCalls,
       subscriptions,
       publications,
       setCredential: (value: string) => Effect.sync(() => void (credential = value)),
@@ -615,6 +621,7 @@ describe("PeerRpcServer", () => {
       const malformedError = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [
           { documentType: Task.name, documentId: taskId },
           { documentType: Note.name, documentId: taskId }
@@ -640,6 +647,7 @@ describe("PeerRpcServer", () => {
       const malformedError = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: serverPeerId,
+        definitionHash,
         documents: [
           { documentType: Task.name, documentId: taskId },
           { documentType: Note.name, documentId: taskId }
@@ -1086,7 +1094,7 @@ describe("PeerRpcServer", () => {
       const cases = [
         {
           request: {
-            protocolVersion: 2,
+            protocolVersion: PeerRpc.protocolVersion + 1,
             expectedPeerId: serverPeerId,
             definitionHash,
             documents: [{ documentType: Task.name, documentId: taskId }]
@@ -1106,7 +1114,7 @@ describe("PeerRpcServer", () => {
           request: {
             protocolVersion: PeerRpc.protocolVersion,
             expectedPeerId: serverPeerId,
-            definitionHash: "def_ffffffffffffffffffffffffffffffff",
+            definitionHash: "def_ffffffffffffffff",
             documents: [{ documentType: Task.name, documentId: taskId }]
           },
           tag: "DefinitionMismatch"
@@ -1136,18 +1144,52 @@ describe("PeerRpcServer", () => {
           request: {
             protocolVersion: PeerRpc.protocolVersion,
             expectedPeerId: serverPeerId,
+            definitionHash,
             documents: [
               { documentType: Task.name, documentId: taskId },
               { documentType: Note.name, documentId: taskId }
             ]
           },
           tag: "InvalidRequest"
+        },
+        {
+          request: {
+            protocolVersion: PeerRpc.protocolVersion + 1,
+            expectedPeerId: remotePeerA,
+            definitionHash: "def_ffffffffffffffff",
+            documents: []
+          },
+          tag: "UnsupportedVersion"
+        },
+        {
+          request: {
+            protocolVersion: PeerRpc.protocolVersion,
+            expectedPeerId: remotePeerA,
+            definitionHash: "def_ffffffffffffffff",
+            documents: []
+          },
+          tag: "PeerMismatch"
+        },
+        {
+          request: {
+            protocolVersion: PeerRpc.protocolVersion,
+            expectedPeerId: serverPeerId,
+            definitionHash: "def_ffffffffffffffff",
+            documents: []
+          },
+          tag: "DefinitionMismatch"
         }
       ]
       for (const testCase of cases) {
         const error = yield* fixture.client.Open(testCase.request).pipe(Stream.runDrain, Effect.flip)
         assert.strictEqual(error._tag, testCase.tag)
       }
+      const legacyError = yield* fixture.client.Open({
+        protocolVersion: 1,
+        expectedPeerId: serverPeerId,
+        documents: [{ documentType: Task.name, documentId: taskId }]
+      }).pipe(Stream.runDrain, Effect.flip)
+      assert.instanceOf(legacyError, PeerRpcError.UnsupportedVersion)
       yield* fixture.setCredential("other-tenant")
       const tenantError = yield* fixture.client.Open({
         protocolVersion: PeerRpc.protocolVersion,
@@ -1157,6 +1199,36 @@ describe("PeerRpcServer", () => {
       }).pipe(Stream.runDrain, Effect.flip)
       assert.instanceOf(tenantError, PeerRpcError.AccessDenied)
       assert.strictEqual(yield* Ref.get(fixture.authorizationCalls), 0)
+      assert.strictEqual(yield* Ref.get(fixture.sessionOpenCalls), 0)
+    })))
+
+  it.effect("rejects authorized documents that do not belong to the configured definition", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const TaskV2 = Document.make(Task.name, {
+        schema: Schema.Struct({ title: Schema.String }),
+        version: Task.version + 1
+      })
+      const fixture = yield* makeFixture({
+        ...baseOptions,
+        authorization: (request) =>
+          Effect.succeed({
+            documents: request.documents.map(({ documentId }) => ({ document: TaskV2, documentId })),
+            validUntil: Number.MAX_SAFE_INTEGER,
+            invalidated: Effect.never
+          })
+      })
+      const exit = yield* fixture.client.Open({
+        protocolVersion: PeerRpc.protocolVersion,
+        expectedPeerId: serverPeerId,
+        definitionHash,
+        documents: [{ documentType: Task.name, documentId: taskId }]
+      }).pipe(Stream.take(1), Stream.runDrain, Effect.exit)
+      assert.isTrue(Exit.isFailure(exit))
+      if (Exit.isFailure(exit)) {
+        const error = Cause.findErrorOption(exit.cause)
+        assert.isTrue(Option.isSome(error) && error.value._tag === "AccessDenied")
+      }
+      assert.strictEqual(yield* Ref.get(fixture.sessionOpenCalls), 0)
     })))
 
   it.effect("mediates every direct authorization selection before session allocation", () =>

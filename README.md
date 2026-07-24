@@ -953,7 +953,7 @@ import * as Redacted from "effect/Redacted"
 import * as HttpRouter from "effect/unstable/http/HttpRouter"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
-import { Task } from "./domain.js"
+import { definition, Task } from "./domain.js"
 
 declare const authenticatedClientPeerId: Identity.PeerId
 declare const hostedServerPeerId: Identity.PeerId
@@ -997,7 +997,8 @@ const AuthenticationLive = PeerAuthentication.layerServer.pipe(
 
 const HandlersLive = PeerRpcServer.layerHandlers({
   tenantId: "acme",
-  peerId: hostedServerPeerId
+  peerId: hostedServerPeerId,
+  definition
 }).pipe(Layer.provide(PoliciesLive))
 
 const WsProtocol = RpcServer.layerProtocolWebsocket({ path: "/rpc" }).pipe(
@@ -1051,7 +1052,7 @@ import * as Layer from "effect/Layer"
 import * as Redacted from "effect/Redacted"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import { Task } from "./domain.js"
+import { definition, Task } from "./domain.js"
 import { EngineLive } from "./replica.js"
 
 declare const documentId: Identity.DocumentId
@@ -1076,7 +1077,8 @@ const synchronize = Effect.scoped(Effect.gen(function*() {
   const client = yield* PeerRpc.makeRpcClient
   const session = yield* RpcPeerTransport.makeSession(client, {
     peerId: hostedServerPeerId,
-    documents: [{ document: Task, documentId }]
+    documents: [{ document: Task, documentId }],
+    definition
   })
   yield* session.flush
   return yield* session.observedByPeer(documentId)
@@ -1092,7 +1094,8 @@ scope. Effect's socket protocol may reconnect the socket, but it cannot replay a
 stream. On retry, recreate the client scope and peer session. Reuse the same stable remote `PeerId` and requested
 document identities. A fresh Automerge sync state generates new messages from persisted canonical causal history.
 The prior epoch's SQL outbox is not resumed. Do not cache `SessionId`, connection epoch, stream, or middleware lease
-across scopes.
+across scopes. During a graceful server restart, close client connection scopes or otherwise close upgraded WebSocket
+connections before awaiting the HTTP server shutdown.
 
 `RpcPeerTransport.isRetryable` classifies only `ReplicaError(StorageUnavailable)` as retryable. Authentication,
 authorization, version, peer identity, request shape, and declared limit failures map to
@@ -1662,26 +1665,28 @@ planning:
 
 ### `@lucas-barake/effect-local-rpc`
 
-| Namespace            | Public API                                                                                                                                                                                                                                                                      |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PeerAuthentication` | `PeerPrincipal` schema and type, request service `AuthenticatedPeer`, required RPC middleware `PeerAuthentication`, argument free `layerServer`, argument free `layerClient`                                                                                                    |
-| `PeerAuthenticator`  | `PeerAuthenticator` service. `authenticate(Redacted<string>)` returns principal, finite `validUntil`, and `invalidated`, or `AuthenticationFailure`                                                                                                                             |
-| `PeerAuthorization`  | `PeerAuthorization` service and validating constructor `layer`. `authorize` returns exactly resolved `SelectedDocument` values, finite `validUntil`, and `invalidated`, or `AccessDenied` or `ServerUnavailable`                                                                |
-| `PeerCredentials`    | `PeerCredentials` service. `get` is an Effect that returns a rotating `Redacted<string>` or `AuthenticationFailure`                                                                                                                                                             |
-| `PeerRpc`            | `protocolVersion`, `RequestedDocument`, `Opened`, `Message`, `OpenEvent`, `OpenRpc`, `PushRpc`, `Rpcs`, generated `RpcClient`, `makeRpcClient`                                                                                                                                  |
-| `PeerRpcError`       | `AuthenticationFailure`, `AccessDenied`, `UnsupportedVersion`, `PeerMismatch`, `InvalidRequest`, `RequestLimitExceeded`, `RequestCapacityExceeded`, `SessionUnavailable`, `SessionOverloaded`, `ServerUnavailable`, union schema and type `PeerRpcError`, fixed `Defect` schema |
-| `PeerRpcLimits`      | `Values` schema and type, `defaults`, `InvalidPeerRpcLimits`, `PeerRpcLimits` service, `make`, `layer`, `layerDefaults`                                                                                                                                                         |
-| `PeerRpcServer`      | `layerHandlers({ tenantId, peerId })`                                                                                                                                                                                                                                           |
-| `RpcPeerTransport`   | `isRetryable`, advanced `layer(client, { documents })`, preferred `makeSession(client, { peerId, documents })`                                                                                                                                                                  |
+| Namespace            | Public API                                                                                                                                                                                                                                                                                            |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PeerAuthentication` | `PeerPrincipal` schema and type, request service `AuthenticatedPeer`, required RPC middleware `PeerAuthentication`, argument free `layerServer`, argument free `layerClient`                                                                                                                          |
+| `PeerAuthenticator`  | `PeerAuthenticator` service. `authenticate(Redacted<string>)` returns principal, finite `validUntil`, and `invalidated`, or `AuthenticationFailure`                                                                                                                                                   |
+| `PeerAuthorization`  | `PeerAuthorization` service and validating constructor `layer`. `authorize` returns exactly resolved `SelectedDocument` values, finite `validUntil`, and `invalidated`, or `AccessDenied` or `ServerUnavailable`                                                                                      |
+| `PeerCredentials`    | `PeerCredentials` service. `get` is an Effect that returns a rotating `Redacted<string>` or `AuthenticationFailure`                                                                                                                                                                                   |
+| `PeerRpc`            | `protocolVersion`, `DefinitionHash`, `RequestedDocument`, `Opened`, `Message`, `OpenEvent`, `OpenRpc`, `PushRpc`, `Rpcs`, generated `RpcClient`, `makeRpcClient`                                                                                                                                      |
+| `PeerRpcError`       | `AuthenticationFailure`, `AccessDenied`, `UnsupportedVersion`, `PeerMismatch`, `DefinitionMismatch`, `InvalidRequest`, `RequestLimitExceeded`, `RequestCapacityExceeded`, `SessionUnavailable`, `SessionOverloaded`, `ServerUnavailable`, union schema and type `PeerRpcError`, fixed `Defect` schema |
+| `PeerRpcLimits`      | `Values` schema and type, `defaults`, `InvalidPeerRpcLimits`, `PeerRpcLimits` service, `make`, `layer`, `layerDefaults`                                                                                                                                                                               |
+| `PeerRpcServer`      | `layerHandlers({ tenantId, peerId, definition })`                                                                                                                                                                                                                                                     |
+| `RpcPeerTransport`   | `isRetryable`, advanced `layer(client, { documents, definition })`, preferred `makeSession(client, { peerId, documents, definition })`                                                                                                                                                                |
 
 #### RPC procedure contract
 
-| Procedure | Request                                                                                            | Success                                                               | Typed errors         | Lifecycle                                                                                                                                                                                                     |
-| --------- | -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Open`    | `protocolVersion`, `expectedPeerId`, unique requested whole documents, middleware owned credential | Stream beginning with one `Opened`, followed only by `Message` events | Every `PeerRpcError` | Stream interruption is connection close. One active incarnation exists per authenticated peer                                                                                                                 |
-| `Push`    | Current `sessionId`, bounded byte payload, middleware owned credential                             | `void` after bounded in memory admission                              | Every `PeerRpcError` | Authenticated identity, current authorized session, ownership, lease, and limits are checked. Inbound overflow or any outbound capacity timeout revokes the session and fails `Open` with `SessionOverloaded` |
+| Procedure | Request                                                                                                              | Success                                                               | Typed errors         | Lifecycle                                                                                                                                                                                                     |
+| --------- | -------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Open`    | `protocolVersion`, `expectedPeerId`, `definitionHash`, unique requested whole documents, middleware owned credential | Stream beginning with one `Opened`, followed only by `Message` events | Every `PeerRpcError` | Stream interruption is connection close. One active incarnation exists per authenticated peer                                                                                                                 |
+| `Push`    | Current `sessionId`, bounded byte payload, middleware owned credential                                               | `void` after bounded in memory admission                              | Every `PeerRpcError` | Authenticated identity, current authorized session, ownership, lease, and limits are checked. Inbound overflow or any outbound capacity timeout revokes the session and fails `Open` with `SessionOverloaded` |
 
-`Opened` contains the negotiated version, new `SessionId`, server `PeerId`, and
+Protocol version `2` requires a canonical `definitionHash` in the `def_` plus 16 lowercase hexadecimal format. Version
+`1` requests remain decodable only so the server can reject them with `UnsupportedVersion`. `Opened` contains the
+negotiated version, new `SessionId`, server `PeerId`, and
 `capabilities: { storeAndForward: false }`. `Message` contains one `Uint8Array`. `OpenRpc` and `PushRpc` both carry the
 required `PeerAuthentication` middleware. `makeRpcClient` requires `RpcClient.Protocol`, client authentication
 middleware, and `Scope`. It deliberately does not return a package owned connection service.
