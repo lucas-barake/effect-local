@@ -55,6 +55,110 @@ describe("ReplicaDefinition", () => {
     )
   })
 
+  it("keeps the hash stable across documentation annotations", () => {
+    const plain = ReplicaDefinition.make({
+      name: "tasks",
+      documents: DocumentSet.make(
+        Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
+      )
+    })
+    const documented = ReplicaDefinition.make({
+      name: "tasks",
+      documents: DocumentSet.make(
+        Document.make("Task", {
+          schema: Schema.Struct({
+            title: Schema.String.pipe(Schema.annotate({
+              description: "The task title",
+              title: "Title",
+              examples: ["Buy milk"]
+            }))
+          }),
+          version: 1
+        })
+      )
+    })
+    assert.strictEqual(plain.hash, documented.hash)
+  })
+
+  it("changes the hash when a document field codec changes", () => {
+    const plain = ReplicaDefinition.make({
+      name: "tasks",
+      documents: DocumentSet.make(
+        Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
+      )
+    })
+    const codec = ReplicaDefinition.make({
+      name: "tasks",
+      documents: DocumentSet.make(
+        Document.make("Task", { schema: Schema.Struct({ title: Schema.NumberFromString }), version: 1 })
+      )
+    })
+    assert.notStrictEqual(plain.hash, codec.hash)
+  })
+
+  it("changes the hash when a mutation payload codec changes", () => {
+    const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
+    const definitionWith = (payload: Document.WireSchema) =>
+      ReplicaDefinition.make({
+        name: "tasks",
+        documents: DocumentSet.make(Task),
+        mutations: [Mutation.make("Rename", { document: Task, payload })]
+      })
+    assert.notStrictEqual(
+      definitionWith(Schema.String).hash,
+      definitionWith(Schema.NumberFromString).hash
+    )
+  })
+
+  it("changes the hash for every schema-bearing definition position", () => {
+    class StringFailure extends Schema.TaggedErrorClass<StringFailure>()("Failure", {
+      value: Schema.String
+    }) {}
+    class NumberFailure extends Schema.TaggedErrorClass<NumberFailure>()("Failure", {
+      value: Schema.NumberFromString
+    }) {}
+    const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
+    const make = (options: {
+      readonly mutation?: Mutation.Any
+      readonly projection?: Projection.Any
+      readonly query?: Query.Any
+    }) =>
+      ReplicaDefinition.make({
+        name: "tasks",
+        documents: DocumentSet.make(Task),
+        mutations: options.mutation === undefined ? [] : [options.mutation],
+        projections: options.projection === undefined ? [] : [options.projection],
+        queries: options.query === undefined ? [] : [options.query]
+      }).hash
+    const mutationSuccess = (success: Document.WireSchema) =>
+      make({ mutation: Mutation.make("Change", { document: Task, success }) })
+    const mutationError = (error: typeof StringFailure | typeof NumberFailure) =>
+      make({ mutation: Mutation.make("Change", { document: Task, error }) })
+    const projectionRow = (Row: Document.WireSchema) =>
+      make({
+        projection: Projection.make("Rows", {
+          document: Task,
+          version: 1,
+          Row,
+          key: String,
+          project: () => []
+        })
+      })
+    const queryPayload = (payload: Document.WireSchema) =>
+      make({ query: Query.make("Read", { payload, dependsOn: [] }) })
+    const querySuccess = (success: Document.WireSchema) =>
+      make({ query: Query.make("Read", { success, dependsOn: [] }) })
+    const queryError = (error: typeof StringFailure | typeof NumberFailure) =>
+      make({ query: Query.make("Read", { error, dependsOn: [] }) })
+
+    assert.notStrictEqual(mutationSuccess(Schema.String), mutationSuccess(Schema.NumberFromString))
+    assert.notStrictEqual(mutationError(StringFailure), mutationError(NumberFailure))
+    assert.notStrictEqual(projectionRow(Schema.String), projectionRow(Schema.NumberFromString))
+    assert.notStrictEqual(queryPayload(Schema.String), queryPayload(Schema.NumberFromString))
+    assert.notStrictEqual(querySuccess(Schema.String), querySuccess(Schema.NumberFromString))
+    assert.notStrictEqual(queryError(StringFailure), queryError(NumberFailure))
+  })
+
   it("defaults omitted collections to empty tuples", () => {
     const fixture = makeFixture()
     const minimal = ReplicaDefinition.make({

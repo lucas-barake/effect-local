@@ -1,10 +1,10 @@
-import * as Schema from "effect/Schema"
 import * as Canonical from "./Canonical.js"
 import type * as Document from "./Document.js"
 import type * as DocumentSet from "./DocumentSet.js"
 import type * as Mutation from "./Mutation.js"
 import type * as Projection from "./Projection.js"
 import type * as Query from "./Query.js"
+import * as SchemaDescriptor from "./SchemaDescriptor.js"
 
 export interface ReplicaDefinition<
   out Name extends string,
@@ -35,8 +35,6 @@ const assertUnique = (kind: string, values: ReadonlyArray<{ readonly name: strin
     names.add(value.name)
   }
 }
-
-const schemaDescriptor = (schema: Document.WireSchema) => Schema.toJsonSchemaDocument(schema)
 
 export const make = <
   const Name extends string,
@@ -86,29 +84,29 @@ export const make = <
       name: options.name,
       documents: documentSet.documents.map((document) => ({
         name: document.name,
-        schema: schemaDescriptor(document.schema),
+        schema: SchemaDescriptor.make(document.schema),
         version: document.version
       })),
       mutations: mutations.map((mutation) => ({
         document: mutation.document.name,
-        error: schemaDescriptor(mutation.errorSchema),
+        error: SchemaDescriptor.make(mutation.errorSchema),
         name: mutation.name,
-        payload: schemaDescriptor(mutation.payloadSchema),
-        success: schemaDescriptor(mutation.successSchema),
+        payload: SchemaDescriptor.make(mutation.payloadSchema),
+        success: SchemaDescriptor.make(mutation.successSchema),
         version: mutation.version
       })),
       projections: projections.map((projection) => ({
         document: projection.document.name,
         name: projection.name,
-        row: schemaDescriptor(projection.Row),
+        row: SchemaDescriptor.make(projection.Row),
         version: projection.version
       })),
       queries: queries.map((query) => ({
         dependencies: query.dependsOn.map((projection: Projection.Any) => projection.name),
-        error: schemaDescriptor(query.errorSchema),
+        error: SchemaDescriptor.make(query.errorSchema),
         name: query.name,
-        payload: schemaDescriptor(query.payloadSchema),
-        success: schemaDescriptor(query.successSchema),
+        payload: SchemaDescriptor.make(query.payloadSchema),
+        success: SchemaDescriptor.make(query.successSchema),
         version: query.version
       }))
     })
