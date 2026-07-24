@@ -1,6 +1,6 @@
 {
   "name": "@lucas-barake/effect-local-sql",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "SQLite persistence and durable execution for Effect Local",
   "homepage": "https://github.com/lucas-barake/effect-local#readme",
   "bugs": "https://github.com/lucas-barake/effect-local/issues",
