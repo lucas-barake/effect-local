@@ -120,6 +120,17 @@ describe("PeerSync", () => {
   const PendingReceiptServices = Layer.merge(PendingReceiptInfrastructure, PendingReceiptStoreService)
   const PendingReceiptSyncService = PeerSync.layer.pipe(Layer.provide(PendingReceiptServices))
   const PendingReceiptLayer = Layer.merge(PendingReceiptServices, PendingReceiptSyncService)
+  const CapacityReceiptLimits = ReplicaLimits.layer({
+    ...limits,
+    maxPendingChangesPerDocument: 1,
+    maxPendingChangesPerPeer: 1,
+    maxPendingChangesPerReplica: 1
+  })
+  const CapacityReceiptInfrastructure = Layer.mergeAll(Base, Gate, CapacityReceiptLimits)
+  const CapacityReceiptStoreService = DocumentStore.layer.pipe(Layer.provide(CapacityReceiptInfrastructure))
+  const CapacityReceiptServices = Layer.merge(CapacityReceiptInfrastructure, CapacityReceiptStoreService)
+  const CapacityReceiptSyncService = PeerSync.layer.pipe(Layer.provide(CapacityReceiptServices))
+  const CapacityReceiptLayer = Layer.merge(CapacityReceiptServices, CapacityReceiptSyncService)
 
   it.effect("does not issue a stale session during an exclusive claim", () =>
     Effect.gen(function*() {
@@ -469,7 +480,7 @@ describe("PeerSync", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(ReplicaReceiptLayer)))
 
-  it.effect("rejects a session once genuinely pending receipts exhaust the quota", () =>
+  it.effect("accepts a resolved receipt when genuinely pending receipts exhaust the quota", () =>
     Effect.gen(function*() {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
@@ -488,22 +499,22 @@ describe("PeerSync", () => {
           accepted_heads, commit_sequence, accepted_at
         ) VALUES (
           ${session.replicaIncarnation}, ${session.peerId}, ${session.connectionEpoch}, ${sequence}, ${documentId},
-          ${`pending-${sequence}`}, NULL, NULL, ${message}, '[]', '[]', 0, ${new Date(0).toISOString()}
+          ${`pending-${sequence}`}, NULL, NULL, ${message}, '[]', ${JSON.stringify(["a".repeat(64)])}, 0,
+          ${new Date(0).toISOString()}
         )`
       }
-      const exhausted = yield* Effect.exit(sync.receive(Task, documentId, session, {
+      const received = yield* sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: 2,
         message
-      }))
-      assert.strictEqual(exhausted._tag, "Failure")
-      if (exhausted._tag === "Failure") {
-        assert.strictEqual(Option.getOrThrow(Cause.findErrorOption(exhausted.cause)).reason._tag, "QuotaExceeded")
-      }
-      const rows = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+      })
+      assert.isFalse(received.duplicate)
+      const rows = yield* sql<{ readonly pending: number; readonly total: number }>`SELECT
+        COUNT(*) AS total,
+        COUNT(CASE WHEN pending_message IS NOT NULL THEN 1 END) AS pending
         FROM effect_local_peer_receipts
         WHERE peer_id = ${session.peerId} AND connection_epoch = ${session.connectionEpoch}`
-      assert.strictEqual(rows[0]?.count, 2)
+      assert.deepStrictEqual(rows, [{ pending: 2, total: 3 }])
       InternalAutomerge.free(remote)
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(ReceiptLayer)))
@@ -557,6 +568,18 @@ describe("PeerSync", () => {
         WHERE peer_id = ${session.peerId} AND connection_epoch = ${session.connectionEpoch}
           AND receive_sequence = ${pendingSequence} AND pending_message IS NOT NULL`
       assert.strictEqual(pendingRow[0]?.count, 1)
+      const beforeRejected = yield* sql<{
+        readonly acceptedHeads: string
+        readonly changes: number
+        readonly commitSequence: number
+        readonly materializedHeads: string
+        readonly receipts: number
+      }>`SELECT
+        (SELECT accepted_heads FROM effect_local_documents WHERE document_id = ${documentId}) AS acceptedHeads,
+        (SELECT COUNT(*) FROM effect_local_changes WHERE document_id = ${documentId}) AS changes,
+        (SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1) AS commitSequence,
+        (SELECT materialized_heads FROM effect_local_documents WHERE document_id = ${documentId}) AS materializedHeads,
+        (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts`
       const exhausted = yield* Effect.exit(sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: sequence++,
@@ -566,9 +589,442 @@ describe("PeerSync", () => {
       if (exhausted._tag === "Failure") {
         assert.strictEqual(Option.getOrThrow(Cause.findErrorOption(exhausted.cause)).reason._tag, "QuotaExceeded")
       }
+      const afterRejected = yield* sql<{
+        readonly acceptedHeads: string
+        readonly changes: number
+        readonly commitSequence: number
+        readonly materializedHeads: string
+        readonly receipts: number
+      }>`SELECT
+        (SELECT accepted_heads FROM effect_local_documents WHERE document_id = ${documentId}) AS acceptedHeads,
+        (SELECT COUNT(*) FROM effect_local_changes WHERE document_id = ${documentId}) AS changes,
+        (SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1) AS commitSequence,
+        (SELECT materialized_heads FROM effect_local_documents WHERE document_id = ${documentId}) AS materializedHeads,
+        (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts`
+      assert.deepStrictEqual(afterRejected, beforeRejected)
       InternalAutomerge.free(remote)
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(PendingReceiptLayer)))
+
+  it.effect("replays and resolves a pending receipt while every receipt quota is at capacity", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      let remote = Automerge.clone(created.automerge, { actor: "8".repeat(32) })
+      let remoteState = Automerge.initSyncState()
+      let sequence = 0
+      for (let round = 0; round < 4; round++) {
+        const outbound = Automerge.generateSyncMessage(remote, remoteState)
+        remoteState = outbound[0]
+        if (outbound[1] === null) break
+        const received = yield* sync.receive(Task, documentId, session, {
+          remoteConnectionEpoch: session.connectionEpoch,
+          receiveSequence: sequence++,
+          message: outbound[1]
+        })
+        if (received.reply !== null) {
+          const applied = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
+          remote = applied[0]
+          remoteState = applied[1]
+        }
+      }
+      remote = Automerge.change(remote, (draft) => {
+        ;(draft.value as { title: string }).title = "first"
+      })
+      const first = Automerge.generateSyncMessage(remote, remoteState)
+      remoteState = first[0]
+      assert.isNotNull(first[1])
+      remote = Automerge.change(remote, (draft) => {
+        ;(draft.value as unknown as { labels: Array<string> }).labels.push("second")
+      })
+      const second = Automerge.generateSyncMessage(remote, remoteState)
+      assert.isNotNull(second[1])
+      const pendingSequence = sequence++
+      yield* sync.receive(Task, documentId, session, {
+        remoteConnectionEpoch: session.connectionEpoch,
+        receiveSequence: pendingSequence,
+        message: second[1]!
+      })
+      const beforeRecovery = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+        FROM effect_local_peer_receipts
+        WHERE replica_incarnation = ${session.replicaIncarnation}
+          AND document_id = ${documentId} AND pending_message IS NOT NULL`
+      assert.strictEqual(beforeRecovery[0]?.count, 1)
+      const replay = yield* sync.receive(Task, documentId, session, {
+        remoteConnectionEpoch: session.connectionEpoch,
+        receiveSequence: pendingSequence,
+        message: second[1]!
+      })
+      assert.isTrue(replay.duplicate)
+
+      yield* sync.receive(Task, documentId, session, {
+        remoteConnectionEpoch: session.connectionEpoch,
+        receiveSequence: sequence++,
+        message: first[1]!
+      })
+
+      const afterRecovery = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+        FROM effect_local_peer_receipts
+        WHERE replica_incarnation = ${session.replicaIncarnation}
+          AND document_id = ${documentId} AND pending_message IS NOT NULL`
+      assert.strictEqual(afterRecovery[0]?.count, 0)
+      const reloaded = yield* store.load(Task, documentId)
+      assert.deepStrictEqual(reloaded.snapshot.value, { title: "first", labels: ["second"] })
+      InternalAutomerge.free(reloaded.automerge)
+      InternalAutomerge.free(remote)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(CapacityReceiptLayer)))
+
+  it.effect("accepts resolved input after the pending peer quota is lowered below durable usage", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const pendingDocumentCleanup = new Array<() => void>()
+      const makePending = (actor: string, sequenceBase: number) =>
+        Effect.gen(function*() {
+          const documentId = yield* Identity.makeDocumentId
+          const created = yield* store.create(Task, documentId, { title: actor, labels: [] })
+          let remote = Automerge.clone(created.automerge, { actor: actor.repeat(32) })
+          let remoteState = Automerge.initSyncState()
+          let sequence = sequenceBase
+          for (let round = 0; round < 4; round++) {
+            const outbound = Automerge.generateSyncMessage(remote, remoteState)
+            remoteState = outbound[0]
+            if (outbound[1] === null) break
+            const received = yield* sync.receive(Task, documentId, session, {
+              remoteConnectionEpoch: `remote-${actor}`,
+              receiveSequence: sequence++,
+              message: outbound[1]
+            })
+            if (received.reply !== null) {
+              const applied = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
+              remote = applied[0]
+              remoteState = applied[1]
+            }
+          }
+          remote = Automerge.change(remote, (draft) => {
+            ;(draft.value as { title: string }).title = `${actor}-first`
+          })
+          const dependency = Automerge.generateSyncMessage(remote, remoteState)
+          remoteState = dependency[0]
+          assert.isNotNull(dependency[1])
+          remote = Automerge.change(remote, (draft) => {
+            ;(draft.value as unknown as { labels: Array<string> }).labels.push(`${actor}-second`)
+          })
+          const dependent = Automerge.generateSyncMessage(remote, remoteState)
+          assert.isNotNull(dependent[1])
+          yield* sync.receive(Task, documentId, session, {
+            remoteConnectionEpoch: `remote-${actor}`,
+            receiveSequence: sequence,
+            message: dependent[1]!
+          })
+          pendingDocumentCleanup.push(() => {
+            InternalAutomerge.free(remote)
+            InternalAutomerge.free(created.automerge)
+          })
+        })
+      yield* makePending("e", 100)
+      yield* makePending("f", 200)
+      assert.deepStrictEqual(
+        yield* sql<{ readonly pending: number }>`SELECT COUNT(*) AS pending
+          FROM effect_local_peer_receipts
+          WHERE peer_id = ${session.peerId} AND pending_message IS NOT NULL`,
+        [{ pending: 2 }]
+      )
+
+      const resolvedDocumentId = yield* Identity.makeDocumentId
+      const resolvedCreated = yield* store.create(Task, resolvedDocumentId, { title: "resolved", labels: [] })
+      const resolvedRemote = Automerge.change(
+        Automerge.clone(resolvedCreated.automerge, { actor: "9".repeat(32) }),
+        (draft) => {
+          ;(draft.value as { title: string }).title = "accepted"
+        }
+      )
+      const resolvedMessage = Automerge.generateSyncMessage(resolvedRemote, Automerge.initSyncState())[1]!
+      const restartedExit = yield* Effect.scoped(
+        Effect.gen(function*() {
+          const restarted = yield* PeerSync.PeerSync
+          return yield* Effect.exit(restarted.receive(Task, resolvedDocumentId, session, {
+            remoteConnectionEpoch: "resolved-remote",
+            receiveSequence: 0,
+            message: resolvedMessage
+          }))
+        }).pipe(
+          Effect.provide(
+            Layer.fresh(PeerSync.layer).pipe(
+              Layer.provide(ReplicaLimits.layer({ ...limits, maxPendingChangesPerPeer: 1 }))
+            )
+          )
+        )
+      )
+      assert.strictEqual(restartedExit._tag, "Success")
+      for (const cleanup of pendingDocumentCleanup) cleanup()
+      InternalAutomerge.free(resolvedRemote)
+      InternalAutomerge.free(resolvedCreated.automerge)
+    }).pipe(Effect.provide(ReceiptLayer)))
+
+  it.effect("admits one concurrent pending receipt and rolls back the rejected admission", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const prepare = (actor: string, sequenceBase: number) =>
+        Effect.gen(function*() {
+          const documentId = yield* Identity.makeDocumentId
+          const remoteConnectionEpoch = `remote-${actor}`
+          const created = yield* store.create(Task, documentId, { title: actor, labels: [] })
+          let remote = Automerge.clone(created.automerge, { actor: actor.repeat(32) })
+          let remoteState = Automerge.initSyncState()
+          let sequence = sequenceBase
+          for (let round = 0; round < 4; round++) {
+            const outbound = Automerge.generateSyncMessage(remote, remoteState)
+            remoteState = outbound[0]
+            if (outbound[1] === null) break
+            const received = yield* sync.receive(Task, documentId, session, {
+              remoteConnectionEpoch,
+              receiveSequence: sequence++,
+              message: outbound[1]
+            })
+            if (received.reply !== null) {
+              const applied = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
+              remote = applied[0]
+              remoteState = applied[1]
+            }
+          }
+          remote = Automerge.change(remote, (draft) => {
+            ;(draft.value as { title: string }).title = `${actor}-first`
+          })
+          const dependency = Automerge.generateSyncMessage(remote, remoteState)
+          remoteState = dependency[0]
+          assert.isNotNull(dependency[1])
+          remote = Automerge.change(remote, (draft) => {
+            ;(draft.value as unknown as { labels: Array<string> }).labels.push(`${actor}-second`)
+          })
+          const dependent = Automerge.generateSyncMessage(remote, remoteState)
+          assert.isNotNull(dependent[1])
+          return {
+            created,
+            dependency: dependency[1]!,
+            dependent: dependent[1]!,
+            documentId,
+            remote,
+            remoteConnectionEpoch,
+            sequence
+          }
+        })
+      const prepared = [
+        yield* prepare("c", 100),
+        yield* prepare("d", 200)
+      ]
+      const attempts = yield* Effect.all(
+        prepared.map((item) =>
+          Effect.exit(sync.receive(Task, item.documentId, session, {
+            remoteConnectionEpoch: item.remoteConnectionEpoch,
+            receiveSequence: item.sequence,
+            message: item.dependent
+          }))
+        ),
+        { concurrency: "unbounded" }
+      )
+      const winnerIndex = attempts.findIndex((exit) => exit._tag === "Success")
+      const loserIndex = attempts.findIndex((exit) => exit._tag === "Failure")
+      assert.isAtLeast(winnerIndex, 0)
+      assert.isAtLeast(loserIndex, 0)
+      if (attempts[loserIndex]!._tag === "Failure") {
+        const error = Option.getOrThrow(Cause.findErrorOption(attempts[loserIndex]!.cause))
+        assert.strictEqual(error.reason._tag, "QuotaExceeded")
+        if (error.reason._tag === "QuotaExceeded") assert.strictEqual(error.reason.resource, "peer sync receipts")
+      }
+      assert.deepStrictEqual(
+        yield* sql<{ readonly pending: number }>`SELECT COUNT(*) AS pending
+          FROM effect_local_peer_receipts WHERE pending_message IS NOT NULL`,
+        [{ pending: 1 }]
+      )
+
+      const winner = prepared[winnerIndex]!
+      yield* sync.receive(Task, winner.documentId, session, {
+        remoteConnectionEpoch: winner.remoteConnectionEpoch,
+        receiveSequence: winner.sequence + 1,
+        message: winner.dependency
+      })
+      const loser = prepared[loserIndex]!
+      const retried = yield* sync.receive(Task, loser.documentId, session, {
+        remoteConnectionEpoch: loser.remoteConnectionEpoch,
+        receiveSequence: loser.sequence,
+        message: loser.dependent
+      })
+      assert.isFalse(retried.duplicate)
+      assert.deepStrictEqual(
+        yield* sql<{ readonly pending: number }>`SELECT COUNT(*) AS pending
+          FROM effect_local_peer_receipts WHERE pending_message IS NOT NULL`,
+        [{ pending: 1 }]
+      )
+      for (const item of prepared) {
+        InternalAutomerge.free(item.remote)
+        InternalAutomerge.free(item.created.automerge)
+      }
+    }).pipe(Effect.provide(CapacityReceiptLayer)))
+
+  it.effect("rejects pending receipts above the document quota across peers", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      const prepare = (session: PeerSync.Session, actor: string, sequenceBase: number) =>
+        Effect.gen(function*() {
+          const remoteConnectionEpoch = `remote-${actor}`
+          let remote = Automerge.clone(created.automerge, { actor: actor.repeat(32) })
+          let remoteState = Automerge.initSyncState()
+          let sequence = sequenceBase
+          for (let round = 0; round < 4; round++) {
+            const outbound = Automerge.generateSyncMessage(remote, remoteState)
+            remoteState = outbound[0]
+            if (outbound[1] === null) break
+            const received = yield* sync.receive(Task, documentId, session, {
+              remoteConnectionEpoch,
+              receiveSequence: sequence++,
+              message: outbound[1]
+            })
+            if (received.reply !== null) {
+              const applied = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
+              remote = applied[0]
+              remoteState = applied[1]
+            }
+          }
+          remote = Automerge.change(remote, (draft) => {
+            ;(draft.value as { title: string }).title = `${actor}-first`
+          })
+          const dependency = Automerge.generateSyncMessage(remote, remoteState)
+          remoteState = dependency[0]
+          assert.isNotNull(dependency[1])
+          remote = Automerge.change(remote, (draft) => {
+            ;(draft.value as unknown as { labels: Array<string> }).labels.push(`${actor}-second`)
+          })
+          const dependent = Automerge.generateSyncMessage(remote, remoteState)
+          assert.isNotNull(dependent[1])
+          return { dependent: dependent[1]!, remote, remoteConnectionEpoch, sequence }
+        })
+      const firstSession = yield* sync.open(yield* Identity.makePeerId)
+      const secondSession = yield* sync.open(yield* Identity.makePeerId)
+      const first = yield* prepare(firstSession, "e", 300)
+      const second = yield* prepare(secondSession, "f", 400)
+
+      yield* sync.receive(Task, documentId, firstSession, {
+        remoteConnectionEpoch: first.remoteConnectionEpoch,
+        receiveSequence: first.sequence,
+        message: first.dependent
+      })
+      const rejected = yield* Effect.exit(sync.receive(Task, documentId, secondSession, {
+        remoteConnectionEpoch: second.remoteConnectionEpoch,
+        receiveSequence: second.sequence,
+        message: second.dependent
+      }))
+      assert.strictEqual(rejected._tag, "Failure")
+      if (rejected._tag === "Failure") {
+        const error = Option.getOrThrow(Cause.findErrorOption(rejected.cause))
+        assert.strictEqual(error.reason._tag, "QuotaExceeded")
+        if (error.reason._tag === "QuotaExceeded") {
+          assert.strictEqual(error.reason.resource, "document sync receipts")
+        }
+      }
+      InternalAutomerge.free(first.remote)
+      InternalAutomerge.free(second.remote)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(CapacityReceiptLayer)))
+
+  it.effect("rejects pending receipts above the replica quota while isolating incarnations", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const prepare = (session: PeerSync.Session, actor: string, sequenceBase: number) =>
+        Effect.gen(function*() {
+          const documentId = yield* Identity.makeDocumentId
+          const remoteConnectionEpoch = `remote-${actor}`
+          const created = yield* store.create(Task, documentId, { title: actor, labels: [] })
+          let remote = Automerge.clone(created.automerge, { actor: actor.repeat(32) })
+          let remoteState = Automerge.initSyncState()
+          let sequence = sequenceBase
+          for (let round = 0; round < 4; round++) {
+            const outbound = Automerge.generateSyncMessage(remote, remoteState)
+            remoteState = outbound[0]
+            if (outbound[1] === null) break
+            const received = yield* sync.receive(Task, documentId, session, {
+              remoteConnectionEpoch,
+              receiveSequence: sequence++,
+              message: outbound[1]
+            })
+            if (received.reply !== null) {
+              const applied = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
+              remote = applied[0]
+              remoteState = applied[1]
+            }
+          }
+          remote = Automerge.change(remote, (draft) => {
+            ;(draft.value as { title: string }).title = `${actor}-first`
+          })
+          const dependency = Automerge.generateSyncMessage(remote, remoteState)
+          remoteState = dependency[0]
+          assert.isNotNull(dependency[1])
+          remote = Automerge.change(remote, (draft) => {
+            ;(draft.value as unknown as { labels: Array<string> }).labels.push(`${actor}-second`)
+          })
+          const dependent = Automerge.generateSyncMessage(remote, remoteState)
+          assert.isNotNull(dependent[1])
+          return { created, dependent: dependent[1]!, documentId, remote, remoteConnectionEpoch, sequence }
+        })
+      const firstSession = yield* sync.open(yield* Identity.makePeerId)
+      const secondSession = yield* sync.open(yield* Identity.makePeerId)
+      const first = yield* prepare(firstSession, "1", 500)
+      const second = yield* prepare(secondSession, "2", 600)
+      const otherIncarnationDocument = yield* Identity.makeDocumentId
+      const otherIncarnationCreated = yield* store.create(
+        Task,
+        otherIncarnationDocument,
+        { title: "retired", labels: [] }
+      )
+      yield* sql`INSERT INTO effect_local_peer_receipts (
+        replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id,
+        message_hash, reply, reply_hash, pending_message, heads,
+        accepted_heads, commit_sequence, accepted_at
+      ) VALUES (
+        ${firstSession.replicaIncarnation + 1}, ${firstSession.peerId}, 'retired', 0, ${otherIncarnationDocument},
+        'other-incarnation', NULL, NULL, ${new Uint8Array([1])}, '[]', ${JSON.stringify(["f".repeat(64)])}, 0,
+        ${new Date(0).toISOString()}
+      )`
+
+      yield* sync.receive(Task, first.documentId, firstSession, {
+        remoteConnectionEpoch: first.remoteConnectionEpoch,
+        receiveSequence: first.sequence,
+        message: first.dependent
+      })
+      const rejected = yield* Effect.exit(sync.receive(Task, second.documentId, secondSession, {
+        remoteConnectionEpoch: second.remoteConnectionEpoch,
+        receiveSequence: second.sequence,
+        message: second.dependent
+      }))
+      assert.strictEqual(rejected._tag, "Failure")
+      if (rejected._tag === "Failure") {
+        const error = Option.getOrThrow(Cause.findErrorOption(rejected.cause))
+        assert.strictEqual(error.reason._tag, "QuotaExceeded")
+        if (error.reason._tag === "QuotaExceeded") {
+          assert.strictEqual(error.reason.resource, "replica sync receipts")
+        }
+      }
+      for (const item of [first, second]) {
+        InternalAutomerge.free(item.remote)
+        InternalAutomerge.free(item.created.automerge)
+      }
+      InternalAutomerge.free(otherIncarnationCreated.automerge)
+    }).pipe(Effect.provide(CapacityReceiptLayer)))
 
   it.effect("bounds input before Automerge receive and resets connection state", () =>
     Effect.gen(function*() {

@@ -928,7 +928,7 @@ export const layer: Layer.Layer<
                     })
                   )
                   const receiptTotal = receiptTotals[0]
-                  if ((receiptTotal?.document_count ?? 0) >= limits.maxPendingChangesPerDocument) {
+                  if ((receiptTotal?.document_count ?? 0) > limits.maxPendingChangesPerDocument) {
                     return yield* new ReplicaError.ReplicaError({
                       reason: new ReplicaError.QuotaExceeded({
                         resource: "document sync receipts",
@@ -936,7 +936,7 @@ export const layer: Layer.Layer<
                       })
                     })
                   }
-                  if ((receiptTotal?.peer_count ?? 0) >= limits.maxPendingChangesPerPeer) {
+                  if ((receiptTotal?.peer_count ?? 0) > limits.maxPendingChangesPerPeer) {
                     return yield* new ReplicaError.ReplicaError({
                       reason: new ReplicaError.QuotaExceeded({
                         resource: "peer sync receipts",
@@ -944,7 +944,7 @@ export const layer: Layer.Layer<
                       })
                     })
                   }
-                  if ((receiptTotal?.replica_count ?? 0) >= limits.maxPendingChangesPerReplica) {
+                  if ((receiptTotal?.replica_count ?? 0) > limits.maxPendingChangesPerReplica) {
                     return yield* new ReplicaError.ReplicaError({
                       reason: new ReplicaError.QuotaExceeded({
                         resource: "replica sync receipts",
@@ -1075,13 +1075,7 @@ export const layer: Layer.Layer<
                           SchemaError: failStorageCorrupt
                         })
                       )
-                      const hashes = yield* validateExistingChanges(existingChanges)
-                      const incoming = changeBytes.filter((_, index) => !hashes.has(changes[index]!.hash))
-                      const incomingBytes = incoming.reduce((total, bytes) => total + bytes.byteLength, 0)
-                      const incomingDependencies = changes.filter((change) => !hashes.has(change.hash)).reduce(
-                        (total, change) => total + change.deps.length,
-                        0
-                      )
+                      yield* validateExistingChanges(existingChanges)
                       const validatePendingQuota = Effect.gen(function*() {
                         const pendingTotals = yield* findDocumentPendingChangeTotals(documentId).pipe(
                           Effect.catchTags({
@@ -1099,8 +1093,7 @@ export const layer: Layer.Layer<
                           })
                         )
                         if (
-                          (pendingTotals[0]?.bytes ?? 0) + (receiptPending[0]?.bytes ?? 0) +
-                              incomingBytes + unresolvedBytes >
+                          (pendingTotals[0]?.bytes ?? 0) + (receiptPending[0]?.bytes ?? 0) >
                             limits.maxPendingBytesPerDocument
                         ) {
                           return yield* new ReplicaError.ReplicaError({
@@ -1111,8 +1104,8 @@ export const layer: Layer.Layer<
                           })
                         }
                         if (
-                          (pendingTotals[0]?.count ?? 0) + (receiptPending[0]?.count ?? 0) + incoming.length +
-                              (unresolvedBytes === 0 ? 0 : 1) > limits.maxPendingChangesPerDocument
+                          (pendingTotals[0]?.count ?? 0) + (receiptPending[0]?.count ?? 0) >
+                            limits.maxPendingChangesPerDocument
                         ) {
                           return yield* new ReplicaError.ReplicaError({
                             reason: new ReplicaError.QuotaExceeded({
@@ -1122,8 +1115,7 @@ export const layer: Layer.Layer<
                           })
                         }
                         if (
-                          (pendingTotals[0]?.dependencies ?? 0) + incomingDependencies >
-                            limits.maxPendingDependencyEdgesPerDocument
+                          (pendingTotals[0]?.dependencies ?? 0) > limits.maxPendingDependencyEdgesPerDocument
                         ) {
                           return yield* new ReplicaError.ReplicaError({
                             reason: new ReplicaError.QuotaExceeded({
@@ -1148,8 +1140,7 @@ export const layer: Layer.Layer<
                           })
                         )
                         if (
-                          (peerTotals[0]?.bytes ?? 0) + (peerReceiptPending[0]?.bytes ?? 0) +
-                              incomingBytes + unresolvedBytes >
+                          (peerTotals[0]?.bytes ?? 0) + (peerReceiptPending[0]?.bytes ?? 0) >
                             limits.maxPendingBytesPerPeer
                         ) {
                           return yield* new ReplicaError.ReplicaError({
@@ -1160,8 +1151,8 @@ export const layer: Layer.Layer<
                           })
                         }
                         if (
-                          (peerTotals[0]?.count ?? 0) + (peerReceiptPending[0]?.count ?? 0) + incoming.length +
-                              (unresolvedBytes === 0 ? 0 : 1) > limits.maxPendingChangesPerPeer
+                          (peerTotals[0]?.count ?? 0) + (peerReceiptPending[0]?.count ?? 0) >
+                            limits.maxPendingChangesPerPeer
                         ) {
                           return yield* new ReplicaError.ReplicaError({
                             reason: new ReplicaError.QuotaExceeded({
@@ -1171,8 +1162,7 @@ export const layer: Layer.Layer<
                           })
                         }
                         if (
-                          (peerTotals[0]?.dependencies ?? 0) + incomingDependencies >
-                            limits.maxPendingDependencyEdgesPerPeer
+                          (peerTotals[0]?.dependencies ?? 0) > limits.maxPendingDependencyEdgesPerPeer
                         ) {
                           return yield* new ReplicaError.ReplicaError({
                             reason: new ReplicaError.QuotaExceeded({
@@ -1196,8 +1186,7 @@ export const layer: Layer.Layer<
                           })
                         )
                         if (
-                          (replicaTotals[0]?.bytes ?? 0) + (replicaReceiptPending[0]?.bytes ?? 0) +
-                              incomingBytes + unresolvedBytes >
+                          (replicaTotals[0]?.bytes ?? 0) + (replicaReceiptPending[0]?.bytes ?? 0) >
                             limits.maxPendingBytesPerReplica
                         ) {
                           return yield* new ReplicaError.ReplicaError({
@@ -1208,8 +1197,8 @@ export const layer: Layer.Layer<
                           })
                         }
                         if (
-                          (replicaTotals[0]?.count ?? 0) + (replicaReceiptPending[0]?.count ?? 0) + incoming.length +
-                              (unresolvedBytes === 0 ? 0 : 1) > limits.maxPendingChangesPerReplica
+                          (replicaTotals[0]?.count ?? 0) + (replicaReceiptPending[0]?.count ?? 0) >
+                            limits.maxPendingChangesPerReplica
                         ) {
                           return yield* new ReplicaError.ReplicaError({
                             reason: new ReplicaError.QuotaExceeded({
@@ -1219,8 +1208,7 @@ export const layer: Layer.Layer<
                           })
                         }
                         if (
-                          (replicaTotals[0]?.dependencies ?? 0) + incomingDependencies >
-                            limits.maxPendingDependencyEdgesPerReplica
+                          (replicaTotals[0]?.dependencies ?? 0) > limits.maxPendingDependencyEdgesPerReplica
                         ) {
                           return yield* new ReplicaError.ReplicaError({
                             reason: new ReplicaError.QuotaExceeded({
@@ -1325,8 +1313,6 @@ export const layer: Layer.Layer<
                             }))
                           })
                           yield* validateExistingChanges(committedChanges)
-                          yield* validateReceiptQuota
-                          yield* validatePendingQuota
                           yield* gate.validate(permit)
                           const commitSequence = transition ? yield* nextSequence : yield* currentSequence
                           for (let index = 0; index < changes.length; index++) {
@@ -1413,6 +1399,10 @@ export const layer: Layer.Layer<
             ${unresolvedBytes === 0 ? null : message}, ${Schema.encodeSync(Heads)(materializedHeads)},
             ${Schema.encodeSync(Heads)(acceptedHeads)}, ${commitSequence}, ${acceptedAt}
           )`
+                          if (unresolvedBytes !== 0) {
+                            yield* validateReceiptQuota
+                            yield* validatePendingQuota
+                          }
                           return { _tag: "Committed" as const, commitSequence, reply }
                         })).pipe(
                           Effect.catchTags({
