@@ -19,14 +19,18 @@ const start = async () => {
     import("./app.tsx"),
     import("./replica-client.ts")
   ])
-  createRoot(document.querySelector("#root")!).render(
+  const root = createRoot(document.querySelector("#root")!)
+  root.render(
     <StrictMode>
       <RegistryProvider>
         <App />
       </RegistryProvider>
     </StrictMode>
   )
-  window.addEventListener("pagehide", dispose, { once: true })
+  window.addEventListener("pagehide", () => {
+    void dispose()
+    root.unmount()
+  }, { once: true })
 }
 
 void start()

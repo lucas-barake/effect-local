@@ -46,9 +46,11 @@
     "build:tsgo": "tsgo -b tsconfig.json",
     "check": "tsc -b tsconfig.json",
     "test": "vitest --config vitest.config.ts",
-    "test:browser": "pnpm run test:browser:durability && pnpm run test:browser:ownership",
+    "test:browser": "pnpm run test:browser:durability && pnpm run test:browser:durability:production && pnpm run test:browser:ownership && pnpm run test:browser:ownership:production",
     "test:browser:durability": "playwright test --config test-browser/durability/playwright.config.ts",
-    "test:browser:ownership": "playwright test --config test-browser/ownership/playwright.config.ts"
+    "test:browser:durability:production": "playwright test --config test-browser/durability/playwright.production.config.ts",
+    "test:browser:ownership": "playwright test --config test-browser/ownership/playwright.config.ts",
+    "test:browser:ownership:production": "playwright test --config test-browser/ownership/playwright.production.config.ts"
   },
   "dependencies": {
     "@lucas-barake/effect-local": "workspace:^",
