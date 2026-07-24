@@ -13,7 +13,6 @@ import { definition, DomainLive, limits, TaskListSql } from "./domain.ts"
 declare const self: SharedWorkerGlobalScope
 
 const makeEngine = (databasePort: MessagePort, providerPort: MessagePort) => {
-  databasePort.start()
   const DatabaseLive = BrowserSqlite.layerMessagePort(databasePort)
   const DependenciesLive = Layer.mergeAll(
     DatabaseLive,
