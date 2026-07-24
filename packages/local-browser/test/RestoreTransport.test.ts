@@ -351,7 +351,7 @@ it.effect("reserves an outstanding Pull sequence before posting the authoritativ
             {
               _tag: "End",
               nonce: started.nonce,
-              sequence: 1
+              sequence: RestoreProtocol.RestoreSequence.make(1)
             } satisfies RestoreProtocol.End
           )
           started.port.postMessage(

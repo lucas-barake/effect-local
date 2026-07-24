@@ -1097,9 +1097,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 Deferred.succeed(opened, payload.sessionId).pipe(Effect.andThen(value(payload)))
             }
             if (property === "BeginRestoreBackupV4") {
-              return (payload: never) =>
-                value(payload).pipe(
-                  Effect.tap(({ port }: { readonly port: MessagePort }) =>
+              return (payload: Parameters<typeof target.BeginRestoreBackupV4>[0]) =>
+                target.BeginRestoreBackupV4(payload).pipe(
+                  Effect.tap(({ port }) =>
                     Effect.sync(() => {
                       port.addEventListener("message", (event: MessageEvent<unknown>) => {
                         if (
