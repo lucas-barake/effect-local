@@ -448,7 +448,7 @@ export const layerHandlers = (options: { readonly tenantId: string; readonly pee
         const subject = subjectState(subjectId, now)
         if (subject === undefined) return "Capacity" as const
         const storedUpdatedAt = operation === "Open" ? subject.openUpdatedAt : subject.pushUpdatedAt
-        const effectiveNow = Math.max(now, storedUpdatedAt, subject.lastUsedAt)
+        const effectiveNow = Math.max(now, subject.openUpdatedAt, subject.pushUpdatedAt)
         const elapsed = effectiveNow - storedUpdatedAt
         if (operation === "Open") {
           subject.openTokens = Math.min(
