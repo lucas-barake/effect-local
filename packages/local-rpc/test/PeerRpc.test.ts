@@ -106,6 +106,7 @@ describe("PeerRpc", () => {
       const events = yield* client.Open({
         protocolVersion: PeerRpc.protocolVersion,
         expectedPeerId: peerId,
+        definitionHash: "def_0000000000000000",
         documents: [{ documentType: "Task", documentId }]
       }).pipe(Stream.runCollect)
       yield* client.Push({ sessionId, payload: Uint8Array.of(4, 5, 6) })
@@ -120,10 +121,11 @@ describe("PeerRpc", () => {
       assert.strictEqual(Redacted.value((yield* Deferred.await(pushRequest)).credential!), "secret")
     })))
 
-  it("roundtrips every version one request and response event", () => {
+  it("roundtrips every current-version request and response event", () => {
     const open = PeerRpc.OpenRpc.payloadSchema.make({
       protocolVersion: PeerRpc.protocolVersion,
       expectedPeerId: peerId,
+      definitionHash: "def_0000000000000000",
       documents: [{ documentType: "Task", documentId }]
     })
     const opened = PeerRpc.Opened.make({
@@ -150,6 +152,7 @@ describe("PeerRpc", () => {
       new PeerRpcError.AccessDenied(),
       new PeerRpcError.UnsupportedVersion(),
       new PeerRpcError.PeerMismatch(),
+      new PeerRpcError.DefinitionMismatch(),
       new PeerRpcError.InvalidRequest(),
       new PeerRpcError.RequestLimitExceeded(),
       new PeerRpcError.RequestCapacityExceeded(),
@@ -159,7 +162,9 @@ describe("PeerRpc", () => {
     ]
 
     for (const error of errors) {
-      assert.deepStrictEqual(Schema.encodeSync(PeerRpcError.PeerRpcError)(error), { _tag: error._tag })
+      const encoded = Schema.encodeSync(PeerRpcError.PeerRpcError)(error)
+      assert.deepStrictEqual(encoded, { _tag: error._tag })
+      assert.strictEqual(Schema.decodeUnknownSync(PeerRpcError.PeerRpcError)(encoded)._tag, error._tag)
     }
   })
 
@@ -173,8 +178,66 @@ describe("PeerRpc", () => {
       Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)({
         protocolVersion: 1,
         expectedPeerId: "peer_invalid",
+        definitionHash: "def_0000000000000000",
         documents: [{ documentType: "", documentId }]
       })
     )
+  })
+
+  it("rejects malformed definition hashes at the wire boundary", () => {
+    for (
+      const definitionHash of [
+        "",
+        "def_short",
+        "bad_0000000000000000",
+        "def_000000000000000G",
+        "def_000000000000000A",
+        "def_00000000000000000",
+        "x".repeat(1024 * 1024)
+      ]
+    ) {
+      assert.throws(() =>
+        Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)({
+          protocolVersion: PeerRpc.protocolVersion,
+          expectedPeerId: peerId,
+          definitionHash,
+          documents: [{ documentType: "Task", documentId }]
+        })
+      )
+    }
+  })
+
+  it("requires a definition hash for the current protocol version", () => {
+    assert.throws(() =>
+      Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)({
+        protocolVersion: PeerRpc.protocolVersion,
+        expectedPeerId: peerId,
+        documents: [{ documentType: "Task", documentId }]
+      })
+    )
+  })
+
+  it("keeps version one requests decodable for a typed version rejection", () => {
+    const legacy = Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)({
+      protocolVersion: 1,
+      expectedPeerId: peerId,
+      documents: [{ documentType: "Task", documentId }]
+    })
+    assert.strictEqual(legacy.protocolVersion, 1)
+    assert.notStrictEqual(PeerRpc.protocolVersion, 1)
+
+    const VersionOneOpen = Schema.Struct({
+      protocolVersion: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+      expectedPeerId: Identity.PeerId,
+      documents: Schema.Array(PeerRpc.RequestedDocument)
+    })
+    const decodedByVersionOne = Schema.decodeUnknownSync(VersionOneOpen)({
+      protocolVersion: PeerRpc.protocolVersion,
+      expectedPeerId: peerId,
+      definitionHash: "def_0000000000000000",
+      documents: [{ documentType: "Task", documentId }]
+    })
+    assert.strictEqual(decodedByVersionOne.protocolVersion, PeerRpc.protocolVersion)
+    assert.notStrictEqual(decodedByVersionOne.protocolVersion, 1)
   })
 })

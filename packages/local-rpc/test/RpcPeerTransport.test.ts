@@ -1,7 +1,9 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Document from "@lucas-barake/effect-local/Document"
+import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
+import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
@@ -25,6 +27,7 @@ import * as PeerRpcError from "../src/PeerRpcError.js"
 import * as RpcPeerTransport from "../src/RpcPeerTransport.js"
 
 const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
+const TaskV2 = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 2 })
 const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
 const replicaId = Identity.ReplicaId.make("rep_00000000-0000-4000-8000-000000000001")
 const serverPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001")
@@ -32,6 +35,13 @@ const otherPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000
 const sessionId = Identity.SessionId.make("ses_00000000-0000-4000-8000-000000000001")
 const otherSessionId = Identity.SessionId.make("ses_00000000-0000-4000-8000-000000000002")
 const documents = [{ document: Task, documentId }]
+const definition = ReplicaDefinition.make({
+  name: "rpc-peer-transport-test",
+  documents: DocumentSet.make(Task),
+  mutations: [],
+  projections: [],
+  queries: []
+})
 
 const opened = (peerId: Identity.PeerId, openSessionId: Identity.SessionId) =>
   PeerRpc.Opened.make({
@@ -53,7 +63,7 @@ const makeClient = (
 
 const connect = (client: PeerRpc.RpcClient, peerId: Identity.PeerId) =>
   Effect.gen(function*() {
-    const context = yield* Layer.build(RpcPeerTransport.layer(client, { documents }))
+    const context = yield* Layer.build(RpcPeerTransport.layer(client, { documents, definition }))
     return yield* Context.get(context, PeerTransport.PeerTransport).connect({ replicaId, peerId })
   })
 
@@ -79,6 +89,29 @@ describe("RpcPeerTransport", () => {
       assert.strictEqual(connection.peerId, serverPeerId)
       assert.deepStrictEqual(yield* Stream.runCollect(connection.receive), [payload])
       yield* connection.close
+    })))
+
+  it.effect("rejects selected documents that do not belong to the supplied definition", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const opens = yield* Ref.make(0)
+      const client = makeClient(
+        () => Ref.update(opens, (count) => count + 1).pipe(Effect.as(liveOpen(serverOpened)), Stream.unwrap),
+        () => Effect.void
+      )
+      const context = yield* Layer.build(RpcPeerTransport.layer(client, {
+        documents: [{ document: TaskV2, documentId }],
+        definition
+      }))
+      const exit = yield* Context.get(context, PeerTransport.PeerTransport).connect({
+        replicaId,
+        peerId: serverPeerId
+      }).pipe(Effect.exit)
+      assert.isTrue(Exit.isFailure(exit))
+      if (Exit.isFailure(exit)) {
+        const error = Cause.findErrorOption(exit.cause)
+        assert.isTrue(Option.isSome(error) && error.value.reason._tag === "ProtocolMismatch")
+      }
+      assert.strictEqual(yield* Ref.get(opens), 0)
     })))
 
   it.effect("records adapter boundaries without peer session document or payload values", () => {
@@ -464,7 +497,7 @@ describe("RpcPeerTransport", () => {
   it.effect("reports storeAndForward false", () =>
     Effect.scoped(Effect.gen(function*() {
       const client = makeClient(() => liveOpen(serverOpened), () => Effect.void)
-      const context = yield* Layer.build(RpcPeerTransport.layer(client, { documents }))
+      const context = yield* Layer.build(RpcPeerTransport.layer(client, { documents, definition }))
       const transport = Context.get(context, PeerTransport.PeerTransport)
       assert.isFalse(transport.capabilities.storeAndForward)
       const connection = yield* transport.connect({ replicaId, peerId: serverPeerId })
@@ -617,7 +650,7 @@ describe("RpcPeerTransport", () => {
         () => liveOpen(serverOpened),
         (request) => Deferred.succeed(pushed, request).pipe(Effect.asVoid)
       )
-      const context = yield* Layer.build(RpcPeerTransport.layer(client, { documents }))
+      const context = yield* Layer.build(RpcPeerTransport.layer(client, { documents, definition }))
       const connection = yield* Context.get(context, PeerTransport.PeerTransport).connect({
         replicaId,
         peerId: serverPeerId

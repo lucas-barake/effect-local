@@ -11,7 +11,7 @@ import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import * as PeerAuthentication from "./PeerAuthentication.js"
 import * as PeerRpcError from "./PeerRpcError.js"
 
-export const protocolVersion = 1
+export const protocolVersion = 2
 
 export const RequestedDocument = Schema.Struct({
   documentType: Schema.NonEmptyString,
@@ -37,13 +37,23 @@ export type OpenEvent = typeof OpenEvent.Type
 
 const Credential = Schema.optionalKey(Schema.RedactedFromValue(Schema.String))
 
+export const DefinitionHash = Schema.String.check(Schema.isPattern(/^def_[0-9a-f]{16}$/))
+
+const OpenPayload = Schema.Struct({
+  protocolVersion: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  expectedPeerId: Identity.PeerId,
+  definitionHash: Schema.optionalKey(DefinitionHash),
+  documents: Schema.Array(RequestedDocument),
+  credential: Credential
+}).check(
+  Schema.makeFilter(
+    (request) => request.protocolVersion !== protocolVersion || request.definitionHash !== undefined,
+    { expected: `definitionHash for protocol version ${protocolVersion}` }
+  )
+)
+
 export class OpenRpc extends Rpc.make("Open", {
-  payload: {
-    protocolVersion: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-    expectedPeerId: Identity.PeerId,
-    documents: Schema.Array(RequestedDocument),
-    credential: Credential
-  },
+  payload: OpenPayload,
   success: OpenEvent,
   error: PeerRpcError.PeerRpcError,
   defect: PeerRpcError.Defect,
