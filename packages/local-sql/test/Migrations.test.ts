@@ -23,7 +23,9 @@ describe("Migrations", () => {
         "effect_local_peer_outbox_connection_status",
         "effect_local_peer_outbox_incarnation_created",
         "effect_local_peer_receipts_document_sequence",
-        "effect_local_peer_receipts_incarnation_accepted"
+        "effect_local_peer_receipts_incarnation_accepted",
+        "effect_local_peer_receipts_pending_document",
+        "effect_local_peer_receipts_pending_peer"
       ])
       const readinessIndexes = yield* sql<{ readonly name: string }>`
         SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (
@@ -49,6 +51,30 @@ describe("Migrations", () => {
       assert.isTrue(
         readinessPlan.some((row) => row.detail.includes("effect_local_document_projections_not_ready"))
       )
+      const receiptQuotaPlan = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN
+        SELECT
+          (SELECT COUNT(*) FROM effect_local_peer_receipts
+            WHERE replica_incarnation = 1
+              AND document_id = 'document-1'
+              AND pending_message IS NOT NULL),
+          (SELECT COUNT(*) FROM effect_local_peer_receipts
+            WHERE replica_incarnation = 1
+              AND peer_id = 'peer-1'
+              AND pending_message IS NOT NULL),
+          (SELECT COUNT(*) FROM effect_local_peer_receipts
+            WHERE replica_incarnation = 1
+              AND pending_message IS NOT NULL)
+      `
+      assert.isTrue(
+        receiptQuotaPlan.some((row) => row.detail.includes("effect_local_peer_receipts_pending_document"))
+      )
+      assert.isTrue(
+        receiptQuotaPlan.some((row) => row.detail.includes("effect_local_peer_receipts_pending_peer"))
+      )
+      assert.strictEqual(
+        receiptQuotaPlan.filter((row) => row.detail.includes("effect_local_peer_receipts_pending_")).length,
+        3
+      )
       yield* sql`UPDATE effect_local_migration_catalog SET checksum = 'changed' WHERE migration_id = 1`
       assert.strictEqual((yield* Effect.exit(Migrations.run))._tag, "Failure")
     }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
@@ -66,17 +92,21 @@ describe("Migrations", () => {
       assert.strictEqual(error._tag, "MigrationError")
       assert.include(error.message, "Canonical store")
 
-      const index = yield* sql<{ readonly name: string }>`
+      const indexes = yield* sql<{ readonly name: string }>`
         SELECT name FROM sqlite_master
-        WHERE type = 'index' AND name = 'effect_local_document_projections_not_ready'
+        WHERE type = 'index' AND name IN (
+          'effect_local_document_projections_not_ready',
+          'effect_local_peer_receipts_pending_document',
+          'effect_local_peer_receipts_pending_peer'
+        )
       `
-      assert.strictEqual(index.length, 0)
+      assert.strictEqual(indexes.length, 0)
       const recorded = yield* sql<{ readonly migration_id: number }>`
-        SELECT migration_id FROM effect_local_migrations WHERE migration_id = 4
+        SELECT migration_id FROM effect_local_migrations WHERE migration_id IN (4, 5)
       `
       assert.strictEqual(recorded.length, 0)
       const catalog = yield* sql<{ readonly migration_id: number }>`
-        SELECT migration_id FROM effect_local_migration_catalog WHERE migration_id = 4
+        SELECT migration_id FROM effect_local_migration_catalog WHERE migration_id IN (4, 5)
       `
       assert.strictEqual(catalog.length, 0)
     }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
@@ -105,7 +135,11 @@ describe("Migrations", () => {
         ('checkpoint-4', 'task-1', '[]', ${new Uint8Array([4])}, 'checksum-4', 4, 0)`
 
       const applied = yield* Migrations.run
-      assert.deepStrictEqual(applied, [[3, "durability_indexes"], [4, "projection_readiness"]])
+      assert.deepStrictEqual(applied, [
+        [3, "durability_indexes"],
+        [4, "projection_readiness"],
+        [5, "pending_receipt_indexes"]
+      ])
 
       const outbox = yield* sql<{ readonly created_at: string }>`
         SELECT created_at FROM effect_local_peer_outbox WHERE message_hash = 'message-1'
@@ -128,7 +162,8 @@ describe("Migrations", () => {
         { migration_id: 1, name: "canonical_store", checksum: Migrations.canonicalStoreChecksum },
         { migration_id: 2, name: "peer_sync", checksum: Migrations.peerSyncChecksum },
         { migration_id: 3, name: "durability_indexes", checksum: Migrations.durabilityIndexesChecksum },
-        { migration_id: 4, name: "projection_readiness", checksum: Migrations.projectionReadinessChecksum }
+        { migration_id: 4, name: "projection_readiness", checksum: Migrations.projectionReadinessChecksum },
+        { migration_id: 5, name: "pending_receipt_indexes", checksum: Migrations.pendingReceiptIndexesChecksum }
       ])
 
       const indexes = yield* sql<{ readonly name: string }>`
@@ -139,7 +174,9 @@ describe("Migrations", () => {
           'effect_local_documents_type_projection_status',
           'effect_local_projection_registry_name_status',
           'effect_local_peer_outbox_incarnation_created',
-          'effect_local_peer_receipts_incarnation_accepted'
+          'effect_local_peer_receipts_incarnation_accepted',
+          'effect_local_peer_receipts_pending_document',
+          'effect_local_peer_receipts_pending_peer'
         ) ORDER BY name
       `
       assert.deepStrictEqual(indexes.map((row) => row.name), [
@@ -149,6 +186,8 @@ describe("Migrations", () => {
         "effect_local_documents_type_projection_status",
         "effect_local_peer_outbox_incarnation_created",
         "effect_local_peer_receipts_incarnation_accepted",
+        "effect_local_peer_receipts_pending_document",
+        "effect_local_peer_receipts_pending_peer",
         "effect_local_projection_registry_name_status"
       ])
     }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))

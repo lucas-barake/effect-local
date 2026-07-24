@@ -10,6 +10,7 @@ export const canonicalStoreChecksum = "sha256:effect-local-canonical-store-v1"
 export const peerSyncChecksum = "sha256:effect-local-peer-sync-v3"
 export const durabilityIndexesChecksum = "sha256:effect-local-durability-indexes-v1"
 export const projectionReadinessChecksum = "sha256:effect-local-projection-readiness-v1"
+export const pendingReceiptIndexesChecksum = "sha256:effect-local-pending-receipt-indexes-v1"
 
 const migration = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
@@ -197,11 +198,24 @@ const projectionReadinessMigration = Effect.gen(function*() {
     VALUES (4, 'projection_readiness', ${projectionReadinessChecksum})`
 })
 
+const pendingReceiptIndexesMigration = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`CREATE INDEX effect_local_peer_receipts_pending_document
+    ON effect_local_peer_receipts(replica_incarnation, document_id)
+    WHERE pending_message IS NOT NULL`
+  yield* sql`CREATE INDEX effect_local_peer_receipts_pending_peer
+    ON effect_local_peer_receipts(replica_incarnation, peer_id)
+    WHERE pending_message IS NOT NULL`
+  yield* sql`INSERT INTO effect_local_migration_catalog (migration_id, name, checksum)
+    VALUES (5, 'pending_receipt_indexes', ${pendingReceiptIndexesChecksum})`
+})
+
 export const loader = Migrator.fromRecord({
   "1_canonical_store": migration,
   "2_peer_sync": peerSyncMigration,
   "3_durability_indexes": durabilityIndexesMigration,
-  "4_projection_readiness": projectionReadinessMigration
+  "4_projection_readiness": projectionReadinessMigration,
+  "5_pending_receipt_indexes": pendingReceiptIndexesMigration
 })
 
 const migrate = Migrator.make({})({ loader, table: "effect_local_migrations" })
@@ -218,7 +232,13 @@ export const run = Effect.gen(function*() {
     { id: 1, name: "canonical_store", checksum: canonicalStoreChecksum, label: "Canonical store" },
     { id: 2, name: "peer_sync", checksum: peerSyncChecksum, label: "Peer sync" },
     { id: 3, name: "durability_indexes", checksum: durabilityIndexesChecksum, label: "Durability indexes" },
-    { id: 4, name: "projection_readiness", checksum: projectionReadinessChecksum, label: "Projection readiness" }
+    { id: 4, name: "projection_readiness", checksum: projectionReadinessChecksum, label: "Projection readiness" },
+    {
+      id: 5,
+      name: "pending_receipt_indexes",
+      checksum: pendingReceiptIndexesChecksum,
+      label: "Pending receipt indexes"
+    }
   ] as const
   // One transaction over migrate + validation so a rejected catalog rolls back
   // the freshly applied migrations instead of leaving a partial schema.
