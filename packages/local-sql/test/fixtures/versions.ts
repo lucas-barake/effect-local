@@ -3,13 +3,13 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import { fileURLToPath } from "node:url"
 
-export const documentId = "task-1"
-export const outboxMessageHash = "message-1"
+const documentId = "task-1"
+const outboxMessageHash = "message-1"
 
 const frozenOutboxCreatedAt = "2020-01-01T00:00:00.000Z"
-const survivingCheckpoints = ["checkpoint-1", "checkpoint-3"] as const
 const outboxMessage = new Uint8Array([1])
 
+export const fixtureDirectory = fileURLToPath(new URL(".", import.meta.url))
 export const fixturePath = (file: string): string => fileURLToPath(new URL(`./${file}`, import.meta.url))
 
 type Seed = Effect.Effect<void, SqlError.SqlError, SqlClient.SqlClient>
@@ -66,16 +66,13 @@ const seedV3: Seed = Effect.gen(function*() {
   )`
 })
 
-type OutboxExpectation = "none" | "backfilled" | { readonly frozen: string }
+export type HistoricalVersion = 1 | 2 | 3
 
 export interface FixtureSpec {
-  readonly version: number
+  readonly version: HistoricalVersion
   readonly file: string
   readonly appliedThroughId: number
   readonly seed: Seed
-  readonly expectedApplied: ReadonlyArray<readonly [number, string]>
-  readonly expectedCheckpoints: ReadonlyArray<string>
-  readonly outbox: OutboxExpectation
 }
 
 export const fixtures: ReadonlyArray<FixtureSpec> = [
@@ -83,27 +80,18 @@ export const fixtures: ReadonlyArray<FixtureSpec> = [
     version: 1,
     file: "v1_canonical_store.db",
     appliedThroughId: 1,
-    seed: seedV1,
-    expectedApplied: [[2, "peer_sync"], [3, "durability_indexes"], [4, "projection_readiness"]],
-    expectedCheckpoints: survivingCheckpoints,
-    outbox: "none"
+    seed: seedV1
   },
   {
     version: 2,
     file: "v2_peer_sync.db",
     appliedThroughId: 2,
-    seed: seedV2,
-    expectedApplied: [[3, "durability_indexes"], [4, "projection_readiness"]],
-    expectedCheckpoints: survivingCheckpoints,
-    outbox: "backfilled"
+    seed: seedV2
   },
   {
     version: 3,
     file: "v3_durability_indexes.db",
     appliedThroughId: 3,
-    seed: seedV3,
-    expectedApplied: [[4, "projection_readiness"]],
-    expectedCheckpoints: survivingCheckpoints,
-    outbox: { frozen: frozenOutboxCreatedAt }
+    seed: seedV3
   }
 ]

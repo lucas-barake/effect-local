@@ -6,78 +6,252 @@ import { FileSystem } from "effect/FileSystem"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
-import { tables } from "../src/internal/schema.js"
 import * as Migrations from "../src/Migrations.js"
-import type { FixtureSpec } from "./fixtures/versions.js"
-import { documentId, fixturePath, fixtures, outboxMessageHash } from "./fixtures/versions.js"
+import type { FixtureSpec, HistoricalVersion } from "./fixtures/versions.js"
+import { fixturePath, fixtures } from "./fixtures/versions.js"
 
-const readinessIndexes: ReadonlyArray<string> = [
-  "effect_local_checkpoints_document_verified_sequence",
-  "effect_local_commit_outbox_published_sequence",
-  "effect_local_document_projections_not_ready",
-  "effect_local_documents_type_projection_status",
-  "effect_local_peer_outbox_incarnation_created",
-  "effect_local_peer_receipts_incarnation_accepted",
-  "effect_local_projection_registry_name_status"
-]
+const expectations = {
+  1: {
+    applied: [
+      [2, "peer_sync"],
+      [3, "durability_indexes"],
+      [4, "projection_readiness"],
+      [5, "pending_receipt_indexes"]
+    ],
+    outbox: "none"
+  },
+  2: {
+    applied: [
+      [3, "durability_indexes"],
+      [4, "projection_readiness"],
+      [5, "pending_receipt_indexes"]
+    ],
+    outbox: "backfilled"
+  },
+  3: {
+    applied: [
+      [4, "projection_readiness"],
+      [5, "pending_receipt_indexes"]
+    ],
+    outbox: { frozen: "2020-01-01T00:00:00.000Z" }
+  }
+} as const satisfies Record<
+  HistoricalVersion,
+  {
+    readonly applied: ReadonlyArray<readonly [number, string]>
+    readonly outbox: "none" | "backfilled" | { readonly frozen: string }
+  }
+>
 
-const assertUpgradesToCurrentSchema = (spec: FixtureSpec) =>
+const SchemaObject = Schema.Struct({
+  type: Schema.String,
+  name: Schema.String,
+  table_name: Schema.String,
+  definition: Schema.NullOr(Schema.String)
+})
+
+const normalizeSchema = (definition: string | null) =>
+  definition === null ? null : definition.replace(/\s+/g, " ").trim()
+
+const readSchema = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  const rows = yield* SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: SchemaObject,
+    execute: () =>
+      sql`SELECT type, name, tbl_name AS table_name, sql AS definition
+        FROM sqlite_master
+        WHERE name LIKE 'effect_local_%' OR tbl_name LIKE 'effect_local_%'
+        ORDER BY type, name`
+  })(undefined)
+  return rows.map((row) => ({
+    type: row.type,
+    name: row.name,
+    table_name: row.table_name,
+    definition: normalizeSchema(row.definition)
+  }))
+})
+
+const readCurrentSchema = Effect.gen(function*() {
+  yield* Migrations.run
+  return yield* readSchema
+}).pipe(
+  Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
+  Effect.scoped
+)
+
+const assertDatabaseIntegrity = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  const integrity = yield* SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: Schema.Struct({ integrity_check: Schema.String }),
+    execute: () => sql`PRAGMA integrity_check`
+  })(undefined)
+  assert.deepStrictEqual(integrity, [{ integrity_check: "ok" }])
+
+  const foreignKeyViolations = yield* SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: Schema.Struct({
+      table: Schema.String,
+      rowid: Schema.NullOr(Schema.Int),
+      parent: Schema.String,
+      fkid: Schema.Int
+    }),
+    execute: () => sql`PRAGMA foreign_key_check`
+  })(undefined)
+  assert.deepStrictEqual(foreignKeyViolations, [])
+})
+
+const assertMigrationHistory = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  const history = yield* SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: Schema.Struct({ migration_id: Schema.Int, name: Schema.String }),
+    execute: () => sql`SELECT migration_id, name FROM effect_local_migrations ORDER BY migration_id`
+  })(undefined)
+  assert.deepStrictEqual(history, [
+    { migration_id: 1, name: "canonical_store" },
+    { migration_id: 2, name: "peer_sync" },
+    { migration_id: 3, name: "durability_indexes" },
+    { migration_id: 4, name: "projection_readiness" },
+    { migration_id: 5, name: "pending_receipt_indexes" }
+  ])
+
+  const catalog = yield* SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: Schema.Struct({ migration_id: Schema.Int, name: Schema.String, checksum: Schema.String }),
+    execute: () => sql`SELECT migration_id, name, checksum FROM effect_local_migration_catalog ORDER BY migration_id`
+  })(undefined)
+  assert.deepStrictEqual(catalog, [
+    { migration_id: 1, name: "canonical_store", checksum: Migrations.canonicalStoreChecksum },
+    { migration_id: 2, name: "peer_sync", checksum: Migrations.peerSyncChecksum },
+    { migration_id: 3, name: "durability_indexes", checksum: Migrations.durabilityIndexesChecksum },
+    { migration_id: 4, name: "projection_readiness", checksum: Migrations.projectionReadinessChecksum },
+    { migration_id: 5, name: "pending_receipt_indexes", checksum: Migrations.pendingReceiptIndexesChecksum }
+  ])
+})
+
+const assertSeededDurabilityState = (version: HistoricalVersion) =>
   Effect.gen(function*() {
     const sql = yield* SqlClient.SqlClient
-
-    const applied = yield* Migrations.run
-    assert.deepStrictEqual(applied, spec.expectedApplied)
-
-    const presentTables = new Set(
-      (yield* sql<{ readonly name: string }>`
-        SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'effect_local_%'
-      `).map((row) => row.name)
-    )
-    for (const table of tables) assert.isTrue(presentTables.has(table), `missing table ${table}`)
-
-    const indexes = yield* sql<{ readonly name: string }>`
-      SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ${sql.in(readinessIndexes)}
-    `
-    assert.deepStrictEqual(indexes.map((row) => row.name).toSorted(), readinessIndexes)
-
-    const catalog = yield* SqlSchema.findAll({
-      Request: Schema.Void,
-      Result: Schema.Struct({ migration_id: Schema.Int, name: Schema.String, checksum: Schema.String }),
-      execute: () => sql`SELECT migration_id, name, checksum FROM effect_local_migration_catalog ORDER BY migration_id`
-    })(undefined)
-    assert.deepStrictEqual(catalog, [
-      { migration_id: 1, name: "canonical_store", checksum: Migrations.canonicalStoreChecksum },
-      { migration_id: 2, name: "peer_sync", checksum: Migrations.peerSyncChecksum },
-      { migration_id: 3, name: "durability_indexes", checksum: Migrations.durabilityIndexesChecksum },
-      { migration_id: 4, name: "projection_readiness", checksum: Migrations.projectionReadinessChecksum }
-    ])
-
     const documents = yield* SqlSchema.findAll({
       Request: Schema.Void,
-      Result: Schema.Struct({ document_id: Schema.String, document_type: Schema.String }),
-      execute: () => sql`SELECT document_id, document_type FROM effect_local_documents`
+      Result: Schema.Struct({
+        document_id: Schema.String,
+        document_type: Schema.String,
+        schema_version: Schema.Int,
+        observed_versions: Schema.String,
+        materialized_heads: Schema.String,
+        accepted_heads: Schema.String,
+        tombstone: Schema.Int,
+        projection_status: Schema.String,
+        checkpoint_hash: Schema.NullOr(Schema.String)
+      }),
+      execute: () => sql`SELECT * FROM effect_local_documents ORDER BY document_id`
     })(undefined)
-    assert.deepStrictEqual(documents, [{ document_id: documentId, document_type: "Task" }])
+    assert.deepStrictEqual(documents, [{
+      document_id: "task-1",
+      document_type: "Task",
+      schema_version: 1,
+      observed_versions: "[]",
+      materialized_heads: "[]",
+      accepted_heads: "[]",
+      tombstone: 0,
+      projection_status: "ready",
+      checkpoint_hash: null
+    }])
 
-    const checkpoints = yield* sql<{ readonly checkpoint_hash: string }>`
-      SELECT checkpoint_hash FROM effect_local_checkpoints WHERE document_id = ${documentId}
-      ORDER BY checkpoint_hash
-    `
-    assert.deepStrictEqual(checkpoints.map((row) => row.checkpoint_hash), spec.expectedCheckpoints)
+    const checkpoints = yield* SqlSchema.findAll({
+      Request: Schema.Void,
+      Result: Schema.Struct({
+        checkpoint_hash: Schema.String,
+        document_id: Schema.String,
+        heads: Schema.String,
+        bytes: Schema.Uint8Array,
+        checksum: Schema.String,
+        commit_sequence: Schema.Int,
+        verified: Schema.Int
+      }),
+      execute: () => sql`SELECT * FROM effect_local_checkpoints ORDER BY checkpoint_hash`
+    })(undefined)
+    assert.deepStrictEqual(checkpoints, [
+      {
+        checkpoint_hash: "checkpoint-1",
+        document_id: "task-1",
+        heads: "[]",
+        bytes: Uint8Array.of(1),
+        checksum: "checksum-1",
+        commit_sequence: 1,
+        verified: 1
+      },
+      {
+        checkpoint_hash: "checkpoint-3",
+        document_id: "task-1",
+        heads: "[]",
+        bytes: Uint8Array.of(3),
+        checksum: "checksum-3",
+        commit_sequence: 3,
+        verified: 1
+      }
+    ])
 
-    const outbox = yield* sql<{ readonly created_at: string }>`
-      SELECT created_at FROM effect_local_peer_outbox WHERE message_hash = ${outboxMessageHash}
-    `
-    if (spec.outbox === "none") {
-      assert.strictEqual(outbox.length, 0)
-    } else if (spec.outbox === "backfilled") {
-      assert.match(outbox[0]?.created_at ?? "", /^\d{4}-\d{2}-\d{2}T/)
+    const outbox = yield* SqlSchema.findAll({
+      Request: Schema.Void,
+      Result: Schema.Struct({
+        replica_incarnation: Schema.Int,
+        peer_id: Schema.String,
+        connection_epoch: Schema.String,
+        document_id: Schema.String,
+        send_sequence: Schema.Int,
+        message: Schema.Uint8Array,
+        message_hash: Schema.String,
+        heads: Schema.String,
+        status: Schema.String,
+        created_at: Schema.String
+      }),
+      execute: () => sql`SELECT * FROM effect_local_peer_outbox ORDER BY send_sequence`
+    })(undefined)
+    if (expectations[version].outbox === "none") {
+      assert.deepStrictEqual(outbox, [])
+      return
+    }
+    assert.deepStrictEqual(
+      outbox.map(({ created_at: _, ...row }) => row),
+      [{
+        replica_incarnation: 0,
+        peer_id: "peer-1",
+        connection_epoch: "connection-1",
+        document_id: "task-1",
+        send_sequence: 1,
+        message: Uint8Array.of(1),
+        message_hash: "message-1",
+        heads: "[]",
+        status: "pending"
+      }]
+    )
+    const createdAt = outbox[0]?.created_at ?? ""
+    const expectedOutbox = expectations[version].outbox
+    if (expectedOutbox === "backfilled") {
+      const timestamp = Date.parse(createdAt)
+      assert.isFalse(Number.isNaN(timestamp), `invalid backfilled timestamp ${createdAt}`)
+      assert.strictEqual(new Date(timestamp).toISOString(), createdAt)
     } else {
-      assert.strictEqual(outbox[0]?.created_at, spec.outbox.frozen)
+      assert.strictEqual(createdAt, expectedOutbox.frozen)
     }
   })
 
-describe("Migrations against frozen released-version fixtures", () => {
+const assertUpgradesToCurrentSchema = (spec: FixtureSpec) =>
+  Effect.gen(function*() {
+    const applied = yield* Migrations.run
+    assert.deepStrictEqual(applied, expectations[spec.version].applied)
+
+    yield* assertDatabaseIntegrity
+    yield* assertMigrationHistory
+    assert.deepStrictEqual(yield* readSchema, yield* readCurrentSchema)
+    yield* assertSeededDurabilityState(spec.version)
+  })
+
+describe("Migrations against frozen historical fixtures", () => {
   for (const spec of fixtures) {
     it.effect(`upgrades the version ${spec.version} database to the current schema`, () =>
       Effect.gen(function*() {
