@@ -145,7 +145,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             Effect.as({ outbound: null, observedByPeer: false, dirty: false })
           ),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
         pending: () => Ref.updateAndGet(pendingCalls, (count) => count + 1).pipe(Effect.as([])),
         markSent: () => Effect.succeed(true)
       })
@@ -208,6 +208,62 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       Effect.map((value) => new TextEncoder().encode(value))
     )
 
+  it.effect("bounds a maximum size sync envelope including writer provenance", () =>
+    Effect.gen(function*() {
+      const encoded = yield* encode({
+        connectionEpoch: "x".repeat(256),
+        sequence: Number.MAX_SAFE_INTEGER,
+        documentId: yield* Identity.makeDocumentId,
+        documentType: "x".repeat(256),
+        messageHash: "x".repeat(256),
+        message: new Uint8Array(limits.maxSyncMessageBytes),
+        writerProvenance: Array.from(
+          { length: limits.maxSyncChangesPerMessage },
+          (_, index) => ({
+            changeHash: index.toString(16).padStart(64, "0"),
+            writerSchemaVersion: Number.MAX_SAFE_INTEGER,
+            writerDefinitionHash: "x".repeat(256)
+          })
+        )
+      })
+      assert.isAtMost(
+        encoded.byteLength,
+        PeerSession.maximumSyncEnvelopeBytes(
+          limits.maxSyncMessageBytes,
+          limits.maxSyncChangesPerMessage
+        )
+      )
+    }))
+
+  it.effect("rejects an oversized writer definition hash within an otherwise valid envelope", () =>
+    Effect.gen(function*() {
+      const documentId = yield* Identity.makeDocumentId
+      const message = Uint8Array.of(1, 2, 3)
+      const messageHash = yield* Canonical.digest(message)
+      const valid = yield* encode({
+        connectionEpoch: "remote-epoch",
+        sequence: 0,
+        documentId,
+        documentType: Task.name,
+        messageHash,
+        message,
+        writerProvenance: [{
+          changeHash: "a".repeat(64),
+          writerSchemaVersion: Task.version,
+          writerDefinitionHash: definition.hash
+        }]
+      })
+      const tampered = JSON.parse(new TextDecoder().decode(valid))
+      tampered.writerProvenance[0].writerDefinitionHash = "a".repeat(130_000)
+      const json = JSON.stringify(tampered)
+      assert.isBelow(
+        new TextEncoder().encode(json).byteLength,
+        PeerSession.maximumSyncEnvelopeBytes(limits.maxSyncMessageBytes, limits.maxSyncChangesPerMessage)
+      )
+      const exit = yield* Effect.exit(Schema.decodeUnknownEffect(SyncEnvelopeJson)(json))
+      assert.strictEqual(exit._tag, "Failure")
+    }))
+
   it.effect("rejects one document id selected with conflicting document types before opening transport", () =>
     Effect.gen(function*() {
       const Note = Document.make("Note", { schema: Schema.Struct({ body: Schema.String }), version: 1 })
@@ -224,7 +280,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         reset: () => Effect.void,
         generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
         pending: () => Effect.succeed([]),
         markSent: () => Effect.succeed(true)
       })
@@ -312,7 +368,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
               }))
             ),
           receive: () => Effect.die("unexpected direct receive"),
-          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
           pending: () => Effect.succeed([]),
           markSent: () => Effect.succeed(true)
         })
@@ -370,7 +426,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             documentId,
             documentType: Task.name,
             messageHash,
-            message
+            message,
+            writerProvenance: [{
+              changeHash: "a".repeat(64),
+              writerSchemaVersion: Task.version,
+              writerDefinitionHash: definition.hash
+            }]
           })
         yield* Queue.offer(inbound, yield* envelope(0))
         yield* Deferred.await(applyCompleted)
@@ -430,7 +491,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
               )
           },
           receive: () => Effect.die("unexpected direct receive"),
-          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
           pending: () => Effect.succeed([]),
           markSent: () => Effect.succeed(true)
         })
@@ -495,7 +556,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             documentId,
             documentType: Task.name,
             messageHash,
-            message
+            message,
+            writerProvenance: [{
+              changeHash: "a".repeat(64),
+              writerSchemaVersion: Task.version,
+              writerDefinitionHash: definition.hash
+            }]
           })
         )
         yield* Deferred.await(inboundDigested)
@@ -552,6 +618,11 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           messageHash: "reply-hash",
           heads: []
         }
+        const replyProvenance = [{
+          changeHash: "b".repeat(64),
+          writerSchemaVersion: Task.version + 1,
+          writerDefinitionHash: "reply-definition"
+        }]
         const sync = PeerSync.PeerSync.of({
           open: (id) =>
             Effect.succeed({
@@ -572,7 +643,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
               return { ...result, reply }
             }),
           enqueue: (_session, value) => {
-            const outbound = { ...value, sendSequence: 7 }
+            const outbound = { ...value, sendSequence: 7, writerProvenance: replyProvenance }
             return Ref.updateAndGet(enqueueCalls, (count) => count + 1).pipe(
               Effect.flatMap((call) => call === 1 ? Ref.set(pending, [outbound]) : Effect.void),
               Effect.as(outbound)
@@ -641,7 +712,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             documentId,
             documentType: Task.name,
             messageHash: yield* Canonical.digest(message),
-            message
+            message,
+            writerProvenance: [{
+              changeHash: "a".repeat(64),
+              writerSchemaVersion: Task.version,
+              writerDefinitionHash: definition.hash
+            }]
           })
         )
         yield* Deferred.await(firstReceived)
@@ -654,7 +730,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             documentId,
             documentType: Task.name,
             messageHash: yield* Canonical.digest(message),
-            message
+            message,
+            writerProvenance: [{
+              changeHash: "a".repeat(64),
+              writerSchemaVersion: Task.version,
+              writerDefinitionHash: definition.hash
+            }]
           })
         )
         yield* Deferred.await(secondReceived)
@@ -665,6 +746,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         )
         assert.strictEqual(replyEnvelope.sequence, 7)
         assert.strictEqual(replyEnvelope.connectionEpoch, "local-epoch")
+        assert.deepStrictEqual(replyEnvelope.writerProvenance, replyProvenance)
         assert.strictEqual(yield* Ref.get(published), 2)
         assert.isTrue(yield* session.observedByPeer(documentId))
         assert.isFalse(yield* session.durableConfirmation(documentId))
@@ -690,7 +772,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           documentId,
           message: Uint8Array.of(2),
           messageHash: "initial",
-          heads: []
+          heads: [],
+          writerProvenance: []
         }
         const reply = {
           documentId,
@@ -703,7 +786,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           documentId,
           message: Uint8Array.of(4),
           messageHash: "generated",
-          heads: []
+          heads: [],
+          writerProvenance: []
         }
         const sync = PeerSync.PeerSync.of({
           open: (id) =>
@@ -730,7 +814,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             ),
           receive: () => Effect.succeed({ ...result, reply }),
           enqueue: (_session, value) => {
-            const outbound = { ...value, sendSequence: 1 }
+            const outbound = { ...value, sendSequence: 1, writerProvenance: [] }
             return Ref.set(pending, [outbound]).pipe(
               Effect.andThen(Deferred.succeed(enqueued, undefined)),
               Effect.as(outbound)
@@ -808,7 +892,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             documentId,
             documentType: Task.name,
             messageHash: yield* Canonical.digest(inboundMessage),
-            message: inboundMessage
+            message: inboundMessage,
+            writerProvenance: [{
+              changeHash: "a".repeat(64),
+              writerSchemaVersion: Task.version,
+              writerDefinitionHash: definition.hash
+            }]
           })
         )
         yield* Deferred.await(enqueued)
@@ -859,14 +948,15 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                   documentId,
                   message: Uint8Array.of(sendSequence),
                   messageHash: `hash-${sendSequence}`,
-                  heads: []
+                  heads: [],
+                  writerProvenance: []
                 },
                 observedByPeer: false,
                 dirty: false
               }))
             ),
           receive: () => Effect.succeed(result),
-          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
           pending: () => Effect.succeed([]),
           markSent: () => Ref.set(pendingCount, 0).pipe(Effect.as(true))
         })
@@ -942,7 +1032,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                     documentId,
                     message: Uint8Array.of(9),
                     messageHash: "hash-9",
-                    heads: []
+                    heads: [],
+                    writerProvenance: []
                   }
                   : null,
                 observedByPeer: false,
@@ -950,7 +1041,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
               }))
             ),
           receive: () => Effect.succeed(result),
-          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
           pending: () => Effect.succeed([]),
           markSent: () => Effect.succeed(true)
         })
@@ -1027,7 +1118,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
           receive: () => Effect.succeed({ ...result, reply }),
           enqueue: (_session, value) => {
-            const outbound = { ...value, sendSequence: 0 }
+            const outbound = { ...value, sendSequence: 0, writerProvenance: [] }
             return Ref.set(pending, [outbound]).pipe(Effect.as(outbound))
           },
           pending: () => Ref.get(pending),
@@ -1082,7 +1173,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             documentId,
             documentType: Task.name,
             messageHash: yield* Canonical.digest(message),
-            message
+            message,
+            writerProvenance: [{
+              changeHash: "a".repeat(64),
+              writerSchemaVersion: Task.version,
+              writerDefinitionHash: definition.hash
+            }]
           })
         )
         yield* Deferred.await(closed)
@@ -1110,7 +1206,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             documentId,
             documentType: Task.name,
             messageHash: "incorrect-hash",
-            message
+            message,
+            writerProvenance: [{
+              changeHash: "a".repeat(64),
+              writerSchemaVersion: Task.version,
+              writerDefinitionHash: definition.hash
+            }]
           })
         },
         {
@@ -1121,8 +1222,79 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             documentId: otherDocumentId,
             documentType: Task.name,
             messageHash,
-            message
+            message,
+            writerProvenance: [{
+              changeHash: "a".repeat(64),
+              writerSchemaVersion: Task.version,
+              writerDefinitionHash: definition.hash
+            }]
           })
+        },
+        {
+          name: "non-positive writer schema version",
+          bytes: yield* encode({
+            connectionEpoch: "remote-epoch",
+            sequence: 0,
+            documentId,
+            documentType: Task.name,
+            messageHash,
+            message,
+            writerProvenance: [{
+              changeHash: "a".repeat(64),
+              writerSchemaVersion: Task.version,
+              writerDefinitionHash: definition.hash
+            }]
+          }).pipe(
+            Effect.map((valid) => {
+              const tampered = JSON.parse(new TextDecoder().decode(valid))
+              tampered.writerProvenance[0].writerSchemaVersion = 0
+              return new TextEncoder().encode(JSON.stringify(tampered))
+            })
+          )
+        },
+        {
+          name: "empty writer definition hash",
+          bytes: yield* encode({
+            connectionEpoch: "remote-epoch",
+            sequence: 0,
+            documentId,
+            documentType: Task.name,
+            messageHash,
+            message,
+            writerProvenance: [{
+              changeHash: "a".repeat(64),
+              writerSchemaVersion: Task.version,
+              writerDefinitionHash: definition.hash
+            }]
+          }).pipe(
+            Effect.map((valid) => {
+              const tampered = JSON.parse(new TextDecoder().decode(valid))
+              tampered.writerProvenance[0].writerDefinitionHash = ""
+              return new TextEncoder().encode(JSON.stringify(tampered))
+            })
+          )
+        },
+        {
+          name: "missing writer provenance fields",
+          bytes: yield* encode({
+            connectionEpoch: "remote-epoch",
+            sequence: 0,
+            documentId,
+            documentType: Task.name,
+            messageHash,
+            message,
+            writerProvenance: [{
+              changeHash: "a".repeat(64),
+              writerSchemaVersion: Task.version,
+              writerDefinitionHash: definition.hash
+            }]
+          }).pipe(
+            Effect.map((valid) => {
+              const tampered = JSON.parse(new TextDecoder().decode(valid))
+              delete tampered.writerProvenance
+              return new TextEncoder().encode(JSON.stringify(tampered))
+            })
+          )
         }
       ]
 
@@ -1143,7 +1315,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             reset: () => Effect.void,
             generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
             receive: () => Effect.succeed(result),
-            enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+            enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
             pending: () => Effect.succeed([]),
             markSent: () => Effect.succeed(true)
           })
@@ -1213,7 +1385,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         reset: () => Effect.void,
         generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
         pending: () => Effect.succeed([]),
         markSent: () => Effect.succeed(true)
       })
@@ -1298,7 +1470,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         reset: () => Effect.void,
         generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
         pending: () => Effect.succeed([]),
         markSent: () => Effect.succeed(true)
       })
@@ -1356,7 +1528,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         reset: () => Effect.void,
         generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
         pending: () => Effect.never,
         markSent: () => Effect.succeed(true)
       })
@@ -1423,7 +1595,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           reset: () => Effect.void,
           generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
           receive: () => Effect.succeed(result),
-          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
           pending: () => Effect.succeed([]),
           markSent: () => Effect.succeed(true)
         })
@@ -1493,7 +1665,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         receive: () => Effect.succeed(result),
         enqueue: (_session, reply) =>
           Ref.update(enqueues, (count) => count + 1).pipe(
-            Effect.as({ ...reply, sendSequence: 0 })
+            Effect.as({ ...reply, sendSequence: 0, writerProvenance: [] })
           ),
         pending: () => Effect.succeed([]),
         markSent: () => Effect.succeed(true)
@@ -1560,7 +1732,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                 documentId,
                 documentType: Task.name,
                 messageHash: yield* Canonical.digest(message),
-                message
+                message,
+                writerProvenance: [{
+                  changeHash: "a".repeat(64),
+                  writerSchemaVersion: Task.version,
+                  writerDefinitionHash: definition.hash
+                }]
               })
             )
             yield* Deferred.await(receiveStarted)
@@ -1610,13 +1787,14 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
               documentId,
               message: Uint8Array.of(1),
               messageHash: "message-hash",
-              heads: []
+              heads: [],
+              writerProvenance: []
             },
             observedByPeer: false,
             dirty: false
           }),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
         pending: () => Effect.succeed([]),
         markSent: () => Effect.succeed(true)
       })
@@ -1691,7 +1869,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                     documentId: id,
                     message: new Uint8Array([call]),
                     messageHash: `hash-${call}`,
-                    heads: []
+                    heads: [],
+                    writerProvenance: []
                   },
                   observedByPeer: false,
                   dirty: false
@@ -1699,7 +1878,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             )
           ),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
         pending: () => Effect.succeed([]),
         markSent: () => Ref.update(marked, (count) => count + 1).pipe(Effect.as(true))
       })
@@ -1815,7 +1994,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         documentId,
         message: Uint8Array.of(1),
         messageHash: "message-hash",
-        heads: []
+        heads: [],
+        writerProvenance: []
       }
       const sync = PeerSync.PeerSync.of({
         open: (id) =>
@@ -1830,7 +2010,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             Effect.as({ outbound: null, observedByPeer: false, dirty: false })
           ),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
         pending: () =>
           Ref.updateAndGet(pendingCalls, (count) => count + 1).pipe(
             Effect.map((call) => call === 1 ? [] : [outbound])
@@ -1928,7 +2108,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
               )
             ),
           receive: () => Effect.succeed(result),
-          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
           pending: () =>
             Ref.updateAndGet(pendingCalls, (count) => count + 1).pipe(
               Effect.flatMap((call) =>
@@ -2025,7 +2205,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             Effect.tap(() => Deferred.succeed(firstReceived, undefined)),
             Effect.as(result)
           ),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
         pending: () => Effect.succeed([]),
         markSent: () => Effect.succeed(true)
       })
@@ -2060,7 +2240,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                     {
                       remoteConnectionEpoch: "remote-epoch",
                       receiveSequence: 0,
-                      message
+                      message,
+                      writerProvenance: [{
+                        changeHash: "a".repeat(64),
+                        writerSchemaVersion: Task.version,
+                        writerDefinitionHash: definition.hash
+                      }]
                     }
                   )
               } as never)
@@ -2072,7 +2257,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
               documentId,
               documentType: Task.name,
               messageHash,
-              message
+              message,
+              writerProvenance: [{
+                changeHash: "a".repeat(64),
+                writerSchemaVersion: Task.version,
+                writerDefinitionHash: definition.hash
+              }]
             })
           yield* Queue.offer(inbound, yield* envelope("remote-epoch"))
           yield* Deferred.await(firstReceived)
@@ -2131,7 +2321,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                     documentId,
                     message: new Uint8Array([current.length]),
                     messageHash: `hash-${current.length}`,
-                    heads: []
+                    heads: [],
+                    writerProvenance: []
                   },
                   observedByPeer: false,
                   dirty: false
@@ -2139,7 +2330,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             )
           ),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
         pending: () => Effect.succeed([]),
         markSent: () => Effect.succeed(true)
       })
@@ -2461,7 +2652,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         reset: () => Effect.void,
         generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
         receive: () => Effect.succeed(applyResult),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0 }),
+        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
         pending: () => Effect.succeed([]),
         markSent: () => Effect.succeed(true)
       })
@@ -2502,7 +2693,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           documentId,
           documentType: Task.name,
           messageHash,
-          message
+          message,
+          writerProvenance: [{
+            changeHash: "a".repeat(64),
+            writerSchemaVersion: Task.version,
+            writerDefinitionHash: definition.hash
+          }]
         })
       )
       yield* Deferred.await(applyReady)

@@ -17,6 +17,7 @@ import * as Stream from "effect/Stream"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
 import * as CommitPublisher from "./CommitPublisher.js"
 import * as DocumentEntity from "./DocumentEntity.js"
+import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as PeerSync from "./PeerSync.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
@@ -44,9 +45,13 @@ export const SyncEnvelope = Schema.Struct({
   documentId: Identity.DocumentId,
   documentType: Schema.String,
   messageHash: Schema.String,
-  message: Schema.Uint8ArrayFromBase64
+  message: Schema.Uint8ArrayFromBase64,
+  writerProvenance: WriterProvenance.ChangeProvenances
 })
-export const maximumSyncEnvelopeBytes = (maxSyncMessageBytes: number) => maxSyncMessageBytes * 2 + 4_096
+export const maximumSyncEnvelopeBytes = (
+  maxSyncMessageBytes: number,
+  maxSyncChangesPerMessage: number
+) => maxSyncMessageBytes * 2 + maxSyncChangesPerMessage * 512 + 4_096
 const SyncEnvelopeJson = Schema.fromJsonString(Schema.toCodecJson(SyncEnvelope))
 
 const key = (documentType: string, documentId: Identity.DocumentId) => `${documentType}:${documentId}`
@@ -194,7 +199,8 @@ const makeWithTerminal = (
             documentId: outbound.documentId,
             documentType: entry.document.name,
             messageHash: outbound.messageHash,
-            message: outbound.message
+            message: outbound.message,
+            writerProvenance: outbound.writerProvenance
           })
           yield* Effect.scoped(Effect.gen(function*() {
             const permit = yield* gate.shared
@@ -332,7 +338,10 @@ const makeWithTerminal = (
 
     const receive = (bytes: Uint8Array) =>
       Effect.gen(function*() {
-        const maximumBytes = maximumSyncEnvelopeBytes(limits.maxSyncMessageBytes)
+        const maximumBytes = maximumSyncEnvelopeBytes(
+          limits.maxSyncMessageBytes,
+          limits.maxSyncChangesPerMessage
+        )
         if (bytes.byteLength > maximumBytes) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.ProtocolMismatch({
@@ -398,7 +407,8 @@ const makeWithTerminal = (
               receiveSequence: envelope.sequence,
               documentType: envelope.documentType,
               messageHash: envelope.messageHash,
-              message: envelope.message
+              message: envelope.message,
+              writerProvenance: envelope.writerProvenance
             }).pipe(
               Effect.catchTag(
                 ["MailboxFull", "AlreadyProcessingMessage", "PersistenceError"],

@@ -21,9 +21,11 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import { rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import * as Compaction from "../src/Compaction.js"
 import * as DocumentStore from "../src/DocumentStore.js"
 import * as InternalAutomerge from "../src/internal/automerge.js"
 import * as PeerSync from "../src/PeerSync.js"
+import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
 
@@ -77,6 +79,11 @@ describe("PeerSync", () => {
   const Services = Layer.merge(Infrastructure, StoreService)
   const SyncService = PeerSync.layer.pipe(Layer.provide(Services))
   const TestLayer = Layer.merge(Services, SyncService)
+  const RecoveryService = Recovery.layer.pipe(Layer.provide(Services))
+  const CompactionService = Compaction.layer.pipe(
+    Layer.provide(Layer.merge(Services, RecoveryService))
+  )
+  const CompactionLayer = Layer.mergeAll(TestLayer, RecoveryService, CompactionService)
   const StrictLimits = ReplicaLimits.layer({ ...limits, maxSyncOperationsPerMessage: 1 })
   const StrictInfrastructure = Layer.mergeAll(Base, Gate, StrictLimits)
   const StrictStoreService = DocumentStore.layer.pipe(Layer.provide(StrictInfrastructure))
@@ -131,6 +138,32 @@ describe("PeerSync", () => {
   const CapacityReceiptServices = Layer.merge(CapacityReceiptInfrastructure, CapacityReceiptStoreService)
   const CapacityReceiptSyncService = PeerSync.layer.pipe(Layer.provide(CapacityReceiptServices))
   const CapacityReceiptLayer = Layer.merge(CapacityReceiptServices, CapacityReceiptSyncService)
+  const provenanceFor = (
+    message: Uint8Array,
+    writerSchemaVersion = Task.version,
+    writerDefinitionHash = definition.hash
+  ) => {
+    const hashes = new Set<string>()
+    for (const chunk of Automerge.decodeSyncMessage(message).changes) {
+      try {
+        hashes.add(Automerge.decodeChange(chunk).hash)
+      } catch {
+        const document = Automerge.load(chunk)
+        try {
+          for (const bytes of Automerge.getAllChanges(document)) {
+            hashes.add(Automerge.decodeChange(bytes).hash)
+          }
+        } finally {
+          Automerge.free(document)
+        }
+      }
+    }
+    return [...hashes].toSorted().map((changeHash) => ({
+      changeHash,
+      writerSchemaVersion,
+      writerDefinitionHash
+    }))
+  }
 
   it.effect("does not issue a stale session during an exclusive claim", () =>
     Effect.gen(function*() {
@@ -182,7 +215,8 @@ describe("PeerSync", () => {
       const received = yield* sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: 0,
-        message: generated[1]!
+        message: generated[1]!,
+        writerProvenance: provenanceFor(generated[1]!, Task.version, definition.hash)
       })
       const durableReply = yield* sql<{ readonly outbox: number; readonly receipts: number }>`SELECT
         (SELECT COUNT(*) FROM effect_local_peer_outbox WHERE status = 'Pending') AS outbox,
@@ -199,7 +233,8 @@ describe("PeerSync", () => {
         yield* sync.receive(Task, documentId, session, {
           remoteConnectionEpoch: session.connectionEpoch,
           receiveSequence: 1,
-          message: nextGenerated[1]
+          message: nextGenerated[1],
+          writerProvenance: provenanceFor(nextGenerated[1], Task.version, definition.hash)
         })
       }
       const reloaded = yield* store.load(Task, documentId)
@@ -207,7 +242,8 @@ describe("PeerSync", () => {
       const duplicate = yield* sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: 0,
-        message: generated[1]!
+        message: generated[1]!,
+        writerProvenance: provenanceFor(generated[1]!, Task.version, definition.hash)
       })
       assert.isTrue(duplicate.duplicate)
       assert.deepStrictEqual(duplicate.reply?.message, received.reply?.message)
@@ -215,6 +251,359 @@ describe("PeerSync", () => {
       assert.strictEqual(rows[0]?.count, 2)
       InternalAutomerge.free(reloaded.automerge)
       InternalAutomerge.free(remote)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(TestLayer)))
+
+  it.effect("persists the wire declared writer provenance for an inbound change, not the receiver's own", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      const remote = Automerge.change(Automerge.clone(created.automerge, { actor: "7".repeat(32) }), (draft) => {
+        ;(draft.value as { title: string }).title = "from another build"
+      })
+      const remoteChangeBytes = Automerge.getChangesSince(remote, [...created.materializedHeads])
+      assert.strictEqual(remoteChangeBytes.length, 1)
+      const remoteChangeHash = Automerge.decodeChange(remoteChangeBytes[0]!).hash
+      const writerSchemaVersion = Task.version + 41
+      const writerDefinitionHash = "a-different-peers-build-hash"
+      let remoteState = Automerge.initSyncState()
+      const firstGenerated = Automerge.generateSyncMessage(remote, remoteState)
+      remoteState = firstGenerated[0]
+      assert.isNotNull(firstGenerated[1])
+      const first = yield* sync.receive(Task, documentId, session, {
+        remoteConnectionEpoch: session.connectionEpoch,
+        receiveSequence: 0,
+        message: firstGenerated[1]!,
+        writerProvenance: provenanceFor(firstGenerated[1]!).map((entry) =>
+          entry.changeHash === remoteChangeHash
+            ? { changeHash: entry.changeHash, writerSchemaVersion, writerDefinitionHash }
+            : entry
+        )
+      })
+      if (first.reply !== null) {
+        remoteState = Automerge.receiveSyncMessage(remote, remoteState, first.reply.message)[1]
+      }
+      const secondGenerated = Automerge.generateSyncMessage(remote, remoteState)
+      if (secondGenerated[1] !== null) {
+        yield* sync.receive(Task, documentId, session, {
+          remoteConnectionEpoch: session.connectionEpoch,
+          receiveSequence: 1,
+          message: secondGenerated[1],
+          writerProvenance: provenanceFor(secondGenerated[1]).map((entry) =>
+            entry.changeHash === remoteChangeHash
+              ? { changeHash: entry.changeHash, writerSchemaVersion, writerDefinitionHash }
+              : entry
+          )
+        })
+      }
+      const reloaded = yield* store.load(Task, documentId)
+      assert.deepStrictEqual(reloaded.snapshot.value, { title: "from another build", labels: [] })
+      const rows = yield* sql<{
+        readonly writer_schema_version: number
+        readonly writer_definition_hash: string
+      }>`SELECT writer_schema_version, writer_definition_hash FROM effect_local_changes
+        WHERE change_hash = ${remoteChangeHash}`
+      assert.deepStrictEqual(rows, [{
+        writer_schema_version: writerSchemaVersion,
+        writer_definition_hash: writerDefinitionHash
+      }])
+      InternalAutomerge.free(reloaded.automerge)
+      InternalAutomerge.free(remote)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(TestLayer)))
+
+  it.effect("preserves each change writer provenance in a relayed sync message", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      const origin = Automerge.change(
+        Automerge.clone(created.automerge, { actor: "a".repeat(32) }),
+        (draft) => {
+          ;(draft.value as { title: string }).title = "origin"
+        }
+      )
+      const relayed = Automerge.change(
+        Automerge.clone(origin, { actor: "b".repeat(32) }),
+        (draft) => {
+          ;(draft.value as unknown as { labels: Array<string> }).labels.push("relay")
+        }
+      )
+      const originHash = Automerge.decodeChange(
+        Automerge.getChangesSince(origin, [...created.materializedHeads])[0]!
+      ).hash
+      const relayHash = Automerge.decodeChange(
+        Automerge.getChangesSince(relayed, Automerge.getHeads(origin))[0]!
+      ).hash
+      const originWriter = {
+        writerSchemaVersion: Task.version + 10,
+        writerDefinitionHash: "origin-definition"
+      }
+      const relayWriter = {
+        writerSchemaVersion: Task.version + 20,
+        writerDefinitionHash: "relay-definition"
+      }
+      let remote = Automerge.clone(relayed)
+      let remoteState = Automerge.initSyncState()
+      let receiveSequence = 0
+      for (let round = 0; round < 4; round++) {
+        const generated = Automerge.generateSyncMessage(remote, remoteState)
+        remoteState = generated[0]
+        if (generated[1] === null) break
+        const received = yield* sync.receive(Task, documentId, session, {
+          remoteConnectionEpoch: "relay",
+          receiveSequence: receiveSequence++,
+          message: generated[1],
+          writerProvenance: provenanceFor(generated[1]).map((entry) => {
+            if (entry.changeHash === originHash) return Object.assign({ changeHash: entry.changeHash }, originWriter)
+            if (entry.changeHash === relayHash) return Object.assign({ changeHash: entry.changeHash }, relayWriter)
+            return entry
+          })
+        })
+        if (received.reply !== null) {
+          const applied = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
+          remote = applied[0]
+          remoteState = applied[1]
+        }
+      }
+      const rows = yield* sql<{
+        readonly change_hash: string
+        readonly writer_schema_version: number
+        readonly writer_definition_hash: string
+      }>`SELECT change_hash, writer_schema_version, writer_definition_hash
+        FROM effect_local_changes
+        WHERE change_hash = ${originHash} OR change_hash = ${relayHash}`
+      const byHash = new Map(rows.map((row) => [row.change_hash, row]))
+      assert.deepInclude(byHash.get(originHash), {
+        writer_schema_version: originWriter.writerSchemaVersion,
+        writer_definition_hash: originWriter.writerDefinitionHash
+      })
+      assert.deepInclude(byHash.get(relayHash), {
+        writer_schema_version: relayWriter.writerSchemaVersion,
+        writer_definition_hash: relayWriter.writerDefinitionHash
+      })
+      InternalAutomerge.free(origin)
+      InternalAutomerge.free(remote)
+      InternalAutomerge.free(relayed)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(TestLayer)))
+
+  it.effect("sends exact writer provenance after compaction prunes change rows", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      yield* compaction.compact(Task, documentId)
+      const staged = yield* store.stage(created, (draft) => {
+        draft.title = "two"
+      })
+      const persisted = yield* store.persist(Task, documentId, created, staged)
+      yield* compaction.compact(Task, documentId)
+      assert.strictEqual(yield* compaction.prune(documentId), 1)
+
+      const remote = Automerge.init<InternalAutomerge.Root<{ title: string; labels: Array<string> }>>()
+      const handshake = Automerge.generateSyncMessage(remote, Automerge.initSyncState())[1]!
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const received = yield* sync.receive(Task, documentId, session, {
+        remoteConnectionEpoch: "fresh-peer",
+        receiveSequence: 0,
+        message: handshake,
+        writerProvenance: []
+      })
+      assert.isNotNull(received.reply)
+      const outbound = yield* sync.enqueue(session, received.reply!)
+      assert.deepStrictEqual(
+        outbound.writerProvenance,
+        provenanceFor(outbound.message, Task.version, definition.hash)
+      )
+
+      InternalAutomerge.free(remote)
+      InternalAutomerge.free(persisted.automerge)
+      InternalAutomerge.free(staged)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(CompactionLayer)))
+
+  it.effect("rejects invalid writer provenance at the direct receive boundary", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      const remote = Automerge.change(
+        Automerge.clone(created.automerge, { actor: "c".repeat(32) }),
+        (draft) => {
+          ;(draft.value as { title: string }).title = "invalid"
+        }
+      )
+      const message = Automerge.generateSyncMessage(remote, Automerge.initSyncState())[1]!
+      const remoteHash = Automerge.decodeChange(
+        Automerge.getChangesSince(remote, [...created.materializedHeads])[0]!
+      ).hash
+      const before = yield* sql<{ readonly changes: number; readonly receipts: number }>`SELECT
+        (SELECT COUNT(*) FROM effect_local_changes) AS changes,
+        (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts`
+      for (
+        const provenance of [
+          { writerSchemaVersion: 0, writerDefinitionHash: definition.hash },
+          { writerSchemaVersion: 1.5, writerDefinitionHash: definition.hash },
+          { writerSchemaVersion: Number.MAX_SAFE_INTEGER + 1, writerDefinitionHash: definition.hash },
+          { writerSchemaVersion: Task.version, writerDefinitionHash: "" },
+          { writerSchemaVersion: Task.version, writerDefinitionHash: "x".repeat(257) },
+          { writerSchemaVersion: Task.version, writerDefinitionHash: "界".repeat(256) },
+          { writerSchemaVersion: Task.version, writerDefinitionHash: "\0".repeat(256) }
+        ]
+      ) {
+        const exit = yield* Effect.exit(sync.receive(Task, documentId, session, {
+          remoteConnectionEpoch: session.connectionEpoch,
+          receiveSequence: 0,
+          message,
+          writerProvenance: [{
+            changeHash: remoteHash,
+            writerSchemaVersion: provenance.writerSchemaVersion,
+            writerDefinitionHash: provenance.writerDefinitionHash
+          }]
+        }))
+        assert.strictEqual(exit._tag, "Failure", JSON.stringify(provenance))
+        if (exit._tag === "Failure") {
+          assert.strictEqual(Option.getOrThrow(Cause.findErrorOption(exit.cause)).reason._tag, "ProtocolMismatch")
+        }
+      }
+      const after = yield* sql<{ readonly changes: number; readonly receipts: number }>`SELECT
+        (SELECT COUNT(*) FROM effect_local_changes) AS changes,
+        (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts`
+      assert.deepStrictEqual(after, before)
+      InternalAutomerge.free(remote)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(TestLayer)))
+
+  it.effect("rejects missing, duplicate, unrelated, and excess provenance mappings", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      let remote = Automerge.change(
+        Automerge.clone(created.automerge, { actor: "b".repeat(32) }),
+        (draft) => {
+          ;(draft.value as { title: string }).title = "mapped"
+        }
+      )
+      const emptyPeer = Automerge.init<InternalAutomerge.Root<{ title: string; labels: Array<string> }>>()
+      const localHandshake = Automerge.generateSyncMessage(emptyPeer, Automerge.initSyncState())[1]!
+      const receivedHandshake = Automerge.receiveSyncMessage(
+        remote,
+        Automerge.initSyncState(),
+        localHandshake
+      )
+      remote = receivedHandshake[0]
+      const message = Automerge.generateSyncMessage(remote, receivedHandshake[1])[1]!
+      const valid = provenanceFor(message, Task.version, definition.hash)
+      assert.isAbove(valid.length, 0)
+      const usedHashes = new Set(valid.map((entry) => entry.changeHash))
+      const unrelatedHash = ["a", "b", "c"].map((value) => value.repeat(64))
+        .find((changeHash) => !usedHashes.has(changeHash))!
+      const unrelated = {
+        ...valid[0]!,
+        changeHash: unrelatedHash
+      }
+      const before = yield* sql<{ readonly changes: number; readonly receipts: number }>`SELECT
+        (SELECT COUNT(*) FROM effect_local_changes) AS changes,
+        (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts`
+      for (
+        const provenance of [
+          valid.slice(1),
+          [...valid, valid[0]!],
+          [unrelated, ...valid.slice(1)],
+          [...valid, unrelated]
+        ]
+      ) {
+        const result = yield* Effect.exit(sync.receive(Task, documentId, session, {
+          remoteConnectionEpoch: "mapping",
+          receiveSequence: 0,
+          message,
+          writerProvenance: provenance
+        }))
+        assert.strictEqual(result._tag, "Failure")
+        if (result._tag === "Failure") {
+          assert.strictEqual(Option.getOrThrow(Cause.findErrorOption(result.cause)).reason._tag, "ProtocolMismatch")
+        }
+      }
+      const after = yield* sql<{ readonly changes: number; readonly receipts: number }>`SELECT
+        (SELECT COUNT(*) FROM effect_local_changes) AS changes,
+        (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts`
+      assert.deepStrictEqual(after, before)
+      InternalAutomerge.free(emptyPeer)
+      InternalAutomerge.free(remote)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(TestLayer)))
+
+  it.effect("rejects a retransmission that changes writer provenance", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      const remote = Automerge.change(
+        Automerge.clone(created.automerge, { actor: "d".repeat(32) }),
+        (draft) => {
+          ;(draft.value as { title: string }).title = "remote"
+        }
+      )
+      const message = Automerge.generateSyncMessage(remote, Automerge.initSyncState())[1]!
+      yield* sync.receive(Task, documentId, session, {
+        remoteConnectionEpoch: "remote",
+        receiveSequence: 0,
+        message,
+        writerProvenance: provenanceFor(message, Task.version, definition.hash)
+      })
+      const conflict = yield* Effect.exit(sync.receive(Task, documentId, session, {
+        remoteConnectionEpoch: "remote",
+        receiveSequence: 0,
+        message,
+        writerProvenance: [{
+          changeHash: "a".repeat(64),
+          writerSchemaVersion: Task.version + 1,
+          writerDefinitionHash: "different-definition"
+        }]
+      }))
+      assert.strictEqual(conflict._tag, "Failure")
+      if (conflict._tag === "Failure") {
+        assert.strictEqual(Option.getOrThrow(Cause.findErrorOption(conflict.cause)).reason._tag, "ProtocolMismatch")
+      }
+      InternalAutomerge.free(remote)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(TestLayer)))
+
+  it.effect("keeps locally authored changes stamped with their exact definition", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      const rows = yield* sql<{
+        readonly writer_schema_version: number
+        readonly writer_definition_hash: string
+      }>`SELECT writer_schema_version, writer_definition_hash FROM effect_local_changes
+        WHERE document_id = ${documentId}`
+      assert.isAtLeast(rows.length, 1)
+      for (const row of rows) {
+        assert.strictEqual(row.writer_schema_version, Task.version)
+        assert.strictEqual(row.writer_definition_hash, definition.hash)
+      }
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(TestLayer)))
 
@@ -234,7 +623,8 @@ describe("PeerSync", () => {
       const first = yield* sync.receive(Task, documentId, firstSession, {
         remoteConnectionEpoch: "stable-remote-epoch",
         receiveSequence: 0,
-        message
+        message,
+        writerProvenance: provenanceFor(message, Task.version, definition.hash)
       })
       assert.isNotNull(first.reply)
       const firstOutbound = yield* sync.enqueue(firstSession, first.reply!)
@@ -242,7 +632,8 @@ describe("PeerSync", () => {
       const replayed = yield* sync.receive(Task, documentId, secondSession, {
         remoteConnectionEpoch: "stable-remote-epoch",
         receiveSequence: 0,
-        message
+        message,
+        writerProvenance: provenanceFor(message, Task.version, definition.hash)
       })
       assert.isTrue(replayed.duplicate)
       assert.isNotNull(replayed.reply)
@@ -275,12 +666,14 @@ describe("PeerSync", () => {
       yield* sync.receive(Task, firstDocumentId, session, {
         remoteConnectionEpoch: "remote-epoch",
         receiveSequence: 0,
-        message
+        message,
+        writerProvenance: provenanceFor(message, Task.version, definition.hash)
       })
       const reused = yield* Effect.exit(sync.receive(Task, secondDocumentId, session, {
         remoteConnectionEpoch: "remote-epoch",
         receiveSequence: 0,
-        message
+        message,
+        writerProvenance: provenanceFor(message, Task.version, definition.hash)
       }))
       assert.strictEqual(reused._tag, "Failure")
       if (reused._tag === "Failure") {
@@ -306,7 +699,8 @@ describe("PeerSync", () => {
       yield* sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: 0,
-        message
+        message,
+        writerProvenance: provenanceFor(message, Task.version, definition.hash)
       })
       const before = yield* sql<{ readonly receipts: number; readonly changes: number }>`SELECT
         (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts,
@@ -316,7 +710,8 @@ describe("PeerSync", () => {
       const exit = yield* Effect.exit(sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: 0,
-        message: altered
+        message: altered,
+        writerProvenance: provenanceFor(altered, Task.version, definition.hash)
       }))
       assert.strictEqual(exit._tag, "Failure")
       if (exit._tag === "Failure") {
@@ -366,7 +761,8 @@ describe("PeerSync", () => {
         (yield* Effect.exit(sync.receive(Task, documentId, session, {
           remoteConnectionEpoch: session.connectionEpoch,
           receiveSequence: 0,
-          message
+          message,
+          writerProvenance: provenanceFor(message, Task.version, definition.hash)
         })))._tag,
         "Failure"
       )
@@ -405,7 +801,8 @@ describe("PeerSync", () => {
         const received = yield* sync.receive(Task, documentId, session, {
           remoteConnectionEpoch: session.connectionEpoch,
           receiveSequence: sequence,
-          message
+          message,
+          writerProvenance: provenanceFor(message, Task.version, definition.hash)
         })
         if (received.reply !== null) {
           const outbound = yield* sync.enqueue(session, received.reply)
@@ -436,7 +833,8 @@ describe("PeerSync", () => {
         const received = yield* sync.receive(Task, documentId, session, {
           remoteConnectionEpoch: session.connectionEpoch,
           receiveSequence: sequence,
-          message
+          message,
+          writerProvenance: provenanceFor(message, Task.version, definition.hash)
         })
         if (received.reply !== null) {
           const outbound = yield* sync.enqueue(session, received.reply)
@@ -467,7 +865,8 @@ describe("PeerSync", () => {
         const received = yield* sync.receive(Task, documentId, session, {
           remoteConnectionEpoch: session.connectionEpoch,
           receiveSequence: sequence,
-          message
+          message,
+          writerProvenance: provenanceFor(message, Task.version, definition.hash)
         })
         if (received.reply !== null) {
           const outbound = yield* sync.enqueue(session, received.reply)
@@ -506,7 +905,8 @@ describe("PeerSync", () => {
       const received = yield* sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: 2,
-        message
+        message,
+        writerProvenance: provenanceFor(message, Task.version, definition.hash)
       })
       assert.isFalse(received.duplicate)
       const rows = yield* sql<{ readonly pending: number; readonly total: number }>`SELECT
@@ -537,7 +937,8 @@ describe("PeerSync", () => {
         const received = yield* sync.receive(Task, documentId, session, {
           remoteConnectionEpoch: session.connectionEpoch,
           receiveSequence: sequence++,
-          message: outbound[1]
+          message: outbound[1],
+          writerProvenance: provenanceFor(outbound[1], Task.version, definition.hash)
         })
         if (received.reply !== null) {
           const applied = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
@@ -560,7 +961,8 @@ describe("PeerSync", () => {
       const pending = yield* sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: pendingSequence,
-        message: second[1]!
+        message: second[1]!,
+        writerProvenance: provenanceFor(second[1]!, Task.version, definition.hash)
       })
       assert.isFalse(sameHeadsForTest(pending.heads, Automerge.getHeads(remote)))
       const pendingRow = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
@@ -583,7 +985,8 @@ describe("PeerSync", () => {
       const exhausted = yield* Effect.exit(sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: sequence++,
-        message: second[1]!
+        message: second[1]!,
+        writerProvenance: provenanceFor(second[1]!, Task.version, definition.hash)
       }))
       assert.strictEqual(exhausted._tag, "Failure")
       if (exhausted._tag === "Failure") {
@@ -624,7 +1027,8 @@ describe("PeerSync", () => {
         const received = yield* sync.receive(Task, documentId, session, {
           remoteConnectionEpoch: session.connectionEpoch,
           receiveSequence: sequence++,
-          message: outbound[1]
+          message: outbound[1],
+          writerProvenance: provenanceFor(outbound[1], Task.version, definition.hash)
         })
         if (received.reply !== null) {
           const applied = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
@@ -647,7 +1051,8 @@ describe("PeerSync", () => {
       yield* sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: pendingSequence,
-        message: second[1]!
+        message: second[1]!,
+        writerProvenance: provenanceFor(second[1]!, Task.version, definition.hash)
       })
       const beforeRecovery = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
         FROM effect_local_peer_receipts
@@ -657,14 +1062,16 @@ describe("PeerSync", () => {
       const replay = yield* sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: pendingSequence,
-        message: second[1]!
+        message: second[1]!,
+        writerProvenance: provenanceFor(second[1]!, Task.version, definition.hash)
       })
       assert.isTrue(replay.duplicate)
 
       yield* sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: sequence++,
-        message: first[1]!
+        message: first[1]!,
+        writerProvenance: provenanceFor(first[1]!, Task.version, definition.hash)
       })
 
       const afterRecovery = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
@@ -678,6 +1085,76 @@ describe("PeerSync", () => {
       InternalAutomerge.free(remote)
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(CapacityReceiptLayer)))
+
+  it.effect("rejects conflicting provenance for a change held by another pending receipt", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      let remote = Automerge.clone(created.automerge, { actor: "7".repeat(32) })
+      let remoteState = Automerge.initSyncState()
+      let sequence = 0
+      for (let round = 0; round < 4; round++) {
+        const outbound = Automerge.generateSyncMessage(remote, remoteState)
+        remoteState = outbound[0]
+        if (outbound[1] === null) break
+        const received = yield* sync.receive(Task, documentId, session, {
+          remoteConnectionEpoch: session.connectionEpoch,
+          receiveSequence: sequence++,
+          message: outbound[1],
+          writerProvenance: provenanceFor(outbound[1])
+        })
+        if (received.reply !== null) {
+          const applied = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
+          remote = applied[0]
+          remoteState = applied[1]
+        }
+      }
+      remote = Automerge.change(remote, (draft) => {
+        ;(draft.value as { title: string }).title = "dependency"
+      })
+      const dependency = Automerge.generateSyncMessage(remote, remoteState)
+      remoteState = dependency[0]
+      assert.isNotNull(dependency[1])
+      remote = Automerge.change(remote, (draft) => {
+        ;(draft.value as unknown as { labels: Array<string> }).labels.push("dependent")
+      })
+      const dependent = Automerge.generateSyncMessage(remote, remoteState)
+      assert.isNotNull(dependent[1])
+      const provenance = provenanceFor(dependent[1]!)
+      yield* sync.receive(Task, documentId, session, {
+        remoteConnectionEpoch: session.connectionEpoch,
+        receiveSequence: sequence++,
+        message: dependent[1]!,
+        writerProvenance: provenance
+      })
+
+      const conflict = yield* Effect.exit(sync.receive(Task, documentId, session, {
+        remoteConnectionEpoch: session.connectionEpoch,
+        receiveSequence: sequence,
+        message: dependent[1]!,
+        writerProvenance: provenance.map((entry) => ({
+          changeHash: entry.changeHash,
+          writerSchemaVersion: entry.writerSchemaVersion,
+          writerDefinitionHash: "conflicting-pending-definition"
+        }))
+      }))
+      assert.strictEqual(conflict._tag, "Failure")
+      if (conflict._tag === "Failure") {
+        assert.strictEqual(Option.getOrThrow(Cause.findErrorOption(conflict.cause)).reason._tag, "ProtocolMismatch")
+      }
+      assert.deepStrictEqual(
+        yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_peer_receipts
+          WHERE document_id = ${documentId} AND pending_message IS NOT NULL`,
+        [{ count: 1 }]
+      )
+      InternalAutomerge.free(remote)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(TestLayer)))
 
   it.effect("accepts resolved input after the pending peer quota is lowered below durable usage", () =>
     Effect.gen(function*() {
@@ -700,7 +1177,8 @@ describe("PeerSync", () => {
             const received = yield* sync.receive(Task, documentId, session, {
               remoteConnectionEpoch: `remote-${actor}`,
               receiveSequence: sequence++,
-              message: outbound[1]
+              message: outbound[1],
+              writerProvenance: provenanceFor(outbound[1], Task.version, definition.hash)
             })
             if (received.reply !== null) {
               const applied = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
@@ -722,7 +1200,8 @@ describe("PeerSync", () => {
           yield* sync.receive(Task, documentId, session, {
             remoteConnectionEpoch: `remote-${actor}`,
             receiveSequence: sequence,
-            message: dependent[1]!
+            message: dependent[1]!,
+            writerProvenance: provenanceFor(dependent[1]!, Task.version, definition.hash)
           })
           pendingDocumentCleanup.push(() => {
             InternalAutomerge.free(remote)
@@ -753,7 +1232,8 @@ describe("PeerSync", () => {
           return yield* Effect.exit(restarted.receive(Task, resolvedDocumentId, session, {
             remoteConnectionEpoch: "resolved-remote",
             receiveSequence: 0,
-            message: resolvedMessage
+            message: resolvedMessage,
+            writerProvenance: provenanceFor(resolvedMessage, Task.version, definition.hash)
           }))
         }).pipe(
           Effect.provide(
@@ -790,7 +1270,8 @@ describe("PeerSync", () => {
             const received = yield* sync.receive(Task, documentId, session, {
               remoteConnectionEpoch,
               receiveSequence: sequence++,
-              message: outbound[1]
+              message: outbound[1],
+              writerProvenance: provenanceFor(outbound[1], Task.version, definition.hash)
             })
             if (received.reply !== null) {
               const applied = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
@@ -828,7 +1309,8 @@ describe("PeerSync", () => {
           Effect.exit(sync.receive(Task, item.documentId, session, {
             remoteConnectionEpoch: item.remoteConnectionEpoch,
             receiveSequence: item.sequence,
-            message: item.dependent
+            message: item.dependent,
+            writerProvenance: provenanceFor(item.dependent, Task.version, definition.hash)
           }))
         ),
         { concurrency: "unbounded" }
@@ -852,13 +1334,15 @@ describe("PeerSync", () => {
       yield* sync.receive(Task, winner.documentId, session, {
         remoteConnectionEpoch: winner.remoteConnectionEpoch,
         receiveSequence: winner.sequence + 1,
-        message: winner.dependency
+        message: winner.dependency,
+        writerProvenance: provenanceFor(winner.dependency, Task.version, definition.hash)
       })
       const loser = prepared[loserIndex]!
       const retried = yield* sync.receive(Task, loser.documentId, session, {
         remoteConnectionEpoch: loser.remoteConnectionEpoch,
         receiveSequence: loser.sequence,
-        message: loser.dependent
+        message: loser.dependent,
+        writerProvenance: provenanceFor(loser.dependent, Task.version, definition.hash)
       })
       assert.isFalse(retried.duplicate)
       assert.deepStrictEqual(
@@ -891,7 +1375,8 @@ describe("PeerSync", () => {
             const received = yield* sync.receive(Task, documentId, session, {
               remoteConnectionEpoch,
               receiveSequence: sequence++,
-              message: outbound[1]
+              message: outbound[1],
+              writerProvenance: provenanceFor(outbound[1], Task.version, definition.hash)
             })
             if (received.reply !== null) {
               const applied = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
@@ -920,12 +1405,14 @@ describe("PeerSync", () => {
       yield* sync.receive(Task, documentId, firstSession, {
         remoteConnectionEpoch: first.remoteConnectionEpoch,
         receiveSequence: first.sequence,
-        message: first.dependent
+        message: first.dependent,
+        writerProvenance: provenanceFor(first.dependent, Task.version, definition.hash)
       })
       const rejected = yield* Effect.exit(sync.receive(Task, documentId, secondSession, {
         remoteConnectionEpoch: second.remoteConnectionEpoch,
         receiveSequence: second.sequence,
-        message: second.dependent
+        message: second.dependent,
+        writerProvenance: provenanceFor(second.dependent, Task.version, definition.hash)
       }))
       assert.strictEqual(rejected._tag, "Failure")
       if (rejected._tag === "Failure") {
@@ -960,7 +1447,8 @@ describe("PeerSync", () => {
             const received = yield* sync.receive(Task, documentId, session, {
               remoteConnectionEpoch,
               receiveSequence: sequence++,
-              message: outbound[1]
+              message: outbound[1],
+              writerProvenance: provenanceFor(outbound[1], Task.version, definition.hash)
             })
             if (received.reply !== null) {
               const applied = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
@@ -1004,12 +1492,14 @@ describe("PeerSync", () => {
       yield* sync.receive(Task, first.documentId, firstSession, {
         remoteConnectionEpoch: first.remoteConnectionEpoch,
         receiveSequence: first.sequence,
-        message: first.dependent
+        message: first.dependent,
+        writerProvenance: provenanceFor(first.dependent, Task.version, definition.hash)
       })
       const rejected = yield* Effect.exit(sync.receive(Task, second.documentId, secondSession, {
         remoteConnectionEpoch: second.remoteConnectionEpoch,
         receiveSequence: second.sequence,
-        message: second.dependent
+        message: second.dependent,
+        writerProvenance: provenanceFor(second.dependent, Task.version, definition.hash)
       }))
       assert.strictEqual(rejected._tag, "Failure")
       if (rejected._tag === "Failure") {
@@ -1038,7 +1528,8 @@ describe("PeerSync", () => {
         sync.receive(Task, documentId, session, {
           remoteConnectionEpoch: session.connectionEpoch,
           receiveSequence: 0,
-          message: new Uint8Array(limits.maxSyncMessageBytes + 1)
+          message: new Uint8Array(limits.maxSyncMessageBytes + 1),
+          writerProvenance: []
         })
       )
       assert.strictEqual(exit._tag, "Failure")
@@ -1046,7 +1537,8 @@ describe("PeerSync", () => {
         (yield* Effect.exit(sync.receive(Task, documentId, session, {
           remoteConnectionEpoch: session.connectionEpoch,
           receiveSequence: 0,
-          message: new Uint8Array([1, 2, 3])
+          message: new Uint8Array([1, 2, 3]),
+          writerProvenance: []
         })))._tag,
         "Failure"
       )
@@ -1078,29 +1570,35 @@ describe("PeerSync", () => {
       const documentId = yield* Identity.makeDocumentId
       const session = yield* sync.open(yield* Identity.makePeerId)
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
-      const generated = yield* sync.generate(Task, documentId, session)
-      assert.isNotNull(generated.outbound)
-      yield* sql`INSERT INTO effect_local_peer_receipts (
-        replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id,
-        message_hash, reply, reply_hash, pending_message, heads,
-        accepted_heads, commit_sequence, accepted_at
-      ) VALUES (
-        ${session.replicaIncarnation}, ${session.peerId}, ${session.connectionEpoch}, 0, ${documentId},
-        'receipt', NULL, NULL, NULL, ${JSON.stringify(created.materializedHeads)},
-        ${JSON.stringify(created.acceptedHeads)}, ${created.commitSequence}, ${new Date(0).toISOString()}
-      )`
+      const remote = Automerge.init<InternalAutomerge.Root<{ title: string; labels: Array<string> }>>()
+      const handshake = Automerge.generateSyncMessage(remote, Automerge.initSyncState())[1]!
+      const received = yield* sync.receive(Task, documentId, session, {
+        remoteConnectionEpoch: "remote-restart",
+        receiveSequence: 0,
+        message: handshake,
+        writerProvenance: []
+      })
+      assert.isNotNull(received.reply)
+      const generated = yield* sync.enqueue(session, received.reply!)
+      assert.isAbove(generated.writerProvenance.length, 0)
+      assert.deepStrictEqual(
+        generated.writerProvenance,
+        provenanceFor(generated.message, Task.version, definition.hash)
+      )
       yield* Effect.scoped(
         Effect.gen(function*() {
           const restarted = yield* PeerSync.PeerSync
           const pending = yield* restarted.pending(session)
           assert.strictEqual(pending.length, 1)
-          assert.strictEqual(pending[0]?.messageHash, generated.outbound?.messageHash)
+          assert.strictEqual(pending[0]?.messageHash, generated.messageHash)
+          assert.deepStrictEqual(pending[0]?.writerProvenance, generated.writerProvenance)
           const rows = yield* sql<{ readonly outbox: number; readonly receipts: number }>`SELECT
             (SELECT COUNT(*) FROM effect_local_peer_outbox) AS outbox,
             (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts`
           assert.deepStrictEqual(rows, [{ outbox: 1, receipts: 1 }])
         }).pipe(Effect.provide(PeerSync.layer))
       )
+      InternalAutomerge.free(remote)
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(TestLayer)))
 
@@ -1150,7 +1648,8 @@ describe("PeerSync", () => {
         const firstInput = {
           remoteConnectionEpoch: "first remote",
           receiveSequence: 0,
-          message: firstMessage
+          message: firstMessage,
+          writerProvenance: provenanceFor(firstMessage)
         }
         const first = yield* sync.receive(Task, firstDocumentId, firstSession, firstInput).pipe(Effect.forkChild)
         yield* Deferred.await(firstStarted)
@@ -1158,7 +1657,8 @@ describe("PeerSync", () => {
         const independent = yield* sync.receive(Task, secondDocumentId, secondSession, {
           remoteConnectionEpoch: "second remote",
           receiveSequence: 0,
-          message: secondMessage
+          message: secondMessage,
+          writerProvenance: provenanceFor(secondMessage, Task.version, definition.hash)
         }).pipe(Effect.forkChild)
         yield* Deferred.await(secondStarted)
         assert.isUndefined(same.pollUnsafe())
@@ -1208,7 +1708,12 @@ describe("PeerSync", () => {
       yield* Effect.gen(function*() {
         const sync = yield* PeerSync.PeerSync
         const session = yield* sync.open(yield* Identity.makePeerId)
-        const input = { remoteConnectionEpoch: "remote", receiveSequence: 0, message }
+        const input = {
+          remoteConnectionEpoch: "remote",
+          receiveSequence: 0,
+          message,
+          writerProvenance: provenanceFor(message)
+        }
         const inFlight = yield* Effect.exit(sync.receive(Task, documentId, session, input)).pipe(Effect.forkChild)
         yield* Deferred.await(started)
         yield* sync.reset(session)
@@ -1321,7 +1826,8 @@ describe("PeerSync", () => {
         const exit = yield* Effect.exit(sync.receive(Task, documentId, session, {
           remoteConnectionEpoch: session.connectionEpoch,
           receiveSequence: sequence,
-          message: generated[1]
+          message: generated[1],
+          writerProvenance: provenanceFor(generated[1], Task.version, definition.hash)
         }))
         if (exit._tag === "Failure") {
           const after = yield* sql<{ readonly changes: number; readonly receipts: number }>`SELECT
@@ -1402,7 +1908,8 @@ describe("PeerSync", () => {
       const received = yield* sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: 0,
-        message
+        message,
+        writerProvenance: provenanceFor(message, Task.version, definition.hash)
       })
       assert.isFalse(received.duplicate)
       const remaining = yield* sql<{
@@ -1428,6 +1935,7 @@ describe("PeerSync", () => {
     Effect.gen(function*() {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
       const documentId = yield* Identity.makeDocumentId
       const peerId = yield* Identity.makePeerId
       const session = yield* sync.open(peerId)
@@ -1442,7 +1950,8 @@ describe("PeerSync", () => {
         const received = yield* sync.receive(Task, documentId, session, {
           remoteConnectionEpoch: session.connectionEpoch,
           receiveSequence: sequence++,
-          message: outbound[1]
+          message: outbound[1],
+          writerProvenance: provenanceFor(outbound[1], Task.version, definition.hash)
         })
         if (received.reply !== null) {
           const applied = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
@@ -1453,28 +1962,73 @@ describe("PeerSync", () => {
       remote = Automerge.change(remote, (draft) => {
         ;(draft.value as { title: string }).title = "two"
       })
+      const dependencyHash = Automerge.decodeChange(
+        Automerge.getChangesSince(remote, [...created.materializedHeads]).at(-1)!
+      ).hash
       const first = Automerge.generateSyncMessage(remote, remoteState)
       remoteState = first[0]
       assert.isNotNull(first[1])
+      const dependencyProvenance = provenanceFor(first[1]!, Task.version, definition.hash).map((entry) =>
+        entry.changeHash === dependencyHash
+          ? Object.assign({}, entry, {
+            writerSchemaVersion: 7,
+            writerDefinitionHash: "dependency-definition"
+          })
+          : entry
+      )
+      const dependencyHeads = Automerge.getHeads(remote)
       remote = Automerge.change(remote, (draft) => {
         ;(draft.value as unknown as { labels: Array<string> }).labels.push("after")
       })
+      const dependentHash = Automerge.decodeChange(
+        Automerge.getChangesSince(remote, dependencyHeads).at(-1)!
+      ).hash
       const second = Automerge.generateSyncMessage(remote, remoteState)
       assert.isNotNull(second[1])
+      const dependentProvenance = provenanceFor(second[1]!, Task.version, definition.hash).map((entry) => {
+        if (entry.changeHash === dependencyHash) {
+          return Object.assign({}, entry, {
+            writerSchemaVersion: 7,
+            writerDefinitionHash: "dependency-definition"
+          })
+        }
+        if (entry.changeHash === dependentHash) {
+          return Object.assign({}, entry, {
+            writerSchemaVersion: 8,
+            writerDefinitionHash: "dependent-definition"
+          })
+        }
+        return entry
+      })
       const pending = yield* sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: sequence++,
-        message: second[1]!
+        message: second[1]!,
+        writerProvenance: dependentProvenance
       })
       assert.isFalse(sameHeadsForTest(pending.heads, Automerge.getHeads(remote)))
       yield* sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: sequence++,
-        message: first[1]!
+        message: first[1]!,
+        writerProvenance: dependencyProvenance
       })
       const converged = yield* store.load(Task, documentId)
       assert.deepStrictEqual(converged.snapshot.value, { title: "two", labels: ["after"] })
       assert.strictEqual(converged.snapshot.projection, "Blocked")
+      const provenance = yield* sql<{
+        readonly change_hash: string
+        readonly writer_definition_hash: string
+        readonly writer_schema_version: number
+      }>`SELECT change_hash, writer_definition_hash, writer_schema_version
+        FROM effect_local_changes WHERE document_id = ${documentId}`
+      const byHash = new Map(provenance.map((entry) => [entry.change_hash, entry]))
+      for (const entry of [...dependencyProvenance, ...dependentProvenance]) {
+        assert.deepInclude(byHash.get(entry.changeHash), {
+          writer_definition_hash: entry.writerDefinitionHash,
+          writer_schema_version: entry.writerSchemaVersion
+        })
+      }
       yield* sync.reset(session)
       const reconnected = yield* sync.open(peerId)
       assert.notStrictEqual(reconnected.connectionEpoch, session.connectionEpoch)
@@ -1502,7 +2056,8 @@ describe("PeerSync", () => {
         const received = yield* sync.receive(Task, documentId, session, {
           remoteConnectionEpoch: session.connectionEpoch,
           receiveSequence: sequence++,
-          message: outbound[1]
+          message: outbound[1],
+          writerProvenance: provenanceFor(outbound[1], Task.version, definition.hash)
         })
         if (received.reply !== null) {
           const applied = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
@@ -1534,13 +2089,15 @@ describe("PeerSync", () => {
       const pending = yield* sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: sequence++,
-        message: second[1]!
+        message: second[1]!,
+        writerProvenance: provenanceFor(second[1]!, Task.version, definition.hash)
       })
       assert.isFalse(sameHeadsForTest(pending.heads, Automerge.getHeads(remote)))
       yield* sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: sequence++,
-        message: first[1]!
+        message: first[1]!,
+        writerProvenance: provenanceFor(first[1]!, Task.version, definition.hash)
       })
       const converged = yield* store.load(Task, documentId)
       assert.strictEqual(converged.snapshot.value.title, "x".repeat(2048))
@@ -1622,7 +2179,8 @@ describe("PeerSync", () => {
           const received = yield* sync.receive(Task, documentId, session, {
             remoteConnectionEpoch: "remote",
             receiveSequence: receiveSequence++,
-            message: outbound[1]
+            message: outbound[1],
+            writerProvenance: provenanceFor(outbound[1], Task.version, definition.hash)
           })
           if (received.reply !== null) {
             const applied = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
@@ -1641,7 +2199,8 @@ describe("PeerSync", () => {
         const received = yield* sync.receive(Task, documentId, session, {
           remoteConnectionEpoch: "remote",
           receiveSequence: receiveSequence++,
-          message: outbound[1]!
+          message: outbound[1]!,
+          writerProvenance: provenanceFor(outbound[1]!, Task.version, definition.hash)
         }).pipe(Effect.forkChild)
         yield* Deferred.await(loaded)
         const staged = yield* store.stage(created, (draft) => {
@@ -1708,7 +2267,8 @@ describe("PeerSync", () => {
         const result = yield* Effect.result(sync.receive(Task, documentId, session, {
           remoteConnectionEpoch: "remote",
           receiveSequence: 0,
-          message
+          message,
+          writerProvenance: provenanceFor(message, Task.version, definition.hash)
         }))
         assert.strictEqual(conflicts, 9)
         assert.isTrue(Result.isFailure(result))
@@ -1790,7 +2350,8 @@ describe("PeerSync", () => {
         const received = yield* Effect.result(sync.receive(Task, documentId, session, {
           remoteConnectionEpoch: "remote",
           receiveSequence: 0,
-          message
+          message,
+          writerProvenance: provenanceFor(message, Task.version, definition.hash)
         })).pipe(Effect.forkChild)
         yield* Deferred.await(firstAttemptClosed)
         yield* sync.reset(session)
@@ -1877,7 +2438,8 @@ describe("PeerSync", () => {
           sync.receive(Task, documentId, session, {
             remoteConnectionEpoch: "remote",
             receiveSequence: 0,
-            message: generated[1]!
+            message: generated[1]!,
+            writerProvenance: provenanceFor(generated[1]!, Task.version, definition.hash)
           })
         )
 

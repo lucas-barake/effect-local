@@ -80,6 +80,14 @@ const replicaLimits = ReplicaLimits.Values.make({
   maxInFlightPerSession: 1,
   maxQueuedRpc: 32
 })
+const maximumWriterProvenance = Array.from(
+  { length: replicaLimits.maxSyncChangesPerMessage },
+  (_, index) => ({
+    changeHash: index.toString(16).padStart(64, "0"),
+    writerSchemaVersion: Number.MAX_SAFE_INTEGER,
+    writerDefinitionHash: "x".repeat(256)
+  })
+)
 const rpcLimits = PeerRpcLimits.Values.make({
   ...PeerRpcLimits.defaults,
   openRatePerSecond: 1_000,
@@ -136,6 +144,7 @@ const makeFixture = (options: {
     const commits = yield* Queue.unbounded<CommitPublisher.CommitEvent>()
     const generated = yield* Queue.unbounded<Identity.DocumentId>()
     const received = yield* Queue.unbounded<number>()
+    const receivedPayloads = yield* Queue.unbounded<typeof DocumentEntity.ApplySync.payloadSchema.Type>()
     const sent = yield* Queue.unbounded<number>()
     const enqueued = yield* Queue.unbounded<Identity.DocumentId>()
     const pendingStarted = yield* Queue.unbounded<Identity.PeerId>()
@@ -255,7 +264,7 @@ const makeFixture = (options: {
         ),
       receive: () => Effect.die("unexpected direct PeerSync receive"),
       enqueue: (session, reply) => {
-        const outbound = { ...reply, sendSequence: 0 }
+        const outbound = { ...reply, sendSequence: 0, writerProvenance: maximumWriterProvenance }
         return Queue.offer(enqueued, reply.documentId).pipe(
           Effect.andThen(Ref.update(enqueuedOutbounds, (pendingByPeer) => {
             const next = new Map(pendingByPeer)
@@ -306,7 +315,8 @@ const makeFixture = (options: {
         Effect.succeed(() =>
           ({
             ApplySync: (payload: typeof DocumentEntity.ApplySync.payloadSchema.Type) =>
-              Queue.offer(received, payload.receiveSequence).pipe(
+              Queue.offer(receivedPayloads, payload).pipe(
+                Effect.andThen(Queue.offer(received, payload.receiveSequence)),
                 Effect.andThen(
                   options.blockInbound
                     ? Deferred.succeed(inboundBlocked, undefined).pipe(Effect.andThen(Deferred.await(inboundRelease)))
@@ -452,7 +462,12 @@ const makeFixture = (options: {
           documentId,
           documentType,
           messageHash: yield* Canonical.digest(message).pipe(Effect.provideService(Crypto.Crypto, crypto)),
-          message
+          message,
+          writerProvenance: [{
+            changeHash: "a".repeat(64),
+            writerSchemaVersion: 1,
+            writerDefinitionHash: "remote-definition-hash"
+          }]
         })
         return new TextEncoder().encode(value)
       })
@@ -463,6 +478,7 @@ const makeFixture = (options: {
       commits,
       generated,
       received,
+      receivedPayloads,
       sent,
       enqueued,
       pendingStarted,
@@ -510,7 +526,8 @@ describe("PeerRpcServer", () => {
           documentId: taskId,
           message: Uint8Array.of(1, 2, 3),
           messageHash: "hash",
-          heads: []
+          heads: [],
+          writerProvenance: []
         }
       })
       const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
@@ -525,6 +542,14 @@ describe("PeerRpcServer", () => {
       const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
       yield* fixture.client.Push({ sessionId: session.opened.sessionId, payload: yield* fixture.encode(0) })
       assert.strictEqual(yield* Queue.take(fixture.received), 0)
+      const payload = yield* Queue.take(fixture.receivedPayloads)
+      assert.strictEqual(payload.connectionEpoch, "remote-epoch")
+      assert.strictEqual(payload.localConnectionEpoch, "local-epoch")
+      assert.deepStrictEqual(payload.writerProvenance, [{
+        changeHash: "a".repeat(64),
+        writerSchemaVersion: 1,
+        writerDefinitionHash: "remote-definition-hash"
+      }])
       assert.strictEqual(yield* Ref.get(fixture.publications), 1)
       yield* Fiber.interrupt(session.fiber)
     })))
@@ -723,13 +748,19 @@ describe("PeerRpcServer", () => {
     Effect.scoped(Effect.gen(function*() {
       const fixture = yield* makeFixture({
         ...baseOptions,
-        rpcLimits: { maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(replicaLimits.maxSyncMessageBytes) },
+        rpcLimits: {
+          maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(
+            replicaLimits.maxSyncMessageBytes,
+            replicaLimits.maxSyncChangesPerMessage
+          )
+        },
         initialOutbound: {
           sendSequence: 0,
           documentId: taskId,
           message: new Uint8Array(48_000),
           messageHash: "fifo-blocker",
-          heads: []
+          heads: [],
+          writerProvenance: maximumWriterProvenance
         }
       })
       const opened = yield* Queue.unbounded<string>()
@@ -748,7 +779,8 @@ describe("PeerRpcServer", () => {
         documentId: noteId,
         message: new Uint8Array(replicaLimits.maxSyncMessageBytes),
         messageHash: "fifo-head",
-        heads: []
+        heads: [],
+        writerProvenance: maximumWriterProvenance
       })
       yield* fixture.setCredential("foreign")
       const head = yield* Stream.runForEach(
@@ -768,7 +800,8 @@ describe("PeerRpcServer", () => {
         documentId: taskId,
         message: new Uint8Array(48_000),
         messageHash: "fifo-tail",
-        heads: []
+        heads: [],
+        writerProvenance: []
       })
       yield* fixture.setCredential("subject-10")
       const tail = yield* Stream.runForEach(
@@ -795,14 +828,20 @@ describe("PeerRpcServer", () => {
     Effect.scoped(Effect.gen(function*() {
       const fixture = yield* makeFixture({
         ...baseOptions,
-        rpcLimits: { maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(replicaLimits.maxSyncMessageBytes) }
+        rpcLimits: {
+          maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(
+            replicaLimits.maxSyncMessageBytes,
+            replicaLimits.maxSyncChangesPerMessage
+          )
+        }
       })
       yield* fixture.setPendingOutbound({
         sendSequence: 0,
         documentId: taskId,
         message: new Uint8Array(replicaLimits.maxSyncMessageBytes),
         messageHash: "cancel-blocker",
-        heads: []
+        heads: [],
+        writerProvenance: maximumWriterProvenance
       })
       const blockerReady = yield* Deferred.make<void>()
       const blocker = yield* Effect.scoped(Effect.gen(function*() {
@@ -819,7 +858,8 @@ describe("PeerRpcServer", () => {
         documentId: noteId,
         message: new Uint8Array(replicaLimits.maxSyncMessageBytes),
         messageHash: "cancel-head",
-        heads: []
+        heads: [],
+        writerProvenance: []
       })
       const head = yield* fixture.directOpenAs(
         "foreign",
@@ -832,7 +872,8 @@ describe("PeerRpcServer", () => {
         documentId: taskId,
         message: Uint8Array.of(1),
         messageHash: "cancel-tail",
-        heads: []
+        heads: [],
+        writerProvenance: []
       })
       const tailMessage = yield* Deferred.make<void>()
       const tail = yield* fixture.directOpenAs(
@@ -855,7 +896,8 @@ describe("PeerRpcServer", () => {
         documentId: taskId,
         message: new Uint8Array(replicaLimits.maxSyncMessageBytes),
         messageHash: "cancel-probe",
-        heads: []
+        heads: [],
+        writerProvenance: []
       })
       const probeMessage = yield* Deferred.make<void>()
       const probe = yield* fixture.directOpenAs(
@@ -876,7 +918,12 @@ describe("PeerRpcServer", () => {
       const fixture = yield* makeFixture({
         ...baseOptions,
         replicaLimits: { maxSessions: 8 },
-        rpcLimits: { maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(replicaLimits.maxSyncMessageBytes) }
+        rpcLimits: {
+          maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(
+            replicaLimits.maxSyncMessageBytes,
+            replicaLimits.maxSyncChangesPerMessage
+          )
+        }
       })
       const large = new Uint8Array(replicaLimits.maxSyncMessageBytes)
       yield* fixture.setPendingOutbound({
@@ -884,7 +931,8 @@ describe("PeerRpcServer", () => {
         documentId: taskId,
         message: large,
         messageHash: "bounded-blocker",
-        heads: []
+        heads: [],
+        writerProvenance: maximumWriterProvenance
       })
       const blockerReady = yield* Deferred.make<void>()
       const blocker = yield* Effect.scoped(Effect.gen(function*() {
@@ -903,7 +951,8 @@ describe("PeerRpcServer", () => {
           documentId: taskId,
           message: large,
           messageHash: `bounded-waiter-${index}`,
-          heads: []
+          heads: [],
+          writerProvenance: []
         })
         yield* fixture.setCredential(`subject-${index + 10}`)
         waiters.push(
@@ -921,7 +970,8 @@ describe("PeerRpcServer", () => {
         documentId: taskId,
         message: large,
         messageHash: "bounded-rejected",
-        heads: []
+        heads: [],
+        writerProvenance: []
       })
       yield* fixture.setCredential("subject-20")
       const rejected = yield* fixture.client.Open({
@@ -1303,7 +1353,8 @@ describe("PeerRpcServer", () => {
           documentId: taskId,
           message: Uint8Array.of(1),
           messageHash: "held",
-          heads: []
+          heads: [],
+          writerProvenance: []
         }
       })
       const messageHeld = yield* Deferred.make<void>()
@@ -1334,7 +1385,8 @@ describe("PeerRpcServer", () => {
           documentId: taskId,
           message: Uint8Array.of(1),
           messageHash: "taken-before-overload",
-          heads: []
+          heads: [],
+          writerProvenance: []
         }
       })
       const opened = yield* Deferred.make<PeerRpc.Opened>()
@@ -1547,7 +1599,8 @@ describe("PeerRpcServer", () => {
           documentId: taskId,
           message: Uint8Array.of(1, 2, 3),
           messageHash: "lease-boundary",
-          heads: []
+          heads: [],
+          writerProvenance: []
         },
         manualClock: true
       })
@@ -1588,7 +1641,8 @@ describe("PeerRpcServer", () => {
         documentId: taskId,
         message: Uint8Array.of(1, 2, 3),
         messageHash: "lease-boundary",
-        heads: []
+        heads: [],
+        writerProvenance: []
       })
       yield* fixture.setCurrentTime(1_000)
       yield* Queue.offer(fixture.commits, {
@@ -1652,7 +1706,12 @@ describe("PeerRpcServer", () => {
       const fixture = yield* makeFixture({
         ...baseOptions,
         blockInbound: true,
-        rpcLimits: { maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(replicaLimits.maxSyncMessageBytes) }
+        rpcLimits: {
+          maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(
+            replicaLimits.maxSyncMessageBytes,
+            replicaLimits.maxSyncChangesPerMessage
+          )
+        }
       })
       const blocker = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
       yield* Queue.take(fixture.generated)
@@ -1667,7 +1726,8 @@ describe("PeerRpcServer", () => {
         documentId: noteId,
         message,
         messageHash: "initial-capacity",
-        heads: []
+        heads: [],
+        writerProvenance: maximumWriterProvenance
       })
       yield* fixture.setCredential("foreign")
       const opening = yield* fixture.client.Open({
@@ -1688,13 +1748,19 @@ describe("PeerRpcServer", () => {
       const message = new Uint8Array(replicaLimits.maxSyncMessageBytes)
       const fixture = yield* makeFixture({
         ...baseOptions,
-        rpcLimits: { maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(replicaLimits.maxSyncMessageBytes) },
+        rpcLimits: {
+          maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(
+            replicaLimits.maxSyncMessageBytes,
+            replicaLimits.maxSyncChangesPerMessage
+          )
+        },
         initialOutbound: {
           sendSequence: 0,
           documentId: taskId,
           message,
           messageHash: "held-for-push-reply",
-          heads: []
+          heads: [],
+          writerProvenance: maximumWriterProvenance
         }
       })
       const messageHeld = yield* Deferred.make<void>()
@@ -1753,15 +1819,22 @@ describe("PeerRpcServer", () => {
       const fixture = yield* makeFixture({
         ...baseOptions,
         rpcLimits: {
-          maxOutboundBufferedBytesPerSession: PeerSession.maximumSyncEnvelopeBytes(replicaLimits.maxSyncMessageBytes),
-          maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(replicaLimits.maxSyncMessageBytes)
+          maxOutboundBufferedBytesPerSession: PeerSession.maximumSyncEnvelopeBytes(
+            replicaLimits.maxSyncMessageBytes,
+            replicaLimits.maxSyncChangesPerMessage
+          ),
+          maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(
+            replicaLimits.maxSyncMessageBytes,
+            replicaLimits.maxSyncChangesPerMessage
+          )
         },
         initialOutbound: {
           sendSequence: 0,
           documentId: taskId,
           message,
           messageHash: "first",
-          heads: []
+          heads: [],
+          writerProvenance: maximumWriterProvenance
         }
       })
       const opened = yield* Deferred.make<PeerRpc.Opened>()
@@ -1785,7 +1858,8 @@ describe("PeerRpcServer", () => {
         documentId: taskId,
         message,
         messageHash: "second",
-        heads: []
+        heads: [],
+        writerProvenance: []
       })
       yield* Queue.offer(fixture.commits, {
         _tag: "Commit",
@@ -1813,7 +1887,12 @@ describe("PeerRpcServer", () => {
       const fixture = yield* makeFixture({
         ...baseOptions,
         blockInbound: true,
-        rpcLimits: { maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(replicaLimits.maxSyncMessageBytes) }
+        rpcLimits: {
+          maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(
+            replicaLimits.maxSyncMessageBytes,
+            replicaLimits.maxSyncChangesPerMessage
+          )
+        }
       })
       const blocker = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
       yield* Queue.take(fixture.pendingStarted)
@@ -1832,7 +1911,8 @@ describe("PeerRpcServer", () => {
         documentId: noteId,
         message,
         messageHash: "flush-capacity",
-        heads: []
+        heads: [],
+        writerProvenance: maximumWriterProvenance
       })
       yield* Queue.offer(fixture.commits, {
         _tag: "Commit",
@@ -1855,7 +1935,12 @@ describe("PeerRpcServer", () => {
       const fixture = yield* makeFixture({
         ...baseOptions,
         blockInbound: true,
-        rpcLimits: { maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(replicaLimits.maxSyncMessageBytes) }
+        rpcLimits: {
+          maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(
+            replicaLimits.maxSyncMessageBytes,
+            replicaLimits.maxSyncChangesPerMessage
+          )
+        }
       })
       const first = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
       const payload = yield* fixture.encodeMessage(0, taskId, Task.name, message)
@@ -1985,7 +2070,8 @@ describe("PeerRpcServer", () => {
           documentId: taskId,
           message: Uint8Array.of(17, 18, 19),
           messageHash: "hash",
-          heads: []
+          heads: [],
+          writerProvenance: []
         },
         authorization: (request) =>
           Effect.logDebug("authorization-log-forbidden-value").pipe(
@@ -2383,7 +2469,10 @@ describe("PeerRpcServer", () => {
       const fixture = yield* makeFixture(baseOptions)
       const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
       const oversized = new Uint8Array(
-        PeerSession.maximumSyncEnvelopeBytes(replicaLimits.maxSyncMessageBytes) + 1
+        PeerSession.maximumSyncEnvelopeBytes(
+          replicaLimits.maxSyncMessageBytes,
+          replicaLimits.maxSyncChangesPerMessage
+        ) + 1
       )
       const rejected = yield* fixture.client.Push({
         sessionId: session.opened.sessionId,

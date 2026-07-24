@@ -16,7 +16,8 @@ const expectations = {
       [2, "peer_sync"],
       [3, "durability_indexes"],
       [4, "projection_readiness"],
-      [5, "pending_receipt_indexes"]
+      [5, "pending_receipt_indexes"],
+      [6, "peer_writer_provenance"]
     ],
     outbox: "none"
   },
@@ -24,14 +25,16 @@ const expectations = {
     applied: [
       [3, "durability_indexes"],
       [4, "projection_readiness"],
-      [5, "pending_receipt_indexes"]
+      [5, "pending_receipt_indexes"],
+      [6, "peer_writer_provenance"]
     ],
     outbox: "backfilled"
   },
   3: {
     applied: [
       [4, "projection_readiness"],
-      [5, "pending_receipt_indexes"]
+      [5, "pending_receipt_indexes"],
+      [6, "peer_writer_provenance"]
     ],
     outbox: { frozen: "2020-01-01T00:00:00.000Z" }
   }
@@ -114,7 +117,8 @@ const assertMigrationHistory = Effect.gen(function*() {
     { migration_id: 2, name: "peer_sync" },
     { migration_id: 3, name: "durability_indexes" },
     { migration_id: 4, name: "projection_readiness" },
-    { migration_id: 5, name: "pending_receipt_indexes" }
+    { migration_id: 5, name: "pending_receipt_indexes" },
+    { migration_id: 6, name: "peer_writer_provenance" }
   ])
 
   const catalog = yield* SqlSchema.findAll({
@@ -127,7 +131,8 @@ const assertMigrationHistory = Effect.gen(function*() {
     { migration_id: 2, name: "peer_sync", checksum: Migrations.peerSyncChecksum },
     { migration_id: 3, name: "durability_indexes", checksum: Migrations.durabilityIndexesChecksum },
     { migration_id: 4, name: "projection_readiness", checksum: Migrations.projectionReadinessChecksum },
-    { migration_id: 5, name: "pending_receipt_indexes", checksum: Migrations.pendingReceiptIndexesChecksum }
+    { migration_id: 5, name: "pending_receipt_indexes", checksum: Migrations.pendingReceiptIndexesChecksum },
+    { migration_id: 6, name: "peer_writer_provenance", checksum: Migrations.peerWriterProvenanceChecksum }
   ])
 })
 
@@ -170,7 +175,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         bytes: Schema.Uint8Array,
         checksum: Schema.String,
         commit_sequence: Schema.Int,
-        verified: Schema.Int
+        verified: Schema.Int,
+        writer_provenance: Schema.String
       }),
       execute: () => sql`SELECT * FROM effect_local_checkpoints ORDER BY checkpoint_hash`
     })(undefined)
@@ -182,7 +188,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         bytes: Uint8Array.of(1),
         checksum: "checksum-1",
         commit_sequence: 1,
-        verified: 1
+        verified: 1,
+        writer_provenance: "[]"
       },
       {
         checkpoint_hash: "checkpoint-3",
@@ -191,7 +198,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         bytes: Uint8Array.of(3),
         checksum: "checksum-3",
         commit_sequence: 3,
-        verified: 1
+        verified: 1,
+        writer_provenance: "[]"
       }
     ])
 
@@ -207,7 +215,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         message_hash: Schema.String,
         heads: Schema.String,
         status: Schema.String,
-        created_at: Schema.String
+        created_at: Schema.String,
+        writer_provenance: Schema.String
       }),
       execute: () => sql`SELECT * FROM effect_local_peer_outbox ORDER BY send_sequence`
     })(undefined)
@@ -226,7 +235,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         message: Uint8Array.of(1),
         message_hash: "message-1",
         heads: "[]",
-        status: "pending"
+        status: "pending",
+        writer_provenance: "[]"
       }]
     )
     const createdAt = outbox[0]?.created_at ?? ""

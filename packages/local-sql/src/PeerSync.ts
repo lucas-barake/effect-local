@@ -18,6 +18,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as DocumentStore from "./DocumentStore.js"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
@@ -33,6 +34,7 @@ export interface Outbound {
   readonly message: Uint8Array
   readonly messageHash: string
   readonly heads: ReadonlyArray<string>
+  readonly writerProvenance: ReadonlyArray<WriterProvenance.ChangeProvenance>
 }
 
 export interface Reply {
@@ -71,7 +73,8 @@ const ReceiptRow = Schema.Struct({
   message_hash: Schema.String,
   reply: Schema.NullOr(Schema.Uint8Array),
   reply_hash: Schema.NullOr(Schema.String),
-  document_id: Schema.String
+  document_id: Schema.String,
+  writer_provenance: WriterProvenance.StoredChangeProvenances
 })
 
 const PendingRow = Schema.Struct({
@@ -79,21 +82,26 @@ const PendingRow = Schema.Struct({
   bytes: Schema.Uint8Array,
   change_hash: Schema.String,
   dependencies: Schema.String,
-  sequence: Schema.Int
+  sequence: Schema.Int,
+  writer_definition_hash: WriterProvenance.WriterDefinitionHash,
+  writer_schema_version: WriterProvenance.WriterSchemaVersion
 })
 
 const PendingReceiptRow = Schema.Struct({
   accepted_heads: Heads,
   connection_epoch: Schema.String,
   peer_id: Schema.String,
-  receive_sequence: Schema.Number
+  receive_sequence: Schema.Number,
+  writer_provenance: WriterProvenance.StoredChangeProvenances
 })
 
 const ExistingChangeRow = Schema.Struct({
   actor: Schema.String,
   change_hash: Schema.String,
   document_id: Schema.String,
-  sequence: Schema.Number
+  sequence: Schema.Number,
+  writer_definition_hash: WriterProvenance.WriterDefinitionHash,
+  writer_schema_version: WriterProvenance.WriterSchemaVersion
 })
 
 const OutboxRow = Schema.Struct({
@@ -101,7 +109,22 @@ const OutboxRow = Schema.Struct({
   heads: Heads,
   message: Schema.Uint8Array,
   message_hash: Schema.String,
-  send_sequence: Schema.Number
+  send_sequence: Schema.Number,
+  writer_provenance: WriterProvenance.StoredChangeProvenances
+})
+
+const ChangeProvenanceRow = Schema.Struct({
+  change_hash: WriterProvenance.ChangeHash,
+  writer_definition_hash: WriterProvenance.WriterDefinitionHash,
+  writer_schema_version: WriterProvenance.WriterSchemaVersion
+})
+
+const CheckpointProvenanceRow = Schema.Struct({
+  writer_provenance: WriterProvenance.StoredChangeProvenances
+})
+
+const CheckpointHashRow = Schema.Struct({
+  checkpoint_hash: Schema.String
 })
 
 const CommitSequenceRow = Schema.Struct({
@@ -159,6 +182,30 @@ const receivedFromReceipt = (documentId: Identity.DocumentId, receipt: typeof Re
 const sameHeads = (left: ReadonlyArray<string>, right: ReadonlyArray<string>) =>
   Equal.equals(left.toSorted(), right.toSorted())
 
+const decodeSyncChanges = (
+  chunks: ReadonlyArray<Uint8Array>
+): ReadonlyArray<Automerge.DecodedChange> => {
+  const changes = new Map<string, Automerge.DecodedChange>()
+  for (const chunk of chunks) {
+    try {
+      const change = Automerge.decodeChange(chunk)
+      changes.set(change.hash, change)
+      continue
+    } catch {
+      const document = Automerge.load(chunk)
+      try {
+        for (const bytes of Automerge.getAllChanges(document)) {
+          const change = Automerge.decodeChange(bytes)
+          changes.set(change.hash, change)
+        }
+      } finally {
+        Automerge.free(document)
+      }
+    }
+  }
+  return [...changes.values()]
+}
+
 const failStorageUnavailable = (cause: unknown) =>
   Effect.fail(
     new ReplicaError.ReplicaError({
@@ -189,6 +236,7 @@ export class PeerSync extends Context.Service<PeerSync, {
       readonly remoteConnectionEpoch: string
       readonly receiveSequence: number
       readonly message: Uint8Array
+      readonly writerProvenance: ReadonlyArray<WriterProvenance.ChangeProvenance>
     }
   ) => Effect.Effect<Received, ReplicaError.ReplicaError>
   readonly enqueue: (session: Session, reply: Reply) => Effect.Effect<Outbound, ReplicaError.ReplicaError>
@@ -241,7 +289,8 @@ export const layer: Layer.Layer<
       }),
       Result: ReceiptRow,
       execute: (request) =>
-        sql`SELECT accepted_heads, commit_sequence, document_id, heads, message_hash, reply, reply_hash
+        sql`SELECT accepted_heads, commit_sequence, document_id, heads, message_hash, reply, reply_hash,
+          writer_provenance
           FROM effect_local_peer_receipts
           WHERE replica_incarnation = ${request.replicaIncarnation}
             AND peer_id = ${request.peerId}
@@ -259,7 +308,8 @@ export const layer: Layer.Layer<
       }),
       Result: ExistingChangeRow,
       execute: (request) =>
-        sql`SELECT actor, change_hash, document_id, sequence FROM effect_local_changes
+        sql`SELECT actor, change_hash, document_id, sequence, writer_definition_hash, writer_schema_version
+          FROM effect_local_changes
           WHERE ${sql.in("change_hash", request.changes.map((change) => change.changeHash))}
             OR (document_id = ${request.documentId} AND ${
           sql.or(request.changes.map((change) => sql`(actor = ${change.actor} AND sequence = ${change.sequence})`))
@@ -269,7 +319,9 @@ export const layer: Layer.Layer<
       Request: Identity.DocumentId,
       Result: PendingRow,
       execute: (documentId) =>
-        sql`SELECT actor, bytes, change_hash, dependencies, sequence FROM effect_local_changes
+        sql`SELECT actor, bytes, change_hash, dependencies, sequence,
+          writer_definition_hash, writer_schema_version
+          FROM effect_local_changes
           WHERE document_id = ${documentId} AND applied = 0 ORDER BY accepted_at, change_hash`
     })
     const findPendingReceipts = SqlSchema.findAll({
@@ -279,7 +331,7 @@ export const layer: Layer.Layer<
       }),
       Result: PendingReceiptRow,
       execute: (request) =>
-        sql`SELECT accepted_heads, connection_epoch, peer_id, receive_sequence
+        sql`SELECT accepted_heads, connection_epoch, peer_id, receive_sequence, writer_provenance
           FROM effect_local_peer_receipts
           WHERE replica_incarnation = ${request.replicaIncarnation}
             AND document_id = ${request.documentId}
@@ -293,7 +345,7 @@ export const layer: Layer.Layer<
       }),
       Result: OutboxRow,
       execute: (request) =>
-        sql`SELECT document_id, heads, message, message_hash, send_sequence
+        sql`SELECT document_id, heads, message, message_hash, send_sequence, writer_provenance
           FROM effect_local_peer_outbox
           WHERE replica_incarnation = ${request.replicaIncarnation}
             AND peer_id = ${request.peerId}
@@ -311,7 +363,7 @@ export const layer: Layer.Layer<
       }),
       Result: OutboxRow,
       execute: (request) =>
-        sql`SELECT document_id, heads, message, message_hash, send_sequence
+        sql`SELECT document_id, heads, message, message_hash, send_sequence, writer_provenance
           FROM effect_local_peer_outbox
           WHERE replica_incarnation = ${request.replicaIncarnation}
             AND peer_id = ${request.peerId}
@@ -320,6 +372,54 @@ export const layer: Layer.Layer<
             AND message_hash = ${request.messageHash}
           ORDER BY send_sequence
           LIMIT 1`
+    })
+    const findChangeProvenance = SqlSchema.findAll({
+      Request: Schema.Array(WriterProvenance.ChangeHash),
+      Result: ChangeProvenanceRow,
+      execute: (changeHashes) =>
+        sql`SELECT change_hash, writer_definition_hash, writer_schema_version
+          FROM effect_local_changes
+          WHERE ${sql.in("change_hash", changeHashes)}`
+    })
+    const findDocumentChangeProvenance = SqlSchema.findAll({
+      Request: Identity.DocumentId,
+      Result: ChangeProvenanceRow,
+      execute: (documentId) =>
+        sql`SELECT change_hash, writer_definition_hash, writer_schema_version
+          FROM effect_local_changes
+          WHERE document_id = ${documentId}`
+    })
+    const findCheckpointProvenance = SqlSchema.findAll({
+      Request: Identity.DocumentId,
+      Result: CheckpointProvenanceRow,
+      execute: (documentId) =>
+        sql`SELECT writer_provenance
+          FROM effect_local_checkpoints
+          WHERE document_id = ${documentId} AND verified = 1
+          ORDER BY commit_sequence DESC, checkpoint_hash DESC
+          LIMIT 2`
+    })
+    const findCheckpointIdentity = SqlSchema.findAll({
+      Request: Schema.Struct({
+        bytes: Schema.Uint8Array,
+        checkpointHash: Schema.String,
+        checksum: Schema.String,
+        documentId: Identity.DocumentId,
+        heads: Heads,
+        writerProvenance: WriterProvenance.ChangeProvenances
+      }),
+      Result: CheckpointHashRow,
+      execute: (request) =>
+        sql`SELECT checkpoint_hash FROM effect_local_checkpoints
+          WHERE checkpoint_hash = ${request.checkpointHash}
+            AND document_id = ${request.documentId}
+            AND heads = ${request.heads}
+            AND bytes = ${request.bytes}
+            AND checksum = ${request.checksum}
+            AND verified = 1
+            AND writer_provenance = ${
+          Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(request.writerProvenance)
+        }`
     })
     const findCommitSequence = SqlSchema.findAll({
       Request: Schema.Void,
@@ -649,6 +749,53 @@ export const layer: Layer.Layer<
         : Effect.succeed(Identity.CommitSequence.make(rows[0].commit_sequence))
     ))
 
+    const loadWriterProvenance = (documentId: Identity.DocumentId, message: Uint8Array) =>
+      Effect.gen(function*() {
+        const changes = yield* Effect.try({
+          try: () => decodeSyncChanges(Automerge.decodeSyncMessage(message).changes),
+          catch: (cause) =>
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+        })
+        if (changes.length > limits.maxSyncChangesPerMessage) {
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.QuotaExceeded({
+              resource: "sync message writer provenance",
+              limit: limits.maxSyncChangesPerMessage
+            })
+          })
+        }
+        if (changes.length === 0) return []
+        const [rows, checkpoints] = yield* Effect.all([
+          findChangeProvenance(changes.map((change) => change.hash)),
+          findCheckpointProvenance(documentId)
+        ]).pipe(
+          Effect.catchTags({
+            SqlError: failStorageUnavailable,
+            SchemaError: failStorageCorrupt
+          })
+        )
+        return yield* Effect.try({
+          try: () =>
+            WriterProvenance.resolve(
+              changes.map((change) => change.hash),
+              [
+                ...rows.map((row) => ({
+                  changeHash: row.change_hash,
+                  writerSchemaVersion: row.writer_schema_version,
+                  writerDefinitionHash: row.writer_definition_hash
+                })),
+                ...checkpoints.flatMap((checkpoint) => checkpoint.writer_provenance)
+              ]
+            ),
+          catch: (cause) =>
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+        })
+      })
+
     const persistOutbound = (
       session: Session,
       documentId: Identity.DocumentId,
@@ -656,6 +803,7 @@ export const layer: Layer.Layer<
       heads: ReadonlyArray<string>
     ) =>
       Effect.gen(function*() {
+        const writerProvenance = yield* loadWriterProvenance(documentId, message)
         const totals = yield* findOutboxTotals({
           replicaIncarnation: session.replicaIncarnation,
           peerId: session.peerId,
@@ -687,12 +835,13 @@ export const layer: Layer.Layer<
         const createdAt = new Date(yield* Clock.currentTimeMillis).toISOString()
         yield* sql`INSERT INTO effect_local_peer_outbox (
           replica_incarnation, peer_id, connection_epoch, document_id, send_sequence,
-          message, message_hash, heads, status, created_at
+          message, message_hash, heads, status, created_at, writer_provenance
         ) VALUES (
           ${session.replicaIncarnation}, ${session.peerId}, ${session.connectionEpoch}, ${documentId}, ${sendSequence},
-          ${message}, ${messageHash}, ${Schema.encodeSync(Heads)(heads)}, 'Pending', ${createdAt}
+          ${message}, ${messageHash}, ${Schema.encodeSync(Heads)(heads)}, 'Pending', ${createdAt},
+          ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(writerProvenance)}
         )`
-        return { sendSequence, documentId, message, messageHash, heads } satisfies Outbound
+        return { sendSequence, documentId, message, messageHash, heads, writerProvenance } satisfies Outbound
       })
 
     const enqueue = (session: Session, reply: Reply) =>
@@ -728,7 +877,8 @@ export const layer: Layer.Layer<
               documentId: reply.documentId,
               message: existing.message,
               messageHash: existing.message_hash,
-              heads: existing.heads
+              heads: existing.heads,
+              writerProvenance: existing.writer_provenance
             }
           }
           return yield* sql.withTransaction(
@@ -837,6 +987,7 @@ export const layer: Layer.Layer<
         readonly remoteConnectionEpoch: string
         readonly receiveSequence: number
         readonly message: Uint8Array
+        readonly writerProvenance: ReadonlyArray<WriterProvenance.ChangeProvenance>
       }
     ) =>
       withSessionGeneration(session, (generation) =>
@@ -847,6 +998,27 @@ export const layer: Layer.Layer<
               Effect.scoped(Effect.gen(function*() {
                 const receiptSession = { ...session, connectionEpoch: input.remoteConnectionEpoch }
                 const { message, receiveSequence } = input
+                const writerProvenance = yield* Schema.decodeUnknownEffect(
+                  WriterProvenance.ChangeProvenances
+                )(input.writerProvenance).pipe(
+                  Effect.map(WriterProvenance.canonicalize),
+                  Effect.mapError(() =>
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.ProtocolMismatch({
+                        expected: "valid writer provenance",
+                        observed: "invalid writer provenance"
+                      })
+                    })
+                  )
+                )
+                if (writerProvenance.length > limits.maxSyncChangesPerMessage) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.ProtocolMismatch({
+                      expected: `at most ${limits.maxSyncChangesPerMessage} writer provenance entries`,
+                      observed: String(writerProvenance.length)
+                    })
+                  })
+                }
                 if (!Number.isSafeInteger(receiveSequence) || receiveSequence < 0) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.ProtocolMismatch({
@@ -895,6 +1067,14 @@ export const layer: Layer.Layer<
                         reason: new ReplicaError.ProtocolMismatch({
                           expected: receipt.message_hash,
                           observed: messageHash
+                        })
+                      })
+                    }
+                    if (!WriterProvenance.equals(receipt.writer_provenance, writerProvenance)) {
+                      return yield* new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.ProtocolMismatch({
+                          expected: "matching writer provenance",
+                          observed: "conflicting writer provenance"
                         })
                       })
                     }
@@ -963,6 +1143,36 @@ export const layer: Layer.Layer<
                       })
                     })
                 })
+                const incomingChanges = yield* Effect.try({
+                  try: () => decodeSyncChanges(decoded.changes),
+                  catch: (cause) =>
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.ProtocolMismatch({
+                        expected: "valid Automerge change chunks",
+                        observed: String(cause)
+                      })
+                    })
+                })
+                if (incomingChanges.length !== writerProvenance.length) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.ProtocolMismatch({
+                      expected: `writer provenance for ${incomingChanges.length} sync changes`,
+                      observed: String(writerProvenance.length)
+                    })
+                  })
+                }
+                const provenanceByHash = new Map(writerProvenance.map((entry) => [entry.changeHash, entry]))
+                if (
+                  provenanceByHash.size !== writerProvenance.length ||
+                  incomingChanges.some((change) => !provenanceByHash.has(change.hash))
+                ) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.ProtocolMismatch({
+                      expected: "one writer provenance entry per sync change",
+                      observed: "missing, duplicate, or unrelated writer provenance"
+                    })
+                  })
+                }
                 return yield* Effect.acquireUseRelease(
                   store.load(document, documentId),
                   (durable) =>
@@ -1019,7 +1229,12 @@ export const layer: Layer.Layer<
                         })
                       }
                       const identities = new Map<string, string>()
-                      for (const change of changes) {
+                      const validationChanges = [
+                        ...new Map(
+                          [...changes, ...incomingChanges].map((change) => [change.hash, change])
+                        ).values()
+                      ]
+                      for (const change of validationChanges) {
                         const key = `${change.actor}:${change.seq}`
                         const existing = identities.get(key)
                         if (existing !== undefined && existing !== change.hash) {
@@ -1036,7 +1251,7 @@ export const layer: Layer.Layer<
                         Effect.gen(function*() {
                           const hashes = new Map(rows.map((row) => [row.change_hash, row]))
                           const storedIdentities = new Map(rows.map((row) => [`${row.actor}:${row.sequence}`, row]))
-                          for (const change of changes) {
+                          for (const change of validationChanges) {
                             const hash = hashes.get(change.hash)
                             if (
                               hash !== undefined &&
@@ -1059,12 +1274,27 @@ export const layer: Layer.Layer<
                                 })
                               })
                             }
+                            const provenance = provenanceByHash.get(change.hash)
+                            if (
+                              hash !== undefined && provenance !== undefined &&
+                              (
+                                hash.writer_schema_version !== provenance.writerSchemaVersion ||
+                                hash.writer_definition_hash !== provenance.writerDefinitionHash
+                              )
+                            ) {
+                              return yield* new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.ProtocolMismatch({
+                                  expected: "matching stored writer provenance",
+                                  observed: "conflicting writer provenance"
+                                })
+                              })
+                            }
                           }
                           return hashes
                         })
-                      const existingChanges = changes.length === 0 ? [] : yield* findExistingChanges({
+                      const existingChanges = validationChanges.length === 0 ? [] : yield* findExistingChanges({
                         documentId,
-                        changes: changes.map((change) => ({
+                        changes: validationChanges.map((change) => ({
                           actor: change.actor,
                           changeHash: change.hash,
                           sequence: change.seq
@@ -1235,6 +1465,99 @@ export const layer: Layer.Layer<
                           SchemaError: failStorageCorrupt
                         })
                       )
+                      const pendingReceiptRows = yield* findPendingReceipts({
+                        replicaIncarnation: receiptSession.replicaIncarnation,
+                        documentId
+                      }).pipe(
+                        Effect.catchTags({
+                          SqlError: failStorageUnavailable,
+                          SchemaError: failStorageCorrupt
+                        })
+                      )
+                      const checkpointProvenanceRows = yield* findCheckpointProvenance(documentId).pipe(
+                        Effect.catchTags({
+                          SqlError: failStorageUnavailable,
+                          SchemaError: failStorageCorrupt
+                        })
+                      )
+                      const checkpointProvenanceByHash = new Map<
+                        string,
+                        WriterProvenance.ChangeProvenance
+                      >()
+                      for (const entry of checkpointProvenanceRows.flatMap((row) => row.writer_provenance)) {
+                        const existing = checkpointProvenanceByHash.get(entry.changeHash)
+                        if (
+                          existing !== undefined &&
+                          (
+                            existing.writerSchemaVersion !== entry.writerSchemaVersion ||
+                            existing.writerDefinitionHash !== entry.writerDefinitionHash
+                          )
+                        ) {
+                          return yield* failStorageCorrupt(
+                            new Error(`Conflicting checkpoint writer provenance for change ${entry.changeHash}`)
+                          )
+                        }
+                        checkpointProvenanceByHash.set(entry.changeHash, entry)
+                      }
+                      for (const entry of writerProvenance) {
+                        const checkpointEntry = checkpointProvenanceByHash.get(entry.changeHash)
+                        if (
+                          checkpointEntry !== undefined &&
+                          (
+                            checkpointEntry.writerSchemaVersion !== entry.writerSchemaVersion ||
+                            checkpointEntry.writerDefinitionHash !== entry.writerDefinitionHash
+                          )
+                        ) {
+                          return yield* new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.ProtocolMismatch({
+                              expected: "matching checkpoint writer provenance",
+                              observed: "conflicting writer provenance"
+                            })
+                          })
+                        }
+                      }
+                      const pendingProvenanceByHash = new Map<string, WriterProvenance.ChangeProvenance>()
+                      for (
+                        const entry of [
+                          ...pendingRows.map((row) => ({
+                            changeHash: row.change_hash,
+                            writerSchemaVersion: row.writer_schema_version,
+                            writerDefinitionHash: row.writer_definition_hash
+                          })),
+                          ...pendingReceiptRows.flatMap((row) => row.writer_provenance)
+                        ]
+                      ) {
+                        const existing = pendingProvenanceByHash.get(entry.changeHash)
+                        if (
+                          existing !== undefined &&
+                          (
+                            existing.writerSchemaVersion !== entry.writerSchemaVersion ||
+                            existing.writerDefinitionHash !== entry.writerDefinitionHash
+                          )
+                        ) {
+                          return yield* failStorageCorrupt(
+                            new Error(`Conflicting pending writer provenance for change ${entry.changeHash}`)
+                          )
+                        }
+                        pendingProvenanceByHash.set(entry.changeHash, entry)
+                      }
+                      for (const entry of writerProvenance) {
+                        const pending = pendingProvenanceByHash.get(entry.changeHash)
+                        if (
+                          pending !== undefined &&
+                          (
+                            pending.writerSchemaVersion !== entry.writerSchemaVersion ||
+                            pending.writerDefinitionHash !== entry.writerDefinitionHash
+                          )
+                        ) {
+                          return yield* new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.ProtocolMismatch({
+                              expected: "matching pending writer provenance",
+                              observed: "conflicting writer provenance"
+                            })
+                          })
+                        }
+                      }
                       const staged = pendingRows.length === 0
                         ? received[0]
                         : yield* Effect.try({
@@ -1279,17 +1602,43 @@ export const layer: Layer.Layer<
                         ? materializedHeads
                         : [...new Set([...durable.acceptedHeads, ...materializedHeads, ...decoded.heads])].toSorted()
                       const transition = !sameHeads(materializedHeads, durable.materializedHeads)
-                      const checkpoint = decoded.changes.length === 0 ?
-                        null :
-                        yield* Effect.sync(() => InternalAutomerge.save(staged)).pipe(
-                          Effect.flatMap((bytes) =>
-                            Effect.all({
-                              bytes: Effect.succeed(bytes),
-                              checksum: digest(bytes),
-                              checkpointHash: digest({ documentId, bytes })
+                      const checkpoint = decoded.changes.length === 0
+                        ? null
+                        : yield* Effect.gen(function*() {
+                          const bytes = InternalAutomerge.save(staged)
+                          const durableRows = yield* findDocumentChangeProvenance(documentId).pipe(
+                            Effect.catchTags({
+                              SqlError: failStorageUnavailable,
+                              SchemaError: failStorageCorrupt
                             })
                           )
-                        )
+                          const checkpointWriterProvenance = yield* Effect.try({
+                            try: () =>
+                              WriterProvenance.resolve(
+                                WriterProvenance.changeHashes(staged),
+                                [
+                                  ...durableRows.map((row) => ({
+                                    changeHash: row.change_hash,
+                                    writerSchemaVersion: row.writer_schema_version,
+                                    writerDefinitionHash: row.writer_definition_hash
+                                  })),
+                                  ...checkpointProvenanceByHash.values(),
+                                  ...pendingProvenanceByHash.values(),
+                                  ...writerProvenance
+                                ]
+                              ),
+                            catch: (cause) =>
+                              new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.StorageCorrupt({ cause })
+                              })
+                          })
+                          return {
+                            bytes,
+                            checksum: yield* digest(bytes),
+                            checkpointHash: yield* digest({ documentId, bytes }),
+                            writerProvenance: checkpointWriterProvenance
+                          }
+                        })
                       const result = yield* quotaLock.withPermit(Effect.gen(function*() {
                         const result = yield* sql.withTransaction(Effect.gen(function*() {
                           yield* validateSessionGeneration(generation, sessionGeneration)
@@ -1304,29 +1653,55 @@ export const layer: Layer.Layer<
                             yield* validateReceipt(receipt)
                             return { _tag: "Duplicate" as const, received: receivedFromReceipt(documentId, receipt) }
                           }
-                          const committedChanges = changes.length === 0 ? [] : yield* findExistingChanges({
+                          const committedChanges = validationChanges.length === 0 ? [] : yield* findExistingChanges({
                             documentId,
-                            changes: changes.map((change) => ({
+                            changes: validationChanges.map((change) => ({
                               actor: change.actor,
                               changeHash: change.hash,
                               sequence: change.seq
                             }))
                           })
-                          yield* validateExistingChanges(committedChanges)
+                          const committedChangeMap = yield* validateExistingChanges(committedChanges)
                           yield* gate.validate(permit)
                           const commitSequence = transition ? yield* nextSequence : yield* currentSequence
                           for (let index = 0; index < changes.length; index++) {
                             const change = changes[index]!
+                            if (committedChangeMap.has(change.hash)) continue
                             const bytes = changeBytes[index]!
                             const applied = Automerge.hasHeads(staged, [change.hash]) ? 1 : 0
+                            const provenance = provenanceByHash.get(change.hash) ??
+                              pendingProvenanceByHash.get(change.hash)
+                            if (provenance === undefined) {
+                              return yield* new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.ProtocolMismatch({
+                                  expected: `writer provenance for change ${change.hash}`,
+                                  observed: `missing writer provenance (incoming=${
+                                    provenanceByHash.has(change.hash)
+                                  }, pending=${pendingProvenanceByHash.has(change.hash)}, committed=${
+                                    committedChangeMap.has(change.hash)
+                                  })`
+                                })
+                              })
+                            }
                             yield* sql`INSERT INTO effect_local_changes (
               change_hash, document_id, document_type, writer_schema_version, writer_definition_hash,
               actor, sequence, dependencies, bytes, applied, peer_id, accepted_at, commit_sequence
             ) VALUES (
-              ${change.hash}, ${documentId}, ${document.name}, ${document.version}, ${bootstrap.definitionHash},
+              ${change.hash}, ${documentId}, ${document.name}, ${provenance.writerSchemaVersion},
+              ${provenance.writerDefinitionHash},
               ${change.actor}, ${change.seq}, ${Schema.encodeSync(Heads)(change.deps)}, ${bytes}, ${applied},
               ${receiptSession.peerId}, ${acceptedAt}, ${commitSequence}
             ) ON CONFLICT(change_hash) DO NOTHING`
+                          }
+                          if (validationChanges.length > 0) {
+                            yield* findExistingChanges({
+                              documentId,
+                              changes: validationChanges.map((change) => ({
+                                actor: change.actor,
+                                changeHash: change.hash,
+                                sequence: change.seq
+                              }))
+                            }).pipe(Effect.flatMap(validateExistingChanges))
                           }
                           for (const row of pendingRows) {
                             if (Automerge.hasHeads(staged, [row.change_hash])) {
@@ -1334,11 +1709,7 @@ export const layer: Layer.Layer<
                 WHERE change_hash = ${row.change_hash}`
                             }
                           }
-                          const pendingReceipts = yield* findPendingReceipts({
-                            replicaIncarnation: receiptSession.replicaIncarnation,
-                            documentId
-                          })
-                          for (const row of pendingReceipts) {
+                          for (const row of pendingReceiptRows) {
                             if (Automerge.hasHeads(staged, [...row.accepted_heads])) {
                               yield* sql`UPDATE effect_local_peer_receipts SET pending_message = NULL
                 WHERE replica_incarnation = ${receiptSession.replicaIncarnation}
@@ -1349,11 +1720,23 @@ export const layer: Layer.Layer<
                           }
                           if (checkpoint !== null) {
                             yield* sql`INSERT INTO effect_local_checkpoints (
-              checkpoint_hash, document_id, heads, bytes, checksum, commit_sequence, verified
+              checkpoint_hash, document_id, heads, bytes, checksum, commit_sequence, verified, writer_provenance
             ) VALUES (
               ${checkpoint.checkpointHash}, ${documentId}, ${Schema.encodeSync(Heads)(materializedHeads)},
-              ${checkpoint.bytes}, ${checkpoint.checksum}, ${commitSequence}, 1
+              ${checkpoint.bytes}, ${checkpoint.checksum}, ${commitSequence}, 1,
+              ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(checkpoint.writerProvenance)}
             ) ON CONFLICT(checkpoint_hash) DO NOTHING`
+                            const installed = yield* findCheckpointIdentity({
+                              bytes: checkpoint.bytes,
+                              checkpointHash: checkpoint.checkpointHash,
+                              checksum: checkpoint.checksum,
+                              documentId,
+                              heads: materializedHeads,
+                              writerProvenance: checkpoint.writerProvenance
+                            })
+                            if (installed.length !== 1) {
+                              return yield* failStorageCorrupt(new Error("Checkpoint identity collision"))
+                            }
                             yield* sql`DELETE FROM effect_local_checkpoints
                 WHERE document_id = ${documentId}
                   AND checkpoint_hash NOT IN (
@@ -1391,13 +1774,14 @@ export const layer: Layer.Layer<
                           yield* sql`INSERT INTO effect_local_peer_receipts (
             replica_incarnation, peer_id, connection_epoch, receive_sequence,
             document_id, message_hash, reply, reply_hash, pending_message,
-            heads, accepted_heads, commit_sequence, accepted_at
+            heads, accepted_heads, commit_sequence, accepted_at, writer_provenance
           ) VALUES (
             ${receiptSession.replicaIncarnation}, ${receiptSession.peerId}, ${receiptSession.connectionEpoch},
             ${receiveSequence},
             ${documentId}, ${messageHash}, ${reply?.message ?? null}, ${reply?.messageHash ?? null},
             ${unresolvedBytes === 0 ? null : message}, ${Schema.encodeSync(Heads)(materializedHeads)},
-            ${Schema.encodeSync(Heads)(acceptedHeads)}, ${commitSequence}, ${acceptedAt}
+            ${Schema.encodeSync(Heads)(acceptedHeads)}, ${commitSequence}, ${acceptedAt},
+            ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(writerProvenance)}
           )`
                           if (unresolvedBytes !== 0) {
                             yield* validateReceiptQuota
@@ -1498,7 +1882,8 @@ export const layer: Layer.Layer<
                 documentId: Identity.DocumentId.make(row.document_id),
                 message: row.message,
                 messageHash: row.message_hash,
-                heads: row.heads
+                heads: row.heads,
+                writerProvenance: row.writer_provenance
               }))
             ),
             Effect.catchTags({

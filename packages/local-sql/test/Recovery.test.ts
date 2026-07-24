@@ -51,6 +51,12 @@ describe("Recovery", () => {
         draft.title = "two"
       })
       const persisted = yield* store.persist(Task, documentId, created, staged)
+      yield* sql`UPDATE effect_local_changes
+        SET writer_schema_version = 9, writer_definition_hash = 'historical-definition'
+        WHERE document_id = ${documentId}
+          AND sequence = (
+            SELECT MAX(sequence) FROM effect_local_changes WHERE document_id = ${documentId}
+          )`
       const latest = yield* compaction.compact(Task, documentId)
       yield* compaction.prune(documentId)
       yield* sql`UPDATE effect_local_checkpoints SET bytes = ${new Uint8Array([1, 2, 3])}
@@ -58,6 +64,16 @@ describe("Recovery", () => {
       const recovered = yield* recovery.recover(Task, documentId)
       assert.deepStrictEqual(recovered.snapshot.value, { title: "two" })
       assert.deepStrictEqual(recovered.materializedHeads, persisted.materializedHeads)
+      const provenance = yield* sql<{
+        readonly writer_definition_hash: string
+        readonly writer_schema_version: number
+      }>`SELECT writer_definition_hash, writer_schema_version
+        FROM effect_local_changes
+        WHERE document_id = ${documentId}
+        ORDER BY sequence`
+      assert.deepStrictEqual(provenance, [
+        { writer_definition_hash: "historical-definition", writer_schema_version: 9 }
+      ])
       const rows = yield* sql<{ readonly verified: number }>`
         SELECT verified FROM effect_local_checkpoints WHERE checkpoint_hash = ${latest.checkpoint.checkpointHash}
       `
@@ -65,6 +81,27 @@ describe("Recovery", () => {
       InternalAutomerge.free(recovered.automerge)
       InternalAutomerge.free(persisted.automerge)
       InternalAutomerge.free(staged)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("rejects provenance conflicts between a checkpoint and surviving changes", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const recovery = yield* Recovery.Recovery
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one" })
+      yield* compaction.compact(Task, documentId)
+      yield* sql`UPDATE effect_local_changes
+        SET writer_definition_hash = 'conflicting-definition'
+        WHERE document_id = ${documentId}`
+
+      const result = yield* Effect.result(recovery.recover(Task, documentId))
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure.reason._tag, "StorageCorrupt")
+      }
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(Services)))
 

@@ -70,7 +70,10 @@ export class PeerRpcLimits extends Context.Service<PeerRpcLimits, Values>()(
 ) {}
 
 const validate = (values: Values, replicaLimits: ReplicaLimits.Values) => {
-  const envelope = PeerSession.maximumSyncEnvelopeBytes(replicaLimits.maxSyncMessageBytes)
+  const envelope = PeerSession.maximumSyncEnvelopeBytes(
+    replicaLimits.maxSyncMessageBytes,
+    replicaLimits.maxSyncChangesPerMessage
+  )
   const checks: ReadonlyArray<readonly [field: keyof Values, valid: boolean]> = [
     ["maxInboundBufferedBytesPerSession", values.maxInboundBufferedBytesPerSession >= envelope],
     ["maxOutboundBufferedBytesPerSession", values.maxOutboundBufferedBytesPerSession >= envelope],

@@ -120,8 +120,11 @@ describe("PeerRpcLimits", () => {
 
   it.effect("rejects incompatible byte budgets with the exact field", () =>
     Effect.gen(function*() {
-      const envelope = PeerSession.maximumSyncEnvelopeBytes(replicaLimits.maxSyncMessageBytes)
-      assert.strictEqual(envelope, 6_144)
+      const envelope = PeerSession.maximumSyncEnvelopeBytes(
+        replicaLimits.maxSyncMessageBytes,
+        replicaLimits.maxSyncChangesPerMessage
+      )
+      assert.strictEqual(envelope, 6_656)
       const cases = [
         ["maxInboundBufferedBytesPerSession", {
           ...PeerRpcLimits.defaults,
