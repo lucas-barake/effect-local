@@ -2,6 +2,10 @@
   "$schema": "https://unpkg.com/knip@6.27.0/schema.json",
   "includeEntryExports": false,
   "workspaces": {
+    "packages/local-sql": {
+      "entry": ["test/crash-durability/childProcess.ts"],
+      "ignoreDependencies": ["tsx"]
+    },
     "packages/local-rpc": {
       "ignore": ["bench/PeerRpcServerPerformance.bench.ts", "bench/vitest.admission.config.ts"]
     },
