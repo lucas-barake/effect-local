@@ -135,10 +135,14 @@ test("downloads and restores a canonical local backup", async ({ page }) => {
   await page.goto("/")
   await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
 
-  const title = `Backup ${crypto.randomUUID()}`
-  await page.getByLabel("New task title").fill(title)
+  const archivedTitle = `Archived backup ${crypto.randomUUID()}`
+  const postBackupTitle = `Post backup ${crypto.randomUUID()}`
+  await page.getByLabel("New task title").fill(archivedTitle)
   await page.getByRole("button", { name: "Add task" }).click()
-  await expect(page.getByText(title, { exact: true })).toBeVisible()
+  await expect(page.getByText(archivedTitle, { exact: true })).toBeVisible()
+  await page.getByRole("button", { name: `Mark ${archivedTitle} complete` }).click()
+  await page.getByRole("button", { name: "Completed" }).click()
+  await expect(page.getByText(archivedTitle, { exact: true })).toBeVisible()
 
   const downloadPromise = page.waitForEvent("download")
   await page.getByRole("button", { name: "Download" }).click()
@@ -147,9 +151,25 @@ test("downloads and restores a canonical local backup", async ({ page }) => {
   expect(path).not.toBeNull()
   await expect(page.getByText("Backup downloaded")).toBeVisible()
 
+  await page.getByRole("button", { name: `Delete ${archivedTitle}` }).click()
+  await expect(page.getByText(archivedTitle, { exact: true })).not.toBeVisible()
+  await page.getByRole("button", { name: "Active" }).click()
+  await page.getByLabel("New task title").fill(postBackupTitle)
+  await page.getByRole("button", { name: "Add task" }).click()
+  await expect(page.getByText(postBackupTitle, { exact: true })).toBeVisible()
+
   page.once("dialog", (dialog) => void dialog.accept())
   await page.getByLabel("Choose backup file").setInputFiles(path!)
   await expect(page.getByText("Backup restored")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText(postBackupTitle, { exact: true })).not.toBeVisible()
+  await page.getByRole("button", { name: "Completed" }).click()
+  await expect(page.getByText(archivedTitle, { exact: true })).toBeVisible()
+
+  await page.reload()
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText(postBackupTitle, { exact: true })).not.toBeVisible()
+  await page.getByRole("button", { name: "Completed" }).click()
+  await expect(page.getByText(archivedTitle, { exact: true })).toBeVisible()
 })
 
 test("shares one durable owner across tabs", async ({ context, page }) => {
