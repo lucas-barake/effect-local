@@ -26,7 +26,13 @@ describe("ReplicaLimits", () => {
     maxSessions: 4,
     maxStreamsPerSession: 2,
     maxInFlightPerSession: 8,
-    maxQueuedRpc: 32
+    maxQueuedRpc: 32,
+    maxActiveRestores: 32,
+    maxRestoresPerSession: 8,
+    maxRestoreMillis: 30_000,
+    maxRestorePullMillis: 10_000,
+    maxRestoreCoalesceMillis: 25,
+    maxRestoreErrorBytes: 4_096
   }
 
   it.effect("requires and provides validated owner limits", () =>
@@ -39,6 +45,91 @@ describe("ReplicaLimits", () => {
       assert.strictEqual((yield* Effect.exit(ReplicaLimits.make({ ...values, maxSessions: 0 })))._tag, "Failure")
       assert.strictEqual(
         (yield* Effect.exit(ReplicaLimits.make({ ...values, maxBackupBytes: Number.MAX_VALUE })))._tag,
+        "Failure"
+      )
+      assert.strictEqual(
+        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxActiveRestores: 0 })))._tag,
+        "Failure"
+      )
+      assert.strictEqual(
+        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestoresPerSession: 0 })))._tag,
+        "Failure"
+      )
+      assert.strictEqual(
+        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestoreMillis: 0 })))._tag,
+        "Failure"
+      )
+      assert.strictEqual(
+        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestorePullMillis: 0 })))._tag,
+        "Failure"
+      )
+      assert.strictEqual(
+        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestoreCoalesceMillis: 0 })))._tag,
+        "Failure"
+      )
+      assert.strictEqual(
+        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestoreErrorBytes: 0 })))._tag,
+        "Failure"
+      )
+      assert.strictEqual(
+        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxActiveRestores: Number.MAX_VALUE })))._tag,
+        "Failure"
+      )
+      assert.strictEqual(
+        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestoresPerSession: Number.MAX_VALUE })))._tag,
+        "Failure"
+      )
+      assert.strictEqual(
+        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestoreMillis: Number.MAX_VALUE })))._tag,
+        "Failure"
+      )
+      assert.strictEqual(
+        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestorePullMillis: Number.MAX_VALUE })))._tag,
+        "Failure"
+      )
+      assert.strictEqual(
+        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestoreCoalesceMillis: Number.MAX_VALUE })))._tag,
+        "Failure"
+      )
+      assert.strictEqual(
+        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestoreErrorBytes: Number.MAX_VALUE })))._tag,
+        "Failure"
+      )
+    }))
+
+  it.effect("requires enough restore error bytes to preserve every wire error shape", () =>
+    Effect.gen(function*() {
+      assert.strictEqual(ReplicaLimits.minimumRestoreErrorBytes, 111)
+      assert.strictEqual(
+        (yield* Effect.exit(ReplicaLimits.make({
+          ...values,
+          maxRestoreErrorBytes: ReplicaLimits.minimumRestoreErrorBytes
+        })))._tag,
+        "Success"
+      )
+      assert.strictEqual(
+        (yield* Effect.exit(ReplicaLimits.make({
+          ...values,
+          maxRestoreErrorBytes: ReplicaLimits.minimumRestoreErrorBytes - 1
+        })))._tag,
+        "Failure"
+      )
+    }))
+
+  it.effect("requires restore coalescing to be shorter than the pull deadline", () =>
+    Effect.gen(function*() {
+      assert.strictEqual(
+        (yield* Effect.exit(ReplicaLimits.make({
+          ...values,
+          maxRestoreCoalesceMillis: values.maxRestorePullMillis
+        })))._tag,
+        "Failure"
+      )
+      assert.strictEqual(
+        (yield* Effect.exit(ReplicaLimits.make({
+          ...values,
+          maxRestoreCoalesceMillis: values.maxRestorePullMillis + 1
+        })))._tag,
         "Failure"
       )
     }))

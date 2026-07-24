@@ -739,6 +739,18 @@ Session timeout applies to open, renewal, and close. Operation timeout applies i
 attempt, including durable command receipt lookup. Status, invalidation, and backup export streams are intentionally
 unbounded.
 
+Browser restore protocol version 4 begins with a short unary request. The owner returns a dedicated `MessagePort`,
+then drives archive input with `Start` and one outstanding `Pull` credit. The page sends one bounded chunk per credit.
+An authoritative terminal result is acknowledged before the owner confirms that active restore admission was
+released. This lets the unary worker slot return before the archive source is subscribed and preserves backpressure
+when the source uses the same client.
+
+Restore admission is fail fast and separate from ordinary stream, in flight, and queued RPC permits. The global limit
+is `maxActiveRestores`. Each session is also bounded by `maxRestoresPerSession`. `maxRestoreMillis` bounds owner work
+before cancellation begins. `maxRestorePullMillis` bounds individual protocol waits.
+`maxRestoreCoalesceMillis` bounds how long a partial frame waits for more immediately available bytes.
+`maxRestoreErrorBytes` bounds encoded private channel error details.
+
 The `Attach` message is application ownership protocol, not hidden library behavior. Production applications must also
 handle liveness, expiring provisioning nonces, OPFS worker creation, database port transfer, and provider loss.
 
@@ -838,6 +850,15 @@ const duplicateDocument = (documentId: Identity.DocumentId) =>
 Replace restore stages and validates the archive before changing the active incarnation. Clone restore creates a new
 local identity. Portable document import validates the document name and schema version, then creates fresh causal
 history.
+
+For conforming browser clients, each admitted restore retains at most one owner payload of `P`, one page staging buffer
+of `P`, and the caller owned current source chunk. `P` is the smaller of the advertised `maxChunkBytes` and the caller
+validated `maxBytes`. Across the owner, archive payload retained by the transport is bounded by `R × P`.
+`R` is the smaller of `maxActiveRestores` and `maxSessions × maxRestoresPerSession`. Active and finishing control
+scopes are bounded by `2R`. Finishing scopes retain no archive payload. A hostile raw peer causes synchronous listener
+removal and channel closure on the first invalid frame. Messages already queued by the browser before that closure are
+outside the application bound. SQL archive staging and validation are separate and remain bounded by the existing
+backup limits.
 
 ### 11. Add peer sync and presence
 
@@ -1662,14 +1683,15 @@ maximum delay. Its methods connect peers, partition, heal, and flush traffic. `t
 `TestReplica.defaultLimits` is the only exported `ReplicaLimits` preset. It is intended for tests, not production capacity
 planning:
 
-| Category                 | Exact defaults                                                                                                                                                                        |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Backup and encoding      | `maxBackupBytes = 16 MiB`, `maxChunkBytes = 64 KiB`, `maxArchiveRecords = 10_000`, `maxJsonDepth = 64`                                                                                |
-| One sync message         | `maxSyncMessageBytes = 1 MiB`, `maxPeerSendMillis = 10_000`, `maxSyncChangesPerMessage = 1_000`, `maxSyncDependencyEdgesPerMessage = 10_000`, `maxSyncOperationsPerMessage = 100_000` |
-| Pending bytes            | Per document `16 MiB`, per peer `32 MiB`, per replica `64 MiB`, maximum age `60_000 ms`                                                                                               |
-| Pending changes          | Per document `10_000`, per peer `20_000`, per replica `50_000`                                                                                                                        |
-| Pending dependency edges | Per document `100_000`, per peer `200_000`, per replica `500_000`                                                                                                                     |
-| Browser owner RPC        | `maxSessions = 32`, `maxStreamsPerSession = 32`, `maxInFlightPerSession = 128`, `maxQueuedRpc = 1_024`                                                                                |
+| Category                 | Exact defaults                                                                                                                                                                            |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Backup and encoding      | `maxBackupBytes = 16 MiB`, `maxChunkBytes = 64 KiB`, `maxArchiveRecords = 10_000`, `maxJsonDepth = 64`                                                                                    |
+| One sync message         | `maxSyncMessageBytes = 1 MiB`, `maxPeerSendMillis = 10_000`, `maxSyncChangesPerMessage = 1_000`, `maxSyncDependencyEdgesPerMessage = 10_000`, `maxSyncOperationsPerMessage = 100_000`     |
+| Pending bytes            | Per document `16 MiB`, per peer `32 MiB`, per replica `64 MiB`, maximum age `60_000 ms`                                                                                                   |
+| Pending changes          | Per document `10_000`, per peer `20_000`, per replica `50_000`                                                                                                                            |
+| Pending dependency edges | Per document `100_000`, per peer `200_000`, per replica `500_000`                                                                                                                         |
+| Browser owner RPC        | `maxSessions = 32`, `maxStreamsPerSession = 32`, `maxInFlightPerSession = 128`, `maxQueuedRpc = 1_024`                                                                                    |
+| Browser restore          | `maxActiveRestores = 1_024`, `maxRestoresPerSession = 128`, `maxRestoreMillis = 30_000`, `maxRestorePullMillis = 10_000`, `maxRestoreCoalesceMillis = 25`, `maxRestoreErrorBytes = 4_096` |
 
 ### `@lucas-barake/effect-local-rpc`
 

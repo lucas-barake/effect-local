@@ -48,7 +48,13 @@ const limits: ReplicaLimits.Values = {
   maxSessions: 4,
   maxStreamsPerSession: 4,
   maxInFlightPerSession: 16,
-  maxQueuedRpc: 64
+  maxQueuedRpc: 64,
+  maxActiveRestores: 64,
+  maxRestoresPerSession: 16,
+  maxRestoreMillis: 30_000,
+  maxRestorePullMillis: 10_000,
+  maxRestoreCoalesceMillis: 25,
+  maxRestoreErrorBytes: 4_096
 }
 
 const environment = Layer.mergeAll(

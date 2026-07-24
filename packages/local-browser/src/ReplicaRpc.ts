@@ -5,6 +5,7 @@ import * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Schema from "effect/Schema"
 import { Rpc, RpcGroup } from "effect/unstable/rpc"
 import * as Transferable from "effect/unstable/workers/Transferable"
+import * as RestoreProtocol from "./internal/restoreProtocol.js"
 
 const Snapshot = Schema.Struct({
   documentId: Identity.DocumentId,
@@ -23,14 +24,40 @@ const ExportedDocument = Schema.Struct({
 
 const JsonOutcome = CommandOutcome.schema(Schema.Json, Schema.Json)
 const DocumentIdOutcome = CommandOutcome.schema(Identity.DocumentId, Schema.Never)
-export const protocolVersion = 3
+export const protocolVersion = 4
 const SessionLease = Schema.Struct({ leaseMillis: Schema.Int })
-const SessionHandshake = Schema.Struct({
+export const SessionHandshake = Schema.Struct({
   leaseMillis: Schema.Int,
   protocolVersion: Schema.Int,
   definitionHash: Schema.String,
-  ownerEpoch: Schema.String
+  ownerEpoch: Schema.String,
+  maxChunkBytes: Schema.optional(Schema.Int),
+  maxRestoreCoalesceMillis: Schema.optional(Schema.Int),
+  maxRestoreErrorBytes: Schema.optional(Schema.Int)
 })
+export type SessionHandshake = typeof SessionHandshake.Type
+
+const isMessagePort = (input: unknown): input is MessagePort => {
+  if (typeof input !== "object" || input === null) return false
+  try {
+    return (
+      typeof Reflect.get(input, "postMessage") === "function" &&
+      typeof Reflect.get(input, "addEventListener") === "function" &&
+      typeof Reflect.get(input, "removeEventListener") === "function" &&
+      typeof Reflect.get(input, "start") === "function" &&
+      typeof Reflect.get(input, "close") === "function"
+    )
+  } catch {
+    return false
+  }
+}
+
+export const MessagePortSchema = Transferable.schema(
+  Schema.declare<MessagePort>(isMessagePort, {
+    identifier: "@lucas-barake/effect-local-browser/MessagePort"
+  }),
+  (port) => [port]
+)
 
 export const Invalidation = Schema.Union([
   Schema.TaggedStruct("Invalidation", {
@@ -156,14 +183,21 @@ export const group = RpcGroup.make(
     stream: true
   }),
   Rpc.make("RestoreBackup", {
+    payload: { sessionId: Identity.SessionId },
+    error: ReplicaError.ReplicaError
+  }),
+  Rpc.make("BeginRestoreBackupV4", {
     payload: {
       sessionId: Identity.SessionId,
-      chunks: Schema.Array(Transferable.Uint8Array),
       mode: Schema.Literals(["clone", "replace"]),
       maxBytes: Schema.Number,
       expectedDefinitionHash: Schema.String,
       installationId: Identity.BackupInstallationId
     },
+    success: Schema.Struct({
+      nonce: RestoreProtocol.RestoreNonce,
+      port: MessagePortSchema
+    }),
     error: ReplicaError.ReplicaError
   }),
   Rpc.make("ExportDocument", {

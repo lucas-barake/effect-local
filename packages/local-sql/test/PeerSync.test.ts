@@ -64,7 +64,13 @@ describe("PeerSync", () => {
     maxSessions: 10,
     maxStreamsPerSession: 10,
     maxInFlightPerSession: 1,
-    maxQueuedRpc: 100
+    maxQueuedRpc: 100,
+    maxActiveRestores: 100,
+    maxRestoresPerSession: 1,
+    maxRestoreMillis: 30_000,
+    maxRestorePullMillis: 10_000,
+    maxRestoreCoalesceMillis: 25,
+    maxRestoreErrorBytes: 4_096
   }
   const Database = Layer.merge(
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),

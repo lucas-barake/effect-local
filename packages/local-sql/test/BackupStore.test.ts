@@ -100,7 +100,13 @@ describe("BackupStore", () => {
     maxSessions: 8,
     maxStreamsPerSession: 8,
     maxInFlightPerSession: 32,
-    maxQueuedRpc: 128
+    maxQueuedRpc: 128,
+    maxActiveRestores: 128,
+    maxRestoresPerSession: 32,
+    maxRestoreMillis: 30_000,
+    maxRestorePullMillis: 10_000,
+    maxRestoreCoalesceMillis: 25,
+    maxRestoreErrorBytes: 4_096
   }
   const Database = Layer.merge(
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),

@@ -40,7 +40,13 @@ it.layer(NodeCrypto.layer)("PeerSession coverage", (it) => {
     maxSessions: 8,
     maxStreamsPerSession: 4,
     maxInFlightPerSession: 1,
-    maxQueuedRpc: 32
+    maxQueuedRpc: 32,
+    maxActiveRestores: 32,
+    maxRestoresPerSession: 1,
+    maxRestoreMillis: 30_000,
+    maxRestorePullMillis: 10_000,
+    maxRestoreCoalesceMillis: 25,
+    maxRestoreErrorBytes: 4_096
   } satisfies ReplicaLimits.Values
   const permit = {
     replicaId: Identity.ReplicaId.make("rep_00000000-0000-4000-8000-000000000001"),

@@ -1,11 +1,16 @@
 import { NodeCrypto } from "@effect/platform-node"
+import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, it } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
+import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
+import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
@@ -48,7 +53,13 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     maxSessions: 2,
     maxStreamsPerSession: 2,
     maxInFlightPerSession: 2,
-    maxQueuedRpc: 4
+    maxQueuedRpc: 4,
+    maxActiveRestores: 4,
+    maxRestoresPerSession: 2,
+    maxRestoreMillis: 30_000,
+    maxRestorePullMillis: 10_000,
+    maxRestoreCoalesceMillis: 25,
+    maxRestoreErrorBytes: 4_096
   } satisfies ReplicaLimits.Values
   const Sessions = SessionManager.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)))
   const Publisher = Layer.succeed(
@@ -925,6 +936,218 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     })).pipe(Effect.provide(BackupOwner))
   })
 
+  it.effect("dispatches restore before the source completes", () => {
+    const backupLimits = {
+      ...limits,
+      maxBackupBytes: 64 * 1024
+    } satisfies ReplicaLimits.Values
+    const BackupSessions = SessionManager.layer.pipe(Layer.provide(ReplicaLimits.layer(backupLimits)))
+    const backupDefinition = ReplicaDefinition.make({
+      name: "streaming-restore",
+      documents: DocumentSet.make(Task),
+      mutations: [],
+      projections: [],
+      queries: []
+    })
+    const Sql = SqlReplica.layerWithBindings(backupDefinition, { projections: [] }).pipe(
+      Layer.provide(Layer.merge(
+        SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+        ReplicaLimits.layer(backupLimits)
+      ))
+    )
+    return Effect.scoped(Effect.gen(function*() {
+      const sql = yield* Layer.build(Sql)
+      const productionReplica = Context.get(sql, Replica.Replica)
+      const publisher = Context.get(sql, CommitPublisher.CommitPublisher)
+      const archiveChunks = Array.from(
+        yield* Stream.runCollect(productionReplica.exportBackup({ maxBytes: backupLimits.maxBackupBytes }))
+      )
+      const archiveLength = archiveChunks.reduce((length, chunk) => length + chunk.byteLength, 0)
+      const archive = new Uint8Array(archiveLength)
+      let offset = 0
+      for (const chunk of archiveChunks) {
+        archive.set(chunk, offset)
+        offset += chunk.byteLength
+      }
+      assert.isAbove(archive.byteLength, 1)
+
+      const outerDispatched = yield* Deferred.make<void>()
+      const tailRequested = yield* Deferred.make<void>()
+      const ownerConsumedFirst = yield* Deferred.make<void>()
+      const observedReplica = Replica.Replica.of({
+        ...productionReplica,
+        restoreBackup: (options) =>
+          productionReplica.restoreBackup({
+            ...options,
+            source: options.source.pipe(
+              Stream.tap(() => Deferred.succeed(ownerConsumedFirst, undefined))
+            )
+          })
+      })
+      const ProductionOwner = ReplicaOwner.layerHandlers(backupDefinition).pipe(
+        Layer.provideMerge(BackupSessions),
+        Layer.provide(Layer.merge(
+          Layer.succeed(CommitPublisher.CommitPublisher, publisher),
+          Layer.succeed(Replica.Replica, observedReplica)
+        ))
+      )
+
+      yield* Effect.scoped(Effect.gen(function*() {
+        const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+        const observedRpc = new Proxy(rpc, {
+          get(target, property, receiver) {
+            const value = Reflect.get(target, property, receiver)
+            if (property !== "RestoreBackup" && property !== "BeginRestoreBackupV4") return value
+            return (payload: never) =>
+              Deferred.succeed(outerDispatched, undefined).pipe(
+                Effect.andThen(value(payload))
+              )
+          }
+        })
+        const client = yield* ReplicaClient.fromRpcClient(backupDefinition, observedRpc)
+        const source = Stream.make(archive.slice(0, 1)).pipe(
+          Stream.concat(Stream.fromEffect(
+            Deferred.succeed(tailRequested, undefined).pipe(
+              Effect.andThen(Deferred.await(ownerConsumedFirst)),
+              Effect.as(archive.slice(1))
+            )
+          ))
+        )
+        const restore = yield* client.restoreBackup({
+          source,
+          mode: "replace",
+          maxBytes: backupLimits.maxBackupBytes,
+          expectedDefinitionHash: backupDefinition.hash,
+          installationId: Identity.BackupInstallationId.make("bak_43c8d2f4-58ce-4c9a-9155-9d21019f5e9d")
+        }).pipe(Effect.forkChild)
+
+        yield* Deferred.await(tailRequested)
+        assert.isTrue(yield* Deferred.isDone(outerDispatched))
+        yield* TestClock.adjust(25)
+        yield* Fiber.join(restore)
+      })).pipe(Effect.provide(ProductionOwner))
+    }))
+  })
+
+  it.effect("accepts session expiry after a Pull is already outstanding", () => {
+    const backupLimits = {
+      ...limits,
+      maxBackupBytes: 64 * 1024
+    } satisfies ReplicaLimits.Values
+    const BackupSessions = SessionManager.layer.pipe(Layer.provide(ReplicaLimits.layer(backupLimits)))
+    const backupDefinition = ReplicaDefinition.make({
+      name: "restore-expiry",
+      documents: DocumentSet.make(Task),
+      mutations: [],
+      projections: [],
+      queries: []
+    })
+    const Sql = SqlReplica.layerWithBindings(backupDefinition, { projections: [] }).pipe(
+      Layer.provide(Layer.merge(
+        SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+        ReplicaLimits.layer(backupLimits)
+      ))
+    )
+    return Effect.scoped(Effect.gen(function*() {
+      const sql = yield* Layer.build(Sql)
+      const productionReplica = Context.get(sql, Replica.Replica)
+      const publisher = Context.get(sql, CommitPublisher.CommitPublisher)
+      const archiveChunks = Array.from(
+        yield* Stream.runCollect(productionReplica.exportBackup({ maxBytes: backupLimits.maxBackupBytes }))
+      )
+      const archiveLength = archiveChunks.reduce((length, chunk) => length + chunk.byteLength, 0)
+      const archive = new Uint8Array(archiveLength)
+      let offset = 0
+      for (const chunk of archiveChunks) {
+        archive.set(chunk, offset)
+        offset += chunk.byteLength
+      }
+      assert.isAbove(archive.byteLength, 1)
+
+      const ownerConsumedFirst = yield* Deferred.make<void>()
+      const observedReplica = Replica.Replica.of({
+        ...productionReplica,
+        restoreBackup: (options) =>
+          productionReplica.restoreBackup({
+            ...options,
+            source: options.source.pipe(
+              Stream.tap(() => Deferred.succeed(ownerConsumedFirst, undefined))
+            )
+          })
+      })
+      const ProductionOwner = ReplicaOwner.layerHandlers(backupDefinition).pipe(
+        Layer.provideMerge(BackupSessions),
+        Layer.provide(Layer.merge(
+          Layer.succeed(CommitPublisher.CommitPublisher, publisher),
+          Layer.succeed(Replica.Replica, observedReplica)
+        ))
+      )
+
+      yield* Effect.scoped(Effect.gen(function*() {
+        const sessions = yield* SessionManager.SessionManager
+        const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+        const opened = yield* Deferred.make<Identity.SessionId>()
+        const firstPull = yield* Deferred.make<void>()
+        const secondPull = yield* Deferred.make<void>()
+        const observedRpc = new Proxy(rpc, {
+          get(target, property, receiver) {
+            const value = Reflect.get(target, property, receiver)
+            if (property === "OpenSession") {
+              return (payload: { readonly sessionId: Identity.SessionId }) =>
+                Deferred.succeed(opened, payload.sessionId).pipe(Effect.andThen(value(payload)))
+            }
+            if (property === "BeginRestoreBackupV4") {
+              return (payload: never) =>
+                value(payload).pipe(
+                  Effect.tap(({ port }: { readonly port: MessagePort }) =>
+                    Effect.sync(() => {
+                      port.addEventListener("message", (event: MessageEvent<unknown>) => {
+                        if (
+                          typeof event.data !== "object" ||
+                          event.data === null ||
+                          Reflect.get(event.data, "_tag") !== "Pull"
+                        ) {
+                          return
+                        }
+                        const sequence = Reflect.get(event.data, "sequence")
+                        if (sequence === 1) Effect.runSync(Deferred.succeed(firstPull, undefined))
+                        if (sequence === 2) Effect.runSync(Deferred.succeed(secondPull, undefined))
+                      })
+                    })
+                  )
+                )
+            }
+            return value
+          }
+        })
+        const client = yield* ReplicaClient.fromRpcClient(backupDefinition, observedRpc)
+        const restore = yield* client.restoreBackup({
+          source: Stream.make(archive.slice(0, 1)).pipe(
+            Stream.concat(Stream.fromEffect(Effect.never))
+          ),
+          mode: "replace",
+          maxBytes: backupLimits.maxBackupBytes,
+          expectedDefinitionHash: backupDefinition.hash,
+          installationId: Identity.BackupInstallationId.make("bak_830da692-45fb-4e48-bbbb-97d356c08eb3")
+        }).pipe(Effect.flip, Effect.forkChild)
+
+        const sessionId = yield* Deferred.await(opened)
+        yield* Deferred.await(firstPull)
+        yield* TestClock.adjust(backupLimits.maxRestoreCoalesceMillis)
+        yield* Deferred.await(ownerConsumedFirst)
+        yield* Deferred.await(secondPull)
+        yield* sessions.close(sessionId, 0)
+        const error = yield* Fiber.join(restore)
+        yield* TestClock.adjust(backupLimits.maxRestorePullMillis + 1)
+        assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+        if (error.reason._tag === "ProtocolMismatch") {
+          assert.strictEqual(error.reason.expected, "active session")
+          assert.strictEqual(error.reason.observed, sessionId)
+        }
+      })).pipe(Effect.provide(ProductionOwner))
+    }))
+  })
+
   it.effect("surfaces ProtocolMismatch without replaying an in-flight restore", () => {
     let applications = 0
     let restoreCalls = 0
@@ -936,7 +1159,11 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         Layer.succeed(Replica.Replica, {
           ...replica,
           restoreBackup: ({ source }) =>
-            Stream.runDrain(source).pipe(Effect.tap(() => Effect.sync(() => ++applications)))
+            Stream.runDrain(source).pipe(
+              Effect.tap(() => Effect.sync(() => ++applications)),
+              Effect.tap(() => Effect.sync(() => ++restoreCalls)),
+              Effect.andThen(Effect.fail(protocolMismatch("restore")))
+            )
         })
       ))
     )
@@ -950,16 +1177,6 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           if (property === "OpenSession") {
             return (payload: { readonly sessionId: Identity.SessionId }) =>
               Effect.sync(() => openedSessionIds.push(payload.sessionId)).pipe(Effect.andThen(value(payload)))
-          }
-          if (property === "RestoreBackup") {
-            return (payload: never) => {
-              restoreCalls++
-              return restoreCalls === 1
-                ? value(payload).pipe(Effect.andThen(Effect.fail(
-                  protocolMismatch("restore")
-                )))
-                : value(payload)
-            }
           }
           if (property === "Get") {
             return (payload: { readonly sessionId: Identity.SessionId }) => {
@@ -988,8 +1205,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.strictEqual(applications, 1)
       assert.strictEqual(error.reason._tag, "ProtocolMismatch")
       if (error.reason._tag === "ProtocolMismatch") assert.strictEqual(error.reason.observed, "restore")
-      assert.strictEqual(openedSessionIds.length, 2)
-      assert.deepStrictEqual(getSessionIds, [openedSessionIds[1]])
+      assert.strictEqual(openedSessionIds.length, 1)
+      assert.deepStrictEqual(getSessionIds, [openedSessionIds[0]])
     })).pipe(Effect.provide(CountingOwner))
   })
 
@@ -1123,11 +1340,11 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 : value(payload)
             }
           }
-          if (property === "RestoreBackup") {
+          if (property === "BeginRestoreBackupV4") {
             return (payload: never) => {
               restoreCalls++
               return restoreCalls === 1
-                ? value(payload).pipe(Effect.andThen(Effect.fail(protocolMismatch("restore"))))
+                ? Effect.fail(protocolMismatch("restore"))
                 : value(payload)
             }
           }
@@ -1150,7 +1367,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       const error = yield* Fiber.join(fiber)
       assert.strictEqual(openSessions, 3)
       assert.strictEqual(restoreCalls, 1)
-      assert.strictEqual(applications, 1)
+      assert.strictEqual(applications, 0)
       assert.strictEqual(error.reason._tag, "ProtocolMismatch")
       if (error.reason._tag === "ProtocolMismatch") assert.strictEqual(error.reason.observed, "restore")
     })).pipe(Effect.provide(CountingOwner))
@@ -1188,10 +1405,10 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 : value(payload)
             }
           }
-          if (property === "RestoreBackup") {
+          if (property === "BeginRestoreBackupV4") {
             return (payload: never) => {
               restoreCalls++
-              return value(payload).pipe(Effect.andThen(Effect.fail(protocolMismatch("restore"))))
+              return Effect.fail(protocolMismatch("restore"))
             }
           }
           return value
@@ -1207,7 +1424,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       }).pipe(Effect.flip)
       assert.strictEqual(openSessions, 2)
       assert.strictEqual(restoreCalls, 1)
-      assert.strictEqual(applications, 1)
+      assert.strictEqual(applications, 0)
       assert.strictEqual(error.reason._tag, "QuotaExceeded")
       if (error.reason._tag === "QuotaExceeded") assert.strictEqual(error.reason.resource, "sessions")
     })).pipe(Effect.provide(CountingOwner))
@@ -1242,10 +1459,10 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 : value(payload)
             }
           }
-          if (property === "RestoreBackup") {
+          if (property === "BeginRestoreBackupV4") {
             return (payload: never) => {
               restoreCalls++
-              return value(payload).pipe(Effect.andThen(Effect.fail(protocolMismatch("restore"))))
+              return Effect.fail(protocolMismatch("restore"))
             }
           }
           return value
@@ -1263,7 +1480,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       yield* Fiber.interrupt(fiber)
       assert.strictEqual(openSessions, 2)
       assert.strictEqual(restoreCalls, 1)
-      assert.strictEqual(applications, 1)
+      assert.strictEqual(applications, 0)
     })).pipe(Effect.provide(CountingOwner))
   })
 
@@ -1297,11 +1514,10 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
               return value(payload)
             }
           }
-          if (property === "RestoreBackup") {
+          if (property === "BeginRestoreBackupV4") {
             return (payload: never) => {
               restoreCalls++
-              return value(payload).pipe(
-                Effect.andThen(Deferred.succeed(restoreApplied, undefined)),
+              return Deferred.succeed(restoreApplied, undefined).pipe(
                 Effect.andThen(Deferred.await(releaseRestoreMismatch)),
                 Effect.andThen(Effect.fail(protocolMismatch("restore")))
               )
@@ -1332,7 +1548,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       const restoreError = yield* Fiber.join(restore)
       assert.strictEqual((yield* client.get(Task, documentId)).documentId, documentId)
       assert.strictEqual(restoreCalls, 1)
-      assert.strictEqual(applications, 1)
+      assert.strictEqual(applications, 0)
       assert.strictEqual(restoreError.reason._tag, "ProtocolMismatch")
       if (restoreError.reason._tag === "ProtocolMismatch") {
         assert.strictEqual(restoreError.reason.observed, "restore")

@@ -34,7 +34,13 @@ it.layer(NodeCrypto.layer)("SessionManager", (it) => {
     maxSessions: 2,
     maxStreamsPerSession: 1,
     maxInFlightPerSession: 1,
-    maxQueuedRpc: 2
+    maxQueuedRpc: 2,
+    maxActiveRestores: 2,
+    maxRestoresPerSession: 1,
+    maxRestoreMillis: 30_000,
+    maxRestorePullMillis: 10_000,
+    maxRestoreCoalesceMillis: 25,
+    maxRestoreErrorBytes: 4_096
   } satisfies ReplicaLimits.Values
 
   it.effect("tracks idempotent session registration", () =>
@@ -57,6 +63,109 @@ it.layer(NodeCrypto.layer)("SessionManager", (it) => {
       const error = yield* Effect.flip(sessions.open(yield* Identity.makeSessionId, clientId))
       assert.strictEqual(error.reason._tag, "QuotaExceeded")
       if (error.reason._tag === "QuotaExceeded") assert.strictEqual(error.reason.limit, limits.maxSessions)
+    }).pipe(Effect.provide(SessionManager.layer), Effect.provideService(ReplicaLimits.ReplicaLimits, limits)))
+
+  it.effect("exposes the validated restore transport limits", () =>
+    Effect.gen(function*() {
+      const sessions = yield* SessionManager.SessionManager
+      assert.strictEqual(sessions.maxChunkBytes, limits.maxChunkBytes)
+      assert.strictEqual(sessions.maxActiveRestores, limits.maxActiveRestores)
+      assert.strictEqual(sessions.maxRestoresPerSession, limits.maxRestoresPerSession)
+      assert.strictEqual(sessions.maxRestoreMillis, limits.maxRestoreMillis)
+      assert.strictEqual(sessions.maxRestorePullMillis, limits.maxRestorePullMillis)
+      assert.strictEqual(sessions.maxRestoreCoalesceMillis, limits.maxRestoreCoalesceMillis)
+      assert.strictEqual(sessions.maxRestoreErrorBytes, limits.maxRestoreErrorBytes)
+    }).pipe(Effect.provide(SessionManager.layer), Effect.provideService(ReplicaLimits.ReplicaLimits, limits)))
+
+  it.effect("acquires restore admission independently and releases it idempotently", () =>
+    Effect.gen(function*() {
+      const sessions = yield* SessionManager.SessionManager
+      const sessionId = yield* Identity.makeSessionId
+      yield* sessions.open(sessionId, clientId)
+
+      const lease = yield* sessions.acquireRestore(sessionId, clientId)
+      assert.strictEqual(yield* sessions.activeRestoreCount, 1)
+      assert.strictEqual(yield* sessions.activeRestoreCountForSession(sessionId), 1)
+
+      yield* sessions.run(sessionId, clientId, Effect.void)
+      yield* sessions.stream(sessionId, clientId, Stream.empty).pipe(Stream.runDrain)
+
+      yield* lease.release
+      yield* lease.release
+      assert.strictEqual(yield* sessions.activeRestoreCount, 0)
+      assert.strictEqual(yield* sessions.activeRestoreCountForSession(sessionId), 0)
+    }).pipe(Effect.provide(SessionManager.layer), Effect.provideService(ReplicaLimits.ReplicaLimits, limits)))
+
+  it.effect("fails restore admission fast with session then global then per session precedence", () =>
+    Effect.gen(function*() {
+      const sessions = yield* SessionManager.SessionManager
+      assert.strictEqual(sessions.maxActiveRestores, 10)
+      assert.strictEqual(sessions.effectiveRestoreCapacity, 2)
+      const firstSession = yield* Identity.makeSessionId
+      const secondSession = yield* Identity.makeSessionId
+      const missingSession = yield* Identity.makeSessionId
+      yield* sessions.open(firstSession, clientId)
+      yield* sessions.open(secondSession, clientId)
+
+      const firstLease = yield* sessions.acquireRestore(firstSession, clientId)
+      const perSessionError = yield* Effect.flip(sessions.acquireRestore(firstSession, clientId))
+      assert.strictEqual(perSessionError.reason._tag, "QuotaExceeded")
+      if (perSessionError.reason._tag === "QuotaExceeded") {
+        assert.strictEqual(perSessionError.reason.resource, "active restores per session")
+        assert.strictEqual(perSessionError.reason.limit, limits.maxRestoresPerSession)
+      }
+
+      const secondLease = yield* sessions.acquireRestore(secondSession, clientId)
+      const sessionError = yield* Effect.flip(sessions.acquireRestore(missingSession, clientId))
+      assert.strictEqual(sessionError.reason._tag, "ProtocolMismatch")
+      const ownershipError = yield* Effect.flip(sessions.acquireRestore(firstSession, clientId + 1))
+      assert.strictEqual(ownershipError.reason._tag, "ProtocolMismatch")
+
+      const globalError = yield* Effect.flip(sessions.acquireRestore(firstSession, clientId))
+      assert.strictEqual(globalError.reason._tag, "QuotaExceeded")
+      if (globalError.reason._tag === "QuotaExceeded") {
+        assert.strictEqual(globalError.reason.resource, "active restores")
+        assert.strictEqual(globalError.reason.limit, 2)
+      }
+      assert.strictEqual(yield* sessions.activeRestoreCount, 2)
+      assert.strictEqual(yield* sessions.activeRestoreCountForSession(firstSession), 1)
+
+      yield* firstLease.release
+      yield* secondLease.release
+    }).pipe(
+      Effect.provide(SessionManager.layer),
+      Effect.provideService(ReplicaLimits.ReplicaLimits, {
+        ...limits,
+        maxActiveRestores: 10
+      })
+    ))
+
+  it.effect("keeps expired restore admission reserved until its worker releases", () =>
+    Effect.gen(function*() {
+      const sessions = yield* SessionManager.SessionManager
+      const sessionId = yield* Identity.makeSessionId
+      yield* sessions.open(sessionId, clientId)
+      const staleLease = yield* sessions.acquireRestore(sessionId, clientId)
+
+      yield* TestClock.adjust(SessionManager.leaseDurationMillis)
+      const expiry = yield* Deferred.await(staleLease.expired).pipe(Effect.flip)
+      assert.strictEqual(expiry.reason._tag, "ProtocolMismatch")
+      assert.strictEqual(yield* sessions.activeRestoreCount, 1)
+
+      yield* sessions.open(sessionId, clientId)
+      const replacementLease = yield* sessions.acquireRestore(sessionId, clientId)
+      const globalError = yield* Effect.flip(sessions.acquireRestore(sessionId, clientId))
+      assert.strictEqual(globalError.reason._tag, "QuotaExceeded")
+      if (globalError.reason._tag === "QuotaExceeded") {
+        assert.strictEqual(globalError.reason.resource, "active restores")
+      }
+      assert.strictEqual(yield* sessions.activeRestoreCount, 2)
+
+      yield* staleLease.release
+      assert.strictEqual(yield* sessions.activeRestoreCount, 1)
+      assert.strictEqual(yield* sessions.activeRestoreCountForSession(sessionId), 1)
+      yield* replacementLease.release
+      assert.strictEqual(yield* sessions.activeRestoreCount, 0)
     }).pipe(Effect.provide(SessionManager.layer), Effect.provideService(ReplicaLimits.ReplicaLimits, limits)))
 
   it.effect("expires and renews leases using the Effect clock", () =>

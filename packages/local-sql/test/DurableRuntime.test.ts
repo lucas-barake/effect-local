@@ -98,7 +98,13 @@ describe("DurableRuntime", () => {
     maxSessions: 8,
     maxStreamsPerSession: 4,
     maxInFlightPerSession: 16,
-    maxQueuedRpc: 32
+    maxQueuedRpc: 32,
+    maxActiveRestores: 32,
+    maxRestoresPerSession: 16,
+    maxRestoreMillis: 30_000,
+    maxRestorePullMillis: 10_000,
+    maxRestoreCoalesceMillis: 25,
+    maxRestoreErrorBytes: 4_096
   })
   const Gate = ReplicaGate.layer.pipe(Layer.provide(Layer.merge(Database, Bootstrap)))
   const Store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Database, Gate)))
