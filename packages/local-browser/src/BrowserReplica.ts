@@ -7,25 +7,34 @@ import * as ReplicaClient from "./ReplicaClient.js"
 
 type WorkerOptions = Parameters<typeof RpcClient.layerProtocolWorker>[0]
 
-export const layerWith = (definition: ReplicaDefinition.Any, options: WorkerOptions) =>
+export const layerWith = (
+  definition: ReplicaDefinition.Any,
+  options: WorkerOptions,
+  timeouts?: ReplicaClient.TimeoutOptions
+) =>
   Layer.effect(
     Replica.Replica,
     ReplicaClient.ReplicaClient
   ).pipe(
-    Layer.provide(ReplicaClient.layer(definition)),
+    Layer.provide(ReplicaClient.layer(definition, timeouts)),
     Layer.provide(RpcClient.layerProtocolWorker(options))
   )
 
-export const layer = (definition: ReplicaDefinition.Any) => layerWith(definition, { size: 1, concurrency: 32 })
+export const layer = (definition: ReplicaDefinition.Any, timeouts?: ReplicaClient.TimeoutOptions) =>
+  layerWith(definition, { size: 1, concurrency: 32 }, timeouts)
 
-export const layerWithReactivityOptions = (definition: ReplicaDefinition.Any, options: WorkerOptions) =>
+export const layerWithReactivityOptions = (
+  definition: ReplicaDefinition.Any,
+  options: WorkerOptions,
+  timeouts?: ReplicaClient.TimeoutOptions
+) =>
   Layer.merge(
     Layer.effect(Replica.Replica, ReplicaClient.ReplicaClient),
     ReplicaAtom.layerReactivity
   ).pipe(
-    Layer.provide(ReplicaClient.layer(definition)),
+    Layer.provide(ReplicaClient.layer(definition, timeouts)),
     Layer.provide(RpcClient.layerProtocolWorker(options))
   )
 
-export const layerWithReactivity = (definition: ReplicaDefinition.Any) =>
-  layerWithReactivityOptions(definition, { size: 1, concurrency: 32 })
+export const layerWithReactivity = (definition: ReplicaDefinition.Any, timeouts?: ReplicaClient.TimeoutOptions) =>
+  layerWithReactivityOptions(definition, { size: 1, concurrency: 32 }, timeouts)

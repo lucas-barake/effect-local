@@ -69,28 +69,22 @@ const isTransientStatus = (error: ReplicaError.ReplicaError) => {
     isTransientRpcClientError(error.reason.cause)
 }
 
-const recoverCommand = <A,>(
-  commandId: Identity.CommandId,
-  dispatch: Effect.Effect<A, ReplicaError.ReplicaError | RpcClientError.RpcClientError>,
-  lookup: Effect.Effect<A, ReplicaError.ReplicaError | RpcClientError.RpcClientError>
-): Effect.Effect<A | CommandOutcome.OutcomeUnknown, ReplicaError.ReplicaError> =>
-  dispatch.pipe(
-    Effect.catchTag("RpcClientError", () =>
-      lookup.pipe(
-        Effect.catchTag("RpcClientError", () => Effect.succeed(CommandOutcome.unknown(commandId)))
-      ))
-  )
-
 export const fromRpcClient = (
   definition: ReplicaDefinition.Any,
   rpc: RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>,
   options?: TimeoutOptions
 ): Effect.Effect<ReplicaClient["Service"], ReplicaError.ReplicaError, Scope.Scope | Crypto.Crypto> =>
   Effect.gen(function*() {
-    const sessionTimeout = options?.sessionTimeout ?? defaultSessionTimeout
-    const operationTimeout = options?.operationTimeout ?? defaultOperationTimeout
+    const sessionTimeout = Duration.fromInputUnsafe(options?.sessionTimeout ?? defaultSessionTimeout)
+    const operationTimeout = Duration.fromInputUnsafe(options?.operationTimeout ?? defaultOperationTimeout)
+    const timeoutMillis = (duration: Duration.Duration) => {
+      const millis = Duration.toMillis(duration)
+      if (millis <= 0 || Number.isNaN(millis)) return 0
+      if (millis >= Number.MAX_SAFE_INTEGER) return Number.MAX_SAFE_INTEGER
+      return Math.trunc(millis)
+    }
     const boundBy =
-      (operation: string, duration: Duration.Input) =>
+      (operation: string, duration: Duration.Duration) =>
       <A, E, R,>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E | ReplicaError.ReplicaError, R> =>
         Effect.timeoutOrElse(effect, {
           duration,
@@ -99,13 +93,36 @@ export const fromRpcClient = (
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.OperationTimeout({
                   operation,
-                  timeoutMillis: Math.trunc(Duration.toMillis(duration))
+                  timeoutMillis: timeoutMillis(duration)
                 })
               })
             )
         })
     const boundSession = (operation: string) => boundBy(operation, sessionTimeout)
     const boundOperation = (operation: string) => boundBy(operation, operationTimeout)
+    const recoverCommand = <A,>(
+      commandId: Identity.CommandId,
+      dispatchOperation: string,
+      dispatch: Effect.Effect<A, ReplicaError.ReplicaError | RpcClientError.RpcClientError>,
+      lookupOperation: string,
+      lookup: Effect.Effect<A, ReplicaError.ReplicaError | RpcClientError.RpcClientError>
+    ): Effect.Effect<A | CommandOutcome.OutcomeUnknown, ReplicaError.ReplicaError> => {
+      const unknown = () => Effect.succeed(CommandOutcome.unknown(commandId))
+      const lookupOrUnknown = lookup.pipe(
+        boundOperation(lookupOperation),
+        Effect.catchTags({
+          RpcClientError: unknown,
+          ReplicaError: (error) => error.reason._tag === "OperationTimeout" ? unknown() : Effect.fail(error)
+        })
+      )
+      return dispatch.pipe(
+        boundOperation(dispatchOperation),
+        Effect.catchTags({
+          RpcClientError: () => lookupOrUnknown,
+          ReplicaError: (error) => error.reason._tag === "OperationTimeout" ? lookupOrUnknown : Effect.fail(error)
+        })
+      )
+    }
     const closeSession = (sessionId: Identity.SessionId) =>
       rpc.CloseSession({ sessionId }).pipe(boundSession("CloseSession"))
     const crypto = yield* Crypto.Crypto
@@ -232,10 +249,13 @@ export const fromRpcClient = (
       use: (
         session: Session
       ) => Effect.Effect<A, E | ReplicaError.ReplicaError, R>,
-      options?: { readonly replayAfterReopen?: boolean }
+      options?: {
+        readonly boundOperation?: boolean
+        readonly replayAfterReopen?: boolean
+      }
     ) => {
       const bounded = (session: Session) =>
-        use(session).pipe(boundOperation(operation))
+        options?.boundOperation === false ? use(session) : use(session).pipe(boundOperation(operation))
       return SubscriptionRef.get(sessions).pipe(
         Effect.flatMap((session) =>
           bounded(session).pipe(
@@ -308,7 +328,10 @@ export const fromRpcClient = (
               })
             })
           )),
-        Effect.retry({ schedule: retrySchedule, while: isTransient }),
+        Effect.retry({
+          schedule: retrySchedule,
+          while: (error) => isTransient(error) || error.reason._tag === "OperationTimeout"
+        }),
         Effect.catchReason("ReplicaError", "ProtocolMismatch", () => reopen(session).pipe(Effect.as(undefined)))
       )
       if (renewed !== undefined && renewed.leaseMillis !== session.lease.leaseMillis) {
@@ -448,18 +471,20 @@ export const fromRpcClient = (
             withSession("Create", (session) =>
               recoverCommand(
                 options.commandId,
+                "Create",
                 rpc.Create({
                   sessionId: session.sessionId,
                   document: document.name,
                   commandId: options.commandId,
                   value
                 }),
+                "LookupCreate",
                 rpc.LookupCreate({
                   sessionId: session.sessionId,
                   document: document.name,
                   commandId: options.commandId
                 })
-              ))
+              ), { boundOperation: false })
           )
         ),
       get: (document, documentId) =>
@@ -485,6 +510,7 @@ export const fromRpcClient = (
             withSession("Mutate", (session) =>
               recoverCommand(
                 options.commandId,
+                "Mutate",
                 rpc.Mutate({
                   sessionId: session.sessionId,
                   mutation: mutation.name,
@@ -492,12 +518,13 @@ export const fromRpcClient = (
                   documentId: options.documentId,
                   payload
                 }),
+                "LookupMutation",
                 rpc.LookupMutation({
                   sessionId: session.sessionId,
                   mutation: mutation.name,
                   commandId: options.commandId
                 })
-              ))
+              ), { boundOperation: false })
           ),
           Effect.flatMap((outcome) => Wire.decodeOutcome(mutation.successSchema, mutation.errorSchema, outcome))
         ),
@@ -505,9 +532,11 @@ export const fromRpcClient = (
         withSession("Delete", (session) =>
           recoverCommand(
             options.commandId,
+            "Delete",
             rpc.Delete({ sessionId: session.sessionId, document: document.name, ...options }),
+            "LookupDelete",
             rpc.LookupDelete({ sessionId: session.sessionId, document: document.name, commandId: options.commandId })
-          )).pipe(
+          ), { boundOperation: false }).pipe(
             Effect.flatMap((outcome) => Wire.decodeOutcome(Schema.Void, Schema.Never, outcome))
           ),
       query: (query, ...payload) =>
@@ -715,8 +744,9 @@ export const fromRpcClient = (
                     reason: new ReplicaError.StorageUnavailable({
                       cause: error
                     })
-                  ))
-              )
+                  })
+                ))
+            )
           )
         )
     }

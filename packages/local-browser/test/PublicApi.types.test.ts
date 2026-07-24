@@ -10,6 +10,7 @@ import type * as Worker from "effect/unstable/workers/Worker"
 import type * as WorkerError from "effect/unstable/workers/WorkerError"
 import * as BrowserReplica from "../src/BrowserReplica.js"
 import * as BrowserSqlite from "../src/BrowserSqlite.js"
+import type * as ReplicaClient from "../src/ReplicaClient.js"
 import { definition } from "./fixtures.js"
 
 describe("public browser API types", () => {
@@ -20,6 +21,18 @@ describe("public browser API types", () => {
       Crypto.Crypto | Worker.WorkerPlatform | Worker.Spawner
     > = BrowserReplica.layer(definition)
     assert.isDefined(layer)
+  })
+
+  it("exposes timeout options through every browser replica constructor", () => {
+    const timeouts = {
+      sessionTimeout: "20 seconds",
+      operationTimeout: "2 minutes"
+    } satisfies ReplicaClient.TimeoutOptions
+    const worker = { size: 2, concurrency: 8 }
+    assert.isDefined(BrowserReplica.layer(definition, timeouts))
+    assert.isDefined(BrowserReplica.layerWith(definition, worker, timeouts))
+    assert.isDefined(BrowserReplica.layerWithReactivity(definition, timeouts))
+    assert.isDefined(BrowserReplica.layerWithReactivityOptions(definition, worker, timeouts))
   })
 
   it("accepts a page provisioned database port", () => {

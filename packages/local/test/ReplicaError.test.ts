@@ -29,4 +29,20 @@ describe("ReplicaError", () => {
     if (!Schema.is(Schema.Error())(decoded.reason.cause)) return
     assert.strictEqual(decoded.reason.cause.message, "database closed")
   })
+
+  it("round trips operation timeout metadata", () => {
+    const error = new ReplicaError.ReplicaError({
+      reason: new ReplicaError.OperationTimeout({
+        operation: "Get",
+        timeoutMillis: 2_000
+      })
+    })
+    const encoded = Schema.encodeSync(ReplicaError.ReplicaError)(error)
+    assert.deepStrictEqual(encoded.reason, {
+      _tag: "OperationTimeout",
+      operation: "Get",
+      timeoutMillis: 2_000
+    })
+    assert.deepStrictEqual(Schema.decodeUnknownSync(ReplicaError.ReplicaError)(encoded), error)
+  })
 })
