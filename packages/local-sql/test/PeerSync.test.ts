@@ -501,10 +501,8 @@ describe("PeerSync", () => {
           ;(draft.value as { title: string }).title = "mapped"
         }
       )
-      const localHandshake = Automerge.generateSyncMessage(
-        created.automerge,
-        Automerge.initSyncState()
-      )[1]!
+      const emptyPeer = Automerge.init<InternalAutomerge.Root<{ title: string; labels: Array<string> }>>()
+      const localHandshake = Automerge.generateSyncMessage(emptyPeer, Automerge.initSyncState())[1]!
       const receivedHandshake = Automerge.receiveSyncMessage(
         remote,
         Automerge.initSyncState(),
@@ -547,6 +545,7 @@ describe("PeerSync", () => {
         (SELECT COUNT(*) FROM effect_local_changes) AS changes,
         (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts`
       assert.deepStrictEqual(after, before)
+      InternalAutomerge.free(emptyPeer)
       InternalAutomerge.free(remote)
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(TestLayer)))
