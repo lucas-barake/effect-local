@@ -941,6 +941,22 @@ const presence = Presence.make(Cursor, { timeToLive: "15 seconds" })
 the authenticated transport peer. It is not a durable user identity. `timeToLive` accepts any Effect `Duration.Input`
 whose normalized millisecond value is positive, finite, and no greater than `Number.MAX_SAFE_INTEGER`.
 
+Concurrent writes for one peer resolve by arrival at the API boundary. Each `receive`, `publish`, and `remove` claims a
+monotonic sequence when it is called, and a write is stored only when its sequence is newer than the newest call that
+has already settled that peer, so a slow payload decode can no longer let an earlier call overwrite a later one. The
+comparison survives the entry itself: a write that lost the race stays dropped even if the winner is removed, expires,
+or is reclaimed by a `values` read before the loser finishes decoding.
+
+Two consequences follow. A losing write is dropped silently and success is not an admission signal, so a peer should
+hold at most one `publish` scope at a time; a losing `publish` holds no entry for the lifetime of its scope, and its
+release removes nothing. And the ordering is over arrival at this process, not production at the remote peer: a
+transport that reorders two updates from one peer still delivers the stale one last, and Presence will store it.
+Ordering across a reordering transport requires a sequence carried in the payload, which is the application's
+responsibility.
+
+Expiry is enforced lazily when `values` reads. Entries stay resident until then, so a peer that only writes never
+reclaims expired entries.
+
 ### 12. Host a canonical replica over Effect RPC
 
 The hosted process runs the same `SqlReplica` composition as any Node replica. The RPC package adds a live transport
@@ -1662,7 +1678,7 @@ Browser composition contracts:
 | `ReplicaClient`  | Extends the core `Replica` service with `ownerEpoch` and invalidations. `fromRpcClient` owns session open, renewal, close, transient reconnect, command ambiguity recovery, and invalidation resubscription. `layer` builds the internal generated client. Session lifecycle RPCs default to 10 second timeouts. Unary operations default to 30 seconds. Restore uses one end to end deadline across transport and session replacement. `Invalidations`, `Status`, and `ExportBackup` streams remain unbounded |
 | `BrowserReplica` | `layer` is the standard page service. Every constructor accepts optional `TimeoutOptions`. `layerWith` and `layerWithReactivityOptions` also accept Worker options. Reactivity variants provide invalidation bridging                                                                                                                                                                                                                                                                                          |
 | `ReplicaAtom`    | `documentFamily`, `queryFamily`, `mutation`, and `status` build reactive views over an Atom runtime. `layerReactivity` connects commit invalidations. Atom state remains rebuildable                                                                                                                                                                                                                                                                                                                           |
-| `Presence`       | `make` validates a positive finite TTL and returns `receive`, scoped `publish`, `remove`, and `values`. Presence is ephemeral and never authorization state                                                                                                                                                                                                                                                                                                                                                    |
+| `Presence`       | `make` validates a positive finite TTL and returns `receive`, scoped `publish`, `remove`, and `values`. Concurrent writes for one peer resolve by arrival sequence, and a write older than the newest settled call for that peer is dropped without an error, including after the winner was removed or expired. Ordering covers arrival at this process, not transport reordering. Expiry is applied lazily on `values`. Presence is ephemeral and never authorization state                                  |
 
 The internal browser `ReplicaRpc` protocol and the external peer `PeerRpc` protocol are different contracts. The
 first connects a page to its SharedWorker owned local replica. The second connects independent canonical replicas.
