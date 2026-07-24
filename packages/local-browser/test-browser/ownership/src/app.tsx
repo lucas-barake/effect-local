@@ -240,6 +240,8 @@ export const App = () => {
     ? "Offline, saved locally"
     : replicaStatus._tag === "Success" && replicaStatus.value._tag === "Ready"
     ? "Local replica ready"
+    : replicaStatus._tag === "Success" && replicaStatus.value._tag === "Degraded"
+    ? `Local replica degraded: ${replicaStatus.value.reason}`
     : "Starting local replica"
 
   return (

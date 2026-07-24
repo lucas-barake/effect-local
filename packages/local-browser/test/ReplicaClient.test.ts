@@ -595,18 +595,26 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       let initialSessionId: Identity.SessionId | undefined
       let openSessions = 0
+      const openedSessionIds: Array<Identity.SessionId> = []
       const reconnecting = new Proxy(rpc, {
         get(target, property, receiver) {
           const value = Reflect.get(target, property, receiver)
           if (property === "OpenSession") {
             return (payload: { readonly sessionId: Identity.SessionId }) => {
               openSessions++
+              openedSessionIds.push(payload.sessionId)
               if (initialSessionId === undefined) initialSessionId = payload.sessionId
               const opened = value(payload)
               return openSessions === 2 || openSessions === 3
                 ? opened.pipe(Effect.andThen(Effect.fail(disconnected())))
                 : opened
             }
+          }
+          if (property === "CloseSession") {
+            return (payload: { readonly sessionId: Identity.SessionId }) =>
+              payload.sessionId !== initialSessionId && openSessions <= 3
+                ? Effect.fail(disconnected())
+                : value(payload)
           }
           if (property === "Get") {
             return (payload: { readonly sessionId: Identity.SessionId }) =>
@@ -629,6 +637,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       yield* TestClock.adjust("2 seconds")
       assert.strictEqual((yield* Fiber.join(snapshot)).documentId, documentId)
       assert.strictEqual(openSessions, 4)
+      assert.notStrictEqual(openedSessionIds[1], openedSessionIds[0])
+      assert.strictEqual(openedSessionIds[2], openedSessionIds[1])
+      assert.strictEqual(openedSessionIds[3], openedSessionIds[1])
       assert.strictEqual(yield* sessions.activeCount, 1)
     })).pipe(Effect.provide(Owner)))
 
