@@ -1458,7 +1458,7 @@ describe("PeerRpcServer", () => {
           if (Exit.isFailure(rejection)) {
             const error = Cause.findErrorOption(rejection.cause)
             assert.strictEqual(error._tag, "Some")
-            if (error._tag === "Some") assert.instanceOf(error.value, PeerRpcError.SessionUnavailable)
+            if (error._tag === "Some") assert.strictEqual(error.value._tag, "SessionUnavailable")
           }
         }).pipe(Effect.ensuring(Deferred.succeed(teardownRelease, undefined)))
 
