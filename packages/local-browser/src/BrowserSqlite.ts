@@ -49,18 +49,21 @@ const compatiblePort = (port: MessagePort): MessagePort =>
     }
   })
 
-export const layer = DatabasePort.pipe(
-  Effect.map((port) =>
-    SqliteClient.layer({
-      // A MessagePort from `new MessageChannel()` only dispatches queued messages once started.
-      worker: Effect.sync(() => {
-        port.start()
-        return compatiblePort(port)
+const makeLayer = () =>
+  DatabasePort.pipe(
+    Effect.map((port) =>
+      SqliteClient.layer({
+        // A MessagePort from `new MessageChannel()` only dispatches queued messages once started.
+        worker: Effect.sync(() => {
+          port.start()
+          return compatiblePort(port)
+        })
       })
-    })
-  ),
-  Layer.unwrap,
-  Layer.fresh
-)
+    ),
+    Layer.unwrap
+  )
 
-export const layerMessagePort = (port: MessagePort) => layer.pipe(Layer.provide(Layer.succeed(DatabasePort, port)))
+export const layer = makeLayer()
+
+export const layerMessagePort = (port: MessagePort) =>
+  makeLayer().pipe(Layer.provide(Layer.succeed(DatabasePort, port)))
