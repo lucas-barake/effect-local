@@ -78,8 +78,12 @@ advertised `lineageAware` is never sent a rewritten document. A peer whose asser
 one is refused for that document alone, and the session keeps serving every other selected document. Lineage is an
 unauthenticated peer assertion. It is a correctness signal against an honest but stale peer, not a security control.
 
-The canonical backup archive does not carry the lineage column. Export and restore transport the rewritten document
-content and land the restored replica on the genesis lineage, so restore does not repair a lineage refusal.
+An archive that contains a rewritten lineage uses format 2 and carries lineage on every document and checkpoint
+record. Restore preserves it. Format 1 archives may omit lineage and restore those records as genesis. A refused peer
+can therefore be repaired by exporting the authoritative replica after the rewrite and clone restoring that archive
+onto the refused replica. Replace restore is appropriate only when the archive source replica has been retired,
+because it adopts the source replica identity. Either mode discards any unsynced local change on the superseded
+lineage because it has no causal relationship to the new root and cannot be merged safely.
 
 ## Workflows
 
