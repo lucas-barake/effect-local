@@ -3,6 +3,8 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
+import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Projection from "@lucas-barake/effect-local/Projection"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
@@ -74,6 +76,32 @@ describe("ReplicaHealth", () => {
     Layer.provideMerge(Layer.merge(Bootstrap, ReplicaLimits.layer(limits)))
   )
   const Live = ReplicaHealth.layer(definition).pipe(Layer.provideMerge(Gate))
+
+  // A replica whose blocked documents do not all map to a projection: `Note` carries none, `Task` does.
+  const Note = Document.make("Note", { schema: Schema.Struct({ body: Schema.String }), version: 1 })
+  const TaskById = Projection.make("TaskById", {
+    document: Task,
+    version: 1,
+    Row: Schema.Struct({ sourceDocumentId: Identity.DocumentId, title: Schema.String }),
+    key: (row) => row.sourceDocumentId,
+    project: (snapshot) => [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title }]
+  })
+  const projectedDefinition = ReplicaDefinition.make({
+    name: "health-projected-replica",
+    documents: DocumentSet.make(Task, Note),
+    mutations: [],
+    projections: [TaskById],
+    queries: []
+  })
+  const ProjectedDatabase = Layer.merge(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer
+  )
+  const ProjectedBootstrap = ReplicaBootstrap.layer(projectedDefinition).pipe(Layer.provideMerge(ProjectedDatabase))
+  const ProjectedGate = ReplicaGate.layer.pipe(
+    Layer.provideMerge(Layer.merge(ProjectedBootstrap, ReplicaLimits.layer(limits)))
+  )
+  const Projected = ReplicaHealth.layer(projectedDefinition).pipe(Layer.provideMerge(ProjectedGate))
 
   it.effect("delivers the current status to the first subscriber", () =>
     Effect.gen(function*() {
@@ -208,6 +236,36 @@ describe("ReplicaHealth", () => {
       }
     }).pipe(Effect.provide(Live)))
 
+  it.effect("does not report a fenced replica when a claim commits between the sampler's reads", () =>
+    Effect.gen(function*() {
+      const health = yield* ReplicaHealth.ReplicaHealth
+      const gate = yield* ReplicaGate.ReplicaGate
+      const collected: Array<ReplicaStatus.ReplicaStatus> = []
+      const observer = yield* health.status.pipe(
+        Stream.tap((status) => Effect.sync(() => collected.push(status))),
+        Stream.runDrain,
+        Effect.forkChild
+      )
+      yield* Effect.yieldNow
+      // The sampler reads `writer_generation` before it reads the gate's owner and permit. A claim that
+      // both starts and finishes inside that gap leaves the sampler holding a generation older than the
+      // permit it reads next, which is this process advancing its own replica rather than a foreign
+      // writer fencing it. The operation budget schedules that interleaving deterministically.
+      const sampler = yield* health.sample.pipe(
+        Effect.provideService(Scheduler.MaxOpsBeforeYield, 64),
+        Effect.forkChild
+      )
+      const claim = yield* gate.claim(() => Effect.void).pipe(Effect.forkChild)
+      yield* Fiber.join(sampler)
+      yield* Fiber.join(claim)
+      yield* Effect.yieldNow
+      yield* Fiber.interrupt(observer)
+      const permit = yield* gate.current
+      // Nothing fenced this replica: the durable generation is exactly the one the permit carries.
+      assert.strictEqual((yield* gate.refresh).writerGeneration, permit.writerGeneration)
+      assert.deepStrictEqual(collected.filter((status) => status._tag === "ReadOnly"), [])
+    }).pipe(Effect.provide(Live)))
+
   it.effect("reports a fenced replica as read-only", () =>
     Effect.gen(function*() {
       const health = yield* ReplicaHealth.ReplicaHealth
@@ -315,6 +373,28 @@ describe("ReplicaHealth", () => {
       }
     }).pipe(Effect.provide(Live), Effect.provide(Database)))
 
+  it.effect("reports a blocked projection that a projectionless blocked document sorts ahead of", () =>
+    Effect.gen(function*() {
+      const health = yield* ReplicaHealth.ReplicaHealth
+      const sql = yield* SqlClient.SqlClient
+      const insertBlocked = (documentId: string, documentType: string) =>
+        sql`INSERT INTO effect_local_documents (
+          document_id, document_type, schema_version, observed_versions,
+          materialized_heads, accepted_heads, tombstone, projection_status
+        ) VALUES (${documentId}, ${documentType}, 1, '[]', '[]', '[]', 0, 'Blocked')`
+      // `Note` has no projection and its id sorts first, so it is the row the sampler's `LIMIT 1` sees.
+      yield* insertBlocked("doc_00000000-0000-4000-8000-000000000001", "Note")
+      yield* insertBlocked("doc_00000000-0000-4000-8000-000000000002", "Task")
+      assert.deepStrictEqual(
+        yield* Stream.runHead(health.status),
+        Option.some<ReplicaStatus.ReplicaStatus>({
+          _tag: "ProjectionBlocked",
+          projection: "TaskById",
+          reason: "A Task document is blocked for projection"
+        })
+      )
+    }).pipe(Effect.provide(Projected), Effect.provide(ProjectedDatabase)))
+
   it.effect("reports an undecodable durable row as failed", () =>
     Effect.gen(function*() {
       const health = yield* ReplicaHealth.ReplicaHealth
@@ -326,4 +406,61 @@ describe("ReplicaHealth", () => {
         assert.include(failed.message, "writer_generation")
       }
     }).pipe(Effect.provide(Live), Effect.provide(Database)))
+  it.effect("does not report a fenced replica when a local claim finishes after the generation read", () =>
+    Effect.gen(function*() {
+      const atClaiming = yield* Deferred.make<void>()
+      const releaseClaiming = yield* Deferred.make<void>()
+      let armed = false
+      // The sampler reads `writer_generation` from the database before it reads the gate. A local
+      // `ReplicaGate.claim` that commits inside that window leaves the sampler holding a generation older
+      // than the permit it reads next, which is the only seam that reproduces the read skew deterministically.
+      const SkewedGate = Layer.effect(
+        ReplicaGate.ReplicaGate,
+        Effect.gen(function*() {
+          const gate = yield* ReplicaGate.ReplicaGate
+          return ReplicaGate.ReplicaGate.of({
+            ...gate,
+            claiming: Effect.suspend(() => {
+              if (!armed) return gate.claiming
+              armed = false
+              return Deferred.succeed(atClaiming, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseClaiming)),
+                Effect.andThen(gate.claiming)
+              )
+            })
+          })
+        })
+      ).pipe(Layer.provideMerge(Gate))
+      yield* Effect.gen(function*() {
+        const health = yield* ReplicaHealth.ReplicaHealth
+        const gate = yield* ReplicaGate.ReplicaGate
+        const collected: Array<ReplicaStatus.ReplicaStatus> = []
+        const subscribed = yield* Deferred.make<void>()
+        const observer = yield* health.status.pipe(
+          Stream.tap((status) =>
+            Effect.sync(() => collected.push(status)).pipe(
+              Effect.andThen(Deferred.succeed(subscribed, undefined))
+            )
+          ),
+          Stream.runDrain,
+          Effect.forkChild
+        )
+        yield* Deferred.await(subscribed)
+        armed = true
+        const sampler = yield* health.sample.pipe(Effect.forkChild)
+        yield* Deferred.await(atClaiming)
+        yield* Effect.orDie(gate.claim(() => Effect.void))
+        yield* Deferred.succeed(releaseClaiming, undefined)
+        yield* Fiber.join(sampler)
+        yield* Effect.yieldNow
+        yield* Effect.yieldNow
+        yield* Effect.yieldNow
+        yield* Fiber.interrupt(observer)
+        assert.deepStrictEqual(
+          collected.filter((status) => status._tag === "ReadOnly"),
+          [],
+          "a completed local claim was reported as another writer generation fencing the replica"
+        )
+      }).pipe(Effect.provide(ReplicaHealth.layer(definition).pipe(Layer.provideMerge(SkewedGate))))
+    }))
 })

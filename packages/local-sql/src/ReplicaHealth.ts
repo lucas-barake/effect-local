@@ -143,12 +143,15 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         Result: PendingRow,
         execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_commit_outbox WHERE published = 0`
       })
-      const findBlockedDocument = SqlSchema.findOneOption({
+      // Distinct types, not the first blocked row: a document type carrying no projection is still blocked
+      // durably, and picking one row would let such a type shadow a type whose projection has to be
+      // reported. The result is bounded by the number of stored document types.
+      const findBlockedDocumentTypes = SqlSchema.findAll({
         Request: Schema.Void,
         Result: BlockedRow,
         execute: () =>
-          sql`SELECT document_type FROM effect_local_documents
-            WHERE projection_status = 'Blocked' ORDER BY document_id LIMIT 1`
+          sql`SELECT DISTINCT document_type FROM effect_local_documents
+            WHERE projection_status = 'Blocked' ORDER BY document_type`
       })
       const findWriterGeneration = SqlSchema.findOneOption({
         Request: Schema.Void,
@@ -199,7 +202,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
 
       const sample = Effect.gen(function*() {
         const pending = yield* read(countPending(undefined))
-        const blockedDocument = yield* read(findBlockedDocument(undefined))
+        const blockedDocumentTypes = yield* read(findBlockedDocumentTypes(undefined))
         const generation = yield* read(findWriterGeneration(undefined))
         // Read in this order on purpose. `ReplicaGate.claim` sets its owner, bumps `writer_generation`
         // inside its transaction, republishes the matching permit, and only then clears the owner, and the
@@ -216,7 +219,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             failure: Option.some("Replica metadata is missing")
           }))
         }
-        const blocked = Option.flatMap(blockedDocument, (row) =>
+        const blocked = Arr.findFirst(blockedDocumentTypes, (row) =>
           Option.map(projectionFor(row.document_type), (projection) => ({
             projection,
             reason: `A ${row.document_type} document is blocked for projection`
@@ -232,7 +235,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           blocked,
           degraded: Option.none(),
           failure: Option.none(),
-          fenced: !claiming && generation.value.writer_generation !== permit.writerGeneration
+          // Only a generation ahead of the permit is a fence. `writer_generation` only ever increases, so a
+          // durable value behind the permit cannot mean a foreign writer: it is this sampler's own read skew
+          // over a local claim that committed and republished its permit after the generation was read.
+          fenced: !claiming && generation.value.writer_generation > permit.writerGeneration
         }))
       }).pipe(
         Effect.catchReason("ReplicaError", "StorageCorrupt", (reason) =>

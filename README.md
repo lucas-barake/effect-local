@@ -821,7 +821,7 @@ also receives pushed restore progress. It reports:
 | `ReadOnly`          | A restore is installing under the writer claim, or another writer generation has fenced it |
 | `ProjectionBlocked` | A document is durably marked blocked for a projection this definition declares             |
 | `Degraded`          | Storage was transiently unavailable on the last sample                                     |
-| `Failed`            | The replica metadata singleton is missing, so the replica has no identity to work from     |
+| `Failed`            | Storage is corrupt, its metadata singleton is missing, or health sampling stopped          |
 
 `Starting` is not emitted by the SQL composition: bootstrap completes while the layer graph is still building, so no
 consumer can hold a `Replica` in time to observe it. It remains a public protocol value for other compositions.
