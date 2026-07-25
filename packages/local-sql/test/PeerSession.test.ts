@@ -2850,6 +2850,15 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const dispatched = yield* Queue.unbounded<Identity.DocumentId>()
         const publications = yield* Ref.make(0)
         const closed = yield* Ref.make(0)
+        const crypto = yield* Crypto.Crypto
+        const digestCalls = yield* Ref.make(0)
+        const recordingCrypto: Crypto.Crypto = {
+          ...crypto,
+          digest: (algorithm, data) =>
+            Ref.update(digestCalls, (count) => count + 1).pipe(
+              Effect.andThen(crypto.digest(algorithm, data))
+            )
+        }
         // `makeTestClient` has no awaitDisconnect, so the connection close the terminal path
         // performs is what tells this test the session died instead of scoping the refusal.
         const closeStarted = yield* Deferred.make<void>()
@@ -2929,6 +2938,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           },
           entity
         ).pipe(
+          Effect.provideService(Crypto.Crypto, recordingCrypto),
           Effect.provideService(PeerTransport.PeerTransport, transport),
           Effect.provideService(PeerSync.PeerSync, sync),
           Effect.provideService(ReplicaGate.ReplicaGate, gate),
@@ -2948,13 +2958,15 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         )
         yield* Queue.offer(inbound, yield* envelope(0, refusedId))
         assert.strictEqual(yield* whileOpen(Queue.take(dispatched)), refusedId)
+        yield* Ref.set(digestCalls, 0)
         // The peer keeps pushing the refused document. The second message must be dropped ahead of
-        // the entity, so a hostile peer cannot make the session re-enter storage for it at will.
+        // the digest and entity, so a hostile peer cannot make the session repeat either cost at will.
         yield* Queue.offer(inbound, yield* envelope(1, refusedId))
         yield* Queue.offer(inbound, yield* envelope(2, survivingId))
         // Taken after two further messages, so it is only reachable if the refusal neither ended the
         // session nor stopped the receive loop.
         assert.strictEqual(yield* whileOpen(Queue.take(dispatched)), survivingId)
+        assert.strictEqual(yield* Ref.get(digestCalls), 1)
         assert.strictEqual(yield* Queue.size(dispatched), 0)
         // Only the applied document published, and the connection is still open.
         assert.strictEqual(yield* Ref.get(publications), 1)

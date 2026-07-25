@@ -424,6 +424,11 @@ const makeWithTerminal = (
             })
           })
         }
+        const selectedDocument = selected.has(key(envelope.documentType, envelope.documentId))
+        // Dropped before the digest and entity dispatch, not after. Nothing can restore the refused
+        // lineage inside this session, so hashing and dispatching every further message the peer
+        // sends for it would be a peer driven retry loop over CPU, allocation, and storage.
+        if (selectedDocument && (yield* Ref.get(refused)).has(envelope.documentId)) return
         const messageHash = yield* Canonical.digest(envelope.message).pipe(
           Effect.provideService(Crypto.Crypto, crypto)
         )
@@ -435,7 +440,7 @@ const makeWithTerminal = (
             })
           })
         }
-        if (!selected.has(key(envelope.documentType, envelope.documentId))) {
+        if (!selectedDocument) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.ProtocolMismatch({
               expected: "selected whole document",
@@ -443,10 +448,6 @@ const makeWithTerminal = (
             })
           })
         }
-        // Dropped before the entity dispatch, not after. Nothing can restore the refused lineage
-        // inside this session, so dispatching every further message the peer sends for it would be
-        // a peer driven retry loop over the entity and its storage.
-        if ((yield* Ref.get(refused)).has(envelope.documentId)) return
         const result = yield* withSyncLock(
           envelope.documentId,
           Effect.gen(function*() {
