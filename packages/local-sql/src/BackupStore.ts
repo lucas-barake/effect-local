@@ -746,116 +746,120 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               )
             )
             : manifest.replicaId
-          yield* Effect.scoped(reporter.installing.pipe(Effect.andThen(gate.claim((permit) =>
-            Effect.gen(function*() {
-              const restoredPermit: ReplicaGate.Permit = {
-                ...permit,
-                incarnation: Identity.ReplicaIncarnation.make(
-                  Math.max(permit.incarnation, manifest.incarnation + 1)
-                )
-              }
-              const installed = yield* findInstallation(options.installationId)
-              if (installed._tag === "Some") {
-                if (
-                  installed.value.manifest_checksum !== manifestEnvelope.checksum ||
-                  installed.value.mode !== options.mode
-                ) {
-                  return yield* new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.BackupInvalid({
-                      cause: new Error("Backup installation id was already used for a different restore")
-                    })
-                  })
+          yield* Effect.scoped(Effect.gen(function*() {
+            yield* reporter.installing
+            yield* gate.claim((permit) =>
+              Effect.gen(function*() {
+                const restoredPermit: ReplicaGate.Permit = {
+                  ...permit,
+                  incarnation: Identity.ReplicaIncarnation.make(
+                    Math.max(permit.incarnation, manifest.incarnation + 1)
+                  )
                 }
-                return
-              }
-              yield* sql`INSERT INTO effect_local_backup_installations (
+                const installed = yield* findInstallation(options.installationId)
+                if (installed._tag === "Some") {
+                  if (
+                    installed.value.manifest_checksum !== manifestEnvelope.checksum ||
+                    installed.value.mode !== options.mode
+                  ) {
+                    return yield* new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.BackupInvalid({
+                        cause: new Error("Backup installation id was already used for a different restore")
+                      })
+                    })
+                  }
+                  return
+                }
+                yield* sql`INSERT INTO effect_local_backup_installations (
                 installation_id, mode, manifest_checksum, installed_at, replica_incarnation
               ) VALUES (
                 ${options.installationId}, ${options.mode}, ${manifestEnvelope.checksum},
                 ${DateTime.formatIso(yield* DateTime.now)}, ${restoredPermit.incarnation}
               )`
-              const clusterTables = yield* findClusterTables(undefined)
-              if (clusterTables.some((table) => table.name === `${ClusterStorage.messagePrefix}_replies`)) {
-                yield* sql`DELETE FROM ${sql(`${ClusterStorage.messagePrefix}_replies`)}`
-              }
-              if (clusterTables.some((table) => table.name === `${ClusterStorage.messagePrefix}_messages`)) {
-                yield* sql`DELETE FROM ${sql(`${ClusterStorage.messagePrefix}_messages`)}`
-              }
-              yield* sql`DELETE FROM effect_local_commit_outbox`
-              yield* sql`DELETE FROM effect_local_command_receipts`
-              yield* sql`DELETE FROM effect_local_checkpoints`
-              yield* sql`DELETE FROM effect_local_changes`
-              yield* projections.clear
-              yield* sql`DELETE FROM effect_local_documents`
-              const documents = decoded.flatMap((record) =>
-                record.kind === "Document" ? [{ ...record.value, projection_status: "Ready" }] : []
-              )
-              const changes = decoded.flatMap((record) => record.kind === "Change" ? [record.value] : [])
-              const checkpoints = decoded.flatMap((record) =>
-                record.kind === "Checkpoint"
-                  ? [{
-                    ...record.value,
-                    writer_provenance: Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(
-                      record.value.writer_provenance
-                    )
-                  }]
-                  : []
-              )
-              const receipts = decoded.flatMap((record) => record.kind === "Receipt" ? [record.value] : [])
-              for (let index = 0; index < documents.length; index += 50) {
-                yield* sql`INSERT INTO effect_local_documents ${sql.insert(documents.slice(index, index + 50))}`
-              }
-              for (let index = 0; index < changes.length; index += 50) {
-                yield* sql`INSERT INTO effect_local_changes ${sql.insert(changes.slice(index, index + 50))}`
-              }
-              for (let index = 0; index < checkpoints.length; index += 50) {
-                yield* sql`INSERT INTO effect_local_checkpoints ${sql.insert(checkpoints.slice(index, index + 50))}`
-              }
-              for (let index = 0; index < receipts.length; index += 50) {
-                yield* sql`INSERT INTO effect_local_command_receipts ${sql.insert(receipts.slice(index, index + 50))}`
-              }
-              const sequences = decoded.flatMap((record) =>
-                "commit_sequence" in record.value ? [record.value.commit_sequence] : []
-              )
-              const commitSequence = sequences.length === 0 ? 0 : Math.max(...sequences)
-              yield* sql`UPDATE effect_local_metadata SET
+                const clusterTables = yield* findClusterTables(undefined)
+                if (clusterTables.some((table) => table.name === `${ClusterStorage.messagePrefix}_replies`)) {
+                  yield* sql`DELETE FROM ${sql(`${ClusterStorage.messagePrefix}_replies`)}`
+                }
+                if (clusterTables.some((table) => table.name === `${ClusterStorage.messagePrefix}_messages`)) {
+                  yield* sql`DELETE FROM ${sql(`${ClusterStorage.messagePrefix}_messages`)}`
+                }
+                yield* sql`DELETE FROM effect_local_commit_outbox`
+                yield* sql`DELETE FROM effect_local_command_receipts`
+                yield* sql`DELETE FROM effect_local_checkpoints`
+                yield* sql`DELETE FROM effect_local_changes`
+                yield* projections.clear
+                yield* sql`DELETE FROM effect_local_documents`
+                const documents = decoded.flatMap((record) =>
+                  record.kind === "Document" ? [{ ...record.value, projection_status: "Ready" }] : []
+                )
+                const changes = decoded.flatMap((record) => record.kind === "Change" ? [record.value] : [])
+                const checkpoints = decoded.flatMap((record) =>
+                  record.kind === "Checkpoint"
+                    ? [{
+                      ...record.value,
+                      writer_provenance: Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(
+                        record.value.writer_provenance
+                      )
+                    }]
+                    : []
+                )
+                const receipts = decoded.flatMap((record) => record.kind === "Receipt" ? [record.value] : [])
+                for (let index = 0; index < documents.length; index += 50) {
+                  yield* sql`INSERT INTO effect_local_documents ${sql.insert(documents.slice(index, index + 50))}`
+                }
+                for (let index = 0; index < changes.length; index += 50) {
+                  yield* sql`INSERT INTO effect_local_changes ${sql.insert(changes.slice(index, index + 50))}`
+                }
+                for (let index = 0; index < checkpoints.length; index += 50) {
+                  yield* sql`INSERT INTO effect_local_checkpoints ${sql.insert(checkpoints.slice(index, index + 50))}`
+                }
+                for (let index = 0; index < receipts.length; index += 50) {
+                  yield* sql`INSERT INTO effect_local_command_receipts ${sql.insert(receipts.slice(index, index + 50))}`
+                }
+                const sequences = decoded.flatMap((record) =>
+                  "commit_sequence" in record.value ? [record.value.commit_sequence] : []
+                )
+                const commitSequence = sequences.length === 0 ? 0 : Math.max(...sequences)
+                yield* sql`UPDATE effect_local_metadata SET
             replica_id = ${nextReplicaId},
             replica_incarnation = ${restoredPermit.incarnation},
             definition_hash = ${definition.hash},
             commit_sequence = ${commitSequence}
             WHERE singleton = 1`
-              for (const record of decoded) {
-                if (record.kind !== "Document") continue
-                const document = definition.documents.byName.get(record.value.document_type)!
-                const stored = yield* recovery.recoverWithPermit(
-                  document,
-                  record.value.document_id,
-                  restoredPermit
-                ).pipe(
-                  Effect.mapError((cause) =>
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.BackupInvalid({
-                        cause
+                for (const record of decoded) {
+                  if (record.kind !== "Document") continue
+                  const document = definition.documents.byName.get(record.value.document_type)!
+                  const stored = yield* recovery.recoverWithPermit(
+                    document,
+                    record.value.document_id,
+                    restoredPermit
+                  ).pipe(
+                    Effect.mapError((cause) =>
+                      new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.BackupInvalid({
+                          cause
+                        })
                       })
-                    })
+                    )
                   )
-                )
-                yield* projections.replaceDocument(document, stored.snapshot, stored.commitSequence).pipe(
-                  Effect.ensuring(Effect.sync(() => InternalAutomerge.free(stored.automerge)))
-                )
-              }
-              const foreignKeys = yield* findForeignKeyViolations(undefined)
-              if (foreignKeys.length > 0) {
-                return yield* new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.BackupInvalid({
-                    cause: new Error("Backup violates SQLite foreign keys")
+                  yield* projections.replaceDocument(document, stored.snapshot, stored.commitSequence).pipe(
+                    Effect.ensuring(Effect.sync(() => InternalAutomerge.free(stored.automerge)))
+                  )
+                }
+                const foreignKeys = yield* findForeignKeyViolations(undefined)
+                if (foreignKeys.length > 0) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.BackupInvalid({
+                      cause: new Error("Backup violates SQLite foreign keys")
+                    })
                   })
-                })
-              }
-              yield* gate.validate(restoredPermit)
-            })
-          ))))
-        }).pipe(Effect.scoped).pipe(
+                }
+                yield* gate.validate(restoredPermit)
+              })
+            )
+          }))
+        }).pipe(
+          Effect.scoped,
           Effect.catchTags({
             SchemaError: (cause) =>
               Effect.fail(
