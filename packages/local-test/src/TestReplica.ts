@@ -11,6 +11,7 @@ import * as Recovery from "@lucas-barake/effect-local-sql/Recovery"
 import * as ReplicaBootstrap from "@lucas-barake/effect-local-sql/ReplicaBootstrap"
 import * as ReplicaEvolution from "@lucas-barake/effect-local-sql/ReplicaEvolution"
 import * as ReplicaGate from "@lucas-barake/effect-local-sql/ReplicaGate"
+import * as ReplicaHealth from "@lucas-barake/effect-local-sql/ReplicaHealth"
 import type * as SqlProjection from "@lucas-barake/effect-local-sql/SqlProjection"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
@@ -56,9 +57,16 @@ export const layerWithLimits = <
   const Bindings extends ReadonlyArray<SqlProjection.Any>,
 >(
   definition: D,
-  options: { readonly projections: Bindings; readonly limits: ReplicaLimits.Values }
+  options: {
+    readonly health?: ReplicaHealth.Options
+    readonly projections: Bindings
+    readonly limits: ReplicaLimits.Values
+  }
 ) =>
-  SqlReplica.layerWithBindings(definition, { projections: options.projections }).pipe(
+  SqlReplica.layerWithBindings(definition, {
+    health: options.health ?? ReplicaHealth.defaultOptions,
+    projections: options.projections
+  }).pipe(
     Layer.provide([
       SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
       NodeCrypto.layer,
@@ -68,15 +76,24 @@ export const layerWithLimits = <
 
 export const layer = <D extends ReplicaDefinition.Any, const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
   definition: D,
-  options: { readonly projections: Bindings }
-) => layerWithLimits(definition, { projections: options.projections, limits: defaultLimits })
+  options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
+) =>
+  layerWithLimits(definition, {
+    health: options.health ?? ReplicaHealth.defaultOptions,
+    projections: options.projections,
+    limits: defaultLimits
+  })
 
 export const layerWithSyncAndLimits = <
   D extends ReplicaDefinition.Any,
   const Bindings extends ReadonlyArray<SqlProjection.Any>,
 >(
   definition: D,
-  options: { readonly projections: Bindings; readonly limits: ReplicaLimits.Values }
+  options: {
+    readonly health?: ReplicaHealth.Options
+    readonly projections: Bindings
+    readonly limits: ReplicaLimits.Values
+  }
 ) => {
   const bootstrap = ReplicaBootstrap.layer(definition).pipe(
     Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))
@@ -88,7 +105,10 @@ export const layerWithSyncAndLimits = <
   const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
   const projections = ProjectionStore.layer(options.projections).pipe(Layer.provideMerge(store))
   const evolution = ReplicaEvolution.layer(definition).pipe(Layer.provideMerge(projections))
-  const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(evolution))
+  const health = ReplicaHealth.layer(definition, options.health ?? ReplicaHealth.defaultOptions).pipe(
+    Layer.provideMerge(evolution)
+  )
+  const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(health))
   const queries = QueryExecutor.layer(definition).pipe(
     Layer.provideMerge([commands, Reactivity.layer])
   )
@@ -106,5 +126,10 @@ export const layerWithSync = <
   const Bindings extends ReadonlyArray<SqlProjection.Any>,
 >(
   definition: D,
-  options: { readonly projections: Bindings }
-) => layerWithSyncAndLimits(definition, { projections: options.projections, limits: defaultLimits })
+  options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
+) =>
+  layerWithSyncAndLimits(definition, {
+    health: options.health ?? ReplicaHealth.defaultOptions,
+    projections: options.projections,
+    limits: defaultLimits
+  })

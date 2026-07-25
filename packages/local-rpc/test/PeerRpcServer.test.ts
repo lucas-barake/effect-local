@@ -253,6 +253,7 @@ const makeFixture = (options: {
     ])
     const gate = ReplicaGate.ReplicaGate.of({
       current: Effect.succeed(permit),
+      claiming: Effect.succeed(false),
       shared: Effect.acquireRelease(Effect.succeed(permit), () => Effect.void),
       admit: Effect.acquireRelease(Effect.succeed(permit), () => Effect.void),
       claim: (use) => use(permit),

@@ -796,23 +796,42 @@ React applications provide an `AtomRegistry` through `@effect/atom-react` and co
 
 `Replica.status` is a stream. `ReplicaAtom.status(runtime)` wraps it as an Atom.
 
-| Status              | Meaning                                                              |
-| ------------------- | -------------------------------------------------------------------- |
-| `Starting`          | Startup is in the named phase                                        |
-| `Ready`             | The local replica accepts work and reports pending commands          |
-| `ReadOnly`          | Reads remain available but writes are disabled for the stated reason |
-| `Degraded`          | The replica is usable with a reported degradation                    |
-| `ProjectionBlocked` | A projection cannot represent accepted canonical state               |
-| `Restoring`         | A restore is active and reports progress                             |
-| `Failed`            | Startup or runtime ownership failed                                  |
+| Status              | Meaning                                                     |
+| ------------------- | ----------------------------------------------------------- |
+| `Starting`          | Startup is in the named phase                               |
+| `Ready`             | The local replica accepts work and reports pending commands |
+| `ReadOnly`          | Writes are unavailable for the stated reason                |
+| `Degraded`          | The replica is usable with a reported degradation           |
+| `ProjectionBlocked` | A projection cannot represent accepted canonical state      |
+| `Restoring`         | A restore is active and reports progress                    |
+| `Failed`            | Startup or runtime ownership failed                         |
 
 Runtime ownership is scoped. `Atom.runtime` does not own a dispose operation. React applications release mounted
 atoms when `RegistryProvider` unmounts. Non React applications dispose their `AtomRegistry`. Applications separately
 close control ports and terminate workers they created. Call `replica.flush` before an intentional shutdown when the
 application wants pending invalidations published. It is not a substitute for browser lifecycle guarantees.
 
-The current SQL composition emits `Ready` after startup. Other status variants are public protocol values for
-compositions that publish richer startup, restore, or failure state.
+The SQL composition backs the stream with `ReplicaHealth`, which samples the durable tables once per second and
+also receives pushed restore progress. It reports:
+
+| Status              | Source                                                                                     |
+| ------------------- | ------------------------------------------------------------------------------------------ |
+| `Ready`             | `pendingCommands` is the unpublished commit-outbox depth, which `replica.flush` drains     |
+| `Restoring`         | Bytes consumed while a backup is being ingested                                            |
+| `ReadOnly`          | A restore is installing under the writer claim, or another writer generation has fenced it |
+| `ProjectionBlocked` | A document is durably marked blocked for a projection this definition declares             |
+| `Degraded`          | Storage was transiently unavailable on the last sample                                     |
+| `Failed`            | Storage is corrupt, its metadata singleton is missing, or health sampling stopped          |
+
+`Starting` is not emitted by the SQL composition: bootstrap completes while the layer graph is still building, so no
+consumer can hold a `Replica` in time to observe it. It remains a public protocol value for other compositions.
+
+The stream is long lived and never completes on its own, so consume it with a bounded operator such as
+`Stream.take` or `Stream.runHead` rather than `Stream.runCollect`. It is a latest-wins level signal: subscribing
+samples once so a late subscriber starts from the current value, repeated identical statuses are suppressed, and a
+slow consumer converges on the newest status instead of replaying history. Closing the replica scope ends every live
+subscriber. Each live subscriber holds one `maxStreamsPerSession` permit and one `maxInFlightPerSession` permit for
+its lifetime, so budget for it alongside `invalidations`.
 
 ### 10. Export backups and portable documents
 

@@ -33,6 +33,7 @@ describe("Migrations", () => {
           'effect_local_checkpoints_document_verified_sequence',
           'effect_local_commit_outbox_published_sequence',
           'effect_local_document_projections_not_ready',
+          'effect_local_documents_not_ready_type',
           'effect_local_documents_type_projection_status',
           'effect_local_projection_registry_name_status'
         )
@@ -41,10 +42,33 @@ describe("Migrations", () => {
         "effect_local_checkpoints_document_verified_sequence",
         "effect_local_commit_outbox_published_sequence",
         "effect_local_document_projections_not_ready",
+        "effect_local_documents_not_ready_type",
         "effect_local_documents_type_projection_status",
         "effect_local_projection_registry_name_status"
       ])
 
+      yield* sql`WITH RECURSIVE documents(id) AS (
+          VALUES(1)
+          UNION ALL
+          SELECT id + 1 FROM documents WHERE id < 10000
+        )
+        INSERT INTO effect_local_documents (
+          document_id, document_type, schema_version, observed_versions, materialized_heads,
+          accepted_heads, tombstone, projection_status
+        )
+        SELECT printf('document-%05d', id), 'Task', 1, '[]', '[]', '[]', 0, 'Ready'
+        FROM documents`
+      yield* sql`UPDATE effect_local_documents SET projection_status = 'Blocked'
+        WHERE document_id = 'document-10000'`
+      yield* sql`ANALYZE`
+      const blockedDocumentPlan = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN
+        SELECT DISTINCT document_type FROM effect_local_documents
+        WHERE projection_status != 'Ready' ORDER BY document_type
+      `
+      assert.isTrue(
+        blockedDocumentPlan.some((row) => row.detail.includes("effect_local_documents_not_ready_type")),
+        JSON.stringify(blockedDocumentPlan)
+      )
       const readinessPlan = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN
         SELECT COUNT(*) FROM effect_local_document_projections
         WHERE projection_name = 'tasks' AND status != 'Ready'
@@ -97,17 +121,18 @@ describe("Migrations", () => {
         SELECT name FROM sqlite_master
         WHERE type = 'index' AND name IN (
           'effect_local_document_projections_not_ready',
+          'effect_local_documents_not_ready_type',
           'effect_local_peer_receipts_pending_document',
           'effect_local_peer_receipts_pending_peer'
         )
       `
       assert.strictEqual(indexes.length, 0)
       const recorded = yield* sql<{ readonly migration_id: number }>`
-        SELECT migration_id FROM effect_local_migrations WHERE migration_id IN (4, 5, 6)
+        SELECT migration_id FROM effect_local_migrations WHERE migration_id IN (4, 5, 6, 7)
       `
       assert.strictEqual(recorded.length, 0)
       const catalog = yield* sql<{ readonly migration_id: number }>`
-        SELECT migration_id FROM effect_local_migration_catalog WHERE migration_id IN (4, 5, 6)
+        SELECT migration_id FROM effect_local_migration_catalog WHERE migration_id IN (4, 5, 6, 7)
       `
       assert.strictEqual(catalog.length, 0)
     }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
@@ -191,7 +216,8 @@ describe("Migrations", () => {
         [3, "durability_indexes"],
         [4, "projection_readiness"],
         [5, "pending_receipt_indexes"],
-        [6, "peer_writer_provenance"]
+        [6, "peer_writer_provenance"],
+        [7, "replica_health_indexes"]
       ])
 
       const outbox = yield* sql<{
@@ -280,7 +306,8 @@ describe("Migrations", () => {
         { migration_id: 3, name: "durability_indexes", checksum: Migrations.durabilityIndexesChecksum },
         { migration_id: 4, name: "projection_readiness", checksum: Migrations.projectionReadinessChecksum },
         { migration_id: 5, name: "pending_receipt_indexes", checksum: Migrations.pendingReceiptIndexesChecksum },
-        { migration_id: 6, name: "peer_writer_provenance", checksum: Migrations.peerWriterProvenanceChecksum }
+        { migration_id: 6, name: "peer_writer_provenance", checksum: Migrations.peerWriterProvenanceChecksum },
+        { migration_id: 7, name: "replica_health_indexes", checksum: Migrations.replicaHealthIndexesChecksum }
       ])
 
       const indexes = yield* sql<{ readonly name: string }>`
@@ -288,6 +315,7 @@ describe("Migrations", () => {
           'effect_local_checkpoints_document_verified_sequence',
           'effect_local_commit_outbox_published_sequence',
           'effect_local_document_projections_not_ready',
+          'effect_local_documents_not_ready_type',
           'effect_local_documents_type_projection_status',
           'effect_local_projection_registry_name_status',
           'effect_local_peer_outbox_incarnation_created',
@@ -300,6 +328,7 @@ describe("Migrations", () => {
         "effect_local_checkpoints_document_verified_sequence",
         "effect_local_commit_outbox_published_sequence",
         "effect_local_document_projections_not_ready",
+        "effect_local_documents_not_ready_type",
         "effect_local_documents_type_projection_status",
         "effect_local_peer_outbox_incarnation_created",
         "effect_local_peer_receipts_incarnation_accepted",
