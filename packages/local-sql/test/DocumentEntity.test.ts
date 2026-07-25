@@ -94,6 +94,7 @@ describe("DocumentEntity", () => {
   }
   const peerSync = (receive: PeerSync.PeerSync["Service"]["receive"] = () => Effect.succeed(syncResult)) =>
     PeerSync.PeerSync.of({
+      withDocumentInvalidation: (_documentId, effect) => effect,
       invalidateDocument: () => Effect.void,
       open: (peerId) =>
         Effect.succeed({

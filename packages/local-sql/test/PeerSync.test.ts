@@ -2899,6 +2899,112 @@ describe("PeerSync", () => {
       InternalAutomerge.free(first.automerge)
       InternalAutomerge.free(second.automerge)
     }).pipe(Effect.provide(TestLayer)))
+
+  it.effect("acquires the document sync lock before a rewrite can commit", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const loadStarted = yield* Deferred.make<void>()
+      const releaseLoad = yield* Deferred.make<void>()
+      const rewriteCommitted = yield* Deferred.make<void>()
+      const blockingStore = new Proxy(store, {
+        get(target, property, receiver) {
+          if (property !== "load") return Reflect.get(target, property, receiver)
+          const load: typeof store.load = (document, requestedId) =>
+            store.load(document, requestedId).pipe(
+              Effect.tap(() =>
+                requestedId === documentId
+                  ? Deferred.succeed(loadStarted, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseLoad))
+                  )
+                  : Effect.void
+              )
+            )
+          return load
+        }
+      })
+
+      yield* Effect.gen(function*() {
+        const sync = yield* PeerSync.PeerSync
+        const session = yield* sync.open(yield* Identity.makePeerId)
+        const created = yield* blockingStore.create(Task, documentId, { title: "kept", labels: [] })
+        InternalAutomerge.free(created.automerge)
+
+        const generating = yield* sync.generate(
+          Task,
+          documentId,
+          session,
+          { lineageAware: true }
+        ).pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Deferred.await(loadStarted)
+
+        // `rewriteCommitted` stands at the destructive SQL commit boundary. PeerSync must acquire
+        // the same document lock as generate and receive before that boundary can be crossed.
+        const rewriting = yield* sync.withDocumentInvalidation(
+          documentId,
+          Deferred.succeed(rewriteCommitted, undefined)
+        ).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        for (let index = 0; index < 10; index++) yield* Effect.yieldNow
+
+        assert.isFalse(
+          yield* Deferred.isDone(rewriteCommitted),
+          "rewrite committed before acquiring the peer document lock"
+        )
+
+        yield* Deferred.succeed(releaseLoad, undefined)
+        yield* Fiber.join(generating)
+        yield* Fiber.join(rewriting)
+      }).pipe(
+        Effect.provide(
+          PeerSync.layer.pipe(
+            Layer.provide(Layer.succeed(DocumentStore.DocumentStore, blockingStore))
+          )
+        ),
+        Effect.ensuring(Deferred.succeed(releaseLoad, undefined))
+      )
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("clears document sync state when interruption arrives during commit", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const created = yield* store.create(Task, documentId, { title: "kept", labels: [] })
+      const initial = yield* sync.generate(Task, documentId, session, { lineageAware: true })
+      assert.isNotNull(initial.outbound)
+      yield* sync.markSent(session, initial.outbound!.sendSequence, initial.outbound!.messageHash)
+      assert.isNull((yield* sync.generate(Task, documentId, session, { lineageAware: true })).outbound)
+
+      const commitStarted = yield* Deferred.make<void>()
+      const releaseCommit = yield* Deferred.make<void>()
+      const transaction = Effect.uninterruptibleMask((restore) =>
+        restore(Effect.void).pipe(
+          Effect.exit,
+          Effect.flatMap((exit) =>
+            Deferred.succeed(commitStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseCommit)),
+              Effect.flatMap(() => exit)
+            )
+          )
+        )
+      )
+      const maintenance = yield* sync.withDocumentInvalidation(documentId, transaction).pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Deferred.await(commitStarted)
+      const interrupting = yield* Fiber.interrupt(maintenance).pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Effect.yieldNow
+      yield* Deferred.succeed(releaseCommit, undefined)
+      yield* Fiber.join(interrupting)
+
+      assert.isNotNull((yield* sync.generate(Task, documentId, session, { lineageAware: true })).outbound)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(TestLayer)))
 })
 
 const sameHeadsForTest = (left: ReadonlyArray<string>, right: ReadonlyArray<string>) =>

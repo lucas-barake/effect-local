@@ -140,6 +140,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         reason: new ReplicaError.StorageUnavailable({ cause: new Error("generate failed") })
       })
       const sync = PeerSync.PeerSync.of({
+        withDocumentInvalidation: (_documentId, effect) => effect,
         invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
@@ -336,6 +337,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const peerId = yield* Identity.makePeerId
       const connectCalls = yield* Ref.make(0)
       const sync = PeerSync.PeerSync.of({
+        withDocumentInvalidation: (_documentId, effect) => effect,
         invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
@@ -419,6 +421,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const message = Uint8Array.of(1)
         const messageHash = yield* Canonical.digest(message)
         const sync = PeerSync.PeerSync.of({
+          withDocumentInvalidation: (_documentId, effect) => effect,
           invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
@@ -545,6 +548,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const permit = yield* gate.current
         let generateCalls = 0
         const sync = PeerSync.PeerSync.of({
+          withDocumentInvalidation: (_documentId, effect) => effect,
           invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
@@ -698,6 +702,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           writerDefinitionHash: "reply-definition"
         }]
         const sync = PeerSync.PeerSync.of({
+          withDocumentInvalidation: (_documentId, effect) => effect,
           invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
@@ -872,6 +877,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           writerProvenance: []
         }
         const sync = PeerSync.PeerSync.of({
+          withDocumentInvalidation: (_documentId, effect) => effect,
           invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
@@ -1003,6 +1009,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const nextSequence = yield* Ref.make(0)
         const sentDocuments = yield* Ref.make<ReadonlyArray<Identity.DocumentId>>([])
         const sync = PeerSync.PeerSync.of({
+          withDocumentInvalidation: (_documentId, effect) => effect,
           invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
@@ -1102,6 +1109,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const generateCalls = yield* Ref.make(0)
         const sendCalls = yield* Ref.make(0)
         const sync = PeerSync.PeerSync.of({
+          withDocumentInvalidation: (_documentId, effect) => effect,
           invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
@@ -1197,6 +1205,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           heads: []
         }
         const sync = PeerSync.PeerSync.of({
+          withDocumentInvalidation: (_documentId, effect) => effect,
           invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
@@ -1396,6 +1405,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           const publications = yield* Ref.make(0)
           const peerId = yield* Identity.makePeerId
           const sync = PeerSync.PeerSync.of({
+            withDocumentInvalidation: (_documentId, effect) => effect,
             invalidateDocument: () => Effect.void,
             open: (id) =>
               Effect.succeed({
@@ -1468,6 +1478,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         )
       })
       const sync = PeerSync.PeerSync.of({
+        withDocumentInvalidation: (_documentId, effect) => effect,
         invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
@@ -1558,6 +1569,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         validate: () => Effect.void
       })
       const sync = PeerSync.PeerSync.of({
+        withDocumentInvalidation: (_documentId, effect) => effect,
         invalidateDocument: () => Effect.void,
         open: (id) =>
           Ref.get(current).pipe(
@@ -1620,6 +1632,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const peerId = yield* Identity.makePeerId
       const closed = yield* Ref.make(false)
       const sync = PeerSync.PeerSync.of({
+        withDocumentInvalidation: (_documentId, effect) => effect,
         invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
@@ -1689,6 +1702,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const releaseClose = yield* Deferred.make<void>()
         yield* Effect.addFinalizer(() => Deferred.succeed(releaseClose, undefined).pipe(Effect.asVoid))
         const sync = PeerSync.PeerSync.of({
+          withDocumentInvalidation: (_documentId, effect) => effect,
           invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
@@ -1759,6 +1773,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const peerId = yield* Identity.makePeerId
       const message = Uint8Array.of(1)
       const sync = PeerSync.PeerSync.of({
+        withDocumentInvalidation: (_documentId, effect) => effect,
         invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
@@ -1879,6 +1894,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         )
       })
       const sync = PeerSync.PeerSync.of({
+        withDocumentInvalidation: (_documentId, effect) => effect,
         invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
@@ -1960,6 +1976,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const peerId = yield* Identity.makePeerId
       const generateCalls = yield* Ref.make(0)
       const sync = PeerSync.PeerSync.of({
+        withDocumentInvalidation: (_documentId, effect) => effect,
         invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
@@ -2111,6 +2128,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         writerProvenance: []
       }
       const sync = PeerSync.PeerSync.of({
+        withDocumentInvalidation: (_documentId, effect) => effect,
         invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
@@ -2204,6 +2222,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const peerId = yield* Identity.makePeerId
         const generated = { outbound: null, observedByPeer: false, dirty: false } as const
         const sync = PeerSync.PeerSync.of({
+          withDocumentInvalidation: (_documentId, effect) => effect,
           invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
@@ -2309,6 +2328,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const message = new Uint8Array([1])
       const messageHash = yield* Canonical.digest(message)
       const sync = PeerSync.PeerSync.of({
+        withDocumentInvalidation: (_documentId, effect) => effect,
         invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
@@ -2423,6 +2443,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const sends = yield* Ref.make(0)
       const sentSequences = yield* Ref.make<ReadonlyArray<number>>([])
       const sync = PeerSync.PeerSync.of({
+        withDocumentInvalidation: (_documentId, effect) => effect,
         invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
@@ -2853,6 +2874,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             } as unknown as ReturnType<Effect.Success<typeof DocumentEntity.DocumentEntity.client>>
           )
         const sync = PeerSync.PeerSync.of({
+          withDocumentInvalidation: (_documentId, effect) => effect,
           invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
@@ -2983,6 +3005,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         )
       const inbound = yield* Queue.unbounded<Uint8Array>()
       const sync = PeerSync.PeerSync.of({
+        withDocumentInvalidation: (_documentId, effect) => effect,
         invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({ peerId: id, connectionEpoch: "local-epoch", replicaIncarnation: initial.incarnation }),

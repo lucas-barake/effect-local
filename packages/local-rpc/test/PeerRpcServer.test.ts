@@ -266,6 +266,7 @@ const makeFixture = (options: {
       validate: () => Effect.void
     })
     const sync = PeerSync.PeerSync.of({
+      withDocumentInvalidation: (_documentId, effect) => effect,
       invalidateDocument: () => Effect.void,
       open: (peerId) =>
         Ref.update(sessionOpenCalls, (count) => count + 1).pipe(

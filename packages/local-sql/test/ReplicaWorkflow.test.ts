@@ -124,9 +124,9 @@ describe("ReplicaWorkflow", () => {
         const inner = yield* PeerSync.PeerSync
         return PeerSync.PeerSync.of({
           ...inner,
-          invalidateDocument: (documentId) =>
-            inner.invalidateDocument(documentId).pipe(
-              Effect.andThen(Ref.update(invalidated, (all) => [...all, documentId]))
+          withDocumentInvalidation: (documentId, effect) =>
+            inner.withDocumentInvalidation(documentId, effect).pipe(
+              Effect.tap(() => Ref.update(invalidated, (all) => [...all, documentId]))
             )
         })
       })

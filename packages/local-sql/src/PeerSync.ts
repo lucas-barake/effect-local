@@ -270,6 +270,18 @@ export class PeerSync extends Context.Service<PeerSync, {
     messageHash: string
   ) => Effect.Effect<boolean, ReplicaError.ReplicaError>
   /**
+   * Runs one document maintenance operation under the same lock as `generate` and `receive`, then
+   * clears that document's sync state before releasing the lock.
+   *
+   * The lock is acquired before `effect` starts, so a capacity failure cannot happen after the
+   * maintenance operation commits. The handoff from a successful interruptible operation to state
+   * invalidation is uninterruptible.
+   */
+  readonly withDocumentInvalidation: <A, E, R,>(
+    documentId: Identity.DocumentId,
+    effect: Effect.Effect<A, E, R>
+  ) => Effect.Effect<A, E | ReplicaError.ReplicaError, R>
+  /**
    * Drops the in-memory Automerge sync state every live session holds for one document.
    *
    * A history rewrite replaces the document's change graph without touching the replica
@@ -702,6 +714,12 @@ export const layer: Layer.Layer<
         return new Map([...current].filter(([key]) => !key.startsWith(prefix)))
       })
 
+    const removeDocumentState = (documentId: Identity.DocumentId) =>
+      Ref.update(states, (current) => {
+        const suffix = `:${documentId}`
+        return new Map([...current].filter(([key]) => !key.endsWith(suffix)))
+      })
+
     const withStateLock = <A, E, R,>(
       documentId: Identity.DocumentId,
       effect: Effect.Effect<A, E, R>
@@ -958,100 +976,105 @@ export const layer: Layer.Layer<
       peer: { readonly lineageAware: boolean }
     ) =>
       withSessionGeneration(session, (generation) =>
-        withStateLock(
-          documentId,
-          Effect.scoped(Effect.gen(function*() {
-            const permit = yield* gate.shared
-            yield* validateSession(permit, session)
-            // The one direction the receive side refusal cannot cover. A peer that does not compare
-            // lineage merges whatever it is handed, so handing it a rewritten document makes it
-            // resurrect the discarded history and push it back here as its own reply. Fail locally
-            // instead of emitting: the peer is not at fault and has nothing to reject.
-            const lineage = yield* documentLineage(documentId)
-            if (lineage !== Identity.genesisLineage && !peer.lineageAware) {
-              return yield* new ReplicaError.ReplicaError({
-                reason: new ReplicaError.DocumentLineageChanged({
-                  documentId,
-                  localLineage: lineage,
-                  remoteLineage: Identity.genesisLineage
+        Effect.scoped(Effect.gen(function*() {
+          // Claims and history rewrites take the gate before any document lock. Keep the same order
+          // here so a queued exclusive claim cannot leave generation holding the document lock while
+          // it waits for a gate permit that the rewrite cannot release until it acquires that lock.
+          const permit = yield* gate.shared
+          yield* validateSession(permit, session)
+          return yield* withStateLock(
+            documentId,
+            Effect.gen(function*() {
+              // The one direction the receive side refusal cannot cover. A peer that does not compare
+              // lineage merges whatever it is handed, so handing it a rewritten document makes it
+              // resurrect the discarded history and push it back here as its own reply. Fail locally
+              // instead of emitting: the peer is not at fault and has nothing to reject.
+              const lineage = yield* documentLineage(documentId)
+              if (lineage !== Identity.genesisLineage && !peer.lineageAware) {
+                return yield* new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.DocumentLineageChanged({
+                    documentId,
+                    localLineage: lineage,
+                    remoteLineage: Identity.genesisLineage
+                  })
                 })
-              })
-            }
-            const sessionGeneration = yield* Ref.get(generation)
-            const existing = yield* findPendingOutboxCount({
-              replicaIncarnation: session.replicaIncarnation,
-              peerId: session.peerId,
-              connectionEpoch: session.connectionEpoch,
-              documentId
-            }).pipe(
-              Effect.catchTags({
-                SqlError: failStorageUnavailable,
-                SchemaError: failStorageCorrupt
-              })
-            )
-            if ((existing[0]?.count ?? 0) > 0) {
-              return { outbound: null, observedByPeer: false, dirty: true }
-            }
-            return yield* Effect.acquireUseRelease(
-              store.load(document, documentId),
-              (durable) =>
-                Effect.gen(function*() {
-                  const state = yield* readState(session, documentId)
-                  const generated = yield* Effect.try({
-                    try: () => Automerge.generateSyncMessage(durable.automerge, state),
-                    catch: (cause) =>
-                      new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.ProtocolMismatch({
-                          expected: "valid local Automerge sync state",
-                          observed: String(cause)
+              }
+              const sessionGeneration = yield* Ref.get(generation)
+              const existing = yield* findPendingOutboxCount({
+                replicaIncarnation: session.replicaIncarnation,
+                peerId: session.peerId,
+                connectionEpoch: session.connectionEpoch,
+                documentId
+              }).pipe(
+                Effect.catchTags({
+                  SqlError: failStorageUnavailable,
+                  SchemaError: failStorageCorrupt
+                })
+              )
+              if ((existing[0]?.count ?? 0) > 0) {
+                return { outbound: null, observedByPeer: false, dirty: true }
+              }
+              return yield* Effect.acquireUseRelease(
+                store.load(document, documentId),
+                (durable) =>
+                  Effect.gen(function*() {
+                    const state = yield* readState(session, documentId)
+                    const generated = yield* Effect.try({
+                      try: () => Automerge.generateSyncMessage(durable.automerge, state),
+                      catch: (cause) =>
+                        new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.ProtocolMismatch({
+                            expected: "valid local Automerge sync state",
+                            observed: String(cause)
+                          })
+                        })
+                    })
+                    const observedByPeer = Automerge.hasOurChanges(durable.automerge, generated[0])
+                    if (generated[1] === null) {
+                      yield* quotaLock.withPermit(
+                        validateSessionGeneration(generation, sessionGeneration).pipe(
+                          Effect.andThen(writeState(session, documentId, generated[0]))
+                        )
+                      )
+                      return { outbound: null, observedByPeer, dirty: false }
+                    }
+                    if (generated[1].byteLength > limits.maxSyncMessageBytes) {
+                      return yield* new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.QuotaExceeded({
+                          resource: "sync message bytes",
+                          limit: limits.maxSyncMessageBytes
                         })
                       })
-                  })
-                  const observedByPeer = Automerge.hasOurChanges(durable.automerge, generated[0])
-                  if (generated[1] === null) {
-                    yield* quotaLock.withPermit(
-                      validateSessionGeneration(generation, sessionGeneration).pipe(
-                        Effect.andThen(writeState(session, documentId, generated[0]))
-                      )
-                    )
-                    return { outbound: null, observedByPeer, dirty: false }
-                  }
-                  if (generated[1].byteLength > limits.maxSyncMessageBytes) {
-                    return yield* new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.QuotaExceeded({
-                        resource: "sync message bytes",
-                        limit: limits.maxSyncMessageBytes
+                    }
+                    const outbound = yield* quotaLock.withPermit(Effect.gen(function*() {
+                      yield* validateSessionGeneration(generation, sessionGeneration)
+                      const existing = yield* findPendingOutboxCount({
+                        replicaIncarnation: session.replicaIncarnation,
+                        peerId: session.peerId,
+                        connectionEpoch: session.connectionEpoch,
+                        documentId
                       })
-                    })
-                  }
-                  const outbound = yield* quotaLock.withPermit(Effect.gen(function*() {
-                    yield* validateSessionGeneration(generation, sessionGeneration)
-                    const existing = yield* findPendingOutboxCount({
-                      replicaIncarnation: session.replicaIncarnation,
-                      peerId: session.peerId,
-                      connectionEpoch: session.connectionEpoch,
-                      documentId
-                    })
-                    if ((existing[0]?.count ?? 0) > 0) return null
-                    const outbound = yield* sql.withTransaction(
-                      persistOutbound(session, documentId, generated[1]!, durable.materializedHeads)
+                      if ((existing[0]?.count ?? 0) > 0) return null
+                      const outbound = yield* sql.withTransaction(
+                        persistOutbound(session, documentId, generated[1]!, durable.materializedHeads)
+                      )
+                      yield* writeState(session, documentId, generated[0])
+                      return outbound
+                    })).pipe(
+                      Effect.catchTags({
+                        SqlError: failStorageUnavailable,
+                        SchemaError: failStorageCorrupt
+                      })
                     )
-                    yield* writeState(session, documentId, generated[0])
-                    return outbound
-                  })).pipe(
-                    Effect.catchTags({
-                      SqlError: failStorageUnavailable,
-                      SchemaError: failStorageCorrupt
-                    })
-                  )
-                  return outbound === null
-                    ? { outbound: null, observedByPeer: false, dirty: true }
-                    : { outbound, observedByPeer, dirty: false }
-                }),
-              (durable) => Effect.sync(() => InternalAutomerge.free(durable.automerge))
-            )
-          }))
-        ))
+                    return outbound === null
+                      ? { outbound: null, observedByPeer: false, dirty: true }
+                      : { outbound, observedByPeer, dirty: false }
+                  }),
+                (durable) => Effect.sync(() => InternalAutomerge.free(durable.automerge))
+              )
+            })
+          )
+        })))
 
     const receive = <D extends Document.Any,>(
       document: D,
@@ -1995,17 +2018,18 @@ export const layer: Layer.Layer<
       generate,
       receive,
       enqueue,
+      withDocumentInvalidation: (documentId, effect) =>
+        withStateLock(
+          documentId,
+          Effect.uninterruptibleMask((restore) =>
+            restore(effect).pipe(Effect.ensuring(removeDocumentState(documentId)))
+          )
+        ),
       invalidateDocument: (documentId) =>
         // Under the per document lock rather than the session lock: a rewrite is scoped to one
         // document but crosses every session, and taking the same lock `generate` and `receive`
         // take is what stops a state being rewritten back in by a call already in flight.
-        withStateLock(
-          documentId,
-          Ref.update(states, (current) => {
-            const suffix = `:${documentId}`
-            return new Map([...current].filter(([key]) => !key.endsWith(suffix)))
-          })
-        ),
+        withStateLock(documentId, removeDocumentState(documentId)),
       pending: (session) =>
         Effect.scoped(Effect.gen(function*() {
           const permit = yield* gate.shared

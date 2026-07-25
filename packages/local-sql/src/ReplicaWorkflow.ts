@@ -430,17 +430,14 @@ export const layerHistoryRewriteRegistration = (
           // the replica incarnation and writer generation and invalidate every live workflow handle
           // and peer session for what is one document's maintenance.
           //
-          // Dropping the per document sync state is part of the rewrite, not a follow up. Nothing
-          // else evicts it: a rewrite replaces the change graph without touching the replica
-          // incarnation or any session generation, so a live peer session would keep negotiating
-          // from shared heads that name destroyed history, and the send path would fail with an
-          // untyped `StorageCorrupt` that the lineage refusal cannot reach. `uninterruptibleMask`
-          // leaves the rewrite itself interruptible and puts the invalidation out of reach of an
-          // interrupt arriving between the rewrite's commit and it.
-          return yield* Effect.uninterruptibleMask((restore) =>
-            restore(compaction.rewriteHistory(document, payload.documentId, payload.operationId)).pipe(
-              Effect.tap(() => peerSync.invalidateDocument(payload.documentId))
-            )
+          // The rewrite must take the same per document lock as peer generation and receive before
+          // it can commit. Acquiring that lock only after the commit lets an already admitted peer
+          // operation load the new root under the old lineage and persist discarded history back
+          // into it. `withDocumentInvalidation` also clears every session's old sync state before
+          // releasing the lock, with an uninterruptible handoff after the interruptible rewrite.
+          return yield* peerSync.withDocumentInvalidation(
+            payload.documentId,
+            compaction.rewriteHistory(document, payload.documentId, payload.operationId)
           )
         })
       )
