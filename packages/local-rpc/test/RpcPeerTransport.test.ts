@@ -69,6 +69,9 @@ const connect = (client: PeerRpc.RpcClient, peerId: Identity.PeerId) =>
 
 const liveOpen = (event: PeerRpc.OpenEvent) => Stream.concat(Stream.make(event), Stream.never)
 
+const openWithMessage = (payload: Uint8Array) =>
+  Stream.fromIterable([serverOpened, PeerRpc.Message.make({ _tag: "Message", payload })]).pipe(Stream.rechunk(1))
+
 describe("RpcPeerTransport", () => {
   it.effect("validates the first streamed event as the handshake and uses response capacity one", () =>
     Effect.scoped(Effect.gen(function*() {
@@ -78,10 +81,7 @@ describe("RpcPeerTransport", () => {
           assert.strictEqual(options.streamBufferSize, 1)
           assert.strictEqual(request.expectedPeerId, serverPeerId)
           assert.deepStrictEqual(request.documents, [{ documentType: Task.name, documentId }])
-          return Stream.fromIterable([
-            serverOpened,
-            PeerRpc.Message.make({ _tag: "Message", payload })
-          ]).pipe(Stream.rechunk(1))
+          return openWithMessage(payload)
         },
         () => Effect.void
       )
@@ -590,6 +590,237 @@ describe("RpcPeerTransport", () => {
       yield* Fiber.join(secondClose)
       assert.isTrue(Exit.isFailure(yield* Fiber.await(sending)))
     })))
+
+  it.live("interrupts a parked receive consumer when close runs", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const payload = Uint8Array.of(1, 2, 3)
+      const received = yield* Deferred.make<void>()
+      const client = makeClient(() => openWithMessage(payload).pipe(Stream.concat(Stream.never)), () => Effect.void)
+      const connection = yield* connect(client, serverPeerId)
+      const receiving = yield* Stream.runForEach(
+        connection.receive,
+        () => Deferred.succeed(received, undefined)
+      ).pipe(Effect.forkChild)
+
+      const arrived = yield* Deferred.await(received).pipe(Effect.timeoutOption("4 seconds"))
+      assert.isTrue(Option.isSome(arrived), "consumer never received a Message")
+
+      const closing = yield* connection.close.pipe(Effect.forkChild)
+      const closed = yield* Fiber.await(closing).pipe(Effect.timeoutOption("4 seconds"))
+      assert.isTrue(Option.isSome(closed), "connection.close did not complete")
+
+      const exit = yield* Fiber.await(receiving).pipe(Effect.timeoutOption("4 seconds"))
+      assert.isTrue(Option.isSome(exit), "close did not terminate the receive consumer")
+      if (Option.isSome(exit)) {
+        assert.isTrue(Exit.isFailure(exit.value))
+        if (Exit.isFailure(exit.value)) {
+          assert.isTrue(Cause.hasInterruptsOnly(exit.value.cause))
+        }
+      }
+
+      const late = yield* Stream.runDrain(connection.receive).pipe(Effect.forkChild)
+      const lateExit = yield* Fiber.await(late).pipe(Effect.timeoutOption("4 seconds"))
+      assert.isTrue(Option.isSome(lateExit), "receive did not terminate for a consumer started after close")
+      if (Option.isSome(lateExit)) {
+        assert.isTrue(Exit.isFailure(lateExit.value), "receive ended normally for a consumer started after close")
+        if (Exit.isFailure(lateExit.value)) {
+          assert.isTrue(Cause.hasInterruptsOnly(lateExit.value.cause))
+        }
+      }
+    })), 30000)
+
+  it.live(
+    "finishes an in-flight receive handler and terminates at the next pull when close runs",
+    () =>
+      Effect.scoped(Effect.gen(function*() {
+        const first = Uint8Array.of(1)
+        const second = Uint8Array.of(2)
+        const delivered = yield* Queue.unbounded<number>()
+        const inHandler = yield* Deferred.make<void>()
+        const releaseHandler = yield* Deferred.make<void>()
+        const accepted = yield* Deferred.make<void>()
+        const handlerInterrupted = yield* Ref.make(false)
+        const client = makeClient(
+          () =>
+            Stream.fromIterable([
+              serverOpened,
+              PeerRpc.Message.make({ _tag: "Message", payload: first }),
+              PeerRpc.Message.make({ _tag: "Message", payload: second })
+            ]).pipe(
+              Stream.rechunk(1),
+              Stream.tap((event) =>
+                event._tag === "Message" && event.payload === second
+                  ? Deferred.succeed(accepted, undefined)
+                  : Effect.void
+              ),
+              Stream.concat(Stream.never)
+            ),
+          () => Effect.void
+        )
+        const connection = yield* connect(client, serverPeerId)
+        const receiving = yield* Stream.runForEach(
+          connection.receive,
+          (payload) =>
+            Queue.offer(delivered, payload[0]!).pipe(
+              Effect.andThen(
+                payload[0] === 1
+                  ? Deferred.succeed(inHandler, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseHandler)),
+                    Effect.onInterrupt(() => Ref.set(handlerInterrupted, true))
+                  )
+                  : Effect.void
+              )
+            )
+        ).pipe(Effect.forkChild)
+
+        const entered = yield* Deferred.await(inHandler).pipe(Effect.timeoutOption("4 seconds"))
+        assert.isTrue(Option.isSome(entered), "consumer never entered its element handler")
+        const pulled = yield* Deferred.await(accepted).pipe(Effect.timeoutOption("4 seconds"))
+        assert.isTrue(Option.isSome(pulled), "the transport never accepted the second payload")
+        yield* Effect.yieldNow
+
+        yield* connection.close
+        assert.isUndefined(receiving.pollUnsafe(), "close terminated the consumer inside its element handler")
+        assert.isFalse(yield* Ref.get(handlerInterrupted), "close interrupted the in-flight element handler")
+
+        yield* Deferred.succeed(releaseHandler, undefined)
+        const exit = yield* Fiber.await(receiving).pipe(Effect.timeoutOption("4 seconds"))
+        assert.isTrue(Option.isSome(exit), "consumer did not terminate at its next pull")
+        if (Option.isSome(exit)) {
+          assert.isTrue(Exit.isFailure(exit.value))
+          if (Exit.isFailure(exit.value)) {
+            assert.isTrue(Cause.hasInterruptsOnly(exit.value.cause))
+          }
+        }
+        // Channel.merge hands the consumer a rendezvous queue. Whether the payload the transport
+        // already pulled is still handed off depends on whether its Queue.offer registered before
+        // the close trigger failed that queue, so both [1] and [1, 2] are legal deliveries.
+        const payloads = yield* Queue.takeAll(delivered)
+        assert.deepStrictEqual(payloads, [1, 2].slice(0, payloads.length))
+        assert.strictEqual(payloads[0], 1)
+      })),
+    30000
+  )
+
+  it.live(
+    "makes concurrent close callers interrupt one parked receive consumer",
+    () =>
+      Effect.scoped(Effect.gen(function*() {
+        const received = yield* Deferred.make<void>()
+        const pushStarted = yield* Deferred.make<void>()
+        const cleanupStarted = yield* Deferred.make<void>()
+        const cleanupRelease = yield* Deferred.make<void>()
+        const finalized = yield* Ref.make(0)
+        const client = makeClient(
+          () =>
+            openWithMessage(Uint8Array.of(1, 2, 3)).pipe(
+              Stream.concat(Stream.never),
+              Stream.ensuring(Ref.update(finalized, (count) => count + 1))
+            ),
+          () =>
+            Deferred.succeed(pushStarted, undefined).pipe(
+              Effect.andThen(Effect.never),
+              Effect.ensuring(
+                Deferred.succeed(cleanupStarted, undefined).pipe(
+                  Effect.andThen(Deferred.await(cleanupRelease))
+                )
+              )
+            )
+        )
+        const connection = yield* connect(client, serverPeerId)
+        const receiving = yield* Stream.runForEach(
+          connection.receive,
+          () => Deferred.succeed(received, undefined)
+        ).pipe(Effect.forkChild)
+        const arrived = yield* Deferred.await(received).pipe(Effect.timeoutOption("4 seconds"))
+        assert.isTrue(Option.isSome(arrived), "consumer never received a Message")
+
+        const sending = yield* connection.send(Uint8Array.of(1)).pipe(Effect.forkChild)
+        yield* Deferred.await(pushStarted)
+        const firstClose = yield* connection.close.pipe(Effect.forkChild)
+        yield* Deferred.await(cleanupStarted)
+        const secondClose = yield* connection.close.pipe(Effect.forkChild)
+        yield* Effect.yieldNow
+        assert.isUndefined(secondClose.pollUnsafe())
+
+        yield* Deferred.succeed(cleanupRelease, undefined)
+        yield* Fiber.join(firstClose)
+        yield* Fiber.join(secondClose)
+
+        const exit = yield* Fiber.await(receiving).pipe(Effect.timeoutOption("4 seconds"))
+        assert.isTrue(Option.isSome(exit), "concurrent close did not terminate the receive consumer")
+        if (Option.isSome(exit)) {
+          assert.isTrue(Exit.isFailure(exit.value))
+          if (Exit.isFailure(exit.value)) {
+            assert.isTrue(Cause.hasInterruptsOnly(exit.value.cause))
+          }
+        }
+        assert.isTrue(Exit.isFailure(yield* Fiber.await(sending)))
+        assert.strictEqual(yield* Ref.get(finalized), 1)
+      })),
+    30000
+  )
+
+  it.live("interrupts a parked receive consumer when the supplied ambient scope closes", () =>
+    Effect.gen(function*() {
+      const ambient = yield* Scope.make()
+      const received = yield* Deferred.make<void>()
+      const client = makeClient(
+        () => openWithMessage(Uint8Array.of(1, 2, 3)).pipe(Stream.concat(Stream.never)),
+        () => Effect.void
+      )
+      const connection = yield* connect(client, serverPeerId).pipe(Effect.provideService(Scope.Scope, ambient))
+      const receiving = yield* Stream.runForEach(
+        connection.receive,
+        () => Deferred.succeed(received, undefined)
+      ).pipe(Effect.forkChild)
+      const arrived = yield* Deferred.await(received).pipe(Effect.timeoutOption("4 seconds"))
+      assert.isTrue(Option.isSome(arrived), "consumer never received a Message")
+
+      yield* Scope.close(ambient, Exit.void)
+
+      const exit = yield* Fiber.await(receiving).pipe(Effect.timeoutOption("4 seconds"))
+      assert.isTrue(Option.isSome(exit), "ambient scope close did not terminate the receive consumer")
+      if (Option.isSome(exit)) {
+        assert.isTrue(Exit.isFailure(exit.value))
+        if (Exit.isFailure(exit.value)) {
+          assert.isTrue(Cause.hasInterruptsOnly(exit.value.cause))
+        }
+      }
+    }), 30000)
+
+  it.live("drops payloads the peer emits after close", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const before = Uint8Array.of(1)
+      const after = Uint8Array.of(2)
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>()
+      yield* Queue.offer(events, serverOpened)
+      const delivered = yield* Queue.unbounded<Uint8Array>()
+      const received = yield* Deferred.make<void>()
+      const client = makeClient(() => Stream.fromQueue(events), () => Effect.void)
+      const connection = yield* connect(client, serverPeerId)
+      const receiving = yield* Stream.runForEach(
+        connection.receive,
+        (payload) => Queue.offer(delivered, payload).pipe(Effect.andThen(Deferred.succeed(received, undefined)))
+      ).pipe(Effect.forkChild)
+
+      yield* Queue.offer(events, PeerRpc.Message.make({ _tag: "Message", payload: before }))
+      const arrived = yield* Deferred.await(received).pipe(Effect.timeoutOption("4 seconds"))
+      assert.isTrue(Option.isSome(arrived), "consumer never received the pre-close Message")
+
+      yield* connection.close
+      yield* Queue.offer(events, PeerRpc.Message.make({ _tag: "Message", payload: after }))
+
+      const exit = yield* Fiber.await(receiving).pipe(Effect.timeoutOption("4 seconds"))
+      assert.isTrue(Option.isSome(exit), "close did not terminate the receive consumer")
+      if (Option.isSome(exit)) {
+        assert.isTrue(Exit.isFailure(exit.value))
+        if (Exit.isFailure(exit.value)) {
+          assert.isTrue(Cause.hasInterruptsOnly(exit.value.cause))
+        }
+      }
+      assert.deepStrictEqual(yield* Queue.takeAll(delivered), [before])
+    })), 30000)
 
   it.effect("interrupts and joins a canceled send before a later send begins", () =>
     Effect.scoped(Effect.gen(function*() {

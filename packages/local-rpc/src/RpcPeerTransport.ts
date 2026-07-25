@@ -92,6 +92,9 @@ export const layer = (
               const connectionScope = yield* Scope.make("parallel")
               const stateLock = yield* Semaphore.make(1)
               const closeCompleted = yield* Deferred.make<void>()
+              // Effect.interrupt is required. A trigger that succeeds ends the stream normally,
+              // and PeerSession reports a normally ended receive stream as a retryable StorageUnavailable.
+              const interruptOnClose = Deferred.await(closeCompleted).pipe(Effect.andThen(Effect.interrupt))
               let closing = false
               const closeConnection = (exit: Exit.Exit<unknown, unknown>) =>
                 Effect.sync(() => {
@@ -201,7 +204,8 @@ export const layer = (
                       event._tag === "Message"
                         ? Effect.succeed(event.payload)
                         : Effect.fail(protocolFailure(event._tag))
-                    )
+                    ),
+                    Stream.interruptWhen(interruptOnClose)
                   ),
                   send,
                   close: closeWithExit(Exit.void)
