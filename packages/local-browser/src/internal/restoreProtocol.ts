@@ -91,6 +91,10 @@ const OperationTimeout = Schema.TaggedStruct("OperationTimeout", {
   operation: Schema.String,
   timeoutMillis: Schema.Int
 })
+const UnsupportedStorageFormatVersion = Schema.TaggedStruct("UnsupportedStorageFormatVersion", {
+  observedVersion: Schema.Int,
+  supportedVersion: Schema.Int
+})
 
 export const RestoreWireError = Schema.Union([
   DocumentNotFound,
@@ -111,7 +115,8 @@ export const RestoreWireError = Schema.Union([
   RestoreFailed,
   ProtocolMismatch,
   ReplicaFenced,
-  OperationTimeout
+  OperationTimeout,
+  UnsupportedStorageFormatVersion
 ])
 export type RestoreWireError = typeof RestoreWireError.Type
 
@@ -208,7 +213,8 @@ export const restoreWireErrorFields = fieldMetadata({
   RestoreFailed,
   ProtocolMismatch,
   ReplicaFenced,
-  OperationTimeout
+  OperationTimeout,
+  UnsupportedStorageFormatVersion
 })
 
 export const boundedErrorDescriptionFields: ReadonlySet<string> = new Set(
@@ -474,6 +480,20 @@ export const encodeReplicaError = (
           timeoutMillis: reason.timeoutMillis
         })
       )
+    case "UnsupportedStorageFormatVersion":
+      return encodeWithinBudget(
+        maxBytes,
+        {
+          _tag: reason._tag,
+          observedVersion: reason.observedVersion,
+          supportedVersion: reason.supportedVersion
+        },
+        () => ({
+          _tag: reason._tag,
+          observedVersion: reason.observedVersion,
+          supportedVersion: reason.supportedVersion
+        })
+      )
   }
 }
 
@@ -561,6 +581,12 @@ export const replicaErrorFromWire = (wire: RestoreWireError): ReplicaError.Repli
       reason = new ReplicaError.OperationTimeout({
         operation: wire.operation,
         timeoutMillis: wire.timeoutMillis
+      })
+      break
+    case "UnsupportedStorageFormatVersion":
+      reason = new ReplicaError.UnsupportedStorageFormatVersion({
+        observedVersion: wire.observedVersion,
+        supportedVersion: wire.supportedVersion
       })
       break
   }

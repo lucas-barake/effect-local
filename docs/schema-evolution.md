@@ -25,6 +25,16 @@ documents remain decodable.
 Peer sync and browser session gates still require identical definition hashes: two peers on different definitions
 never exchange changes.
 
+## Storage format version
+
+`storage_format_version` is a separate, lower-level gate than the definition hash. It describes the on-disk layout
+itself rather than the application schema, and no migration path across it exists: a replica written under a
+different storage format version cannot be opened by this build at all. Bootstrap checks it before running any
+migration, so a rejected database is left exactly as the other build wrote it, and fails with
+`UnsupportedStorageFormatVersion` carrying `observedVersion` and `supportedVersion`. Compare the two to tell an
+upgrade from a downgrade: the remedy is to run a build that supports the observed version, or to discard the local
+replica and re-seed it. Unlike `ProtocolMismatch`, this is not recoverable by adjusting the definition.
+
 ## Documents
 
 Increment the document version when encoded meaning changes, and register a `Document.migration` for every prior

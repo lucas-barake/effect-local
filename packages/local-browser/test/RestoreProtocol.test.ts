@@ -171,7 +171,8 @@ it.effect("encodes every restore error and defect at the minimum configured budg
         expectedGeneration: Identity.WriterGeneration.make(1),
         observedGeneration: Identity.WriterGeneration.make(2)
       }),
-      new ReplicaError.OperationTimeout({ operation: "operation".repeat(32), timeoutMillis: 1 })
+      new ReplicaError.OperationTimeout({ operation: "operation".repeat(32), timeoutMillis: 1 }),
+      new ReplicaError.UnsupportedStorageFormatVersion({ observedVersion: 2, supportedVersion: 1 })
     ]
 
     for (const reason of reasons) {
