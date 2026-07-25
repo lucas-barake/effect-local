@@ -46,6 +46,14 @@ export class ServerUnavailable extends Schema.TaggedErrorClass<ServerUnavailable
   "@lucas-barake/effect-local-rpc/PeerRpcError/ServerUnavailable"
 )("ServerUnavailable", {}) {}
 
+// Fieldless like every other wire error: the peer learns that its view of the document lineage is
+// stale, never which document, and never the lineage identifiers themselves. Reflecting the peer's
+// own lineage string back would attach document identity to the RPC boundary and hand a probing
+// peer an amplification path.
+export class DocumentLineageChanged extends Schema.TaggedErrorClass<DocumentLineageChanged>(
+  "@lucas-barake/effect-local-rpc/PeerRpcError/DocumentLineageChanged"
+)("DocumentLineageChanged", {}) {}
+
 export const PeerRpcError = Schema.Union([
   AuthenticationFailure,
   AccessDenied,
@@ -57,7 +65,8 @@ export const PeerRpcError = Schema.Union([
   RequestCapacityExceeded,
   SessionUnavailable,
   SessionOverloaded,
-  ServerUnavailable
+  ServerUnavailable,
+  DocumentLineageChanged
 ])
 export type PeerRpcError = typeof PeerRpcError.Type
 

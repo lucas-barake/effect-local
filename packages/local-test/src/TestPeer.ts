@@ -295,7 +295,9 @@ export const make = (
       heal: (left, right) => updatePartition(left, right, false),
       flush,
       transport: (peerId) => ({
-        capabilities: { storeAndForward: false },
+        // Both ends of this transport are this build, which compares lineage before it merges, so
+        // the advertisement is a statement of fact rather than a test convenience.
+        capabilities: { storeAndForward: false, lineageAware: true },
         connect: ({ peerId: remotePeerId }) =>
           connect(peerId, remotePeerId).pipe(
             Effect.tap(() =>
@@ -306,7 +308,7 @@ export const make = (
             ),
             Effect.map((connection) => ({
               peerId: remotePeerId,
-              capabilities: { storeAndForward: false },
+              capabilities: { storeAndForward: false, lineageAware: true },
               receive: connection.receive,
               send: (message) =>
                 connection.send(message).pipe(

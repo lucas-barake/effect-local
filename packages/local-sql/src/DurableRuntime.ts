@@ -23,10 +23,17 @@ export const layerWith = <A, E, R,>(
     const workflows = Layer.mergeAll(
       ReplicaWorkflow.layerRegistration(definition),
       ReplicaWorkflow.layerRuntime,
+      ReplicaWorkflow.layerHistoryRewriteRegistration(definition),
+      ReplicaWorkflow.layerHistoryRewriteRuntime,
       workflowRegistrations
     )
-    return Layer.merge(DocumentEntity.layer(definition).pipe(Layer.provideMerge(PeerSync.layer)), workflows)
+    // `PeerSync` is provided to both branches, not just the entity. A workflow that changes what a
+    // document's history is has to be able to reach the in-memory sync state keyed on that document,
+    // and it is reachable only from whatever branch the layer is provided into. `PeerSync.layer`
+    // requires no cluster service, so hoisting it above `cluster` introduces no cycle.
+    return Layer.merge(DocumentEntity.layer(definition), workflows)
       .pipe(
+        Layer.provideMerge(PeerSync.layer),
         Layer.provideMerge(cluster)
       )
   }))

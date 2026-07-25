@@ -75,11 +75,13 @@ it.layer(NodeCrypto.layer)("PeerSession coverage", (it) => {
   }
   const makeSync = (incarnation: Identity.ReplicaIncarnation) =>
     PeerSync.PeerSync.of({
+      invalidateDocument: () => Effect.void,
       open: (id) => Effect.succeed({ peerId: id, connectionEpoch: "local-epoch", replicaIncarnation: incarnation }),
       reset: () => Effect.void,
       generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
       receive: () => Effect.succeed(result),
-      enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+      enqueue: (_session, reply) =>
+        Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
       pending: () => Effect.succeed([]),
       markSent: () => Effect.succeed(true)
     })

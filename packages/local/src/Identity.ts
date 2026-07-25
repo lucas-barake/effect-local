@@ -44,6 +44,15 @@ export const ProjectionVersion = Schema.Int.check(Schema.isGreaterThan(0)).pipe(
 )
 export type ProjectionVersion = typeof ProjectionVersion.Type
 
+export const DocumentLineage = Schema.String.check(
+  Schema.isPattern(
+    /^$|^lin_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+  )
+).pipe(Schema.brand("@lucas-barake/effect-local/DocumentLineage"))
+export type DocumentLineage = typeof DocumentLineage.Type
+
+export const genesisLineage: DocumentLineage = DocumentLineage.make("")
+
 export const makeReplicaId = Crypto.Crypto.use((crypto) =>
   crypto.randomUUIDv4.pipe(Effect.map((uuid) => ReplicaId.make(`rep_${uuid}`)))
 )
@@ -61,6 +70,10 @@ export const makePeerId = Crypto.Crypto.use((crypto) =>
 )
 export const makeBackupInstallationId = Crypto.Crypto.use((crypto) =>
   crypto.randomUUIDv4.pipe(Effect.map((uuid) => BackupInstallationId.make(`bak_${uuid}`)))
+)
+
+export const makeDocumentLineage = Crypto.Crypto.use((crypto) =>
+  crypto.randomUUIDv4.pipe(Effect.map((uuid) => DocumentLineage.make(`lin_${uuid}`)))
 )
 
 export const documentIdFromCommandId = (commandId: CommandId): DocumentId =>

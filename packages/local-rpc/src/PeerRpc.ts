@@ -23,7 +23,13 @@ export const Opened = Schema.TaggedStruct("Opened", {
   protocolVersion: Schema.Literal(protocolVersion),
   sessionId: Identity.SessionId,
   peerId: Identity.PeerId,
-  capabilities: Schema.Struct({ storeAndForward: Schema.Literal(false) })
+  // `lineageAware` is `optionalKey` and never `Schema.Boolean` alone: this struct decodes every
+  // `Opened` frame, including one from a peer built before lineage existed, and a required key
+  // would make that frame fail to decode instead of reading as "not lineage aware".
+  capabilities: Schema.Struct({
+    storeAndForward: Schema.Literal(false),
+    lineageAware: Schema.optionalKey(Schema.Boolean)
+  })
 })
 export type Opened = typeof Opened.Type
 
@@ -44,6 +50,18 @@ const OpenPayload = Schema.Struct({
   expectedPeerId: Identity.PeerId,
   definitionHash: Schema.optionalKey(DefinitionHash),
   documents: Schema.Array(RequestedDocument),
+  // What the opening client claims about itself, and the only thing that tells the server whether
+  // this peer compares document lineage before it merges. `optionalKey` at both levels and never a
+  // required key: a client built before lineage sends neither, and a required key would make its
+  // `Open` fail to decode instead of reading as "not lineage aware".
+  //
+  // `protocolVersion` was deliberately not bumped for lineage, so an older build passes the version
+  // check and this advertisement is the only thing that distinguishes it. Absent is the fail closed
+  // answer: such a client unions whatever it is given, so a rewritten document sent to it comes
+  // straight back carrying the history the rewrite discarded.
+  capabilities: Schema.optionalKey(Schema.Struct({
+    lineageAware: Schema.optionalKey(Schema.Boolean)
+  })),
   credential: Credential
 }).check(
   Schema.makeFilter(

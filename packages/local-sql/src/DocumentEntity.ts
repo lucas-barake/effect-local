@@ -34,12 +34,16 @@ const primaryKey = (payload: {
   readonly requestHash: string
 }) => `${payload.replicaIncarnation}:${payload.commandId}:${payload.requestHash}`
 
+// `lineage` is part of the key, not just of the payload: two requests that differ only in the
+// lineage they claim describe two different histories, and collapsing them onto one idempotency key
+// would let a request from a superseded lineage be answered from the receipt of a current one.
 const syncPrimaryKey = (payload: {
   readonly replicaIncarnation: Identity.ReplicaIncarnation
   readonly peerId: Identity.PeerId
   readonly connectionEpoch: string
   readonly receiveSequence: number
   readonly messageHash: string
+  readonly lineage?: Identity.DocumentLineage
   readonly writerProvenance: ReadonlyArray<WriterProvenance.ChangeProvenance>
 }) =>
   JSON.stringify([
@@ -48,7 +52,8 @@ const syncPrimaryKey = (payload: {
     payload.connectionEpoch,
     payload.receiveSequence,
     payload.messageHash,
-    WriterProvenance.canonicalize(payload.writerProvenance)
+    WriterProvenance.canonicalize(payload.writerProvenance),
+    payload.lineage ?? Identity.genesisLineage
   ])
 
 export const Create = Rpc.make("Create", {
@@ -106,6 +111,10 @@ export const ApplySync = Rpc.make("ApplySync", {
     documentType: Schema.String,
     messageHash: Schema.String,
     message: Schema.Uint8ArrayFromBase64,
+    // `optionalKey` because this payload is annotated `Persisted`: a message enqueued by the
+    // previous build has no lineage key, and a required field would make it fail to decode on
+    // replay instead of replaying as the genesis lineage it was written under.
+    lineage: Schema.optionalKey(Identity.DocumentLineage),
     writerProvenance: WriterProvenance.ChangeProvenances
   },
   success: ApplySyncResult,
@@ -300,6 +309,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 {
                   remoteConnectionEpoch: request.payload.connectionEpoch,
                   receiveSequence: request.payload.receiveSequence,
+                  lineage: request.payload.lineage ?? Identity.genesisLineage,
                   message: request.payload.message,
                   writerProvenance: request.payload.writerProvenance
                 }

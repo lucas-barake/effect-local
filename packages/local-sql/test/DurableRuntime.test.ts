@@ -881,4 +881,266 @@ describe("DurableRuntime", () => {
       }),
     20_000
   )
+
+  /** Overwrites `title` `count` times through the real store, leaving one change row per write. */
+  const churn = (documentId: Identity.DocumentId, count: number) =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      let durable = yield* store.create(Task, documentId, { title: "write-0" })
+      for (let index = 1; index <= count; index++) {
+        const staged = yield* store.stage(durable, (draft) => {
+          draft.title = `write-${index}`
+        })
+        const next = yield* store.persist(Task, documentId, durable, staged)
+        InternalAutomerge.free(staged)
+        InternalAutomerge.free(durable.automerge)
+        durable = next
+      }
+      InternalAutomerge.free(durable.automerge)
+      return { title: `write-${count}` }
+    })
+
+  const lineageOf = (documentId: Identity.DocumentId) =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const rows = yield* sql<{ readonly lineage: string }>`SELECT lineage
+        FROM effect_local_documents WHERE document_id = ${documentId}`
+      assert.strictEqual(rows.length, 1)
+      return rows[0]!.lineage
+    })
+
+  const changeCountOf = (documentId: Identity.DocumentId) =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const rows = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+        FROM effect_local_changes WHERE document_id = ${documentId}`
+      return rows[0]!.count
+    })
+
+  /** Identity of the one checkpoint a rewritten document keeps, so a second rewrite is visible. */
+  const checkpointsOf = (documentId: Identity.DocumentId) =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      return yield* sql<{
+        readonly checkpoint_hash: string
+        readonly commit_sequence: number
+        readonly lineage: string
+      }>`SELECT checkpoint_hash, commit_sequence, lineage
+        FROM effect_local_checkpoints WHERE document_id = ${documentId} ORDER BY checkpoint_hash`
+    })
+
+  /** The lineage a completed rewrite reported, asserting the run reached `Complete` and succeeded. */
+  const rewrittenLineage = (
+    result: Option.Option<Workflow.Result<Identity.DocumentLineage, ReplicaError.ReplicaError>>
+  ) => {
+    assert.isTrue(Option.isSome(result))
+    if (!Option.isSome(result)) throw new Error("unreachable")
+    assert.strictEqual(result.value._tag, "Complete")
+    if (result.value._tag !== "Complete") throw new Error("unreachable")
+    assert.isTrue(Exit.isSuccess(result.value.exit))
+    if (!Exit.isSuccess(result.value.exit)) throw new Error("unreachable")
+    return result.value.exit.value
+  }
+
+  it.effect(
+    "rewrites a high-churn document's history and keeps its latest value loadable",
+    () =>
+      Effect.gen(function*() {
+        const runtime = yield* ReplicaWorkflow.HistoryRewriteWorkflow
+        const store = yield* DocumentStore.DocumentStore
+        const documentId = yield* Identity.makeDocumentId
+        const value = yield* churn(documentId, 60)
+        assert.strictEqual(yield* changeCountOf(documentId), 61)
+        assert.strictEqual(yield* lineageOf(documentId), Identity.genesisLineage)
+
+        const execution = yield* runtime.execute(
+          documentId,
+          ReplicaWorkflow.OperationId.make("rewrite-history")
+        )
+        yield* drive
+
+        const lineage = rewrittenLineage(yield* runtime.poll(execution))
+        assert.notStrictEqual(lineage, Identity.genesisLineage)
+        assert.strictEqual(yield* lineageOf(documentId), lineage)
+
+        // The whole point of the rewrite: the churned history is gone, down to the single re-rooted
+        // change and the checkpoint that carries it.
+        assert.strictEqual(yield* changeCountOf(documentId), 1)
+        const checkpoints = yield* checkpointsOf(documentId)
+        assert.strictEqual(checkpoints.length, 1)
+        assert.strictEqual(checkpoints[0]!.lineage, lineage)
+
+        // Value preservation is what makes the discard acceptable, so it is asserted through the
+        // ordinary load path rather than against the workflow's own report.
+        const reloaded = yield* store.load(Task, documentId)
+        assert.deepStrictEqual(reloaded.snapshot.value, value)
+        assert.isFalse(reloaded.snapshot.tombstone)
+        InternalAutomerge.free(reloaded.automerge)
+      }).pipe(Effect.provide(Services)),
+    20_000
+  )
+
+  it.effect(
+    "does not rewrite a second time when the same operation id is executed again",
+    () =>
+      Effect.gen(function*() {
+        const runtime = yield* ReplicaWorkflow.HistoryRewriteWorkflow
+        const documentId = yield* Identity.makeDocumentId
+        yield* churn(documentId, 20)
+        const operationId = ReplicaWorkflow.OperationId.make("rewrite-once")
+
+        const first = yield* runtime.execute(documentId, operationId)
+        yield* drive
+        const lineage = rewrittenLineage(yield* runtime.poll(first))
+        const rewritten = yield* checkpointsOf(documentId)
+        assert.strictEqual(rewritten.length, 1)
+
+        const second = yield* runtime.execute(documentId, operationId)
+        yield* drive
+
+        // The idempotency key hashes into the execution id, so the repeat resolves to the execution
+        // that already ran and reports its recorded result instead of re-entering the handler.
+        assert.strictEqual(second.executionId, first.executionId)
+        assert.strictEqual(rewrittenLineage(yield* runtime.poll(second)), lineage)
+
+        // A second rewrite would mint a new lineage, a new checkpoint hash and consume a new commit
+        // sequence. Asserting the whole checkpoint row pins all three at once, and the document
+        // lineage pins that nothing swapped the pointer either.
+        assert.deepStrictEqual(yield* checkpointsOf(documentId), rewritten)
+        assert.strictEqual(yield* lineageOf(documentId), lineage)
+        assert.strictEqual(yield* changeCountOf(documentId), 1)
+      }).pipe(Effect.provide(Services)),
+    20_000
+  )
+
+  it.effect(
+    "rewrites again under a different operation id and reports a new lineage",
+    () =>
+      Effect.gen(function*() {
+        const runtime = yield* ReplicaWorkflow.HistoryRewriteWorkflow
+        const documentId = yield* Identity.makeDocumentId
+        yield* churn(documentId, 20)
+
+        const first = yield* runtime.execute(documentId, ReplicaWorkflow.OperationId.make("rewrite-first"))
+        yield* drive
+        const firstLineage = rewrittenLineage(yield* runtime.poll(first))
+        const firstCheckpoints = yield* checkpointsOf(documentId)
+
+        const second = yield* runtime.execute(documentId, ReplicaWorkflow.OperationId.make("rewrite-second"))
+        yield* drive
+        const secondLineage = rewrittenLineage(yield* runtime.poll(second))
+
+        assert.notStrictEqual(second.executionId, first.executionId)
+        assert.notStrictEqual(secondLineage, firstLineage)
+        assert.notStrictEqual(secondLineage, Identity.genesisLineage)
+        assert.strictEqual(yield* lineageOf(documentId), secondLineage)
+        const secondCheckpoints = yield* checkpointsOf(documentId)
+        assert.strictEqual(secondCheckpoints.length, 1)
+        assert.strictEqual(secondCheckpoints[0]!.lineage, secondLineage)
+        assert.isAbove(secondCheckpoints[0]!.commit_sequence, firstCheckpoints[0]!.commit_sequence)
+        assert.strictEqual(yield* changeCountOf(documentId), 1)
+      }).pipe(Effect.provide(Services)),
+    20_000
+  )
+
+  /**
+   * Rebuilds the production runtime around a `Compaction` whose `rewriteHistory` is interrupted
+   * once, immediately after it returns and therefore after its transaction has committed.
+   *
+   * This is the crash window the durable marker exists for. The activity's SQL commit and the
+   * journaling of its result are two separate writes -- the activity carries no
+   * `ClusterSchema.WithTransaction` annotation, which defaults to `false` -- so a process that dies
+   * between them leaves the rewrite committed and no record that it ran. `Activity.make` handles an
+   * interrupted attempt by retrying the attempt itself, so injecting the interrupt here reproduces
+   * exactly that: the activity body runs a second time against storage that already holds a
+   * completed rewrite. Every other service, including the real `Compaction`, stays production code,
+   * and `lineages` records what each attempt reported so a second minting is visible rather than
+   * inferred.
+   */
+  const interruptedAfterCommitServices = Effect.gen(function*() {
+    const lineages = yield* Ref.make<ReadonlyArray<Identity.DocumentLineage>>([])
+    const interrupted = yield* Ref.make(false)
+    const compaction = Layer.effect(
+      Compaction.Compaction,
+      Effect.gen(function*() {
+        const inner = yield* Compaction.Compaction
+        return Compaction.Compaction.of({
+          ...inner,
+          rewriteHistory: <D extends Document.Any,>(
+            document: D,
+            documentId: Identity.DocumentId,
+            operationId: Compaction.OperationId
+          ) =>
+            inner.rewriteHistory(document, documentId, operationId).pipe(
+              Effect.tap((lineage) =>
+                Effect.gen(function*() {
+                  yield* Ref.update(lineages, (all) => [...all, lineage])
+                  if (yield* Ref.getAndSet(interrupted, true)) return
+                  yield* Effect.interrupt
+                })
+              )
+            )
+        })
+      })
+    ).pipe(Layer.provide(Layer.mergeAll(Database, Gate, RecoveryService, CompactionService)))
+    const inputs = Layer.mergeAll(Database, Bootstrap, Executor, Limits, Gate, Store, RecoveryService, compaction)
+    return {
+      lineages,
+      services: Layer.merge(inputs, DurableRuntime.layer(definition).pipe(Layer.provide(inputs)))
+    }
+  })
+
+  const rewriteMarkers = Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    return yield* sql<{
+      readonly document_id: string
+      readonly lineage: string
+      readonly operation_id: string
+    }>`SELECT document_id, operation_id, lineage FROM effect_local_history_rewrites
+      ORDER BY replica_incarnation, operation_id`
+  })
+
+  it.effect(
+    "mints one lineage when the rewrite activity re-runs after its transaction committed",
+    () =>
+      Effect.gen(function*() {
+        const { lineages, services } = yield* interruptedAfterCommitServices
+        yield* Effect.gen(function*() {
+          const runtime = yield* ReplicaWorkflow.HistoryRewriteWorkflow
+          const store = yield* DocumentStore.DocumentStore
+          const documentId = yield* Identity.makeDocumentId
+          const value = yield* churn(documentId, 20)
+          const operationId = ReplicaWorkflow.OperationId.make("rewrite-after-crash")
+
+          const execution = yield* runtime.execute(documentId, operationId)
+          yield* drive
+
+          const lineage = rewrittenLineage(yield* runtime.poll(execution))
+
+          // Two attempts, one lineage. The second element proves the activity really did run again
+          // after the first attempt's transaction committed, and that it reported the lineage the
+          // first attempt minted rather than a fresh one.
+          assert.deepStrictEqual(yield* Ref.get(lineages), [lineage, lineage])
+          assert.notStrictEqual(lineage, Identity.genesisLineage)
+
+          // One rewrite, durably. A second rewrite would leave a second marker, a different document
+          // lineage, a different checkpoint and a new commit sequence.
+          assert.deepStrictEqual(yield* rewriteMarkers, [{
+            document_id: documentId as string,
+            operation_id: operationId as string,
+            lineage: lineage as string
+          }])
+          assert.strictEqual(yield* lineageOf(documentId), lineage)
+          const checkpoints = yield* checkpointsOf(documentId)
+          assert.strictEqual(checkpoints.length, 1)
+          assert.strictEqual(checkpoints[0]!.lineage, lineage)
+          assert.strictEqual(yield* changeCountOf(documentId), 1)
+
+          const reloaded = yield* store.load(Task, documentId)
+          assert.deepStrictEqual(reloaded.snapshot.value, value)
+          InternalAutomerge.free(reloaded.automerge)
+        }).pipe(Effect.provide(services))
+      }),
+    20_000
+  )
 })

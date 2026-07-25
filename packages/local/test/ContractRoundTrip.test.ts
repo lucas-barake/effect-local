@@ -29,6 +29,11 @@ describe("wire contracts", () => {
     }
     const encoded = Schema.encodeSync(Backup.Header)(header)
     assert.deepStrictEqual(Schema.decodeUnknownSync(Backup.Header)(encoded), header)
-    assert.throws(() => Schema.decodeUnknownSync(Backup.FormatVersion)(2))
+    // Both readable versions, and nothing beyond them. Version 2 is what an archive carrying a
+    // rewritten document lineage declares, so a build that only reads 1 rejects it rather than
+    // importing the document back onto the genesis lineage.
+    assert.strictEqual(Schema.decodeUnknownSync(Backup.FormatVersion)(1), 1)
+    assert.strictEqual(Schema.decodeUnknownSync(Backup.FormatVersion)(2), 2)
+    assert.throws(() => Schema.decodeUnknownSync(Backup.FormatVersion)(3))
   })
 })

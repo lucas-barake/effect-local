@@ -130,6 +130,14 @@ export class CheckpointSuperseded extends Schema.TaggedErrorClass<CheckpointSupe
   attempts: Schema.Int
 }) {}
 
+export class DocumentLineageChanged extends Schema.TaggedErrorClass<DocumentLineageChanged>(
+  "@lucas-barake/effect-local/ReplicaError/DocumentLineageChanged"
+)("DocumentLineageChanged", {
+  documentId: Identity.DocumentId,
+  localLineage: Identity.DocumentLineage,
+  remoteLineage: Identity.DocumentLineage
+}) {}
+
 export const Reason = Schema.Union([
   DocumentNotFound,
   DocumentDecodeError,
@@ -151,7 +159,8 @@ export const Reason = Schema.Union([
   ReplicaFenced,
   OperationTimeout,
   UnsupportedStorageFormatVersion,
-  CheckpointSuperseded
+  CheckpointSuperseded,
+  DocumentLineageChanged
 ])
 export type Reason = typeof Reason.Type
 

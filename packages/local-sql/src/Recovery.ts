@@ -69,6 +69,7 @@ export const make = Effect.gen(function*() {
           (SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1) AS commit_sequence,
           document_id,
           document_type,
+          lineage,
           materialized_heads,
           observed_versions,
           projection_status,
@@ -80,7 +81,7 @@ export const make = Effect.gen(function*() {
     Request: Identity.DocumentId,
     Result: CheckpointRow,
     execute: (documentId) =>
-      sql`SELECT bytes, checkpoint_hash, checksum, commit_sequence, document_id, heads, verified, writer_provenance
+      sql`SELECT bytes, checkpoint_hash, checksum, commit_sequence, document_id, heads, lineage, verified, writer_provenance
         FROM effect_local_checkpoints
         WHERE document_id = ${documentId}
         ORDER BY commit_sequence DESC, checkpoint_hash DESC
@@ -90,7 +91,7 @@ export const make = Effect.gen(function*() {
     Request: Identity.DocumentId,
     Result: CheckpointRow,
     execute: (documentId) =>
-      sql`SELECT bytes, checkpoint_hash, checksum, commit_sequence, document_id, heads, verified, writer_provenance
+      sql`SELECT bytes, checkpoint_hash, checksum, commit_sequence, document_id, heads, lineage, verified, writer_provenance
         FROM effect_local_checkpoints
         WHERE document_id = ${documentId} AND verified = 1
         ORDER BY commit_sequence DESC, checkpoint_hash DESC
@@ -295,6 +296,18 @@ export const make = Effect.gen(function*() {
       }
       const invalidCheckpoints: Array<string> = []
       for (const checkpoint of [...checkpoints, null]) {
+        // The lineage check joins the per candidate checks below rather than preceding the loop: a
+        // checkpoint from a superseded history is not a corrupt replica, it is one unusable
+        // candidate, so it is demoted and the next candidate is tried exactly as a failed checksum
+        // or a provenance conflict is. `rewriteHistory` mints a lineage and re-roots the document,
+        // and every change the superseded checkpoint holds is unreachable from the surviving
+        // history; replaying it would rebuild the document from a graph it no longer belongs to.
+        // A never rewritten document and its checkpoints are all on `genesisLineage`, so this
+        // rejects nothing that was written consistently.
+        if (checkpoint !== null && checkpoint.lineage !== row.lineage) {
+          invalidCheckpoints.push(checkpoint.checkpoint_hash)
+          continue
+        }
         let current: Automerge.Doc<InternalAutomerge.Root<D["schema"]["Encoded"]>> | undefined
         const recovered = yield* Effect.result(
           Effect.gen(function*() {

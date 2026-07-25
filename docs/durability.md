@@ -40,6 +40,47 @@ concurrent commit anywhere in the replica supersedes a prepared checkpoint. A su
 op, which makes re-preparing safe. Change pruning runs only after a checkpoint is published. Receipt reclamation is
 independent of any checkpoint and runs once per compaction run.
 
+## Document lineage and history rewrite
+
+Compaction never discards causal history. It bounds SQL change rows while the surviving checkpoint still encodes
+every change the document ever had, because `Automerge.save` writes the whole change graph and Automerge `3.3.2`
+exposes no way to remove history from a live document. `Compaction.rewriteHistory` is the one operation that does
+discard it. It rebuilds the document as a fresh single change document carrying the value the current one
+materializes to. It is reached only through `ReplicaWorkflow.HistoryRewriteWorkflow`, never from a page, a peer, or
+a document entity.
+
+Every document carries a lineage. Migration 8 adds the column to `effect_local_documents`,
+`effect_local_checkpoints`, and `effect_local_peer_outbox` with a default of the empty string. That is the genesis
+lineage, so every existing row and every never rewritten document agrees without a handshake. A rewrite mints `lin_`
+followed by a UUID and installs it with the swap that installs the rebuilt document.
+
+Expensive work happens outside the transaction, as it does in prepare and prune. Inside one transaction the rewrite
+rechecks the durable marker, requires a settled history, compares and swaps the document row against the heads the
+rebuild was actually derived from, deletes that document's changes, checkpoints, peer outbox rows, and peer
+receipts, installs one verified checkpoint and the root change row, and reads its own work back while the
+transaction can still roll back. Command receipts are retained, so command idempotency is unchanged. A failed
+compare and swap fails the effect instead of committing a no op, because a commit after those deletes would leave a
+document with no recoverable state.
+
+Migration 9 adds `effect_local_history_rewrites`, keyed `(replica_incarnation, operation_id)`. Workflow idempotency
+dedupes operator requests, not activity attempts. A crash between the rewrite's SQL commit and the journaling of its
+activity reply reruns the activity, and this marker is what makes the rerun return the lineage already minted rather
+than a second one. The row is written by the same transaction as the rewrite, so it cannot be observed apart from
+it. The incarnation is part of the key for the same reason command receipts carry one: restore raises the
+incarnation, so a marker written before a restore cannot short circuit a rewrite after it. An operation identity is
+bound to the first document it rewrote, and reusing it against a different document fails with `ProtocolMismatch`
+before anything destructive runs.
+
+Lineage is compared, never merged. Every Automerge ingestion path is a union, so applying a message from a
+superseded lineage restores the discarded history and then reverts the rewritten value, because register winners are
+ordered by Lamport operation counter before actor identity. Both directions therefore refuse. A peer that has not
+advertised `lineageAware` is never sent a rewritten document. A peer whose asserted lineage differs from the local
+one is refused for that document alone, and the session keeps serving every other selected document. Lineage is an
+unauthenticated peer assertion. It is a correctness signal against an honest but stale peer, not a security control.
+
+The canonical backup archive does not carry the lineage column. Export and restore transport the rewritten document
+content and land the restored replica on the genesis lineage, so restore does not repair a lineage refusal.
+
 ## Workflows
 
 `ClusterWorkflowEngine` uses the same SQL backed single runner composition as document entities. Message and runner
@@ -49,6 +90,12 @@ command receipt reclamation activity, then a document listing activity, then one
 Reclamation is journaled first so a document that cannot publish does not starve it. `CompactionWorkflow` exposes execute, poll,
 and resume while rejecting handles from a prior replica incarnation.
 
+The registered history rewrite workflow derives its execution identity from replica incarnation, document identity,
+and operation identity. It journals one activity, which reads the document type from storage rather than from the
+payload, performs the rewrite, and drops that document's in memory peer sync state. `HistoryRewriteWorkflow` exposes
+the same execute, poll, interrupt, and resume surface and rejects handles from a prior replica incarnation in the
+same way. Its handles carry the document identity as well.
+
 A compact activity retries a bounded number of times when its checkpoint publication is superseded. If every attempt
 is superseded the document is recorded and the run continues, and the workflow fails once at the end with
 `CheckpointSuperseded` listing every superseded document. A failed exit therefore means partial compaction, not
@@ -57,7 +104,8 @@ that raised it. Because the outcome is journaled per execution identity, retryin
 
 Adding a reason to `ReplicaError` is backward compatible for records an older build wrote, but not forward
 compatible. A record carrying a reason a build does not know fails to decode and becomes a defect, so a local
-replica database must not be opened by a build older than the one that wrote its workflow records.
+replica database must not be opened by a build older than the one that wrote its workflow records. This release adds
+`DocumentLineageChanged`, so a journaled workflow record carrying it is undecodable by every earlier build.
 
 Projection rebuild, backup, and restore definitions reserve stable identities but are not registered operations in
 the current beta. Backup creation needs an explicit durable destination contract. Restore needs an explicit durable

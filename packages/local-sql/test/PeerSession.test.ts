@@ -128,6 +128,9 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const generateReleases = yield* Queue.unbounded<void>()
       const generated = yield* Queue.unbounded<Identity.DocumentId>()
       const failGenerate = yield* Ref.make(false)
+      // Per document generate failures, so one document can be made to fail while the rest of the
+      // session's documents keep generating normally.
+      const generateFailures = yield* Ref.make(new Map<Identity.DocumentId, ReplicaError.ReplicaError>())
       const pendingCalls = yield* Ref.make(0)
       const receiveFailure = yield* Deferred.make<never, ReplicaError.ReplicaError>()
       const subscribed = yield* Deferred.make<void>()
@@ -137,6 +140,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         reason: new ReplicaError.StorageUnavailable({ cause: new Error("generate failed") })
       })
       const sync = PeerSync.PeerSync.of({
+        invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -147,14 +151,20 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         generate: (_document, documentId) =>
           Queue.offer(generateStarted, documentId).pipe(
             Effect.andThen(Queue.take(generateReleases)),
-            Effect.andThen(Ref.get(failGenerate)),
-            Effect.flatMap((shouldFail) =>
-              shouldFail ? Effect.fail(generateError) : Queue.offer(generated, documentId)
-            ),
+            Effect.andThen(Ref.get(generateFailures)),
+            Effect.flatMap((failures) => {
+              const failure = failures.get(documentId)
+              return failure !== undefined ? Effect.fail(failure) : Ref.get(failGenerate).pipe(
+                Effect.flatMap((shouldFail) =>
+                  shouldFail ? Effect.fail(generateError) : Queue.offer(generated, documentId)
+                )
+              )
+            }),
             Effect.as({ outbound: null, observedByPeer: false, dirty: false })
           ),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+        enqueue: (_session, reply) =>
+          Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
         pending: () => Ref.updateAndGet(pendingCalls, (count) => count + 1).pipe(Effect.as([])),
         markSent: () => Effect.succeed(true)
       })
@@ -194,6 +204,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         generateReleases,
         generated,
         failGenerate,
+        generateFailures,
         pendingCalls,
         receiveFailure,
         subscribed,
@@ -212,6 +223,9 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
     })
 
   const SyncEnvelopeJson = Schema.fromJsonString(Schema.toCodecJson(PeerSession.SyncEnvelope))
+  // The longest value the lineage schema admits, so the envelope size bound is checked against the
+  // worst case rather than against an absent or genesis lineage.
+  const maximalLineage = Identity.DocumentLineage.make("lin_ffffffff-ffff-4fff-bfff-ffffffffffff")
   const encode = (envelope: typeof PeerSession.SyncEnvelope.Type) =>
     Schema.encodeEffect(SyncEnvelopeJson)(envelope).pipe(
       Effect.map((value) => new TextEncoder().encode(value))
@@ -226,6 +240,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         documentType: "x".repeat(256),
         messageHash: "x".repeat(256),
         message: new Uint8Array(limits.maxSyncMessageBytes),
+        lineage: maximalLineage,
         writerProvenance: Array.from(
           { length: limits.maxSyncChangesPerMessage },
           (_, index) => ({
@@ -242,6 +257,47 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           limits.maxSyncChangesPerMessage
         )
       )
+    }))
+
+  it.effect("decodes a sync envelope with no lineage field as the genesis lineage", () =>
+    Effect.gen(function*() {
+      const documentId = yield* Identity.makeDocumentId
+      const message = Uint8Array.of(1, 2, 3)
+      const messageHash = yield* Canonical.digest(message)
+      const encoded = yield* encode({
+        connectionEpoch: "remote-epoch",
+        sequence: 0,
+        documentId,
+        documentType: Task.name,
+        messageHash,
+        message,
+        writerProvenance: []
+      })
+      const wire = JSON.parse(new TextDecoder().decode(encoded))
+      // The compatibility claim itself: an envelope from a peer built before lineage carries no
+      // such key at all, rather than carrying an empty one.
+      assert.isFalse("lineage" in wire)
+
+      const withoutLineage = yield* Schema.decodeUnknownEffect(SyncEnvelopeJson)(JSON.stringify(wire))
+      assert.isUndefined(withoutLineage.lineage)
+      assert.strictEqual(withoutLineage.lineage ?? Identity.genesisLineage, Identity.genesisLineage)
+
+      const withLineage = yield* Schema.decodeUnknownEffect(SyncEnvelopeJson)(
+        JSON.stringify({ ...wire, lineage: maximalLineage })
+      )
+      assert.strictEqual(withLineage.lineage, maximalLineage)
+
+      for (const lineage of ["x".repeat(257), "界".repeat(256), "\0".repeat(256), "lin_not-a-uuid"]) {
+        const exit = yield* Effect.exit(
+          Schema.decodeUnknownEffect(SyncEnvelopeJson)(JSON.stringify({ ...wire, lineage }))
+        )
+        assert.strictEqual(exit._tag, "Failure", `expected ${JSON.stringify(lineage)} to be rejected`)
+      }
+
+      const genesisOnTheWire = yield* Schema.decodeUnknownEffect(SyncEnvelopeJson)(
+        JSON.stringify({ ...wire, lineage: Identity.genesisLineage })
+      )
+      assert.strictEqual(genesisOnTheWire.lineage, Identity.genesisLineage)
     }))
 
   it.effect("rejects an oversized writer definition hash within an otherwise valid envelope", () =>
@@ -280,6 +336,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const peerId = yield* Identity.makePeerId
       const connectCalls = yield* Ref.make(0)
       const sync = PeerSync.PeerSync.of({
+        invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -289,7 +346,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         reset: () => Effect.void,
         generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+        enqueue: (_session, reply) =>
+          Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
         pending: () => Effect.succeed([]),
         markSent: () => Effect.succeed(true)
       })
@@ -361,6 +419,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const message = Uint8Array.of(1)
         const messageHash = yield* Canonical.digest(message)
         const sync = PeerSync.PeerSync.of({
+          invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -377,7 +436,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
               }))
             ),
           receive: () => Effect.die("unexpected direct receive"),
-          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+          enqueue: (_session, reply) =>
+            Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
           pending: () => Effect.succeed([]),
           markSent: () => Effect.succeed(true)
         })
@@ -485,6 +545,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const permit = yield* gate.current
         let generateCalls = 0
         const sync = PeerSync.PeerSync.of({
+          invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -503,7 +564,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
               )
           },
           receive: () => Effect.die("unexpected direct receive"),
-          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+          enqueue: (_session, reply) =>
+            Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
           pending: () => Effect.succeed([]),
           markSent: () => Effect.succeed(true)
         })
@@ -636,6 +698,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           writerDefinitionHash: "reply-definition"
         }]
         const sync = PeerSync.PeerSync.of({
+          invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -655,7 +718,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
               return { ...result, reply }
             }),
           enqueue: (_session, value) => {
-            const outbound = { ...value, sendSequence: 7, writerProvenance: replyProvenance }
+            const outbound = {
+              ...value,
+              sendSequence: 7,
+              lineage: Identity.genesisLineage,
+              writerProvenance: replyProvenance
+            }
             return Ref.updateAndGet(enqueueCalls, (count) => count + 1).pipe(
               Effect.flatMap((call) => call === 1 ? Ref.set(pending, [outbound]) : Effect.void),
               Effect.as(outbound)
@@ -785,6 +853,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           message: Uint8Array.of(2),
           messageHash: "initial",
           heads: [],
+          lineage: Identity.genesisLineage,
           writerProvenance: []
         }
         const reply = {
@@ -799,9 +868,11 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           message: Uint8Array.of(4),
           messageHash: "generated",
           heads: [],
+          lineage: Identity.genesisLineage,
           writerProvenance: []
         }
         const sync = PeerSync.PeerSync.of({
+          invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -826,7 +897,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             ),
           receive: () => Effect.succeed({ ...result, reply }),
           enqueue: (_session, value) => {
-            const outbound = { ...value, sendSequence: 1, writerProvenance: [] }
+            const outbound = { ...value, sendSequence: 1, lineage: Identity.genesisLineage, writerProvenance: [] }
             return Ref.set(pending, [outbound]).pipe(
               Effect.andThen(Deferred.succeed(enqueued, undefined)),
               Effect.as(outbound)
@@ -932,6 +1003,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const nextSequence = yield* Ref.make(0)
         const sentDocuments = yield* Ref.make<ReadonlyArray<Identity.DocumentId>>([])
         const sync = PeerSync.PeerSync.of({
+          invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -961,6 +1033,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                   message: Uint8Array.of(sendSequence),
                   messageHash: `hash-${sendSequence}`,
                   heads: [],
+                  lineage: Identity.genesisLineage,
                   writerProvenance: []
                 },
                 observedByPeer: false,
@@ -968,7 +1041,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
               }))
             ),
           receive: () => Effect.succeed(result),
-          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+          enqueue: (_session, reply) =>
+            Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
           pending: () => Effect.succeed([]),
           markSent: () => Ref.set(pendingCount, 0).pipe(Effect.as(true))
         })
@@ -1028,6 +1102,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const generateCalls = yield* Ref.make(0)
         const sendCalls = yield* Ref.make(0)
         const sync = PeerSync.PeerSync.of({
+          invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -1045,6 +1120,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                     message: Uint8Array.of(9),
                     messageHash: "hash-9",
                     heads: [],
+                    lineage: Identity.genesisLineage,
                     writerProvenance: []
                   }
                   : null,
@@ -1053,7 +1129,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
               }))
             ),
           receive: () => Effect.succeed(result),
-          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+          enqueue: (_session, reply) =>
+            Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
           pending: () => Effect.succeed([]),
           markSent: () => Effect.succeed(true)
         })
@@ -1120,6 +1197,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           heads: []
         }
         const sync = PeerSync.PeerSync.of({
+          invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -1130,7 +1208,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
           receive: () => Effect.succeed({ ...result, reply }),
           enqueue: (_session, value) => {
-            const outbound = { ...value, sendSequence: 0, writerProvenance: [] }
+            const outbound = { ...value, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }
             return Ref.set(pending, [outbound]).pipe(Effect.as(outbound))
           },
           pending: () => Ref.get(pending),
@@ -1318,6 +1396,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           const publications = yield* Ref.make(0)
           const peerId = yield* Identity.makePeerId
           const sync = PeerSync.PeerSync.of({
+            invalidateDocument: () => Effect.void,
             open: (id) =>
               Effect.succeed({
                 peerId: id,
@@ -1327,7 +1406,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             reset: () => Effect.void,
             generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
             receive: () => Effect.succeed(result),
-            enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+            enqueue: (_session, reply) =>
+              Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
             pending: () => Effect.succeed([]),
             markSent: () => Effect.succeed(true)
           })
@@ -1388,6 +1468,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         )
       })
       const sync = PeerSync.PeerSync.of({
+        invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -1397,7 +1478,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         reset: () => Effect.void,
         generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+        enqueue: (_session, reply) =>
+          Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
         pending: () => Effect.succeed([]),
         markSent: () => Effect.succeed(true)
       })
@@ -1476,6 +1558,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         validate: () => Effect.void
       })
       const sync = PeerSync.PeerSync.of({
+        invalidateDocument: () => Effect.void,
         open: (id) =>
           Ref.get(current).pipe(
             Effect.map((current) => ({
@@ -1487,7 +1570,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         reset: () => Effect.void,
         generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+        enqueue: (_session, reply) =>
+          Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
         pending: () => Effect.succeed([]),
         markSent: () => Effect.succeed(true)
       })
@@ -1536,6 +1620,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const peerId = yield* Identity.makePeerId
       const closed = yield* Ref.make(false)
       const sync = PeerSync.PeerSync.of({
+        invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -1545,7 +1630,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         reset: () => Effect.void,
         generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+        enqueue: (_session, reply) =>
+          Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
         pending: () => Effect.never,
         markSent: () => Effect.succeed(true)
       })
@@ -1603,6 +1689,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const releaseClose = yield* Deferred.make<void>()
         yield* Effect.addFinalizer(() => Deferred.succeed(releaseClose, undefined).pipe(Effect.asVoid))
         const sync = PeerSync.PeerSync.of({
+          invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -1612,7 +1699,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           reset: () => Effect.void,
           generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
           receive: () => Effect.succeed(result),
-          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+          enqueue: (_session, reply) =>
+            Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
           pending: () => Effect.succeed([]),
           markSent: () => Effect.succeed(true)
         })
@@ -1671,6 +1759,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const peerId = yield* Identity.makePeerId
       const message = Uint8Array.of(1)
       const sync = PeerSync.PeerSync.of({
+        invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -1682,7 +1771,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         receive: () => Effect.succeed(result),
         enqueue: (_session, reply) =>
           Ref.update(enqueues, (count) => count + 1).pipe(
-            Effect.as({ ...reply, sendSequence: 0, writerProvenance: [] })
+            Effect.as({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] })
           ),
         pending: () => Effect.succeed([]),
         markSent: () => Effect.succeed(true)
@@ -1790,6 +1879,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         )
       })
       const sync = PeerSync.PeerSync.of({
+        invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -1805,13 +1895,15 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
               message: Uint8Array.of(1),
               messageHash: "message-hash",
               heads: [],
+              lineage: Identity.genesisLineage,
               writerProvenance: []
             },
             observedByPeer: false,
             dirty: false
           }),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+        enqueue: (_session, reply) =>
+          Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
         pending: () => Effect.succeed([]),
         markSent: () => Effect.succeed(true)
       })
@@ -1868,6 +1960,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const peerId = yield* Identity.makePeerId
       const generateCalls = yield* Ref.make(0)
       const sync = PeerSync.PeerSync.of({
+        invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -1887,6 +1980,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                     message: new Uint8Array([call]),
                     messageHash: `hash-${call}`,
                     heads: [],
+                    lineage: Identity.genesisLineage,
                     writerProvenance: []
                   },
                   observedByPeer: false,
@@ -1895,7 +1989,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             )
           ),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+        enqueue: (_session, reply) =>
+          Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
         pending: () => Effect.succeed([]),
         markSent: () => Ref.update(marked, (count) => count + 1).pipe(Effect.as(true))
       })
@@ -2012,9 +2107,11 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         message: Uint8Array.of(1),
         messageHash: "message-hash",
         heads: [],
+        lineage: Identity.genesisLineage,
         writerProvenance: []
       }
       const sync = PeerSync.PeerSync.of({
+        invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -2027,7 +2124,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             Effect.as({ outbound: null, observedByPeer: false, dirty: false })
           ),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+        enqueue: (_session, reply) =>
+          Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
         pending: () =>
           Ref.updateAndGet(pendingCalls, (count) => count + 1).pipe(
             Effect.map((call) => call === 1 ? [] : [outbound])
@@ -2106,6 +2204,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const peerId = yield* Identity.makePeerId
         const generated = { outbound: null, observedByPeer: false, dirty: false } as const
         const sync = PeerSync.PeerSync.of({
+          invalidateDocument: () => Effect.void,
           open: (id) =>
             Effect.succeed({
               peerId: id,
@@ -2125,7 +2224,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
               )
             ),
           receive: () => Effect.succeed(result),
-          enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+          enqueue: (_session, reply) =>
+            Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
           pending: () =>
             Ref.updateAndGet(pendingCalls, (count) => count + 1).pipe(
               Effect.flatMap((call) =>
@@ -2209,6 +2309,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const message = new Uint8Array([1])
       const messageHash = yield* Canonical.digest(message)
       const sync = PeerSync.PeerSync.of({
+        invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -2222,7 +2323,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             Effect.tap(() => Deferred.succeed(firstReceived, undefined)),
             Effect.as(result)
           ),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+        enqueue: (_session, reply) =>
+          Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
         pending: () => Effect.succeed([]),
         markSent: () => Effect.succeed(true)
       })
@@ -2257,6 +2359,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                     {
                       remoteConnectionEpoch: "remote-epoch",
                       receiveSequence: 0,
+                      lineage: Identity.genesisLineage,
                       message,
                       writerProvenance: [{
                         changeHash: "a".repeat(64),
@@ -2320,6 +2423,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const sends = yield* Ref.make(0)
       const sentSequences = yield* Ref.make<ReadonlyArray<number>>([])
       const sync = PeerSync.PeerSync.of({
+        invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({
             peerId: id,
@@ -2339,6 +2443,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                     message: new Uint8Array([current.length]),
                     messageHash: `hash-${current.length}`,
                     heads: [],
+                    lineage: Identity.genesisLineage,
                     writerProvenance: []
                   },
                   observedByPeer: false,
@@ -2347,7 +2452,8 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             )
           ),
         receive: () => Effect.succeed(result),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+        enqueue: (_session, reply) =>
+          Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
         pending: () => Effect.succeed([]),
         markSent: () => Effect.succeed(true)
       })
@@ -2596,31 +2702,241 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
     }).pipe(Effect.provide(NodeCrypto.layer)))
 
   it.effect("fails the supervised session when commit driven flush fails", () =>
+    Effect.gen(function*() {
+      // Scoping the lineage refusal to one document must not have widened into "generate failures
+      // are survivable". Every other reason still ends the whole session, so each of these has to
+      // reach awaitDisconnect unchanged.
+      const terminalFailures = [
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.StorageUnavailable({ cause: new Error("generate failed") })
+        }),
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.ProtocolMismatch({ expected: "expected", observed: "observed" })
+        }),
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.QuotaExceeded({ resource: "documents", limit: 1 })
+        }),
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.CheckpointSuperseded({ documentIds: [], attempts: 1 })
+        })
+      ]
+      for (const failure of terminalFailures) {
+        yield* Effect.scoped(Effect.gen(function*() {
+          const documentId = yield* Identity.makeDocumentId
+          const fixture = yield* makeLiveFixture([{ document: Task, documentId }])
+          const sessionFiber = yield* PeerSession.makeLive({
+            peerId: fixture.peerId,
+            documents: fixture.documents
+          }).pipe(Effect.provide(fixture.layer), Effect.forkChild)
+          yield* Queue.take(fixture.generateStarted)
+          yield* Queue.offer(fixture.generateReleases, undefined)
+          const session = yield* Fiber.join(sessionFiber)
+          yield* Queue.take(fixture.generated)
+          yield* Ref.set(fixture.generateFailures, new Map([[documentId, failure]]))
+          yield* Queue.offer(fixture.events, {
+            _tag: "Commit",
+            commitSequence: Identity.CommitSequence.make(1),
+            documentId,
+            keys: [],
+            refreshGeneration: 0
+          })
+          yield* Queue.take(fixture.generateStarted)
+          yield* Queue.offer(fixture.generateReleases, undefined)
+          assert.strictEqual(yield* Effect.flip(session.awaitDisconnect), failure)
+          yield* Deferred.await(fixture.subscriberEnded)
+          assert.isAbove(yield* Ref.get(fixture.closed), 0)
+        }))
+      }
+    }).pipe(Effect.provide(NodeCrypto.layer)))
+
+  it.effect("keeps the session and the other documents synchronizing when generate refuses one lineage", () =>
     Effect.scoped(
       Effect.gen(function*() {
-        const documentId = yield* Identity.makeDocumentId
-        const fixture = yield* makeLiveFixture([{ document: Task, documentId }])
+        const refusedId = yield* Identity.makeDocumentId
+        const survivingId = yield* Identity.makeDocumentId
+        const fixture = yield* makeLiveFixture([
+          { document: Task, documentId: refusedId },
+          { document: Task, documentId: survivingId }
+        ])
+        const lineageChanged = new ReplicaError.ReplicaError({
+          reason: new ReplicaError.DocumentLineageChanged({
+            documentId: refusedId,
+            localLineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000001"),
+            remoteLineage: Identity.genesisLineage
+          })
+        })
+        yield* Ref.set(fixture.generateFailures, new Map([[refusedId, lineageChanged]]))
         const sessionFiber = yield* PeerSession.makeLive({
           peerId: fixture.peerId,
           documents: fixture.documents
         }).pipe(Effect.provide(fixture.layer), Effect.forkChild)
-        yield* Queue.take(fixture.generateStarted)
+        // A session that dies on the refusal must surface as that failure rather than as a queue
+        // that nobody ever fills, so every wait below races the session's own liveness.
+        const whileOpening = <A,>(effect: Effect.Effect<A>) =>
+          Effect.raceFirst(effect, Fiber.join(sessionFiber).pipe(Effect.andThen(Effect.never)))
+
+        // The opening flush walks both documents in selection order. The first is refused.
+        assert.strictEqual(yield* whileOpening(Queue.take(fixture.generateStarted)), refusedId)
         yield* Queue.offer(fixture.generateReleases, undefined)
+        // The second is reached at all, which it would not be if the refusal had ended the session.
+        assert.strictEqual(yield* whileOpening(Queue.take(fixture.generateStarted)), survivingId)
+        yield* Queue.offer(fixture.generateReleases, undefined)
+        assert.strictEqual(yield* whileOpening(Queue.take(fixture.generated)), survivingId)
         const session = yield* Fiber.join(sessionFiber)
-        yield* Queue.take(fixture.generated)
-        yield* Ref.set(fixture.failGenerate, true)
+        const disconnect = yield* session.awaitDisconnect.pipe(Effect.forkChild)
+        const whileOpen = <A,>(effect: Effect.Effect<A>) => Effect.raceFirst(effect, session.awaitDisconnect)
+
+        // The refused document is marked dirty again and must still never reach generate, while the
+        // commit that follows it must. A retry of the refused document would be taken here first.
         yield* Queue.offer(fixture.events, {
           _tag: "Commit",
           commitSequence: Identity.CommitSequence.make(1),
-          documentId,
+          documentId: refusedId,
           keys: [],
           refreshGeneration: 0
         })
-        yield* Queue.take(fixture.generateStarted)
+        yield* Queue.offer(fixture.events, {
+          _tag: "Commit",
+          commitSequence: Identity.CommitSequence.make(2),
+          documentId: survivingId,
+          keys: [],
+          refreshGeneration: 0
+        })
+        assert.strictEqual(yield* whileOpen(Queue.take(fixture.generateStarted)), survivingId)
         yield* Queue.offer(fixture.generateReleases, undefined)
-        assert.strictEqual(yield* Effect.flip(session.awaitDisconnect), fixture.generateError)
-        yield* Deferred.await(fixture.subscriberEnded)
-        assert.isAbove(yield* Ref.get(fixture.closed), 0)
+        assert.strictEqual(yield* whileOpen(Queue.take(fixture.generated)), survivingId)
+
+        // A full refresh marks every selected document, including the refused one, and still must
+        // not put it back into the flush loop.
+        yield* Queue.offer(fixture.events, { _tag: "FullRefreshRequired", refreshGeneration: 1 })
+        assert.strictEqual(yield* whileOpen(Queue.take(fixture.generateStarted)), survivingId)
+        yield* Queue.offer(fixture.generateReleases, undefined)
+        assert.strictEqual(yield* whileOpen(Queue.take(fixture.generated)), survivingId)
+
+        assert.strictEqual(yield* Queue.size(fixture.generateStarted), 0)
+        assert.isUndefined(disconnect.pollUnsafe())
+        assert.strictEqual(yield* Ref.get(fixture.closed), 0)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("keeps the session and the other documents applying when an inbound lineage is refused", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const refusedId = yield* Identity.makeDocumentId
+        const survivingId = yield* Identity.makeDocumentId
+        const peerId = yield* Identity.makePeerId
+        const inbound = yield* Queue.unbounded<Uint8Array>()
+        const dispatched = yield* Queue.unbounded<Identity.DocumentId>()
+        const publications = yield* Ref.make(0)
+        const closed = yield* Ref.make(0)
+        // `makeTestClient` has no awaitDisconnect, so the connection close the terminal path
+        // performs is what tells this test the session died instead of scoping the refusal.
+        const closeStarted = yield* Deferred.make<void>()
+        const message = Uint8Array.of(1, 2, 3)
+        const messageHash = yield* Canonical.digest(message)
+        const lineageChanged = new ReplicaError.ReplicaError({
+          reason: new ReplicaError.DocumentLineageChanged({
+            documentId: refusedId,
+            localLineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000002"),
+            remoteLineage: Identity.genesisLineage
+          })
+        })
+        const entity = (documentId: Identity.DocumentId) =>
+          Effect.succeed(
+            {
+              ApplySync: () =>
+                Queue.offer(dispatched, documentId).pipe(
+                  Effect.andThen(
+                    documentId === refusedId ? Effect.fail(lineageChanged) : Effect.succeed(result)
+                  )
+                )
+            } as unknown as ReturnType<Effect.Success<typeof DocumentEntity.DocumentEntity.client>>
+          )
+        const sync = PeerSync.PeerSync.of({
+          invalidateDocument: () => Effect.void,
+          open: (id) =>
+            Effect.succeed({
+              peerId: id,
+              connectionEpoch: "local-epoch",
+              replicaIncarnation: permit.incarnation
+            }),
+          reset: () => Effect.void,
+          generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
+          receive: () => Effect.succeed(result),
+          enqueue: (_session, reply) =>
+            Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
+          pending: () => Effect.succeed([]),
+          markSent: () => Effect.succeed(true)
+        })
+        const transport = PeerTransport.PeerTransport.of({
+          capabilities: { storeAndForward: false, lineageAware: true },
+          connect: () =>
+            Effect.succeed({
+              peerId,
+              capabilities: { storeAndForward: false, lineageAware: true },
+              receive: Stream.fromQueue(inbound),
+              send: () => Effect.void,
+              close: Ref.update(closed, (count) => count + 1).pipe(
+                Effect.andThen(Deferred.succeed(closeStarted, undefined)),
+                Effect.asVoid
+              )
+            })
+        })
+        const whileOpen = <A,>(effect: Effect.Effect<A>) =>
+          Effect.raceFirst(
+            effect,
+            Deferred.await(closeStarted).pipe(Effect.andThen(Effect.die("peer session closed the connection")))
+          )
+        const envelope = (sequence: number, documentId: Identity.DocumentId) =>
+          encode({
+            connectionEpoch: "remote-epoch",
+            sequence,
+            documentId,
+            documentType: Task.name,
+            messageHash,
+            message,
+            writerProvenance: []
+          })
+        yield* PeerSession.makeTestClient(
+          {
+            peerId,
+            documents: [
+              { document: Task, documentId: refusedId },
+              { document: Task, documentId: survivingId }
+            ]
+          },
+          entity
+        ).pipe(
+          Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provideService(PeerSync.PeerSync, sync),
+          Effect.provideService(ReplicaGate.ReplicaGate, gate),
+          Effect.provideService(
+            CommitPublisher.CommitPublisher,
+            CommitPublisher.CommitPublisher.of({
+              publishPending: Ref.updateAndGet(publications, (count) => count + 1),
+              invalidate: () => Effect.void,
+              subscribe: Effect.succeed({
+                watermark: Identity.CommitSequence.make(0),
+                refreshGeneration: 0,
+                events: Stream.never
+              })
+            })
+          ),
+          Effect.provideService(ReplicaLimits.ReplicaLimits, limits)
+        )
+        yield* Queue.offer(inbound, yield* envelope(0, refusedId))
+        assert.strictEqual(yield* whileOpen(Queue.take(dispatched)), refusedId)
+        // The peer keeps pushing the refused document. The second message must be dropped ahead of
+        // the entity, so a hostile peer cannot make the session re-enter storage for it at will.
+        yield* Queue.offer(inbound, yield* envelope(1, refusedId))
+        yield* Queue.offer(inbound, yield* envelope(2, survivingId))
+        // Taken after two further messages, so it is only reachable if the refusal neither ended the
+        // session nor stopped the receive loop.
+        assert.strictEqual(yield* whileOpen(Queue.take(dispatched)), survivingId)
+        assert.strictEqual(yield* Queue.size(dispatched), 0)
+        // Only the applied document published, and the connection is still open.
+        assert.strictEqual(yield* Ref.get(publications), 1)
+        assert.strictEqual(yield* Ref.get(closed), 0)
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
@@ -2667,12 +2983,14 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         )
       const inbound = yield* Queue.unbounded<Uint8Array>()
       const sync = PeerSync.PeerSync.of({
+        invalidateDocument: () => Effect.void,
         open: (id) =>
           Effect.succeed({ peerId: id, connectionEpoch: "local-epoch", replicaIncarnation: initial.incarnation }),
         reset: () => Effect.void,
         generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
         receive: () => Effect.succeed(applyResult),
-        enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+        enqueue: (_session, reply) =>
+          Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
         pending: () => Effect.succeed([]),
         markSent: () => Effect.succeed(true)
       })

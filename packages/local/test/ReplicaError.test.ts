@@ -62,6 +62,24 @@ describe("ReplicaError", () => {
     assert.deepStrictEqual(Schema.decodeUnknownSync(ReplicaError.ReplicaError)(encoded), error)
   })
 
+  it("round trips changed document lineage metadata", () => {
+    const error = new ReplicaError.ReplicaError({
+      reason: new ReplicaError.DocumentLineageChanged({
+        documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001"),
+        localLineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000002"),
+        remoteLineage: Identity.genesisLineage
+      })
+    })
+    const encoded = Schema.encodeSync(ReplicaError.ReplicaError)(error)
+    assert.deepStrictEqual(encoded.reason, {
+      _tag: "DocumentLineageChanged",
+      documentId: "doc_00000000-0000-4000-8000-000000000001",
+      localLineage: "lin_00000000-0000-4000-8000-000000000002",
+      remoteLineage: ""
+    })
+    assert.deepStrictEqual(Schema.decodeUnknownSync(ReplicaError.ReplicaError)(encoded), error)
+  })
+
   it("round trips operation timeout metadata", () => {
     const error = new ReplicaError.ReplicaError({
       reason: new ReplicaError.OperationTimeout({

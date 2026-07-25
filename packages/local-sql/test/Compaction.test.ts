@@ -86,6 +86,112 @@ describe("Compaction", () => {
       (left.command_id < right.command_id ? -1 : left.command_id > right.command_id ? 1 : 0)
     )
 
+  /** Overwrites `title` `count` times through the real store, leaving one change per write. */
+  const churn = (documentId: Identity.DocumentId, count: number) =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      let durable = yield* store.create(Task, documentId, { title: "write-0", labels: [] })
+      for (let index = 1; index <= count; index++) {
+        const staged = yield* store.stage(durable, (draft) => {
+          draft.title = `write-${index}`
+        })
+        const next = yield* store.persist(Task, documentId, durable, staged)
+        InternalAutomerge.free(staged)
+        InternalAutomerge.free(durable.automerge)
+        durable = next
+      }
+      InternalAutomerge.free(durable.automerge)
+      return { title: `write-${count}`, labels: [] as ReadonlyArray<string> }
+    })
+
+  const checkpointsOf = (documentId: Identity.DocumentId) =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      return yield* sql<{
+        readonly bytes: Uint8Array
+        readonly commit_sequence: number
+        readonly lineage: string
+        readonly verified: number
+        readonly writer_provenance: string
+      }>`SELECT bytes, commit_sequence, lineage, verified, writer_provenance
+        FROM effect_local_checkpoints WHERE document_id = ${documentId}`
+    })
+
+  const changesOf = (documentId: Identity.DocumentId) =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      return yield* sql<{
+        readonly applied: number
+        readonly change_hash: string
+        readonly commit_sequence: number
+        readonly peer_id: string | null
+      }>`SELECT applied, change_hash, commit_sequence, peer_id
+        FROM effect_local_changes WHERE document_id = ${documentId}`
+    })
+
+  const documentRowOf = (documentId: Identity.DocumentId) =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const rows = yield* sql<{
+        readonly lineage: string
+        readonly projection_status: string
+        readonly tombstone: number
+      }>`SELECT lineage, projection_status, tombstone
+        FROM effect_local_documents WHERE document_id = ${documentId}`
+      return rows[0]!
+    })
+
+  /**
+   * Every column of the one checkpoint a rewritten document keeps. Whole-row comparison is what
+   * separates "the rewrite ran once" from "it ran twice and again left one checkpoint behind".
+   */
+  const rewrittenCheckpointOf = (documentId: Identity.DocumentId) =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const rows = yield* sql<{
+        readonly bytes: Uint8Array
+        readonly checkpoint_hash: string
+        readonly checksum: string
+        readonly commit_sequence: number
+        readonly heads: string
+        readonly lineage: string
+        readonly verified: number
+        readonly writer_provenance: string
+      }>`SELECT bytes, checkpoint_hash, checksum, commit_sequence, heads, lineage, verified, writer_provenance
+        FROM effect_local_checkpoints WHERE document_id = ${documentId} ORDER BY checkpoint_hash`
+      assert.strictEqual(rows.length, 1)
+      return rows[0]!
+    })
+
+  /** The durable rewrite markers, which is where a second rewrite of one request would be visible. */
+  const rewriteMarkers = Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    return yield* sql<{
+      readonly document_id: string
+      readonly lineage: string
+      readonly operation_id: string
+      readonly replica_incarnation: number
+    }>`SELECT replica_incarnation, operation_id, document_id, lineage
+      FROM effect_local_history_rewrites ORDER BY replica_incarnation, rewritten_at, operation_id`
+  })
+
+  /**
+   * The operator request every single-rewrite test below serves. Each test builds its own in-memory
+   * database, so one id is unambiguous across them; the tests that need a second request name their
+   * own.
+   */
+  const operationId = Compaction.OperationId.make("rewrite-history")
+
+  /** The change hashes a saved Automerge document actually contains. */
+  const changeHashesOf = (bytes: Uint8Array) => {
+    const loaded = Automerge.load(bytes)
+    try {
+      return Automerge.getAllChanges(loaded).map((change) => Automerge.decodeChange(change).hash)
+    } finally {
+      Automerge.free(loaded)
+    }
+  }
+
   it.effect("publishes a checkpoint only when heads and commit sequence still match", () =>
     Effect.gen(function*() {
       const compaction = yield* Compaction.Compaction
@@ -415,5 +521,442 @@ describe("Compaction", () => {
       const error = yield* Effect.flip(compaction.pruneCommandReceipts)
       assert.strictEqual(error.reason._tag, "StorageUnavailable")
       assert.deepStrictEqual(yield* listReceipts, byKey([superseded, live]))
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("rewrites a high-churn document down to a single change and checkpoint", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const value = yield* churn(documentId, 200)
+      assert.isTrue((yield* compaction.compact(Task, documentId)).published)
+      const churned = (yield* checkpointsOf(documentId))[0]!
+      assert.strictEqual((yield* changesOf(documentId)).length, 201)
+
+      // The floor a single write costs: the same value written once into a fresh document and
+      // checkpointed. A rewrite that still carried the discarded history would sit far above it.
+      const floorDocumentId = yield* Identity.makeDocumentId
+      const floor = yield* store.create(Task, floorDocumentId, value)
+      InternalAutomerge.free(floor.automerge)
+      yield* compaction.compact(Task, floorDocumentId)
+      const floorBytes = (yield* checkpointsOf(floorDocumentId))[0]!.bytes.byteLength
+
+      const lineage = yield* compaction.rewriteHistory(Task, documentId, operationId)
+      assert.notStrictEqual(lineage, "")
+
+      const checkpoints = yield* checkpointsOf(documentId)
+      assert.strictEqual(checkpoints.length, 1)
+      const rewritten = checkpoints[0]!
+      assert.strictEqual(rewritten.verified, 1)
+      assert.strictEqual(rewritten.lineage, lineage)
+      assert.isBelow(rewritten.bytes.byteLength, churned.bytes.byteLength)
+      // Measured: 1928 bytes churned, 204 rewritten, 204 for the single write floor. The rewrite
+      // lands exactly on the floor, because it is one change setting the same two root fields.
+      assert.isAtMost(rewritten.bytes.byteLength, floorBytes)
+
+      const changes = yield* changesOf(documentId)
+      assert.strictEqual(changes.length, 1)
+      assert.strictEqual(changes[0]!.applied, 1)
+      assert.strictEqual(changes[0]!.peer_id, null)
+      assert.strictEqual(changes[0]!.commit_sequence, rewritten.commit_sequence)
+
+      const hashes = changeHashesOf(rewritten.bytes)
+      assert.strictEqual(hashes.length, 1)
+      assert.deepStrictEqual(hashes, [changes[0]!.change_hash])
+      const provenance = JSON.parse(rewritten.writer_provenance) as ReadonlyArray<{ readonly changeHash: string }>
+      assert.strictEqual(provenance.length, 1)
+      assert.strictEqual(provenance[0]!.changeHash, changes[0]!.change_hash)
+
+      const row = yield* documentRowOf(documentId)
+      assert.strictEqual(row.lineage, lineage)
+      assert.notStrictEqual(row.lineage, "")
+
+      const reloaded = yield* store.load(Task, documentId)
+      assert.deepStrictEqual(reloaded.snapshot.value, value)
+      assert.isFalse(reloaded.snapshot.tombstone)
+      InternalAutomerge.free(reloaded.automerge)
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("rewrites a tombstoned document without resurrecting it", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const executor = yield* CommandExecutor.CommandExecutor
+      const gate = yield* ReplicaGate.ReplicaGate
+      const recovery = yield* Recovery.Recovery
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      InternalAutomerge.free(created.automerge)
+      // Deleted through the real command path so the tombstone is a durable Automerge change, not a
+      // hand written row.
+      const permit = yield* gate.current
+      const commandId = yield* Identity.makeCommandId
+      yield* executor.delete(Task, {
+        commandId,
+        documentId,
+        permit,
+        requestHash: yield* CommandExecutor.deleteRequestHash({
+          incarnation: permit.incarnation,
+          commandId,
+          document: Task,
+          documentId
+        })
+      })
+      assert.strictEqual((yield* documentRowOf(documentId)).tombstone, 1)
+
+      yield* compaction.rewriteHistory(Task, documentId, operationId)
+
+      assert.strictEqual((yield* documentRowOf(documentId)).tombstone, 1)
+      const recovered = yield* recovery.recover(Task, documentId)
+      assert.isTrue(recovered.snapshot.tombstone)
+      assert.isTrue(InternalAutomerge.tombstone(recovered.automerge))
+      InternalAutomerge.free(recovered.automerge)
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("refuses to rewrite while materialized and accepted heads are diverged", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const sql = yield* SqlClient.SqlClient
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      InternalAutomerge.free(created.automerge)
+      yield* compaction.compact(Task, documentId)
+      yield* sql`UPDATE effect_local_documents
+        SET accepted_heads = ${"[\"0000000000000000000000000000000000000000000000000000000000000000\"]"}
+        WHERE document_id = ${documentId}`
+
+      const error = yield* Effect.flip(compaction.rewriteHistory(Task, documentId, operationId))
+      assert.strictEqual(error.reason._tag, "StorageCorrupt")
+      assert.strictEqual((yield* checkpointsOf(documentId)).length, 1)
+      assert.strictEqual((yield* changesOf(documentId)).length, 1)
+      assert.strictEqual((yield* documentRowOf(documentId)).lineage, "")
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("refuses to rewrite while an unapplied change row exists", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const sql = yield* SqlClient.SqlClient
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      InternalAutomerge.free(created.automerge)
+      yield* compaction.compact(Task, documentId)
+      // An accepted peer change this replica cannot apply yet. Recovery skips it, so only the
+      // rewrite's own guard can see that the canonical history is still incomplete.
+      yield* sql`INSERT INTO effect_local_changes (
+        change_hash, document_id, document_type, writer_schema_version, writer_definition_hash,
+        actor, sequence, dependencies, bytes, applied, peer_id, accepted_at, commit_sequence
+      ) VALUES (
+        ${"a".repeat(64)}, ${documentId}, ${"Task"}, ${1}, ${"peer-definition"},
+        ${"deadbeefdeadbeefdeadbeefdeadbeef"}, ${1}, ${"[]"}, ${new Uint8Array([1, 2, 3])}, ${0},
+        ${"peer_00000000-0000-4000-8000-000000000000"}, ${"2020-01-01T00:00:00.000Z"}, ${1}
+      )`
+
+      const error = yield* Effect.flip(compaction.rewriteHistory(Task, documentId, operationId))
+      assert.strictEqual(error.reason._tag, "StorageCorrupt")
+      assert.strictEqual((yield* checkpointsOf(documentId)).length, 1)
+      assert.strictEqual((yield* changesOf(documentId)).length, 2)
+      assert.strictEqual((yield* documentRowOf(documentId)).lineage, "")
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("refuses to rewrite while a peer receipt still holds an undecoded pending message", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      InternalAutomerge.free(created.automerge)
+      yield* compaction.compact(Task, documentId)
+      // An orphan peer change: accepted, but its dependency never arrived, so it produced no change
+      // row at all. The `pending_message` blob is its only durable record, and the rewrite deletes
+      // the receipt table, so a guard that only counted unapplied change rows would lose the write.
+      const permit = yield* gate.current
+      yield* sql`INSERT INTO effect_local_peer_receipts (
+        replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id, message_hash,
+        reply, reply_hash, pending_message, heads, accepted_heads, commit_sequence, accepted_at,
+        writer_provenance
+      ) VALUES (
+        ${permit.incarnation}, ${"peer_00000000-0000-4000-8000-000000000000"}, ${"epoch-1"}, ${1},
+        ${documentId}, ${"b".repeat(64)}, NULL, NULL, ${new Uint8Array([9, 9, 9])}, ${"[]"}, ${"[]"},
+        ${1}, ${"2020-01-01T00:00:00.000Z"}, ${"[]"}
+      )`
+
+      const error = yield* Effect.flip(compaction.rewriteHistory(Task, documentId, operationId))
+      assert.strictEqual(error.reason._tag, "StorageCorrupt")
+      const retained = yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count FROM effect_local_peer_receipts WHERE document_id = ${documentId}
+      `
+      assert.strictEqual(retained[0]!.count, 1)
+      assert.strictEqual((yield* documentRowOf(documentId)).lineage, "")
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("refuses to rewrite while a pending peer outbox row is unsent", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      InternalAutomerge.free(created.automerge)
+      yield* compaction.compact(Task, documentId)
+      const permit = yield* gate.current
+      yield* sql`INSERT INTO effect_local_peer_outbox (
+        replica_incarnation, peer_id, connection_epoch, document_id, send_sequence, message,
+        message_hash, heads, status, created_at, writer_provenance, lineage
+      ) VALUES (
+        ${permit.incarnation}, ${"peer_00000000-0000-4000-8000-000000000000"}, ${"epoch-1"},
+        ${documentId}, ${1}, ${new Uint8Array([7, 7, 7])}, ${"c".repeat(64)}, ${"[]"}, ${"Pending"},
+        ${"2020-01-01T00:00:00.000Z"}, ${"[]"}, ${""}
+      )`
+
+      const error = yield* Effect.flip(compaction.rewriteHistory(Task, documentId, operationId))
+      assert.strictEqual(error.reason._tag, "StorageCorrupt")
+      const retained = yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count FROM effect_local_peer_outbox WHERE document_id = ${documentId}
+      `
+      assert.strictEqual(retained[0]!.count, 1)
+      assert.strictEqual((yield* documentRowOf(documentId)).lineage, "")
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("refuses to rewrite when the document advances between recovery and the transaction", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const sql = yield* SqlClient.SqlClient
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      InternalAutomerge.free(created.automerge)
+      yield* compaction.compact(Task, documentId)
+      const changesBefore = yield* changesOf(documentId)
+      // A concurrent writer advancing the document after `recover` committed its own transaction and
+      // before the rewrite opens its own. Expressed as a trigger on the permit validation both of
+      // those transactions run, so it lands in exactly that window. Both head columns move together,
+      // so the settled-history guard still passes and only the compare-and-swap can catch it: the
+      // rewrite would otherwise commit a document rebuilt from the value it read before the advance.
+      // `sql.unsafe` because SQLite rejects bound parameters inside a trigger body.
+      const advanced = `'["${"d".repeat(64)}"]'`
+      yield* sql.unsafe(`CREATE TRIGGER advance_during_rewrite
+        AFTER UPDATE OF writer_generation ON effect_local_metadata
+        BEGIN
+          UPDATE effect_local_documents
+            SET materialized_heads = ${advanced}, accepted_heads = ${advanced}
+            WHERE document_id = '${documentId}';
+        END`)
+
+      const error = yield* Effect.flip(compaction.rewriteHistory(Task, documentId, operationId))
+      assert.strictEqual(error.reason._tag, "StorageCorrupt")
+      assert.strictEqual((yield* checkpointsOf(documentId)).length, 1)
+      assert.deepStrictEqual(
+        (yield* changesOf(documentId)).map((row) => row.change_hash),
+        changesBefore.map((row) => row.change_hash)
+      )
+      assert.strictEqual((yield* documentRowOf(documentId)).lineage, "")
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("rolls back the whole rewrite when the replica permit changes in the transaction", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const sql = yield* SqlClient.SqlClient
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const value = yield* churn(documentId, 3)
+      yield* compaction.compact(Task, documentId)
+      const checkpointsBefore = yield* checkpointsOf(documentId)
+      const changesBefore = yield* changesOf(documentId)
+      yield* sql`CREATE TRIGGER fence_history_rewrite
+        AFTER UPDATE OF checkpoint_hash ON effect_local_documents
+        BEGIN
+          UPDATE effect_local_metadata SET writer_generation = writer_generation + 1 WHERE singleton = 1;
+        END`
+
+      const error = yield* Effect.flip(compaction.rewriteHistory(Task, documentId, operationId))
+      assert.strictEqual(error.reason._tag, "ReplicaFenced")
+      assert.deepStrictEqual(
+        (yield* checkpointsOf(documentId)).map((row) => row.commit_sequence),
+        checkpointsBefore.map((row) => row.commit_sequence)
+      )
+      assert.deepStrictEqual(
+        (yield* changesOf(documentId)).map((row) => row.change_hash).toSorted(),
+        changesBefore.map((row) => row.change_hash).toSorted()
+      )
+      assert.strictEqual((yield* documentRowOf(documentId)).lineage, "")
+      const reloaded = yield* store.load(Task, documentId)
+      assert.deepStrictEqual(reloaded.snapshot.value, value)
+      InternalAutomerge.free(reloaded.automerge)
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("recovers a rewritten document from its checkpoint and from its change row alone", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const recovery = yield* Recovery.Recovery
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const value = yield* churn(documentId, 20)
+      yield* compaction.compact(Task, documentId)
+      yield* compaction.rewriteHistory(Task, documentId, operationId)
+
+      const fromCheckpoint = yield* recovery.recover(Task, documentId)
+      assert.deepStrictEqual(fromCheckpoint.snapshot.value, value)
+      assert.strictEqual(Automerge.getAllChanges(fromCheckpoint.automerge).length, 1)
+      InternalAutomerge.free(fromCheckpoint.automerge)
+
+      // The rows-only tail. Dropping the single checkpoint leaves the re-rooted change row as the
+      // only source, which is exactly why the rewrite writes one.
+      yield* sql`DELETE FROM effect_local_checkpoints WHERE document_id = ${documentId}`
+      const fromChanges = yield* recovery.recover(Task, documentId)
+      assert.deepStrictEqual(fromChanges.snapshot.value, value)
+      assert.strictEqual(Automerge.getAllChanges(fromChanges.automerge).length, 1)
+      InternalAutomerge.free(fromChanges.automerge)
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("performs exactly one rewrite when the same operation id is replayed", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const value = yield* churn(documentId, 20)
+      yield* compaction.compact(Task, documentId)
+
+      const lineage = yield* compaction.rewriteHistory(Task, documentId, operationId)
+      const rewritten = yield* rewrittenCheckpointOf(documentId)
+      const changes = yield* changesOf(documentId)
+
+      // The hazard the marker closes, reproduced at the seam it guards: the activity re-running with
+      // the same arguments after its own transaction already committed, with no workflow in between
+      // to dedupe it.
+      const replayed = yield* compaction.rewriteHistory(Task, documentId, operationId)
+
+      assert.strictEqual(replayed, lineage)
+      // Byte identical, not merely "still one checkpoint": a second rewrite also leaves exactly one,
+      // with a new lineage, new bytes, a new hash and a new commit sequence. Comparing the whole row
+      // is what makes a hidden second rewrite impossible to pass.
+      assert.deepStrictEqual(yield* rewrittenCheckpointOf(documentId), rewritten)
+      assert.deepStrictEqual(yield* changesOf(documentId), changes)
+      assert.strictEqual((yield* documentRowOf(documentId)).lineage, lineage)
+      assert.deepStrictEqual(
+        (yield* rewriteMarkers).map((row) => ({ document_id: row.document_id, lineage: row.lineage })),
+        [{ document_id: documentId as string, lineage: lineage as string }]
+      )
+
+      const reloaded = yield* store.load(Task, documentId)
+      assert.deepStrictEqual(reloaded.snapshot.value, value)
+      InternalAutomerge.free(reloaded.automerge)
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("rewrites a second time under a different operation id", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const documentId = yield* Identity.makeDocumentId
+      yield* churn(documentId, 20)
+      yield* compaction.compact(Task, documentId)
+
+      const first = yield* compaction.rewriteHistory(Task, documentId, operationId)
+      const firstCheckpoint = yield* rewrittenCheckpointOf(documentId)
+      const second = yield* compaction.rewriteHistory(
+        Task,
+        documentId,
+        Compaction.OperationId.make("rewrite-history-again")
+      )
+
+      assert.notStrictEqual(second, first)
+      const secondCheckpoint = yield* rewrittenCheckpointOf(documentId)
+      assert.strictEqual(secondCheckpoint.lineage, second)
+      assert.notStrictEqual(secondCheckpoint.checkpoint_hash, firstCheckpoint.checkpoint_hash)
+      assert.isAbove(secondCheckpoint.commit_sequence, firstCheckpoint.commit_sequence)
+      assert.strictEqual((yield* documentRowOf(documentId)).lineage, second)
+      assert.deepStrictEqual((yield* rewriteMarkers).map((row) => row.lineage), [first as string, second as string])
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("stamps the document's current lineage on a checkpoint published after a rewrite", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      InternalAutomerge.free(created.automerge)
+      const lineage = yield* compaction.rewriteHistory(Task, documentId, operationId)
+      assert.notStrictEqual(lineage, Identity.genesisLineage)
+
+      // A real write between the rewrite and the compaction, so `publish` installs a NEW checkpoint
+      // row rather than colliding with the one the rewrite already wrote under the new lineage.
+      const durable = yield* store.load(Task, documentId)
+      const staged = yield* store.stage(durable, (draft) => {
+        draft.title = "two"
+      })
+      const persisted = yield* store.persist(Task, documentId, durable, staged)
+      InternalAutomerge.free(persisted.automerge)
+      InternalAutomerge.free(staged)
+      InternalAutomerge.free(durable.automerge)
+
+      assert.isTrue((yield* compaction.compact(Task, documentId)).published)
+
+      const checkpoints = yield* checkpointsOf(documentId)
+      assert.strictEqual(checkpoints.length, 2)
+      // Every retained checkpoint names the lineage its document is actually on. A genesis label
+      // here would make the document and its own checkpoints disagree about which history they
+      // belong to.
+      assert.deepStrictEqual([...new Set(checkpoints.map((row) => row.lineage))], [lineage as string])
+      assert.strictEqual((yield* documentRowOf(documentId)).lineage, lineage)
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("prunes only within the document's current lineage", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const sql = yield* SqlClient.SqlClient
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      yield* compaction.compact(Task, documentId)
+      const staged = yield* store.stage(created, (draft) => {
+        draft.title = "two"
+      })
+      const persisted = yield* store.persist(Task, documentId, created, staged)
+      yield* compaction.compact(Task, documentId)
+      InternalAutomerge.free(persisted.automerge)
+      InternalAutomerge.free(staged)
+      InternalAutomerge.free(created.automerge)
+      assert.strictEqual((yield* checkpointsOf(documentId)).length, 2)
+
+      // The document moves to a new lineage without its checkpoints following it. This is exactly
+      // the state an unstamped `publish` used to leave behind, and the pair `prune` would otherwise
+      // retain now straddles two histories.
+      const lineage = yield* Identity.makeDocumentLineage
+      yield* sql`UPDATE effect_local_documents SET lineage = ${lineage} WHERE document_id = ${documentId}`
+
+      assert.strictEqual(yield* compaction.prune(documentId), 0)
+      // Nothing was deleted, so the change the straddling pair would have dominated survives.
+      assert.strictEqual((yield* changesOf(documentId)).length, 2)
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("refuses to reuse an operation id for a different document", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const rewrittenId = yield* Identity.makeDocumentId
+      const otherId = yield* Identity.makeDocumentId
+      yield* churn(rewrittenId, 5)
+      const other = yield* store.create(Task, otherId, { title: "other", labels: [] })
+      InternalAutomerge.free(other.automerge)
+      yield* compaction.compact(Task, rewrittenId)
+      yield* compaction.compact(Task, otherId)
+
+      const lineage = yield* compaction.rewriteHistory(Task, rewrittenId, operationId)
+      const otherCheckpoints = yield* checkpointsOf(otherId)
+      const otherChanges = yield* changesOf(otherId)
+
+      const error = yield* Effect.flip(compaction.rewriteHistory(Task, otherId, operationId))
+      assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+
+      // The second document keeps its history, its checkpoints and its genesis lineage: the reuse is
+      // refused before anything destructive runs, not repaired afterwards.
+      assert.deepStrictEqual(yield* checkpointsOf(otherId), otherCheckpoints)
+      assert.deepStrictEqual(yield* changesOf(otherId), otherChanges)
+      assert.strictEqual((yield* documentRowOf(otherId)).lineage, Identity.genesisLineage)
+      assert.strictEqual((yield* documentRowOf(rewrittenId)).lineage, lineage)
+      assert.deepStrictEqual((yield* rewriteMarkers).map((row) => row.document_id), [rewrittenId as string])
     }).pipe(Effect.provide(Services)))
 })

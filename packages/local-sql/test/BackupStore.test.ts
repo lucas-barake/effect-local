@@ -379,6 +379,158 @@ describe("BackupStore", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(CompactedLive)))
 
+  /**
+   * The archive lines of a completed export, parsed. Every lineage assertion below reads the
+   * archive itself rather than the database it came from: the documented remedy for a peer refused
+   * on a lineage mismatch is to carry an archive to that peer, so a value the archive does not
+   * contain is a value the remedy cannot deliver.
+   */
+  const archiveLinesOf = (chunks: ReadonlyArray<Uint8Array>) =>
+    new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n").map((line) => JSON.parse(line))
+
+  /** Rewrites the archive's checksums after its records were edited by hand. */
+  const resealArchive = (lines: ReadonlyArray<any>) =>
+    Effect.gen(function*() {
+      const end = lines.at(-1)!
+      end.value.recordsChecksum = yield* Canonical.digest(lines.slice(1, -1).map((line) => line.checksum))
+      end.checksum = yield* Canonical.digest(end.value)
+      const manifest = lines[0]!
+      for (let attempt = 0; attempt < 8; attempt++) {
+        manifest.checksum = yield* Canonical.digest(manifest.value)
+        const encoded = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+        if (manifest.value.declaredBytes === encoded.byteLength) break
+        manifest.value.declaredBytes = encoded.byteLength
+      }
+      manifest.checksum = yield* Canonical.digest(manifest.value)
+      return new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+    })
+
+  it.effect("preserves a rewritten document's lineage across export and restore", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "rewritten" })
+      InternalAutomerge.free(created.automerge)
+      const lineage = yield* compaction.rewriteHistory(
+        Task,
+        documentId,
+        Compaction.OperationId.make("rewrite-history")
+      )
+      assert.notStrictEqual(lineage, Identity.genesisLineage)
+
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      const lines = archiveLinesOf(chunks)
+      assert.strictEqual(lines.find((line) => line.kind === "Document").value.lineage, lineage)
+      assert.strictEqual(lines.find((line) => line.kind === "Checkpoint").value.lineage, lineage)
+
+      // `replace` deletes every canonical row before it inserts, so nothing that survives below was
+      // carried over from local state: it all came out of the archive.
+      yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.fromIterable(chunks),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      })
+
+      assert.deepStrictEqual(
+        yield* sql<{ readonly lineage: string }>`
+          SELECT lineage FROM effect_local_documents WHERE document_id = ${documentId}`,
+        [{ lineage: lineage as string }]
+      )
+      assert.deepStrictEqual(
+        yield* sql<{ readonly lineage: string }>`
+          SELECT lineage FROM effect_local_checkpoints WHERE document_id = ${documentId}`,
+        [{ lineage: lineage as string }]
+      )
+      const restored = yield* store.load(Task, documentId)
+      assert.strictEqual(restored.snapshot.value.title, "rewritten")
+      InternalAutomerge.free(restored.automerge)
+    }).pipe(Effect.provide(CompactedLive)))
+
+  it.effect("emits format version two only for an archive carrying a rewritten lineage", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      // Exactly the manifest decode a build that predates lineage performs. A version two archive
+      // must fail it rather than be read and silently downgraded to genesis.
+      const priorReaderManifest = Schema.Struct({ formatVersion: Schema.Literal(1) })
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "genesis" })
+      InternalAutomerge.free(created.automerge)
+      yield* compaction.compact(Task, documentId)
+
+      const genesis = archiveLinesOf(yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect))
+      assert.strictEqual(genesis[0]!.value.formatVersion, 1)
+      assert.deepStrictEqual(Schema.decodeUnknownSync(priorReaderManifest)(genesis[0]!.value), { formatVersion: 1 })
+
+      yield* compaction.rewriteHistory(Task, documentId, Compaction.OperationId.make("rewrite-history"))
+
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      const rewritten = archiveLinesOf(chunks)
+      assert.strictEqual(rewritten[0]!.value.formatVersion, 2)
+      assert.throws(() => Schema.decodeUnknownSync(priorReaderManifest)(rewritten[0]!.value))
+
+      // This build reads both versions, so raising the version fences prior readers out without
+      // costing the current one its own archives.
+      yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.fromIterable(chunks),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      })
+      const restored = yield* store.load(Task, documentId)
+      assert.strictEqual(restored.snapshot.value.title, "genesis")
+      InternalAutomerge.free(restored.automerge)
+    }).pipe(Effect.provide(CompactedLive)))
+
+  it.effect("restores pre-lineage records that carry no lineage field as genesis", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "legacy" })
+      InternalAutomerge.free(created.automerge)
+      yield* compaction.compact(Task, documentId)
+      const lines = archiveLinesOf(yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect))
+      const document = lines.find((line) => line.kind === "Document")!
+      delete document.value.lineage
+      document.checksum = yield* Canonical.digest(document.value)
+      const checkpoint = lines.find((line) => line.kind === "Checkpoint")!
+      delete checkpoint.value.lineage
+      checkpoint.checksum = yield* Canonical.digest(checkpoint.value)
+      const archive = yield* resealArchive(lines)
+
+      yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.make(archive),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      })
+
+      assert.deepStrictEqual(
+        yield* sql<{ readonly lineage: string }>`
+          SELECT lineage FROM effect_local_documents WHERE document_id = ${documentId}`,
+        [{ lineage: Identity.genesisLineage as string }]
+      )
+      assert.deepStrictEqual(
+        yield* sql<{ readonly lineage: string }>`
+          SELECT lineage FROM effect_local_checkpoints WHERE document_id = ${documentId}`,
+        [{ lineage: Identity.genesisLineage as string }]
+      )
+      const restored = yield* store.load(Task, documentId)
+      assert.strictEqual(restored.snapshot.value.title, "legacy")
+      InternalAutomerge.free(restored.automerge)
+    }).pipe(Effect.provide(CompactedLive)))
+
   it.effect("rejects checkpoint and change provenance conflicts during restore", () =>
     Effect.gen(function*() {
       const backups = yield* BackupStore.BackupStore

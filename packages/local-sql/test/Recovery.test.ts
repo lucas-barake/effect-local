@@ -85,6 +85,49 @@ describe("Recovery", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(Services)))
 
+  it.effect("demotes a checkpoint whose lineage does not match its document row", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const recovery = yield* Recovery.Recovery
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const checkpointsOf = (documentId: Identity.DocumentId) =>
+        sql<{ readonly lineage: string; readonly verified: number }>`
+          SELECT lineage, verified FROM effect_local_checkpoints WHERE document_id = ${documentId}
+        `
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one" })
+      InternalAutomerge.free(created.automerge)
+      const lineage = yield* compaction.rewriteHistory(
+        Task,
+        documentId,
+        Compaction.OperationId.make("rewrite-history")
+      )
+
+      // A rewrite leaves the document and its checkpoint on one lineage, and recovery replays that
+      // checkpoint and leaves it verified. This half is what keeps the check below from demoting
+      // every legitimate checkpoint, genesis ones included.
+      const agreeing = yield* recovery.recover(Task, documentId)
+      assert.deepStrictEqual(agreeing.snapshot.value, { title: "one" })
+      InternalAutomerge.free(agreeing.automerge)
+      assert.deepStrictEqual(yield* checkpointsOf(documentId), [{ lineage: lineage as string, verified: 1 }])
+
+      // A checkpoint left on the genesis lineage under a rewritten document. Replaying it would
+      // rebuild the document from a history it no longer belongs to, and its heads happen to match
+      // because it is the very checkpoint the rewrite wrote.
+      yield* sql`UPDATE effect_local_checkpoints SET lineage = ${Identity.genesisLineage}
+        WHERE document_id = ${documentId}`
+
+      const recovered = yield* recovery.recover(Task, documentId)
+      assert.deepStrictEqual(recovered.snapshot.value, { title: "one" })
+      InternalAutomerge.free(recovered.automerge)
+      // Demoted through the ordinary invalidation path rather than quarantined: the document itself
+      // is intact and its change rows still rebuild it.
+      assert.deepStrictEqual(yield* checkpointsOf(documentId), [{ lineage: "", verified: 0 }])
+      const quarantine = yield* sql`SELECT reason FROM effect_local_quarantine WHERE document_id = ${documentId}`
+      assert.deepStrictEqual(quarantine, [])
+    }).pipe(Effect.provide(Services)))
+
   it.effect("rejects provenance conflicts between a checkpoint and surviving changes", () =>
     Effect.gen(function*() {
       const compaction = yield* Compaction.Compaction

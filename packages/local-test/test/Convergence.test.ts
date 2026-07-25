@@ -131,7 +131,7 @@ const drain = (documentId: Identity.DocumentId, left: Side, right: Side, reverse
   Effect.gen(function*() {
     const pending: Array<Packet> = []
     const enqueueGenerated = Effect.fnUntraced(function*(from: Side, to: Side) {
-      const generated = yield* from.sync.generate(Task, documentId, from.session)
+      const generated = yield* from.sync.generate(Task, documentId, from.session, { lineageAware: true })
       if (generated.outbound !== null) pending.push({ from, outbound: generated.outbound, to })
       return generated
     })
@@ -166,6 +166,7 @@ const drain = (documentId: Identity.DocumentId, left: Side, right: Side, reverse
           {
             remoteConnectionEpoch: packet.from.session.connectionEpoch,
             receiveSequence: packet.outbound.sendSequence,
+            lineage: packet.outbound.lineage,
             message: packet.outbound.message,
             writerProvenance: packet.outbound.writerProvenance
           }

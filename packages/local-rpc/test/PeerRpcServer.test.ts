@@ -8,6 +8,7 @@ import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
@@ -43,6 +44,7 @@ import * as PeerRpc from "../src/PeerRpc.js"
 import * as PeerRpcError from "../src/PeerRpcError.js"
 import * as PeerRpcLimits from "../src/PeerRpcLimits.js"
 import * as PeerRpcServer from "../src/PeerRpcServer.js"
+import * as RpcPeerTransport from "../src/RpcPeerTransport.js"
 
 const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
 const Note = Document.make("Note", { schema: Schema.Struct({ body: Schema.String }), version: 1 })
@@ -131,6 +133,7 @@ const baseOptions = {
   blockInbound: false,
   blockAuthorization: false,
   failSessionOpen: false,
+  sessionOpenFailure: undefined,
   manualClock: false
 }
 
@@ -153,6 +156,7 @@ const makeFixture = (options: {
   readonly blockInbound: boolean
   readonly blockAuthorization: boolean
   readonly failSessionOpen: boolean
+  readonly sessionOpenFailure: ReplicaError.Reason | undefined
   readonly manualClock: boolean
 }) =>
   Effect.gen(function*() {
@@ -160,6 +164,7 @@ const makeFixture = (options: {
     const configuredRpcLimits = PeerRpcLimits.Values.make({ ...rpcLimits, ...options.rpcLimits })
     const commits = yield* Queue.unbounded<CommitPublisher.CommitEvent>()
     const generated = yield* Queue.unbounded<Identity.DocumentId>()
+    const generatePeers = yield* Queue.unbounded<{ readonly lineageAware: boolean }>()
     const received = yield* Queue.unbounded<number>()
     const receivedPayloads = yield* Queue.unbounded<typeof DocumentEntity.ApplySync.payloadSchema.Type>()
     const sent = yield* Queue.unbounded<number>()
@@ -261,21 +266,26 @@ const makeFixture = (options: {
       validate: () => Effect.void
     })
     const sync = PeerSync.PeerSync.of({
+      invalidateDocument: () => Effect.void,
       open: (peerId) =>
         Ref.update(sessionOpenCalls, (count) => count + 1).pipe(
           Effect.andThen(
             failSessionOpen
               ? Effect.fail(
                 new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageUnavailable({ cause: new Error("session startup failed") })
+                  reason: options.sessionOpenFailure ??
+                    new ReplicaError.StorageUnavailable({ cause: new Error("session startup failed") })
                 })
               )
               : Effect.succeed({ peerId, connectionEpoch: "local-epoch", replicaIncarnation: permit.incarnation })
           )
         ),
       reset: () => Effect.void,
-      generate: (_document, documentId) =>
+      generate: (_document, documentId, _session, peer) =>
         Queue.offer(generated, documentId).pipe(
+          // What the server side session read off its own transport connection. This is the value
+          // that decides whether a rewritten document may be emitted toward the connected peer.
+          Effect.andThen(Queue.offer(generatePeers, peer)),
           Effect.andThen(
             blockCommitFlush
               ? Deferred.succeed(commitFlushStarted, undefined).pipe(
@@ -288,7 +298,12 @@ const makeFixture = (options: {
         ),
       receive: () => Effect.die("unexpected direct PeerSync receive"),
       enqueue: (session, reply) => {
-        const outbound = { ...reply, sendSequence: 0, writerProvenance: maximumWriterProvenance }
+        const outbound = {
+          ...reply,
+          sendSequence: 0,
+          lineage: Identity.genesisLineage,
+          writerProvenance: maximumWriterProvenance
+        }
         return Queue.offer(enqueued, reply.documentId).pipe(
           Effect.andThen(Ref.update(enqueuedOutbounds, (pendingByPeer) => {
             const next = new Map(pendingByPeer)
@@ -460,7 +475,13 @@ const makeFixture = (options: {
       }),
       Effect.provideService(PeerRpcLimits.PeerRpcLimits, configuredRpcLimits)
     )
-    const open = (documents: ReadonlyArray<PeerRpc.RequestedDocument>) =>
+    // `capabilities` is omitted unless a test supplies one, which is exactly the payload a client
+    // built before lineage sends. It is spread rather than passed as `undefined` because the field
+    // is `Schema.optionalKey`: absent and explicitly undefined are not the same wire value.
+    const open = (
+      documents: ReadonlyArray<PeerRpc.RequestedDocument>,
+      capabilities?: { readonly lineageAware?: boolean }
+    ) =>
       Effect.gen(function*() {
         const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
         const fiber = yield* Stream.runForEach(
@@ -468,6 +489,7 @@ const makeFixture = (options: {
             protocolVersion: PeerRpc.protocolVersion,
             expectedPeerId: serverPeerId,
             definitionHash,
+            ...(capabilities === undefined ? {} : { capabilities }),
             documents
           }),
           (event) => Queue.offer(events, event).pipe(Effect.asVoid)
@@ -507,6 +529,7 @@ const makeFixture = (options: {
       client,
       commits,
       generated,
+      generatePeers,
       received,
       receivedPayloads,
       sent,
@@ -558,6 +581,7 @@ describe("PeerRpcServer", () => {
           message: Uint8Array.of(1, 2, 3),
           messageHash: "hash",
           heads: [],
+          lineage: Identity.genesisLineage,
           writerProvenance: []
         }
       })
@@ -565,6 +589,50 @@ describe("PeerRpcServer", () => {
       assert.strictEqual((yield* Queue.take(session.events))._tag, "Message")
       yield* Fiber.interrupt(session.fiber)
       assert.strictEqual(yield* Ref.get(fixture.subscriptions), 1)
+    })))
+
+  it.effect("advertises lineage awareness through a real Open handshake and into peer session generation", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const fixture = yield* makeFixture(baseOptions)
+      // Both halves of the handshake through the adapter a real peer actually uses: its `Open`
+      // carries the client's capability advertisement, and it decodes the server's out of `Opened`.
+      const context = yield* Layer.build(RpcPeerTransport.layer(fixture.client, {
+        documents: [{ document: Task, documentId: taskId }],
+        definition
+      }))
+      const connection = yield* Context.get(context, PeerTransport.PeerTransport).connect({
+        replicaId: permit.replicaId,
+        peerId: serverPeerId
+      })
+      // The wire frame, decoded by the real client through the real `Opened` schema. Absent here
+      // would mean every lineage aware peer refuses to emit a rewritten document to this server.
+      assert.deepStrictEqual(connection.capabilities, { storeAndForward: false, lineageAware: true })
+      // The server side session read the CLIENT's advertisement off its own transport connection, so
+      // a rewritten document may be generated toward this peer. `PeerSync.generate` is what turns a
+      // false here into a refusal, which its own suite covers.
+      assert.deepStrictEqual(yield* Queue.take(fixture.generatePeers), { lineageAware: true })
+      yield* connection.close
+    })))
+
+  it.effect("treats an Open that omits the client capability as not lineage aware", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const fixture = yield* makeFixture(baseOptions)
+      // Exactly what a client built before lineage sends. `PeerRpc.protocolVersion` was not bumped
+      // for lineage, so it passes the version check; inferring awareness from that version would
+      // hand it a rewritten document, which it would union and reply with the discarded history.
+      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
+      // The server's own claim is unconditional and independent of the client's.
+      assert.deepStrictEqual(session.opened.capabilities, { storeAndForward: false, lineageAware: true })
+      assert.deepStrictEqual(yield* Queue.take(fixture.generatePeers), { lineageAware: false })
+      yield* Fiber.interrupt(session.fiber)
+    })))
+
+  it.effect("reads the advertised flag rather than the presence of the capability object", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const fixture = yield* makeFixture(baseOptions)
+      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }], {})
+      assert.deepStrictEqual(yield* Queue.take(fixture.generatePeers), { lineageAware: false })
+      yield* Fiber.interrupt(session.fiber)
     })))
 
   it.effect("hosts the existing canonical replica through the real PeerSession", () =>
@@ -798,6 +866,7 @@ describe("PeerRpcServer", () => {
           message: new Uint8Array(48_000),
           messageHash: "fifo-blocker",
           heads: [],
+          lineage: Identity.genesisLineage,
           writerProvenance: maximumWriterProvenance
         }
       })
@@ -818,6 +887,7 @@ describe("PeerRpcServer", () => {
         message: new Uint8Array(replicaLimits.maxSyncMessageBytes),
         messageHash: "fifo-head",
         heads: [],
+        lineage: Identity.genesisLineage,
         writerProvenance: maximumWriterProvenance
       })
       yield* fixture.setCredential("foreign")
@@ -840,6 +910,7 @@ describe("PeerRpcServer", () => {
         message: new Uint8Array(48_000),
         messageHash: "fifo-tail",
         heads: [],
+        lineage: Identity.genesisLineage,
         writerProvenance: []
       })
       yield* fixture.setCredential("subject-10")
@@ -881,6 +952,7 @@ describe("PeerRpcServer", () => {
         message: new Uint8Array(replicaLimits.maxSyncMessageBytes),
         messageHash: "cancel-blocker",
         heads: [],
+        lineage: Identity.genesisLineage,
         writerProvenance: maximumWriterProvenance
       })
       const blockerReady = yield* Deferred.make<void>()
@@ -899,6 +971,7 @@ describe("PeerRpcServer", () => {
         message: new Uint8Array(replicaLimits.maxSyncMessageBytes),
         messageHash: "cancel-head",
         heads: [],
+        lineage: Identity.genesisLineage,
         writerProvenance: []
       })
       const head = yield* fixture.directOpenAs(
@@ -913,6 +986,7 @@ describe("PeerRpcServer", () => {
         message: Uint8Array.of(1),
         messageHash: "cancel-tail",
         heads: [],
+        lineage: Identity.genesisLineage,
         writerProvenance: []
       })
       const tailMessage = yield* Deferred.make<void>()
@@ -937,6 +1011,7 @@ describe("PeerRpcServer", () => {
         message: new Uint8Array(replicaLimits.maxSyncMessageBytes),
         messageHash: "cancel-probe",
         heads: [],
+        lineage: Identity.genesisLineage,
         writerProvenance: []
       })
       const probeMessage = yield* Deferred.make<void>()
@@ -972,6 +1047,7 @@ describe("PeerRpcServer", () => {
         message: large,
         messageHash: "bounded-blocker",
         heads: [],
+        lineage: Identity.genesisLineage,
         writerProvenance: maximumWriterProvenance
       })
       const blockerReady = yield* Deferred.make<void>()
@@ -992,6 +1068,7 @@ describe("PeerRpcServer", () => {
           message: large,
           messageHash: `bounded-waiter-${index}`,
           heads: [],
+          lineage: Identity.genesisLineage,
           writerProvenance: []
         })
         yield* fixture.setCredential(`subject-${index + 10}`)
@@ -1012,6 +1089,7 @@ describe("PeerRpcServer", () => {
         message: large,
         messageHash: "bounded-rejected",
         heads: [],
+        lineage: Identity.genesisLineage,
         writerProvenance: []
       })
       yield* fixture.setCredential("subject-20")
@@ -1489,6 +1567,7 @@ describe("PeerRpcServer", () => {
           message: Uint8Array.of(1),
           messageHash: "held",
           heads: [],
+          lineage: Identity.genesisLineage,
           writerProvenance: []
         }
       })
@@ -1521,6 +1600,7 @@ describe("PeerRpcServer", () => {
           message: Uint8Array.of(1),
           messageHash: "taken-before-overload",
           heads: [],
+          lineage: Identity.genesisLineage,
           writerProvenance: []
         }
       })
@@ -1735,6 +1815,7 @@ describe("PeerRpcServer", () => {
           message: Uint8Array.of(1, 2, 3),
           messageHash: "lease-boundary",
           heads: [],
+          lineage: Identity.genesisLineage,
           writerProvenance: []
         },
         manualClock: true
@@ -1777,6 +1858,7 @@ describe("PeerRpcServer", () => {
         message: Uint8Array.of(1, 2, 3),
         messageHash: "lease-boundary",
         heads: [],
+        lineage: Identity.genesisLineage,
         writerProvenance: []
       })
       yield* fixture.setCurrentTime(1_000)
@@ -1837,6 +1919,31 @@ describe("PeerRpcServer", () => {
       yield* Fiber.interrupt(session.fiber)
     })))
 
+  it.effect("reports a lineage rewrite session failure as its own fieldless wire error", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const fixture = yield* makeFixture({
+        ...baseOptions,
+        failSessionOpen: true,
+        sessionOpenFailure: new ReplicaError.DocumentLineageChanged({
+          documentId: taskId,
+          localLineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000004"),
+          remoteLineage: Identity.genesisLineage
+        })
+      })
+      const error = yield* fixture.client.Open({
+        protocolVersion: PeerRpc.protocolVersion,
+        expectedPeerId: serverPeerId,
+        definitionHash,
+        documents: [{ documentType: Task.name, documentId: taskId }]
+      }).pipe(Stream.runDrain, Effect.flip)
+      assert.instanceOf(error, PeerRpcError.DocumentLineageChanged)
+      // The peer learns the lineage no longer matches and nothing else: no document id, no lineage.
+      assert.deepStrictEqual(
+        Schema.encodeSync(PeerRpcError.PeerRpcError)(error),
+        { _tag: "DocumentLineageChanged" }
+      )
+    })))
+
   it.effect("maps initialization send capacity timeout to SessionOverloaded", () =>
     Effect.scoped(Effect.gen(function*() {
       const message = new Uint8Array(replicaLimits.maxSyncMessageBytes)
@@ -1864,6 +1971,7 @@ describe("PeerRpcServer", () => {
         message,
         messageHash: "initial-capacity",
         heads: [],
+        lineage: Identity.genesisLineage,
         writerProvenance: maximumWriterProvenance
       })
       yield* fixture.setCredential("foreign")
@@ -1898,6 +2006,7 @@ describe("PeerRpcServer", () => {
           message,
           messageHash: "held-for-push-reply",
           heads: [],
+          lineage: Identity.genesisLineage,
           writerProvenance: maximumWriterProvenance
         }
       })
@@ -1973,6 +2082,7 @@ describe("PeerRpcServer", () => {
           message,
           messageHash: "first",
           heads: [],
+          lineage: Identity.genesisLineage,
           writerProvenance: maximumWriterProvenance
         }
       })
@@ -1998,6 +2108,7 @@ describe("PeerRpcServer", () => {
         message,
         messageHash: "second",
         heads: [],
+        lineage: Identity.genesisLineage,
         writerProvenance: []
       })
       yield* Queue.offer(fixture.commits, {
@@ -2051,6 +2162,7 @@ describe("PeerRpcServer", () => {
         message,
         messageHash: "flush-capacity",
         heads: [],
+        lineage: Identity.genesisLineage,
         writerProvenance: maximumWriterProvenance
       })
       yield* Queue.offer(fixture.commits, {
@@ -2210,6 +2322,7 @@ describe("PeerRpcServer", () => {
           message: Uint8Array.of(17, 18, 19),
           messageHash: "hash",
           heads: [],
+          lineage: Identity.genesisLineage,
           writerProvenance: []
         },
         authorization: (request) =>

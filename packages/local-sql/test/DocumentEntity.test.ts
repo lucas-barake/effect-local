@@ -94,6 +94,7 @@ describe("DocumentEntity", () => {
   }
   const peerSync = (receive: PeerSync.PeerSync["Service"]["receive"] = () => Effect.succeed(syncResult)) =>
     PeerSync.PeerSync.of({
+      invalidateDocument: () => Effect.void,
       open: (peerId) =>
         Effect.succeed({
           peerId,
@@ -103,7 +104,8 @@ describe("DocumentEntity", () => {
       reset: () => Effect.void,
       generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
       receive,
-      enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+      enqueue: (_session, reply) =>
+        Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
       pending: () => Effect.succeed([]),
       markSent: () => Effect.succeed(false)
     })
@@ -183,7 +185,17 @@ describe("DocumentEntity", () => {
       return PrimaryKey.value(payload)
     }
     const key = keyOf(DocumentEntity.ApplySync.payloadSchema.make(base))
-    assert.strictEqual(key, JSON.stringify([1, peerId, "connection", 2, "hash-a", base.writerProvenance]))
+    assert.strictEqual(
+      key,
+      JSON.stringify([1, peerId, "connection", 2, "hash-a", base.writerProvenance, ""])
+    )
+    assert.notStrictEqual(
+      key,
+      keyOf(DocumentEntity.ApplySync.payloadSchema.make({
+        ...base,
+        lineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000001")
+      }))
+    )
     assert.notStrictEqual(
       key,
       keyOf(DocumentEntity.ApplySync.payloadSchema.make({
@@ -247,6 +259,47 @@ describe("DocumentEntity", () => {
     }))
 
     assert.notStrictEqual(first, second)
+  })
+
+  it("round trips a persisted ApplySync payload with and without a lineage key", () => {
+    const lineage = "lin_22222222-2222-4222-9222-222222222222"
+    const wire = {
+      replicaIncarnation: 1,
+      peerId: "peer_00000000-0000-4000-8000-000000000001",
+      connectionEpoch: "connection",
+      localConnectionEpoch: "local-connection",
+      receiveSequence: 2,
+      documentType: Task.name,
+      messageHash: "hash-a",
+      message: "AQID",
+      writerProvenance: [{
+        changeHash: "a".repeat(64),
+        writerSchemaVersion: Task.version,
+        writerDefinitionHash: definition.hash
+      }]
+    }
+    // A message enqueued by a build without lineage has no such key. `Persisted` means it is
+    // replayed through this schema, so decoding it must succeed rather than fail the whole payload.
+    const replayed = Schema.decodeUnknownSync(DocumentEntity.ApplySync.payloadSchema)(wire)
+    assert.isUndefined(replayed.lineage)
+    assert.deepStrictEqual(
+      Schema.encodeUnknownSync(DocumentEntity.ApplySync.payloadSchema)(replayed),
+      wire
+    )
+
+    const carried = Schema.decodeUnknownSync(DocumentEntity.ApplySync.payloadSchema)({ ...wire, lineage })
+    assert.strictEqual(carried.lineage, lineage)
+    assert.deepStrictEqual(
+      Schema.encodeUnknownSync(DocumentEntity.ApplySync.payloadSchema)(carried),
+      { ...wire, lineage }
+    )
+
+    assert.throws(() =>
+      Schema.decodeUnknownSync(DocumentEntity.ApplySync.payloadSchema)({
+        ...wire,
+        lineage: "x".repeat(257)
+      })
+    )
   })
 
   it("persists RPCs in the shared SQL transaction without server interruption", () => {

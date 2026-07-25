@@ -36,6 +36,10 @@ const Manifest = Schema.Struct({
   declaredBytes: Schema.Int
 })
 
+// `lineage` is `optionalKey` on both archive records for the same reason `writer_provenance` is: an
+// archive written before the column existed carries no such field, and it has to keep importing.
+// Absent means genesis, which is exactly what the column's own default records, so the value is
+// normalized once at decode and required from there on.
 const DocumentRecord = Schema.Struct({
   document_id: Identity.DocumentId,
   document_type: Schema.String,
@@ -45,7 +49,8 @@ const DocumentRecord = Schema.Struct({
   accepted_heads: Schema.String,
   tombstone: Schema.Int,
   projection_status: Schema.String,
-  checkpoint_hash: Schema.NullOr(Schema.String)
+  checkpoint_hash: Schema.NullOr(Schema.String),
+  lineage: Schema.optionalKey(Identity.DocumentLineage)
 })
 
 const ChangeRecord = Schema.Struct({
@@ -72,7 +77,8 @@ const CheckpointRecord = Schema.Struct({
   checksum: Schema.String,
   commit_sequence: Schema.Int,
   verified: Schema.Int,
-  writer_provenance: Schema.optionalKey(WriterProvenance.ChangeProvenances)
+  writer_provenance: Schema.optionalKey(WriterProvenance.ChangeProvenances),
+  lineage: Schema.optionalKey(Identity.DocumentLineage)
 })
 
 const ReceiptRecord = Schema.Struct({
@@ -87,15 +93,23 @@ const ReceiptRecord = Schema.Struct({
 })
 
 const StoredChangeRecord = Schema.Struct({ ...ChangeRecord.fields, bytes: Schema.Uint8Array })
+// The durable columns are `NOT NULL DEFAULT ''`, so a row read out of SQLite always carries a
+// lineage even when it was added by migration 8. Only the archive shape tolerates its absence.
+const StoredDocumentRecord = Schema.Struct({
+  ...DocumentRecord.fields,
+  lineage: Identity.DocumentLineage
+})
 const StoredCheckpointRecord = Schema.Struct({
   ...CheckpointRecord.fields,
   bytes: Schema.Uint8Array,
-  writer_provenance: WriterProvenance.StoredChangeProvenances
+  writer_provenance: WriterProvenance.StoredChangeProvenances,
+  lineage: Identity.DocumentLineage
 })
 const DecodedCheckpointRecord = Schema.Struct({
   ...CheckpointRecord.fields,
   bytes: Schema.Uint8Array,
-  writer_provenance: WriterProvenance.ChangeProvenances
+  writer_provenance: WriterProvenance.ChangeProvenances,
+  lineage: Identity.DocumentLineage
 })
 const StoredReceiptRecord = Schema.Struct({ ...ReceiptRecord.fields, result: Schema.Uint8Array })
 
@@ -114,7 +128,7 @@ const EnvelopeJson = Schema.fromJsonString(Envelope)
 
 type Envelope = typeof Envelope.Type
 type RawDecodedRecord =
-  | { readonly kind: "Document"; readonly value: typeof DocumentRecord.Type }
+  | { readonly kind: "Document"; readonly value: typeof StoredDocumentRecord.Type }
   | { readonly kind: "Change"; readonly value: typeof StoredChangeRecord.Type }
   | {
     readonly kind: "Checkpoint"
@@ -149,6 +163,10 @@ const decodeBytes = (encoded: string) =>
       })
     )
   )
+
+/** Whether any of these rows sits on a lineage a history rewrite minted. */
+const carriesRewrittenLineage = (rows: ReadonlyArray<{ readonly lineage: Identity.DocumentLineage }>) =>
+  rows.some((row) => row.lineage !== Identity.genesisLineage)
 
 const exceedsJsonDepth = (value: unknown, limit: number) => {
   const pending: Array<readonly [unknown, number]> = [[value, 1]]
@@ -192,7 +210,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       const crypto = yield* Crypto.Crypto
       const findDocuments = SqlSchema.findAll({
         Request: Schema.Void,
-        Result: DocumentRecord,
+        Result: StoredDocumentRecord,
         execute: () => sql`SELECT * FROM effect_local_documents ORDER BY document_id`
       })
       const findChanges = SqlSchema.findAll({
@@ -222,7 +240,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             (SELECT COALESCE(SUM(
               length(document_id) + length(document_type) + length(observed_versions) +
               length(materialized_heads) + length(accepted_heads) + length(projection_status) +
-              length(COALESCE(checkpoint_hash, ''))
+              length(COALESCE(checkpoint_hash, '')) + length(lineage)
             ), 0) FROM effect_local_documents) +
             (SELECT COALESCE(SUM(
               length(change_hash) + length(document_id) + length(document_type) +
@@ -231,7 +249,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             ), 0) FROM effect_local_changes) +
             (SELECT COALESCE(SUM(
               length(checkpoint_hash) + length(document_id) + length(heads) + length(bytes) + length(checksum) +
-              length(writer_provenance)
+              length(writer_provenance) + length(lineage)
             ), 0) FROM effect_local_checkpoints) +
             (SELECT COALESCE(SUM(
               length(command_id) + length(request_hash) + length(mutation_name) + length(result) +
@@ -327,6 +345,12 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             const end = yield* encodeEnvelope("End", { recordCount: records.length, recordsChecksum })
             const recordLines = yield* Effect.forEach(records, encodeEnvelopeJson)
             const endLine = yield* encodeEnvelopeJson(end)
+            // Raised only when the archive actually carries a value a prior reader would drop.
+            // Checkpoints are inspected as well as documents so the predicate is exactly "this
+            // archive contains a non-genesis lineage" rather than resting on the document and
+            // checkpoint agreement that `Compaction` maintains and `Recovery` enforces.
+            const formatVersion: Backup.FormatVersion =
+              carriesRewrittenLineage(snapshot.documents) || carriesRewrittenLineage(snapshot.checkpoints) ? 2 : 1
             const createdAt = DateTime.formatIso(yield* DateTime.now)
             const encoder = new TextEncoder()
             const recordBytes = recordLines.map((line) => encoder.encode(`${line}\n`))
@@ -337,7 +361,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             let manifestBytes = new Uint8Array()
             for (let attempt = 0; attempt < 8; attempt++) {
               const manifest = yield* encodeEnvelope("Manifest", {
-                formatVersion: 1,
+                formatVersion,
                 definitionHash: definition.hash,
                 replicaId: identity.replicaId,
                 incarnation: identity.incarnation,
@@ -534,7 +558,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               switch (record.kind) {
                 case "Document": {
                   const value = yield* Schema.decodeUnknownEffect(DocumentRecord)(record.value)
-                  decoded.push({ kind: "Document", value })
+                  decoded.push({
+                    kind: "Document",
+                    value: { ...value, lineage: value.lineage ?? Identity.genesisLineage }
+                  })
                   break
                 }
                 case "Change": {
@@ -555,7 +582,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 case "Checkpoint": {
                   const encoded = yield* Schema.decodeUnknownEffect(CheckpointRecord)(record.value)
                   const bytes = yield* decodeBytes(encoded.bytes)
-                  decoded.push({ kind: "Checkpoint", value: { ...encoded, bytes } })
+                  decoded.push({
+                    kind: "Checkpoint",
+                    value: { ...encoded, bytes, lineage: encoded.lineage ?? Identity.genesisLineage }
+                  })
                   break
                 }
                 case "Receipt": {
@@ -583,7 +613,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 })
               ))
           )
-          const documentById = new Map<string, typeof DocumentRecord.Type>(
+          const documentById = new Map<string, typeof StoredDocumentRecord.Type>(
             rawDecoded.flatMap((record) =>
               record.kind === "Document" ? [[record.value.document_id, record.value] as const] : []
             )
