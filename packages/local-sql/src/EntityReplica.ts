@@ -12,7 +12,6 @@ import * as Layer from "effect/Layer"
 import * as RcMap from "effect/RcMap"
 import * as Schema from "effect/Schema"
 import * as Semaphore from "effect/Semaphore"
-import * as Stream from "effect/Stream"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
 import * as BackupStore from "./BackupStore.js"
 import * as CommandExecutor from "./CommandExecutor.js"
@@ -22,6 +21,7 @@ import * as DocumentStore from "./DocumentStore.js"
 import * as InternalAutomerge from "./internal/automerge.js"
 import * as QueryExecutor from "./QueryExecutor.js"
 import * as ReplicaGate from "./ReplicaGate.js"
+import * as ReplicaHealth from "./ReplicaHealth.js"
 
 const encode = <S extends Document.WireSchema,>(schema: S, value: S["Type"]) =>
   Schema.encodeEffect(Schema.fromJsonString(Schema.toCodecJson(schema)))(value).pipe(
@@ -57,6 +57,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
   | DocumentStore.DocumentStore
   | QueryExecutor.QueryExecutor
   | ReplicaGate.ReplicaGate
+  | ReplicaHealth.ReplicaHealth
   | ReplicaLimits.ReplicaLimits
   | Crypto.Crypto
   | Sharding.Sharding
@@ -71,6 +72,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       const entity = yield* DocumentEntity.DocumentEntity.client
       const queries = yield* QueryExecutor.QueryExecutor
       const gate = yield* ReplicaGate.ReplicaGate
+      const health = yield* ReplicaHealth.ReplicaHealth
       const limits = yield* ReplicaLimits.ReplicaLimits
       const crypto = yield* Crypto.Crypto
       const commandLocks = yield* RcMap.make({
@@ -220,7 +222,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         lookupCreate: (_document, commandId) => withPermit((permit) => commands.lookupCreate(commandId, permit)),
         lookupDelete: (_document, commandId) => withPermit((permit) => commands.lookupDelete(commandId, permit)),
         flush: withPermit(() => publisher.publishPending).pipe(Effect.asVoid),
-        status: Stream.succeed({ _tag: "Ready", pendingCommands: 0 }),
+        status: health.status,
         exportBackup: backups.export,
         restoreBackup: (options) =>
           backups.restore(options).pipe(

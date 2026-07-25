@@ -112,6 +112,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
   }
   const gate = ReplicaGate.ReplicaGate.of({
     current: Effect.succeed(permit),
+    claiming: Effect.succeed(false),
     shared: Effect.acquireRelease(Effect.succeed(permit), () => Effect.void),
     admit: Effect.acquireRelease(Effect.succeed(permit), () => Effect.void),
     claim: (use) => use(permit),
@@ -1461,6 +1462,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const connectedReplica = yield* Ref.make<Identity.ReplicaId | null>(null)
       const scopedGate = ReplicaGate.ReplicaGate.of({
         current: Ref.get(current),
+        claiming: Effect.succeed(false),
         shared: Effect.acquireRelease(
           Ref.set(sharedHeld, true).pipe(Effect.andThen(Ref.get(current))),
           () => Ref.set(sharedHeld, false)

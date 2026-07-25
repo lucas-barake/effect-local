@@ -24,6 +24,7 @@ import * as ProjectionStore from "./ProjectionStore.js"
 import * as Recovery from "./Recovery.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
 import * as ReplicaGate from "./ReplicaGate.js"
+import * as ReplicaHealth from "./ReplicaHealth.js"
 
 const Manifest = Schema.Struct({
   formatVersion: Backup.FormatVersion,
@@ -174,6 +175,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
   | ProjectionStore.ProjectionStore
   | ReplicaBootstrap.ReplicaBootstrap
   | ReplicaGate.ReplicaGate
+  | ReplicaHealth.ReplicaHealth
   | ReplicaLimits.ReplicaLimits
   | Crypto.Crypto
   | SqlClient.SqlClient
@@ -183,6 +185,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
     Effect.gen(function*() {
       yield* ReplicaBootstrap.ReplicaBootstrap
       const gate = yield* ReplicaGate.ReplicaGate
+      const health = yield* ReplicaHealth.ReplicaHealth
       const limits = yield* ReplicaLimits.ReplicaLimits
       const projections = yield* ProjectionStore.ProjectionStore
       const sql = yield* SqlClient.SqlClient
@@ -389,6 +392,9 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         options: Backup.RestoreOptions<R>
       ): Effect.Effect<void, ReplicaError.ReplicaError, R> =>
         Effect.gen(function*() {
+          // Ingest and installation are reported as two sequential conditions, not one overlapping pair:
+          // during ingest the replica still serves reads and writes, and only the install claim blocks them.
+          const reporter = yield* health.restoring
           const maxBytes = yield* Backup.validateMaxBytes(options.maxBytes)
           if (maxBytes > limits.maxBackupBytes) {
             return yield* new ReplicaError.ReplicaError({
@@ -422,7 +428,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                         })
                       })
                     )
-                    : Effect.succeed(chunk)
+                    : reporter.progress(bytes).pipe(Effect.as(chunk))
                 })
               )
             ),
@@ -742,7 +748,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               )
             )
             : manifest.replicaId
-          yield* gate.claim((permit) =>
+          yield* Effect.scoped(reporter.installing.pipe(Effect.andThen(gate.claim((permit) =>
             Effect.gen(function*() {
               const restoredPermit: ReplicaGate.Permit = {
                 ...permit,
@@ -850,8 +856,8 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               }
               yield* gate.validate(restoredPermit)
             })
-          )
-        }).pipe(
+          ))))
+        }).pipe(Effect.scoped).pipe(
           Effect.catchTags({
             SchemaError: (cause) =>
               Effect.fail(

@@ -38,6 +38,13 @@ type Acquirer = "shared" | "exclusive" | "bounded"
 
 export class ReplicaGate extends Context.Service<ReplicaGate, {
   readonly current: Effect.Effect<Permit>
+  /**
+   * Whether an exclusive claim owns the replica right now. `current` lags the database for as long as a
+   * claim is running, because the claim bumps `writer_generation` inside its transaction and republishes
+   * the matching permit only once that transaction has committed. An observer that compares the two has to
+   * know that the disagreement belongs to this process, not to a foreign writer that fenced the replica.
+   */
+  readonly claiming: Effect.Effect<boolean>
   readonly shared: Effect.Effect<Permit, never, Scope.Scope>
   readonly admit: Effect.Effect<Permit, ReplicaError.ReplicaError, Scope.Scope>
   readonly claim: <A, E, R,>(
@@ -320,6 +327,9 @@ export const layer: Layer.Layer<
       }
       return {
         current: Ref.get(state),
+        // `writer` is set before `run` and cleared only after `run` has republished `state`, so a `false`
+        // here proves `state` already carries the generation of the last claim that touched the database.
+        claiming: Ref.get(writer).pipe(Effect.map((owner) => owner !== null)),
         refresh: readState.pipe(Effect.tap((next) => Ref.set(state, next))),
         shared: sharedWith(acquire),
         admit: sharedWith(acquireBounded),

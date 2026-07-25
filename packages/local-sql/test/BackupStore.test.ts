@@ -27,6 +27,7 @@ import * as ProjectionStore from "../src/ProjectionStore.js"
 import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
+import * as ReplicaHealth from "../src/ReplicaHealth.js"
 import * as SqlProjection from "../src/SqlProjection.js"
 
 describe("BackupStore", () => {
@@ -120,7 +121,10 @@ describe("BackupStore", () => {
   const Store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Base, Gate)))
   const Projections = ProjectionStore.layer([]).pipe(Layer.provide(Base))
   const Limits = ReplicaLimits.layer(limits)
-  const Backup = BackupStore.layer(definition).pipe(Layer.provide(Layer.mergeAll(Base, Gate, Limits, Projections)))
+  const Health = ReplicaHealth.layer(definition).pipe(Layer.provide(Layer.merge(Base, Gate)))
+  const Backup = BackupStore.layer(definition).pipe(
+    Layer.provide(Layer.mergeAll(Base, Gate, Limits, Projections, Health))
+  )
   const Live = Layer.mergeAll(Base, Gate, Store, Limits, Projections, Backup)
   const RecoveryService = Recovery.layer.pipe(Layer.provide(Live))
   const CompactionService = Compaction.layer.pipe(Layer.provide(Layer.merge(Live, RecoveryService)))
@@ -132,8 +136,11 @@ describe("BackupStore", () => {
   const ProjectedProjections = ProjectionStore.layer([TaskListSql]).pipe(
     Layer.provide(Layer.merge(ProjectedBase, TaskListSql.layer))
   )
+  const ProjectedHealth = ReplicaHealth.layer(projectedDefinition).pipe(
+    Layer.provide(Layer.merge(ProjectedBase, ProjectedGate))
+  )
   const ProjectedBackup = BackupStore.layer(projectedDefinition).pipe(
-    Layer.provide(Layer.mergeAll(ProjectedBase, ProjectedGate, Limits, ProjectedProjections))
+    Layer.provide(Layer.mergeAll(ProjectedBase, ProjectedGate, Limits, ProjectedProjections, ProjectedHealth))
   )
   const ProjectedLive = Layer.mergeAll(
     ProjectedBase,
@@ -163,7 +170,7 @@ describe("BackupStore", () => {
   // layers below `ReplicaLimits` (`Base`, `Gate`, `Store`, `Projections`), which do not read limits.
   const smallArchiveRecords = 8
   const SmallLimits = ReplicaLimits.layer({ ...limits, maxArchiveRecords: smallArchiveRecords })
-  const SmallInfrastructure = Layer.mergeAll(Base, Gate, Store, Projections, SmallLimits)
+  const SmallInfrastructure = Layer.mergeAll(Base, Gate, Store, Projections, SmallLimits, Health)
   const SmallBackup = BackupStore.layer(definition).pipe(Layer.provide(SmallInfrastructure))
   const SmallRecovery = Recovery.layer.pipe(Layer.provide(SmallInfrastructure))
   const SmallCompaction = Compaction.layer.pipe(Layer.provide(Layer.merge(SmallInfrastructure, SmallRecovery)))
@@ -199,7 +206,17 @@ describe("BackupStore", () => {
   const MutatedGate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(MutatedBase))
   const MutatedStore = DocumentStore.layer.pipe(Layer.provide(Layer.merge(MutatedBase, MutatedGate)))
   const MutatedProjections = ProjectionStore.layer([]).pipe(Layer.provide(MutatedBase))
-  const MutatedInfrastructure = Layer.mergeAll(MutatedBase, MutatedGate, MutatedStore, MutatedProjections, Limits)
+  const MutatedHealth = ReplicaHealth.layer(mutatedDefinition).pipe(
+    Layer.provide(Layer.merge(MutatedBase, MutatedGate))
+  )
+  const MutatedInfrastructure = Layer.mergeAll(
+    MutatedBase,
+    MutatedGate,
+    MutatedStore,
+    MutatedProjections,
+    Limits,
+    MutatedHealth
+  )
   const MutatedBackup = BackupStore.layer(mutatedDefinition).pipe(Layer.provide(MutatedInfrastructure))
   const MutatedRecovery = Recovery.layer.pipe(Layer.provide(MutatedInfrastructure))
   const MutatedCompaction = Compaction.layer.pipe(

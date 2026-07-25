@@ -110,6 +110,7 @@ describe("DocumentEntity", () => {
   const replicaGate = (permit: ReplicaGate.Permit) =>
     ReplicaGate.ReplicaGate.of({
       current: Effect.succeed(permit),
+      claiming: Effect.succeed(false),
       shared: Effect.die("unused"),
       admit: Effect.die("unused"),
       claim: (use) => use(permit),

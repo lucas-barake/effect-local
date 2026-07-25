@@ -10,7 +10,6 @@ import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
-import * as Stream from "effect/Stream"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import type * as Migrator from "effect/unstable/sql/Migrator"
@@ -31,6 +30,7 @@ import * as Recovery from "./Recovery.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
 import * as ReplicaEvolution from "./ReplicaEvolution.js"
 import * as ReplicaGate from "./ReplicaGate.js"
+import * as ReplicaHealth from "./ReplicaHealth.js"
 import type * as ReplicaWorkflow from "./ReplicaWorkflow.js"
 import type * as SqlProjection from "./SqlProjection.js"
 
@@ -43,6 +43,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
   | DocumentStore.DocumentStore
   | QueryExecutor.QueryExecutor
   | ReplicaGate.ReplicaGate
+  | ReplicaHealth.ReplicaHealth
   | Crypto.Crypto
 > =>
   Layer.effect(
@@ -54,6 +55,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
       const documents = yield* DocumentStore.DocumentStore
       const queries = yield* QueryExecutor.QueryExecutor
       const gate = yield* ReplicaGate.ReplicaGate
+      const health = yield* ReplicaHealth.ReplicaHealth
       const crypto = yield* Crypto.Crypto
 
       const withPermit = <A, E, R,>(f: (permit: ReplicaGate.Permit) => Effect.Effect<A, E, R>) =>
@@ -135,7 +137,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
         lookupCreate: (_document, commandId) => withPermit((permit) => commands.lookupCreate(commandId, permit)),
         lookupDelete: (_document, commandId) => withPermit((permit) => commands.lookupDelete(commandId, permit)),
         flush: withPermit(() => publisher.publishPending).pipe(Effect.asVoid),
-        status: Stream.succeed({ _tag: "Ready", pendingCommands: 0 }),
+        status: health.status,
         exportBackup: backups.export,
         restoreBackup: (options) =>
           backups.restore(options).pipe(
@@ -206,7 +208,8 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   const compaction = Compaction.layer.pipe(Layer.provideMerge(recovery))
   const projections = ProjectionStore.layer(options.projections).pipe(Layer.provideMerge(store))
   const evolution = ReplicaEvolution.layer(definition).pipe(Layer.provideMerge(projections))
-  const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(evolution))
+  const health = ReplicaHealth.layer(definition).pipe(Layer.provideMerge(evolution))
+  const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(health))
   const queries = QueryExecutor.layer(definition).pipe(
     Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
   )

@@ -10,6 +10,7 @@ import * as Projection from "@lucas-barake/effect-local/Projection"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
@@ -31,6 +32,7 @@ import * as QueryExecutor from "../src/QueryExecutor.js"
 import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
+import * as ReplicaHealth from "../src/ReplicaHealth.js"
 import * as ReplicaWorkflow from "../src/ReplicaWorkflow.js"
 import * as SqlProjection from "../src/SqlProjection.js"
 import * as SqlReplica from "../src/SqlReplica.js"
@@ -331,7 +333,8 @@ describe("SqlReplica", () => {
       const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
       const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
       const projections = ProjectionStore.layer([]).pipe(Layer.provideMerge(store))
-      const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(projections))
+      const health = ReplicaHealth.layer(definition).pipe(Layer.provideMerge(projections))
+      const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(health))
       const queries = QueryExecutor.layer(definition).pipe(
         Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
       )
@@ -414,7 +417,8 @@ describe("SqlReplica", () => {
       const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
       const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
       const projections = ProjectionStore.layer([]).pipe(Layer.provideMerge(store))
-      const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(projections))
+      const health = ReplicaHealth.layer(definition).pipe(Layer.provideMerge(projections))
+      const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(health))
       const queries = QueryExecutor.layer(definition).pipe(
         Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
       )
@@ -461,4 +465,86 @@ describe("SqlReplica", () => {
         assert.isTrue(invalidated)
       }).pipe(Effect.scoped, Effect.provide(services))
     }))
+  const statusServices = Effect.gen(function*() {
+    const database = Layer.merge(
+      SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+      NodeCrypto.layer
+    )
+    const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provideMerge(database))
+    const infrastructure = Layer.merge(bootstrap, Limits)
+    const gate = ReplicaGate.layer.pipe(Layer.provideMerge(infrastructure))
+    const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
+    const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
+    const projections = ProjectionStore.layer([]).pipe(Layer.provideMerge(store))
+    const health = ReplicaHealth.layer(definition).pipe(Layer.provideMerge(projections))
+    const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(health))
+    const queries = QueryExecutor.layer(definition).pipe(
+      Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
+    )
+    const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
+    const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
+    const direct = SqlReplica.layerFromServices(definition).pipe(Layer.provideMerge(backups))
+    return Layer.merge(direct, Reactivity.layer).pipe(Layer.provide(Handler))
+  })
+
+  it.effect("reports unpublished commits as pending commands", () =>
+    Effect.gen(function*() {
+      const services = yield* statusServices
+      yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const sql = yield* SqlClient.SqlClient
+        yield* sql`INSERT INTO effect_local_commit_outbox
+          (commit_sequence, document_id, invalidation_keys, published)
+          VALUES (9001, 'doc_00000000-0000-4000-8000-000000000001', '["Task"]', 0)`
+        yield* sql`INSERT INTO effect_local_commit_outbox
+          (commit_sequence, document_id, invalidation_keys, published)
+          VALUES (9002, 'doc_00000000-0000-4000-8000-000000000002', '["Task"]', 0)`
+        assert.deepStrictEqual(
+          yield* Stream.runHead(replica.status),
+          Option.some<ReplicaStatus.ReplicaStatus>({ _tag: "Ready", pendingCommands: 2 })
+        )
+        yield* replica.flush
+        assert.deepStrictEqual(
+          yield* Stream.runHead(replica.status),
+          Option.some<ReplicaStatus.ReplicaStatus>({ _tag: "Ready", pendingCommands: 0 })
+        )
+      }).pipe(Effect.scoped, Effect.provide(services))
+    }))
+
+  it.effect("keeps the status stream open", () =>
+    Effect.gen(function*() {
+      const services = yield* statusServices
+      yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const ended = yield* Deferred.make<void>()
+        const consumer = yield* replica.status.pipe(
+          Stream.runDrain,
+          Effect.andThen(Deferred.succeed(ended, undefined)),
+          Effect.forkChild
+        )
+        yield* Effect.yieldNow
+        assert.isTrue(Option.isNone(yield* Deferred.poll(ended)))
+        yield* Fiber.interrupt(consumer)
+      }).pipe(Effect.scoped, Effect.provide(services))
+    }))
+  it.effect("reports pending commands through the sharded replica layer", () =>
+    Effect.gen(function*() {
+      const replica = yield* Replica.Replica
+      const sql = yield* SqlClient.SqlClient
+      yield* sql`INSERT INTO effect_local_commit_outbox
+        (commit_sequence, document_id, invalidation_keys, published)
+        VALUES (9101, 'doc_00000000-0000-4000-8000-000000000011', '["Task"]', 0)`
+      yield* sql`INSERT INTO effect_local_commit_outbox
+        (commit_sequence, document_id, invalidation_keys, published)
+        VALUES (9102, 'doc_00000000-0000-4000-8000-000000000012', '["Task"]', 0)`
+      assert.deepStrictEqual(
+        yield* Stream.runHead(replica.status),
+        Option.some<ReplicaStatus.ReplicaStatus>({ _tag: "Ready", pendingCommands: 2 })
+      )
+      yield* replica.flush
+      assert.deepStrictEqual(
+        yield* Stream.runHead(replica.status),
+        Option.some<ReplicaStatus.ReplicaStatus>({ _tag: "Ready", pendingCommands: 0 })
+      )
+    }).pipe(Effect.provide(Live), Effect.provide(Database), TestClock.withLive))
 })

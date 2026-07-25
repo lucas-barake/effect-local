@@ -27,6 +27,7 @@ import * as QueryExecutor from "../src/QueryExecutor.js"
 import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
+import * as ReplicaHealth from "../src/ReplicaHealth.js"
 
 describe("EntityReplica in-flight command limit", () => {
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
@@ -79,7 +80,8 @@ describe("EntityReplica in-flight command limit", () => {
     const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
     const compaction = Compaction.layer.pipe(Layer.provideMerge(recovery))
     const projections = ProjectionStore.layer([]).pipe(Layer.provideMerge(store))
-    const commands = Layer.merge(executor, projections)
+    const health = ReplicaHealth.layer(definition).pipe(Layer.provideMerge(projections))
+    const commands = Layer.merge(executor, health)
     const queries = QueryExecutor.layer(definition).pipe(
       Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
     )
