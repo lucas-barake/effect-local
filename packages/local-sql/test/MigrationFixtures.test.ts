@@ -1,6 +1,7 @@
 import { NodeFileSystem } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Effect from "effect/Effect"
 import { FileSystem } from "effect/FileSystem"
 import * as Schema from "effect/Schema"
@@ -169,7 +170,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         accepted_heads: Schema.String,
         tombstone: Schema.Int,
         projection_status: Schema.String,
-        checkpoint_hash: Schema.NullOr(Schema.String)
+        checkpoint_hash: Schema.NullOr(Schema.String),
+        lineage: Identity.DocumentLineage
       }),
       execute: () => sql`SELECT * FROM effect_local_documents ORDER BY document_id`
     })(undefined)
@@ -182,7 +184,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
       accepted_heads: "[]",
       tombstone: 0,
       projection_status: "ready",
-      checkpoint_hash: null
+      checkpoint_hash: null,
+      lineage: Identity.genesisLineage
     }])
 
     const checkpoints = yield* SqlSchema.findAll({
@@ -195,7 +198,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         checksum: Schema.String,
         commit_sequence: Schema.Int,
         verified: Schema.Int,
-        writer_provenance: Schema.String
+        writer_provenance: Schema.String,
+        lineage: Identity.DocumentLineage
       }),
       execute: () => sql`SELECT * FROM effect_local_checkpoints ORDER BY checkpoint_hash`
     })(undefined)
@@ -208,7 +212,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         checksum: "checksum-1",
         commit_sequence: 1,
         verified: 1,
-        writer_provenance: "[]"
+        writer_provenance: "[]",
+        lineage: Identity.genesisLineage
       },
       {
         checkpoint_hash: "checkpoint-3",
@@ -218,7 +223,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         checksum: "checksum-3",
         commit_sequence: 3,
         verified: 1,
-        writer_provenance: "[]"
+        writer_provenance: "[]",
+        lineage: Identity.genesisLineage
       }
     ])
 
@@ -235,7 +241,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         heads: Schema.String,
         status: Schema.String,
         created_at: Schema.String,
-        writer_provenance: Schema.String
+        writer_provenance: Schema.String,
+        lineage: Identity.DocumentLineage
       }),
       execute: () => sql`SELECT * FROM effect_local_peer_outbox ORDER BY send_sequence`
     })(undefined)
@@ -255,7 +262,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         message_hash: "message-1",
         heads: "[]",
         status: "pending",
-        writer_provenance: "[]"
+        writer_provenance: "[]",
+        lineage: Identity.genesisLineage
       }]
     )
     const createdAt = outbox[0]?.created_at ?? ""
