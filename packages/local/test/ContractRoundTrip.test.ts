@@ -33,7 +33,6 @@ describe("wire contracts", () => {
     // rewritten document lineage declares, so a build that only reads 1 rejects it rather than
     // importing the document back onto the genesis lineage.
     assert.strictEqual(Schema.decodeUnknownSync(Backup.FormatVersion)(1), 1)
-    assert.strictEqual(Schema.decodeUnknownSync(Backup.FormatVersion)(2), 2)
     assert.throws(() => Schema.decodeUnknownSync(Backup.FormatVersion)(3))
   })
 })

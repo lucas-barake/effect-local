@@ -1318,15 +1318,13 @@ lineage.
    that the **local** document is stale. Confirm on this replica that a rewrite actually ran, through the workflow
    result or the document's own lineage, before acting on a refusal.
 
-**Recovery for a refused peer replaces its obsolete canonical state.** An archive that contains a rewritten lineage
-uses backup format 2 and carries that lineage on every document and checkpoint record. Restore preserves it. A
-pre-lineage format 1 archive may omit the field and restores those records as genesis. To repair a refusal, export
-the authoritative replica after the rewrite and clone restore that archive onto the refused replica. Use replace
-restore only when the archive source replica has been retired, because replace adopts the source replica identity.
-Either mode discards the refused replica's old canonical state, including any unsynced change on the superseded
-lineage. Those changes have no causal relationship to the new root and cannot be merged safely. This destructive
-recovery requirement is the main reason history rewrite is opt in and operator driven rather than a background
-policy.
+**Recovery for a refused peer replaces its obsolete canonical state.** Canonical archives carry lineage on every
+document and checkpoint record, and restore preserves it. To repair a refusal, export the authoritative replica after
+the rewrite and clone restore that archive onto the refused replica. Use replace restore only when the archive source
+replica has been retired, because replace adopts the source replica identity. Either mode discards the refused
+replica's old canonical state, including any unsynced change on the superseded lineage. Those changes have no causal
+relationship to the new root and cannot be merged safely. This destructive recovery requirement is the main reason
+history rewrite is opt in and operator driven rather than a background policy.
 
 ### 15. Write deterministic tests
 
