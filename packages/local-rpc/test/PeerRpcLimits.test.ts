@@ -27,7 +27,13 @@ const replicaLimits = ReplicaLimits.Values.make({
   maxSessions: 1,
   maxStreamsPerSession: 1,
   maxInFlightPerSession: 1,
-  maxQueuedRpc: 1
+  maxQueuedRpc: 1,
+  maxActiveRestores: 1,
+  maxRestoresPerSession: 1,
+  maxRestoreMillis: 30_000,
+  maxRestorePullMillis: 10_000,
+  maxRestoreCoalesceMillis: 25,
+  maxRestoreErrorBytes: 4_096
 })
 
 describe("PeerRpcLimits", () => {

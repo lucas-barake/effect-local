@@ -88,7 +88,13 @@ const replicaLimits = ReplicaLimits.Values.make({
   maxSessions: 8,
   maxStreamsPerSession: 4,
   maxInFlightPerSession: 1,
-  maxQueuedRpc: 32
+  maxQueuedRpc: 32,
+  maxActiveRestores: 32,
+  maxRestoresPerSession: 1,
+  maxRestoreMillis: 30_000,
+  maxRestorePullMillis: 10_000,
+  maxRestoreCoalesceMillis: 25,
+  maxRestoreErrorBytes: 4_096
 })
 const maximumWriterProvenance = Array.from(
   { length: replicaLimits.maxSyncChangesPerMessage },

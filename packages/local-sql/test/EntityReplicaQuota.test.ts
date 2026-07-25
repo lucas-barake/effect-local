@@ -60,7 +60,13 @@ describe("EntityReplica in-flight command limit", () => {
     maxSessions: 8,
     maxStreamsPerSession: 4,
     maxInFlightPerSession: 16,
-    maxQueuedRpc: 1
+    maxQueuedRpc: 1,
+    maxActiveRestores: 1,
+    maxRestoresPerSession: 16,
+    maxRestoreMillis: 30_000,
+    maxRestorePullMillis: 10_000,
+    maxRestoreCoalesceMillis: 25,
+    maxRestoreErrorBytes: 4_096
   }
 
   const buildLive = (executor: Layer.Layer<CommandExecutor.CommandExecutor>) => {

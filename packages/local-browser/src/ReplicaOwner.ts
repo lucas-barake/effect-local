@@ -1,4 +1,5 @@
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
+import * as Backup from "@lucas-barake/effect-local/Backup"
 import type * as Document from "@lucas-barake/effect-local/Document"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import type * as Query from "@lucas-barake/effect-local/Query"
@@ -11,6 +12,7 @@ import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { RpcServer } from "effect/unstable/rpc"
+import * as RestoreTransport from "./internal/RestoreTransport.js"
 import * as Wire from "./internal/wire.js"
 import * as ReplicaRpc from "./ReplicaRpc.js"
 import * as SessionManager from "./SessionManager.js"
@@ -37,6 +39,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
   ReplicaRpc.group.toLayer(Effect.gen(function*() {
     const replica = yield* Replica.Replica
     const sessions = yield* SessionManager.SessionManager
+    const restoreTransport = yield* RestoreTransport.RestoreTransport
     const commits = yield* CommitPublisher.CommitPublisher
     const crypto = yield* Crypto.Crypto
     const ownerEpoch = yield* crypto.randomUUIDv4.pipe(
@@ -65,7 +68,10 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
             leaseMillis: SessionManager.leaseDurationMillis,
             protocolVersion: ReplicaRpc.protocolVersion,
             definitionHash: definition.hash,
-            ownerEpoch
+            ownerEpoch,
+            maxChunkBytes: sessions.maxChunkBytes,
+            maxRestoreCoalesceMillis: sessions.maxRestoreCoalesceMillis,
+            maxRestoreErrorBytes: sessions.maxRestoreErrorBytes
           }))
           : Effect.fail(
             new ReplicaError.ReplicaError({
@@ -235,18 +241,41 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
             Stream.map((chunk) => new Uint8Array(chunk))
           )
         ),
-      RestoreBackup: ({ chunks, expectedDefinitionHash, installationId, maxBytes, mode, sessionId }, { client }) =>
+      RestoreBackup: ({ sessionId }, { client }) =>
         sessions.run(
           sessionId,
           client.id,
-          replica.restoreBackup({
-            source: Stream.fromIterable(chunks),
-            expectedDefinitionHash,
-            installationId,
-            maxBytes,
-            mode
-          })
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: "BeginRestoreBackupV4",
+                observed: "RestoreBackup"
+              })
+            })
+          )
         ),
+      BeginRestoreBackupV4: (
+        { expectedDefinitionHash, installationId, maxBytes, mode, sessionId },
+        { client }
+      ) =>
+        Backup.validateMaxBytes(maxBytes).pipe(
+          Effect.flatMap((validatedMaxBytes) =>
+            restoreTransport.begin({
+              sessionId,
+              clientId: client.id,
+              mode,
+              maxBytes: validatedMaxBytes,
+              expectedDefinitionHash,
+              installationId
+            })
+          )
+        ),
+      FinishRestoreBackupV4: ({ nonce, sessionId }, { client }) =>
+        restoreTransport.finish({
+          sessionId,
+          clientId: client.id,
+          nonce
+        }),
       ExportDocument: ({ document, documentId, sessionId }, { client }) =>
         sessions.run(
           sessionId,
@@ -281,7 +310,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           )
         )
     })
-  }))
+  })).pipe(Layer.provide(RestoreTransport.freshLayer))
 
 export const layer = (definition: ReplicaDefinition.Any) =>
   RpcServer.layer(ReplicaRpc.group).pipe(Layer.provide(layerHandlers(definition)))

@@ -46,7 +46,13 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
     maxSessions: 2,
     maxStreamsPerSession: 2,
     maxInFlightPerSession: 2,
-    maxQueuedRpc: 4
+    maxQueuedRpc: 4,
+    maxActiveRestores: 4,
+    maxRestoresPerSession: 2,
+    maxRestoreMillis: 30_000,
+    maxRestorePullMillis: 10_000,
+    maxRestoreCoalesceMillis: 25,
+    maxRestoreErrorBytes: 4_096
   } satisfies ReplicaLimits.Values
   const Sessions = SessionManager.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)))
   const Publisher = Layer.succeed(

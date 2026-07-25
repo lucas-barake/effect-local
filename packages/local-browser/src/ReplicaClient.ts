@@ -4,15 +4,21 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import * as Cause from "effect/Cause"
+import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as PubSub from "effect/PubSub"
+import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
@@ -21,6 +27,7 @@ import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
 import { RpcClient } from "effect/unstable/rpc"
 import * as RpcClientError from "effect/unstable/rpc/RpcClientError"
+import * as RestoreProtocol from "./internal/restoreProtocol.js"
 import * as Wire from "./internal/wire.js"
 import * as ReplicaRpc from "./ReplicaRpc.js"
 
@@ -41,6 +48,106 @@ export interface TimeoutOptions {
 
 export const defaultSessionTimeout: Duration.Duration = Duration.seconds(10)
 export const defaultOperationTimeout: Duration.Duration = Duration.seconds(30)
+
+class RestoreBackupError extends Schema.TaggedErrorClass<RestoreBackupError>(
+  "@lucas-barake/effect-local-browser/ReplicaClient/RestoreBackupError"
+)("RestoreBackupError", {
+  error: ReplicaError.ReplicaError
+}) {}
+
+const isAuthoritativeRestoreResult = (
+  exit: Exit.Exit<void, ReplicaError.ReplicaError | RestoreBackupError>
+): boolean =>
+  Exit.isSuccess(exit) ||
+  exit.cause.reasons.every((reason) =>
+    !Cause.isFailReason(reason) ||
+    reason.error._tag !== "RestoreBackupError" ||
+    reason.error.error.reason._tag !== "StorageUnavailable" ||
+    !Schema.is(RpcClientError.RpcClientError)(reason.error.error.reason.cause)
+  )
+
+const acceptedProtocolMismatch = (
+  exit: Exit.Exit<void, ReplicaError.ReplicaError | RestoreBackupError>
+): ReplicaError.ReplicaError | undefined => {
+  if (Exit.isSuccess(exit) || exit.cause.reasons.length !== 1) return undefined
+  const reason = exit.cause.reasons[0]
+  if (reason === undefined || !Cause.isFailReason(reason)) return undefined
+  if (reason.error._tag === "RestoreBackupError") return undefined
+  return reason.error.reason._tag === "ProtocolMismatch" ? reason.error : undefined
+}
+
+const protocolFailure = (observed: string) =>
+  new ReplicaError.ReplicaError({
+    reason: new ReplicaError.ProtocolMismatch({
+      expected: "restore protocol version 4",
+      observed
+    })
+  })
+
+const storageFailure = (cause: unknown) =>
+  new ReplicaError.ReplicaError({
+    reason: new ReplicaError.StorageUnavailable({
+      cause
+    })
+  })
+
+const isPositiveSafeInteger = (value: unknown): value is number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value > 0
+
+const isNativeErrorNamed = (value: unknown, name: string): boolean => {
+  if (typeof value !== "object" || value === null) return false
+  try {
+    return Object.prototype.toString.call(value) === "[object DOMException]" &&
+      Reflect.get(value, "name") === name
+  } catch {
+    return false
+  }
+}
+
+const isDataCloneError = (value: unknown): boolean => isNativeErrorNamed(value, "DataCloneError")
+
+const ownDataProperties = (
+  value: object,
+  maxProperties: number
+): ReadonlyMap<string, unknown> | undefined => {
+  const properties = new Map<string, unknown>()
+  try {
+    for (const key in value) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) continue
+      if (properties.size >= maxProperties) return undefined
+      const descriptor = Object.getOwnPropertyDescriptor(value, key)
+      if (descriptor === undefined || !("value" in descriptor)) return undefined
+      properties.set(key, descriptor.value)
+    }
+    return properties
+  } catch {
+    return undefined
+  }
+}
+
+const preflightOwnerFrame = (value: unknown): boolean => {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false
+  const properties = ownDataProperties(value, 4)
+  if (properties === undefined) return false
+  const tag = properties.get("_tag")
+  const nonce = properties.get("nonce")
+  const sequence = properties.get("sequence")
+  if (
+    typeof tag !== "string" ||
+    tag.length > 32 ||
+    typeof nonce !== "string" ||
+    nonce.length > 64 ||
+    !Number.isSafeInteger(sequence) ||
+    (sequence as number) < 0
+  ) return false
+  const expectedFields = RestoreProtocol.ownerToPageFrameFields[tag]
+  if (
+    expectedFields === undefined ||
+    properties.size !== expectedFields.size ||
+    Array.from(expectedFields).some((field) => !properties.has(field))
+  ) return false
+  return true
+}
 
 const isTransient = (error: ReplicaError.ReplicaError) => error.reason._tag === "StorageUnavailable"
 
@@ -154,7 +261,25 @@ export const fromRpcClient = (
           )),
         Effect.onInterrupt(() => Effect.ignore(closeSession(sessionId)))
       )
-      if (lease.protocolVersion !== ReplicaRpc.protocolVersion || lease.definitionHash !== definition.hash) {
+      if (lease.protocolVersion !== ReplicaRpc.protocolVersion) {
+        yield* Effect.ignore(closeSession(sessionId))
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.ProtocolMismatch({
+            expected: `protocol version ${ReplicaRpc.protocolVersion}`,
+            observed: `protocol version ${lease.protocolVersion}`
+          })
+        })
+      }
+      if (
+        !isPositiveSafeInteger(lease.maxChunkBytes) ||
+        !isPositiveSafeInteger(lease.maxRestoreCoalesceMillis) ||
+        !isPositiveSafeInteger(lease.maxRestoreErrorBytes) ||
+        lease.maxRestoreErrorBytes < ReplicaLimits.minimumRestoreErrorBytes
+      ) {
+        yield* Effect.ignore(closeSession(sessionId))
+        return yield* protocolFailure("invalid advertised restore limits")
+      }
+      if (lease.definitionHash !== definition.hash) {
         yield* Effect.ignore(closeSession(sessionId))
         return yield* new ReplicaError.ReplicaError({
           reason: new ReplicaError.ProtocolMismatch({
@@ -163,7 +288,15 @@ export const fromRpcClient = (
           })
         })
       }
-      return { sessionId, lease }
+      return {
+        sessionId,
+        lease: {
+          ...lease,
+          maxChunkBytes: lease.maxChunkBytes,
+          maxRestoreCoalesceMillis: lease.maxRestoreCoalesceMillis,
+          maxRestoreErrorBytes: lease.maxRestoreErrorBytes
+        }
+      }
     })
     const newSession = makeSessionId.pipe(Effect.flatMap(openSession))
     const sessions = yield* Effect.acquireRelease(
@@ -252,6 +385,9 @@ export const fromRpcClient = (
       options?: {
         readonly boundOperation?: boolean
         readonly replayAfterReopen?: boolean
+        readonly replaceSession?: (
+          stale: Session
+        ) => Effect.Effect<Session, ReplicaError.ReplicaError>
       }
     ) => {
       const bounded = (session: Session) =>
@@ -259,12 +395,21 @@ export const fromRpcClient = (
       return SubscriptionRef.get(sessions).pipe(
         Effect.flatMap((session) =>
           bounded(session).pipe(
-            Effect.catchTag("ReplicaError", (error) =>
-              Schema.is(ReplicaError.ReplicaError)(error) && error.reason._tag === "ProtocolMismatch"
-                ? options?.replayAfterReopen === false
-                  ? reopen(session).pipe(Effect.andThen(Effect.fail(error)))
-                  : reopen(session).pipe(Effect.flatMap(bounded))
-                : Effect.fail(error))
+            Effect.catchCause((cause) => {
+              const reason = cause.reasons.length === 1 ? cause.reasons[0] : undefined
+              if (
+                reason === undefined ||
+                !Cause.isFailReason(reason) ||
+                !Schema.is(ReplicaError.ReplicaError)(reason.error) ||
+                reason.error.reason._tag !== "ProtocolMismatch"
+              ) {
+                return Effect.failCause(cause)
+              }
+              const replaceSession = options?.replaceSession ?? reopen
+              return options?.replayAfterReopen === false
+                ? replaceSession(session).pipe(Effect.andThen(Effect.fail(reason.error)))
+                : replaceSession(session).pipe(Effect.flatMap(bounded))
+            })
           )
         )
       )
@@ -460,6 +605,469 @@ export const fromRpcClient = (
         )
       )
     )
+    const serveRestoreSource = <R,>(
+      source: Stream.Stream<Uint8Array, ReplicaError.ReplicaError, R>,
+      port: MessagePort,
+      nonce: RestoreProtocol.RestoreNonce,
+      maxBytes: number,
+      maxChunkBytes: number,
+      maxCoalesceMillis: number,
+      maxErrorBytes: number,
+      closePort: () => void,
+      awaitResult: Effect.Effect<void, ReplicaError.ReplicaError | RestoreBackupError>,
+      acceptResult: (
+        exit: Exit.Exit<void, ReplicaError.ReplicaError | RestoreBackupError>
+      ) => Effect.Effect<void, ReplicaError.ReplicaError>
+    ): Effect.Effect<void, ReplicaError.ReplicaError | RestoreBackupError, R> =>
+      Effect.scoped(
+        Effect.gen(function*() {
+          const credits = yield* Queue.bounded<RestoreProtocol.Pull>(1)
+          const terminal = yield* Deferred.make<RestoreProtocol.TerminalReady>()
+          const released = yield* Deferred.make<void>()
+          const acceptedResultDisconnect = yield* Deferred.make<void>()
+          const localFailure = yield* Deferred.make<never, RestoreBackupError>()
+          let logicalOpen = true
+          let terminalAccepted = false
+          let resultAccepted = false
+          let terminalAckPosted = false
+          let expectedOwnerSequence = 1
+          let pullOutstanding = false
+          let sourceComplete = false
+          let sourceWorker: Fiber.Fiber<void, ReplicaError.ReplicaError> | undefined
+
+          const removeListeners = () => {
+            port.removeEventListener("message", onMessage)
+            port.removeEventListener("messageerror", onMessageError)
+            port.removeEventListener("close", onClose)
+          }
+          const stopIngress = () => {
+            if (!logicalOpen) return
+            logicalOpen = false
+            removeListeners()
+            closePort()
+          }
+          const failClosed = (error: ReplicaError.ReplicaError) => {
+            stopIngress()
+            if (terminalAccepted) {
+              Deferred.doneUnsafe(released, Effect.void)
+            } else if (resultAccepted) {
+              Deferred.doneUnsafe(acceptedResultDisconnect, Effect.void)
+            } else {
+              Deferred.doneUnsafe(
+                localFailure,
+                Effect.fail(new RestoreBackupError({ error }))
+              )
+            }
+            sourceWorker?.interruptUnsafe()
+          }
+          const decodeOwnerFrame = (
+            value: unknown
+          ): Exit.Exit<RestoreProtocol.OwnerToPageFrame, unknown> => {
+            if (!preflightOwnerFrame(value)) {
+              return Exit.fail(protocolFailure("invalid restore owner frame"))
+            }
+            return Schema.decodeUnknownExit(
+              RestoreProtocol.OwnerToPageFrame,
+              { onExcessProperty: "error" }
+            )(value)
+          }
+          const postFrame = <A, I,>(
+            schema: Schema.Codec<A, I, never>,
+            frame: A,
+            transfer?: ReadonlyArray<Transferable>
+          ): Effect.Effect<void, ReplicaError.ReplicaError> =>
+            Effect.suspend(() => {
+              let encoded: I
+              try {
+                encoded = Schema.encodeSync(schema)(frame)
+              } catch (cause) {
+                return Effect.die(cause)
+              }
+              return Effect.try({
+                try: () => port.postMessage(encoded, transfer === undefined ? [] : [...transfer]),
+                catch: storageFailure
+              })
+            })
+          const postReleasedAck = (frame: RestoreProtocol.Released) => {
+            try {
+              const encoded = Schema.encodeSync(RestoreProtocol.ReleasedAck)({
+                _tag: "ReleasedAck",
+                nonce,
+                sequence: frame.sequence
+              })
+              port.postMessage(encoded)
+            } catch {
+              // The terminal result is already authoritative.
+            }
+          }
+          const acceptOwnerFrame = (frame: RestoreProtocol.OwnerToPageFrame) => {
+            if (frame.nonce !== nonce || frame.sequence !== expectedOwnerSequence) {
+              failClosed(protocolFailure("invalid restore owner sequence"))
+              return
+            }
+            if (frame._tag === "Pull") {
+              if (terminalAccepted || sourceComplete || pullOutstanding || !Queue.offerUnsafe(credits, frame)) {
+                failClosed(protocolFailure("unsolicited restore pull"))
+                return
+              }
+              pullOutstanding = true
+              expectedOwnerSequence += 1
+              return
+            }
+            if (frame._tag === "TerminalReady") {
+              if (terminalAccepted) {
+                failClosed(protocolFailure("duplicate restore terminal"))
+                return
+              }
+              terminalAccepted = true
+              expectedOwnerSequence += 1
+              sourceWorker?.interruptUnsafe()
+              Deferred.doneUnsafe(terminal, Effect.succeed(frame))
+              return
+            }
+            if (frame._tag === "Released") {
+              if (!terminalAccepted || !terminalAckPosted) {
+                failClosed(protocolFailure("unexpected restore release"))
+                return
+              }
+              expectedOwnerSequence += 1
+              postReleasedAck(frame)
+              Deferred.doneUnsafe(released, Effect.void)
+            }
+          }
+          function onMessage(event: MessageEvent<unknown>) {
+            if (!logicalOpen) return
+            let decoded: Exit.Exit<RestoreProtocol.OwnerToPageFrame, unknown>
+            try {
+              decoded = decodeOwnerFrame(event.data)
+            } catch {
+              failClosed(protocolFailure("invalid restore owner frame"))
+              return
+            }
+            if (Exit.isFailure(decoded)) {
+              failClosed(protocolFailure("invalid restore owner frame"))
+              return
+            }
+            acceptOwnerFrame(decoded.value)
+          }
+          function onMessageError() {
+            failClosed(storageFailure(new Error("restore channel message decoding failed")))
+          }
+          function onClose() {
+            failClosed(storageFailure(new Error("restore channel peer closed")))
+          }
+
+          const cleanup = Effect.uninterruptible(
+            Effect.gen(function*() {
+              stopIngress()
+              yield* Queue.shutdown(credits)
+              if (sourceWorker !== undefined) yield* Fiber.interrupt(sourceWorker)
+            })
+          )
+          return yield* Effect.gen(function*() {
+            port.addEventListener("message", onMessage)
+            port.addEventListener("messageerror", onMessageError)
+            port.addEventListener("close", onClose)
+            port.start()
+
+            sourceWorker = yield* Effect.gen(function*() {
+              const pull = yield* Stream.toPull(source)
+              const staging = new Uint8Array(
+                Math.min(RestoreProtocol.maxPageStagingBytes, maxChunkBytes, maxBytes)
+              )
+              type SourceResult =
+                | { readonly _tag: "Chunk"; readonly chunk: Uint8Array }
+                | { readonly _tag: "End" }
+                | { readonly _tag: "Failure"; readonly error: ReplicaError.ReplicaError }
+              const classifySourceCause = (
+                cause: Cause.Cause<ReplicaError.ReplicaError | Cause.Done<void>>
+              ): SourceResult | undefined => {
+                if (cause.reasons.length !== 1) return undefined
+                const reason = cause.reasons[0]
+                if (reason === undefined || !Cause.isFailReason(reason)) return undefined
+                if (Cause.isDone(reason.error)) return { _tag: "End" }
+                if (Schema.is(ReplicaError.ReplicaError)(reason.error)) {
+                  return { _tag: "Failure", error: reason.error }
+                }
+                return undefined
+              }
+              let pendingPull:
+                | Fiber.Fiber<
+                  ReadonlyArray<Uint8Array>,
+                  ReplicaError.ReplicaError | Cause.Done<void>
+                >
+                | undefined
+              let pendingPullObserved = false
+              let pendingChunks: ReadonlyArray<Uint8Array> | undefined
+              let pendingChunkIndex = 0
+              let currentChunk: Uint8Array | undefined
+              let currentOffset = 0
+              let cumulativeBytes = 0
+              let pendingCompletion:
+                | { readonly _tag: "End" }
+                | { readonly _tag: "Failure"; readonly error: ReplicaError.ReplicaError }
+                | undefined
+
+              const startPull = Effect.gen(function*() {
+                if (pendingPull !== undefined) return pendingPull
+                const next = yield* pull.pipe(Effect.forkChild)
+                pendingPull = next
+                pendingPullObserved = false
+                return next
+              })
+              const observePendingPull = () => {
+                if (pendingPull === undefined || pendingPullObserved) return
+                pendingPullObserved = true
+                pendingPull.addObserver((exit) => {
+                  if (Exit.isSuccess(exit) || terminalAccepted) return
+                  if (resultAccepted) {
+                    stopIngress()
+                    Deferred.doneUnsafe(acceptedResultDisconnect, Effect.void)
+                    sourceWorker?.interruptUnsafe()
+                    return
+                  }
+                  if (classifySourceCause(exit.cause) !== undefined) return
+                  stopIngress()
+                  Deferred.doneUnsafe(localFailure, Effect.failCause(exit.cause as Cause.Cause<never>))
+                  sourceWorker?.interruptUnsafe()
+                })
+              }
+              const takeSource: Effect.Effect<SourceResult> = Effect.gen(function*() {
+                if (pendingChunks !== undefined) {
+                  const chunk = pendingChunks[pendingChunkIndex++]
+                  if (pendingChunkIndex === pendingChunks.length) {
+                    pendingChunks = undefined
+                    pendingChunkIndex = 0
+                  }
+                  if (chunk === undefined) {
+                    return yield* Effect.die(new Error("restore source emitted an empty batch"))
+                  }
+                  return { _tag: "Chunk", chunk }
+                }
+                const next = yield* startPull
+                const exit = yield* Fiber.await(next)
+                pendingPull = undefined
+                pendingPullObserved = false
+                if (Exit.isSuccess(exit)) {
+                  const chunk = exit.value[0]
+                  if (chunk === undefined) return yield* Effect.die(new Error("restore source emitted an empty batch"))
+                  if (exit.value.length > 1) {
+                    pendingChunks = exit.value
+                    pendingChunkIndex = 1
+                  }
+                  return { _tag: "Chunk", chunk }
+                }
+                const classified = classifySourceCause(exit.cause)
+                if (classified !== undefined) return classified
+                return yield* Effect.failCause(exit.cause as Cause.Cause<never>)
+              })
+              const postResponse = <A, I,>(
+                schema: Schema.Codec<A, I, never>,
+                frame: A,
+                transfer?: ReadonlyArray<Transferable>
+              ) =>
+                terminalAccepted
+                  ? Effect.succeed(false)
+                  : postFrame(schema, frame, transfer).pipe(
+                    Effect.tap(() =>
+                      Effect.sync(() => {
+                        pullOutstanding = false
+                      })
+                    ),
+                    Effect.as(true)
+                  )
+
+              while (true) {
+                const credit = yield* Queue.take(credits)
+                const startedAt = yield* Clock.currentTimeMillis
+                let staged = 0
+                if (pendingCompletion !== undefined) {
+                  sourceComplete = true
+                  if (pendingCompletion._tag === "End") {
+                    yield* postResponse(RestoreProtocol.End, {
+                      _tag: "End",
+                      nonce,
+                      sequence: credit.sequence
+                    })
+                  } else {
+                    yield* postResponse(RestoreProtocol.SourceFailure, {
+                      _tag: "SourceFailure",
+                      nonce,
+                      sequence: credit.sequence,
+                      error: RestoreProtocol.encodeReplicaError(pendingCompletion.error, maxErrorBytes)
+                    })
+                  }
+                  return
+                }
+                while (staged < staging.byteLength) {
+                  if (currentChunk !== undefined) {
+                    const available = currentChunk.byteLength - currentOffset
+                    const copied = Math.min(available, staging.byteLength - staged)
+                    staging.set(currentChunk.subarray(currentOffset, currentOffset + copied), staged)
+                    staged += copied
+                    currentOffset += copied
+                    if (currentOffset === currentChunk.byteLength) {
+                      currentChunk = undefined
+                      currentOffset = 0
+                    }
+                    if (staged === staging.byteLength) break
+                  }
+
+                  if (pendingChunks === undefined) {
+                    const nextFiber = yield* startPull
+                    if (staged > 0) {
+                      const now = yield* Clock.currentTimeMillis
+                      const remaining = startedAt + maxCoalesceMillis - now
+                      if (remaining <= 0) break
+                      const next = yield* Effect.raceFirst(
+                        Fiber.await(nextFiber).pipe(
+                          Effect.map((exit) => ({ _tag: "Source" as const, exit }))
+                        ),
+                        Effect.sleep(remaining).pipe(
+                          Effect.as({ _tag: "Coalesce" as const })
+                        )
+                      )
+                      if (next._tag === "Coalesce") {
+                        observePendingPull()
+                        break
+                      }
+                    }
+                  }
+
+                  const result = yield* takeSource
+                  if (result._tag === "Chunk") {
+                    if (result.chunk.byteLength === 0) continue
+                    const observed = cumulativeBytes + result.chunk.byteLength
+                    if (observed > maxBytes) {
+                      pendingCompletion = {
+                        _tag: "Failure",
+                        error: new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.BackupTooLarge({
+                            limit: maxBytes,
+                            observed
+                          })
+                        })
+                      }
+                      break
+                    }
+                    cumulativeBytes = observed
+                    currentChunk = result.chunk
+                    currentOffset = 0
+                    continue
+                  }
+                  pendingCompletion = result
+                  break
+                }
+
+                if (staged > 0) {
+                  const bytes = staging.slice(0, staged)
+                  const posted = yield* postResponse(RestoreProtocol.Chunk, {
+                    _tag: "Chunk",
+                    nonce,
+                    sequence: credit.sequence,
+                    bytes
+                  }, [bytes.buffer])
+                  if (!posted) return
+                  continue
+                }
+                sourceComplete = true
+                if (pendingCompletion?._tag === "Failure") {
+                  yield* postResponse(RestoreProtocol.SourceFailure, {
+                    _tag: "SourceFailure",
+                    nonce,
+                    sequence: credit.sequence,
+                    error: RestoreProtocol.encodeReplicaError(pendingCompletion.error, maxErrorBytes)
+                  })
+                } else {
+                  yield* postResponse(RestoreProtocol.End, {
+                    _tag: "End",
+                    nonce,
+                    sequence: credit.sequence
+                  })
+                }
+                return
+              }
+            }).pipe(
+              Effect.forkChild({ startImmediately: true })
+            )
+            yield* Fiber.await(sourceWorker).pipe(
+              Effect.flatMap((exit) => {
+                if (Exit.isSuccess(exit) || terminalAccepted) return Effect.void
+                if (resultAccepted) {
+                  return Effect.sync(() => {
+                    stopIngress()
+                    Deferred.doneUnsafe(acceptedResultDisconnect, Effect.void)
+                  })
+                }
+                return Effect.sync(() => {
+                  stopIngress()
+                  const cause = Cause.map(
+                    exit.cause,
+                    (error) => new RestoreBackupError({ error })
+                  )
+                  Deferred.doneUnsafe(localFailure, Effect.failCause(cause))
+                })
+              }),
+              Effect.forkChild
+            )
+
+            yield* postFrame(RestoreProtocol.Start, {
+              _tag: "Start",
+              nonce,
+              sequence: 0
+            })
+            const awaitTerminal = Effect.raceFirst(
+              Deferred.await(terminal),
+              Deferred.await(localFailure)
+            )
+            const first = yield* Effect.raceFirst(
+              awaitTerminal.pipe(
+                Effect.map((frame) => ({ _tag: "Terminal" as const, frame }))
+              ),
+              Effect.exit(awaitResult).pipe(
+                Effect.filterOrElse(
+                  isAuthoritativeRestoreResult,
+                  () => Effect.never
+                ),
+                Effect.map((exit) => ({ _tag: "Result" as const, exit }))
+              )
+            )
+            let frame: RestoreProtocol.TerminalReady
+            let authoritative: Exit.Exit<void, ReplicaError.ReplicaError | RestoreBackupError>
+            if (first._tag === "Result") {
+              resultAccepted = true
+              yield* acceptResult(first.exit)
+              const next = yield* Effect.raceFirst(
+                awaitTerminal.pipe(
+                  Effect.map((frame) => ({ _tag: "Terminal" as const, frame }))
+                ),
+                Deferred.await(acceptedResultDisconnect).pipe(
+                  Effect.as({ _tag: "Disconnected" as const })
+                )
+              )
+              if (next._tag === "Disconnected") return yield* first.exit
+              frame = next.frame
+              authoritative = first.exit
+            } else {
+              frame = first.frame
+              authoritative = yield* Effect.exit(awaitResult)
+              resultAccepted = true
+              yield* acceptResult(authoritative)
+            }
+            terminalAckPosted = yield* postFrame(RestoreProtocol.TerminalAck, {
+              _tag: "TerminalAck",
+              nonce,
+              sequence: frame.sequence
+            }).pipe(
+              Effect.as(true),
+              Effect.catch(() => Effect.succeed(false))
+            )
+            if (terminalAckPosted) yield* Deferred.await(released)
+            return yield* authoritative
+          }).pipe(Effect.ensuring(cleanup))
+        })
+      )
+
     return {
       get ownerEpoch() {
         return SubscriptionRef.getUnsafe(sessions).lease.ownerEpoch
@@ -658,52 +1266,197 @@ export const fromRpcClient = (
             ))
         ),
       restoreBackup: <R,>(options: Backup.RestoreOptions<R>) =>
-        Backup.validateMaxBytes(options.maxBytes).pipe(
-          Effect.flatMap((maxBytes) =>
-            Stream.runFoldEffect(
-              options.source,
-              () => ({ bytes: 0, chunks: [] as Array<Uint8Array<ArrayBuffer>> }),
-              (accumulator, chunk) => {
-                const bytes = accumulator.bytes + chunk.byteLength
-                if (bytes > maxBytes) {
-                  return Effect.fail(
+        Effect.gen(function*() {
+          const startedAt = yield* Clock.currentTimeMillis
+          const deadline = Math.min(
+            Number.MAX_SAFE_INTEGER,
+            startedAt + timeoutMillis(operationTimeout)
+          )
+          const maxBytes = yield* Backup.validateMaxBytes(options.maxBytes)
+          let acceptedTerminal:
+            | Exit.Exit<void, ReplicaError.ReplicaError | RestoreBackupError>
+            | undefined
+          let acceptedReplacement:
+            | Fiber.Fiber<Session, ReplicaError.ReplicaError>
+            | undefined
+          const timeoutError = () =>
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.OperationTimeout({
+                operation: "RestoreBackup",
+                timeoutMillis: timeoutMillis(operationTimeout)
+              })
+            })
+          const withinDeadline = <E, R,>(
+            operation: Effect.Effect<void, E, R>
+          ): Effect.Effect<
+            void,
+            E | ReplicaError.ReplicaError | RestoreBackupError,
+            R
+          > =>
+            Clock.currentTimeMillis.pipe(
+              Effect.flatMap((now) =>
+                Effect.timeoutOrElse(operation, {
+                  duration: Math.max(0, deadline - now),
+                  orElse: () =>
+                    acceptedTerminal ??
+                      Effect.fail(timeoutError())
+                })
+              )
+            )
+          const reopenWithinDeadline = (session: Session) =>
+            Clock.currentTimeMillis.pipe(
+              Effect.flatMap((now) => {
+                const remaining = Math.max(0, deadline - now)
+                const replacement = acceptedReplacement
+                if (replacement !== undefined) {
+                  const completed = replacement.pollUnsafe()
+                  if (completed !== undefined) {
+                    return Exit.isFailure(completed) &&
+                        completed.cause.reasons.every(Cause.isInterruptReason)
+                      ? Effect.fail(timeoutError())
+                      : completed
+                  }
+                  return remaining === 0
+                    ? Effect.fail(timeoutError())
+                    : Effect.timeoutOrElse(Fiber.join(replacement), {
+                      duration: remaining,
+                      orElse: () => Effect.fail(timeoutError())
+                    })
+                }
+                return remaining === 0
+                  ? Effect.fail(timeoutError())
+                  : Effect.timeoutOrElse(reopen(session), {
+                    duration: remaining,
+                    orElse: () => Effect.fail(timeoutError())
+                  })
+              })
+            )
+          const operation = withSession(
+            "RestoreBackup",
+            (session) =>
+              rpc.BeginRestoreBackupV4({
+                sessionId: session.sessionId,
+                mode: options.mode,
+                maxBytes,
+                expectedDefinitionHash: options.expectedDefinitionHash,
+                installationId: options.installationId
+              }).pipe(
+                Effect.catchCause((cause) => {
+                  if (
+                    cause.reasons.length === 1 &&
+                    Cause.isDieReason(cause.reasons[0]) &&
+                    isDataCloneError(cause.reasons[0].defect)
+                  ) {
+                    return Effect.fail(
+                      storageFailure(cause.reasons[0].defect)
+                    )
+                  }
+                  return Effect.failCause(cause)
+                }),
+                Effect.catchTag("RpcClientError", (error) =>
+                  Effect.fail(
                     new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.BackupTooLarge({
-                        limit: maxBytes,
-                        observed: bytes
+                      reason: new ReplicaError.StorageUnavailable({
+                        cause: error
                       })
                     })
+                  )),
+                Effect.flatMap(({ nonce, port }) =>
+                  Effect.acquireUseRelease(
+                    Effect.sync(() => {
+                      const nativeClose = port.close.bind(port)
+                      let open = true
+                      return {
+                        nonce,
+                        port,
+                        close: () => {
+                          if (!open) return
+                          open = false
+                          nativeClose()
+                        }
+                      }
+                    }),
+                    ({ close, nonce, port }) =>
+                      Effect.gen(function*() {
+                        const result = rpc.FinishRestoreBackupV4({
+                          sessionId: session.sessionId,
+                          nonce
+                        }).pipe(
+                          Effect.catchCause((cause) =>
+                            Effect.failCause(
+                              Cause.map(cause, (error) => {
+                                if (error._tag === "RestoreResultSessionFailure") {
+                                  return RestoreProtocol.replicaErrorFromWire(error.error)
+                                }
+                                if (error._tag === "RestoreResultRestoreFailure") {
+                                  return new RestoreBackupError({
+                                    error: RestoreProtocol.replicaErrorFromWire(error.error)
+                                  })
+                                }
+                                return new RestoreBackupError({
+                                  error: storageFailure(error)
+                                })
+                              })
+                            )
+                          )
+                        )
+                        const resultFiber = yield* result.pipe(
+                          Effect.forkChild({ startImmediately: true })
+                        )
+                        yield* serveRestoreSource(
+                          options.source,
+                          port,
+                          nonce,
+                          maxBytes,
+                          session.lease.maxChunkBytes,
+                          session.lease.maxRestoreCoalesceMillis,
+                          session.lease.maxRestoreErrorBytes,
+                          close,
+                          Fiber.join(resultFiber),
+                          (exit) =>
+                            Effect.gen(function*() {
+                              acceptedTerminal = exit
+                              if (
+                                acceptedReplacement === undefined &&
+                                acceptedProtocolMismatch(exit) !== undefined
+                              ) {
+                                acceptedReplacement = yield* reopen(session).pipe(
+                                  Effect.forkChild
+                                )
+                              }
+                            })
+                        )
+                      }),
+                    ({ close }) => Effect.sync(close)
                   )
-                }
-                accumulator.chunks.push(new Uint8Array(chunk))
-                accumulator.bytes = bytes
-                return Effect.succeed(accumulator)
-              }
-            )
-          ),
-          Effect.flatMap(({ chunks }) =>
-            withSession(
-              "RestoreBackup",
-              (session) =>
-                rpc.RestoreBackup({
-                  sessionId: session.sessionId,
-                  chunks,
-                  mode: options.mode,
-                  maxBytes: options.maxBytes,
-                  expectedDefinitionHash: options.expectedDefinitionHash,
-                  installationId: options.installationId
+                ),
+                Effect.withSpan("ReplicaClient.restoreBackup", {
+                  attributes: {
+                    "restore.mode": options.mode,
+                    "restore.max_bytes": maxBytes,
+                    "restore.max_chunk_bytes": session.lease.maxChunkBytes,
+                    "restore.max_coalesce_millis": session.lease.maxRestoreCoalesceMillis,
+                    "restore.max_error_bytes": session.lease.maxRestoreErrorBytes
+                  }
                 }),
-              { replayAfterReopen: false }
+                withinDeadline
+              ),
+            {
+              boundOperation: false,
+              replayAfterReopen: false,
+              replaceSession: reopenWithinDeadline
+            }
+          )
+          return yield* operation
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.failCause(
+              Cause.map(
+                cause,
+                (error) => error._tag === "RestoreBackupError" ? error.error : error
+              )
             )
-          ),
-          Effect.catchTag("RpcClientError", (error) =>
-            Effect.fail(
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.StorageUnavailable({
-                  cause: error
-                })
-              })
-            ))
+          )
         ),
       exportDocument: (document, documentId) =>
         withSession(

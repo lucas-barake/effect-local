@@ -41,7 +41,13 @@ export const defaultLimits: ReplicaLimits.Values = {
   maxSessions: 32,
   maxStreamsPerSession: 32,
   maxInFlightPerSession: 128,
-  maxQueuedRpc: 1024
+  maxQueuedRpc: 1024,
+  maxActiveRestores: 1024,
+  maxRestoresPerSession: 128,
+  maxRestoreMillis: 30_000,
+  maxRestorePullMillis: 10_000,
+  maxRestoreCoalesceMillis: 25,
+  maxRestoreErrorBytes: 4_096
 }
 
 export const layerWithLimits = <

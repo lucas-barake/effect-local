@@ -64,7 +64,13 @@ describe("DocumentEntity", () => {
     maxSessions: 8,
     maxStreamsPerSession: 4,
     maxInFlightPerSession: 16,
-    maxQueuedRpc: 32
+    maxQueuedRpc: 32,
+    maxActiveRestores: 32,
+    maxRestoresPerSession: 16,
+    maxRestoreMillis: 30_000,
+    maxRestorePullMillis: 10_000,
+    maxRestoreCoalesceMillis: 25,
+    maxRestoreErrorBytes: 4_096
   } satisfies ReplicaLimits.Values
   const TestShardingConfig = Layer.merge(
     ShardingConfig.layer({
