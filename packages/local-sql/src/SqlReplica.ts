@@ -176,7 +176,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
 
 export const layer = <D extends ReplicaDefinition.Any, const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
   definition: D,
-  options: { readonly projections: Bindings }
+  options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
 ): Layer.Layer<
   | CommitPublisher.CommitPublisher
   | PeerSync.PeerSync
@@ -208,7 +208,9 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   const compaction = Compaction.layer.pipe(Layer.provideMerge(recovery))
   const projections = ProjectionStore.layer(options.projections).pipe(Layer.provideMerge(store))
   const evolution = ReplicaEvolution.layer(definition).pipe(Layer.provideMerge(projections))
-  const health = ReplicaHealth.layer(definition).pipe(Layer.provideMerge(evolution))
+  const health = ReplicaHealth.layer(definition, options.health ?? ReplicaHealth.defaultOptions).pipe(
+    Layer.provideMerge(evolution)
+  )
   const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(health))
   const queries = QueryExecutor.layer(definition).pipe(
     Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
@@ -226,7 +228,7 @@ export const layerWithBindings = <
   const Bindings extends ReadonlyArray<SqlProjection.Any>,
 >(
   definition: D,
-  options: { readonly projections: Bindings }
+  options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
 ) =>
   layer(definition, options).pipe(
     Layer.provide(Layer.mergeAll(Layer.empty, ...options.projections.map((binding) => binding.layer)))

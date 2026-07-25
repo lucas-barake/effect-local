@@ -3,10 +3,15 @@ import { assert, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
 import * as Result from "effect/Result"
+import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as TestReplica from "../src/TestReplica.js"
 import { definition, Rename, Task } from "./fixtures.js"
 
@@ -30,6 +35,35 @@ it.layer(NodeCrypto.layer)("TestReplica limits threading", (it) => {
       assert.strictEqual(limits.maxSessions, 3)
       assert.strictEqual(limits.maxQueuedRpc, 7)
     }).pipe(TestClock.withLive))
+
+  it.effect("layerWithSyncAndLimits forwards the configured health sampling interval", () =>
+    Effect.gen(function*() {
+      const replica = yield* Replica.Replica
+      const sql = yield* SqlClient.SqlClient
+      const seen = yield* Queue.unbounded<ReplicaStatus.ReplicaStatus>()
+      yield* replica.status.pipe(
+        Stream.runForEach((status) => Queue.offer(seen, status)),
+        Effect.forkChild
+      )
+      assert.deepStrictEqual(yield* Queue.take(seen), { _tag: "Ready", pendingCommands: 0 })
+      yield* sql`UPDATE effect_local_metadata SET writer_generation = writer_generation + 1
+        WHERE singleton = 1`
+      yield* TestClock.adjust("1 second")
+      assert.deepStrictEqual(yield* Queue.poll(seen), Option.none())
+      yield* TestClock.adjust("4 seconds")
+      assert.deepStrictEqual(yield* Queue.take(seen), {
+        _tag: "ReadOnly",
+        reason: "Another writer generation owns this replica"
+      })
+    }).pipe(
+      Effect.provide(
+        TestReplica.layerWithSyncAndLimits(definition, {
+          health: { sampleInterval: "5 seconds" },
+          projections: [],
+          limits: TestReplica.defaultLimits
+        }).pipe(Layer.provide(Handler))
+      )
+    ))
 
   it.effect("commits a concurrent write burst on an idle replica", () =>
     Effect.gen(function*() {

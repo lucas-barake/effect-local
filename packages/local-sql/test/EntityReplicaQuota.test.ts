@@ -80,7 +80,7 @@ describe("EntityReplica in-flight command limit", () => {
     const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
     const compaction = Compaction.layer.pipe(Layer.provideMerge(recovery))
     const projections = ProjectionStore.layer([]).pipe(Layer.provideMerge(store))
-    const health = ReplicaHealth.layer(definition).pipe(Layer.provideMerge(projections))
+    const health = ReplicaHealth.layer(definition, ReplicaHealth.defaultOptions).pipe(Layer.provideMerge(projections))
     const commands = Layer.merge(executor, health)
     const queries = QueryExecutor.layer(definition).pipe(
       Layer.provideMerge(Layer.merge(commands, Reactivity.layer))

@@ -174,7 +174,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           yield* client.importDocument(Task, { commandId: importCommandId, value: exported }),
           CommandOutcome.durablyCommitted(importCommandId, documentId)
         )
-        assert.deepStrictEqual(Array.from(yield* Stream.runCollect(client.status)), [{
+        assert.deepStrictEqual(Array.from(yield* client.status.pipe(Stream.take(1), Stream.runCollect)), [{
           _tag: "Ready",
           pendingCommands: 0
         }])

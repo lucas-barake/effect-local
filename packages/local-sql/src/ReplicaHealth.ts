@@ -1,8 +1,10 @@
+import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Projection from "@lucas-barake/effect-local/Projection"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Arr from "effect/Array"
 import * as Context from "effect/Context"
+import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Exit from "effect/Exit"
@@ -24,9 +26,15 @@ import * as ReplicaGate from "./ReplicaGate.js"
 const PendingRow = Schema.Struct({ count: Schema.Int })
 const BlockedRow = Schema.Struct({ document_type: Schema.String })
 const BlockedProjectionRow = Schema.Struct({ projection_name: Schema.String })
-const GenerationRow = Schema.Struct({ writer_generation: Schema.Int })
+const GenerationRow = Schema.Struct({ writer_generation: Identity.WriterGeneration })
 
-const sampleInterval = "1 second"
+export interface Options {
+  readonly sampleInterval: Duration.Input
+}
+
+export const defaultOptions: Options = {
+  sampleInterval: "1 second"
+}
 
 /**
  * One in-flight restore. Ingest and installation are reported as separate, sequential conditions because
@@ -50,6 +58,7 @@ interface Conditions {
   readonly degraded: Option.Option<string>
   readonly failure: Option.Option<string>
   readonly fenced: boolean
+  readonly samplerStopped: boolean
 }
 
 const initial: Conditions = {
@@ -58,7 +67,8 @@ const initial: Conditions = {
   blocked: Option.none(),
   degraded: Option.none(),
   failure: Option.none(),
-  fenced: false
+  fenced: false,
+  samplerStopped: false
 }
 
 /**
@@ -75,8 +85,9 @@ const derive = (conditions: Conditions): ReplicaStatus.ReplicaStatus => {
   // An install blocks writes even when a concurrent restore is still ingesting, so it must not be masked
   // by the other restore's `Restoring`, which promises a replica that still accepts writes.
   if (!installing && ingesting !== undefined) return { _tag: "Restoring", processedBytes: ingesting }
-  if (Option.isSome(conditions.failure)) return { _tag: "Failed", message: conditions.failure.value }
   if (installing) return { _tag: "ReadOnly", reason: "A backup restore is installing" }
+  if (conditions.samplerStopped) return { _tag: "Failed", message: "Replica health sampling stopped" }
+  if (Option.isSome(conditions.failure)) return { _tag: "Failed", message: conditions.failure.value }
   if (conditions.fenced) return { _tag: "ReadOnly", reason: "Another writer generation owns this replica" }
   if (Option.isSome(conditions.blocked)) {
     return {
@@ -95,7 +106,7 @@ export class ReplicaHealth extends Context.Service<ReplicaHealth, {
   readonly restoring: Effect.Effect<Restore, never, Scope.Scope>
 }>()("@lucas-barake/effect-local-sql/ReplicaHealth") {}
 
-export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
+export const layer = (definition: ReplicaDefinition.Any, options: Options): Layer.Layer<
   ReplicaHealth,
   never,
   ReplicaBootstrap.ReplicaBootstrap | ReplicaGate.ReplicaGate | SqlClient.SqlClient
@@ -112,7 +123,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       // Acquired before the sampler is forked so reverse-order finalization interrupts the sampler first
       // and only then shuts the PubSub down, ending every live subscriber with a graceful stream end.
       const statuses = yield* Effect.acquireRelease(
-        PubSub.sliding<ReplicaStatus.ReplicaStatus>({ capacity: 16, replay: 1 }),
+        PubSub.sliding<ReplicaStatus.ReplicaStatus>({ capacity: 1, replay: 1 }),
         PubSub.shutdown
       )
       // Seeds the replay window. Without it the first subscriber would see nothing until the first change,
@@ -126,6 +137,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       // so without the lock one writer can resurrect a restore another one just deleted and strand the
       // replica in `Restoring` forever.
       const writes = yield* Semaphore.make(1)
+      const samples = yield* Semaphore.make(1)
 
       const commit = (update: (current: Conditions) => Conditions) =>
         writes.withPermit(Effect.gen(function*() {
@@ -200,75 +212,83 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         return messages.length > 0 ? messages.join(": ") : String(cause)
       }
 
-      const sample = Effect.gen(function*() {
-        const pending = yield* countPending(undefined)
-        const blockedDocumentTypes = yield* findBlockedDocumentTypes(undefined)
-        const blockedProjection = yield* findBlockedProjection(undefined)
-        const generation = yield* findWriterGeneration(undefined)
-        // Read in this order on purpose. `ReplicaGate.claim` sets its owner, bumps `writer_generation`
-        // inside its transaction, republishes the matching permit, and only then clears the owner, and the
-        // sampler holds nothing that keeps it out of that window. Observing no owner therefore proves the
-        // permit read next is at least as new as the generation read above, and observing an owner means
-        // any disagreement belongs to a claim this process is running rather than to a foreign writer.
-        const claiming = yield* gate.claiming
-        const permit = yield* gate.current
-        // A missing metadata singleton means the replica's identity is gone, which the rest of the package
-        // already treats as fatal. It is reported level-triggered rather than latched so a repair clears it.
-        if (Option.isNone(generation)) {
-          return yield* commit((current) => ({
-            ...current,
-            failure: Option.some("Replica metadata is missing")
-          }))
-        }
-        const blocked = Arr.findFirst(blockedDocumentTypes, (row) =>
-          Option.map(projectionFor(row.document_type), (projection) => ({
-            projection,
-            reason: `A ${row.document_type} document is not ready for projection`
-          }))).pipe(
-            Option.orElse(() =>
-              Option.filter(blockedProjection, (row) =>
-                isDeclared(row.projection_name)).pipe(
-                  Option.map((row) => ({
-                    projection: row.projection_name,
-                    reason: `The ${row.projection_name} projection is not ready`
-                  }))
-                )
-            )
-          )
-        yield* commit((current) => ({
-          ...current,
-          pendingCommands: Option.match(pending, {
-            onNone: () =>
-              0,
-            onSome: (row) => row.count
-          }),
-          blocked,
-          degraded: Option.none(),
-          failure: Option.none(),
-          // Only a generation ahead of the permit is a fence. `writer_generation` only ever increases, so a
-          // durable value behind the permit cannot mean a foreign writer: it is this sampler's own read skew
-          // over a local claim that committed and republished its permit after the generation was read.
-          fenced: !claiming && generation.value.writer_generation > permit.writerGeneration
-        }))
-      }).pipe(
-        // `SqlError | SchemaError` is the entire failure channel of the reads above, so handling both
-        // closes it and the status stream itself can never fail, which is what keeps subscribers from
-        // having to resubscribe. `catchCause` would also have swallowed defects and interruption.
-        Effect.catchTags({
-          SchemaError: (cause) =>
-            commit((current) => ({
+      const sample = samples.withPermit(
+        Effect.gen(function*() {
+          const pending = yield* countPending(undefined)
+          const blockedDocumentTypes = yield* findBlockedDocumentTypes(undefined)
+          const blockedProjection = yield* findBlockedProjection(undefined)
+          const generation = yield* findWriterGeneration(undefined)
+          // Read in this order on purpose. `ReplicaGate.claim` sets its owner, bumps `writer_generation`
+          // inside its transaction, republishes the matching permit, and only then clears the owner, and the
+          // sampler holds nothing that keeps it out of that window. Observing no owner therefore proves the
+          // permit read next is at least as new as the generation read above, and observing an owner means
+          // any disagreement belongs to a claim this process is running rather than to a foreign writer.
+          const claiming = yield* gate.claiming
+          const permit = yield* gate.current
+          // A missing metadata singleton means the replica's identity is gone, which the rest of the package
+          // already treats as fatal. It is reported level-triggered rather than latched so a repair clears it.
+          if (Option.isNone(generation)) {
+            return yield* commit((current) => ({
               ...current,
-              failure: Option.some(`Replica storage is corrupt: ${detailOf(cause)}`)
-            })),
-          // A busy or locked database is transient, so it degrades rather than failing, and the previously
-          // sampled fields are deliberately left in place instead of being reset to a guess.
-          SqlError: (cause) =>
-            commit((current) => ({
-              ...current,
-              degraded: Option.some(`Replica storage is unavailable: ${detailOf(cause)}`)
+              failure: Option.some("Replica metadata is missing")
             }))
-        }),
-        Effect.withSpan("ReplicaHealth.sample")
+          }
+          const blocked = Arr.findFirst(blockedDocumentTypes, (row) =>
+            Option.map(projectionFor(row.document_type), (projection) => ({
+              projection,
+              reason: `A ${row.document_type} document is not ready for projection`
+            }))).pipe(
+              Option.orElse(() =>
+                Option.filter(blockedProjection, (row) =>
+                  isDeclared(row.projection_name)).pipe(
+                    Option.map((row) => ({
+                      projection: row.projection_name,
+                      reason: `The ${row.projection_name} projection is not ready`
+                    }))
+                  )
+              )
+            )
+          yield* commit((current) => ({
+            ...current,
+            pendingCommands: Option.match(pending, {
+              onNone: () =>
+                0,
+              onSome: (row) => row.count
+            }),
+            blocked,
+            degraded: Option.none(),
+            failure: Option.none(),
+            // Only a generation ahead of the permit is a fence. `writer_generation` only ever increases, so a
+            // durable value behind the permit cannot mean a foreign writer: it is this sampler's own read skew
+            // over a local claim that committed and republished its permit after the generation was read.
+            fenced: !claiming && generation.value.writer_generation > permit.writerGeneration
+          }))
+        }).pipe(
+          // `SqlError | SchemaError` is the entire failure channel of the reads above, so handling both
+          // closes it and the status stream itself can never fail, which is what keeps subscribers from
+          // having to resubscribe. `catchCause` would also have swallowed defects and interruption.
+          Effect.catchTags({
+            SchemaError: (cause) =>
+              commit((current) => ({
+                ...current,
+                failure: Option.some(`Replica storage is corrupt: ${detailOf(cause)}`)
+              })),
+            // A busy or locked database is transient, so it degrades rather than failing, and the previously
+            // sampled fields are deliberately left in place instead of being reset to a guess.
+            SqlError: (cause) =>
+              cause.isRetryable
+                ? commit((current) => ({
+                  ...current,
+                  degraded: Option.some(`Replica storage is unavailable: ${detailOf(cause)}`)
+                }))
+                : commit((current) => ({
+                  ...current,
+                  degraded: Option.none(),
+                  failure: Option.some(`Replica storage failed: ${detailOf(cause)}`)
+                }))
+          }),
+          Effect.withSpan("ReplicaHealth.sample")
+        )
       )
 
       const editRestores = (edit: (restores: Map<number, RestoreState>) => void) =>
@@ -309,19 +329,22 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       )
 
       yield* sample.pipe(
-        Effect.repeat(Schedule.spaced(sampleInterval)),
+        Effect.repeat(Schedule.spaced(options.sampleInterval)),
         Effect.onExit((exit) =>
           Exit.hasInterrupts(exit)
             ? Effect.void
-            : commit((current) => ({ ...current, failure: Option.some("Replica health sampling stopped") }))
+            : commit((current) => ({ ...current, samplerStopped: true }))
         ),
         Effect.forkScoped({ startImmediately: true })
       )
 
       return {
         // Sampling on subscribe means a consumer never starts from a stale value, and it is what makes the
-        // stream observable without waiting for a poll tick.
-        status: Stream.fromPubSub(statuses).pipe(Stream.onStart(sample)),
+        // stream observable without waiting for a poll tick. Racing shutdown keeps a caller-owned stream
+        // from holding its session permits when scope closure lands before the PubSub subscription exists.
+        status: Stream.fromPubSub(statuses).pipe(
+          Stream.onStart(Effect.raceFirst(sample, PubSub.awaitShutdown(statuses)))
+        ),
         sample,
         restoring
       }

@@ -121,7 +121,9 @@ describe("BackupStore", () => {
   const Store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Base, Gate)))
   const Projections = ProjectionStore.layer([]).pipe(Layer.provide(Base))
   const Limits = ReplicaLimits.layer(limits)
-  const Health = ReplicaHealth.layer(definition).pipe(Layer.provide(Layer.merge(Base, Gate)))
+  const Health = ReplicaHealth.layer(definition, ReplicaHealth.defaultOptions).pipe(
+    Layer.provide(Layer.merge(Base, Gate))
+  )
   const Backup = BackupStore.layer(definition).pipe(
     Layer.provide(Layer.mergeAll(Base, Gate, Limits, Projections, Health))
   )
@@ -136,7 +138,7 @@ describe("BackupStore", () => {
   const ProjectedProjections = ProjectionStore.layer([TaskListSql]).pipe(
     Layer.provide(Layer.merge(ProjectedBase, TaskListSql.layer))
   )
-  const ProjectedHealth = ReplicaHealth.layer(projectedDefinition).pipe(
+  const ProjectedHealth = ReplicaHealth.layer(projectedDefinition, ReplicaHealth.defaultOptions).pipe(
     Layer.provide(Layer.merge(ProjectedBase, ProjectedGate))
   )
   const ProjectedBackup = BackupStore.layer(projectedDefinition).pipe(
@@ -206,7 +208,7 @@ describe("BackupStore", () => {
   const MutatedGate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(MutatedBase))
   const MutatedStore = DocumentStore.layer.pipe(Layer.provide(Layer.merge(MutatedBase, MutatedGate)))
   const MutatedProjections = ProjectionStore.layer([]).pipe(Layer.provide(MutatedBase))
-  const MutatedHealth = ReplicaHealth.layer(mutatedDefinition).pipe(
+  const MutatedHealth = ReplicaHealth.layer(mutatedDefinition, ReplicaHealth.defaultOptions).pipe(
     Layer.provide(Layer.merge(MutatedBase, MutatedGate))
   )
   const MutatedInfrastructure = Layer.mergeAll(

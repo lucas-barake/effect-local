@@ -21,6 +21,7 @@ import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlError from "effect/unstable/sql/SqlError"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
 import * as ReplicaHealth from "../src/ReplicaHealth.js"
@@ -41,7 +42,43 @@ describe("ReplicaHealth", () => {
   )
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provideMerge(Database))
   const Gate = ReplicaGate.layer.pipe(withGateLimits, Layer.provideMerge(Bootstrap))
-  const Live = ReplicaHealth.layer(definition).pipe(Layer.provideMerge(Gate))
+  const Live = ReplicaHealth.layer(definition, ReplicaHealth.defaultOptions).pipe(Layer.provideMerge(Gate))
+
+  const healthWithSql = (
+    transform: (
+      text: string,
+      statement: Effect.Effect<unknown, unknown, unknown>
+    ) => Effect.Effect<unknown, unknown, unknown>
+  ) => {
+    const BaseSql = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+    const InstrumentedSql = Layer.effect(
+      SqlClient.SqlClient,
+      Effect.gen(function*() {
+        const sql = yield* SqlClient.SqlClient
+        const execute = (...args: ReadonlyArray<unknown>) => {
+          const statement = (sql as unknown as (
+            ...args: ReadonlyArray<unknown>
+          ) => Effect.Effect<unknown, unknown, unknown>)(...args)
+          const template = args[0]
+          const text = Array.isArray(template) ? template.join("") : ""
+          return transform(text, statement)
+        }
+        return Object.assign(execute, sql) as SqlClient.SqlClient
+      })
+    ).pipe(Layer.provideMerge(BaseSql))
+    const InstrumentedDatabase = Layer.merge(InstrumentedSql, NodeCrypto.layer)
+    const InstrumentedBootstrap = ReplicaBootstrap.layer(definition).pipe(
+      Layer.provideMerge(InstrumentedDatabase)
+    )
+    const InstrumentedGate = ReplicaGate.layer.pipe(
+      withGateLimits,
+      Layer.provideMerge(InstrumentedBootstrap)
+    )
+    const Health = ReplicaHealth.layer(definition, ReplicaHealth.defaultOptions).pipe(
+      Layer.provideMerge(InstrumentedGate)
+    )
+    return Layer.merge(Health, InstrumentedDatabase)
+  }
 
   // A replica whose blocked documents do not all map to a projection: `Note` carries none, `Task` does.
   const Note = Document.make("Note", { schema: Schema.Struct({ body: Schema.String }), version: 1 })
@@ -65,7 +102,9 @@ describe("ReplicaHealth", () => {
   )
   const ProjectedBootstrap = ReplicaBootstrap.layer(projectedDefinition).pipe(Layer.provideMerge(ProjectedDatabase))
   const ProjectedGate = ReplicaGate.layer.pipe(withGateLimits, Layer.provideMerge(ProjectedBootstrap))
-  const Projected = ReplicaHealth.layer(projectedDefinition).pipe(Layer.provideMerge(ProjectedGate))
+  const Projected = ReplicaHealth.layer(projectedDefinition, ReplicaHealth.defaultOptions).pipe(
+    Layer.provideMerge(ProjectedGate)
+  )
 
   it.effect("delivers the current status to the first subscriber", () =>
     Effect.gen(function*() {
@@ -102,6 +141,31 @@ describe("ReplicaHealth", () => {
         Option.some<ReplicaStatus.ReplicaStatus>({ _tag: "Ready", pendingCommands: 0 })
       )
     }).pipe(Effect.provide(Live)))
+
+  it.effect("keeps a repairing restore visible while it installs", () =>
+    Effect.gen(function*() {
+      const health = yield* ReplicaHealth.ReplicaHealth
+      const sql = yield* SqlClient.SqlClient
+      yield* sql`UPDATE effect_local_metadata SET writer_generation = 'not-a-number' WHERE singleton = 1`
+      assert.strictEqual(Option.getOrThrow(yield* Stream.runHead(health.status))._tag, "Failed")
+      yield* Effect.scoped(Effect.gen(function*() {
+        const restore = yield* health.restoring
+        assert.deepStrictEqual(
+          yield* Stream.runHead(health.status),
+          Option.some<ReplicaStatus.ReplicaStatus>({ _tag: "Restoring", processedBytes: 0 })
+        )
+        yield* Effect.scoped(Effect.gen(function*() {
+          yield* restore.installing
+          assert.deepStrictEqual(
+            yield* Stream.runHead(health.status),
+            Option.some<ReplicaStatus.ReplicaStatus>({
+              _tag: "ReadOnly",
+              reason: "A backup restore is installing"
+            })
+          )
+        }))
+      }))
+    }).pipe(Effect.provide(Live), Effect.provide(Database)))
 
   it.effect("keeps reporting a restore while a second one is still ingesting", () =>
     Effect.gen(function*() {
@@ -288,6 +352,45 @@ describe("ReplicaHealth", () => {
       yield* Deferred.await(ended)
     }).pipe(Effect.provide(Database)))
 
+  it.effect("ends a status stream whose startup sample is still running", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const ended = yield* Deferred.make<void>()
+      let armed = false
+      let blocked = false
+      const Services = healthWithSql((text, statement) => {
+        if (!armed || blocked || !text.includes("SELECT COUNT(*) AS count")) return statement
+        blocked = true
+        return statement.pipe(
+          Effect.tap(() => Deferred.succeed(entered, undefined)),
+          Effect.tap(() => Deferred.await(release))
+        )
+      })
+      const layerScope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(layerScope, Exit.void))
+      const context = yield* Scope.provide(Layer.build(Services), layerScope)
+      const health = Context.get(context, ReplicaHealth.ReplicaHealth)
+      armed = true
+      const consumer = yield* health.status.pipe(
+        Stream.runDrain,
+        Effect.andThen(Deferred.succeed(ended, undefined)),
+        Effect.forkChild
+      )
+      yield* Effect.addFinalizer(() =>
+        Deferred.succeed(release, undefined).pipe(
+          Effect.andThen(Fiber.interrupt(consumer))
+        )
+      )
+      yield* Deferred.await(entered)
+      yield* Scope.close(layerScope, Exit.void)
+      yield* Effect.yieldNow
+      assert.isTrue(
+        Option.isSome(yield* Deferred.poll(ended)),
+        "closing the health layer left the started status stream blocked"
+      )
+    })))
+
   it.effect("suppresses an emission when a sample leaves the status unchanged", () =>
     Effect.gen(function*() {
       const health = yield* ReplicaHealth.ReplicaHealth
@@ -304,6 +407,35 @@ describe("ReplicaHealth", () => {
       yield* Fiber.interrupt(consumer)
       assert.deepStrictEqual(collected, [{ _tag: "Ready", pendingCommands: 0 }])
     }).pipe(Effect.provide(Live)))
+
+  it.effect("delivers only the newest status to a slow consumer", () =>
+    Effect.gen(function*() {
+      const health = yield* ReplicaHealth.ReplicaHealth
+      const release = yield* Deferred.make<void>()
+      const seen = yield* Queue.unbounded<ReplicaStatus.ReplicaStatus>()
+      const consumer = yield* health.status.pipe(
+        Stream.runForEach((status) =>
+          Queue.offer(seen, status).pipe(
+            Effect.andThen(status._tag === "Ready" ? Deferred.await(release) : Effect.void)
+          )
+        ),
+        Effect.forkChild
+      )
+      assert.deepStrictEqual(yield* Queue.take(seen), { _tag: "Ready", pendingCommands: 0 })
+      yield* Effect.scoped(Effect.gen(function*() {
+        const restore = yield* health.restoring
+        for (let processedBytes = 1; processedBytes <= 20; processedBytes++) {
+          yield* restore.progress(processedBytes)
+        }
+        yield* Deferred.succeed(release, undefined)
+        assert.deepStrictEqual(yield* Queue.take(seen), {
+          _tag: "Restoring",
+          processedBytes: 20
+        })
+      }))
+      yield* Fiber.interrupt(consumer)
+    }).pipe(Effect.provide(Live)))
+
   it.effect("pushes a status change to an existing subscriber without a new subscription", () =>
     Effect.gen(function*() {
       const health = yield* ReplicaHealth.ReplicaHealth
@@ -322,20 +454,82 @@ describe("ReplicaHealth", () => {
       })
     }).pipe(Effect.provide(Live), Effect.provide(Database)))
 
-  it.effect("reports transient storage loss as degraded without failing the stream", () =>
+  it.effect("uses the configured sample interval", () =>
+    Effect.gen(function*() {
+      const health = yield* ReplicaHealth.ReplicaHealth
+      const sql = yield* SqlClient.SqlClient
+      const seen = yield* Queue.unbounded<ReplicaStatus.ReplicaStatus>()
+      yield* health.status.pipe(
+        Stream.runForEach((status) => Queue.offer(seen, status)),
+        Effect.forkChild
+      )
+      assert.deepStrictEqual(yield* Queue.take(seen), { _tag: "Ready", pendingCommands: 0 })
+      yield* sql`UPDATE effect_local_metadata SET writer_generation = writer_generation + 1
+        WHERE singleton = 1`
+      yield* TestClock.adjust("1 second")
+      assert.deepStrictEqual(yield* Queue.poll(seen), Option.none())
+      yield* TestClock.adjust("4 seconds")
+      assert.deepStrictEqual(yield* Queue.take(seen), {
+        _tag: "ReadOnly",
+        reason: "Another writer generation owns this replica"
+      })
+    }).pipe(
+      Effect.provide(
+        ReplicaHealth.layer(definition, { sampleInterval: "5 seconds" }).pipe(
+          Layer.provideMerge(Gate)
+        )
+      ),
+      Effect.provide(Database)
+    ))
+
+  it.effect("reports permanent storage loss as failed without failing the stream", () =>
     Effect.gen(function*() {
       const health = yield* ReplicaHealth.ReplicaHealth
       const sql = yield* SqlClient.SqlClient
       yield* sql`DROP TABLE effect_local_commit_outbox`
-      const exit = yield* Effect.exit(Stream.runHead(health.status))
-      assert.isTrue(Exit.isSuccess(exit))
-      const degraded = Option.getOrThrow(yield* Stream.runHead(health.status))
-      assert.strictEqual(degraded._tag, "Degraded")
+      const failed = Option.getOrThrow(yield* Stream.runHead(health.status))
+      assert.strictEqual(failed._tag, "Failed")
       // The reason has to name the table, not just restate the error tag, or an operator learns nothing.
-      if (degraded._tag === "Degraded") {
-        assert.include(degraded.reason, "no such table: effect_local_commit_outbox")
+      if (failed._tag === "Failed") {
+        assert.include(failed.message, "no such table: effect_local_commit_outbox")
       }
     }).pipe(Effect.provide(Live), Effect.provide(Database)))
+
+  it.effect("reports retryable storage loss as degraded and clears it after recovery", () =>
+    Effect.gen(function*() {
+      let failNext = false
+      const Services = healthWithSql((text, statement) => {
+        if (failNext && text.includes("SELECT COUNT(*) AS count")) {
+          failNext = false
+          return Effect.fail(
+            new SqlError.SqlError({
+              reason: new SqlError.LockTimeoutError({
+                cause: new Error("database is locked"),
+                message: "database is locked"
+              })
+            })
+          )
+        }
+        return statement
+      })
+      yield* Effect.gen(function*() {
+        const health = yield* ReplicaHealth.ReplicaHealth
+        const seen = yield* Queue.unbounded<ReplicaStatus.ReplicaStatus>()
+        const observer = yield* health.status.pipe(
+          Stream.runForEach((status) => Queue.offer(seen, status)),
+          Effect.forkChild
+        )
+        assert.deepStrictEqual(yield* Queue.take(seen), { _tag: "Ready", pendingCommands: 0 })
+        failNext = true
+        yield* health.sample
+        const degraded = yield* Queue.take(seen)
+        assert.strictEqual(degraded._tag, "Degraded")
+        if (degraded._tag === "Degraded") assert.include(degraded.reason, "database is locked")
+        yield* health.sample
+        assert.deepStrictEqual(yield* Queue.take(seen), { _tag: "Ready", pendingCommands: 0 })
+        yield* Fiber.interrupt(observer)
+      }).pipe(Effect.provide(Services))
+    }))
 
   it.effect("reports a blocked projection that a projectionless blocked document sorts ahead of", () =>
     Effect.gen(function*() {
@@ -370,6 +564,103 @@ describe("ReplicaHealth", () => {
         assert.include(failed.message, "writer_generation")
       }
     }).pipe(Effect.provide(Live), Effect.provide(Database)))
+
+  it.effect("reports a negative durable writer generation as failed", () =>
+    Effect.gen(function*() {
+      const health = yield* ReplicaHealth.ReplicaHealth
+      const sql = yield* SqlClient.SqlClient
+      yield* sql`UPDATE effect_local_metadata SET writer_generation = -1 WHERE singleton = 1`
+      const failed = Option.getOrThrow(yield* Stream.runHead(health.status))
+      assert.strictEqual(failed._tag, "Failed")
+      if (failed._tag === "Failed") {
+        assert.include(failed.message, "writer_generation")
+      }
+    }).pipe(Effect.provide(Live), Effect.provide(Database)))
+
+  it.effect("does not let an older concurrent sample overwrite a newer result", () =>
+    Effect.gen(function*() {
+      const staleRead = yield* Deferred.make<void>()
+      const releaseStale = yield* Deferred.make<void>()
+      let armed = false
+      let blocked = false
+      const Services = healthWithSql((text, statement) => {
+        if (!armed || blocked || !text.includes("SELECT COUNT(*) AS count")) return statement
+        blocked = true
+        return statement.pipe(
+          Effect.tap(() => Deferred.succeed(staleRead, undefined)),
+          Effect.tap(() => Deferred.await(releaseStale))
+        )
+      })
+      yield* Effect.gen(function*() {
+        const health = yield* ReplicaHealth.ReplicaHealth
+        const sql = yield* SqlClient.SqlClient
+        const seen = yield* Queue.unbounded<ReplicaStatus.ReplicaStatus>()
+        const observer = yield* health.status.pipe(
+          Stream.runForEach((status) => Queue.offer(seen, status)),
+          Effect.forkChild
+        )
+        assert.deepStrictEqual(yield* Queue.take(seen), { _tag: "Ready", pendingCommands: 0 })
+        armed = true
+        const stale = yield* health.sample.pipe(Effect.forkChild)
+        yield* Deferred.await(staleRead)
+        yield* sql`INSERT INTO effect_local_commit_outbox
+          (commit_sequence, document_id, invalidation_keys, published)
+          VALUES (
+            9201,
+            'doc_00000000-0000-4000-8000-000000000021',
+            '["Task"]',
+            0
+          )`
+        const fresh = yield* health.sample.pipe(Effect.forkChild)
+        for (let index = 0; index < 10; index++) yield* Effect.yieldNow
+        yield* Deferred.succeed(releaseStale, undefined)
+        yield* Fiber.join(stale)
+        yield* Fiber.join(fresh)
+        assert.deepStrictEqual(
+          yield* Queue.take(seen),
+          { _tag: "Ready", pendingCommands: 1 }
+        )
+        assert.deepStrictEqual(
+          yield* Queue.poll(seen),
+          Option.none(),
+          "the stale sample published pendingCommands = 0 after the newer result"
+        )
+        yield* Fiber.interrupt(observer)
+      }).pipe(Effect.provide(Services))
+    }))
+
+  it.effect("does not hide a terminated background sampler on subscription", () =>
+    Effect.gen(function*() {
+      let failNext = false
+      const Services = healthWithSql((text, statement) => {
+        if (failNext && text.includes("SELECT COUNT(*) AS count")) {
+          failNext = false
+          return Effect.die(new Error("forced sampler defect"))
+        }
+        return statement
+      })
+      yield* Effect.gen(function*() {
+        const health = yield* ReplicaHealth.ReplicaHealth
+        const seen = yield* Queue.unbounded<ReplicaStatus.ReplicaStatus>()
+        yield* health.status.pipe(
+          Stream.runForEach((status) => Queue.offer(seen, status)),
+          Effect.forkChild
+        )
+        assert.deepStrictEqual(yield* Queue.take(seen), { _tag: "Ready", pendingCommands: 0 })
+        failNext = true
+        yield* TestClock.adjust("1 second")
+        assert.deepStrictEqual(yield* Queue.take(seen), {
+          _tag: "Failed",
+          message: "Replica health sampling stopped"
+        })
+        assert.strictEqual(
+          Option.getOrThrow(yield* Stream.runHead(health.status))._tag,
+          "Failed",
+          "a one-shot subscription sample hid the permanently stopped poller"
+        )
+      }).pipe(Effect.provide(Services))
+    }))
+
   it.effect("does not report a fenced replica when a local claim finishes after the generation read", () =>
     Effect.gen(function*() {
       const atClaiming = yield* Deferred.make<void>()
@@ -425,7 +716,11 @@ describe("ReplicaHealth", () => {
           [],
           "a completed local claim was reported as another writer generation fencing the replica"
         )
-      }).pipe(Effect.provide(ReplicaHealth.layer(definition).pipe(Layer.provideMerge(SkewedGate))))
+      }).pipe(
+        Effect.provide(
+          ReplicaHealth.layer(definition, ReplicaHealth.defaultOptions).pipe(Layer.provideMerge(SkewedGate))
+        )
+      )
     }))
   it.effect("reports a projection the query path already refuses to serve", () =>
     Effect.gen(function*() {
@@ -457,7 +752,7 @@ describe("ReplicaHealth", () => {
         projections: [TaskTitle],
         queries: []
       })
-      const ProjectedLive = ReplicaHealth.layer(projected).pipe(Layer.provideMerge(Gate))
+      const ProjectedLive = ReplicaHealth.layer(projected, ReplicaHealth.defaultOptions).pipe(Layer.provideMerge(Gate))
       yield* Effect.gen(function*() {
         const health = yield* ReplicaHealth.ReplicaHealth
         const sql = yield* SqlClient.SqlClient
@@ -476,12 +771,16 @@ describe("ReplicaHealth", () => {
       const health = yield* ReplicaHealth.ReplicaHealth
       const observed: Array<ReplicaStatus.ReplicaStatus> = []
       const subscribed = yield* Deferred.make<void>()
+      const installing = yield* Deferred.make<void>()
       // Drains until the replica reports itself usable again after the install, so the whole restore
       // lifecycle is observed instead of whichever prefix the consumer happened to be scheduled for.
       const consumer = yield* health.status.pipe(
         Stream.tap((status) =>
           Effect.sync(() => observed.push(status)).pipe(
-            Effect.andThen(Deferred.succeed(subscribed, undefined))
+            Effect.andThen(Deferred.succeed(subscribed, undefined)),
+            Effect.andThen(
+              status._tag === "ReadOnly" ? Deferred.succeed(installing, undefined) : Effect.void
+            )
           )
         ),
         Stream.takeUntil((status) => status._tag === "Ready" && observed.some((seen) => seen._tag === "ReadOnly")),
@@ -496,7 +795,10 @@ describe("ReplicaHealth", () => {
       yield* Effect.scoped(Effect.gen(function*() {
         const reporter = yield* health.restoring
         yield* reporter.progress(2048)
-        yield* Effect.scoped(reporter.installing)
+        yield* Effect.scoped(Effect.gen(function*() {
+          yield* reporter.installing
+          yield* Deferred.await(installing)
+        }))
       }))
       yield* Fiber.join(consumer)
       // Installation is the last phase of a restore, so once it is reported the restore must never be
