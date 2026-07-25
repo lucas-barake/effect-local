@@ -175,6 +175,20 @@ describe("Compaction", () => {
       FROM effect_local_history_rewrites ORDER BY replica_incarnation, rewritten_at, operation_id`
   })
 
+  const commitOutboxOf = (documentId: Identity.DocumentId) =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      return yield* sql<{
+        readonly commit_sequence: number
+        readonly document_id: string
+        readonly invalidation_keys: string
+        readonly published: number
+      }>`SELECT commit_sequence, document_id, invalidation_keys, published
+        FROM effect_local_commit_outbox
+        WHERE document_id = ${documentId}
+        ORDER BY commit_sequence`
+    })
+
   /**
    * The operator request every single-rewrite test below serves. Each test builds its own in-memory
    * database, so one id is unambiguous across them; the tests that need a second request name their
@@ -559,6 +573,15 @@ describe("Compaction", () => {
       assert.strictEqual(changes[0]!.applied, 1)
       assert.strictEqual(changes[0]!.peer_id, null)
       assert.strictEqual(changes[0]!.commit_sequence, rewritten.commit_sequence)
+      assert.deepStrictEqual(
+        (yield* commitOutboxOf(documentId)).filter((row) => row.commit_sequence === rewritten.commit_sequence),
+        [{
+          commit_sequence: rewritten.commit_sequence,
+          document_id: documentId as string,
+          invalidation_keys: JSON.stringify([Task.name]),
+          published: 0
+        }]
+      )
 
       const hashes = changeHashesOf(rewritten.bytes)
       assert.strictEqual(hashes.length, 1)
@@ -767,6 +790,8 @@ describe("Compaction", () => {
       yield* compaction.compact(Task, documentId)
       const checkpointsBefore = yield* checkpointsOf(documentId)
       const changesBefore = yield* changesOf(documentId)
+      const outboxBefore = yield* commitOutboxOf(documentId)
+      const markersBefore = yield* rewriteMarkers
       yield* sql`CREATE TRIGGER fence_history_rewrite
         AFTER UPDATE OF checkpoint_hash ON effect_local_documents
         BEGIN
@@ -784,6 +809,8 @@ describe("Compaction", () => {
         changesBefore.map((row) => row.change_hash).toSorted()
       )
       assert.strictEqual((yield* documentRowOf(documentId)).lineage, "")
+      assert.deepStrictEqual(yield* commitOutboxOf(documentId), outboxBefore)
+      assert.deepStrictEqual(yield* rewriteMarkers, markersBefore)
       const reloaded = yield* store.load(Task, documentId)
       assert.deepStrictEqual(reloaded.snapshot.value, value)
       InternalAutomerge.free(reloaded.automerge)
