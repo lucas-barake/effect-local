@@ -390,7 +390,7 @@ describe("ReplicaHealth", () => {
         Option.some<ReplicaStatus.ReplicaStatus>({
           _tag: "ProjectionBlocked",
           projection: "TaskById",
-          reason: "A Task document is blocked for projection"
+          reason: "A Task document is not ready for projection"
         })
       )
     }).pipe(Effect.provide(Projected), Effect.provide(ProjectedDatabase)))
@@ -462,5 +462,49 @@ describe("ReplicaHealth", () => {
           "a completed local claim was reported as another writer generation fencing the replica"
         )
       }).pipe(Effect.provide(ReplicaHealth.layer(definition).pipe(Layer.provideMerge(SkewedGate))))
+    }))
+  it.effect("reports a projection the query path already refuses to serve", () =>
+    Effect.gen(function*() {
+      const health = yield* ReplicaHealth.ReplicaHealth
+      const sql = yield* SqlClient.SqlClient
+      // `QueryExecutor` refuses a query when the registry, a document projection row, or a document is not
+      // `Ready`. `Rebuilding` is one of those states, so reporting `Ready` here would tell a consumer the
+      // replica is usable while every query on it fails.
+      yield* sql`INSERT INTO effect_local_projection_registry
+        (projection_name, table_name, projection_version, schema_checksum, status)
+        VALUES ('TaskTitle', 'task_title_v1', 1, 'sha', 'Rebuilding')`
+      const status = Option.getOrThrow(yield* Stream.runHead(health.status))
+      assert.strictEqual(status._tag, "Ready")
+    }).pipe(Effect.provide(Live), Effect.provide(Database)))
+
+  it.effect("reports a declared projection that is rebuilding as blocked", () =>
+    Effect.gen(function*() {
+      const TaskTitle = Projection.make("TaskTitle", {
+        document: Task,
+        version: 1,
+        Row: Schema.Struct({ sourceDocumentId: Identity.DocumentId, title: Schema.String }),
+        key: (row) => row.sourceDocumentId,
+        project: () => []
+      })
+      const projected = ReplicaDefinition.make({
+        name: "health-replica",
+        documents: DocumentSet.make(Task),
+        mutations: [],
+        projections: [TaskTitle],
+        queries: []
+      })
+      const ProjectedLive = ReplicaHealth.layer(projected).pipe(Layer.provideMerge(Gate))
+      yield* Effect.gen(function*() {
+        const health = yield* ReplicaHealth.ReplicaHealth
+        const sql = yield* SqlClient.SqlClient
+        yield* sql`INSERT INTO effect_local_projection_registry
+          (projection_name, table_name, projection_version, schema_checksum, status)
+          VALUES ('TaskTitle', 'task_title_v1', 1, 'sha', 'Rebuilding')`
+        const status = Option.getOrThrow(yield* Stream.runHead(health.status))
+        assert.strictEqual(status._tag, "ProjectionBlocked")
+        if (status._tag === "ProjectionBlocked") {
+          assert.strictEqual(status.projection, "TaskTitle")
+        }
+      }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database))
     }))
 })

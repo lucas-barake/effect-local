@@ -25,6 +25,7 @@ import * as ReplicaGate from "./ReplicaGate.js"
 
 const PendingRow = Schema.Struct({ count: Schema.Int })
 const BlockedRow = Schema.Struct({ document_type: Schema.String })
+const BlockedProjectionRow = Schema.Struct({ projection_name: Schema.String })
 const GenerationRow = Schema.Struct({ writer_generation: Schema.Int })
 
 const sampleInterval = "1 second"
@@ -151,13 +152,28 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         Result: BlockedRow,
         execute: () =>
           sql`SELECT DISTINCT document_type FROM effect_local_documents
-            WHERE projection_status = 'Blocked' ORDER BY document_type`
+            WHERE projection_status != 'Ready' ORDER BY document_type`
+      })
+      // The other two conditions `QueryExecutor` refuses a query on. Reading only blocked documents would
+      // report `Ready` on a replica whose every query already fails, which is worse than the constant it
+      // replaced.
+      const findBlockedProjection = SqlSchema.findOneOption({
+        Request: Schema.Void,
+        Result: BlockedProjectionRow,
+        execute: () =>
+          sql`SELECT projection_name FROM effect_local_projection_registry WHERE status != 'Ready'
+            UNION
+            SELECT projection_name FROM effect_local_document_projections WHERE status != 'Ready'
+            ORDER BY projection_name LIMIT 1`
       })
       const findWriterGeneration = SqlSchema.findOneOption({
         Request: Schema.Void,
         Result: GenerationRow,
         execute: () => sql`SELECT writer_generation FROM effect_local_metadata WHERE singleton = 1`
       })
+
+      const isDeclared = (projectionName: string): boolean =>
+        definition.projections.some((projection: Projection.Any) => projection.name === projectionName)
 
       const projectionFor = (documentType: string): Option.Option<string> =>
         Arr.findFirst(
@@ -203,6 +219,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       const sample = Effect.gen(function*() {
         const pending = yield* read(countPending(undefined))
         const blockedDocumentTypes = yield* read(findBlockedDocumentTypes(undefined))
+        const blockedProjection = yield* read(findBlockedProjection(undefined))
         const generation = yield* read(findWriterGeneration(undefined))
         // Read in this order on purpose. `ReplicaGate.claim` sets its owner, bumps `writer_generation`
         // inside its transaction, republishes the matching permit, and only then clears the owner, and the
@@ -222,15 +239,24 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         const blocked = Arr.findFirst(blockedDocumentTypes, (row) =>
           Option.map(projectionFor(row.document_type), (projection) => ({
             projection,
-            reason: `A ${row.document_type} document is blocked for projection`
-          })))
+            reason: `A ${row.document_type} document is not ready for projection`
+          }))).pipe(
+            Option.orElse(() =>
+              Option.filter(blockedProjection, (row) =>
+                isDeclared(row.projection_name)).pipe(
+                  Option.map((row) => ({
+                    projection: row.projection_name,
+                    reason: `The ${row.projection_name} projection is not ready`
+                  }))
+                )
+            )
+          )
         yield* commit((current) => ({
           ...current,
           pendingCommands: Option.match(pending, {
             onNone: () =>
               0,
-            onSome: (row) =>
-              row.count
+            onSome: (row) => row.count
           }),
           blocked,
           degraded: Option.none(),
