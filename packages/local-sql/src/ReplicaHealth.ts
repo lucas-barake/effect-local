@@ -1,6 +1,5 @@
 import type * as Projection from "@lucas-barake/effect-local/Projection"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
-import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Arr from "effect/Array"
 import * as Context from "effect/Context"
@@ -18,7 +17,6 @@ import type * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
-import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -88,7 +86,7 @@ const derive = (conditions: Conditions): ReplicaStatus.ReplicaStatus => {
     }
   }
   if (Option.isSome(conditions.degraded)) return { _tag: "Degraded", reason: conditions.degraded.value }
-  return { _tag: "Ready", pendingCommands: Math.max(0, Math.trunc(conditions.pendingCommands)) }
+  return { _tag: "Ready", pendingCommands: conditions.pendingCommands }
 }
 
 export class ReplicaHealth extends Context.Service<ReplicaHealth, {
@@ -202,25 +200,11 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         return messages.length > 0 ? messages.join(": ") : String(cause)
       }
 
-      // Both failures are tagged, so they are discriminated by `_tag` rather than by rendering the cause.
-      // `catchCause` would also have swallowed defects and interruption, which must stay untouched.
-      const read = <A,>(
-        effect: Effect.Effect<A, SqlError.SqlError | Schema.SchemaError>
-      ): Effect.Effect<A, ReplicaError.ReplicaError> =>
-        effect.pipe(
-          Effect.catchTags({
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageCorrupt({ cause }) })),
-            SqlError: (cause) =>
-              Effect.fail(new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) }))
-          })
-        )
-
       const sample = Effect.gen(function*() {
-        const pending = yield* read(countPending(undefined))
-        const blockedDocumentTypes = yield* read(findBlockedDocumentTypes(undefined))
-        const blockedProjection = yield* read(findBlockedProjection(undefined))
-        const generation = yield* read(findWriterGeneration(undefined))
+        const pending = yield* countPending(undefined)
+        const blockedDocumentTypes = yield* findBlockedDocumentTypes(undefined)
+        const blockedProjection = yield* findBlockedProjection(undefined)
+        const generation = yield* findWriterGeneration(undefined)
         // Read in this order on purpose. `ReplicaGate.claim` sets its owner, bumps `writer_generation`
         // inside its transaction, republishes the matching permit, and only then clears the owner, and the
         // sampler holds nothing that keeps it out of that window. Observing no owner therefore proves the
@@ -267,80 +251,59 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           fenced: !claiming && generation.value.writer_generation > permit.writerGeneration
         }))
       }).pipe(
-        Effect.catchReason("ReplicaError", "StorageCorrupt", (reason) =>
-          commit((current) => ({
-            ...current,
-            failure: Option.some(`Replica storage is corrupt: ${detailOf(reason.cause)}`)
-          }))),
-        // A busy or locked database is transient, so it degrades rather than failing, and the previously
-        // sampled fields are deliberately left in place instead of being reset to a guess.
-        Effect.catchReason("ReplicaError", "StorageUnavailable", (reason) =>
-          commit((current) => ({
-            ...current,
-            degraded: Option.some(`Replica storage is unavailable: ${detailOf(reason.cause)}`)
-          }))),
-        // `read` only ever produces the two reasons handled above; this closes the typed channel so the
-        // status stream itself can never fail, which is what keeps subscribers from having to resubscribe.
-        Effect.catchTag("ReplicaError", (error) =>
-          commit((current) => ({
-            ...current,
-            degraded: Option.some(`Replica health sampling failed: ${error.reason._tag}`)
-          }))),
+        // `SqlError | SchemaError` is the entire failure channel of the reads above, so handling both
+        // closes it and the status stream itself can never fail, which is what keeps subscribers from
+        // having to resubscribe. `catchCause` would also have swallowed defects and interruption.
+        Effect.catchTags({
+          SchemaError: (cause) =>
+            commit((current) => ({
+              ...current,
+              failure: Option.some(`Replica storage is corrupt: ${detailOf(cause)}`)
+            })),
+          // A busy or locked database is transient, so it degrades rather than failing, and the previously
+          // sampled fields are deliberately left in place instead of being reset to a guess.
+          SqlError: (cause) =>
+            commit((current) => ({
+              ...current,
+              degraded: Option.some(`Replica storage is unavailable: ${detailOf(cause)}`)
+            }))
+        }),
         Effect.withSpan("ReplicaHealth.sample")
       )
+
+      const editRestores = (edit: (restores: Map<number, RestoreState>) => void) =>
+        commit((current) => {
+          const restores = new Map(current.restores)
+          edit(restores)
+          return { ...current, restores }
+        })
+
+      // An edit that finds no entry is a no-op: the restore has already been retired, and reinstating it
+      // would strand the replica in `Restoring`.
+      const editRestore = (token: number, edit: (state: RestoreState) => RestoreState) =>
+        editRestores((restores) => {
+          const existing = restores.get(token)
+          if (existing !== undefined) restores.set(token, edit(existing))
+        })
 
       const nextToken = yield* Ref.make(0)
       const restoring = Effect.acquireRelease(
         Ref.getAndUpdate(nextToken, (token) => token + 1).pipe(
           Effect.tap((token) =>
-            commit((current) => {
-              const restores = new Map(current.restores)
-              restores.set(token, { processedBytes: 0, installing: false })
-              return { ...current, restores }
-            })
+            editRestores((restores) => restores.set(token, { processedBytes: 0, installing: false }))
           )
         ),
-        (token) =>
-          commit((current) => {
-            const restores = new Map(current.restores)
-            restores.delete(token)
-            return { ...current, restores }
-          })
+        (token) => editRestores((restores) => restores.delete(token))
       ).pipe(
         Effect.map((token): Restore => ({
-          progress: (processedBytes) =>
-            commit((current) => {
-              const existing = current.restores.get(token)
-              if (existing === undefined) {
-                return current
-              }
-              const restores = new Map(current.restores)
-              restores.set(token, { ...existing, processedBytes })
-              return { ...current, restores }
-            }),
+          progress: (processedBytes) => editRestore(token, (state) => ({ ...state, processedBytes })),
           installing: Effect.acquireRelease(
-            commit((current) => {
-              const existing = current.restores.get(token)
-              if (existing === undefined) {
-                return current
-              }
-              const restores = new Map(current.restores)
-              restores.set(token, { ...existing, installing: true })
-              return { ...current, restores }
-            }),
+            editRestore(token, (state) => ({ ...state, installing: true })),
             // Installation is the last phase, so ending it retires the restore rather than dropping it
             // back to the ingest it already finished. Scopes finalize inner-first, so reverting the flag
             // here would re-publish `Restoring` between the install ending and the outer scope removing
             // the token, walking the status backwards on every restore.
-            () =>
-              commit((current) => {
-                if (!current.restores.has(token)) {
-                  return current
-                }
-                const restores = new Map(current.restores)
-                restores.delete(token)
-                return { ...current, restores }
-              })
+            () => editRestores((restores) => restores.delete(token))
           )
         }))
       )

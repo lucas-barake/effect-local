@@ -392,8 +392,6 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         options: Backup.RestoreOptions<R>
       ): Effect.Effect<void, ReplicaError.ReplicaError, R> =>
         Effect.gen(function*() {
-          // Ingest and installation are reported as two sequential conditions, not one overlapping pair:
-          // during ingest the replica still serves reads and writes, and only the install claim blocks them.
           const reporter = yield* health.restoring
           const maxBytes = yield* Backup.validateMaxBytes(options.maxBytes)
           if (maxBytes > limits.maxBackupBytes) {
