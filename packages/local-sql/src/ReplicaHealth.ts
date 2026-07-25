@@ -2,12 +2,14 @@ import type * as Projection from "@lucas-barake/effect-local/Projection"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import * as Arr from "effect/Array"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Predicate from "effect/Predicate"
 import * as PubSub from "effect/PubSub"
 import * as Ref from "effect/Ref"
 import * as Schedule from "effect/Schedule"
@@ -107,6 +109,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       const sql = yield* SqlClient.SqlClient
 
       const conditions = yield* Ref.make(initial)
+      const published = yield* Ref.make(derive(initial))
       // Acquired before the sampler is forked so reverse-order finalization interrupts the sampler first
       // and only then shuts the PubSub down, ending every live subscriber with a graceful stream end.
       const statuses = yield* Effect.acquireRelease(
@@ -126,18 +129,14 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       const writes = yield* Semaphore.make(1)
 
       const commit = (update: (current: Conditions) => Conditions) =>
-        Ref.modify(conditions, (current) => {
-          const next = update(current)
+        writes.withPermit(Effect.gen(function*() {
+          const next = update(yield* Ref.get(conditions))
+          yield* Ref.set(conditions, next)
           const status = derive(next)
-          return [Equal.equals(derive(current), status) ? Option.none() : Option.some(status), next] as const
-        }).pipe(
-          Effect.flatMap(Option.match({
-            onNone: () => Effect.void,
-            onSome: (status) => PubSub.publish(statuses, status).pipe(Effect.asVoid)
-          })),
-          Effect.asVoid,
-          writes.withPermits(1)
-        )
+          if (Equal.equals(yield* Ref.get(published), status)) return
+          yield* Ref.set(published, status)
+          yield* PubSub.publish(statuses, status)
+        }))
 
       const countPending = SqlSchema.findOneOption({
         Request: Schema.Void,
@@ -157,12 +156,12 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         execute: () => sql`SELECT writer_generation FROM effect_local_metadata WHERE singleton = 1`
       })
 
-      const projectionFor = (documentType: string): Option.Option<string> => {
-        const match = definition.projections.find(
-          (projection: Projection.Any) => projection.document.name === documentType
+      const projectionFor = (documentType: string): Option.Option<string> =>
+        Arr.findFirst(
+          definition.projections,
+          (projection: Projection.Any) =>
+            projection.document.name === documentType ? Option.some(projection.name) : Option.none()
         )
-        return match === undefined ? Option.none() : Option.some(match.name)
-      }
 
       // `ReplicaError.message` is only the reason tag, so the underlying driver or schema message is
       // pulled out here: "no such table: effect_local_commit_outbox" is actionable, "StorageUnavailable"
@@ -172,12 +171,14 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       const detailOf = (cause: unknown): string => {
         const messages: Array<string> = []
         let current: unknown = cause
-        while (current !== null && current !== undefined && messages.length < 3) {
-          const message = (current as { readonly message?: unknown }).message
-          if (typeof message === "string" && message.length > 0 && !messages.includes(message)) {
-            messages.push(message)
+        while (Predicate.isNotNullish(current) && messages.length < 3) {
+          if (
+            Predicate.hasProperty(current, "message") && Predicate.isString(current.message) &&
+            current.message.length > 0 && !messages.includes(current.message)
+          ) {
+            messages.push(current.message)
           }
-          current = (current as { readonly cause?: unknown }).cause
+          current = Predicate.hasProperty(current, "cause") ? current.cause : undefined
         }
         return messages.length > 0 ? messages.join(": ") : String(cause)
       }
@@ -325,7 +326,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       return {
         // Sampling on subscribe means a consumer never starts from a stale value, and it is what makes the
         // stream observable without waiting for a poll tick.
-        status: Stream.unwrap(sample.pipe(Effect.as(Stream.fromPubSub(statuses)))),
+        status: Stream.fromPubSub(statuses).pipe(Stream.onStart(sample)),
         sample,
         restoring
       }
