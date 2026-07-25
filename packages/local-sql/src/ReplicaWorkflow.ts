@@ -104,6 +104,28 @@ export const layerRegistration = (
         sql`SELECT document_id AS documentId, document_type AS documentType
         FROM effect_local_documents ORDER BY document_id`
     })
+    // Runs before the document work, not after it. Receipt reclamation is replica scoped and
+    // independent of any document, so it must not sit behind a loop whose failures abort the
+    // handler: only `CheckpointSuperseded` is caught below, so one corrupt checkpoint or one
+    // unrecognised document type would otherwise starve it on every run, on exactly the replica
+    // whose backups are already oversized. Running first also keeps it from replacing the superseded
+    // report at the end of the handler.
+    yield* Activity.make({
+      name: "PruneCommandReceipts",
+      error: ReplicaError.ReplicaError,
+      execute: withActivityPermit(
+        gate,
+        payload.replicaIncarnation,
+        Effect.gen(function*() {
+          const prunedReceipts = yield* compaction.pruneCommandReceipts
+          if (prunedReceipts > 0) {
+            yield* Effect.logDebug("Reclaimed command receipts from superseded incarnations").pipe(
+              Effect.annotateLogs({ prunedReceipts, replicaIncarnation: payload.replicaIncarnation })
+            )
+          }
+        })
+      )
+    })
     const documents = yield* Activity.make({
       name: "ListDocuments",
       success: Schema.Array(DocumentReference),

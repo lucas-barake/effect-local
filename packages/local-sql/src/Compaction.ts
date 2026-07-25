@@ -45,6 +45,10 @@ const CheckpointRow = Schema.Struct({
 })
 
 const ChangeHashRow = Schema.Struct({ change_hash: Schema.String })
+// Plain string, matching `ChangeHashRow` above and the archive's own `command_id` decoding: the
+// value is only counted, never used as an identifier, and branding it would make reclaiming a
+// malformed legacy row fail instead of removing it.
+const CommandIdRow = Schema.Struct({ command_id: Schema.String })
 const AppliedChangeRow = Schema.Struct({
   change_hash: WriterProvenance.ChangeHash,
   writer_definition_hash: WriterProvenance.WriterDefinitionHash,
@@ -79,7 +83,41 @@ export class Compaction extends Context.Service<Compaction, {
     documentId: Identity.DocumentId
   ) => Effect.Effect<CompactResult, ReplicaError.ReplicaError>
   readonly prune: (documentId: Identity.DocumentId) => Effect.Effect<number, ReplicaError.ReplicaError>
+  /**
+   * Reclaims command receipts left behind by superseded replica incarnations and returns how many
+   * rows were deleted.
+   *
+   * Receipts are keyed `(replica_incarnation, command_id)` and are only ever read at the current
+   * incarnation, so rows below it can never satisfy a lookup again. The metadata incarnation only
+   * ever increases, so those rows are unreachable permanently rather than temporarily.
+   *
+   * Acquires no gate lock. The caller owns the lock, exactly as `prune` does, so this must be
+   * entered under an already held shared or write permit.
+   */
+  readonly pruneCommandReceipts: Effect.Effect<number, ReplicaError.ReplicaError>
 }>()("@lucas-barake/effect-local-sql/Compaction") {}
+
+/**
+ * Rows deleted per transaction when reclaiming superseded command receipts. The SQL client owns a
+ * single connection, and a transaction holds it for its whole duration, so one unbounded delete over
+ * the backlog this reclaims would stall every other command, query, and cluster write in the
+ * process. Batching bounds that stall, and bounds the `RETURNING` set the count is derived from.
+ */
+const receiptPruneBatchSize = 512
+
+const failStorageUnavailable = (cause: unknown) =>
+  Effect.fail(
+    new ReplicaError.ReplicaError({
+      reason: new ReplicaError.StorageUnavailable({ cause })
+    })
+  )
+
+const failStorageCorrupt = (cause: unknown) =>
+  Effect.fail(
+    new ReplicaError.ReplicaError({
+      reason: new ReplicaError.StorageCorrupt({ cause })
+    })
+  )
 
 export const layer: Layer.Layer<
   Compaction,
@@ -452,6 +490,58 @@ export const layer: Layer.Layer<
         )
       })
 
+    // `<` rather than PeerSync's `!=` idiom for the equivalent peer receipt sweep: no row can hold
+    // an incarnation above the current one, because receipts are only written under a validated
+    // permit and restore rejects archived rows above the manifest before raising metadata past it.
+    // The two predicates therefore select the same rows, but `replica_incarnation` leads the primary
+    // key, so `<` is an index range scan where `!=` forces a full scan of the table this reclaims.
+    const deleteSupersededReceipts = SqlSchema.findAll({
+      Request: Schema.Struct({ incarnation: Identity.ReplicaIncarnation, limit: Schema.Int }),
+      Result: CommandIdRow,
+      execute: ({ incarnation, limit }) =>
+        sql`DELETE FROM effect_local_command_receipts
+          WHERE rowid IN (
+            SELECT rowid FROM effect_local_command_receipts
+            WHERE replica_incarnation < ${incarnation}
+            LIMIT ${limit}
+          )
+          RETURNING command_id`
+    })
+
+    const pruneCommandReceipts = Effect.gen(function*() {
+      const permit = yield* gate.current
+      // The incarnation is a sequence seeded at zero and only ever advanced by a writer re-claim, so
+      // a replica still on its first incarnation cannot own a superseded receipt. Returning before
+      // opening a transaction keeps compaction free of storage work on every such replica, which is
+      // every replica that has never restored a backup.
+      if (permit.incarnation === 0) return 0
+      let deleted = 0
+      while (true) {
+        // One transaction per batch. Spanning transactions does not weaken the fence: each batch
+        // revalidates the permit before and after its own delete, and the predicate is monotone
+        // because the metadata incarnation only increases. A partially completed sweep is a correct
+        // partial reclaim that the next run finishes, and a fenced batch leaves earlier ones
+        // committed. Lock order stays gate-then-SQL; nothing here acquires the gate.
+        const removed = yield* sql.withTransaction(Effect.gen(function*() {
+          yield* gate.validate(permit)
+          const rows = yield* deleteSupersededReceipts({
+            incarnation: permit.incarnation,
+            limit: receiptPruneBatchSize
+          })
+          yield* gate.validate(permit)
+          return rows.length
+        }))
+        deleted += removed
+        if (removed < receiptPruneBatchSize) return deleted
+      }
+    }).pipe(
+      Effect.catchTags({ SqlError: failStorageUnavailable, SchemaError: failStorageCorrupt }),
+      Effect.tap((deleted) => Effect.annotateCurrentSpan({ "receipts.pruned": deleted })),
+      Effect.withSpan("Compaction.pruneCommandReceipts", {
+        attributes: { "receipts.batch_size": receiptPruneBatchSize }
+      })
+    )
+
     const compact = <D extends Document.Any,>(document: D, documentId: Identity.DocumentId) =>
       Effect.gen(function*() {
         const checkpoint = yield* prepare(document, documentId)
@@ -649,6 +739,6 @@ export const layer: Layer.Layer<
         }))
       })
 
-    return Compaction.of({ compact, prepare, prune, publish })
+    return Compaction.of({ compact, prepare, prune, pruneCommandReceipts, publish })
   })
 )

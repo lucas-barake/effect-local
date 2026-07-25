@@ -25,20 +25,28 @@ single connection deadlock.
 Document loads verify checkpoint checksums, Automerge heads, change metadata, and the tombstone marker. Recovery
 falls back to an older verified checkpoint and replays accepted changes. Corrupt candidates are quarantined.
 
-Compaction has separate prepare, compare and publish, and prune phases. It retains two checkpoints and prunes only
+Compaction has separate prepare, compare and publish, change prune, and receipt reclamation phases. It retains two checkpoints and prunes only
 changes dominated by both retained recovery paths. A crash before publish leaves the old checkpoint authoritative. A
 crash after publish leaves enough history to recover.
 
+Compaction also reclaims command receipts on a second, independent axis. Receipts are keyed by replica incarnation
+and are only ever read at the current one, so rows below it can never resolve a lookup again. Compaction deletes them
+in bounded batches, each batch revalidating the writer permit inside its own transaction. Receipts at the current
+incarnation are never touched, so replay suppression and outcome recovery are unchanged. Restore is the only shipped
+code path that advances the incarnation, so a replica that has never restored has nothing to reclaim.
+
 Publish installs the checkpoint with an optimistic compare and set against the global commit sequence, so a
 concurrent commit anywhere in the replica supersedes a prepared checkpoint. A superseded publish is a committed no
-op, which makes re-preparing safe. Prune runs only after a checkpoint is published.
+op, which makes re-preparing safe. Change pruning runs only after a checkpoint is published. Receipt reclamation is
+independent of any checkpoint and runs once per compaction run.
 
 ## Workflows
 
 `ClusterWorkflowEngine` uses the same SQL backed single runner composition as document entities. Message and runner
 storage use private `effect_local_cluster` and `effect_local_runner` table prefixes. The registered
 compaction workflow derives its execution identity from replica incarnation and operation identity. It journals a
-document listing activity and one compact activity per document. `CompactionWorkflow` exposes execute, poll,
+command receipt reclamation activity, then a document listing activity, then one compact activity per document.
+Reclamation is journaled first so a document that cannot publish does not starve it. `CompactionWorkflow` exposes execute, poll,
 and resume while rejecting handles from a prior replica incarnation.
 
 A compact activity retries a bounded number of times when its checkpoint publication is superseded. If every attempt

@@ -184,6 +184,72 @@ describe("DurableRuntime", () => {
       assert.strictEqual(checkpoints[0]?.count, 1)
     }).pipe(Effect.provide(Services)))
 
+  // Receipts are keyed `(replica_incarnation, command_id)` and are only ever read at the current
+  // incarnation, so every row below it is unreachable. They are seeded directly because
+  // `persistReceipt` always writes the live incarnation, which makes a superseded row impossible to
+  // produce through the executor. Distinct values per column so a wrong-row deletion is visible.
+  // Returns the row the insert wrote, which is what the assertions below compare against.
+  const seedReceipt = (incarnation: Identity.ReplicaIncarnation, label: string, ordinal: number) =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const row = {
+        replica_incarnation: incarnation,
+        command_id: `cmd_00000000-0000-4000-8000-00000000000${ordinal}`,
+        request_hash: `hash-${label}`,
+        document_id: `doc_00000000-0000-4000-8000-00000000000${ordinal}`,
+        commit_sequence: ordinal
+      }
+      yield* sql`INSERT INTO effect_local_command_receipts (
+      replica_incarnation, command_id, request_hash, mutation_name, result,
+      document_id, heads, commit_sequence
+    ) VALUES (
+      ${row.replica_incarnation}, ${row.command_id}, ${row.request_hash}, '$create',
+      ${new TextEncoder().encode(row.command_id)}, ${row.document_id}, '[]',
+      ${row.commit_sequence}
+    )`
+      return row
+    })
+
+  const readReceipts = Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    return yield* sql<{
+      readonly replica_incarnation: number
+      readonly command_id: string
+      readonly request_hash: string
+      readonly document_id: string
+      readonly commit_sequence: number
+    }>`SELECT replica_incarnation, command_id, request_hash, document_id, commit_sequence
+      FROM effect_local_command_receipts ORDER BY command_id`
+  })
+
+  it.effect("prunes command receipts from every superseded incarnation during the compaction workflow", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const runtime = yield* ReplicaWorkflow.CompactionWorkflow
+
+      const oldest = yield* seedReceipt((yield* gate.current).incarnation, "oldest", 1)
+      yield* gate.claim(() => Effect.void)
+      // A second superseded generation: this is what fails a `= current - 1` predicate.
+      const middle = yield* seedReceipt((yield* gate.current).incarnation, "middle", 2)
+      yield* gate.claim(() => Effect.void)
+      const live = yield* seedReceipt((yield* gate.current).incarnation, "live", 3)
+
+      assert.deepStrictEqual(yield* readReceipts, [oldest, middle, live])
+
+      const execution = yield* runtime.execute(ReplicaWorkflow.OperationId.make("prune-receipts"))
+      yield* drive
+      const result = yield* runtime.poll(execution)
+      assert.isTrue(Option.isSome(result))
+      if (Option.isSome(result)) {
+        assert.strictEqual(result.value._tag, "Complete")
+        if (result.value._tag === "Complete") assert.isTrue(Exit.isSuccess(result.value.exit))
+      }
+
+      // Exact set, never `every(...)`: an empty table would satisfy "only the live incarnation" and
+      // would hide a `<=` predicate that destroys the live receipt and silently re-runs its command.
+      assert.deepStrictEqual(yield* readReceipts, [live])
+    }).pipe(Effect.provide(Services)))
+
   it.effect("fences workflow handles from a prior replica incarnation", () =>
     Effect.gen(function*() {
       const gate = yield* ReplicaGate.ReplicaGate
@@ -217,6 +283,10 @@ describe("DurableRuntime", () => {
       const runtime = yield* ReplicaWorkflow.CompactionWorkflow
       const first = yield* runtime.execute(ReplicaWorkflow.OperationId.make("first-operation"))
       const second = yield* runtime.execute(ReplicaWorkflow.OperationId.make("second-operation"))
+      // Same reason as the interrupt twin below: the handler now journals a receipt reclamation
+      // activity first, so an undriven execution parks mid run holding the gate read lock and
+      // shutdown waits on it.
+      yield* drive
       const forged = { ...first, executionId: second.executionId }
       assert.strictEqual((yield* Effect.exit(runtime.poll(forged)))._tag, "Failure")
       assert.strictEqual((yield* Effect.exit(runtime.resume(forged)))._tag, "Failure")
@@ -333,6 +403,10 @@ describe("DurableRuntime", () => {
       const runtime = yield* ReplicaWorkflow.CompactionWorkflow
       const first = yield* runtime.execute(ReplicaWorkflow.OperationId.make("interrupt-first"))
       const second = yield* runtime.execute(ReplicaWorkflow.OperationId.make("interrupt-second"))
+      // Let both executions reach a stable point before tearing the layer down. The handler now
+      // journals a receipt reclamation activity first, so an undriven execution parks mid run
+      // holding the gate read lock and shutdown waits on it.
+      yield* drive
       const forged = { ...first, executionId: second.executionId }
       assert.strictEqual((yield* Effect.exit(runtime.interrupt(forged)))._tag, "Failure")
     }).pipe(Effect.provide(Services)))
@@ -611,6 +685,83 @@ describe("DurableRuntime", () => {
         assert.strictEqual(checkpoints[0]?.count, 0)
       }).pipe(Effect.provide(services))
     }), 20_000)
+
+  // The load bearing half of the ordering decision. `CheckpointSuperseded` is caught and deferred,
+  // so it cannot starve the activity wherever it sits; an unrecognised document type aborts the
+  // handler inside the loop, which is the failure the reclamation must run before. Without this,
+  // moving the activity below the loop passes every other test.
+  it.effect("prunes command receipts when the document loop aborts on an unrecognised document type", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const runtime = yield* ReplicaWorkflow.CompactionWorkflow
+      const sql = yield* SqlClient.SqlClient
+
+      const aborted = yield* seedReceipt((yield* gate.current).incarnation, "aborted", 6)
+      yield* gate.claim(() => Effect.void)
+      const kept = yield* seedReceipt((yield* gate.current).incarnation, "kept", 7)
+      assert.deepStrictEqual(yield* readReceipts, [aborted, kept])
+
+      const documentId = yield* Identity.makeDocumentId
+      yield* sql`INSERT INTO effect_local_documents (
+        document_id, document_type, schema_version, observed_versions, materialized_heads,
+        accepted_heads, tombstone, projection_status, checkpoint_hash
+      ) VALUES (${documentId}, 'Ghost', 1, '[]', '[]', '[]', 0, 'ready', NULL)`
+
+      const execution = yield* runtime.execute(ReplicaWorkflow.OperationId.make("aborted-document-loop"))
+      yield* drive
+
+      const result = yield* runtime.poll(execution)
+      assert.isTrue(Option.isSome(result))
+      if (!Option.isSome(result)) return
+      assert.strictEqual(result.value._tag, "Complete")
+      if (result.value._tag !== "Complete") return
+      assert.isTrue(Exit.isFailure(result.value.exit))
+      if (!Exit.isFailure(result.value.exit)) return
+      const error = Option.getOrThrow(Cause.findErrorOption(result.value.exit.cause))
+      assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+
+      // The handler aborted before finishing the loop, and the superseded receipt is still gone.
+      assert.deepStrictEqual(yield* readReceipts, [kept])
+    }).pipe(Effect.provide(Services)))
+
+  // Pins the other half: a document that can never publish must not starve reclamation either.
+  it.effect(
+    "prunes command receipts even when every document reports a superseded checkpoint",
+    () =>
+      Effect.gen(function*() {
+        const services = yield* supersedingServices({ injections: Number.MAX_SAFE_INTEGER })
+        yield* Effect.gen(function*() {
+          const gate = yield* ReplicaGate.ReplicaGate
+          const runtime = yield* ReplicaWorkflow.CompactionWorkflow
+          const store = yield* DocumentStore.DocumentStore
+
+          yield* seedReceipt((yield* gate.current).incarnation, "starved", 4)
+          yield* gate.claim(() => Effect.void)
+          const retained = yield* seedReceipt((yield* gate.current).incarnation, "retained", 5)
+
+          const documentId = yield* Identity.makeDocumentId
+          const stored = yield* store.create(Task, documentId, { title: "starved" })
+          InternalAutomerge.free(stored.automerge)
+
+          const execution = yield* runtime.execute(ReplicaWorkflow.OperationId.make("superseded-still-prunes"))
+          yield* drive
+
+          const result = yield* runtime.poll(execution)
+          assert.isTrue(Option.isSome(result))
+          if (!Option.isSome(result)) return
+          assert.strictEqual(result.value._tag, "Complete")
+          if (result.value._tag !== "Complete") return
+          assert.isTrue(Exit.isFailure(result.value.exit))
+          if (!Exit.isFailure(result.value.exit)) return
+          const error = Option.getOrThrow(Cause.findErrorOption(result.value.exit.cause))
+          assert.strictEqual(error.reason._tag, "CheckpointSuperseded")
+
+          // The run failed, and the superseded receipt is still gone.
+          assert.deepStrictEqual(yield* readReceipts, [retained])
+        }).pipe(Effect.provide(services))
+      }),
+    20_000
+  )
 
   // The issue-13 regression: the workflow used to report success here. `injections: 9` also pins the
   // retry budget from above, so this subsumes an unbounded-injection variant of the same scenario.

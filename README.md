@@ -1172,8 +1172,10 @@ const compact = Effect.gen(function*() {
 })
 ```
 
-The registered workflow journals document listing and one compact activity per document. Each activity prunes only
-after it publishes a fresh checkpoint. Recovery verifies checkpoint checksums, heads, change metadata, and
+The registered workflow journals one command receipt reclamation activity, then document listing, then one compact
+activity per document. Each compact activity prunes changes only after it publishes a fresh checkpoint. Receipt
+reclamation is independent of any document, so it runs first and is not skipped when a document fails to publish.
+Recovery verifies checkpoint checksums, heads, change metadata, and
 tombstones. It can fall back to an older verified checkpoint and replay accepted changes. `Compaction` and
 `Recovery` are public injectable services for lower level engine assembly.
 
@@ -1286,7 +1288,10 @@ Consistency guarantees:
 - Within the current replica incarnation, reuse a `CommandId` only for the same logical create, mutation, delete, or
   import input. Same identity plus same canonical request hash resolves the durable receipt. Different input fails
   `CommandIdConflict`. Restore can cross the incarnation boundary, after which the current permit can report
-  `OutcomeUnknown` for evidence retained only by the archived incarnation.
+  `OutcomeUnknown` for evidence retained only by the archived incarnation. Compaction reclaims receipts from
+  superseded incarnations, so that archived evidence does not survive the next compaction run and is absent from
+  every later export. A permit captured before the boundary can read it until then, and reports `OutcomeUnknown`
+  afterwards.
 - After `OutcomeUnknown`, call the matching lookup method with the same definition and command ID. If the replica
   incarnation changed, prior receipt protection is not available through the current permit. Application policy must
   decide whether a later request is a new logical operation.
@@ -1588,7 +1593,7 @@ Public SQL service methods:
 | `BackupStore`        | `export(ExportOptions)` returns a byte Stream. `restore(RestoreOptions)` consumes its source environment                                                                                                                    |
 | `CommandExecutor`    | `create`, `mutate`, `delete`, `lookupCreate`, `lookupMutation`, `lookupDelete`                                                                                                                                              |
 | `CommitPublisher`    | `publishPending`, `invalidate(keys)`, scoped `subscribe`                                                                                                                                                                    |
-| `Compaction`         | `prepare(document, documentId)`, `publish(checkpoint)`, `compact(document, documentId)`, `prune(documentId)`                                                                                                                |
+| `Compaction`         | `prepare(document, documentId)`, `publish(checkpoint)`, `compact(document, documentId)`, `prune(documentId)`, `pruneCommandReceipts`                                                                                        |
 | `DocumentStore`      | `create`, `load`, `stage`, `tombstone`, `persist`; callers own the native document returned by `load`                                                                                                                       |
 | `PeerSync`           | `open(peerId)`, `reset(session)`, `generate(document, documentId, session)`, `receive(document, documentId, session, input)`, `enqueue(session, reply)`, `pending(session)`, `markSent(session, sendSequence, messageHash)` |
 | `ProjectionStore`    | `clear`, `replace(binding, snapshot, destinationTable)`, `replaceDocument(document, snapshot, commitSequence)`                                                                                                              |
@@ -1626,7 +1631,7 @@ SQL composition contracts:
 | `DurableRuntime`                     | Builds Cluster and Workflow over the same SQL storage. `layerWith` accepts additional Workflow registrations                                                                                                                                                                                 |
 | `EntityReplica`                      | Adapts durable Cluster commands, stores, queries, backup, status, and commit publication to core `Replica`                                                                                                                                                                                   |
 | `BackupStore`                        | Streams and restores definition bound archives. Export is a snapshot. Restore validates envelope, checksum, bounds, definition, foreign keys, recovery, and projections before installation                                                                                                  |
-| `Compaction` and `Recovery`          | Compaction publishes only verified checkpoints and prunes only with retained safety evidence. Recovery validates checkpoints, changes, heads, and tombstones                                                                                                                                 |
+| `Compaction` and `Recovery`          | Compaction publishes only verified checkpoints and prunes changes only with retained safety evidence. It also reclaims command receipts from superseded incarnations, which no current permit can read. Recovery validates checkpoints, changes, heads, and tombstones                       |
 | `ReplicaWorkflow`                    | Registers and executes the scoped compaction Workflow. Workflow durability does not make peer or backup transport durable                                                                                                                                                                    |
 
 `PeerSession.PeerSession` exposes `peerId`, `connectionEpoch`, `markDirty`, `flush`, `observedByPeer`, and

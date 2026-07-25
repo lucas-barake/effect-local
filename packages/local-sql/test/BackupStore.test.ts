@@ -6,6 +6,7 @@ import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Projection from "@lucas-barake/effect-local/Projection"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -154,6 +155,65 @@ describe("BackupStore", () => {
   )
   const Executor = CommandExecutor.layer(definition).pipe(Layer.provide(Live))
   const BatchLive = Layer.mergeAll(Live, Executor)
+  const CompactedBatchLive = Layer.mergeAll(CompactedLive, Executor)
+  // `BackupStore.layer` reads `ReplicaLimits` once while it builds, so a smaller archive budget has to
+  // come from its own stack rather than `Effect.provideService`. Two `ReplicaLimits` layers in one graph
+  // shadow each other, so this stack never merges with `Live` or `CompactedLive`; it only reuses the
+  // layers below `ReplicaLimits` (`Base`, `Gate`, `Store`, `Projections`), which do not read limits.
+  const smallArchiveRecords = 8
+  const SmallLimits = ReplicaLimits.layer({ ...limits, maxArchiveRecords: smallArchiveRecords })
+  const SmallInfrastructure = Layer.mergeAll(Base, Gate, Store, Projections, SmallLimits)
+  const SmallBackup = BackupStore.layer(definition).pipe(Layer.provide(SmallInfrastructure))
+  const SmallRecovery = Recovery.layer.pipe(Layer.provide(SmallInfrastructure))
+  const SmallCompaction = Compaction.layer.pipe(Layer.provide(Layer.merge(SmallInfrastructure, SmallRecovery)))
+  const SmallExecutor = CommandExecutor.layer(definition).pipe(Layer.provide(SmallInfrastructure))
+  const SmallBatchLive = Layer.mergeAll(
+    SmallInfrastructure,
+    SmallBackup,
+    SmallRecovery,
+    SmallCompaction,
+    SmallExecutor
+  )
+  const CommitRename = Mutation.make("CommitRename", {
+    document: Task,
+    payload: Schema.String,
+    success: Schema.String
+  })
+  // A replica that advances its commit sequence through mutations needs its own definition, because
+  // `definition` declares none. A second definition also means a second bootstrap, so this stack
+  // rebuilds every layer below it rather than reusing the ones bound to `definition`.
+  const mutatedDefinition = ReplicaDefinition.make({
+    name: "mutated-backup-tasks",
+    documents: DocumentSet.make(Task),
+    mutations: [CommitRename],
+    projections: [],
+    queries: []
+  })
+  const MutatedHandlers = CommitRename.toLayer(({ draft, payload }) => {
+    draft.title = payload
+    return payload
+  })
+  const MutatedBootstrap = ReplicaBootstrap.layer(mutatedDefinition).pipe(Layer.provide(Database))
+  const MutatedBase = Layer.merge(Database, MutatedBootstrap)
+  const MutatedGate = ReplicaGate.layer.pipe(Layer.provide(MutatedBase))
+  const MutatedStore = DocumentStore.layer.pipe(Layer.provide(Layer.merge(MutatedBase, MutatedGate)))
+  const MutatedProjections = ProjectionStore.layer([]).pipe(Layer.provide(MutatedBase))
+  const MutatedInfrastructure = Layer.mergeAll(MutatedBase, MutatedGate, MutatedStore, MutatedProjections, Limits)
+  const MutatedBackup = BackupStore.layer(mutatedDefinition).pipe(Layer.provide(MutatedInfrastructure))
+  const MutatedRecovery = Recovery.layer.pipe(Layer.provide(MutatedInfrastructure))
+  const MutatedCompaction = Compaction.layer.pipe(
+    Layer.provide(Layer.merge(MutatedInfrastructure, MutatedRecovery))
+  )
+  const MutatedExecutor = CommandExecutor.layer(mutatedDefinition).pipe(
+    Layer.provide(Layer.merge(MutatedInfrastructure, MutatedHandlers))
+  )
+  const MutatedBatchLive = Layer.mergeAll(
+    MutatedInfrastructure,
+    MutatedBackup,
+    MutatedRecovery,
+    MutatedCompaction,
+    MutatedExecutor
+  )
 
   it.effect("exports and restores canonical history as projection ready when no projections are registered", () =>
     Effect.gen(function*() {
@@ -1135,4 +1195,346 @@ describe("BackupStore", () => {
         expectedDefinitionHash: definition.hash
       })
     }).pipe(Effect.provide(Backup)))
+
+  it.effect("prunes every receipt restored from an archive at a superseded incarnation", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const executor = yield* CommandExecutor.CommandExecutor
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      const archivedPermit = yield* gate.current
+      const archived: Array<{ readonly commandId: Identity.CommandId; readonly documentId: Identity.DocumentId }> = []
+      for (let index = 0; index < 3; index++) {
+        const documentId = yield* Identity.makeDocumentId
+        const commandId = yield* Identity.makeCommandId
+        const title = `archived-${index}`
+        const encoded = yield* Document.encode(Task, documentId, { title })
+        const requestHash = yield* CommandExecutor.createRequestHash({
+          incarnation: archivedPermit.incarnation,
+          commandId,
+          document: Task,
+          documentId,
+          encoded
+        })
+        const outcome = yield* executor.create(Task, {
+          commandId,
+          documentId,
+          permit: archivedPermit,
+          requestHash,
+          value: { title }
+        })
+        assert.deepStrictEqual(outcome, CommandOutcome.durablyCommitted(commandId, documentId))
+        archived.push({ commandId, documentId })
+      }
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+
+      yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.fromIterable(chunks),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      })
+
+      // Restore reinserts every archived receipt at its original incarnation and then raises metadata
+      // past the manifest, so the whole restored set is superseded and the table empties completely.
+      const restoredPermit = yield* gate.current
+      assert.isAbove(restoredPermit.incarnation, archivedPermit.incarnation)
+      const restoredReceipts = yield* sql<{
+        readonly command_id: string
+        readonly replica_incarnation: number
+      }>`SELECT command_id, replica_incarnation FROM effect_local_command_receipts ORDER BY command_id`
+      assert.deepStrictEqual(
+        restoredReceipts,
+        archived.map((entry) => ({
+          command_id: entry.commandId as string,
+          replica_incarnation: archivedPermit.incarnation as number
+        })).toSorted((left, right) => left.command_id < right.command_id ? -1 : 1)
+      )
+
+      assert.strictEqual(yield* compaction.pruneCommandReceipts, archived.length)
+
+      const remaining = yield* sql<{ readonly command_id: string }>`
+        SELECT command_id FROM effect_local_command_receipts
+      `
+      assert.deepStrictEqual(remaining, [])
+
+      const documentId = yield* Identity.makeDocumentId
+      const commandId = yield* Identity.makeCommandId
+      const encoded = yield* Document.encode(Task, documentId, { title: "after-prune" })
+      const requestHash = yield* CommandExecutor.createRequestHash({
+        incarnation: restoredPermit.incarnation,
+        commandId,
+        document: Task,
+        documentId,
+        encoded
+      })
+      const outcome = yield* executor.create(Task, {
+        commandId,
+        documentId,
+        permit: restoredPermit,
+        requestHash,
+        value: { title: "after-prune" }
+      })
+      assert.deepStrictEqual(outcome, CommandOutcome.durablyCommitted(commandId, documentId))
+      assert.deepStrictEqual(
+        yield* executor.lookupCreate(commandId, restoredPermit),
+        CommandOutcome.durablyCommitted(commandId, documentId)
+      )
+      assert.deepStrictEqual(
+        yield* sql<{
+          readonly command_id: string
+          readonly replica_incarnation: number
+        }>`SELECT command_id, replica_incarnation FROM effect_local_command_receipts`,
+        [{ command_id: commandId, replica_incarnation: restoredPermit.incarnation }]
+      )
+    }).pipe(Effect.provide(CompactedBatchLive)))
+
+  it.effect("stops counting superseded receipts toward the archive record limit", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const executor = yield* CommandExecutor.CommandExecutor
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      yield* gate.claim(() => Effect.void)
+      const permit = yield* gate.current
+      const supersededIncarnation = permit.incarnation - 1
+      assert.isAtLeast(supersededIncarnation, 0)
+      // Each live command contributes three records to `record_count`: one document, one change, and
+      // one receipt. Two live commands are six records, four receipt-only rows take the total to ten,
+      // and the stack caps the archive at eight, so the record guard fires and the byte guard does not.
+      const liveCommandIds: Array<Identity.CommandId> = []
+      for (let index = 0; index < 2; index++) {
+        const documentId = yield* Identity.makeDocumentId
+        const commandId = yield* Identity.makeCommandId
+        const title = `live-${index}`
+        const encoded = yield* Document.encode(Task, documentId, { title })
+        const requestHash = yield* CommandExecutor.createRequestHash({
+          incarnation: permit.incarnation,
+          commandId,
+          document: Task,
+          documentId,
+          encoded
+        })
+        const outcome = yield* executor.create(Task, {
+          commandId,
+          documentId,
+          permit,
+          requestHash,
+          value: { title }
+        })
+        assert.deepStrictEqual(outcome, CommandOutcome.durablyCommitted(commandId, documentId))
+        liveCommandIds.push(commandId)
+      }
+      const supersededCommandIds: Array<Identity.CommandId> = []
+      for (let index = 0; index < 4; index++) {
+        const commandId = yield* Identity.makeCommandId
+        const documentId = yield* Identity.makeDocumentId
+        yield* sql`INSERT INTO effect_local_command_receipts (
+          replica_incarnation, command_id, request_hash, mutation_name, result,
+          document_id, heads, commit_sequence
+        ) VALUES (
+          ${supersededIncarnation}, ${commandId}, ${`hash-${index}`}, ${"$create"},
+          ${new TextEncoder().encode("{}")}, ${documentId}, ${"[]"}, ${0}
+        )`
+        supersededCommandIds.push(commandId)
+      }
+      const sizing = yield* sql<{
+        readonly changes: number
+        readonly checkpoints: number
+        readonly documents: number
+        readonly receipts: number
+      }>`SELECT
+        (SELECT COUNT(*) FROM effect_local_documents) AS documents,
+        (SELECT COUNT(*) FROM effect_local_changes) AS changes,
+        (SELECT COUNT(*) FROM effect_local_checkpoints) AS checkpoints,
+        (SELECT COUNT(*) FROM effect_local_command_receipts) AS receipts`
+      assert.deepStrictEqual(sizing, [{ changes: 2, checkpoints: 0, documents: 2, receipts: 6 }])
+      const recordCount = sizing[0]!.documents + sizing[0]!.changes + sizing[0]!.checkpoints + sizing[0]!.receipts
+
+      const error = yield* Effect.flip(
+        backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      )
+      assert.strictEqual(error.reason._tag, "BackupTooLarge")
+      if (error.reason._tag === "BackupTooLarge") {
+        assert.strictEqual(error.reason.limit, smallArchiveRecords)
+        assert.strictEqual(error.reason.observed, recordCount)
+      }
+
+      assert.strictEqual(yield* compaction.pruneCommandReceipts, supersededCommandIds.length)
+
+      const remaining = yield* sql<{
+        readonly command_id: string
+        readonly replica_incarnation: number
+      }>`SELECT command_id, replica_incarnation FROM effect_local_command_receipts ORDER BY command_id`
+      assert.deepStrictEqual(
+        remaining,
+        liveCommandIds.map((commandId) => ({
+          command_id: commandId as string,
+          replica_incarnation: permit.incarnation as number
+        })).toSorted((left, right) => left.command_id < right.command_id ? -1 : 1)
+      )
+
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      assert.isAbove(chunks.length, 0)
+    }).pipe(Effect.provide(SmallBatchLive)))
+
+  // `restore` recomputes the metadata watermark as the maximum `commit_sequence` over every archived
+  // record, receipts included, and every restored receipt is superseded the moment the restore raises
+  // the incarnation. The first prune therefore empties the table, and the next archive has to recover
+  // the same watermark without it. Each replica gets its own `:memory:` database because `Effect.provide`
+  // builds `MutatedBatchLive` once per call.
+  it.effect("preserves the commit sequence watermark across a restore, a receipt prune, and a re-export", () =>
+    Effect.gen(function*() {
+      const source = yield* Effect.gen(function*() {
+        const backups = yield* BackupStore.BackupStore
+        const compaction = yield* Compaction.Compaction
+        const executor = yield* CommandExecutor.CommandExecutor
+        const gate = yield* ReplicaGate.ReplicaGate
+        const sql = yield* SqlClient.SqlClient
+        const permit = yield* gate.current
+        const documentId = yield* Identity.makeDocumentId
+        const createCommandId = yield* Identity.makeCommandId
+        const encoded = yield* Document.encode(Task, documentId, { title: "one" })
+        const createHash = yield* CommandExecutor.createRequestHash({
+          incarnation: permit.incarnation,
+          commandId: createCommandId,
+          document: Task,
+          documentId,
+          encoded
+        })
+        const created = yield* executor.create(Task, {
+          commandId: createCommandId,
+          documentId,
+          permit,
+          requestHash: createHash,
+          value: { title: "one" }
+        })
+        assert.deepStrictEqual(created, CommandOutcome.durablyCommitted(createCommandId, documentId))
+        for (const title of ["two", "three"]) {
+          const commandId = yield* Identity.makeCommandId
+          const requestHash = yield* CommandExecutor.mutationRequestHash({
+            incarnation: permit.incarnation,
+            commandId,
+            documentId,
+            mutation: CommitRename,
+            payload: title
+          })
+          const outcome = yield* executor.mutate(CommitRename, {
+            commandId,
+            documentId,
+            payload: title,
+            permit,
+            requestHash
+          })
+          assert.deepStrictEqual(outcome, CommandOutcome.durablyCommitted(commandId, title))
+          assert.isTrue((yield* compaction.compact(Task, documentId)).published)
+        }
+        // Pruning applied changes is what makes a receipt a plausible sole carrier of the watermark:
+        // it removes the change rows the sequence would otherwise still be recoverable from.
+        assert.isAbove(yield* compaction.prune(documentId), 0)
+        const watermark = yield* sql<{ readonly commit_sequence: number }>`
+          SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1
+        `
+        const commitSequence = watermark[0]!.commit_sequence
+        assert.isAbove(commitSequence, 0)
+        const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+        return { chunks, commitSequence }
+      }).pipe(Effect.provide(MutatedBatchLive))
+
+      const republished = yield* Effect.gen(function*() {
+        const backups = yield* BackupStore.BackupStore
+        const compaction = yield* Compaction.Compaction
+        const sql = yield* SqlClient.SqlClient
+        yield* backups.restore({
+          installationId: yield* Identity.makeBackupInstallationId,
+          source: Stream.fromIterable(source.chunks),
+          mode: "replace",
+          maxBytes: limits.maxBackupBytes,
+          expectedDefinitionHash: mutatedDefinition.hash
+        })
+        assert.deepStrictEqual(
+          yield* sql<{ readonly commit_sequence: number }>`
+            SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1
+          `,
+          [{ commit_sequence: source.commitSequence }]
+        )
+        assert.isAbove(yield* compaction.pruneCommandReceipts, 0)
+        assert.deepStrictEqual(
+          yield* sql<{ readonly command_id: string }>`SELECT command_id FROM effect_local_command_receipts`,
+          []
+        )
+        return yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      }).pipe(Effect.provide(MutatedBatchLive))
+
+      yield* Effect.gen(function*() {
+        const backups = yield* BackupStore.BackupStore
+        const sql = yield* SqlClient.SqlClient
+        yield* backups.restore({
+          installationId: yield* Identity.makeBackupInstallationId,
+          source: Stream.fromIterable(republished),
+          mode: "replace",
+          maxBytes: limits.maxBackupBytes,
+          expectedDefinitionHash: mutatedDefinition.hash
+        })
+        assert.deepStrictEqual(
+          yield* sql<{ readonly commit_sequence: number }>`
+            SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1
+          `,
+          [{ commit_sequence: source.commitSequence }]
+        )
+      }).pipe(Effect.provide(MutatedBatchLive))
+    }))
+
+  it.effect("reports an unknown outcome for a stale permit once superseded receipts are pruned", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const executor = yield* CommandExecutor.CommandExecutor
+      const gate = yield* ReplicaGate.ReplicaGate
+      const archivedPermit = yield* Effect.scoped(gate.shared)
+      const documentId = yield* Identity.makeDocumentId
+      const commandId = yield* Identity.makeCommandId
+      const encoded = yield* Document.encode(Task, documentId, { title: "archived" })
+      const requestHash = yield* CommandExecutor.createRequestHash({
+        incarnation: archivedPermit.incarnation,
+        commandId,
+        document: Task,
+        documentId,
+        encoded
+      })
+      const outcome = yield* executor.create(Task, {
+        commandId,
+        documentId,
+        permit: archivedPermit,
+        requestHash,
+        value: { title: "archived" }
+      })
+      assert.deepStrictEqual(outcome, CommandOutcome.durablyCommitted(commandId, documentId))
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+
+      yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.fromIterable(chunks),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      })
+
+      // A restored receipt still answers a lookup made with the permit it was written under, which is
+      // the contract the archived-permit lookup above relies on. Pruning narrows that deliberately.
+      assert.deepStrictEqual(
+        yield* executor.lookupCreate(commandId, archivedPermit),
+        CommandOutcome.durablyCommitted(commandId, documentId)
+      )
+
+      assert.strictEqual(yield* compaction.pruneCommandReceipts, 1)
+
+      assert.deepStrictEqual(
+        yield* executor.lookupCreate(commandId, archivedPermit),
+        CommandOutcome.unknown(commandId)
+      )
+    }).pipe(Effect.provide(CompactedBatchLive)))
 })
