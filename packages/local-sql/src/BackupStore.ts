@@ -125,6 +125,7 @@ const ForeignKeyViolationRow = Schema.Struct({
 })
 const JsonString = Schema.fromJsonString(Schema.Unknown)
 const EnvelopeJson = Schema.fromJsonString(Envelope)
+const backupAlreadyInstalled = { _tag: "BackupAlreadyInstalled" } as const
 
 type Envelope = typeof Envelope.Type
 type RawDecodedRecord =
@@ -823,7 +824,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                       })
                     })
                   }
-                  return
+                  return yield* Effect.fail(backupAlreadyInstalled)
                 }
                 yield* sql`INSERT INTO effect_local_backup_installations (
                 installation_id, mode, manifest_checksum, installed_at, replica_incarnation
@@ -911,6 +912,8 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 }
                 yield* gate.validate(restoredPermit)
               })
+            ).pipe(
+              Effect.catchTag("BackupAlreadyInstalled", () => gate.refresh.pipe(Effect.asVoid))
             )
           }))
         }).pipe(
