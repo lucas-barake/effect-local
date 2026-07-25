@@ -789,31 +789,38 @@ describe("RpcPeerTransport", () => {
       }
     }), 30000)
 
-  it.live(
-    "completes a forked receive consumer when the Open stream ends naturally",
-    () =>
-      Effect.scoped(Effect.gen(function*() {
-        const payload = Uint8Array.of(1, 2, 3)
-        const delivered = yield* Queue.unbounded<Uint8Array>()
-        const client = makeClient(() => openWithMessage(payload), () => Effect.void)
-        const connection = yield* connect(client, serverPeerId)
-        const consumer = yield* Stream.runForEach(
-          connection.receive,
-          (message) => Queue.offer(delivered, message)
-        ).pipe(Effect.forkChild)
+  it.live("drops payloads the peer emits after close", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const before = Uint8Array.of(1)
+      const after = Uint8Array.of(2)
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>()
+      yield* Queue.offer(events, serverOpened)
+      const delivered = yield* Queue.unbounded<Uint8Array>()
+      const received = yield* Deferred.make<void>()
+      const client = makeClient(() => Stream.fromQueue(events), () => Effect.void)
+      const connection = yield* connect(client, serverPeerId)
+      const receiving = yield* Stream.runForEach(
+        connection.receive,
+        (payload) => Queue.offer(delivered, payload).pipe(Effect.andThen(Deferred.succeed(received, undefined)))
+      ).pipe(Effect.forkChild)
 
-        const exit = yield* Fiber.await(consumer).pipe(Effect.timeoutOption("4 seconds"))
-        assert.isTrue(
-          Option.isSome(exit),
-          "receive did not complete: the interruptWhen trigger fiber pinned the run scope"
-        )
-        if (Option.isSome(exit)) {
-          assert.isTrue(Exit.isSuccess(exit.value))
+      yield* Queue.offer(events, PeerRpc.Message.make({ _tag: "Message", payload: before }))
+      const arrived = yield* Deferred.await(received).pipe(Effect.timeoutOption("4 seconds"))
+      assert.isTrue(Option.isSome(arrived), "consumer never received the pre-close Message")
+
+      yield* connection.close
+      yield* Queue.offer(events, PeerRpc.Message.make({ _tag: "Message", payload: after }))
+
+      const exit = yield* Fiber.await(receiving).pipe(Effect.timeoutOption("4 seconds"))
+      assert.isTrue(Option.isSome(exit), "close did not terminate the receive consumer")
+      if (Option.isSome(exit)) {
+        assert.isTrue(Exit.isFailure(exit.value))
+        if (Exit.isFailure(exit.value)) {
+          assert.isTrue(Cause.hasInterruptsOnly(exit.value.cause))
         }
-        assert.deepStrictEqual(yield* Queue.takeAll(delivered), [payload])
-      })),
-    30000
-  )
+      }
+      assert.deepStrictEqual(yield* Queue.takeAll(delivered), [before])
+    })), 30000)
 
   it.effect("interrupts and joins a canceled send before a later send begins", () =>
     Effect.scoped(Effect.gen(function*() {
