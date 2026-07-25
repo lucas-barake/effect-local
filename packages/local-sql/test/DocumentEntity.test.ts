@@ -341,8 +341,12 @@ describe("DocumentEntity", () => {
             readonly writerDefinitionHash: string
           }>
         >([])
+        const receivedLineages = yield* Ref.make<ReadonlyArray<Identity.DocumentLineage>>([])
         const sync = peerSync((_document, _documentId, _session, input) =>
-          Ref.set(receivedProvenance, input.writerProvenance).pipe(Effect.as(syncResult))
+          Effect.all([
+            Ref.set(receivedProvenance, input.writerProvenance),
+            Ref.update(receivedLineages, (lineages) => [...lineages, input.lineage])
+          ]).pipe(Effect.as(syncResult))
         )
         const makeClient = yield* Entity.makeTestClient(
           DocumentEntity.DocumentEntity,
@@ -420,6 +424,22 @@ describe("DocumentEntity", () => {
         })
         assert.deepStrictEqual(applied, syncResult)
         assert.deepStrictEqual(yield* Ref.get(receivedProvenance), writerProvenance)
+        assert.deepStrictEqual(yield* Ref.get(receivedLineages), [Identity.genesisLineage])
+        const rewrittenLineage = Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000001")
+        const rewritten = yield* client.ApplySync({
+          replicaIncarnation: permit.incarnation,
+          peerId: (yield* Identity.makePeerId),
+          connectionEpoch: "connection",
+          localConnectionEpoch: "local-connection",
+          receiveSequence: 1,
+          documentType: Task.name,
+          messageHash: yield* Canonical.digest(message),
+          message,
+          lineage: rewrittenLineage,
+          writerProvenance
+        })
+        assert.deepStrictEqual(rewritten, syncResult)
+        assert.deepStrictEqual(yield* Ref.get(receivedLineages), [Identity.genesisLineage, rewrittenLineage])
         const stale = yield* Effect.exit(client.ApplySync({
           replicaIncarnation: Identity.ReplicaIncarnation.make(permit.incarnation - 1),
           peerId: (yield* Identity.makePeerId),
