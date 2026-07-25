@@ -30,6 +30,22 @@ describe("ReplicaError", () => {
     assert.strictEqual(decoded.reason.cause.message, "database closed")
   })
 
+  it("round trips unsupported storage format version metadata", () => {
+    const error = new ReplicaError.ReplicaError({
+      reason: new ReplicaError.UnsupportedStorageFormatVersion({
+        observedVersion: 2,
+        supportedVersion: 1
+      })
+    })
+    const encoded = Schema.encodeSync(ReplicaError.ReplicaError)(error)
+    assert.deepStrictEqual(encoded.reason, {
+      _tag: "UnsupportedStorageFormatVersion",
+      observedVersion: 2,
+      supportedVersion: 1
+    })
+    assert.deepStrictEqual(Schema.decodeUnknownSync(ReplicaError.ReplicaError)(encoded), error)
+  })
+
   it("round trips operation timeout metadata", () => {
     const error = new ReplicaError.ReplicaError({
       reason: new ReplicaError.OperationTimeout({

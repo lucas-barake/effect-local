@@ -116,6 +116,13 @@ export class OperationTimeout extends Schema.TaggedErrorClass<OperationTimeout>(
   timeoutMillis: Schema.Int
 }) {}
 
+export class UnsupportedStorageFormatVersion extends Schema.TaggedErrorClass<UnsupportedStorageFormatVersion>(
+  "@lucas-barake/effect-local/ReplicaError/UnsupportedStorageFormatVersion"
+)("UnsupportedStorageFormatVersion", {
+  observedVersion: Schema.Int,
+  supportedVersion: Schema.Int
+}) {}
+
 export const Reason = Schema.Union([
   DocumentNotFound,
   DocumentDecodeError,
@@ -135,7 +142,8 @@ export const Reason = Schema.Union([
   RestoreFailed,
   ProtocolMismatch,
   ReplicaFenced,
-  OperationTimeout
+  OperationTimeout,
+  UnsupportedStorageFormatVersion
 ])
 export type Reason = typeof Reason.Type
 
