@@ -531,6 +531,67 @@ describe("BackupStore", () => {
       InternalAutomerge.free(restored.automerge)
     }).pipe(Effect.provide(CompactedLive)))
 
+  it.effect("rejects a format two archive whose lineage fields are missing", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "rewritten" })
+      InternalAutomerge.free(created.automerge)
+      yield* compaction.rewriteHistory(Task, documentId, Compaction.OperationId.make("rewrite-history"))
+      const lines = archiveLinesOf(yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect))
+      assert.strictEqual(lines[0]!.value.formatVersion, 2)
+      const document = lines.find((line) => line.kind === "Document")!
+      delete document.value.lineage
+      document.checksum = yield* Canonical.digest(document.value)
+      const checkpoint = lines.find((line) => line.kind === "Checkpoint")!
+      delete checkpoint.value.lineage
+      checkpoint.checksum = yield* Canonical.digest(checkpoint.value)
+      const archive = yield* resealArchive(lines)
+
+      const result = yield* Effect.result(backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.make(archive),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      }))
+
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure.reason._tag, "BackupInvalid")
+      }
+    }).pipe(Effect.provide(CompactedLive)))
+
+  it.effect("rejects a version one archive that carries a rewritten lineage", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "rewritten" })
+      InternalAutomerge.free(created.automerge)
+      yield* compaction.rewriteHistory(Task, documentId, Compaction.OperationId.make("rewrite-history"))
+      const lines = archiveLinesOf(yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect))
+      assert.strictEqual(lines[0]!.value.formatVersion, 2)
+      lines[0]!.value.formatVersion = 1
+      const archive = yield* resealArchive(lines)
+
+      const result = yield* Effect.result(backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.make(archive),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      }))
+
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure.reason._tag, "BackupInvalid")
+      }
+    }).pipe(Effect.provide(CompactedLive)))
+
   it.effect("rejects checkpoint and change provenance conflicts during restore", () =>
     Effect.gen(function*() {
       const backups = yield* BackupStore.BackupStore

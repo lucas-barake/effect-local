@@ -554,10 +554,34 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           }
           const rawDecoded = yield* Effect.gen(function*() {
             const decoded: Array<RawDecodedRecord> = []
+            const validateLineage = (
+              kind: "Document" | "Checkpoint",
+              lineage: Identity.DocumentLineage | undefined
+            ) =>
+              manifest.formatVersion === 2
+                ? lineage === undefined
+                  ? Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.BackupInvalid({
+                        cause: new Error(`Format version two ${kind} record is missing lineage`)
+                      })
+                    })
+                  )
+                  : Effect.void
+                : lineage !== undefined && lineage !== Identity.genesisLineage
+                ? Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.BackupInvalid({
+                      cause: new Error(`Format version one ${kind} record carries rewritten lineage`)
+                    })
+                  })
+                )
+                : Effect.void
             for (const record of records) {
               switch (record.kind) {
                 case "Document": {
                   const value = yield* Schema.decodeUnknownEffect(DocumentRecord)(record.value)
+                  yield* validateLineage("Document", value.lineage)
                   decoded.push({
                     kind: "Document",
                     value: { ...value, lineage: value.lineage ?? Identity.genesisLineage }
@@ -581,6 +605,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 }
                 case "Checkpoint": {
                   const encoded = yield* Schema.decodeUnknownEffect(CheckpointRecord)(record.value)
+                  yield* validateLineage("Checkpoint", encoded.lineage)
                   const bytes = yield* decodeBytes(encoded.bytes)
                   decoded.push({
                     kind: "Checkpoint",
