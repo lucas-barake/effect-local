@@ -107,7 +107,6 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       const sql = yield* SqlClient.SqlClient
 
       const conditions = yield* Ref.make(initial)
-      const published = yield* Ref.make(derive(initial))
       // Acquired before the sampler is forked so reverse-order finalization interrupts the sampler first
       // and only then shuts the PubSub down, ending every live subscriber with a graceful stream end.
       const statuses = yield* Effect.acquireRelease(
@@ -127,19 +126,15 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       const writes = yield* Semaphore.make(1)
 
       const commit = (update: (current: Conditions) => Conditions) =>
-        Ref.get(conditions).pipe(
-          Effect.flatMap((current) => {
-            const next = update(current)
-            const status = derive(next)
-            return Ref.set(conditions, next).pipe(
-              Effect.andThen(Ref.get(published)),
-              Effect.flatMap((last) =>
-                Equal.equals(last, status)
-                  ? Effect.void
-                  : Ref.set(published, status).pipe(Effect.andThen(PubSub.publish(statuses, status)))
-              )
-            )
-          }),
+        Ref.modify(conditions, (current) => {
+          const next = update(current)
+          const status = derive(next)
+          return [Equal.equals(derive(current), status) ? Option.none() : Option.some(status), next] as const
+        }).pipe(
+          Effect.flatMap(Option.match({
+            onNone: () => Effect.void,
+            onSome: (status) => PubSub.publish(statuses, status).pipe(Effect.asVoid)
+          })),
           Effect.asVoid,
           writes.withPermits(1)
         )
@@ -167,6 +162,24 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           (projection: Projection.Any) => projection.document.name === documentType
         )
         return match === undefined ? Option.none() : Option.some(match.name)
+      }
+
+      // `ReplicaError.message` is only the reason tag, so the underlying driver or schema message is
+      // pulled out here: "no such table: effect_local_commit_outbox" is actionable, "StorageUnavailable"
+      // is not.
+      // Walks the cause chain because the outermost message is often generic: a `SqlError` says only
+      // "Failed to execute statement" while the driver error underneath it names the missing table.
+      const detailOf = (cause: unknown): string => {
+        const messages: Array<string> = []
+        let current: unknown = cause
+        while (current !== null && current !== undefined && messages.length < 3) {
+          const message = (current as { readonly message?: unknown }).message
+          if (typeof message === "string" && message.length > 0 && !messages.includes(message)) {
+            messages.push(message)
+          }
+          current = (current as { readonly cause?: unknown }).cause
+        }
+        return messages.length > 0 ? messages.join(": ") : String(cause)
       }
 
       // Both failures are tagged, so they are discriminated by `_tag` rather than by rendering the cause.
@@ -222,30 +235,38 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         }))
       }).pipe(
         Effect.catchReason("ReplicaError", "StorageCorrupt", (reason) =>
-          commit((current) => ({ ...current, failure: Option.some(reason._tag) }))),
+          commit((current) => ({
+            ...current,
+            failure: Option.some(`Replica storage is corrupt: ${detailOf(reason.cause)}`)
+          }))),
         // A busy or locked database is transient, so it degrades rather than failing, and the previously
         // sampled fields are deliberately left in place instead of being reset to a guess.
         Effect.catchReason("ReplicaError", "StorageUnavailable", (reason) =>
-          commit((current) => ({ ...current, degraded: Option.some(reason._tag) }))),
+          commit((current) => ({
+            ...current,
+            degraded: Option.some(`Replica storage is unavailable: ${detailOf(reason.cause)}`)
+          }))),
         // `read` only ever produces the two reasons handled above; this closes the typed channel so the
         // status stream itself can never fail, which is what keeps subscribers from having to resubscribe.
         Effect.catchTag("ReplicaError", (error) =>
-          commit((current) => ({ ...current, degraded: Option.some(error.reason._tag) }))),
+          commit((current) => ({
+            ...current,
+            degraded: Option.some(`Replica health sampling failed: ${error.reason._tag}`)
+          }))),
         Effect.withSpan("ReplicaHealth.sample")
       )
 
       const nextToken = yield* Ref.make(0)
       const restoring = Effect.acquireRelease(
-        Ref.getAndUpdate(nextToken, (token) =>
-          token + 1).pipe(
-            Effect.tap((token) =>
-              commit((current) => {
-                const restores = new Map(current.restores)
-                restores.set(token, { processedBytes: 0, installing: false })
-                return { ...current, restores }
-              })
-            )
-          ),
+        Ref.getAndUpdate(nextToken, (token) => token + 1).pipe(
+          Effect.tap((token) =>
+            commit((current) => {
+              const restores = new Map(current.restores)
+              restores.set(token, { processedBytes: 0, installing: false })
+              return { ...current, restores }
+            })
+          )
+        ),
         (token) =>
           commit((current) => {
             const restores = new Map(current.restores)

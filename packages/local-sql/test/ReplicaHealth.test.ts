@@ -307,10 +307,12 @@ describe("ReplicaHealth", () => {
       yield* sql`DROP TABLE effect_local_commit_outbox`
       const exit = yield* Effect.exit(Stream.runHead(health.status))
       assert.isTrue(Exit.isSuccess(exit))
-      assert.deepStrictEqual(
-        yield* Stream.runHead(health.status),
-        Option.some<ReplicaStatus.ReplicaStatus>({ _tag: "Degraded", reason: "StorageUnavailable" })
-      )
+      const degraded = Option.getOrThrow(yield* Stream.runHead(health.status))
+      assert.strictEqual(degraded._tag, "Degraded")
+      // The reason has to name the table, not just restate the error tag, or an operator learns nothing.
+      if (degraded._tag === "Degraded") {
+        assert.include(degraded.reason, "no such table: effect_local_commit_outbox")
+      }
     }).pipe(Effect.provide(Live), Effect.provide(Database)))
 
   it.effect("reports an undecodable durable row as failed", () =>
@@ -318,9 +320,10 @@ describe("ReplicaHealth", () => {
       const health = yield* ReplicaHealth.ReplicaHealth
       const sql = yield* SqlClient.SqlClient
       yield* sql`UPDATE effect_local_metadata SET writer_generation = 'not-a-number' WHERE singleton = 1`
-      assert.deepStrictEqual(
-        yield* Stream.runHead(health.status),
-        Option.some<ReplicaStatus.ReplicaStatus>({ _tag: "Failed", message: "StorageCorrupt" })
-      )
+      const failed = Option.getOrThrow(yield* Stream.runHead(health.status))
+      assert.strictEqual(failed._tag, "Failed")
+      if (failed._tag === "Failed") {
+        assert.include(failed.message, "writer_generation")
+      }
     }).pipe(Effect.provide(Live), Effect.provide(Database)))
 })
