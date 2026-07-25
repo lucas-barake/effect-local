@@ -68,6 +68,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
     maxStreamsPerSession: 4,
     maxInFlightPerSession: 1,
     maxQueuedRpc: 32,
+    maxQueuedPermits: 32,
     maxActiveRestores: 32,
     maxRestoresPerSession: 1,
     maxRestoreMillis: 30_000,
@@ -112,6 +113,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
   const gate = ReplicaGate.ReplicaGate.of({
     current: Effect.succeed(permit),
     shared: Effect.acquireRelease(Effect.succeed(permit), () => Effect.void),
+    admit: Effect.acquireRelease(Effect.succeed(permit), () => Effect.void),
     claim: (use) => use(permit),
     refresh: Effect.succeed(permit),
     validate: () => Effect.void
@@ -459,7 +461,10 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
     )
     const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
     const Dependencies = Layer.merge(Database, Bootstrap)
-    const Gate = Layer.merge(Dependencies, ReplicaGate.layer.pipe(Layer.provide(Dependencies)))
+    const Gate = Layer.merge(
+      Dependencies,
+      ReplicaGate.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)), Layer.provide(Dependencies))
+    )
 
     return Effect.scoped(
       Effect.gen(function*() {
@@ -1457,6 +1462,10 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const scopedGate = ReplicaGate.ReplicaGate.of({
         current: Ref.get(current),
         shared: Effect.acquireRelease(
+          Ref.set(sharedHeld, true).pipe(Effect.andThen(Ref.get(current))),
+          () => Ref.set(sharedHeld, false)
+        ),
+        admit: Effect.acquireRelease(
           Ref.set(sharedHeld, true).pipe(Effect.andThen(Ref.get(current))),
           () => Ref.set(sharedHeld, false)
         ),
@@ -2617,7 +2626,10 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
     const Database = Layer.merge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer)
     const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
     const Dependencies = Layer.merge(Database, Bootstrap)
-    const TestGate = Layer.merge(Dependencies, ReplicaGate.layer.pipe(Layer.provide(Dependencies)))
+    const TestGate = Layer.merge(
+      Dependencies,
+      ReplicaGate.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)), Layer.provide(Dependencies))
+    )
     return Effect.gen(function*() {
       const gate = yield* ReplicaGate.ReplicaGate
       const crypto = yield* Crypto.Crypto

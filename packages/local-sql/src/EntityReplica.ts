@@ -79,7 +79,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       })
 
       const withPermit = <A, E, R,>(f: (permit: ReplicaGate.Permit) => Effect.Effect<A, E, R>) =>
-        gate.shared.pipe(Effect.flatMap(f), Effect.scoped)
+        gate.admit.pipe(Effect.flatMap(f), Effect.scoped)
 
       const withCommandPermit = <A, E, R,>(
         commandId: Identity.CommandId,

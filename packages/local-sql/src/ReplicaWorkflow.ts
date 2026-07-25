@@ -240,7 +240,7 @@ export const layerRuntime: Layer.Layer<
     return CompactionWorkflow.of({
       execute: (operationId) =>
         Effect.gen(function*() {
-          const permit = yield* gate.shared
+          const permit = yield* gate.admit
           yield* gate.validate(permit)
           const executionId = yield* CompactReplica.execute({
             operationId,
@@ -254,7 +254,7 @@ export const layerRuntime: Layer.Layer<
       poll: (execution) =>
         Effect.gen(function*() {
           yield* validateExecution(execution)
-          const permit = yield* gate.shared
+          const permit = yield* gate.admit
           yield* validateIncarnation(execution.replicaIncarnation, permit)
           yield* gate.validate(permit)
           const result = yield* CompactReplica.poll(execution.executionId).pipe(
@@ -265,7 +265,7 @@ export const layerRuntime: Layer.Layer<
         }).pipe(Effect.scoped),
       interrupt: (execution) =>
         Effect.gen(function*() {
-          const permit = yield* gate.shared
+          const permit = yield* gate.admit
           yield* validateExecution(execution)
           yield* validateIncarnation(execution.replicaIncarnation, permit)
           yield* gate.validate(permit)
@@ -276,7 +276,7 @@ export const layerRuntime: Layer.Layer<
         }).pipe(Effect.scoped),
       resume: (execution) =>
         Effect.gen(function*() {
-          const permit = yield* gate.shared
+          const permit = yield* gate.admit
           yield* validateExecution(execution)
           yield* validateIncarnation(execution.replicaIncarnation, permit)
           yield* gate.validate(permit)

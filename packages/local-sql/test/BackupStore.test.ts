@@ -102,6 +102,7 @@ describe("BackupStore", () => {
     maxStreamsPerSession: 8,
     maxInFlightPerSession: 32,
     maxQueuedRpc: 128,
+    maxQueuedPermits: 128,
     maxActiveRestores: 128,
     maxRestoresPerSession: 32,
     maxRestoreMillis: 30_000,
@@ -115,7 +116,7 @@ describe("BackupStore", () => {
   )
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Base = Layer.merge(Database, Bootstrap)
-  const Gate = ReplicaGate.layer.pipe(Layer.provide(Base))
+  const Gate = ReplicaGate.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)), Layer.provide(Base))
   const Store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Base, Gate)))
   const Projections = ProjectionStore.layer([]).pipe(Layer.provide(Base))
   const Limits = ReplicaLimits.layer(limits)
@@ -126,7 +127,7 @@ describe("BackupStore", () => {
   const CompactedLive = Layer.mergeAll(Live, RecoveryService, CompactionService)
   const ProjectedBootstrap = ReplicaBootstrap.layer(projectedDefinition).pipe(Layer.provide(Database))
   const ProjectedBase = Layer.merge(Database, ProjectedBootstrap)
-  const ProjectedGate = ReplicaGate.layer.pipe(Layer.provide(ProjectedBase))
+  const ProjectedGate = ReplicaGate.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)), Layer.provide(ProjectedBase))
   const ProjectedStore = DocumentStore.layer.pipe(Layer.provide(Layer.merge(ProjectedBase, ProjectedGate)))
   const ProjectedProjections = ProjectionStore.layer([TaskListSql]).pipe(
     Layer.provide(Layer.merge(ProjectedBase, TaskListSql.layer))
@@ -195,7 +196,7 @@ describe("BackupStore", () => {
   })
   const MutatedBootstrap = ReplicaBootstrap.layer(mutatedDefinition).pipe(Layer.provide(Database))
   const MutatedBase = Layer.merge(Database, MutatedBootstrap)
-  const MutatedGate = ReplicaGate.layer.pipe(Layer.provide(MutatedBase))
+  const MutatedGate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(MutatedBase))
   const MutatedStore = DocumentStore.layer.pipe(Layer.provide(Layer.merge(MutatedBase, MutatedGate)))
   const MutatedProjections = ProjectionStore.layer([]).pipe(Layer.provide(MutatedBase))
   const MutatedInfrastructure = Layer.mergeAll(MutatedBase, MutatedGate, MutatedStore, MutatedProjections, Limits)

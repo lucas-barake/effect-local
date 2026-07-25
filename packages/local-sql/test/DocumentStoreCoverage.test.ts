@@ -13,6 +13,7 @@ import * as DocumentStore from "../src/DocumentStore.js"
 import * as InternalAutomerge from "../src/internal/automerge.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
+import { withGateLimits } from "./fixtures/limits.js"
 
 describe("DocumentStore coverage probes", () => {
   const Task = Document.make("Task", {
@@ -32,7 +33,7 @@ describe("DocumentStore coverage probes", () => {
   )
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Base = Layer.merge(Database, Bootstrap)
-  const Gate = ReplicaGate.layer.pipe(Layer.provide(Base))
+  const Gate = ReplicaGate.layer.pipe(withGateLimits, Layer.provide(Base))
   const StoreService = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Base, Gate)))
   const Store = Layer.merge(Base, StoreService)
 

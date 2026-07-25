@@ -56,6 +56,7 @@ describe("EntityReplica", () => {
     maxStreamsPerSession: 8,
     maxInFlightPerSession: 32,
     maxQueuedRpc: 128,
+    maxQueuedPermits: 128,
     maxActiveRestores: 128,
     maxRestoresPerSession: 32,
     maxRestoreMillis: 30_000,

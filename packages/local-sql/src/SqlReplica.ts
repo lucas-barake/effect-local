@@ -57,7 +57,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
       const crypto = yield* Crypto.Crypto
 
       const withPermit = <A, E, R,>(f: (permit: ReplicaGate.Permit) => Effect.Effect<A, E, R>) =>
-        gate.shared.pipe(Effect.flatMap(f), Effect.scoped)
+        gate.admit.pipe(Effect.flatMap(f), Effect.scoped)
 
       const service: Replica.Replica["Service"] = {
         create: (document, options) =>

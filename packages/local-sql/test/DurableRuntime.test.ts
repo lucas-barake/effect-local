@@ -102,6 +102,7 @@ describe("DurableRuntime", () => {
     maxStreamsPerSession: 4,
     maxInFlightPerSession: 16,
     maxQueuedRpc: 32,
+    maxQueuedPermits: 32,
     maxActiveRestores: 32,
     maxRestoresPerSession: 16,
     maxRestoreMillis: 30_000,
@@ -109,7 +110,7 @@ describe("DurableRuntime", () => {
     maxRestoreCoalesceMillis: 25,
     maxRestoreErrorBytes: 4_096
   })
-  const Gate = ReplicaGate.layer.pipe(Layer.provide(Layer.merge(Database, Bootstrap)))
+  const Gate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(Layer.merge(Database, Bootstrap)))
   const Store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Database, Gate)))
   const RecoveryService = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate)))
   const CompactionService = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate, RecoveryService)))
@@ -120,7 +121,7 @@ describe("DurableRuntime", () => {
   const servicesAtWith = <A, E, R,>(filename: string, workflowRegistrations: Layer.Layer<A, E, R>) => {
     const database = Layer.merge(SqliteClient.layer({ filename, disableWAL: true }), NodeCrypto.layer)
     const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(database))
-    const gate = ReplicaGate.layer.pipe(Layer.provide(Layer.merge(database, bootstrap)))
+    const gate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(Layer.merge(database, bootstrap)))
     const store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(database, gate)))
     const recovery = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(database, gate)))
     const compaction = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(database, gate, recovery)))

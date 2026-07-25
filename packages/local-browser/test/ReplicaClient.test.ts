@@ -58,6 +58,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     maxStreamsPerSession: 2,
     maxInFlightPerSession: 2,
     maxQueuedRpc: 4,
+    maxQueuedPermits: 4,
     maxActiveRestores: 4,
     maxRestoresPerSession: 2,
     maxRestoreMillis: 30_000,

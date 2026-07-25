@@ -9,6 +9,7 @@ import * as Schema from "effect/Schema"
 import * as DocumentStore from "../../src/DocumentStore.js"
 import * as ReplicaBootstrap from "../../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../../src/ReplicaGate.js"
+import { withGateLimits } from "../fixtures/limits.js"
 
 export const Task = Document.make("Task", {
   schema: Schema.Struct({ title: Schema.String }),
@@ -36,7 +37,7 @@ export const storeLayer = (filename: string) => {
   const database = Layer.merge(SqliteClient.layer({ filename }), NodeCrypto.layer)
   const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(database))
   const base = Layer.merge(database, bootstrap)
-  const gate = ReplicaGate.layer.pipe(Layer.provide(base))
+  const gate = ReplicaGate.layer.pipe(withGateLimits, Layer.provide(base))
   const store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(base, gate)))
   return Layer.merge(base, store)
 }

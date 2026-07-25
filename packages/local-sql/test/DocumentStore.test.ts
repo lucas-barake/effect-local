@@ -16,6 +16,7 @@ import * as DocumentStore from "../src/DocumentStore.js"
 import * as InternalAutomerge from "../src/internal/automerge.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
+import { withGateLimits } from "./fixtures/limits.js"
 import { makeProbe, probeLayer, withFault } from "./helpers/sqlProbe.js"
 
 describe("DocumentStore", () => {
@@ -36,7 +37,7 @@ describe("DocumentStore", () => {
   )
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Base = Layer.merge(Database, Bootstrap)
-  const Gate = ReplicaGate.layer.pipe(Layer.provide(Base))
+  const Gate = ReplicaGate.layer.pipe(withGateLimits, Layer.provide(Base))
   const StoreService = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Base, Gate)))
   const Store = Layer.merge(Base, StoreService)
 
@@ -203,7 +204,7 @@ describe("DocumentStore", () => {
   )
   const ProbedBootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(ProbedDatabase))
   const ProbedBase = Layer.merge(ProbedDatabase, ProbedBootstrap)
-  const ProbedGate = ReplicaGate.layer.pipe(Layer.provide(ProbedBase))
+  const ProbedGate = ReplicaGate.layer.pipe(withGateLimits, Layer.provide(ProbedBase))
   const ProbedStore = Layer.merge(
     ProbedBase,
     DocumentStore.layer.pipe(Layer.provide(Layer.merge(ProbedBase, ProbedGate)))

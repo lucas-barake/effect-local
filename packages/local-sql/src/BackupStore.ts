@@ -277,7 +277,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 })
               })
             }
-            const identity = yield* gate.shared
+            const identity = yield* gate.admit
             const snapshot = yield* sql.withTransaction(Effect.gen(function*() {
               const sizing = yield* findBackupSizing(undefined)
               const { raw_bytes: rawBytes, record_count: recordCount } = Option.getOrElse(

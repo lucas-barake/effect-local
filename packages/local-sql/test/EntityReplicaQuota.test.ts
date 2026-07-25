@@ -61,6 +61,7 @@ describe("EntityReplica in-flight command limit", () => {
     maxStreamsPerSession: 4,
     maxInFlightPerSession: 16,
     maxQueuedRpc: 1,
+    maxQueuedPermits: 1,
     maxActiveRestores: 1,
     maxRestoresPerSession: 16,
     maxRestoreMillis: 30_000,
@@ -117,6 +118,11 @@ describe("EntityReplica in-flight command limit", () => {
         yield* Deferred.await(started)
         const rejected = yield* Effect.flip(replica.create(Task, { commandId: secondId, value: { title: "second" } }))
         assert.strictEqual(rejected.reason._tag, "QuotaExceeded")
+        // The gate also raises QuotaExceeded now, so pin the resource to keep this assertion unambiguous.
+        if (rejected.reason._tag === "QuotaExceeded") {
+          assert.strictEqual(rejected.reason.resource, "in-flight commands")
+          assert.strictEqual(rejected.reason.limit, limits.maxQueuedRpc)
+        }
         yield* Deferred.succeed(release, undefined)
         const committed = yield* Fiber.join(first)
         assert.strictEqual(committed._tag, "DurablyCommittedLocal")
