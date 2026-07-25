@@ -14,9 +14,11 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import { vi } from "vitest"
 import * as CommandExecutor from "../src/CommandExecutor.js"
+import * as Compaction from "../src/Compaction.js"
 import * as DocumentStore from "../src/DocumentStore.js"
 import * as InternalAutomerge from "../src/internal/automerge.js"
 import * as ProjectionStore from "../src/ProjectionStore.js"
+import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
 import { makeProbe, probeLayer, withFault } from "./helpers/sqlProbe.js"
@@ -64,7 +66,9 @@ describe("CommandExecutor", () => {
   )
   const Dependencies = Layer.mergeAll(Base, Gate, Store, Projections, Handlers)
   const Executor = CommandExecutor.layer(definition).pipe(Layer.provide(Dependencies))
-  const Live = Layer.mergeAll(Base, Gate, Executor)
+  const RecoveryService = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(Base, Gate)))
+  const CompactionService = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Base, Gate, RecoveryService)))
+  const Live = Layer.mergeAll(Base, Gate, Executor, CompactionService)
 
   it.effect("deduplicates matching requests and rejects conflicting command reuse", () =>
     Effect.scoped(Effect.gen(function*() {
@@ -332,6 +336,89 @@ describe("CommandExecutor", () => {
       assert.deepStrictEqual(outcome, CommandOutcome.durablyCommitted(commandId, undefined))
       assert.deepStrictEqual(yield* executor.lookupDelete(commandId, permit), outcome)
     })).pipe(Effect.provide(Live)))
+
+  it.effect("keeps replay suppression intact after pruning superseded receipts", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const executor = yield* CommandExecutor.CommandExecutor
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      const changeCount = Effect.map(
+        sql<{ readonly changes: number }>`SELECT COUNT(*) AS changes FROM effect_local_changes`,
+        (rows) => rows[0]?.changes
+      )
+      const receiptKeys = sql<{ readonly command_id: string; readonly replica_incarnation: number }>`
+        SELECT command_id, replica_incarnation FROM effect_local_command_receipts ORDER BY command_id
+      `
+
+      // A command committed before the epoch claim below, so its receipt becomes superseded.
+      const stale = yield* gate.current
+      const staleDocumentId = yield* Identity.makeDocumentId
+      const staleCommandId = yield* Identity.makeCommandId
+      const staleEncoded = yield* Document.encode(Task, staleDocumentId, { title: "stale" })
+      yield* executor.create(Task, {
+        commandId: staleCommandId,
+        documentId: staleDocumentId,
+        permit: stale,
+        requestHash: yield* CommandExecutor.createRequestHash({
+          incarnation: stale.incarnation,
+          commandId: staleCommandId,
+          document: Task,
+          documentId: staleDocumentId,
+          encoded: staleEncoded
+        }),
+        value: { title: "stale" }
+      })
+
+      yield* gate.claim(() => Effect.void)
+      const permit = yield* gate.current
+      assert.isAbove(permit.incarnation, stale.incarnation)
+
+      const documentId = yield* Identity.makeDocumentId
+      const createCommandId = yield* Identity.makeCommandId
+      const encoded = yield* Document.encode(Task, documentId, { title: "one" })
+      yield* executor.create(Task, {
+        commandId: createCommandId,
+        documentId,
+        permit,
+        requestHash: yield* CommandExecutor.createRequestHash({
+          incarnation: permit.incarnation,
+          commandId: createCommandId,
+          document: Task,
+          documentId,
+          encoded
+        }),
+        value: { title: "one" }
+      })
+      const commandId = yield* Identity.makeCommandId
+      const requestHash = yield* CommandExecutor.mutationRequestHash({
+        incarnation: permit.incarnation,
+        commandId,
+        documentId,
+        mutation: Rename,
+        payload: "two"
+      })
+      const mutated = yield* executor.mutate(Rename, { commandId, documentId, payload: "two", permit, requestHash })
+      assert.deepStrictEqual(mutated, CommandOutcome.durablyCommitted(commandId, "two"))
+      const changesBeforePrune = yield* changeCount
+
+      assert.strictEqual(yield* compaction.pruneCommandReceipts, 1)
+
+      // Observed before any replay: re-issuing the command would reinsert the receipt and hide a
+      // live row the prune had destroyed.
+      assert.deepStrictEqual(
+        yield* receiptKeys,
+        [
+          { command_id: createCommandId as string, replica_incarnation: permit.incarnation as number },
+          { command_id: commandId as string, replica_incarnation: permit.incarnation as number }
+        ].toSorted((left, right) => left.command_id < right.command_id ? -1 : 1)
+      )
+      assert.deepStrictEqual(yield* executor.lookupMutation(Rename, commandId, permit), mutated)
+
+      const replayed = yield* executor.mutate(Rename, { commandId, documentId, payload: "two", permit, requestHash })
+      assert.deepStrictEqual(replayed, mutated)
+      assert.strictEqual(yield* changeCount, changesBeforePrune)
+    }).pipe(Effect.provide(Live)))
 
   const probe = makeProbe()
   const ProbedDatabase = Layer.merge(

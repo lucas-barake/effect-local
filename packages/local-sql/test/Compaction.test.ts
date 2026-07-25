@@ -10,9 +10,11 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as Compaction from "../src/Compaction.js"
 import * as DocumentStore from "../src/DocumentStore.js"
 import * as InternalAutomerge from "../src/internal/automerge.js"
+import * as ProjectionStore from "../src/ProjectionStore.js"
 import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
@@ -39,7 +41,49 @@ describe("Compaction", () => {
   const StoreService = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Base, Gate)))
   const RecoveryService = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(Base, Gate)))
   const CompactionService = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Base, Gate, RecoveryService)))
-  const Services = Layer.mergeAll(Base, Gate, StoreService, RecoveryService, CompactionService)
+  const Projections = ProjectionStore.layer([]).pipe(Layer.provide(Base))
+  // `definition` declares no mutations, so `MutationHandlers` resolves to `never` and the executor
+  // needs no handler layer. It is here only to write real command receipts through production code.
+  const Executor = CommandExecutor.layer(definition).pipe(
+    Layer.provide(Layer.mergeAll(Base, Gate, StoreService, Projections))
+  )
+  const Services = Layer.mergeAll(Base, Gate, StoreService, RecoveryService, CompactionService, Executor)
+
+  /** Commits a real create command under the current incarnation and reports the receipt it wrote. */
+  const commitReceipt = Effect.gen(function*() {
+    const executor = yield* CommandExecutor.CommandExecutor
+    const gate = yield* ReplicaGate.ReplicaGate
+    const permit = yield* gate.current
+    const documentId = yield* Identity.makeDocumentId
+    const commandId = yield* Identity.makeCommandId
+    const value = { title: "one", labels: [] as ReadonlyArray<string> }
+    const encoded = yield* Document.encode(Task, documentId, value)
+    const requestHash = yield* CommandExecutor.createRequestHash({
+      incarnation: permit.incarnation,
+      commandId,
+      document: Task,
+      documentId,
+      encoded
+    })
+    yield* executor.create(Task, { commandId, documentId, permit, requestHash, value })
+    return { command_id: commandId as string, replica_incarnation: permit.incarnation as number }
+  })
+
+  const listReceipts = Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    return yield* sql<{ readonly command_id: string; readonly replica_incarnation: number }>`
+      SELECT command_id, replica_incarnation FROM effect_local_command_receipts
+      ORDER BY replica_incarnation, command_id
+    `
+  })
+
+  const byKey = (
+    rows: ReadonlyArray<{ readonly command_id: string; readonly replica_incarnation: number }>
+  ) =>
+    rows.toSorted((left, right) =>
+      left.replica_incarnation - right.replica_incarnation ||
+      (left.command_id < right.command_id ? -1 : left.command_id > right.command_id ? 1 : 0)
+    )
 
   it.effect("publishes a checkpoint only when heads and commit sequence still match", () =>
     Effect.gen(function*() {
@@ -248,5 +292,127 @@ describe("Compaction", () => {
       InternalAutomerge.free(persisted.automerge)
       InternalAutomerge.free(second)
       InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Services)))
+  it.effect("prunes every superseded incarnation, not only the previous one", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const gate = yield* ReplicaGate.ReplicaGate
+      const oldest = yield* commitReceipt
+      yield* gate.claim(() => Effect.void)
+      const middle = yield* commitReceipt
+      yield* gate.claim(() => Effect.void)
+      const live = yield* commitReceipt
+      assert.deepStrictEqual(
+        [oldest.replica_incarnation, middle.replica_incarnation, live.replica_incarnation],
+        [0, 1, 2]
+      )
+
+      assert.strictEqual(yield* compaction.pruneCommandReceipts, 2)
+      assert.deepStrictEqual(yield* listReceipts, [live])
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("keeps every receipt and reports zero on a replica that has never restored", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      // Deliberately no `gate.claim`. Every other prune test claims first, which raises the
+      // incarnation past zero and skips the short circuit this covers: the never restored replica,
+      // where the sweep must not touch storage and must report nothing reclaimed.
+      const first = yield* commitReceipt
+      const second = yield* commitReceipt
+      assert.deepStrictEqual([first.replica_incarnation, second.replica_incarnation], [0, 0])
+
+      assert.strictEqual(yield* compaction.pruneCommandReceipts, 0)
+      assert.deepStrictEqual(yield* listReceipts, byKey([first, second]))
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("is idempotent across runs", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const gate = yield* ReplicaGate.ReplicaGate
+      yield* commitReceipt
+      yield* gate.claim(() => Effect.void)
+      const live = yield* commitReceipt
+
+      assert.strictEqual(yield* compaction.pruneCommandReceipts, 1)
+      assert.strictEqual(yield* compaction.pruneCommandReceipts, 0)
+      assert.deepStrictEqual(yield* listReceipts, [live])
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("reclaims an exact multiple of the batch size without losing or over-counting rows", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      // Claim first so the live receipt sits above zero and the seeded rows below it are superseded.
+      yield* gate.claim(() => Effect.void)
+      const live = yield* commitReceipt
+      const permit = yield* gate.current
+      const supersededIncarnation = permit.incarnation - 1
+      assert.isAtLeast(supersededIncarnation, 0)
+      // An exact multiple of the 512 row batch size, so the last batch that deletes anything returns
+      // a full batch rather than a short one. Two batches then have to be followed by a third that
+      // deletes nothing before the sweep may stop: exiting on `removed <= receiptPruneBatchSize`
+      // would stop after the first batch and report half the rows as reclaimed.
+      const supersededCount = 1024
+      const result = new TextEncoder().encode("{}")
+      // One transaction for the whole seed. Per-row transactions dominate this test's runtime.
+      yield* sql.withTransaction(Effect.gen(function*() {
+        for (let index = 0; index < supersededCount; index++) {
+          yield* sql`INSERT INTO effect_local_command_receipts (
+            replica_incarnation, command_id, request_hash, mutation_name, result,
+            document_id, heads, commit_sequence
+          ) VALUES (
+            ${supersededIncarnation}, ${`superseded-${index}`}, ${`hash-${index}`}, ${"$create"},
+            ${result}, ${`document-${index}`}, ${"[]"}, ${0}
+          )`
+        }
+      }))
+
+      assert.strictEqual(yield* compaction.pruneCommandReceipts, supersededCount)
+      assert.deepStrictEqual(yield* listReceipts, [live])
+      assert.strictEqual(yield* compaction.pruneCommandReceipts, 0)
+      assert.deepStrictEqual(yield* listReceipts, [live])
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("fails without deleting when the permit is fenced", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      const superseded = yield* commitReceipt
+      yield* gate.claim(() => Effect.void)
+      const live = yield* commitReceipt
+      // A concurrent writer claiming the epoch mid-batch, expressed as an in-transaction generation
+      // bump so the delete and the fence land inside the same transaction.
+      yield* sql`CREATE TRIGGER fence_receipt_prune
+        AFTER DELETE ON effect_local_command_receipts
+        BEGIN
+          UPDATE effect_local_metadata SET writer_generation = writer_generation + 1 WHERE singleton = 1;
+        END`
+
+      const error = yield* Effect.flip(compaction.pruneCommandReceipts)
+      assert.strictEqual(error.reason._tag, "ReplicaFenced")
+      assert.deepStrictEqual(yield* listReceipts, byKey([superseded, live]))
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("reports storage unavailable when the receipt sweep cannot delete", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      const superseded = yield* commitReceipt
+      yield* gate.claim(() => Effect.void)
+      const live = yield* commitReceipt
+      // Storage refusing the sweep's own delete, expressed as a trigger that aborts the statement
+      // from inside the batch transaction.
+      yield* sql`CREATE TRIGGER block_receipt_prune
+        BEFORE DELETE ON effect_local_command_receipts
+        BEGIN
+          SELECT RAISE(ABORT, 'storage down');
+        END`
+
+      const error = yield* Effect.flip(compaction.pruneCommandReceipts)
+      assert.strictEqual(error.reason._tag, "StorageUnavailable")
+      assert.deepStrictEqual(yield* listReceipts, byKey([superseded, live]))
     }).pipe(Effect.provide(Services)))
 })
