@@ -15,6 +15,7 @@ export const durabilityIndexesChecksum = "sha256:effect-local-durability-indexes
 export const projectionReadinessChecksum = "sha256:effect-local-projection-readiness-v1"
 export const pendingReceiptIndexesChecksum = "sha256:effect-local-pending-receipt-indexes-v1"
 export const peerWriterProvenanceChecksum = "sha256:effect-local-peer-writer-provenance-v1"
+export const replicaHealthIndexesChecksum = "sha256:effect-local-replica-health-indexes-v1"
 
 const migration = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
@@ -367,13 +368,23 @@ const peerWriterProvenanceMigration = Effect.gen(function*() {
     VALUES (6, 'peer_writer_provenance', ${peerWriterProvenanceChecksum})`
 })
 
+const replicaHealthIndexesMigration = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`CREATE INDEX effect_local_documents_not_ready_type
+    ON effect_local_documents(document_type)
+    WHERE projection_status != 'Ready'`
+  yield* sql`INSERT INTO effect_local_migration_catalog (migration_id, name, checksum)
+    VALUES (7, 'replica_health_indexes', ${replicaHealthIndexesChecksum})`
+})
+
 export const loader = Migrator.fromRecord({
   "1_canonical_store": migration,
   "2_peer_sync": peerSyncMigration,
   "3_durability_indexes": durabilityIndexesMigration,
   "4_projection_readiness": projectionReadinessMigration,
   "5_pending_receipt_indexes": pendingReceiptIndexesMigration,
-  "6_peer_writer_provenance": peerWriterProvenanceMigration
+  "6_peer_writer_provenance": peerWriterProvenanceMigration,
+  "7_replica_health_indexes": replicaHealthIndexesMigration
 })
 
 const migrate = Migrator.make({})({ loader, table: "effect_local_migrations" })
@@ -402,6 +413,12 @@ export const run = Effect.gen(function*() {
       name: "peer_writer_provenance",
       checksum: peerWriterProvenanceChecksum,
       label: "Peer writer provenance"
+    },
+    {
+      id: 7,
+      name: "replica_health_indexes",
+      checksum: replicaHealthIndexesChecksum,
+      label: "Replica health indexes"
     }
   ] as const
   // One transaction over migrate + validation so a rejected catalog rolls back

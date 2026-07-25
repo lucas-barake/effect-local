@@ -17,7 +17,8 @@ const expectations = {
       [3, "durability_indexes"],
       [4, "projection_readiness"],
       [5, "pending_receipt_indexes"],
-      [6, "peer_writer_provenance"]
+      [6, "peer_writer_provenance"],
+      [7, "replica_health_indexes"]
     ],
     outbox: "none"
   },
@@ -26,7 +27,8 @@ const expectations = {
       [3, "durability_indexes"],
       [4, "projection_readiness"],
       [5, "pending_receipt_indexes"],
-      [6, "peer_writer_provenance"]
+      [6, "peer_writer_provenance"],
+      [7, "replica_health_indexes"]
     ],
     outbox: "backfilled"
   },
@@ -34,7 +36,8 @@ const expectations = {
     applied: [
       [4, "projection_readiness"],
       [5, "pending_receipt_indexes"],
-      [6, "peer_writer_provenance"]
+      [6, "peer_writer_provenance"],
+      [7, "replica_health_indexes"]
     ],
     outbox: { frozen: "2020-01-01T00:00:00.000Z" }
   }
@@ -118,7 +121,8 @@ const assertMigrationHistory = Effect.gen(function*() {
     { migration_id: 3, name: "durability_indexes" },
     { migration_id: 4, name: "projection_readiness" },
     { migration_id: 5, name: "pending_receipt_indexes" },
-    { migration_id: 6, name: "peer_writer_provenance" }
+    { migration_id: 6, name: "peer_writer_provenance" },
+    { migration_id: 7, name: "replica_health_indexes" }
   ])
 
   const catalog = yield* SqlSchema.findAll({
@@ -132,7 +136,8 @@ const assertMigrationHistory = Effect.gen(function*() {
     { migration_id: 3, name: "durability_indexes", checksum: Migrations.durabilityIndexesChecksum },
     { migration_id: 4, name: "projection_readiness", checksum: Migrations.projectionReadinessChecksum },
     { migration_id: 5, name: "pending_receipt_indexes", checksum: Migrations.pendingReceiptIndexesChecksum },
-    { migration_id: 6, name: "peer_writer_provenance", checksum: Migrations.peerWriterProvenanceChecksum }
+    { migration_id: 6, name: "peer_writer_provenance", checksum: Migrations.peerWriterProvenanceChecksum },
+    { migration_id: 7, name: "replica_health_indexes", checksum: Migrations.replicaHealthIndexesChecksum }
   ])
 })
 
