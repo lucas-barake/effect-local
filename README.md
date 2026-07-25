@@ -1145,6 +1145,12 @@ The prior epoch's SQL outbox is not resumed. Do not cache `SessionId`, connectio
 across scopes. During a graceful server restart, close client connection scopes or otherwise close upgraded WebSocket
 connections before awaiting the HTTP server shutdown.
 
+Closing an `RpcPeerTransport` connection interrupts any fiber parked consuming its `receive` stream, so that consumer
+observes an interrupt only `Exit` rather than a failure, and does not wait for the enclosing scope to close. A consumer
+inside its element handler is not interrupted mid handler. It finishes that handler, may still receive a payload the
+transport already pulled from the peer, and then observes the interrupt on its next pull. Payloads that arrive after
+close are not delivered.
+
 `RpcPeerTransport.isRetryable` classifies only `ReplicaError(StorageUnavailable)` as retryable. Authentication,
 authorization, version, peer identity, request shape, and declared limit failures map to
 `ReplicaError(ProtocolMismatch)` and require configuration or policy correction. `Push` success means only that the
