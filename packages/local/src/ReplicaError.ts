@@ -123,6 +123,13 @@ export class UnsupportedStorageFormatVersion extends Schema.TaggedErrorClass<Uns
   supportedVersion: Schema.Int
 }) {}
 
+export class CheckpointSuperseded extends Schema.TaggedErrorClass<CheckpointSuperseded>(
+  "@lucas-barake/effect-local/ReplicaError/CheckpointSuperseded"
+)("CheckpointSuperseded", {
+  documentIds: Schema.Array(Identity.DocumentId),
+  attempts: Schema.Int
+}) {}
+
 export const Reason = Schema.Union([
   DocumentNotFound,
   DocumentDecodeError,
@@ -143,7 +150,8 @@ export const Reason = Schema.Union([
   ProtocolMismatch,
   ReplicaFenced,
   OperationTimeout,
-  UnsupportedStorageFormatVersion
+  UnsupportedStorageFormatVersion,
+  CheckpointSuperseded
 ])
 export type Reason = typeof Reason.Type
 
