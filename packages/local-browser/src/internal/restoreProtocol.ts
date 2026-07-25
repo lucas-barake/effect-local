@@ -99,6 +99,11 @@ const CheckpointSuperseded = Schema.TaggedStruct("CheckpointSuperseded", {
   documentIds: Schema.Array(Identity.DocumentId),
   attempts: Schema.Int
 })
+const DocumentLineageChanged = Schema.TaggedStruct("DocumentLineageChanged", {
+  documentId: Identity.DocumentId,
+  localLineage: Identity.DocumentLineage,
+  remoteLineage: Identity.DocumentLineage
+})
 
 export const RestoreWireError = Schema.Union([
   DocumentNotFound,
@@ -121,7 +126,8 @@ export const RestoreWireError = Schema.Union([
   ReplicaFenced,
   OperationTimeout,
   UnsupportedStorageFormatVersion,
-  CheckpointSuperseded
+  CheckpointSuperseded,
+  DocumentLineageChanged
 ])
 export type RestoreWireError = typeof RestoreWireError.Type
 
@@ -220,7 +226,8 @@ export const restoreWireErrorFields = fieldMetadata({
   ReplicaFenced,
   OperationTimeout,
   UnsupportedStorageFormatVersion,
-  CheckpointSuperseded
+  CheckpointSuperseded,
+  DocumentLineageChanged
 })
 
 export const boundedErrorDescriptionFields: ReadonlySet<string> = new Set(
@@ -513,6 +520,32 @@ export const encodeReplicaError = (
           attempts: reason.attempts
         })
       )
+    case "DocumentLineageChanged":
+      // Both lineages are branded values, so they follow the `CheckpointSuperseded` precedent and are
+      // dropped whole rather than truncated: a partially written lineage fails its own pattern check
+      // when the peer decodes it. They are dropped as a pair because a surviving half would read as a
+      // rewrite between lineages that were never observed together. `Identity.genesisLineage` is the
+      // empty string, so the dropped shape costs nothing beyond its keys.
+      return encodeWithinBudget(
+        maxBytes,
+        {
+          _tag: reason._tag,
+          documentId: reason.documentId,
+          localLineage: Identity.genesisLineage,
+          remoteLineage: Identity.genesisLineage
+        },
+        ({ text }) => {
+          const local = text(reason.localLineage)
+          const remote = text(reason.remoteLineage)
+          const preserved = local === reason.localLineage && remote === reason.remoteLineage
+          return {
+            _tag: reason._tag,
+            documentId: reason.documentId,
+            localLineage: preserved ? reason.localLineage : Identity.genesisLineage,
+            remoteLineage: preserved ? reason.remoteLineage : Identity.genesisLineage
+          }
+        }
+      )
   }
 }
 
@@ -612,6 +645,13 @@ export const replicaErrorFromWire = (wire: RestoreWireError): ReplicaError.Repli
       reason = new ReplicaError.CheckpointSuperseded({
         documentIds: wire.documentIds,
         attempts: wire.attempts
+      })
+      break
+    case "DocumentLineageChanged":
+      reason = new ReplicaError.DocumentLineageChanged({
+        documentId: wire.documentId,
+        localLineage: wire.localLineage,
+        remoteLineage: wire.remoteLineage
       })
       break
   }

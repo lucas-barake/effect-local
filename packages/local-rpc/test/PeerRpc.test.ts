@@ -126,6 +126,7 @@ describe("PeerRpc", () => {
       protocolVersion: PeerRpc.protocolVersion,
       expectedPeerId: peerId,
       definitionHash: "def_0000000000000000",
+      capabilities: { lineageAware: true },
       documents: [{ documentType: "Task", documentId }]
     })
     const opened = PeerRpc.Opened.make({
@@ -158,7 +159,8 @@ describe("PeerRpc", () => {
       new PeerRpcError.RequestCapacityExceeded(),
       new PeerRpcError.SessionUnavailable(),
       new PeerRpcError.SessionOverloaded(),
-      new PeerRpcError.ServerUnavailable()
+      new PeerRpcError.ServerUnavailable(),
+      new PeerRpcError.DocumentLineageChanged()
     ]
 
     for (const error of errors) {
@@ -166,6 +168,11 @@ describe("PeerRpc", () => {
       assert.deepStrictEqual(encoded, { _tag: error._tag })
       assert.strictEqual(Schema.decodeUnknownSync(PeerRpcError.PeerRpcError)(encoded)._tag, error._tag)
     }
+  })
+
+  it("keeps the lineage rewrite wire error free of document identity", () => {
+    const encoded = Schema.encodeSync(PeerRpcError.PeerRpcError)(new PeerRpcError.DocumentLineageChanged())
+    assert.deepStrictEqual(encoded, { _tag: "DocumentLineageChanged" })
   })
 
   it("redacts defects to one fixed sentinel", () => {
@@ -215,6 +222,40 @@ describe("PeerRpc", () => {
         documents: [{ documentType: "Task", documentId }]
       })
     )
+  })
+
+  it("decodes an Open from a client that predates lineage without a capability advertisement", () => {
+    // The whole reason the field is `optionalKey`. `protocolVersion` was not bumped for lineage, so
+    // a client on an older build sends exactly this payload and passes the version check. A required
+    // key would make its `Open` fail to decode outright; absent has to read as "not lineage aware"
+    // instead, which is what the server then refuses to send a rewritten document to.
+    const legacy = Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)({
+      protocolVersion: PeerRpc.protocolVersion,
+      expectedPeerId: peerId,
+      definitionHash: "def_0000000000000000",
+      documents: [{ documentType: "Task", documentId }]
+    })
+    assert.isUndefined(legacy.capabilities)
+
+    // An advertisement that is present but says nothing about lineage decodes the same way, so the
+    // server reads the flag itself rather than the presence of the object carrying it.
+    const silent = Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)({
+      protocolVersion: PeerRpc.protocolVersion,
+      expectedPeerId: peerId,
+      definitionHash: "def_0000000000000000",
+      documents: [{ documentType: "Task", documentId }],
+      capabilities: {}
+    })
+    assert.isUndefined(silent.capabilities?.lineageAware)
+
+    const advertised = Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)({
+      protocolVersion: PeerRpc.protocolVersion,
+      expectedPeerId: peerId,
+      definitionHash: "def_0000000000000000",
+      documents: [{ documentType: "Task", documentId }],
+      capabilities: { lineageAware: true }
+    })
+    assert.deepStrictEqual(advertised.capabilities, { lineageAware: true })
   })
 
   it("keeps version one requests decodable for a typed version rejection", () => {

@@ -1,3 +1,4 @@
+import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Schema from "effect/Schema"
 import * as WriterProvenance from "./writerProvenance.js"
 
@@ -18,6 +19,7 @@ export const DocumentRow = Schema.Struct({
   commit_sequence: Schema.Number,
   document_id: Schema.String,
   document_type: Schema.String,
+  lineage: Identity.DocumentLineage,
   materialized_heads: Schema.String,
   observed_versions: Schema.String,
   projection_status: Schema.Literals(["Ready", "Blocked", "Rebuilding"]),
@@ -32,6 +34,7 @@ export const CheckpointRow = Schema.Struct({
   commit_sequence: Schema.Number,
   document_id: Schema.String,
   heads: Schema.String,
+  lineage: Identity.DocumentLineage,
   verified: Schema.Number,
   writer_provenance: WriterProvenance.StoredChangeProvenances
 })

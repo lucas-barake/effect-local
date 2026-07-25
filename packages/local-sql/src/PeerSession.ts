@@ -46,8 +46,14 @@ export const SyncEnvelope = Schema.Struct({
   documentType: Schema.String,
   messageHash: Schema.String,
   message: Schema.Uint8ArrayFromBase64,
+  // `optionalKey`, so an envelope from a peer built before lineage still decodes. An absent key
+  // decodes as absent and never as the genesis lineage, so every reader normalizes it with
+  // `?? Identity.genesisLineage` at the point the envelope enters the system.
+  lineage: Schema.optionalKey(Identity.DocumentLineage),
   writerProvenance: WriterProvenance.ChangeProvenances
 })
+// The lineage field is bounded by its own schema at 40 characters, so it costs at most ~60 bytes of
+// JSON on top of an envelope that already reserves 4 KiB of fixed headroom.
 export const maximumSyncEnvelopeBytes = (
   maxSyncMessageBytes: number,
   maxSyncChangesPerMessage: number
@@ -164,6 +170,9 @@ const makeWithTerminal = (
         options.documents.map((entry) => [entry.documentId, { value: false, revision: 0 }])
       )
     )
+    // Documents this session has permanently stopped synchronizing. A lineage change is scoped to
+    // the one document it names, so it belongs here and not in `terminalFailure`.
+    const refused = yield* Ref.make(new Set<Identity.DocumentId>())
     const remoteEpoch = yield* Ref.make<string | null>(null)
     const active = yield* Ref.make(true)
     const teardown = yield* Deferred.make<void>()
@@ -187,6 +196,40 @@ const makeWithTerminal = (
         : Effect.succeed(entry)
     }
 
+    /**
+     * Retires one document from this session instead of failing the session.
+     *
+     * A lineage change is permanent, but it is permanent for exactly the document it names. Routing
+     * it into `terminalFailure` like every other failure would let an authorized peer forge one
+     * lineage on one document and stop every other selected document from synchronizing, because
+     * the supervisor treats the resulting non retryable failure as a reason to stop reconnecting.
+     *
+     * Clearing the dirty entry and recording the id are both required: the record is what keeps a
+     * later `markDirty` from putting the document back into the flush loop.
+     */
+    const refuse = (
+      documentId: Identity.DocumentId,
+      reason: ReplicaError.DocumentLineageChanged
+    ) =>
+      Ref.update(refused, (current) => new Set(current).add(documentId)).pipe(
+        Effect.andThen(Ref.update(dirty, (values) => {
+          if (!values.has(documentId)) return values
+          const next = new Map(values)
+          next.delete(documentId)
+          return next
+        })),
+        Effect.andThen(
+          Effect.logWarning("Peer session refused one document after its lineage changed").pipe(
+            Effect.annotateLogs({
+              documentId,
+              peerId: connection.peerId,
+              localLineage: reason.localLineage,
+              remoteLineage: reason.remoteLineage
+            })
+          )
+        )
+      )
+
     const send = (outbound: PeerSync.Outbound) =>
       Effect.raceFirst(
         Deferred.await(teardown),
@@ -200,6 +243,10 @@ const makeWithTerminal = (
             documentType: entry.document.name,
             messageHash: outbound.messageHash,
             message: outbound.message,
+            // From the queued row, never re-read from the document. The row records the lineage the
+            // message was generated under, and a rewrite between generation and send must not
+            // relabel it.
+            lineage: outbound.lineage,
             writerProvenance: outbound.writerProvenance
           })
           yield* Effect.scoped(Effect.gen(function*() {
@@ -275,19 +322,25 @@ const makeWithTerminal = (
       const current = yield* Ref.get(dirty)
       for (const entry of options.documents) {
         if (!(yield* Ref.get(active))) return
+        // The whole point of the refusal record. Without this skip a refused document that is
+        // marked dirty again -- by a later local commit, or by a full refresh -- would be handed
+        // back to `generate` on every flush and refused again, once per flush, forever.
+        if ((yield* Ref.get(refused)).has(entry.documentId)) continue
         const revision = current.get(entry.documentId)
         if (revision === undefined) continue
         const generated = yield* Effect.gen(function*() {
           while (true) {
             const attempt = yield* Effect.raceFirst(
               Deferred.await(teardown).pipe(
-                Effect.as({ _tag: "Generated", result: null } as const)
+                Effect.as({ _tag: "TornDown" } as const)
               ),
               withSyncLock(
                 entry.documentId,
                 Effect.gen(function*() {
                   const observationRevision = (yield* Ref.get(observed)).get(entry.documentId)?.revision ?? 0
-                  const result = yield* sync.generate(entry.document, entry.documentId, session)
+                  const result = yield* sync.generate(entry.document, entry.documentId, session, {
+                    lineageAware: connection.capabilities.lineageAware === true
+                  })
                   yield* Ref.update(observed, (values) => {
                     const current = values.get(entry.documentId)
                     if ((current?.revision ?? 0) !== observationRevision) return values
@@ -299,6 +352,13 @@ const makeWithTerminal = (
                   return result
                 }).pipe(
                   Effect.map((result) => ({ _tag: "Generated", result } as const)),
+                  // The send direction refusal. The peer never sees it, so it must not travel any
+                  // further than this document's own slot in the flush loop.
+                  Effect.catchReason(
+                    "ReplicaError",
+                    "DocumentLineageChanged",
+                    (reason) => refuse(entry.documentId, reason).pipe(Effect.as({ _tag: "Refused" } as const))
+                  ),
                   Effect.catchIf(
                     (error) =>
                       error.reason._tag === "QuotaExceeded" &&
@@ -309,22 +369,23 @@ const makeWithTerminal = (
                 )
               )
             )
-            if (attempt._tag === "Generated") return attempt.result
+            if (attempt._tag !== "OutboxQuota") return attempt
             if ((yield* drainOutbox(new Map())) === 0) return yield* attempt.error
           }
         })
-        if (generated === null) return
+        if (generated._tag === "TornDown") return
+        if (generated._tag === "Refused") continue
         const update = Ref.update(dirty, (values) => {
           if (values.get(entry.documentId) !== revision) return values
           const next = new Map(values)
-          if (generated.dirty) next.set(entry.documentId, revision + 1)
+          if (generated.result.dirty) next.set(entry.documentId, revision + 1)
           else next.delete(entry.documentId)
           return next
         })
-        if (generated.outbound === null) yield* update
+        if (generated.result.outbound === null) yield* update
         else {
-          yield* schedule(generated.outbound)
-          yield* drainOutbox(new Map([[generated.outbound.sendSequence, update]]))
+          yield* schedule(generated.result.outbound)
+          yield* drainOutbox(new Map([[generated.result.outbound.sendSequence, update]]))
         }
       }
       if ((yield* Ref.get(scheduled)).size > 0) yield* drainOutbox(new Map())
@@ -363,6 +424,11 @@ const makeWithTerminal = (
             })
           })
         }
+        const selectedDocument = selected.has(key(envelope.documentType, envelope.documentId))
+        // Dropped before the digest and entity dispatch, not after. Nothing can restore the refused
+        // lineage inside this session, so hashing and dispatching every further message the peer
+        // sends for it would be a peer driven retry loop over CPU, allocation, and storage.
+        if (selectedDocument && (yield* Ref.get(refused)).has(envelope.documentId)) return
         const messageHash = yield* Canonical.digest(envelope.message).pipe(
           Effect.provideService(Crypto.Crypto, crypto)
         )
@@ -374,7 +440,7 @@ const makeWithTerminal = (
             })
           })
         }
-        if (!selected.has(key(envelope.documentType, envelope.documentId))) {
+        if (!selectedDocument) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.ProtocolMismatch({
               expected: "selected whole document",
@@ -408,6 +474,9 @@ const makeWithTerminal = (
               documentType: envelope.documentType,
               messageHash: envelope.messageHash,
               message: envelope.message,
+              // The single point an envelope's lineage enters the system, so the single point the
+              // absent key of a pre lineage peer becomes the genesis lineage.
+              lineage: envelope.lineage ?? Identity.genesisLineage,
               writerProvenance: envelope.writerProvenance
             }).pipe(
               Effect.catchTag(
@@ -432,7 +501,17 @@ const makeWithTerminal = (
             })
             return result
           })
+        ).pipe(
+          // The receive direction refusal. `PeerSync.receive` rejects the message before it reaches
+          // storage, so there is nothing to publish and nothing to reply with, and the session goes
+          // on serving every other selected document.
+          Effect.catchReason(
+            "ReplicaError",
+            "DocumentLineageChanged",
+            (reason) => refuse(envelope.documentId, reason).pipe(Effect.as(null))
+          )
         )
+        if (result === null) return
         yield* publisher.publishPending
         if (result.reply !== null) {
           yield* sync.enqueue(session, result.reply).pipe(Effect.flatMap(schedule))

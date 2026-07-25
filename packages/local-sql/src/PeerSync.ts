@@ -34,6 +34,14 @@ export interface Outbound {
   readonly message: Uint8Array
   readonly messageHash: string
   readonly heads: ReadonlyArray<string>
+  /**
+   * The document's lineage at the moment this message was generated, not at the moment it is sent.
+   *
+   * A queued message describes the history it was generated from. Re-reading the document's lineage
+   * at send time would relabel a message generated before a rewrite with the lineage that replaced
+   * it, and the peer would then accept history the rewrite discarded.
+   */
+  readonly lineage: Identity.DocumentLineage
   readonly writerProvenance: ReadonlyArray<WriterProvenance.ChangeProvenance>
 }
 
@@ -107,10 +115,15 @@ const ExistingChangeRow = Schema.Struct({
 const OutboxRow = Schema.Struct({
   document_id: Schema.String,
   heads: Heads,
+  lineage: Identity.DocumentLineage,
   message: Schema.Uint8Array,
   message_hash: Schema.String,
   send_sequence: Schema.Number,
   writer_provenance: WriterProvenance.StoredChangeProvenances
+})
+
+const DocumentLineageRow = Schema.Struct({
+  lineage: Identity.DocumentLineage
 })
 
 const ChangeProvenanceRow = Schema.Struct({
@@ -223,10 +236,19 @@ const failStorageCorrupt = (cause: unknown) =>
 export class PeerSync extends Context.Service<PeerSync, {
   readonly open: (peerId: Identity.PeerId) => Effect.Effect<Session, ReplicaError.ReplicaError>
   readonly reset: (session: Session) => Effect.Effect<void, ReplicaError.ReplicaError>
+  /**
+   * `peer.lineageAware` is what the connected peer advertised, and it gates the send direction.
+   *
+   * A peer that does not compare lineage unions whatever it is given, so emitting a rewritten
+   * document to it would push the discarded history back onto this replica through the peer's own
+   * reply. The refusal on the receive side cannot cover that direction, because it is the peer, not
+   * this replica, that would be doing the merging.
+   */
   readonly generate: <D extends Document.Any,>(
     document: D,
     documentId: Identity.DocumentId,
-    session: Session
+    session: Session,
+    peer: { readonly lineageAware: boolean }
   ) => Effect.Effect<Generated, ReplicaError.ReplicaError>
   readonly receive: <D extends Document.Any,>(
     document: D,
@@ -235,6 +257,7 @@ export class PeerSync extends Context.Service<PeerSync, {
     input: {
       readonly remoteConnectionEpoch: string
       readonly receiveSequence: number
+      readonly lineage: Identity.DocumentLineage
       readonly message: Uint8Array
       readonly writerProvenance: ReadonlyArray<WriterProvenance.ChangeProvenance>
     }
@@ -246,6 +269,28 @@ export class PeerSync extends Context.Service<PeerSync, {
     sendSequence: number,
     messageHash: string
   ) => Effect.Effect<boolean, ReplicaError.ReplicaError>
+  /**
+   * Runs one document maintenance operation under the same lock as `generate` and `receive`, then
+   * clears that document's sync state before releasing the lock.
+   *
+   * The lock is acquired before `effect` starts, so a capacity failure cannot happen after the
+   * maintenance operation commits. The handoff from a successful interruptible operation to state
+   * invalidation is uninterruptible.
+   */
+  readonly withDocumentInvalidation: <A, E, R,>(
+    documentId: Identity.DocumentId,
+    effect: Effect.Effect<A, E, R>
+  ) => Effect.Effect<A, E | ReplicaError.ReplicaError, R>
+  /**
+   * Drops the in-memory Automerge sync state every live session holds for one document.
+   *
+   * A history rewrite replaces the document's change graph without touching the replica
+   * incarnation or any session generation, which are the only two things that evict a sync state
+   * today. A state kept across a rewrite still describes the discarded history, so `generate` would
+   * keep answering from it. Taken under the same per document lock the sync paths use, so it cannot
+   * interleave with a `generate` or `receive` for that document.
+   */
+  readonly invalidateDocument: (documentId: Identity.DocumentId) => Effect.Effect<void, ReplicaError.ReplicaError>
 }>()("@lucas-barake/effect-local-sql/PeerSync") {}
 
 export const layer: Layer.Layer<
@@ -337,6 +382,26 @@ export const layer: Layer.Layer<
             AND document_id = ${request.documentId}
             AND pending_message IS NOT NULL`
     })
+    // Deliberately narrow: one column, one row, one index lookup on the primary key. Both lineage
+    // gates run before any of the expensive work they protect -- before the pending sweep writes,
+    // before a message is decoded, and before the document is rebuilt from storage -- so the read
+    // that decides a refusal must cost less than the work it refuses.
+    const findDocumentLineage = SqlSchema.findOne({
+      Request: Identity.DocumentId,
+      Result: DocumentLineageRow,
+      execute: (documentId) => sql`SELECT lineage FROM effect_local_documents WHERE document_id = ${documentId}`
+    })
+    const documentLineage = (documentId: Identity.DocumentId) =>
+      findDocumentLineage(documentId).pipe(
+        Effect.map((row) => row.lineage),
+        Effect.catchTags({
+          // A document this replica does not hold has no history for a rewrite to have discarded,
+          // so it is on the genesis lineage exactly as a never rewritten document is.
+          NoSuchElementError: () => Effect.succeed(Identity.genesisLineage),
+          SqlError: failStorageUnavailable,
+          SchemaError: failStorageCorrupt
+        })
+      )
     const findPendingOutbox = SqlSchema.findAll({
       Request: Schema.Struct({
         replicaIncarnation: Identity.ReplicaIncarnation,
@@ -345,7 +410,7 @@ export const layer: Layer.Layer<
       }),
       Result: OutboxRow,
       execute: (request) =>
-        sql`SELECT document_id, heads, message, message_hash, send_sequence, writer_provenance
+        sql`SELECT document_id, heads, lineage, message, message_hash, send_sequence, writer_provenance
           FROM effect_local_peer_outbox
           WHERE replica_incarnation = ${request.replicaIncarnation}
             AND peer_id = ${request.peerId}
@@ -363,7 +428,7 @@ export const layer: Layer.Layer<
       }),
       Result: OutboxRow,
       execute: (request) =>
-        sql`SELECT document_id, heads, message, message_hash, send_sequence, writer_provenance
+        sql`SELECT document_id, heads, lineage, message, message_hash, send_sequence, writer_provenance
           FROM effect_local_peer_outbox
           WHERE replica_incarnation = ${request.replicaIncarnation}
             AND peer_id = ${request.peerId}
@@ -649,6 +714,12 @@ export const layer: Layer.Layer<
         return new Map([...current].filter(([key]) => !key.startsWith(prefix)))
       })
 
+    const removeDocumentState = (documentId: Identity.DocumentId) =>
+      Ref.update(states, (current) => {
+        const suffix = `:${documentId}`
+        return new Map([...current].filter(([key]) => !key.endsWith(suffix)))
+      })
+
     const withStateLock = <A, E, R,>(
       documentId: Identity.DocumentId,
       effect: Effect.Effect<A, E, R>
@@ -804,6 +875,11 @@ export const layer: Layer.Layer<
     ) =>
       Effect.gen(function*() {
         const writerProvenance = yield* loadWriterProvenance(documentId, message)
+        // Read here and stored on the row, never re-read when the row is finally sent. This is the
+        // generation time the message describes: a message queued before a rewrite must stay
+        // labelled with the lineage it was generated from, or the peer would apply pre-rewrite
+        // history under the post-rewrite label.
+        const lineage = yield* documentLineage(documentId)
         const totals = yield* findOutboxTotals({
           replicaIncarnation: session.replicaIncarnation,
           peerId: session.peerId,
@@ -835,13 +911,13 @@ export const layer: Layer.Layer<
         const createdAt = new Date(yield* Clock.currentTimeMillis).toISOString()
         yield* sql`INSERT INTO effect_local_peer_outbox (
           replica_incarnation, peer_id, connection_epoch, document_id, send_sequence,
-          message, message_hash, heads, status, created_at, writer_provenance
+          message, message_hash, heads, status, created_at, writer_provenance, lineage
         ) VALUES (
           ${session.replicaIncarnation}, ${session.peerId}, ${session.connectionEpoch}, ${documentId}, ${sendSequence},
           ${message}, ${messageHash}, ${Schema.encodeSync(Heads)(heads)}, 'Pending', ${createdAt},
-          ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(writerProvenance)}
+          ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(writerProvenance)}, ${lineage}
         )`
-        return { sendSequence, documentId, message, messageHash, heads, writerProvenance } satisfies Outbound
+        return { sendSequence, documentId, message, messageHash, heads, lineage, writerProvenance } satisfies Outbound
       })
 
     const enqueue = (session: Session, reply: Reply) =>
@@ -878,6 +954,7 @@ export const layer: Layer.Layer<
               message: existing.message,
               messageHash: existing.message_hash,
               heads: existing.heads,
+              lineage: existing.lineage,
               writerProvenance: existing.writer_provenance
             }
           }
@@ -895,89 +972,109 @@ export const layer: Layer.Layer<
     const generate = <D extends Document.Any,>(
       document: D,
       documentId: Identity.DocumentId,
-      session: Session
+      session: Session,
+      peer: { readonly lineageAware: boolean }
     ) =>
       withSessionGeneration(session, (generation) =>
-        withStateLock(
-          documentId,
-          Effect.scoped(Effect.gen(function*() {
-            const permit = yield* gate.shared
-            yield* validateSession(permit, session)
-            const sessionGeneration = yield* Ref.get(generation)
-            const existing = yield* findPendingOutboxCount({
-              replicaIncarnation: session.replicaIncarnation,
-              peerId: session.peerId,
-              connectionEpoch: session.connectionEpoch,
-              documentId
-            }).pipe(
-              Effect.catchTags({
-                SqlError: failStorageUnavailable,
-                SchemaError: failStorageCorrupt
-              })
-            )
-            if ((existing[0]?.count ?? 0) > 0) {
-              return { outbound: null, observedByPeer: false, dirty: true }
-            }
-            return yield* Effect.acquireUseRelease(
-              store.load(document, documentId),
-              (durable) =>
-                Effect.gen(function*() {
-                  const state = yield* readState(session, documentId)
-                  const generated = yield* Effect.try({
-                    try: () => Automerge.generateSyncMessage(durable.automerge, state),
-                    catch: (cause) =>
-                      new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.ProtocolMismatch({
-                          expected: "valid local Automerge sync state",
-                          observed: String(cause)
+        Effect.scoped(Effect.gen(function*() {
+          // Claims and history rewrites take the gate before any document lock. Keep the same order
+          // here so a queued exclusive claim cannot leave generation holding the document lock while
+          // it waits for a gate permit that the rewrite cannot release until it acquires that lock.
+          const permit = yield* gate.shared
+          yield* validateSession(permit, session)
+          return yield* withStateLock(
+            documentId,
+            Effect.gen(function*() {
+              // The one direction the receive side refusal cannot cover. A peer that does not compare
+              // lineage merges whatever it is handed, so handing it a rewritten document makes it
+              // resurrect the discarded history and push it back here as its own reply. Fail locally
+              // instead of emitting: the peer is not at fault and has nothing to reject.
+              const lineage = yield* documentLineage(documentId)
+              if (lineage !== Identity.genesisLineage && !peer.lineageAware) {
+                return yield* new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.DocumentLineageChanged({
+                    documentId,
+                    localLineage: lineage,
+                    remoteLineage: Identity.genesisLineage
+                  })
+                })
+              }
+              const sessionGeneration = yield* Ref.get(generation)
+              const existing = yield* findPendingOutboxCount({
+                replicaIncarnation: session.replicaIncarnation,
+                peerId: session.peerId,
+                connectionEpoch: session.connectionEpoch,
+                documentId
+              }).pipe(
+                Effect.catchTags({
+                  SqlError: failStorageUnavailable,
+                  SchemaError: failStorageCorrupt
+                })
+              )
+              if ((existing[0]?.count ?? 0) > 0) {
+                return { outbound: null, observedByPeer: false, dirty: true }
+              }
+              return yield* Effect.acquireUseRelease(
+                store.load(document, documentId),
+                (durable) =>
+                  Effect.gen(function*() {
+                    const state = yield* readState(session, documentId)
+                    const generated = yield* Effect.try({
+                      try: () => Automerge.generateSyncMessage(durable.automerge, state),
+                      catch: (cause) =>
+                        new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.ProtocolMismatch({
+                            expected: "valid local Automerge sync state",
+                            observed: String(cause)
+                          })
+                        })
+                    })
+                    const observedByPeer = Automerge.hasOurChanges(durable.automerge, generated[0])
+                    if (generated[1] === null) {
+                      yield* quotaLock.withPermit(
+                        validateSessionGeneration(generation, sessionGeneration).pipe(
+                          Effect.andThen(writeState(session, documentId, generated[0]))
+                        )
+                      )
+                      return { outbound: null, observedByPeer, dirty: false }
+                    }
+                    if (generated[1].byteLength > limits.maxSyncMessageBytes) {
+                      return yield* new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.QuotaExceeded({
+                          resource: "sync message bytes",
+                          limit: limits.maxSyncMessageBytes
                         })
                       })
-                  })
-                  const observedByPeer = Automerge.hasOurChanges(durable.automerge, generated[0])
-                  if (generated[1] === null) {
-                    yield* quotaLock.withPermit(
-                      validateSessionGeneration(generation, sessionGeneration).pipe(
-                        Effect.andThen(writeState(session, documentId, generated[0]))
-                      )
-                    )
-                    return { outbound: null, observedByPeer, dirty: false }
-                  }
-                  if (generated[1].byteLength > limits.maxSyncMessageBytes) {
-                    return yield* new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.QuotaExceeded({
-                        resource: "sync message bytes",
-                        limit: limits.maxSyncMessageBytes
+                    }
+                    const outbound = yield* quotaLock.withPermit(Effect.gen(function*() {
+                      yield* validateSessionGeneration(generation, sessionGeneration)
+                      const existing = yield* findPendingOutboxCount({
+                        replicaIncarnation: session.replicaIncarnation,
+                        peerId: session.peerId,
+                        connectionEpoch: session.connectionEpoch,
+                        documentId
                       })
-                    })
-                  }
-                  const outbound = yield* quotaLock.withPermit(Effect.gen(function*() {
-                    yield* validateSessionGeneration(generation, sessionGeneration)
-                    const existing = yield* findPendingOutboxCount({
-                      replicaIncarnation: session.replicaIncarnation,
-                      peerId: session.peerId,
-                      connectionEpoch: session.connectionEpoch,
-                      documentId
-                    })
-                    if ((existing[0]?.count ?? 0) > 0) return null
-                    const outbound = yield* sql.withTransaction(
-                      persistOutbound(session, documentId, generated[1]!, durable.materializedHeads)
+                      if ((existing[0]?.count ?? 0) > 0) return null
+                      const outbound = yield* sql.withTransaction(
+                        persistOutbound(session, documentId, generated[1]!, durable.materializedHeads)
+                      )
+                      yield* writeState(session, documentId, generated[0])
+                      return outbound
+                    })).pipe(
+                      Effect.catchTags({
+                        SqlError: failStorageUnavailable,
+                        SchemaError: failStorageCorrupt
+                      })
                     )
-                    yield* writeState(session, documentId, generated[0])
-                    return outbound
-                  })).pipe(
-                    Effect.catchTags({
-                      SqlError: failStorageUnavailable,
-                      SchemaError: failStorageCorrupt
-                    })
-                  )
-                  return outbound === null
-                    ? { outbound: null, observedByPeer: false, dirty: true }
-                    : { outbound, observedByPeer, dirty: false }
-                }),
-              (durable) => Effect.sync(() => InternalAutomerge.free(durable.automerge))
-            )
-          }))
-        ))
+                    return outbound === null
+                      ? { outbound: null, observedByPeer: false, dirty: true }
+                      : { outbound, observedByPeer, dirty: false }
+                  }),
+                (durable) => Effect.sync(() => InternalAutomerge.free(durable.automerge))
+              )
+            })
+          )
+        })))
 
     const receive = <D extends Document.Any,>(
       document: D,
@@ -986,6 +1083,7 @@ export const layer: Layer.Layer<
       input: {
         readonly remoteConnectionEpoch: string
         readonly receiveSequence: number
+        readonly lineage: Identity.DocumentLineage
         readonly message: Uint8Array
         readonly writerProvenance: ReadonlyArray<WriterProvenance.ChangeProvenance>
       }
@@ -1011,6 +1109,21 @@ export const layer: Layer.Layer<
                     })
                   )
                 )
+                // Re-decoded here for the same reason the writer provenance above is: the value is
+                // peer controlled, and a direct caller of `receive` has not necessarily passed it
+                // through the wire schema that already checks it.
+                const remoteLineage = yield* Schema.decodeUnknownEffect(Identity.DocumentLineage)(
+                  input.lineage
+                ).pipe(
+                  Effect.mapError(() =>
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.ProtocolMismatch({
+                        expected: "valid document lineage",
+                        observed: "invalid document lineage"
+                      })
+                    })
+                  )
+                )
                 if (writerProvenance.length > limits.maxSyncChangesPerMessage) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.ProtocolMismatch({
@@ -1032,6 +1145,28 @@ export const layer: Layer.Layer<
                     reason: new ReplicaError.ProtocolMismatch({
                       expected: `sync message at most ${limits.maxSyncMessageBytes} bytes`,
                       observed: String(message.byteLength)
+                    })
+                  })
+                }
+                // Refuse before anything else touches storage. Every Automerge ingestion path is a
+                // union, so a message from a superseded lineage cannot be merged at all: applying
+                // it restores exactly the history the rewrite discarded, and the rewritten value
+                // then loses to the surviving lineage's higher operation counters.
+                //
+                // This must stay ahead of three specific things below. `expirePending` already
+                // writes -- it quarantines and deletes rows -- so a refusal after it is not free of
+                // durable effect. The duplicate receipt short circuit replays a receipt cached
+                // before the rewrite and never compares lineage, so a retransmission would slip
+                // past a check placed after it. And `decodeSyncMessage` plus `store.load` are the
+                // expensive part of the whole path, which would make the cheapest hostile message
+                // the most expensive one to reject.
+                const localLineage = yield* documentLineage(documentId)
+                if (localLineage !== remoteLineage) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.DocumentLineageChanged({
+                      documentId,
+                      localLineage,
+                      remoteLineage
                     })
                   })
                 }
@@ -1602,7 +1737,15 @@ export const layer: Layer.Layer<
                         ? materializedHeads
                         : [...new Set([...durable.acceptedHeads, ...materializedHeads, ...decoded.heads])].toSorted()
                       const transition = !sameHeads(materializedHeads, durable.materializedHeads)
-                      const checkpoint = decoded.changes.length === 0
+                      // A chunk whose dependencies are not satisfied yet stays queued inside the Automerge
+                      // document instead of joining its history, so `getChangesSince` above never reports it
+                      // and it never becomes an `effect_local_changes` row. The saved checkpoint is the only
+                      // durable carrier for such a change, so a message that leaves any incoming change
+                      // unmaterialized must still checkpoint even when the canonical heads did not move.
+                      const unmaterialized = incomingChanges.some((change) =>
+                        !Automerge.hasHeads(staged, [change.hash])
+                      )
+                      const checkpoint = !transition && !unmaterialized
                         ? null
                         : yield* Effect.gen(function*() {
                           const bytes = InternalAutomerge.save(staged)
@@ -1719,12 +1862,20 @@ export const layer: Layer.Layer<
                             }
                           }
                           if (checkpoint !== null) {
+                            // Stamped with the lineage this message was admitted under, not left on
+                            // the column default. A checkpoint written for a rewritten document has
+                            // to name the lineage it belongs to, or it would read back as a
+                            // pre rewrite blob. The refusal above proves the two agree, and a
+                            // rewrite that lands in between moves the document's heads, which makes
+                            // `updateDocument` below match no row and roll this transaction back.
                             yield* sql`INSERT INTO effect_local_checkpoints (
-              checkpoint_hash, document_id, heads, bytes, checksum, commit_sequence, verified, writer_provenance
+              checkpoint_hash, document_id, heads, bytes, checksum, commit_sequence, verified, writer_provenance,
+              lineage
             ) VALUES (
               ${checkpoint.checkpointHash}, ${documentId}, ${Schema.encodeSync(Heads)(materializedHeads)},
               ${checkpoint.bytes}, ${checkpoint.checksum}, ${commitSequence}, 1,
-              ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(checkpoint.writerProvenance)}
+              ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(checkpoint.writerProvenance)},
+              ${localLineage}
             ) ON CONFLICT(checkpoint_hash) DO NOTHING`
                             const installed = yield* findCheckpointIdentity({
                               bytes: checkpoint.bytes,
@@ -1867,6 +2018,18 @@ export const layer: Layer.Layer<
       generate,
       receive,
       enqueue,
+      withDocumentInvalidation: (documentId, effect) =>
+        withStateLock(
+          documentId,
+          Effect.uninterruptibleMask((restore) =>
+            restore(effect).pipe(Effect.ensuring(removeDocumentState(documentId)))
+          )
+        ),
+      invalidateDocument: (documentId) =>
+        // Under the per document lock rather than the session lock: a rewrite is scoped to one
+        // document but crosses every session, and taking the same lock `generate` and `receive`
+        // take is what stops a state being rewritten back in by a call already in flight.
+        withStateLock(documentId, removeDocumentState(documentId)),
       pending: (session) =>
         Effect.scoped(Effect.gen(function*() {
           const permit = yield* gate.shared
@@ -1883,6 +2046,7 @@ export const layer: Layer.Layer<
                 message: row.message,
                 messageHash: row.message_hash,
                 heads: row.heads,
+                lineage: row.lineage,
                 writerProvenance: row.writer_provenance
               }))
             ),

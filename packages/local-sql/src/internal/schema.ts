@@ -14,5 +14,6 @@ export const tables = [
   "effect_local_quarantine",
   "effect_local_backup_installations",
   "effect_local_peer_receipts",
-  "effect_local_peer_outbox"
+  "effect_local_peer_outbox",
+  "effect_local_history_rewrites"
 ] as const

@@ -184,6 +184,7 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   | ReplicaEvolution.ReplicaEvolution
   | ReplicaGate.ReplicaGate
   | ReplicaWorkflow.CompactionWorkflow
+  | ReplicaWorkflow.HistoryRewriteWorkflow
   | Sharding.Sharding,
   ConfigError | Migrator.MigrationError | ReplicaError.ReplicaError | SqlError.SqlError,
   | CommandExecutor.MutationHandlers<D>

@@ -28,12 +28,7 @@ export const decode = (bytes: Uint8Array): Change => {
   }
 }
 
-export const actorId = (
-  replicaId: Identity.ReplicaId,
-  generation: Identity.WriterGeneration,
-  documentId: Identity.DocumentId
-): string => {
-  const input = `${replicaId}:${generation}:${documentId}`
+const digestActor = (input: string): string => {
   let first = 0xcbf29ce484222325n
   let second = 0x84222325cbf29ce4n
   for (let index = 0; index < input.length; index++) {
@@ -44,6 +39,25 @@ export const actorId = (
   return `${first.toString(16).padStart(16, "0")}${second.toString(16).padStart(16, "0")}`
 }
 
+export const actorId = (
+  replicaId: Identity.ReplicaId,
+  generation: Identity.WriterGeneration,
+  documentId: Identity.DocumentId
+): string => digestActor(`${replicaId}:${generation}:${documentId}`)
+
+/**
+ * The actor for a re-rooted document. The lineage participates so two rewrites of the same
+ * document under one writer generation start distinct actor chains: both produce a genesis change
+ * at sequence 1, and `UNIQUE(document_id, actor, sequence)` would otherwise reject the second, or
+ * a restored archive would collide with a live row carrying a different hash for the same key.
+ */
+export const rewriteActorId = (
+  replicaId: Identity.ReplicaId,
+  generation: Identity.WriterGeneration,
+  documentId: Identity.DocumentId,
+  lineage: Identity.DocumentLineage
+): string => digestActor(`${replicaId}:${generation}:${documentId}:${lineage}`)
+
 export const initialize = <E,>(value: E, actor: string): Automerge.Doc<Root<E>> =>
   Automerge.change(Automerge.init<Root<E>>({ actor }), (draft) => {
     draft.value = value
@@ -51,6 +65,21 @@ export const initialize = <E,>(value: E, actor: string): Automerge.Doc<Root<E>> 
   })
 
 export const empty = <E,>(actor: string): Automerge.Doc<Root<E>> => Automerge.init<Root<E>>({ actor })
+
+/**
+ * Builds a fresh document carrying `value` and `tombstone` in a single change.
+ *
+ * `initialize` cannot be reused for a history rewrite: it hardcodes `tombstone = false`, and the
+ * flag lives in the root beside `value` rather than inside it, so a rewritten deleted document
+ * would come back alive and then fail `Recovery`'s tombstone check against its own row. Writing
+ * both fields in one `Automerge.change` also keeps the re-rooted document at exactly one change,
+ * which is what the checkpoint's writer provenance is validated against.
+ */
+export const reroot = <E,>(value: E, tombstone: boolean, actor: string): Automerge.Doc<Root<E>> =>
+  Automerge.change(Automerge.init<Root<E>>({ actor }), (draft) => {
+    draft.value = value
+    draft.tombstone = tombstone
+  })
 
 export const stage = <E,>(
   durable: Automerge.Doc<Root<E>>,

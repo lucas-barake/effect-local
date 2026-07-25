@@ -5,6 +5,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
+import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Layer from "effect/Layer"
@@ -16,6 +17,19 @@ import * as InternalAutomerge from "./internal/automerge.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as Recovery from "./Recovery.js"
 import * as ReplicaGate from "./ReplicaGate.js"
+
+/**
+ * The operator's identity for one maintenance request.
+ *
+ * Declared here rather than in `ReplicaWorkflow`, which re-exports it, because it is what keys
+ * `rewriteHistory`'s durable marker: the rewrite has to name the request it is serving, and
+ * `ReplicaWorkflow` already depends on this module. The brand identifier is unchanged from where
+ * this used to live, so no persisted or serialized value moves.
+ */
+export const OperationId = Schema.String.check(Schema.isMinLength(1)).pipe(
+  Schema.brand("@lucas-barake/effect-local-sql/OperationId")
+)
+export type OperationId = typeof OperationId.Type
 
 export interface PreparedCheckpoint {
   readonly bytes: Uint8Array
@@ -41,6 +55,7 @@ const CheckpointRow = Schema.Struct({
   checksum: Schema.String,
   commit_sequence: Identity.CommitSequence,
   heads: Heads,
+  lineage: Identity.DocumentLineage,
   writer_provenance: WriterProvenance.StoredChangeProvenances
 })
 
@@ -62,7 +77,34 @@ const ChangeProvenanceRow = Schema.Struct({
 const encodeHeads = Schema.encodeSync(Heads)
 
 const DocumentRow = Schema.Struct({ document_id: Identity.DocumentId })
+/**
+ * What `installDocumentCheckpoint` returns.
+ *
+ * The lineage comes back from the compare and swap itself rather than from a second read. The swap
+ * does not touch the column, so `RETURNING` reports the value the row holds at the moment the
+ * checkpoint is installed, on the row the swap matched, inside the transaction that writes the
+ * checkpoint. A separate `SELECT` would prove less for one more statement.
+ */
+const InstalledDocumentRow = Schema.Struct({
+  document_id: Identity.DocumentId,
+  lineage: Identity.DocumentLineage
+})
 const CheckpointHashRow = Schema.Struct({ checkpoint_hash: Schema.String })
+const CountRow = Schema.Struct({ count: Schema.Int })
+/** Only the columns `rewriteHistory`'s in-transaction guard and compare-and-swap read. */
+const RewriteGuardRow = Schema.Struct({
+  accepted_heads: Schema.String,
+  checkpoint_hash: Schema.NullOr(Schema.String),
+  document_type: Schema.String,
+  materialized_heads: Schema.String,
+  tombstone: Schema.Int
+})
+/** The `(replica_incarnation, operation_id)` marker a completed history rewrite left behind. */
+const RewriteMarkerRow = Schema.Struct({
+  document_id: Identity.DocumentId,
+  lineage: Identity.DocumentLineage
+})
+const DocumentLineageRow = Schema.Struct({ lineage: Identity.DocumentLineage })
 const CheckpointIdentity = Schema.Struct({
   bytes: Schema.Uint8Array,
   checkpointHash: Schema.String,
@@ -95,6 +137,49 @@ export class Compaction extends Context.Service<Compaction, {
    * entered under an already held shared or write permit.
    */
   readonly pruneCommandReceipts: Effect.Effect<number, ReplicaError.ReplicaError>
+  /**
+   * Re-roots a document from its current value and returns the new lineage.
+   *
+   * Automerge exposes no way to prune a document's change graph, so the only way to bound a
+   * high-churn document's checkpoint is to rebuild it as a fresh document holding the value the
+   * current one materializes to. This is destructive and is not a compaction: it permanently
+   * discards every prior change, every prior checkpoint, and with them the writer provenance of
+   * every dropped change. Nothing that was rewritten can be recovered, and no peer can ever
+   * reconcile its own history against the result -- the new lineage is what tells a peer its view
+   * is unreachable rather than merely behind.
+   *
+   * Register conflict alternatives are collapsed. The rebuilt document carries exactly the value
+   * `Automerge.toJS` exposes, which is the winner of each register; the losing alternatives that
+   * `Automerge.getConflicts` would still report on the old document are gone.
+   *
+   * Refuses unless the document's canonical history is complete and settled: no unapplied change
+   * rows, no peer receipt holding an undecoded pending message, no pending peer outbox row, and
+   * materialized heads equal to accepted heads. An orphan peer change leaves no change row at all,
+   * so the pending message is its only durable record and dropping it would lose an accepted write.
+   *
+   * Acquires no gate lock. The caller owns the lock, exactly as `prune` and `pruneCommandReceipts`
+   * do, so this must be entered under an already held shared or write permit. The permit is only
+   * sampled, never claimed: claiming would bump the replica incarnation and writer generation and
+   * invalidate every live workflow handle and peer session for what is a single document's
+   * maintenance.
+   *
+   * Idempotent per `operationId`. The rewrite records the lineage it minted against
+   * `(replica_incarnation, operationId)` inside its own transaction, and a later call carrying the
+   * same operation id returns that recorded lineage having performed no destructive work at all.
+   * This is what makes the rewrite safe to re-run: the workflow that drives it dedupes operator
+   * REQUESTS, but a crash between this transaction's commit and the journaling of the activity
+   * result re-runs the ACTIVITY, and a second lineage would force every peer that already resynced
+   * onto the first one to resync again.
+   *
+   * An operation id is bound to the first document it rewrote. Reusing it for another document fails
+   * with `ProtocolMismatch` rather than performing a second destructive rewrite under an identity
+   * that already names one.
+   */
+  readonly rewriteHistory: <D extends Document.Any,>(
+    document: D,
+    documentId: Identity.DocumentId,
+    operationId: OperationId
+  ) => Effect.Effect<Identity.DocumentLineage, ReplicaError.ReplicaError>
 }>()("@lucas-barake/effect-local-sql/Compaction") {}
 
 /**
@@ -143,7 +228,7 @@ export const layer: Layer.Layer<
       Request: Identity.DocumentId,
       Result: CheckpointRow,
       execute: (documentId) =>
-        sql`SELECT bytes, checkpoint_hash, checksum, commit_sequence, heads, writer_provenance
+        sql`SELECT bytes, checkpoint_hash, checksum, commit_sequence, heads, lineage, writer_provenance
         FROM effect_local_checkpoints
         WHERE document_id = ${documentId} AND verified = 1
         ORDER BY commit_sequence DESC, checkpoint_hash DESC`
@@ -172,7 +257,7 @@ export const layer: Layer.Layer<
         documentType: Schema.String,
         heads: Heads
       }),
-      Result: DocumentRow,
+      Result: InstalledDocumentRow,
       execute: ({ checkpointHash, commitSequence, documentId, documentType, heads }) =>
         sql`UPDATE effect_local_documents SET checkpoint_hash = ${checkpointHash}
           WHERE document_id = ${documentId}
@@ -180,7 +265,7 @@ export const layer: Layer.Layer<
             AND materialized_heads = ${heads}
             AND accepted_heads = ${heads}
             AND (SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1) = ${commitSequence}
-          RETURNING document_id`
+          RETURNING document_id, lineage`
     })
     const installedCheckpoint = SqlSchema.findAll({
       Request: Schema.Struct({
@@ -251,6 +336,145 @@ export const layer: Layer.Layer<
           WHERE document_id = ${documentId} AND change_hash = ${changeHash} AND applied = 1
           RETURNING change_hash`
     })
+
+    // A platform that cannot produce randomness cannot mint a lineage, and a rewrite without one
+    // would restart the same actor chain. Reported as unavailable rather than corrupt: nothing
+    // durable is wrong, the operation simply could not start.
+    const makeLineage = Identity.makeDocumentLineage.pipe(
+      Effect.provideService(Crypto.Crypto, crypto),
+      Effect.catchTag("PlatformError", failStorageUnavailable)
+    )
+    const findDefinitionHash = SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: Schema.Struct({ definition_hash: WriterProvenance.WriterDefinitionHash }),
+      execute: () => sql`SELECT definition_hash FROM effect_local_metadata WHERE singleton = 1`
+    })
+    // Same allocator `DocumentStore` uses, so a rewrite takes a slot in the one global commit
+    // sequence rather than reusing the sequence the discarded history was written under.
+    const nextCommitSequence = SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: Schema.Struct({ commit_sequence: Identity.CommitSequence }),
+      execute: () =>
+        sql`UPDATE effect_local_metadata SET commit_sequence = commit_sequence + 1
+          WHERE singleton = 1 RETURNING commit_sequence`
+    })
+    const findRewriteGuard = SqlSchema.findOneOption({
+      Request: Identity.DocumentId,
+      Result: RewriteGuardRow,
+      execute: (documentId) =>
+        sql`SELECT accepted_heads, checkpoint_hash, document_type, materialized_heads, tombstone
+          FROM effect_local_documents WHERE document_id = ${documentId}`
+    })
+    const findRewriteMarker = SqlSchema.findOneOption({
+      Request: Schema.Struct({ incarnation: Identity.ReplicaIncarnation, operationId: OperationId }),
+      Result: RewriteMarkerRow,
+      execute: ({ incarnation, operationId }) =>
+        sql`SELECT document_id, lineage FROM effect_local_history_rewrites
+          WHERE replica_incarnation = ${incarnation} AND operation_id = ${operationId}`
+    })
+    const findDocumentLineage = SqlSchema.findOneOption({
+      Request: Identity.DocumentId,
+      Result: DocumentLineageRow,
+      execute: (documentId) => sql`SELECT lineage FROM effect_local_documents WHERE document_id = ${documentId}`
+    })
+    const changeCount = SqlSchema.findOneOption({
+      Request: Identity.DocumentId,
+      Result: CountRow,
+      execute: (documentId) => sql`SELECT COUNT(*) AS count FROM effect_local_changes WHERE document_id = ${documentId}`
+    })
+    // An orphan peer change never becomes a change row, so `pendingCount` cannot see it. Its only
+    // durable record is the receipt's `pending_message` blob, which the rewrite would delete.
+    const pendingReceiptCount = SqlSchema.findOneOption({
+      Request: Identity.DocumentId,
+      Result: CountRow,
+      execute: (documentId) =>
+        sql`SELECT COUNT(*) AS count FROM effect_local_peer_receipts
+          WHERE document_id = ${documentId} AND pending_message IS NOT NULL`
+    })
+    const pendingOutboxCount = SqlSchema.findOneOption({
+      Request: Identity.DocumentId,
+      Result: CountRow,
+      execute: (documentId) =>
+        sql`SELECT COUNT(*) AS count FROM effect_local_peer_outbox
+          WHERE document_id = ${documentId} AND status = 'Pending'`
+    })
+    /**
+     * The fail closed fence for a history rewrite.
+     *
+     * `gate.current` is a bare `Ref.get` and takes no lock, so the permit alone proves nothing about
+     * concurrent writers. This statement is the real fence: it matches only while the document still
+     * carries exactly the heads and checkpoint the rebuilt document was derived from, and every
+     * destructive statement of the rewrite runs after it inside the same transaction. `IS` rather
+     * than `=` on `checkpoint_hash` so a document that has never been compacted, whose hash is NULL,
+     * is matched rather than silently excluded.
+     */
+    const rewriteDocumentRoot = SqlSchema.findAll({
+      Request: Schema.Struct({
+        checkpointHash: Schema.String,
+        documentId: Identity.DocumentId,
+        documentType: Schema.String,
+        heads: Heads,
+        lineage: Identity.DocumentLineage,
+        priorAcceptedHeads: Schema.String,
+        priorCheckpointHash: Schema.NullOr(Schema.String),
+        priorMaterializedHeads: Schema.String,
+        tombstone: Schema.Int
+      }),
+      Result: DocumentRow,
+      execute: (request) =>
+        sql`UPDATE effect_local_documents SET
+            materialized_heads = ${request.heads},
+            accepted_heads = ${request.heads},
+            checkpoint_hash = ${request.checkpointHash},
+            tombstone = ${request.tombstone},
+            projection_status = 'Blocked',
+            lineage = ${request.lineage}
+          WHERE document_id = ${request.documentId}
+            AND document_type = ${request.documentType}
+            AND materialized_heads = ${request.priorMaterializedHeads}
+            AND accepted_heads = ${request.priorAcceptedHeads}
+            AND checkpoint_hash IS ${request.priorCheckpointHash}
+          RETURNING document_id`
+    })
+    /**
+     * The lineage an already completed attempt of this same operator request minted, or `None` when
+     * no attempt has committed yet.
+     *
+     * Modelled on the backup installation guard: look the request up by its own id, reject a
+     * recorded row that does not describe the request being served, and otherwise report that the
+     * work is already done. Two inconsistencies are rejected rather than worked around. A marker
+     * naming a different document means one operation id was reused for two rewrites, and serving it
+     * would destroy a second document's history under an identity that already names one. A marker
+     * whose lineage is not the document's current lineage means the document was rewritten again
+     * after this request committed, so the recorded lineage is one no peer can still reach; reporting
+     * it would tell the operator the document sits at a lineage it does not have.
+     */
+    const replayedRewrite = (
+      documentId: Identity.DocumentId,
+      operationId: OperationId,
+      incarnation: Identity.ReplicaIncarnation
+    ) =>
+      Effect.gen(function*() {
+        const marker = yield* findRewriteMarker({ incarnation, operationId })
+        if (Option.isNone(marker)) return Option.none<Identity.DocumentLineage>()
+        if (marker.value.document_id !== documentId) {
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: `history rewrite of ${marker.value.document_id}`,
+              observed: `history rewrite of ${documentId}`
+            })
+          })
+        }
+        const current = yield* findDocumentLineage(documentId)
+        if (!Option.exists(current, (row) => row.lineage === marker.value.lineage)) {
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({
+              cause: new Error("Recorded history rewrite does not match the document's current lineage")
+            })
+          })
+        }
+        return Option.some(marker.value.lineage)
+      })
 
     const prepare = <D extends Document.Any,>(document: D, documentId: Identity.DocumentId) =>
       Effect.gen(function*() {
@@ -407,7 +631,8 @@ export const layer: Layer.Layer<
             documentType: checkpoint.documentType,
             heads: checkpoint.heads
           })
-          if (rows.length !== 1) {
+          const installedDocument = rows[0]
+          if (rows.length !== 1 || installedDocument === undefined) {
             yield* gate.validate(permit)
             return false
           }
@@ -440,12 +665,19 @@ export const layer: Layer.Layer<
               })
             })
           }
+          // Stamped with the lineage the swap above read off this document, exactly as `PeerSync`
+          // stamps the lineage it admitted a message under. Leaving it at the column default would
+          // label an ordinary compaction of a rewritten document as genesis, so the document and its
+          // own checkpoints would disagree about which history they belong to and `Recovery` would
+          // reject the checkpoint it just wrote.
           yield* sql`INSERT INTO effect_local_checkpoints (
-          checkpoint_hash, document_id, heads, bytes, checksum, commit_sequence, verified, writer_provenance
+          checkpoint_hash, document_id, heads, bytes, checksum, commit_sequence, verified, writer_provenance,
+          lineage
         ) VALUES (
           ${checkpoint.checkpointHash}, ${checkpoint.documentId}, ${heads}, ${checkpoint.bytes},
           ${checkpoint.checksum}, ${checkpoint.commitSequence}, 1,
-          ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(checkpoint.writerProvenance)}
+          ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(checkpoint.writerProvenance)},
+          ${installedDocument.lineage}
         ) ON CONFLICT(checkpoint_hash) DO NOTHING`
           const installed = yield* installedCheckpoint({
             bytes: checkpoint.bytes,
@@ -571,9 +803,36 @@ export const layer: Layer.Layer<
               )
           })
         )
-        if (checkpoints.length < 2) return 0
-        const newest = checkpoints[0]
-        const oldest = checkpoints[checkpoints.length - 1]
+        const documentLineage = yield* findDocumentLineage(documentId).pipe(
+          Effect.catchTags({
+            SqlError: (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause
+                  })
+                })
+              ),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageCorrupt({
+                    cause
+                  })
+                })
+              )
+          })
+        )
+        if (Option.isNone(documentLineage)) return 0
+        // The retained pair is chosen from one lineage only, the document's own. A checkpoint left
+        // over from a discarded history dominates none of the current history's changes, so a pair
+        // that straddled a rewrite would compute domination against a change graph that no longer
+        // exists. The document row is the authority here, not the newest checkpoint: a checkpoint
+        // that disagrees with it is the inconsistency, and `Recovery` demotes it.
+        const retained = checkpoints.filter((checkpoint) => checkpoint.lineage === documentLineage.value.lineage)
+        if (retained.length < 2) return 0
+        const newest = retained[0]
+        const oldest = retained[retained.length - 1]
         return yield* Effect.scoped(Effect.gen(function*() {
           const [newestChecksum, oldestChecksum, newestHash, oldestHash] = yield* Effect.all([
             digest(newest.bytes),
@@ -739,6 +998,301 @@ export const layer: Layer.Layer<
         }))
       })
 
-    return Compaction.of({ compact, prepare, prune, pruneCommandReceipts, publish })
+    const rewriteHistory = <D extends Document.Any,>(
+      document: D,
+      documentId: Identity.DocumentId,
+      operationId: OperationId
+    ) =>
+      Effect.scoped(Effect.gen(function*() {
+        // Sampled, never claimed. `gate.current` is a bare `Ref.get` and takes no lock, so this
+        // permit is only the value `gate.validate` fences against; `rewriteDocumentRoot` is what
+        // actually serialises the rewrite against a concurrent writer.
+        const permit = yield* gate.current
+        // Before any of the work below, not only inside the transaction that rechecks it. A replay
+        // reaches this after its own rewrite already committed, so the document it would recover and
+        // re-root is the rewritten one: redoing that work would discard the whole point of the
+        // marker, and the settled-history guard inside the transaction would reject the replay
+        // outright once a peer has resynced onto the new lineage and left an outbox row behind.
+        const replayed = yield* replayedRewrite(documentId, operationId, permit.incarnation)
+        if (Option.isSome(replayed)) {
+          yield* Effect.annotateCurrentSpan({ "rewrite.replayed": true })
+          return replayed.value
+        }
+        // Everything up to the transaction runs outside it on purpose. The SQL client owns a single
+        // connection and a transaction holds it for its whole duration, so recovering a high-churn
+        // document, re-rooting it and hashing the result inside one would stall every other command
+        // and query in the process for as long as that takes. `prepare` and `prune` read the same
+        // way. Both handles are acquired with their own release: the transaction body below is
+        // interruptible and SQL rolls back, but wasm handles do not.
+        const stored = yield* Effect.acquireRelease(
+          recovery.recover(document, documentId),
+          (stored) => Effect.sync(() => InternalAutomerge.free(stored.automerge))
+        )
+        const lineage = yield* makeLineage
+        const rebuilt = yield* Effect.acquireRelease(
+          Effect.try({
+            try: () =>
+              InternalAutomerge.reroot(
+                InternalAutomerge.value(stored.automerge),
+                InternalAutomerge.tombstone(stored.automerge),
+                InternalAutomerge.rewriteActorId(permit.replicaId, permit.writerGeneration, documentId, lineage)
+              ),
+            catch: (cause) =>
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause })
+              })
+          }),
+          (rebuilt) => Effect.sync(() => InternalAutomerge.free(rebuilt))
+        )
+        const bytes = InternalAutomerge.save(rebuilt)
+        yield* Effect.annotateCurrentSpan({ "rewrite.checkpoint_bytes": bytes.byteLength })
+        const checksum = yield* digest(bytes)
+        const checkpointHash = yield* digest({ documentId, bytes })
+        const heads = InternalAutomerge.heads(rebuilt)
+        const rootChanges = InternalAutomerge.changesSince(rebuilt, [])
+        const rootChange = rootChanges[0]
+        if (rootChanges.length !== 1 || rootChange === undefined) {
+          return yield* failStorageCorrupt(
+            new Error(`Re-rooted document produced ${rootChanges.length} changes instead of one`)
+          )
+        }
+        const definitionHash = yield* findDefinitionHash(undefined).pipe(
+          Effect.map((row) => row.definition_hash),
+          Effect.catchTag("NoSuchElementError", () => Effect.die(new Error("Replica metadata was not initialized")))
+        )
+        // The stored schema version, not `document.version`: `recover` decodes at the version the
+        // row records and does not migrate, so the value the re-rooted change carries is encoded at
+        // exactly that version. `document.version` would attribute a newer encoding to bytes that do
+        // not use it. The document row's own `schema_version` is left untouched, so a later
+        // `DocumentStore.materialize` still upgrades the rewritten document the ordinary way.
+        const writerSchemaVersion = stored.snapshot.version
+        const provenanceEntries = yield* Schema.decodeUnknownEffect(WriterProvenance.ChangeProvenances)(
+          WriterProvenance.changeHashes(rebuilt).map((changeHash) => ({
+            changeHash,
+            writerSchemaVersion,
+            writerDefinitionHash: definitionHash
+          }))
+        )
+        const writerProvenance = yield* Effect.try({
+          try: () => WriterProvenance.resolve(WriterProvenance.changeHashes(rebuilt), provenanceEntries),
+          catch: (cause) =>
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+        })
+        const encodedHeads = encodeHeads(heads)
+        const storedProvenance = Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(writerProvenance)
+        // The heads the rebuilt document was actually derived from, captured here rather than
+        // re-read below. `recover` ran in its own transaction and released the connection, so a
+        // writer can advance the document before this one opens. Feeding the swap the re-read heads
+        // would make it match that advanced row and commit a document rebuilt from a stale value,
+        // silently discarding every write in between. These are what make the swap a real fence.
+        const priorMaterializedHeads = encodeHeads(stored.materializedHeads)
+        const priorAcceptedHeads = encodeHeads(stored.acceptedHeads)
+
+        return yield* sql.withTransaction(Effect.gen(function*() {
+          yield* gate.validate(permit)
+          // Rechecked inside the transaction that performs the write, and before every guard and
+          // every destructive statement below. The read above committed its own transaction and
+          // released the connection, so only this one proves no attempt of this request landed in
+          // between; and a replay must return the recorded lineage rather than be rejected by the
+          // settled-history guard for state the rewrite it already performed produced.
+          const recorded = yield* replayedRewrite(documentId, operationId, permit.incarnation)
+          if (Option.isSome(recorded)) {
+            yield* gate.validate(permit)
+            yield* Effect.annotateCurrentSpan({ "rewrite.replayed": true })
+            return recorded.value
+          }
+          const guard = yield* findRewriteGuard(documentId)
+          if (Option.isNone(guard)) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.DocumentNotFound({ documentId })
+            })
+          }
+          const row = guard.value
+          // Re-read from SQL rather than reused from the `recover` above: that read committed its
+          // own transaction and released the connection, so anything it observed is stale here.
+          const [unapplied, receipts, outbox, priorChanges] = yield* Effect.all([
+            pendingCount(documentId),
+            pendingReceiptCount(documentId),
+            pendingOutboxCount(documentId),
+            changeCount(documentId)
+          ])
+          const nonZero = (count: Option.Option<typeof CountRow.Type>) => Option.exists(count, (row) => row.count !== 0)
+          if (
+            row.document_type !== document.name || row.materialized_heads !== row.accepted_heads ||
+            nonZero(unapplied) || nonZero(receipts) || nonZero(outbox)
+          ) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({
+                cause: new Error("Cannot rewrite the history of an incomplete or unsettled document")
+              })
+            })
+          }
+          const tombstone = InternalAutomerge.tombstone(rebuilt)
+          if ((row.tombstone === 1) !== tombstone) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({
+                cause: new Error("Re-rooted tombstone does not match the stored document")
+              })
+            })
+          }
+          // Compare and swap first, before anything destructive. On zero rows this FAILS rather than
+          // reporting a no-op the way `publish` and `prune` do: those commit, and a commit after the
+          // deletes below would leave a document with no checkpoints, no change rows and a
+          // `checkpoint_hash` pointing at nothing, which no recovery path can repair.
+          const swapped = yield* rewriteDocumentRoot({
+            checkpointHash,
+            documentId,
+            documentType: document.name,
+            heads,
+            lineage,
+            priorAcceptedHeads,
+            // The one prior read in transaction. A checkpoint hash is derived from the heads, so at
+            // unchanged heads it can only have been moved by a concurrent `publish` of an equivalent
+            // checkpoint, which this rewrite supersedes anyway; carrying a stale one would fail the
+            // rewrite for no reason. It stays in the predicate so the swap still targets exactly the
+            // row the guard above read.
+            priorCheckpointHash: row.checkpoint_hash,
+            priorMaterializedHeads,
+            tombstone: tombstone ? 1 : 0
+          })
+          if (swapped.length !== 1) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({
+                cause: new Error("Document advanced while its history rewrite was being prepared")
+              })
+            })
+          }
+          const commitSequence = yield* nextCommitSequence(undefined).pipe(
+            Effect.map((row) => row.commit_sequence),
+            Effect.catchTag("NoSuchElementError", () => Effect.die(new Error("Replica metadata was not initialized")))
+          )
+          yield* sql`DELETE FROM effect_local_changes WHERE document_id = ${documentId}`
+          yield* sql`DELETE FROM effect_local_checkpoints WHERE document_id = ${documentId}`
+          yield* sql`DELETE FROM effect_local_peer_outbox WHERE document_id = ${documentId}`
+          yield* sql`DELETE FROM effect_local_peer_receipts WHERE document_id = ${documentId}`
+          // `effect_local_command_receipts` is deliberately retained. Its `heads` column goes stale,
+          // but nothing reads it: `CommandExecutor` selects only `request_hash`, `mutation_name` and
+          // `result`. Deleting the rows would break command idempotency, so a retried command that
+          // already committed would run a second time against the rewritten document.
+          yield* sql`INSERT INTO effect_local_checkpoints (
+            checkpoint_hash, document_id, heads, bytes, checksum, commit_sequence, verified,
+            writer_provenance, lineage
+          ) VALUES (
+            ${checkpointHash}, ${documentId}, ${encodedHeads}, ${bytes}, ${checksum}, ${commitSequence}, 1,
+            ${storedProvenance}, ${lineage}
+          )`
+          // The re-rooted change is written as a change row too. Without it the rewritten document
+          // would exist only as a checkpoint, and `Recovery`'s rows-only fallback -- the tail it
+          // walks when every checkpoint fails to verify -- would have nothing to rebuild from.
+          yield* sql`INSERT INTO effect_local_changes (
+            change_hash, document_id, document_type, writer_schema_version, writer_definition_hash,
+            actor, sequence, dependencies, bytes, applied, peer_id, accepted_at, commit_sequence
+          ) VALUES (
+            ${rootChange.hash}, ${documentId}, ${document.name}, ${writerSchemaVersion}, ${definitionHash},
+            ${rootChange.actor}, ${rootChange.sequence}, ${encodeHeads(rootChange.dependencies)},
+            ${rootChange.bytes}, 1, NULL, ${DateTime.formatIso(yield* DateTime.now)}, ${commitSequence}
+          )`
+          // Without this row `CommitPublisher` never invalidates the rewritten document, and its gap
+          // detector fires on the next commit because the sequence this rewrite consumed is missing.
+          yield* sql`INSERT INTO effect_local_commit_outbox (
+            commit_sequence, document_id, invalidation_keys, published
+          ) VALUES (${commitSequence}, ${documentId}, ${encodeHeads([document.name])}, 0)`
+          // The marker the replay above consults, written by the same transaction as the rewrite it
+          // records so it can never be observed apart from it. A plain insert rather than an upsert:
+          // the recheck at the top of this transaction already proved no row exists, and a conflict
+          // here would mean the durable state contradicts a read taken on the same connection inside
+          // the same transaction, which must surface rather than be absorbed.
+          yield* sql`INSERT INTO effect_local_history_rewrites (
+            replica_incarnation, operation_id, document_id, lineage, rewritten_at
+          ) VALUES (
+            ${permit.incarnation}, ${operationId}, ${documentId}, ${lineage},
+            ${DateTime.formatIso(yield* DateTime.now)}
+          )`
+
+          // Read back before returning. Every other checkpoint write in this file is verified by the
+          // recovery or publication that follows it; this one destroys the history that would let a
+          // later recovery notice, so it verifies itself here while the transaction can still roll
+          // back.
+          const installed = yield* verifiedCheckpoints(documentId)
+          const persisted = installed[0]
+          if (installed.length !== 1 || persisted === undefined) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({
+                cause: new Error(`Rewritten document retained ${installed.length} verified checkpoints`)
+              })
+            })
+          }
+          const [persistedChecksum, persistedHash] = yield* Effect.all([
+            digest(persisted.bytes),
+            digest({ documentId, bytes: persisted.bytes })
+          ])
+          if (
+            persisted.checkpoint_hash !== checkpointHash || persisted.lineage !== lineage ||
+            persisted.commit_sequence !== commitSequence || persisted.checksum !== persistedChecksum ||
+            persisted.checkpoint_hash !== persistedHash
+          ) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({
+                cause: new Error("Rewritten checkpoint does not match what was written")
+              })
+            })
+          }
+          yield* Effect.acquireUseRelease(
+            Effect.try({
+              try: () => Automerge.load<InternalAutomerge.Root<unknown>>(persisted.bytes),
+              catch: (cause) =>
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageCorrupt({ cause })
+                })
+            }),
+            (automerge) =>
+              Effect.try({
+                try: () => {
+                  if (!Equal.equals(Automerge.getHeads(automerge), persisted.heads)) {
+                    throw new TypeError("Rewritten checkpoint heads do not match its stored heads")
+                  }
+                  WriterProvenance.validateExact(
+                    WriterProvenance.changeHashes(automerge),
+                    persisted.writer_provenance
+                  )
+                },
+                catch: (cause) =>
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageCorrupt({ cause })
+                  })
+              }),
+            (automerge) => Effect.sync(() => InternalAutomerge.free(automerge))
+          )
+          const confirmed = yield* installedCheckpoint({
+            bytes,
+            checkpointHash,
+            checksum,
+            documentId,
+            heads,
+            writerProvenance
+          })
+          if (confirmed.length !== 1) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({
+                cause: new Error("Rewritten checkpoint identity collision")
+              })
+            })
+          }
+          yield* gate.validate(permit)
+          yield* Effect.annotateCurrentSpan({
+            "rewrite.changes_removed": Option.match(priorChanges, { onNone: () => 0, onSome: (row) => row.count })
+          })
+          return lineage
+        }))
+      })).pipe(
+        Effect.catchTags({ SqlError: failStorageUnavailable, SchemaError: failStorageCorrupt }),
+        // Byte and row counts only, annotated from inside. The document's value, its heads and the
+        // lineage itself never reach the span.
+        Effect.withSpan("Compaction.rewriteHistory")
+      )
+
+    return Compaction.of({ compact, prepare, prune, pruneCommandReceipts, publish, rewriteHistory })
   })
 )

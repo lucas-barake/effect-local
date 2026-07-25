@@ -16,6 +16,8 @@ export const projectionReadinessChecksum = "sha256:effect-local-projection-readi
 export const pendingReceiptIndexesChecksum = "sha256:effect-local-pending-receipt-indexes-v1"
 export const peerWriterProvenanceChecksum = "sha256:effect-local-peer-writer-provenance-v1"
 export const replicaHealthIndexesChecksum = "sha256:effect-local-replica-health-indexes-v1"
+export const documentLineageChecksum = "sha256:effect-local-document-lineage-v1"
+export const historyRewriteMarkersChecksum = "sha256:effect-local-history-rewrite-markers-v1"
 
 const migration = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
@@ -377,6 +379,49 @@ const replicaHealthIndexesMigration = Effect.gen(function*() {
     VALUES (7, 'replica_health_indexes', ${replicaHealthIndexesChecksum})`
 })
 
+const documentLineageMigration = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`ALTER TABLE effect_local_documents
+    ADD COLUMN lineage TEXT NOT NULL DEFAULT ''`
+  yield* sql`ALTER TABLE effect_local_checkpoints
+    ADD COLUMN lineage TEXT NOT NULL DEFAULT ''`
+  yield* sql`ALTER TABLE effect_local_peer_outbox
+    ADD COLUMN lineage TEXT NOT NULL DEFAULT ''`
+  yield* sql`INSERT INTO effect_local_migration_catalog (migration_id, name, checksum)
+    VALUES (8, 'document_lineage', ${documentLineageChecksum})`
+})
+
+/**
+ * The durable `(replica_incarnation, operation_id) -> lineage` record of an already performed history
+ * rewrite.
+ *
+ * `Compaction.rewriteHistory` is destructive and mints a lineage that permanently invalidates every
+ * peer's view. Workflow idempotency only dedupes operator REQUESTS: a crash between the rewrite's SQL
+ * commit and the journaling of its activity result makes the activity run again, and without this
+ * table the replay would mint a second lineage and force every peer that already resynced onto the
+ * first one to resync again. The row is written inside the rewrite's own transaction, so it cannot be
+ * observed apart from the rewrite it guards.
+ *
+ * Keyed by incarnation as well as operation, exactly like `effect_local_command_receipts`. A restore
+ * claims the gate and raises the incarnation, so rows written before it can never satisfy a lookup
+ * again and cannot short circuit a rewrite of the restored document. No foreign key to
+ * `effect_local_documents`, for the same reason command receipts carry none: the row records that an
+ * operator request was served, not that the document still exists.
+ */
+const historyRewriteMarkersMigration = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`CREATE TABLE effect_local_history_rewrites (
+    replica_incarnation INTEGER NOT NULL,
+    operation_id TEXT NOT NULL,
+    document_id TEXT NOT NULL,
+    lineage TEXT NOT NULL,
+    rewritten_at TEXT NOT NULL,
+    PRIMARY KEY(replica_incarnation, operation_id)
+  )`
+  yield* sql`INSERT INTO effect_local_migration_catalog (migration_id, name, checksum)
+    VALUES (9, 'history_rewrite_markers', ${historyRewriteMarkersChecksum})`
+})
+
 export const loader = Migrator.fromRecord({
   "1_canonical_store": migration,
   "2_peer_sync": peerSyncMigration,
@@ -384,7 +429,9 @@ export const loader = Migrator.fromRecord({
   "4_projection_readiness": projectionReadinessMigration,
   "5_pending_receipt_indexes": pendingReceiptIndexesMigration,
   "6_peer_writer_provenance": peerWriterProvenanceMigration,
-  "7_replica_health_indexes": replicaHealthIndexesMigration
+  "7_replica_health_indexes": replicaHealthIndexesMigration,
+  "8_document_lineage": documentLineageMigration,
+  "9_history_rewrite_markers": historyRewriteMarkersMigration
 })
 
 const migrate = Migrator.make({})({ loader, table: "effect_local_migrations" })
@@ -419,6 +466,13 @@ export const run = Effect.gen(function*() {
       name: "replica_health_indexes",
       checksum: replicaHealthIndexesChecksum,
       label: "Replica health indexes"
+    },
+    { id: 8, name: "document_lineage", checksum: documentLineageChecksum, label: "Document lineage" },
+    {
+      id: 9,
+      name: "history_rewrite_markers",
+      checksum: historyRewriteMarkersChecksum,
+      label: "History rewrite markers"
     }
   ] as const
   // One transaction over migrate + validation so a rejected catalog rolls back

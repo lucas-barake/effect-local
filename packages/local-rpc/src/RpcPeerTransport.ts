@@ -58,6 +58,11 @@ const mapError = (error: PeerRpcError.PeerRpcError | RpcClientError) => {
     case "DefinitionMismatch":
     case "InvalidRequest":
     case "RequestLimitExceeded":
+    // The wire error is fieldless, so the local side knows only that the remote lineage no longer
+    // matches, never which document or which lineage. The tag is carried in `observed` rather than
+    // rebuilt into a `DocumentLineageChanged` reason, whose `documentId` and lineages would have to
+    // be invented here. Like every other permanent rejection this is not retryable.
+    case "DocumentLineageChanged":
       return protocolFailure(error._tag)
   }
 }
@@ -67,7 +72,12 @@ export const isRetryable = (error: ReplicaError.ReplicaError) => error.reason._t
 const adapterResult = (exit: Exit.Exit<unknown, ReplicaError.ReplicaError>) => {
   if (Exit.isSuccess(exit)) return "Success" as const
   const error = PeerRpcObservability.failure(exit)
-  return error !== undefined && (error.reason._tag === "ProtocolMismatch" || error.reason._tag === "QuotaExceeded")
+  return error !== undefined && (
+      error.reason._tag === "ProtocolMismatch" ||
+      error.reason._tag === "QuotaExceeded" ||
+      // Peer caused: a rewritten lineage is a rejection of the exchange, not an adapter fault.
+      error.reason._tag === "DocumentLineageChanged"
+    )
     ? "ProtocolRejected" as const
     : "Failure" as const
 }
@@ -80,7 +90,10 @@ export const layer = (
   }
 ) =>
   Layer.succeed(PeerTransport.PeerTransport, {
-    capabilities: { storeAndForward: false },
+    // The connection level value below is whatever the server advertised in its `Opened` frame.
+    // This one describes the local adapter, which compares lineage on every inbound message it
+    // hands to `PeerSession`, so it is true for the same reason the server side is.
+    capabilities: { storeAndForward: false, lineageAware: true },
     connect: (connectOptions) =>
       PeerRpcObservability.observe({
         effect: Effect.gen(function*() {
@@ -131,6 +144,12 @@ export const layer = (
                   protocolVersion: PeerRpc.protocolVersion,
                   expectedPeerId: connectOptions.peerId,
                   definitionHash: options.definition.hash,
+                  // Truthful for the same reason the adapter level `capabilities` above is: this
+                  // build compares lineage on every inbound message before it hands one to
+                  // `PeerSession`. The server has no other way to tell this build from an older one
+                  // on the same protocol version, and without the claim it refuses to emit any
+                  // rewritten document toward this replica.
+                  capabilities: { lineageAware: true },
                   documents: options.documents.map((entry) => ({
                     documentType: entry.document.name,
                     documentId: entry.documentId

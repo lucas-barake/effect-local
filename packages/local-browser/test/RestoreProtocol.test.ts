@@ -65,6 +65,44 @@ it.effect("drops whole document ids rather than truncating them when the budget 
     }
   }))
 
+it.effect("round trips a changed document lineage reason through the restore wire", () =>
+  Effect.gen(function*() {
+    const original = new ReplicaError.ReplicaError({
+      reason: new ReplicaError.DocumentLineageChanged({
+        documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001"),
+        localLineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000003"),
+        remoteLineage: Identity.genesisLineage
+      })
+    })
+    const encoded = RestoreProtocol.encodeReplicaError(original, 4_096)
+    const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
+    assert.deepStrictEqual(RestoreProtocol.replicaErrorFromWire(decoded), original)
+  }))
+
+it.effect("drops both lineages whole rather than truncating them when the budget is tight", () =>
+  Effect.gen(function*() {
+    const encoded = RestoreProtocol.encodeReplicaError(
+      new ReplicaError.ReplicaError({
+        reason: new ReplicaError.DocumentLineageChanged({
+          documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001"),
+          localLineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000003"),
+          remoteLineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000004")
+        })
+      }),
+      ReplicaLimits.minimumRestoreErrorBytes
+    )
+    assert.isTrue(RestoreProtocol.preflight(encoded, ReplicaLimits.minimumRestoreErrorBytes))
+    // A surviving lineage must still decode as its own branded value, so none may be truncated.
+    const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
+    const reason = RestoreProtocol.replicaErrorFromWire(decoded).reason
+    assert.strictEqual(reason._tag, "DocumentLineageChanged")
+    if (reason._tag !== "DocumentLineageChanged") return
+    assert.strictEqual(reason.documentId, "doc_00000000-0000-4000-8000-000000000001")
+    // Neither lineage fits beside the document id at the minimum budget, so the pair drops together.
+    assert.strictEqual(reason.localLineage, Identity.genesisLineage)
+    assert.strictEqual(reason.remoteLineage, Identity.genesisLineage)
+  }))
+
 const finishRpc = ReplicaRpc.group.requests.get("FinishRestoreBackupV4")!
 const finishExitCodec = Schema.toCodecJson(Rpc.exitSchema(finishRpc))
 const restoreFailure = (replica: string) =>
@@ -218,6 +256,11 @@ it.effect("encodes every restore error and defect at the minimum configured budg
       new ReplicaError.CheckpointSuperseded({
         documentIds: Array.from({ length: 32 }, () => documentId),
         attempts: 9
+      }),
+      new ReplicaError.DocumentLineageChanged({
+        documentId,
+        localLineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000003"),
+        remoteLineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000004")
       })
     ]
 

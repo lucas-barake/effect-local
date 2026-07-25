@@ -45,7 +45,8 @@ const DocumentRecord = Schema.Struct({
   accepted_heads: Schema.String,
   tombstone: Schema.Int,
   projection_status: Schema.String,
-  checkpoint_hash: Schema.NullOr(Schema.String)
+  checkpoint_hash: Schema.NullOr(Schema.String),
+  lineage: Identity.DocumentLineage
 })
 
 const ChangeRecord = Schema.Struct({
@@ -72,7 +73,8 @@ const CheckpointRecord = Schema.Struct({
   checksum: Schema.String,
   commit_sequence: Schema.Int,
   verified: Schema.Int,
-  writer_provenance: Schema.optionalKey(WriterProvenance.ChangeProvenances)
+  writer_provenance: Schema.optionalKey(WriterProvenance.ChangeProvenances),
+  lineage: Identity.DocumentLineage
 })
 
 const ReceiptRecord = Schema.Struct({
@@ -90,12 +92,14 @@ const StoredChangeRecord = Schema.Struct({ ...ChangeRecord.fields, bytes: Schema
 const StoredCheckpointRecord = Schema.Struct({
   ...CheckpointRecord.fields,
   bytes: Schema.Uint8Array,
-  writer_provenance: WriterProvenance.StoredChangeProvenances
+  writer_provenance: WriterProvenance.StoredChangeProvenances,
+  lineage: Identity.DocumentLineage
 })
 const DecodedCheckpointRecord = Schema.Struct({
   ...CheckpointRecord.fields,
   bytes: Schema.Uint8Array,
-  writer_provenance: WriterProvenance.ChangeProvenances
+  writer_provenance: WriterProvenance.ChangeProvenances,
+  lineage: Identity.DocumentLineage
 })
 const StoredReceiptRecord = Schema.Struct({ ...ReceiptRecord.fields, result: Schema.Uint8Array })
 
@@ -111,6 +115,7 @@ const ForeignKeyViolationRow = Schema.Struct({
 })
 const JsonString = Schema.fromJsonString(Schema.Unknown)
 const EnvelopeJson = Schema.fromJsonString(Envelope)
+const backupAlreadyInstalled = { _tag: "BackupAlreadyInstalled" } as const
 
 type Envelope = typeof Envelope.Type
 type RawDecodedRecord =
@@ -222,7 +227,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             (SELECT COALESCE(SUM(
               length(document_id) + length(document_type) + length(observed_versions) +
               length(materialized_heads) + length(accepted_heads) + length(projection_status) +
-              length(COALESCE(checkpoint_hash, ''))
+              length(COALESCE(checkpoint_hash, '')) + length(lineage)
             ), 0) FROM effect_local_documents) +
             (SELECT COALESCE(SUM(
               length(change_hash) + length(document_id) + length(document_type) +
@@ -231,7 +236,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             ), 0) FROM effect_local_changes) +
             (SELECT COALESCE(SUM(
               length(checkpoint_hash) + length(document_id) + length(heads) + length(bytes) + length(checksum) +
-              length(writer_provenance)
+              length(writer_provenance) + length(lineage)
             ), 0) FROM effect_local_checkpoints) +
             (SELECT COALESCE(SUM(
               length(command_id) + length(request_hash) + length(mutation_name) + length(result) +
@@ -768,7 +773,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                       })
                     })
                   }
-                  return
+                  return yield* Effect.fail(backupAlreadyInstalled)
                 }
                 yield* sql`INSERT INTO effect_local_backup_installations (
                 installation_id, mode, manifest_checksum, installed_at, replica_incarnation
@@ -856,6 +861,8 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 }
                 yield* gate.validate(restoredPermit)
               })
+            ).pipe(
+              Effect.catchTag("BackupAlreadyInstalled", () => gate.refresh.pipe(Effect.asVoid))
             )
           }))
         }).pipe(

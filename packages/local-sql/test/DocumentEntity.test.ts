@@ -94,6 +94,8 @@ describe("DocumentEntity", () => {
   }
   const peerSync = (receive: PeerSync.PeerSync["Service"]["receive"] = () => Effect.succeed(syncResult)) =>
     PeerSync.PeerSync.of({
+      withDocumentInvalidation: (_documentId, effect) => effect,
+      invalidateDocument: () => Effect.void,
       open: (peerId) =>
         Effect.succeed({
           peerId,
@@ -103,7 +105,8 @@ describe("DocumentEntity", () => {
       reset: () => Effect.void,
       generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
       receive,
-      enqueue: (_session, reply) => Effect.succeed({ ...reply, sendSequence: 0, writerProvenance: [] }),
+      enqueue: (_session, reply) =>
+        Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
       pending: () => Effect.succeed([]),
       markSent: () => Effect.succeed(false)
     })
@@ -183,7 +186,17 @@ describe("DocumentEntity", () => {
       return PrimaryKey.value(payload)
     }
     const key = keyOf(DocumentEntity.ApplySync.payloadSchema.make(base))
-    assert.strictEqual(key, JSON.stringify([1, peerId, "connection", 2, "hash-a", base.writerProvenance]))
+    assert.strictEqual(
+      key,
+      JSON.stringify([1, peerId, "connection", 2, "hash-a", base.writerProvenance, ""])
+    )
+    assert.notStrictEqual(
+      key,
+      keyOf(DocumentEntity.ApplySync.payloadSchema.make({
+        ...base,
+        lineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000001")
+      }))
+    )
     assert.notStrictEqual(
       key,
       keyOf(DocumentEntity.ApplySync.payloadSchema.make({
@@ -249,6 +262,47 @@ describe("DocumentEntity", () => {
     assert.notStrictEqual(first, second)
   })
 
+  it("round trips a persisted ApplySync payload with and without a lineage key", () => {
+    const lineage = "lin_22222222-2222-4222-9222-222222222222"
+    const wire = {
+      replicaIncarnation: 1,
+      peerId: "peer_00000000-0000-4000-8000-000000000001",
+      connectionEpoch: "connection",
+      localConnectionEpoch: "local-connection",
+      receiveSequence: 2,
+      documentType: Task.name,
+      messageHash: "hash-a",
+      message: "AQID",
+      writerProvenance: [{
+        changeHash: "a".repeat(64),
+        writerSchemaVersion: Task.version,
+        writerDefinitionHash: definition.hash
+      }]
+    }
+    // A message enqueued by a build without lineage has no such key. `Persisted` means it is
+    // replayed through this schema, so decoding it must succeed rather than fail the whole payload.
+    const replayed = Schema.decodeUnknownSync(DocumentEntity.ApplySync.payloadSchema)(wire)
+    assert.isUndefined(replayed.lineage)
+    assert.deepStrictEqual(
+      Schema.encodeUnknownSync(DocumentEntity.ApplySync.payloadSchema)(replayed),
+      wire
+    )
+
+    const carried = Schema.decodeUnknownSync(DocumentEntity.ApplySync.payloadSchema)({ ...wire, lineage })
+    assert.strictEqual(carried.lineage, lineage)
+    assert.deepStrictEqual(
+      Schema.encodeUnknownSync(DocumentEntity.ApplySync.payloadSchema)(carried),
+      { ...wire, lineage }
+    )
+
+    assert.throws(() =>
+      Schema.decodeUnknownSync(DocumentEntity.ApplySync.payloadSchema)({
+        ...wire,
+        lineage: "x".repeat(257)
+      })
+    )
+  })
+
   it("persists RPCs in the shared SQL transaction without server interruption", () => {
     for (const rpc of [DocumentEntity.Create, DocumentEntity.Mutate, DocumentEntity.Delete]) {
       assert.strictEqual(Context.get(rpc.annotations, ClusterSchema.Persisted), true)
@@ -287,8 +341,12 @@ describe("DocumentEntity", () => {
             readonly writerDefinitionHash: string
           }>
         >([])
+        const receivedLineages = yield* Ref.make<ReadonlyArray<Identity.DocumentLineage>>([])
         const sync = peerSync((_document, _documentId, _session, input) =>
-          Ref.set(receivedProvenance, input.writerProvenance).pipe(Effect.as(syncResult))
+          Effect.all([
+            Ref.set(receivedProvenance, input.writerProvenance),
+            Ref.update(receivedLineages, (lineages) => [...lineages, input.lineage])
+          ]).pipe(Effect.as(syncResult))
         )
         const makeClient = yield* Entity.makeTestClient(
           DocumentEntity.DocumentEntity,
@@ -366,6 +424,22 @@ describe("DocumentEntity", () => {
         })
         assert.deepStrictEqual(applied, syncResult)
         assert.deepStrictEqual(yield* Ref.get(receivedProvenance), writerProvenance)
+        assert.deepStrictEqual(yield* Ref.get(receivedLineages), [Identity.genesisLineage])
+        const rewrittenLineage = Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000001")
+        const rewritten = yield* client.ApplySync({
+          replicaIncarnation: permit.incarnation,
+          peerId: (yield* Identity.makePeerId),
+          connectionEpoch: "connection",
+          localConnectionEpoch: "local-connection",
+          receiveSequence: 1,
+          documentType: Task.name,
+          messageHash: yield* Canonical.digest(message),
+          message,
+          lineage: rewrittenLineage,
+          writerProvenance
+        })
+        assert.deepStrictEqual(rewritten, syncResult)
+        assert.deepStrictEqual(yield* Ref.get(receivedLineages), [Identity.genesisLineage, rewrittenLineage])
         const stale = yield* Effect.exit(client.ApplySync({
           replicaIncarnation: Identity.ReplicaIncarnation.make(permit.incarnation - 1),
           peerId: (yield* Identity.makePeerId),

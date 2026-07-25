@@ -231,6 +231,7 @@ always recover by reading the replica again because Atom is not part of the pers
 | Exchange changes with another replica     | `PeerSession` and an application supplied transport  |
 | Host a live authenticated replica peer    | `PeerRpcServer` plus application owned Effect RPC    |
 | Connect through the generated RPC client  | `RpcPeerTransport.makeSession`                       |
+| Bound a high churn document's checkpoint  | `ReplicaWorkflow.HistoryRewriteWorkflow`             |
 | Show cursors or online state              | Presence                                             |
 | Move or recover all local data            | Backup and restore                                   |
 
@@ -242,14 +243,15 @@ schema checked command.
 
 Some familiar words refer to multiple operations. The README uses the qualified form when the distinction matters.
 
-| Qualified term               | Meaning                                                                                                                                                |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Canonical encoding utilities | Deterministic `Canonical.stringify`, `Canonical.hash`, and `Canonical.digest`. This module is not the canonical storage service.                       |
-| Storage compaction           | Publish a verified Automerge save checkpoint and prune redundant SQL change rows while preserving logical document history.                            |
-| History truncation           | Deliberately discard causal history. Effect Local storage compaction does not make this promise.                                                       |
-| Library storage migration    | Library controlled migration of the internal SQL format.                                                                                               |
-| Projection table migration   | Application supplied DDL for one rebuildable projection table.                                                                                         |
-| Document schema evolution    | Change to a document definition version and value schema. Stored documents migrate in place at startup through the registered versioned decoder chain. |
+| Qualified term               | Meaning                                                                                                                                                         |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Canonical encoding utilities | Deterministic `Canonical.stringify`, `Canonical.hash`, and `Canonical.digest`. This module is not the canonical storage service.                                |
+| Storage compaction           | Publish a verified Automerge save checkpoint and prune redundant SQL change rows while preserving logical document history.                                     |
+| History truncation           | Deliberately discard causal history. Storage compaction never does this. `HistoryRewriteWorkflow` does, for one document, and only when an operator invokes it. |
+| Document lineage             | The identity of one document's causal root. Genesis is the empty string. A history rewrite mints `lin_` plus a UUID.                                            |
+| Library storage migration    | Library controlled migration of the internal SQL format.                                                                                                        |
+| Projection table migration   | Application supplied DDL for one rebuildable projection table.                                                                                                  |
+| Document schema evolution    | Change to a document definition version and value schema. Stored documents migrate in place at startup through the registered versioned decoder chain.          |
 
 ## Installation
 
@@ -664,8 +666,8 @@ export const QueryLive = ListTasks.toLayer((payload) => ListTasksSql(payload).pi
 `SqlReplica.layerWithBindings` accepts exactly one SQL binding per declared projection and provides those binding
 services automatically. It still requires every mutation and query handler,
 `ReplicaLimits`, `Crypto`, and `SqlClient`. It provides `Replica`, `CommitPublisher`, `ReplicaWorkflow.CompactionWorkflow`,
-`PeerSync`, `ReplicaGate`, and Effect Cluster `Sharding`. The owner side peer services stay available so
-`PeerSession.make` can share the same durable runtime and fencing gate.
+`ReplicaWorkflow.HistoryRewriteWorkflow`, `PeerSync`, `ReplicaGate`, and Effect Cluster `Sharding`. The owner side peer
+services stay available so `PeerSession.make` can share the same durable runtime and fencing gate.
 
 ```ts
 import { BrowserCrypto } from "@effect/platform-browser"
@@ -909,10 +911,14 @@ export const TransportLive = Layer.succeed(PeerTransport.PeerTransport, {
 ```
 
 The application adapter must return the public `PeerTransport.Connection` shape with `peerId`, `capabilities`,
-`receive`, `send`, and `close`. Its scope must release every transport resource. `PeerSession.make` selects whole
-documents and connects the transport to durable `PeerSync` state. `PeerSession.makeSupervised` exposes the same neutral
-session with `awaitDisconnect` for hosts that need the exact terminal replica failure without a per session commit
-subscription. `PeerSession.makeLive` adds commit subscription ownership.
+`receive`, `send`, and `close`. Its scope must release every transport resource. `PeerTransport.Capabilities` also
+carries an optional `lineageAware`. It describes the **remote** peer, and an absent value means that peer does not
+compare document lineage before it merges. `PeerSession` reads it and refuses to emit a rewritten document toward
+such a peer, so an adapter must set it only when the remote end really performs that comparison.
+`PeerSession.make` selects whole documents and connects the transport to durable `PeerSync` state.
+`PeerSession.makeSupervised` exposes the same neutral session with `awaitDisconnect` for hosts that need the exact
+terminal replica failure without a per session commit subscription. `PeerSession.makeLive` adds commit subscription
+ownership.
 
 `PeerSync` is the lower level durable protocol. `open` creates the local sync and outbox session for a peer. `receive`
 takes that session plus the remote envelope epoch, sequence, and bytes. Its durable reply is session neutral. `enqueue`
@@ -1171,10 +1177,12 @@ transport already pulled from the peer, and then observes the interrupt on its n
 close are not delivered.
 
 `RpcPeerTransport.isRetryable` classifies only `ReplicaError(StorageUnavailable)` as retryable. Authentication,
-authorization, version, peer identity, request shape, and declared limit failures map to
-`ReplicaError(ProtocolMismatch)` and require configuration or policy correction. `Push` success means only that the
-current server session accepted the bytes into bounded memory. `storeAndForward` and `durableConfirmation` are both
-false. Inbound item or byte overflow is terminal for that incarnation. An outbound capacity timeout during initial
+authorization, version, peer identity, request shape, declared limit, and document lineage failures map to
+`ReplicaError(ProtocolMismatch)` and require configuration or policy correction. A remote
+`PeerRpcError(DocumentLineageChanged)` arrives as `ProtocolMismatch` with the tag in `observed`, because the wire
+error carries no document identity and the adapter will not invent one. Retrying it cannot succeed. `Push` success
+means only that the current server session accepted the bytes into bounded memory. `storeAndForward` and
+`durableConfirmation` are both false. Inbound item or byte overflow is terminal for that incarnation. An outbound capacity timeout during initial
 synchronization, a Push reply, or commit driven flush is also terminal. The triggering operation and active `Open`
 stream fail with `SessionOverloaded`. Later pushes for that session receive `SessionUnavailable`, so recovery creates a
 fresh connection scope and session.
@@ -1217,6 +1225,106 @@ the operation id, and the result is journaled, so re-executing or resuming the s
 recorded outcome instead of compacting again.
 
 Backup and restore streams do not become durable merely because a Workflow is used.
+
+#### Rewrite one document's history
+
+Compaction bounds SQL change rows. It does not bound the checkpoint. `Automerge.save` encodes the whole change
+graph, so one field overwritten N times keeps growing the saved bytes with N even after every redundant change row
+is pruned. Automerge `3.3.2` exposes no API that removes history from a live document. The only way to bound such a
+document is to rebuild it as a new document carrying the value the current one materializes to.
+`ReplicaWorkflow.HistoryRewriteWorkflow` is that operation. It is registered by `SqlReplica.layer` alongside the
+compaction workflow and it is never triggered automatically.
+
+```ts
+import * as ReplicaWorkflow from "@lucas-barake/effect-local-sql/ReplicaWorkflow"
+import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Effect from "effect/Effect"
+
+declare const documentId: Identity.DocumentId
+
+const rewrite = Effect.gen(function*() {
+  const workflows = yield* ReplicaWorkflow.HistoryRewriteWorkflow
+  const execution = yield* workflows.execute(
+    documentId,
+    ReplicaWorkflow.OperationId.make("history-horizon-2026-07")
+  )
+  return yield* workflows.poll(execution)
+})
+```
+
+`execute` returns a durable `DocumentExecution` handle, not the new lineage. The rewrite outlives the caller, so the
+minted lineage is read from the `Complete` result of `poll`. `interrupt` and `resume` behave as they do for
+compaction, and every handle is rejected once the replica incarnation changes.
+
+**Why the peers cannot simply merge the result.** Every Automerge ingestion path is a union. `merge`,
+`applyChanges`, `loadIncremental`, and the sync protocol all add changes and none of them replaces content. A peer
+that still holds the discarded history therefore puts it back. Its bloom filter is anchored at a change the
+rewritten replica no longer has, so it sends a reset that asks for the sender's complete history, and the union
+restores exactly what the rewrite removed. The rewritten value then loses, and it loses deterministically rather
+than occasionally, because an Automerge register winner is ordered by Lamport operation counter first and by actor
+id only on a tie. A rebuilt document starts at counter one against a surviving lineage at counter N. Measured
+against Automerge `3.3.2`, the rewritten value survived 0 of 100 runs at every level of prior churn from one
+upward. This is why the design refuses cross lineage synchronization instead of merging it.
+
+**What a rewrite destroys.** All of it is permanent and none of it is recoverable from this replica.
+
+- Every prior change and every prior checkpoint for that document.
+- The writer provenance of every dropped change. The rewritten checkpoint carries provenance for exactly the one
+  change the rebuild produced, attributed to this replica's current definition hash and to the schema version the
+  stored document was encoded at.
+- Register conflict alternatives. The rebuilt document carries the value `Automerge.toJS` exposes, which is the
+  winner of each register. That winner is the only value this library has ever surfaced through `Snapshot`, so no
+  value an application could read is lost. The losing alternatives that `Automerge.getConflicts` still reports on
+  the old document are gone.
+- That document's durable peer receipts and peer outbox rows.
+
+**What a rewrite preserves.** The current decoded value, and the tombstone marker, so a deleted document is not
+resurrected. Command receipts are deliberately retained, so a retried command that already committed is still
+suppressed.
+
+The rewrite refuses unless the document's canonical history is complete and settled. Materialized heads must equal
+accepted heads, and there must be no unapplied change row, no peer receipt holding an undecoded pending message,
+and no pending peer outbox row. It also refuses if the document advances between the read that prepares the rebuild
+and the transaction that installs it. Every refusal happens before any destructive statement runs.
+
+**Idempotency.** The workflow dedupes twice. `Workflow.execute` derives the execution identity from the replica
+incarnation, the document ID, and the operation ID, so a repeated request resolves to the same execution and
+replays its recorded result. Beneath that, the rewrite records the lineage it minted against
+`(replica_incarnation, operation_id)` in the same transaction that performs the rewrite. A crash between that commit
+and the journaling of the activity reply reruns the activity, and the marker makes the rerun return the first
+lineage instead of minting a second one. A **new** operation ID performs a **second** rewrite and mints a second
+lineage.
+
+**Four contract points that are easy to get wrong.**
+
+1. **An operation ID is not reusable across documents.** It is scoped to `(replica_incarnation, operation_id)` and
+   is bound to the first document it rewrote. Reusing one against a different document fails with `ReplicaError` /
+   `ProtocolMismatch` before any destructive work runs. Restore raises the incarnation, so a marker written before
+   a restore can never satisfy a lookup after it.
+2. **A rewritten document cannot be seeded to a brand new peer.** A peer that has never seen a document resolves
+   its lineage as genesis, because a document it does not hold has no history for a rewrite to have discarded. A
+   non genesis document therefore never matches. This is fail closed and deliberate. The alternative would be to
+   adopt a lineage from whichever side spoke first.
+3. **Peers are handled differently depending on what they advertise.** A peer that did not advertise
+   `lineageAware` is never sent a rewritten document at all. Generation fails locally for that one document and the
+   peer sees nothing, because a peer with no cross lineage check would union the rewritten document and push the
+   discarded history straight back. A peer that did advertise it, and that holds a superseded lineage, is refused
+   with a typed non retryable error scoped to that document. The session stays open and every other selected
+   document keeps synchronizing. The refused document is dropped from the flush loop and its further inbound
+   messages are discarded before they reach storage, so neither side spins.
+4. **Lineage is an unauthenticated peer assertion.** It is a field on the sync envelope, it is not covered by the
+   envelope's message digest, and nothing verifies that the peer is entitled to claim it. It is a correctness
+   signal against an honest but stale peer. It is not a security control. A refusal must never be read as proof
+   that the **local** document is stale. Confirm on this replica that a rewrite actually ran, through the workflow
+   result or the document's own lineage, before acting on a refusal.
+
+**Recovery for a refused peer replaces its obsolete canonical state.** Canonical archives carry lineage on every
+document and checkpoint record, and restore preserves it. To repair a refusal, export the authoritative replica after
+the rewrite and clone restore that archive onto the refused replica. Use replace restore only when the archive source
+replica has been retired, because replace adopts the source replica identity. Either mode discards the refused
+replica's old canonical state, including any unsynced change on the superseded lineage. Those changes have no causal
+relationship to the new root and cannot be merged safely. This destructive recovery requirement is the main reason
+history rewrite is opt in and operator driven rather than a background policy.
 
 ### 15. Write deterministic tests
 
@@ -1297,6 +1405,7 @@ Consistency guarantees:
 | Query                    | Reads local projection state under the replica operation gate                                                              |
 | Multi document invariant | Not transactional. Model one aggregate document or an explicit Workflow                                                    |
 | Peer convergence         | Replicas converge after receiving the same valid Automerge change set                                                      |
+| Cross lineage sync       | Refused, never merged. A rewritten document stops synchronizing with every peer that holds the superseded lineage          |
 | Restore                  | Exclusive, fenced, staged, schema checked, and projection rebuilding                                                       |
 | Atom invalidation        | Reactive cache refresh, not a durability acknowledgement                                                                   |
 | Presence                 | Expiring best effort state with no durability guarantee                                                                    |
@@ -1362,6 +1471,8 @@ Consistency guarantees:
 - Do not bind two SQL projections to the same physical table, skip binding migrations, or treat a SQLite index as a
   projection binding.
 - Do not reuse one command ID for different request bytes or domain intent.
+- Do not reuse one history rewrite operation ID across documents, and do not retry a rewrite under a new operation ID
+  expecting the first one to be undone. A new operation ID performs a second rewrite.
 - Do not use presence, Atom state, invalidation events, RPC client IDs, WebSocket headers, or transport connection state
   as authorization evidence.
 - Do not share one RPC handler Layer across tenants when the underlying SQL replica has no tenant column.
@@ -1407,6 +1518,11 @@ This beta deliberately provides building blocks rather than a complete collabora
 - One mutation targets one document. There is no replicated transaction across documents.
 - Whole document sync is the only sync granularity. Subtree sync is not implemented.
 - Store and forward capability is a transport declaration. The shipped direct and RPC transports report it as false.
+- Document lineage is an unauthenticated peer assertion. It is carried on the sync envelope, it is not covered by the
+  envelope's message digest, and no authorization check restricts what a peer may claim. It exists to stop an honest
+  but stale peer from silently resurrecting discarded history. It is not evidence about the peer and must not be used
+  as one. A refusal is not proof that the local document is stale. Confirm locally that a rewrite ran first. A
+  forged lineage costs the forger that one document in that one session and nothing else.
 - Conflict inspection, history browsing, sharing policy, and resolution UI belong to the application.
 - Presence is not durable awareness and must not carry authorization decisions.
 - Limits must be selected for the product. They bound backup bytes, archive records, JSON depth, sync messages,
@@ -1447,6 +1563,8 @@ Read [architecture](docs/architecture.md), [durability](docs/durability.md), [sy
 - A package owned WebSocket client, HTTP server, router, serializer, TLS layer, or process supervisor.
 - End to end encryption, key agreement, key recovery, or forward secrecy protocols.
 - Replicated transactions across documents, subtree synchronization, or in place document schema evolution.
+- Automatic, scheduled, or threshold triggered history truncation, and any path that lets a rewritten document
+  resume synchronizing with a peer that still holds the superseded lineage.
 - Remote durability confirmation. The current `durableConfirmation` API returns only `false`.
 - Protocol compatibility with versions other than `PeerRpc.protocolVersion`.
 - React APIs in the RPC package. React consumers continue to use `ReplicaAtom` over their local replica.
@@ -1504,25 +1622,25 @@ composition recipes.
 
 ### `@lucas-barake/effect-local`
 
-| Namespace           | Public API                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `Backup`            | `FormatVersion`, `Header`, `ExportOptions`, `RestoreOptions`, `ExportedDocument`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `Canonical`         | `stringify`, `hash`, `digest`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `CommandOutcome`    | `Rejected`, `DurablyCommittedLocal`, `OutcomeUnknown`, `CommandOutcomeUnknown`, `CommandOutcome`, `schema`, `rejected`, `durablyCommitted`, `unknown`, `match`, `committedOrFail`                                                                                                                                                                                                                                                                                                                                                                                  |
-| `Commit`            | `Heads`, `Commit` and their inferred types                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `Document`          | `WireSchema`, `AutomergeEncoded`, `DocumentSchema`, `Document`, `Any`, `make`, `isAutomergeValue`, `decode`, `encode`                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `DocumentSet`       | `DocumentSet`, `make`, `get`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `Identity`          | Schemas and types for `ReplicaId`, `ReplicaIncarnation`, `SessionId`, `DocumentId`, `CommandId`, `WriterGeneration`, `CommitSequence`, `PeerId`, and `ProjectionVersion`. `makeReplicaId`, `makeSessionId`, `makeDocumentId`, `makeCommandId`, `makePeerId`, `documentIdFromCommandId`                                                                                                                                                                                                                                                                             |
-| `Mutation`          | `DraftValue`, `Draft`, `SuccessResult`, `HandlerResult`, `HandlerOptions`, `Handler`, `HandlerService`, `Mutation`, `Any`, `make`; definitions expose `payloadSchema`, `successSchema`, `errorSchema`, `of`, and `toLayer`; `toLayer` accepts a handler or an Effect that builds one                                                                                                                                                                                                                                                                               |
-| `PeerTransport`     | `Capabilities`, `Connection`, `ConnectOptions`, `PeerTransport` service                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `Projection`        | `Projection`, `Any`, `make`, `assertUniqueKeys`, `evaluate`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `Query`             | `Handler`, `HandlerService`, `Query`, `Any`, `make`; definitions expose `payloadSchema`, `successSchema`, `errorSchema`, `of`, and `toLayer`; `toLayer` accepts a handler or an Effect that builds one                                                                                                                                                                                                                                                                                                                                                             |
-| `Replica`           | `Replica` service                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `ReplicaDefinition` | `ReplicaDefinition`, `Any`, `invalidationKeys`, `make`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `ReplicaError`      | Reason schemas `DocumentNotFound`, `DocumentDecodeError`, `DocumentEncodeError`, `UnsupportedDocumentVersion`, `ProjectionBlocked`, `CommandIdConflict`, `ReceiptOperationMismatch`, `StorageUnavailable`, `StorageCorrupt`, `QuotaExceeded`, `MigrationFailed`, `BackupInvalid`, `BackupTooLarge`, `RestoreBusy`, `RestoreFailed`, `ProtocolMismatch`, `ReplicaFenced`, `OperationTimeout`, `UnsupportedStorageFormatVersion`, `CheckpointSuperseded`. Causal reasons use `Schema.Defect()` for transportable arbitrary failures. `Reason`, tagged `ReplicaError` |
-| `ReplicaLimits`     | `Values`, `minimumRestoreErrorBytes`, `ReplicaLimits` service, `make`, `layer`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `ReplicaStatus`     | `Starting`, `Ready`, `ReadOnly`, `Degraded`, `ProjectionBlocked`, `Restoring`, `Failed`, `ReplicaStatus` schemas and types                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `Snapshot`          | `ProjectionState`, `Snapshot`, `FromDocument`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Namespace           | Public API                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Backup`            | `FormatVersion`, `Header`, `ExportOptions`, `RestoreOptions`, `ExportedDocument`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `Canonical`         | `stringify`, `hash`, `digest`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `CommandOutcome`    | `Rejected`, `DurablyCommittedLocal`, `OutcomeUnknown`, `CommandOutcomeUnknown`, `CommandOutcome`, `schema`, `rejected`, `durablyCommitted`, `unknown`, `match`, `committedOrFail`                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `Commit`            | `Heads`, `Commit` and their inferred types                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `Document`          | `WireSchema`, `AutomergeEncoded`, `DocumentSchema`, `Document`, `Any`, `make`, `isAutomergeValue`, `decode`, `encode`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `DocumentSet`       | `DocumentSet`, `make`, `get`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `Identity`          | Schemas and types for `ReplicaId`, `ReplicaIncarnation`, `SessionId`, `DocumentId`, `CommandId`, `WriterGeneration`, `CommitSequence`, `PeerId`, `ProjectionVersion`, and `DocumentLineage`. `genesisLineage`, `makeReplicaId`, `makeSessionId`, `makeDocumentId`, `makeCommandId`, `makePeerId`, `makeDocumentLineage`, `documentIdFromCommandId`                                                                                                                                                                                                                                                                   |
+| `Mutation`          | `DraftValue`, `Draft`, `SuccessResult`, `HandlerResult`, `HandlerOptions`, `Handler`, `HandlerService`, `Mutation`, `Any`, `make`; definitions expose `payloadSchema`, `successSchema`, `errorSchema`, `of`, and `toLayer`; `toLayer` accepts a handler or an Effect that builds one                                                                                                                                                                                                                                                                                                                                 |
+| `PeerTransport`     | `Capabilities`, `Connection`, `ConnectOptions`, `PeerTransport` service                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `Projection`        | `Projection`, `Any`, `make`, `assertUniqueKeys`, `evaluate`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `Query`             | `Handler`, `HandlerService`, `Query`, `Any`, `make`; definitions expose `payloadSchema`, `successSchema`, `errorSchema`, `of`, and `toLayer`; `toLayer` accepts a handler or an Effect that builds one                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `Replica`           | `Replica` service                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `ReplicaDefinition` | `ReplicaDefinition`, `Any`, `invalidationKeys`, `make`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `ReplicaError`      | Reason schemas `DocumentNotFound`, `DocumentDecodeError`, `DocumentEncodeError`, `UnsupportedDocumentVersion`, `ProjectionBlocked`, `CommandIdConflict`, `ReceiptOperationMismatch`, `StorageUnavailable`, `CanonicalEncodeError`, `StorageCorrupt`, `QuotaExceeded`, `MigrationFailed`, `BackupInvalid`, `BackupTooLarge`, `RestoreBusy`, `RestoreFailed`, `ProtocolMismatch`, `ReplicaFenced`, `OperationTimeout`, `UnsupportedStorageFormatVersion`, `CheckpointSuperseded`, `DocumentLineageChanged`. Causal reasons use `Schema.Defect()` for transportable arbitrary failures. `Reason`, tagged `ReplicaError` |
+| `ReplicaLimits`     | `Values`, `minimumRestoreErrorBytes`, `ReplicaLimits` service, `make`, `layer`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `ReplicaStatus`     | `Starting`, `Ready`, `ReadOnly`, `Degraded`, `ProjectionBlocked`, `Restoring`, `Failed`, `ReplicaStatus` schemas and types                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `Snapshot`          | `ProjectionState`, `Snapshot`, `FromDocument`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 
 `Replica.Replica` is the application capability. Its methods are `create`, `get`, `mutate`, `delete`, `query`,
 `lookupMutation`, `lookupCreate`, `lookupDelete`, `flush`, `status`, `exportBackup`, `restoreBackup`,
@@ -1550,27 +1668,32 @@ Core data shapes:
 
 `ReplicaError` is `{ _tag: "ReplicaError", reason }`. Exhaustive reason payloads:
 
-| Reason tag                                                               | Fields after `_tag`                                 |
-| ------------------------------------------------------------------------ | --------------------------------------------------- |
-| `DocumentNotFound`                                                       | `documentId`                                        |
-| `DocumentDecodeError`, `DocumentEncodeError`                             | `documentId`, `cause`                               |
-| `UnsupportedDocumentVersion`                                             | `documentId`, `observedVersion`, `supportedVersion` |
-| `ProjectionBlocked`                                                      | `projection`, `cause`                               |
-| `CommandIdConflict`                                                      | `commandId`                                         |
-| `ReceiptOperationMismatch`                                               | `commandId`, `expected`, `observed`                 |
-| `StorageUnavailable`, `StorageCorrupt`, `BackupInvalid`, `RestoreFailed` | `cause`                                             |
-| `QuotaExceeded`                                                          | `resource`, `limit`                                 |
-| `MigrationFailed`                                                        | `migration`, `cause`                                |
-| `BackupTooLarge`                                                         | `limit`, `observed`                                 |
-| `RestoreBusy`                                                            | `replica`                                           |
-| `ProtocolMismatch`                                                       | `expected`, `observed`                              |
-| `ReplicaFenced`                                                          | `expectedGeneration`, `observedGeneration`          |
-| `OperationTimeout`                                                       | `operation`, `timeoutMillis`                        |
-| `UnsupportedStorageFormatVersion`                                        | `observedVersion`, `supportedVersion`               |
-| `CheckpointSuperseded`                                                   | `documentIds`, `attempts`                           |
+| Reason tag                                                                                       | Fields after `_tag`                                 |
+| ------------------------------------------------------------------------------------------------ | --------------------------------------------------- |
+| `DocumentNotFound`                                                                               | `documentId`                                        |
+| `DocumentDecodeError`, `DocumentEncodeError`                                                     | `documentId`, `cause`                               |
+| `UnsupportedDocumentVersion`                                                                     | `documentId`, `observedVersion`, `supportedVersion` |
+| `ProjectionBlocked`                                                                              | `projection`, `cause`                               |
+| `CommandIdConflict`                                                                              | `commandId`                                         |
+| `ReceiptOperationMismatch`                                                                       | `commandId`, `expected`, `observed`                 |
+| `StorageUnavailable`, `CanonicalEncodeError`, `StorageCorrupt`, `BackupInvalid`, `RestoreFailed` | `cause`                                             |
+| `QuotaExceeded`                                                                                  | `resource`, `limit`                                 |
+| `MigrationFailed`                                                                                | `migration`, `cause`                                |
+| `BackupTooLarge`                                                                                 | `limit`, `observed`                                 |
+| `RestoreBusy`                                                                                    | `replica`                                           |
+| `ProtocolMismatch`                                                                               | `expected`, `observed`                              |
+| `ReplicaFenced`                                                                                  | `expectedGeneration`, `observedGeneration`          |
+| `OperationTimeout`                                                                               | `operation`, `timeoutMillis`                        |
+| `UnsupportedStorageFormatVersion`                                                                | `observedVersion`, `supportedVersion`               |
+| `CheckpointSuperseded`                                                                           | `documentIds`, `attempts`                           |
+| `DocumentLineageChanged`                                                                         | `documentId`, `localLineage`, `remoteLineage`       |
 
 `CheckpointSuperseded` carries every document whose checkpoint publication lost the install race, and `attempts` is
 the number of publish attempts made **per document**, not a total across them.
+
+`DocumentLineageChanged` reports that this replica and a peer disagree about which causal root a document has. Both
+lineage fields are `Identity.DocumentLineage`, so the genesis value reads as the empty string. On the send side the
+peer reported nothing, and `remoteLineage` is that genesis value rather than anything the peer claimed.
 
 Fields named `cause` use `Schema.Defect()` and can cross the local serialization boundary. The external peer RPC does
 not expose them. It maps unexpected defects to its fixed `InternalError` sentinel.
@@ -1593,43 +1716,44 @@ descriptor does not install its handler.
 
 ### `@lucas-barake/effect-local-sql`
 
-| Namespace          | Public API                                                                                                                                                     |
-| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BackupStore`      | `BackupStore` service, `layer`                                                                                                                                 |
-| `CommandExecutor`  | `createRequestHash`, `mutationRequestHash`, `deleteRequestHash`, `CommandExecutor` service, `MutationHandlers`, `layer`                                        |
-| `CommitPublisher`  | `CommitEvent`, `CommitSubscription`, `CommitPublisher` service, `layer`                                                                                        |
-| `Compaction`       | `PreparedCheckpoint`, `CompactResult`, `Compaction` service, `layer`                                                                                           |
-| `DocumentEntity`   | Cluster RPC definitions `Create`, `Mutate`, `Delete`, `ApplySync`, plus `ApplySyncResult`, `DocumentEntity`, `layer`                                           |
-| `DocumentStore`    | `Stored`, `DocumentStore` service, `layer`                                                                                                                     |
-| `DurableRuntime`   | `layer`, `layerWith`                                                                                                                                           |
-| `EntityReplica`    | `layer`                                                                                                                                                        |
-| `Migrations`       | `canonicalStoreChecksum`, `peerSyncChecksum`, `durabilityIndexesChecksum`, `projectionReadinessChecksum`, `loader`, `run`, `layer`                             |
-| `PeerSession`      | `SelectedDocument`, `PeerSession`, `SupervisedPeerSession`, `SyncEnvelope`, `maximumSyncEnvelopeBytes`, `makeTestClient`, `makeSupervised`, `make`, `makeLive` |
-| `PeerSync`         | `Session`, `Outbound`, `Reply`, `Generated`, `Received`, `PeerSync` service, `layer`                                                                           |
-| `ProjectionStore`  | `ProjectionStore` service, `BindingServices`, `layer`                                                                                                          |
-| `QueryExecutor`    | `QueryExecutor` service, `QueryHandlers`, `layer`                                                                                                              |
-| `Recovery`         | `RawRecoveryExport`, `Recovery` service, `make`, `layer`                                                                                                       |
-| `ReplicaBootstrap` | `State`, `ReplicaBootstrap` service, `make`, `layer`                                                                                                           |
-| `ReplicaGate`      | `Permit`, `ReplicaGate` service, `layer`                                                                                                                       |
-| `ReplicaWorkflow`  | `OperationId`, `CompactReplica`, `Execution`, `CompactionWorkflow`, `layerRegistration`, `layerRuntime`                                                        |
-| `SqlProjection`    | `Migration`, `SqlProjection`, `BindingService`, `make`, `Any`                                                                                                  |
-| `SqlReplica`       | `layerFromServices`, `layer`, `layerWithBindings`                                                                                                              |
+| Namespace          | Public API                                                                                                                                                                                                                                                                                      |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BackupStore`      | `BackupStore` service, `layer`                                                                                                                                                                                                                                                                  |
+| `CommandExecutor`  | `createRequestHash`, `mutationRequestHash`, `deleteRequestHash`, `CommandExecutor` service, `MutationHandlers`, `layer`                                                                                                                                                                         |
+| `CommitPublisher`  | `CommitEvent`, `CommitSubscription`, `CommitPublisher` service, `layer`                                                                                                                                                                                                                         |
+| `Compaction`       | `OperationId`, `PreparedCheckpoint`, `CompactResult`, `Compaction` service, `layer`                                                                                                                                                                                                             |
+| `DocumentEntity`   | Cluster RPC definitions `Create`, `Mutate`, `Delete`, `ApplySync`, plus `ApplySyncResult`, `DocumentEntity`, `layer`                                                                                                                                                                            |
+| `DocumentStore`    | `Stored`, `DocumentStore` service, `layer`                                                                                                                                                                                                                                                      |
+| `DurableRuntime`   | `layer`, `layerWith`                                                                                                                                                                                                                                                                            |
+| `EntityReplica`    | `layer`                                                                                                                                                                                                                                                                                         |
+| `Migrations`       | `canonicalStoreChecksum`, `peerSyncChecksum`, `durabilityIndexesChecksum`, `projectionReadinessChecksum`, `pendingReceiptIndexesChecksum`, `peerWriterProvenanceChecksum`, `replicaHealthIndexesChecksum`, `documentLineageChecksum`, `historyRewriteMarkersChecksum`, `loader`, `run`, `layer` |
+| `PeerSession`      | `SelectedDocument`, `PeerSession`, `SupervisedPeerSession`, `SyncEnvelope`, `maximumSyncEnvelopeBytes`, `makeTestClient`, `makeSupervised`, `make`, `makeLive`                                                                                                                                  |
+| `PeerSync`         | `Session`, `Outbound`, `Reply`, `Generated`, `Received`, `PeerSync` service, `layer`                                                                                                                                                                                                            |
+| `ProjectionStore`  | `ProjectionStore` service, `BindingServices`, `layer`                                                                                                                                                                                                                                           |
+| `QueryExecutor`    | `QueryExecutor` service, `QueryHandlers`, `layer`                                                                                                                                                                                                                                               |
+| `Recovery`         | `RawRecoveryExport`, `Recovery` service, `make`, `layer`                                                                                                                                                                                                                                        |
+| `ReplicaBootstrap` | `State`, `ReplicaBootstrap` service, `make`, `layer`                                                                                                                                                                                                                                            |
+| `ReplicaGate`      | `Permit`, `ReplicaGate` service, `layer`                                                                                                                                                                                                                                                        |
+| `ReplicaWorkflow`  | `OperationId` re-exported from `Compaction`, `CompactReplica`, `RewriteDocumentHistory`, `Execution`, `DocumentExecution`, `CompactionWorkflow`, `HistoryRewriteWorkflow`, `layerRegistration`, `layerRuntime`, `layerHistoryRewriteRegistration`, `layerHistoryRewriteRuntime`                 |
+| `SqlProjection`    | `Migration`, `SqlProjection`, `BindingService`, `make`, `Any`                                                                                                                                                                                                                                   |
+| `SqlReplica`       | `layerFromServices`, `layer`, `layerWithBindings`                                                                                                                                                                                                                                               |
 
 Public SQL service methods:
 
-| Service              | Methods and effects                                                                                                                                                                                                         |
-| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BackupStore`        | `export(ExportOptions)` returns a byte Stream. `restore(RestoreOptions)` consumes its source environment                                                                                                                    |
-| `CommandExecutor`    | `create`, `mutate`, `delete`, `lookupCreate`, `lookupMutation`, `lookupDelete`                                                                                                                                              |
-| `CommitPublisher`    | `publishPending`, `invalidate(keys)`, scoped `subscribe`                                                                                                                                                                    |
-| `Compaction`         | `prepare(document, documentId)`, `publish(checkpoint)`, `compact(document, documentId)`, `prune(documentId)`, `pruneCommandReceipts`                                                                                        |
-| `DocumentStore`      | `create`, `load`, `stage`, `tombstone`, `persist`; callers own the native document returned by `load`                                                                                                                       |
-| `PeerSync`           | `open(peerId)`, `reset(session)`, `generate(document, documentId, session)`, `receive(document, documentId, session, input)`, `enqueue(session, reply)`, `pending(session)`, `markSent(session, sendSequence, messageHash)` |
-| `ProjectionStore`    | `clear`, `replace(binding, snapshot, destinationTable)`, `replaceDocument(document, snapshot, commitSequence)`                                                                                                              |
-| `QueryExecutor`      | `execute(query, payload)` and reactive `reactive(query, payload)`                                                                                                                                                           |
-| `Recovery`           | `recover(document, documentId)`, `recoverWithPermit(document, documentId, permit)`, `exportRaw(documentId)`                                                                                                                 |
-| `ReplicaGate`        | `current`, scoped `shared`, bounded scoped `admit`, exclusive `claim(use)`, `refresh`, `validate(expectedPermit)`                                                                                                           |
-| `CompactionWorkflow` | `execute(operationId)`, `poll(execution)`, `interrupt(execution)`, `resume(execution)`                                                                                                                                      |
+| Service                  | Methods and effects                                                                                                                                                                                                                                                 |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BackupStore`            | `export(ExportOptions)` returns a byte Stream. `restore(RestoreOptions)` consumes its source environment                                                                                                                                                            |
+| `CommandExecutor`        | `create`, `mutate`, `delete`, `lookupCreate`, `lookupMutation`, `lookupDelete`                                                                                                                                                                                      |
+| `CommitPublisher`        | `publishPending`, `invalidate(keys)`, scoped `subscribe`                                                                                                                                                                                                            |
+| `Compaction`             | `prepare(document, documentId)`, `publish(checkpoint)`, `compact(document, documentId)`, `prune(documentId)`, `pruneCommandReceipts`, `rewriteHistory(document, documentId, operationId)`                                                                           |
+| `DocumentStore`          | `create`, `load`, `stage`, `tombstone`, `persist`; callers own the native document returned by `load`                                                                                                                                                               |
+| `PeerSync`               | `open(peerId)`, `reset(session)`, `generate(document, documentId, session, peer)`, `receive(document, documentId, session, input)`, `enqueue(session, reply)`, `pending(session)`, `markSent(session, sendSequence, messageHash)`, `invalidateDocument(documentId)` |
+| `ProjectionStore`        | `clear`, `replace(binding, snapshot, destinationTable)`, `replaceDocument(document, snapshot, commitSequence)`                                                                                                                                                      |
+| `QueryExecutor`          | `execute(query, payload)` and reactive `reactive(query, payload)`                                                                                                                                                                                                   |
+| `Recovery`               | `recover(document, documentId)`, `recoverWithPermit(document, documentId, permit)`, `exportRaw(documentId)`                                                                                                                                                         |
+| `ReplicaGate`            | `current`, scoped `shared`, bounded scoped `admit`, exclusive `claim(use)`, `refresh`, `validate(expectedPermit)`                                                                                                                                                   |
+| `CompactionWorkflow`     | `execute(operationId)`, `poll(execution)`, `interrupt(execution)`, `resume(execution)`                                                                                                                                                                              |
+| `HistoryRewriteWorkflow` | `execute(documentId, operationId)`, `poll(execution)`, `interrupt(execution)`, `resume(execution)`. Handles are `DocumentExecution`, which adds `documentId` to `Execution`                                                                                         |
 
 `DocumentEntity` is the durable Cluster protocol beneath `Replica`. All four procedures fail with `ReplicaError`, are
 persisted, and run with the configured SQL transaction annotation. `Create`, `Mutate`, and `Delete` are client
@@ -1660,8 +1784,8 @@ SQL composition contracts:
 | `DurableRuntime`                     | Builds Cluster and Workflow over the same SQL storage. `layerWith` accepts additional Workflow registrations                                                                                                                                                                                                                                                                                                                                                                               |
 | `EntityReplica`                      | Adapts durable Cluster commands, stores, queries, backup, status, and commit publication to core `Replica`                                                                                                                                                                                                                                                                                                                                                                                 |
 | `BackupStore`                        | Streams and restores definition bound archives. Export is a snapshot. Restore validates envelope, checksum, bounds, definition, foreign keys, recovery, and projections before installation                                                                                                                                                                                                                                                                                                |
-| `Compaction` and `Recovery`          | Compaction publishes only verified checkpoints and prunes changes only with retained safety evidence. It also reclaims command receipts from superseded incarnations, which no current permit can read. Recovery validates checkpoints, changes, heads, and tombstones                                                                                                                                                                                                                     |
-| `ReplicaWorkflow`                    | Registers and executes the scoped compaction Workflow. Workflow durability does not make peer or backup transport durable                                                                                                                                                                                                                                                                                                                                                                  |
+| `Compaction` and `Recovery`          | Compaction publishes only verified checkpoints and prunes changes only with retained safety evidence. It also reclaims command receipts from superseded incarnations, which no current permit can read. Recovery validates checkpoints, changes, heads, and tombstones. `Compaction.rewriteHistory` is the one destructive member. It is reached through `ReplicaWorkflow.HistoryRewriteWorkflow`, which is the only composition that owns the required permit for it                      |
+| `ReplicaWorkflow`                    | Registers and executes the scoped compaction and history rewrite Workflows. Workflow durability does not make peer or backup transport durable                                                                                                                                                                                                                                                                                                                                             |
 
 `PeerSession.PeerSession` exposes `peerId`, `connectionEpoch`, `markDirty`, `flush`, `observedByPeer`, and
 `durableConfirmation`. `SupervisedPeerSession` adds `awaitDisconnect`. `make` owns transport and receive lifetime.
@@ -1670,8 +1794,19 @@ SQL composition contracts:
 flush loop. The neutral import is `@lucas-barake/effect-local-sql/PeerSession`; the browser path is a compatibility
 reexport.
 
+`SyncEnvelope` carries an optional `lineage`. It is optional so an envelope from a peer built before lineage still
+decodes, and an absent key becomes the genesis lineage at the single point the envelope enters the session. The
+outbound value comes from the queued outbox row rather than from the document, so a rewrite between generation and
+send never relabels an already generated message. A session that refuses one document for a lineage change records
+that document and keeps serving every other selected document. The record lives for one session, so a reconnect
+reevaluates.
+
 `PeerSync.PeerSync` is the lower level durable protocol service. Its methods are `open`, `reset`, `generate`,
-`receive`, `enqueue`, `pending`, and `markSent`. `Session` binds peer, connection epoch, and replica incarnation.
+`receive`, `enqueue`, `pending`, `markSent`, and `invalidateDocument`. `generate` takes an explicit already
+normalized `{ lineageAware }` for the connected peer, so every caller decides that fact rather than defaulting to
+it. `invalidateDocument` drops the in memory Automerge sync state every live session holds for one document, which
+is what a history rewrite needs because nothing else evicts a state after the change graph is replaced.
+`Session` binds peer, connection epoch, and replica incarnation.
 `Outbound`, `Reply`, `Generated`, and `Received` expose durable protocol evidence. Most applications must not call this
 service directly because `PeerSession` owns sequencing, whole document allowlists, lifecycle, and transport cleanup.
 
@@ -1770,29 +1905,32 @@ planning:
 
 ### `@lucas-barake/effect-local-rpc`
 
-| Namespace            | Public API                                                                                                                                                                                                                                                                                            |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PeerAuthentication` | `PeerPrincipal` schema and type, request service `AuthenticatedPeer`, required RPC middleware `PeerAuthentication`, argument free `layerServer`, argument free `layerClient`                                                                                                                          |
-| `PeerAuthenticator`  | `PeerAuthenticator` service. `authenticate(Redacted<string>)` returns principal, finite `validUntil`, and `invalidated`, or `AuthenticationFailure`                                                                                                                                                   |
-| `PeerAuthorization`  | `PeerAuthorization` service and validating constructor `layer`. `authorize` returns exactly resolved `SelectedDocument` values, finite `validUntil`, and `invalidated`, or `AccessDenied` or `ServerUnavailable`                                                                                      |
-| `PeerCredentials`    | `PeerCredentials` service. `get` is an Effect that returns a rotating `Redacted<string>` or `AuthenticationFailure`                                                                                                                                                                                   |
-| `PeerRpc`            | `protocolVersion`, `DefinitionHash`, `RequestedDocument`, `Opened`, `Message`, `OpenEvent`, `OpenRpc`, `PushRpc`, `Rpcs`, generated `RpcClient`, `makeRpcClient`                                                                                                                                      |
-| `PeerRpcError`       | `AuthenticationFailure`, `AccessDenied`, `UnsupportedVersion`, `PeerMismatch`, `DefinitionMismatch`, `InvalidRequest`, `RequestLimitExceeded`, `RequestCapacityExceeded`, `SessionUnavailable`, `SessionOverloaded`, `ServerUnavailable`, union schema and type `PeerRpcError`, fixed `Defect` schema |
-| `PeerRpcLimits`      | `Values` schema and type, `defaults`, `InvalidPeerRpcLimits`, `PeerRpcLimits` service, `make`, `layer`, `layerDefaults`                                                                                                                                                                               |
-| `PeerRpcServer`      | `layerHandlers({ tenantId, peerId, definition })`                                                                                                                                                                                                                                                     |
-| `RpcPeerTransport`   | `isRetryable`, advanced `layer(client, { documents, definition })`, preferred `makeSession(client, { peerId, documents, definition })`                                                                                                                                                                |
+| Namespace            | Public API                                                                                                                                                                                                                                                                                                                      |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PeerAuthentication` | `PeerPrincipal` schema and type, request service `AuthenticatedPeer`, required RPC middleware `PeerAuthentication`, argument free `layerServer`, argument free `layerClient`                                                                                                                                                    |
+| `PeerAuthenticator`  | `PeerAuthenticator` service. `authenticate(Redacted<string>)` returns principal, finite `validUntil`, and `invalidated`, or `AuthenticationFailure`                                                                                                                                                                             |
+| `PeerAuthorization`  | `PeerAuthorization` service and validating constructor `layer`. `authorize` returns exactly resolved `SelectedDocument` values, finite `validUntil`, and `invalidated`, or `AccessDenied` or `ServerUnavailable`                                                                                                                |
+| `PeerCredentials`    | `PeerCredentials` service. `get` is an Effect that returns a rotating `Redacted<string>` or `AuthenticationFailure`                                                                                                                                                                                                             |
+| `PeerRpc`            | `protocolVersion`, `DefinitionHash`, `RequestedDocument`, `Opened`, `Message`, `OpenEvent`, `OpenRpc`, `PushRpc`, `Rpcs`, generated `RpcClient`, `makeRpcClient`                                                                                                                                                                |
+| `PeerRpcError`       | `AuthenticationFailure`, `AccessDenied`, `UnsupportedVersion`, `PeerMismatch`, `DefinitionMismatch`, `InvalidRequest`, `RequestLimitExceeded`, `RequestCapacityExceeded`, `SessionUnavailable`, `SessionOverloaded`, `ServerUnavailable`, `DocumentLineageChanged`, union schema and type `PeerRpcError`, fixed `Defect` schema |
+| `PeerRpcLimits`      | `Values` schema and type, `defaults`, `InvalidPeerRpcLimits`, `PeerRpcLimits` service, `make`, `layer`, `layerDefaults`                                                                                                                                                                                                         |
+| `PeerRpcServer`      | `layerHandlers({ tenantId, peerId, definition })`                                                                                                                                                                                                                                                                               |
+| `RpcPeerTransport`   | `isRetryable`, advanced `layer(client, { documents, definition })`, preferred `makeSession(client, { peerId, documents, definition })`                                                                                                                                                                                          |
 
 #### RPC procedure contract
 
-| Procedure | Request                                                                                                              | Success                                                               | Typed errors         | Lifecycle                                                                                                                                                                                                     |
-| --------- | -------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Open`    | `protocolVersion`, `expectedPeerId`, `definitionHash`, unique requested whole documents, middleware owned credential | Stream beginning with one `Opened`, followed only by `Message` events | Every `PeerRpcError` | Stream interruption is connection close. One active incarnation exists per authenticated peer                                                                                                                 |
-| `Push`    | Current `sessionId`, bounded byte payload, middleware owned credential                                               | `void` after bounded in memory admission                              | Every `PeerRpcError` | Authenticated identity, current authorized session, ownership, lease, and limits are checked. Inbound overflow or any outbound capacity timeout revokes the session and fails `Open` with `SessionOverloaded` |
+| Procedure | Request                                                                                                                                              | Success                                                               | Typed errors         | Lifecycle                                                                                                                                                                                                     |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Open`    | `protocolVersion`, `expectedPeerId`, `definitionHash`, unique requested whole documents, optional client `capabilities`, middleware owned credential | Stream beginning with one `Opened`, followed only by `Message` events | Every `PeerRpcError` | Stream interruption is connection close. One active incarnation exists per authenticated peer                                                                                                                 |
+| `Push`    | Current `sessionId`, bounded byte payload, middleware owned credential                                                                               | `void` after bounded in memory admission                              | Every `PeerRpcError` | Authenticated identity, current authorized session, ownership, lease, and limits are checked. Inbound overflow or any outbound capacity timeout revokes the session and fails `Open` with `SessionOverloaded` |
 
 Protocol version `2` requires a canonical `definitionHash` in the `def_` plus 16 lowercase hexadecimal format. Version
 `1` requests remain decodable only so the server can reject them with `UnsupportedVersion`. `Opened` contains the
-negotiated version, new `SessionId`, server `PeerId`, and
-`capabilities: { storeAndForward: false }`. `Message` contains one `Uint8Array`. `OpenRpc` and `PushRpc` both carry the
+negotiated version, new `SessionId`, server `PeerId`, and `capabilities`. Server `capabilities` are
+`{ storeAndForward: false, lineageAware: true }`. `lineageAware` is an optional key on the schema, so an `Opened` frame
+from a build that predates it still decodes and reads as not lineage aware. The `Open` request carries the mirrored
+optional client `capabilities: { lineageAware }`, which is how the server learns the same fact about the caller.
+`Message` contains one `Uint8Array`. `OpenRpc` and `PushRpc` both carry the
 required `PeerAuthentication` middleware. `makeRpcClient` requires `RpcClient.Protocol`, client authentication
 middleware, and `Scope`. It deliberately does not return a package owned connection service.
 
@@ -1810,9 +1948,12 @@ RPC environment requirements:
 | `RpcPeerTransport.makeSession`                 | `Scope`, `CommitPublisher`, `Crypto`, `PeerSync`, `ReplicaGate`, core `ReplicaLimits`, `Sharding`; the adapter supplies `PeerTransport`                                 |
 
 `PeerPrincipal` is `{ tenantId, subjectId, peerId }`. `RequestedDocument` is `{ documentType, documentId }`. Every
-`PeerRpcError` class is a fieldless tagged error. `InvalidPeerRpcLimits` is separate from the wire error union and
-carries `field` for relational configuration failures. Middleware supplies the redacted `credential` field on every
-request. Callers must not treat a payload supplied credential as authoritative because `layerClient` overwrites it.
+`PeerRpcError` class is a fieldless tagged error, including `DocumentLineageChanged`. A peer therefore learns that
+its view of a document lineage is stale, never which document and never the lineage values, because reflecting
+those back would attach document identity to the RPC boundary. `InvalidPeerRpcLimits` is separate from the wire
+error union and carries `field` for relational configuration failures. Middleware supplies the redacted
+`credential` field on every request. Callers must not treat a payload supplied credential as authoritative because
+`layerClient` overwrites it.
 
 #### RPC limits contract
 

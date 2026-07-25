@@ -379,6 +379,61 @@ describe("BackupStore", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(CompactedLive)))
 
+  /**
+   * The archive lines of a completed export, parsed. Every lineage assertion below reads the
+   * archive itself rather than the database it came from: the documented remedy for a peer refused
+   * on a lineage mismatch is to carry an archive to that peer, so a value the archive does not
+   * contain is a value the remedy cannot deliver.
+   */
+  const archiveLinesOf = (chunks: ReadonlyArray<Uint8Array>) =>
+    new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n").map((line) => JSON.parse(line))
+
+  it.effect("preserves a rewritten document's lineage across export and restore", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "rewritten" })
+      InternalAutomerge.free(created.automerge)
+      const lineage = yield* compaction.rewriteHistory(
+        Task,
+        documentId,
+        Compaction.OperationId.make("rewrite-history")
+      )
+      assert.notStrictEqual(lineage, Identity.genesisLineage)
+
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      const lines = archiveLinesOf(chunks)
+      assert.strictEqual(lines.find((line) => line.kind === "Document").value.lineage, lineage)
+      assert.strictEqual(lines.find((line) => line.kind === "Checkpoint").value.lineage, lineage)
+
+      // `replace` deletes every canonical row before it inserts, so nothing that survives below was
+      // carried over from local state: it all came out of the archive.
+      yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.fromIterable(chunks),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      })
+
+      assert.deepStrictEqual(
+        yield* sql<{ readonly lineage: string }>`
+          SELECT lineage FROM effect_local_documents WHERE document_id = ${documentId}`,
+        [{ lineage: lineage as string }]
+      )
+      assert.deepStrictEqual(
+        yield* sql<{ readonly lineage: string }>`
+          SELECT lineage FROM effect_local_checkpoints WHERE document_id = ${documentId}`,
+        [{ lineage: lineage as string }]
+      )
+      const restored = yield* store.load(Task, documentId)
+      assert.strictEqual(restored.snapshot.value.title, "rewritten")
+      InternalAutomerge.free(restored.automerge)
+    }).pipe(Effect.provide(CompactedLive)))
+
   it.effect("rejects checkpoint and change provenance conflicts during restore", () =>
     Effect.gen(function*() {
       const backups = yield* BackupStore.BackupStore
@@ -654,6 +709,67 @@ describe("BackupStore", () => {
       const erased = yield* Effect.flip(store.load(Task, interveningId))
       assert.strictEqual(erased.reason._tag, "DocumentNotFound")
     }).pipe(Effect.provide(Live)))
+
+  it.effect("keeps rewrite idempotency reachable after retrying one backup installation", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "archived" })
+      InternalAutomerge.free(created.automerge)
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      const installationId = yield* Identity.makeBackupInstallationId
+      const restore = backups.restore({
+        installationId,
+        source: Stream.fromIterable(chunks),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      })
+
+      yield* restore
+      const operationId = Compaction.OperationId.make("rewrite-after-restore")
+      const firstLineage = yield* compaction.rewriteHistory(Task, documentId, operationId)
+      const permitBeforeRetry = yield* gate.current
+      const checkpointBeforeRetry = yield* sql<{
+        readonly bytes: Uint8Array
+        readonly checkpoint_hash: string
+        readonly commit_sequence: number
+        readonly lineage: string
+      }>`SELECT bytes, checkpoint_hash, commit_sequence, lineage
+        FROM effect_local_checkpoints WHERE document_id = ${documentId}`
+
+      yield* restore
+      const permitAfterRetry = yield* gate.current
+      const replayed = yield* compaction.rewriteHistory(Task, documentId, operationId)
+      const checkpointAfterReplay = yield* sql<{
+        readonly bytes: Uint8Array
+        readonly checkpoint_hash: string
+        readonly commit_sequence: number
+        readonly lineage: string
+      }>`SELECT bytes, checkpoint_hash, commit_sequence, lineage
+        FROM effect_local_checkpoints WHERE document_id = ${documentId}`
+      const markers = yield* sql<{
+        readonly document_id: string
+        readonly lineage: string
+        readonly operation_id: string
+        readonly replica_incarnation: number
+      }>`SELECT replica_incarnation, operation_id, document_id, lineage
+        FROM effect_local_history_rewrites ORDER BY replica_incarnation`
+
+      assert.deepStrictEqual(markers, [{
+        replica_incarnation: permitBeforeRetry.incarnation as number,
+        operation_id: operationId as string,
+        document_id: documentId as string,
+        lineage: firstLineage as string
+      }])
+      assert.deepStrictEqual(permitAfterRetry, permitBeforeRetry)
+      assert.strictEqual(replayed, firstLineage)
+      assert.deepStrictEqual(checkpointAfterReplay, checkpointBeforeRetry)
+    }).pipe(Effect.provide(CompactedLive)))
 
   it.effect("rejects an installation id reused for a different restore request", () =>
     Effect.gen(function*() {

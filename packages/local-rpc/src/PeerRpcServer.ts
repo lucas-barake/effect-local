@@ -41,6 +41,15 @@ interface Entry {
   readonly subjectId: string
   readonly peerId: Identity.PeerId
   readonly sessionId: Identity.SessionId
+  /**
+   * What the client advertised on its own `Open`, never anything inferred from the protocol version.
+   *
+   * `PeerRpc.protocolVersion` was not bumped when lineage was added, so a client running an older
+   * build passes the version check and would be inferred lineage aware. It would then be sent a
+   * rewritten document, union it, and reply with the history the rewrite discarded. Absent means
+   * not lineage aware.
+   */
+  readonly lineageAware: boolean
   readonly validUntil: number
   readonly scope: Scope.Closeable
   readonly inbound: Queue.Queue<InboundItem, ReplicaError.ReplicaError | Cause.Done>
@@ -119,10 +128,16 @@ const sessionFailure = (cause: Cause.Cause<ReplicaError.ReplicaError>) =>
   Cause.findErrorOption(cause).pipe(
     Option.match({
       onNone: () => new PeerRpcError.ServerUnavailable(),
-      onSome: (error) =>
-        error.reason._tag === "StorageUnavailable" && Cause.isTimeoutError(error.reason.cause)
+      onSome: (error) => {
+        // A rewritten document lineage is a peer visible protocol outcome, not a server fault, and
+        // the peer must be able to stop retrying against a history it can no longer reach.
+        if (error.reason._tag === "DocumentLineageChanged") {
+          return new PeerRpcError.DocumentLineageChanged()
+        }
+        return error.reason._tag === "StorageUnavailable" && Cause.isTimeoutError(error.reason.cause)
           ? new PeerRpcError.SessionOverloaded()
           : new PeerRpcError.ServerUnavailable()
+      }
     })
   )
 
@@ -660,7 +675,12 @@ export const layerHandlers = (
         return reserve
       }
       return PeerTransport.PeerTransport.of({
-        capabilities: { storeAndForward: false },
+        // Both `capabilities` here describe the REMOTE peer, which is what the server side
+        // `PeerSession` reads before it lets `PeerSync.generate` emit a rewritten document. The
+        // value is read off the client's own `Open` advertisement and is never inferred from the
+        // shared protocol version, which lineage did not bump and which therefore cannot tell this
+        // build apart from one that would union a rewritten document.
+        capabilities: { storeAndForward: false, lineageAware: entry.lineageAware },
         connect: (connectOptions) =>
           connectOptions.peerId !== entry.peerId
             ? Effect.fail(
@@ -673,7 +693,7 @@ export const layerHandlers = (
             )
             : Effect.succeed({
               peerId: entry.peerId,
-              capabilities: { storeAndForward: false },
+              capabilities: { storeAndForward: false, lineageAware: entry.lineageAware },
               receive,
               send,
               close: Effect.void
@@ -794,7 +814,10 @@ export const layerHandlers = (
                     protocolVersion: PeerRpc.protocolVersion,
                     sessionId: entry.sessionId,
                     peerId: options.peerId,
-                    capabilities: { storeAndForward: false }
+                    // The only place the flag reaches a remote peer. Without it the client reads an
+                    // absent capability, and its own `generate` refuses to emit any rewritten
+                    // document toward this server.
+                    capabilities: { storeAndForward: false, lineageAware: true }
                   }))
                 }))
               }
@@ -891,6 +914,9 @@ export const layerHandlers = (
                 subjectId: authenticated.principal.subjectId,
                 peerId: authenticated.principal.peerId,
                 sessionId,
+                // Read, not inferred. An omitted advertisement is exactly the older client this
+                // must stay false for.
+                lineageAware: request.capabilities?.lineageAware === true,
                 validUntil: Math.min(
                   authenticated.validUntil,
                   authorized.validUntil,
@@ -1069,6 +1095,8 @@ export const layerHandlers = (
         case "DefinitionMismatch":
         case "InvalidRequest":
         case "RequestLimitExceeded":
+        // Peer caused, so it must not read as a server fault in effect_local_rpc_boundary_total.
+        case "DocumentLineageChanged":
           return "ProtocolRejected" as const
         case "RequestCapacityExceeded":
           return "CapacityRejected" as const

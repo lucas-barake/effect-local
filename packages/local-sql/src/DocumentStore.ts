@@ -139,7 +139,7 @@ export const layer: Layer.Layer<
         sql`SELECT
             accepted_heads, checkpoint_hash,
             (SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1) AS commit_sequence,
-            document_id, document_type, materialized_heads, observed_versions,
+            document_id, document_type, lineage, materialized_heads, observed_versions,
             projection_status, schema_version, tombstone
           FROM effect_local_documents WHERE document_id = ${documentId}`
     })

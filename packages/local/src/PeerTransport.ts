@@ -7,6 +7,15 @@ import type * as ReplicaError from "./ReplicaError.js"
 
 export interface Capabilities {
   readonly storeAndForward: boolean
+  /**
+   * Whether the peer compares document lineage before it merges a sync message.
+   *
+   * Optional rather than required: a peer that predates lineage advertises nothing, and an absent
+   * value means exactly that. Such a peer has no cross lineage check, so it would union a rewritten
+   * document and push the discarded history straight back. The send path treats an absent value as
+   * "not lineage aware" and refuses to emit a rewritten document to it.
+   */
+  readonly lineageAware?: boolean
 }
 
 export interface Connection {

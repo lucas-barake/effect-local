@@ -128,11 +128,11 @@ describe("Migrations", () => {
       `
       assert.strictEqual(indexes.length, 0)
       const recorded = yield* sql<{ readonly migration_id: number }>`
-        SELECT migration_id FROM effect_local_migrations WHERE migration_id IN (4, 5, 6, 7)
+        SELECT migration_id FROM effect_local_migrations WHERE migration_id IN (4, 5, 6, 7, 8, 9)
       `
       assert.strictEqual(recorded.length, 0)
       const catalog = yield* sql<{ readonly migration_id: number }>`
-        SELECT migration_id FROM effect_local_migration_catalog WHERE migration_id IN (4, 5, 6, 7)
+        SELECT migration_id FROM effect_local_migration_catalog WHERE migration_id IN (4, 5, 6, 7, 8, 9)
       `
       assert.strictEqual(catalog.length, 0)
     }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
@@ -217,7 +217,9 @@ describe("Migrations", () => {
         [4, "projection_readiness"],
         [5, "pending_receipt_indexes"],
         [6, "peer_writer_provenance"],
-        [7, "replica_health_indexes"]
+        [7, "replica_health_indexes"],
+        [8, "document_lineage"],
+        [9, "history_rewrite_markers"]
       ])
 
       const outbox = yield* sql<{
@@ -307,7 +309,13 @@ describe("Migrations", () => {
         { migration_id: 4, name: "projection_readiness", checksum: Migrations.projectionReadinessChecksum },
         { migration_id: 5, name: "pending_receipt_indexes", checksum: Migrations.pendingReceiptIndexesChecksum },
         { migration_id: 6, name: "peer_writer_provenance", checksum: Migrations.peerWriterProvenanceChecksum },
-        { migration_id: 7, name: "replica_health_indexes", checksum: Migrations.replicaHealthIndexesChecksum }
+        { migration_id: 7, name: "replica_health_indexes", checksum: Migrations.replicaHealthIndexesChecksum },
+        { migration_id: 8, name: "document_lineage", checksum: Migrations.documentLineageChecksum },
+        {
+          migration_id: 9,
+          name: "history_rewrite_markers",
+          checksum: Migrations.historyRewriteMarkersChecksum
+        }
       ])
 
       const indexes = yield* sql<{ readonly name: string }>`

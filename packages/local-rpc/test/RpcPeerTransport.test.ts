@@ -246,12 +246,17 @@ describe("RpcPeerTransport", () => {
         new PeerRpcError.AccessDenied(),
         new PeerRpcError.UnsupportedVersion(),
         new PeerRpcError.PeerMismatch(),
-        new PeerRpcError.InvalidRequest()
+        new PeerRpcError.InvalidRequest(),
+        new PeerRpcError.DocumentLineageChanged()
       ]
       for (const rpcError of permanent) {
         const client = makeClient(() => Stream.fail(rpcError), () => Effect.void)
         const error = yield* connect(client, serverPeerId).pipe(Effect.flip)
         assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+        // The wire tag stays diagnosable without inventing the document identity it withholds.
+        if (error.reason._tag === "ProtocolMismatch") {
+          assert.strictEqual(error.reason.observed, rpcError._tag)
+        }
         assert.isFalse(RpcPeerTransport.isRetryable(error))
       }
       const limited = makeClient(() => Stream.fail(new PeerRpcError.RequestLimitExceeded()), () => Effect.void)
@@ -494,14 +499,52 @@ describe("RpcPeerTransport", () => {
       yield* connection.close
     })))
 
-  it.effect("reports storeAndForward false", () =>
+  it.effect("reports storeAndForward false and its own lineage awareness", () =>
     Effect.scoped(Effect.gen(function*() {
       const client = makeClient(() => liveOpen(serverOpened), () => Effect.void)
       const context = yield* Layer.build(RpcPeerTransport.layer(client, { documents, definition }))
       const transport = Context.get(context, PeerTransport.PeerTransport)
       assert.isFalse(transport.capabilities.storeAndForward)
+      assert.isTrue(transport.capabilities.lineageAware)
       const connection = yield* transport.connect({ replicaId, peerId: serverPeerId })
       assert.isFalse(connection.capabilities.storeAndForward)
+      // The connection level value is the server's, never the adapter's. This stub `Opened` omits
+      // the key the way a peer built before lineage would, and it must stay absent rather than
+      // inherit the adapter's own true.
+      assert.isUndefined(connection.capabilities.lineageAware)
+      yield* connection.close
+    })))
+
+  it.effect("advertises its own lineage awareness on the Open it sends", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const requests = yield* Queue.unbounded<typeof PeerRpc.OpenRpc.payloadSchema.Type>()
+      const client = makeClient(
+        (request) => Queue.offer(requests, request).pipe(Effect.as(liveOpen(serverOpened)), Stream.unwrap),
+        () => Effect.void
+      )
+      const connection = yield* connect(client, serverPeerId)
+      // The server infers nothing from the protocol version, which lineage deliberately did not
+      // bump. This claim is the only thing that separates this build from an older one that would
+      // union a rewritten document and push the discarded history back.
+      assert.deepStrictEqual((yield* Queue.take(requests)).capabilities, { lineageAware: true })
+      yield* connection.close
+    })))
+
+  it.effect("passes a lineage aware server handshake through to the connection", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const client = makeClient(
+        () =>
+          liveOpen(PeerRpc.Opened.make({
+            _tag: "Opened",
+            protocolVersion: PeerRpc.protocolVersion,
+            sessionId,
+            peerId: serverPeerId,
+            capabilities: { storeAndForward: false, lineageAware: true }
+          })),
+        () => Effect.void
+      )
+      const connection = yield* connect(client, serverPeerId)
+      assert.isTrue(connection.capabilities.lineageAware)
       yield* connection.close
     })))
 

@@ -1,6 +1,7 @@
 import { NodeFileSystem } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Effect from "effect/Effect"
 import { FileSystem } from "effect/FileSystem"
 import * as Schema from "effect/Schema"
@@ -18,7 +19,9 @@ const expectations = {
       [4, "projection_readiness"],
       [5, "pending_receipt_indexes"],
       [6, "peer_writer_provenance"],
-      [7, "replica_health_indexes"]
+      [7, "replica_health_indexes"],
+      [8, "document_lineage"],
+      [9, "history_rewrite_markers"]
     ],
     outbox: "none"
   },
@@ -28,7 +31,9 @@ const expectations = {
       [4, "projection_readiness"],
       [5, "pending_receipt_indexes"],
       [6, "peer_writer_provenance"],
-      [7, "replica_health_indexes"]
+      [7, "replica_health_indexes"],
+      [8, "document_lineage"],
+      [9, "history_rewrite_markers"]
     ],
     outbox: "backfilled"
   },
@@ -37,7 +42,9 @@ const expectations = {
       [4, "projection_readiness"],
       [5, "pending_receipt_indexes"],
       [6, "peer_writer_provenance"],
-      [7, "replica_health_indexes"]
+      [7, "replica_health_indexes"],
+      [8, "document_lineage"],
+      [9, "history_rewrite_markers"]
     ],
     outbox: { frozen: "2020-01-01T00:00:00.000Z" }
   }
@@ -122,7 +129,9 @@ const assertMigrationHistory = Effect.gen(function*() {
     { migration_id: 4, name: "projection_readiness" },
     { migration_id: 5, name: "pending_receipt_indexes" },
     { migration_id: 6, name: "peer_writer_provenance" },
-    { migration_id: 7, name: "replica_health_indexes" }
+    { migration_id: 7, name: "replica_health_indexes" },
+    { migration_id: 8, name: "document_lineage" },
+    { migration_id: 9, name: "history_rewrite_markers" }
   ])
 
   const catalog = yield* SqlSchema.findAll({
@@ -137,7 +146,13 @@ const assertMigrationHistory = Effect.gen(function*() {
     { migration_id: 4, name: "projection_readiness", checksum: Migrations.projectionReadinessChecksum },
     { migration_id: 5, name: "pending_receipt_indexes", checksum: Migrations.pendingReceiptIndexesChecksum },
     { migration_id: 6, name: "peer_writer_provenance", checksum: Migrations.peerWriterProvenanceChecksum },
-    { migration_id: 7, name: "replica_health_indexes", checksum: Migrations.replicaHealthIndexesChecksum }
+    { migration_id: 7, name: "replica_health_indexes", checksum: Migrations.replicaHealthIndexesChecksum },
+    { migration_id: 8, name: "document_lineage", checksum: Migrations.documentLineageChecksum },
+    {
+      migration_id: 9,
+      name: "history_rewrite_markers",
+      checksum: Migrations.historyRewriteMarkersChecksum
+    }
   ])
 })
 
@@ -155,7 +170,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         accepted_heads: Schema.String,
         tombstone: Schema.Int,
         projection_status: Schema.String,
-        checkpoint_hash: Schema.NullOr(Schema.String)
+        checkpoint_hash: Schema.NullOr(Schema.String),
+        lineage: Identity.DocumentLineage
       }),
       execute: () => sql`SELECT * FROM effect_local_documents ORDER BY document_id`
     })(undefined)
@@ -168,7 +184,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
       accepted_heads: "[]",
       tombstone: 0,
       projection_status: "ready",
-      checkpoint_hash: null
+      checkpoint_hash: null,
+      lineage: Identity.genesisLineage
     }])
 
     const checkpoints = yield* SqlSchema.findAll({
@@ -181,7 +198,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         checksum: Schema.String,
         commit_sequence: Schema.Int,
         verified: Schema.Int,
-        writer_provenance: Schema.String
+        writer_provenance: Schema.String,
+        lineage: Identity.DocumentLineage
       }),
       execute: () => sql`SELECT * FROM effect_local_checkpoints ORDER BY checkpoint_hash`
     })(undefined)
@@ -194,7 +212,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         checksum: "checksum-1",
         commit_sequence: 1,
         verified: 1,
-        writer_provenance: "[]"
+        writer_provenance: "[]",
+        lineage: Identity.genesisLineage
       },
       {
         checkpoint_hash: "checkpoint-3",
@@ -204,7 +223,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         checksum: "checksum-3",
         commit_sequence: 3,
         verified: 1,
-        writer_provenance: "[]"
+        writer_provenance: "[]",
+        lineage: Identity.genesisLineage
       }
     ])
 
@@ -221,7 +241,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         heads: Schema.String,
         status: Schema.String,
         created_at: Schema.String,
-        writer_provenance: Schema.String
+        writer_provenance: Schema.String,
+        lineage: Identity.DocumentLineage
       }),
       execute: () => sql`SELECT * FROM effect_local_peer_outbox ORDER BY send_sequence`
     })(undefined)
@@ -241,7 +262,8 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         message_hash: "message-1",
         heads: "[]",
         status: "pending",
-        writer_provenance: "[]"
+        writer_provenance: "[]",
+        lineage: Identity.genesisLineage
       }]
     )
     const createdAt = outbox[0]?.created_at ?? ""
