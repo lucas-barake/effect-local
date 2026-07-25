@@ -15,48 +15,11 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as Rows from "./internal/rows.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
-const DocumentRow = Schema.Struct({
-  accepted_heads: Schema.String,
-  checkpoint_hash: Schema.NullOr(Schema.String),
-  commit_sequence: Schema.Number,
-  document_id: Schema.String,
-  document_type: Schema.String,
-  materialized_heads: Schema.String,
-  observed_versions: Schema.String,
-  projection_status: Schema.Literals(["Ready", "Blocked", "Rebuilding"]),
-  schema_version: Schema.Number,
-  tombstone: Schema.Number
-})
-
-const CheckpointRow = Schema.Struct({
-  bytes: Schema.Uint8Array,
-  checkpoint_hash: Schema.String,
-  checksum: Schema.String,
-  commit_sequence: Schema.Number,
-  document_id: Schema.String,
-  heads: Schema.String,
-  verified: Schema.Number,
-  writer_provenance: WriterProvenance.StoredChangeProvenances
-})
-
-const ChangeRow = Schema.Struct({
-  actor: Schema.String,
-  accepted_at: Schema.String,
-  applied: Schema.Number,
-  bytes: Schema.Uint8Array,
-  change_hash: WriterProvenance.ChangeHash,
-  commit_sequence: Schema.Number,
-  dependencies: Schema.String,
-  document_id: Schema.String,
-  document_type: Schema.String,
-  peer_id: Schema.NullOr(Schema.String),
-  sequence: Schema.Number,
-  writer_definition_hash: WriterProvenance.WriterDefinitionHash,
-  writer_schema_version: WriterProvenance.WriterSchemaVersion
-})
+const { ChangeRow, CheckpointRow, DocumentRow } = Rows
 
 export interface RawRecoveryExport {
   readonly document: typeof DocumentRow.Type | null

@@ -242,6 +242,35 @@ describe("SqlReplica", () => {
       assert.deepStrictEqual(rows, [{ sourceDocumentId: created.value, title: "projected" }])
     }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive))
 
+  // Deleting a document replaces its projection rows with none, driven by the
+  // tombstone the commit reports. Nothing else in the suite exercises a delete
+  // against a replica that actually has projection bindings.
+  it.effect("clears projection rows when a projected document is deleted", () =>
+    Effect.gen(function*() {
+      const replica = yield* Replica.Replica
+      const sql = yield* SqlClient.SqlClient
+      const created = yield* replica.create(Task, {
+        commandId: yield* Identity.makeCommandId,
+        value: { title: "projected" }
+      })
+      assert.strictEqual(created._tag, "DurablyCommittedLocal")
+      if (created._tag !== "DurablyCommittedLocal") return
+      const documentId = created.value
+      const projected = () =>
+        sql<{ readonly sourceDocumentId: string; readonly title: string }>`SELECT
+          source_document_id AS sourceDocumentId, title FROM task_title_v1`
+      assert.deepStrictEqual(yield* projected(), [{ sourceDocumentId: documentId, title: "projected" }])
+
+      yield* replica.delete(Task, { commandId: yield* Identity.makeCommandId, documentId })
+
+      assert.deepStrictEqual(yield* projected(), [])
+      assert.isTrue((yield* replica.get(Task, documentId)).tombstone)
+      const keys = yield* sql<{ readonly invalidation_keys: string }>`
+        SELECT invalidation_keys FROM effect_local_commit_outbox ORDER BY commit_sequence DESC LIMIT 1
+      `
+      assert.deepStrictEqual(JSON.parse(keys[0]!.invalidation_keys), ["Task", "TaskTitle"])
+    }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive))
+
   it.effect("rejects importing a document whose portable definition does not match", () =>
     Effect.gen(function*() {
       const replica = yield* Replica.Replica
