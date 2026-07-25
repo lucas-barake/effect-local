@@ -58,6 +58,7 @@ const replicaLimits = ReplicaLimits.Values.make({
   maxStreamsPerSession: 1,
   maxInFlightPerSession: 1,
   maxQueuedRpc: 1,
+  maxQueuedPermits: 1,
   maxActiveRestores: 1,
   maxRestoresPerSession: 1,
   maxRestoreMillis: 30_000,

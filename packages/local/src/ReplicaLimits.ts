@@ -43,6 +43,7 @@ export const Values = Schema.Struct({
   maxStreamsPerSession: Limit,
   maxInFlightPerSession: Limit,
   maxQueuedRpc: Limit,
+  maxQueuedPermits: Limit,
   maxActiveRestores: Limit,
   maxRestoresPerSession: Limit,
   maxRestoreMillis: Limit,

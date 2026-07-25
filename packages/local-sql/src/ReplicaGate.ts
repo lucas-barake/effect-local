@@ -1,10 +1,12 @@
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Context from "effect/Context"
 import * as DateTime from "effect/DateTime"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as LogLevel from "effect/LogLevel"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
@@ -21,9 +23,23 @@ export interface Permit {
   readonly writerGeneration: Identity.WriterGeneration
 }
 
+/**
+ * The arbiter grants by succeeding this, sheds by failing it, and an interrupted acquirer interrupts it
+ * itself. Those are the three outcomes, so they are carried on `Deferred`'s three channels rather than
+ * re-encoded as success values that every consumer would have to re-dispatch on.
+ */
+type Admission = Deferred.Deferred<void, ReplicaError.ReplicaError>
+
+/**
+ * How one acquirer asked for the gate. `exclusive` (`claim`) holds it long enough to build a real
+ * backlog; `bounded` (`admit`) is the only kind the arbiter is ever allowed to shed.
+ */
+type Acquirer = "shared" | "exclusive" | "bounded"
+
 export class ReplicaGate extends Context.Service<ReplicaGate, {
   readonly current: Effect.Effect<Permit>
   readonly shared: Effect.Effect<Permit, never, Scope.Scope>
+  readonly admit: Effect.Effect<Permit, ReplicaError.ReplicaError, Scope.Scope>
   readonly claim: <A, E, R,>(
     use: (permit: Permit) => Effect.Effect<A, E, R>
   ) => Effect.Effect<A, E | ReplicaError.ReplicaError | SqlError.SqlError, R>
@@ -31,50 +47,150 @@ export class ReplicaGate extends Context.Service<ReplicaGate, {
   readonly validate: (expected: Permit) => Effect.Effect<void, ReplicaError.ReplicaError>
 }>()("@lucas-barake/effect-local-sql/ReplicaGate") {}
 
-export const layer: Layer.Layer<ReplicaGate, never, ReplicaBootstrap.ReplicaBootstrap | SqlClient.SqlClient> = Layer
+export const layer: Layer.Layer<
+  ReplicaGate,
+  never,
+  ReplicaBootstrap.ReplicaBootstrap | SqlClient.SqlClient | ReplicaLimits.ReplicaLimits
+> = Layer
   .effect(
     ReplicaGate,
     Effect.gen(function*() {
       const bootstrap = yield* ReplicaBootstrap.ReplicaBootstrap
       const sql = yield* SqlClient.SqlClient
+      const limits = yield* ReplicaLimits.ReplicaLimits
       const state = yield* Ref.make<Permit>(bootstrap)
       const lock = yield* TxReentrantLock.make()
       const writer = yield* Ref.make<number | null>(null)
       const readers = yield* Ref.make(new Map<number, number>())
       const requests = yield* Effect.acquireRelease(
         Queue.unbounded<
-          | {
-            readonly _tag: "Acquire"
-            readonly granted: Deferred.Deferred<boolean>
-          }
+          | { readonly _tag: "Acquire"; readonly granted: Admission; readonly kind: Acquirer }
+          | { readonly _tag: "Interrupt"; readonly granted: Admission }
           | { readonly _tag: "Release" }
         >(),
         Queue.shutdown
       )
+      // The arbiter fiber owns `waiters` for the Layer scope. An interrupted acquirer reports itself with
+      // `Interrupt` so its entry is dropped immediately; without that, entries could only be reaped by the
+      // grant loop below, which cannot run while a writer holds the gate. That reaping, not the cap, is
+      // what actually bounds memory during a long restore.
       yield* Effect.gen(function*() {
-        const pending: Array<Deferred.Deferred<boolean>> = []
-        let occupied = false
+        const waiters = new Set<Admission>()
+        const exclusiveWaiters = new Set<Admission>()
+        // A fresh `waiters.values()` restarts at slot 0 and steps over every slot a previous grant deleted,
+        // because a `Set` deletion leaves a tombstone until the table is rehashed. Building one iterator per
+        // grant makes draining a backlog of N waiters O(N^2). One long-lived cursor yields the same
+        // sequence: a `Set` iterator visits entries added after it was created and skips entries deleted
+        // before it reaches them, which is exactly the FIFO-with-cancellation order this loop wants.
+        let cursor = waiters.values()
+        const takeNext = (): Admission => {
+          let step = cursor.next()
+          // An exhausted iterator stays done, so it has to be replaced once `waiters` refills.
+          if (step.done === true) {
+            cursor = waiters.values()
+            step = cursor.next()
+          }
+          return step.value!
+        }
+        let holder: "shared" | "exclusive" | null = null
         while (true) {
           const request = yield* Queue.take(requests)
-          if (request._tag === "Acquire") pending.push(request.granted)
-          else occupied = false
-          while (!occupied && pending.length > 0) {
-            occupied = yield* Deferred.succeed(pending.shift()!, true)
+          switch (request._tag) {
+            case "Acquire":
+              // Only the arbiter knows the real waiter set, so admission is decided here. A shared
+              // acquirer holds the gate only long enough to take the read lock, so a queue of shared
+              // acquirers always drains on its own: shedding it would reject work that a fully idle
+              // replica can serve. Only a backlog behind an exclusive holder can grow without bound,
+              // so that is the sole condition under which a bounded acquirer is shed.
+              if (
+                request.kind === "bounded" &&
+                (holder === "exclusive" || exclusiveWaiters.size > 0) &&
+                waiters.size >= limits.maxQueuedPermits
+              ) {
+                yield* Deferred.fail(
+                  request.granted,
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.QuotaExceeded({
+                      resource: "queued permits",
+                      limit: limits.maxQueuedPermits
+                    })
+                  })
+                )
+              } else {
+                waiters.add(request.granted)
+                if (request.kind === "exclusive") exclusiveWaiters.add(request.granted)
+              }
+              break
+            case "Interrupt":
+              waiters.delete(request.granted)
+              exclusiveWaiters.delete(request.granted)
+              break
+            case "Release":
+              holder = null
+              break
+          }
+          while (holder === null && waiters.size > 0) {
+            const next = takeNext()
+            waiters.delete(next)
+            const nextExclusive = exclusiveWaiters.delete(next)
+            if (yield* Deferred.succeed(next, undefined)) holder = nextExclusive ? "exclusive" : "shared"
           }
         }
       }).pipe(Effect.forkScoped({ startImmediately: true }))
       const release = Queue.offer(requests, { _tag: "Release" }).pipe(Effect.asVoid)
-      const acquire = Effect.gen(function*() {
-        const granted = yield* Deferred.make<boolean>()
-        yield* Queue.offer(requests, { _tag: "Acquire", granted })
-        yield* Deferred.await(granted).pipe(
-          Effect.onInterrupt(() =>
-            Deferred.succeed(granted, false).pipe(
-              Effect.flatMap((cancelled) => cancelled ? Effect.void : release)
+      // Only `Deferred.await` may be interrupted, and the cleanup handler is installed INSIDE the
+      // surrounding uninterruptible region on purpose.
+      //
+      // `Effect.onInterrupt` is an on-exit frame that is also popped on the success path, and a frame
+      // popped while the fiber is still interruptible re-arms interruptibility behind itself: `onExit`
+      // runs its continuation uninterruptibly and pushes a restore marker UNDER the frame it just
+      // consumed. That marker is an interrupt-raising point which now sits after the handler is gone but
+      // before `Effect.acquireUseRelease` has installed its release. An interrupt landing there granted
+      // the gate to a fiber that then died without ever offering `Release`, so the gate stayed held
+      // forever and every later acquirer deadlocked. Popped from an already-uninterruptible region, no
+      // marker is pushed and the grant flows straight into the bracket that owes the release.
+      //
+      // Callers must therefore run this uninterruptibly, which every caller does: it is always the
+      // `acquire` of `Effect.acquireUseRelease`. That is also why `Effect.interruptible` is applied
+      // directly to the await instead of restored from an `Effect.uninterruptibleMask` -- inside that
+      // bracket the fiber is already uninterruptible, so `uninterruptibleMask` would hand back `identity`
+      // and a queued waiter could never be cancelled at all.
+      const requestAdmission = (kind: Acquirer) =>
+        Deferred.make<void, ReplicaError.ReplicaError>().pipe(
+          Effect.flatMap((granted) =>
+            Effect.uninterruptible(
+              Effect.gen(function*() {
+                yield* Queue.offer(requests, { _tag: "Acquire", granted, kind })
+                return yield* Effect.interruptible(Deferred.await(granted))
+              }).pipe(
+                Effect.onInterrupt(() =>
+                  Deferred.interrupt(granted).pipe(
+                    Effect.flatMap((interrupted) =>
+                      interrupted
+                        ? Queue.offer(requests, { _tag: "Interrupt", granted }).pipe(Effect.asVoid)
+                        // The arbiter decided first. Only a grant leaves the gate held, so a shed
+                        // acquirer must not offer a `Release` it never earned.
+                        : Deferred.await(granted).pipe(Effect.andThen(release), Effect.ignore)
+                    )
+                  )
+                )
+              )
             )
           )
         )
-      }).pipe(Effect.interruptible)
+      // The arbiter only sheds `bounded` requests, so `shared` and `claim` can never be rejected. State
+      // that with `orDie` rather than discarding the failure: silently treating a rejection as a grant
+      // would let the caller take the read lock without holding the gate, breaking mutual exclusion.
+      const acquire = requestAdmission("shared").pipe(Effect.orDie)
+      const acquireExclusive = requestAdmission("exclusive").pipe(Effect.orDie)
+      // `Effect.annotateLogs` copies the fiber context whenever it runs and is not level-guarded, so it
+      // must not execute when Debug is disabled. Rejections are emitted exactly when the replica is
+      // already saturated, which is the worst moment to spend work on a discarded log line.
+      const rejectionLog = Effect.logDebug("ReplicaGate admission rejected").pipe(
+        Effect.annotateLogs({ resource: "queued permits", limit: limits.maxQueuedPermits }),
+        Effect.when(LogLevel.isEnabled("Debug"))
+      )
+      const acquireBounded = requestAdmission("bounded").pipe(Effect.tapError(() => rejectionLog))
       const readLock = Effect.withFiber((fiber) =>
         Effect.acquireRelease(
           TxReentrantLock.acquireRead(lock).pipe(
@@ -95,14 +211,44 @@ export const layer: Layer.Layer<ReplicaGate, never, ReplicaBootstrap.ReplicaBoot
                 else next.set(fiber.id, count - 1)
                 return next
               }))
-            ),
-          { interruptible: true }
+            )
+          // No `{ interruptible: true }`: `TxReentrantLock.acquireRead` commits its `TxRef` before returning,
+          // so an interrupt observed between the commit and the finalizer registration would leak the read
+          // lock and block every future writer forever. This matches `TxReentrantLock.readLock` upstream.
+          // Safe to acquire uninterruptibly here because the arbiter already serialises readers against the
+          // writer, so `acquireRead` never has to retry.
         )
       )
-      const writeLock = Effect.acquireRelease(
-        TxReentrantLock.acquireWrite(lock),
-        () => TxReentrantLock.releaseWrite(lock),
-        { interruptible: true }
+      // `acquireWrite` has to stay interruptible: it blocks until every reader drains, and an interrupted
+      // restore must be able to abandon that wait. But `Effect.tx` commits its journal before leaving its
+      // own mask, so an interrupt recorded during the commit is raised only after the lock is already
+      // held, `Effect.acquireRelease` never reaches its finalizer registration, and the write lock is
+      // stranded. Every later `acquireRead` then retries forever, and because `readLock` acquires
+      // uninterruptibly those readers cannot even be cancelled out of it.
+      //
+      // Compensate on interrupt, but only when this attempt actually took the lock. `writeLocks` reports
+      // the reentrancy count of whichever fiber is the writer, so comparing it across the attempt is what
+      // distinguishes "my acquire committed" from "someone else already held it". Releasing
+      // unconditionally would be wrong for a REENTRANT nested `claim`: that fiber is already the writer at
+      // count 1, so an interrupt before its nested acquire commits would release the OUTER claim's lock.
+      // The comparison is sound because only one fiber can be inside `writeLock` at a time -- the
+      // non-reentrant path reaches it only after the arbiter granted the gate exclusively, and the
+      // reentrant path is by construction the same fiber.
+      const writeLock = Effect.uninterruptibleMask((restore) =>
+        TxReentrantLock.writeLocks(lock).pipe(
+          Effect.flatMap((before) =>
+            Effect.acquireRelease(
+              restore(TxReentrantLock.acquireWrite(lock)).pipe(
+                Effect.onInterrupt(() =>
+                  TxReentrantLock.writeLocks(lock).pipe(
+                    Effect.flatMap((after) => after > before ? TxReentrantLock.releaseWrite(lock) : Effect.void)
+                  )
+                )
+              ),
+              () => TxReentrantLock.releaseWrite(lock)
+            )
+          )
+        )
       )
       const findState = SqlSchema.findOne({
         Request: Schema.Void,
@@ -157,23 +303,26 @@ export const layer: Layer.Layer<ReplicaGate, never, ReplicaBootstrap.ReplicaBoot
               AND writer_generation = ${expected.writerGeneration}
             RETURNING replica_incarnation, writer_generation`
       })
-      return {
-        current: Ref.get(state),
-        refresh: readState.pipe(Effect.tap((next) => Ref.set(state, next))),
-        shared: Effect.withFiber((fiber) =>
+      // A shed acquirer never reaches `readLock` or `release`, because `Effect.acquireUseRelease` installs
+      // its release only after `acquire` succeeds. So the gate's own occupancy is untouched by a shed.
+      const sharedWith = <E,>(admission: Effect.Effect<void, E>) => {
+        const enter = Effect.acquireUseRelease(admission, () => readLock, () => release)
+        return Effect.withFiber((fiber) =>
           Effect.all({ readers: Ref.get(readers), writer: Ref.get(writer) }).pipe(
             Effect.flatMap(({ readers, writer }) =>
               writer === fiber.id || (readers.get(fiber.id) ?? 0) > 0
                 ? readLock
-                : Effect.acquireUseRelease(
-                  acquire,
-                  () => readLock,
-                  () => release
-                )
+                : enter
             ),
             Effect.andThen(Ref.get(state))
           )
-        ),
+        )
+      }
+      return {
+        current: Ref.get(state),
+        refresh: readState.pipe(Effect.tap((next) => Ref.set(state, next))),
+        shared: sharedWith(acquire),
+        admit: sharedWith(acquireBounded),
         claim: (use) =>
           Effect.withFiber((fiber) => {
             const run = (publish: boolean) =>
@@ -209,7 +358,7 @@ export const layer: Layer.Layer<ReplicaGate, never, ReplicaBootstrap.ReplicaBoot
                       transaction._tag === "Some"
                         ? Effect.die(new Error("ReplicaGate.claim cannot run inside an existing SQL transaction"))
                         : Effect.acquireUseRelease(
-                          acquire,
+                          acquireExclusive,
                           () => Ref.set(writer, fiber.id).pipe(Effect.andThen(run(true))),
                           () => Ref.set(writer, null).pipe(Effect.andThen(release))
                         )

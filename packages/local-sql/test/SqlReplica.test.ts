@@ -97,6 +97,7 @@ describe("SqlReplica", () => {
     maxStreamsPerSession: 8,
     maxInFlightPerSession: 32,
     maxQueuedRpc: 128,
+    maxQueuedPermits: 128,
     maxActiveRestores: 128,
     maxRestoresPerSession: 32,
     maxRestoreMillis: 30_000,
@@ -292,6 +293,88 @@ describe("SqlReplica", () => {
       }))
       assert.strictEqual(wrongVersion.reason._tag, "BackupInvalid")
     }).pipe(Effect.provide(Live), Effect.provide(Database), TestClock.withLive))
+
+  it.effect("sheds replica operations while a restore holds the writer", () =>
+    Effect.gen(function*() {
+      const committed = yield* Deferred.make<void>()
+      const release = yield* Latch.make()
+      let armed = false
+      const baseDatabase = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+      const instrumentedDatabase = Layer.effect(
+        SqlClient.SqlClient,
+        Effect.gen(function*() {
+          const sql = yield* SqlClient.SqlClient
+          return Object.assign(
+            ((...args: ReadonlyArray<unknown>) => (sql as any)(...args)) as SqlClient.SqlClient,
+            sql,
+            {
+              withTransaction: <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
+                Effect.serviceOption(sql.transactionService).pipe(
+                  Effect.flatMap((transaction) =>
+                    sql.withTransaction(effect).pipe(
+                      Effect.tap(() =>
+                        armed && Option.isNone(transaction)
+                          ? Deferred.succeed(committed, undefined).pipe(Effect.andThen(release.await))
+                          : Effect.void
+                      )
+                    )
+                  )
+                )
+            }
+          )
+        })
+      ).pipe(Layer.provideMerge(baseDatabase))
+      const database = Layer.merge(instrumentedDatabase, NodeCrypto.layer)
+      const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provideMerge(database))
+      const infrastructure = Layer.merge(bootstrap, ReplicaLimits.layer({ ...limits, maxQueuedPermits: 1 }))
+      const gate = ReplicaGate.layer.pipe(Layer.provideMerge(infrastructure))
+      const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
+      const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
+      const projections = ProjectionStore.layer([]).pipe(Layer.provideMerge(store))
+      const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(projections))
+      const queries = QueryExecutor.layer(definition).pipe(
+        Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
+      )
+      const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
+      const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
+      const direct = SqlReplica.layerFromServices(definition).pipe(Layer.provideMerge(backups))
+      const services = Layer.merge(direct, Reactivity.layer).pipe(Layer.provide(Handler))
+
+      yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const created = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "before" }
+        })
+        assert.strictEqual(created._tag, "DurablyCommittedLocal")
+        if (created._tag !== "DurablyCommittedLocal") return
+        const backup = yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+        armed = true
+        const restore = yield* replica.restoreBackup({
+          expectedDefinitionHash: definition.hash,
+          installationId: yield* Identity.makeBackupInstallationId,
+          maxBytes: limits.maxBackupBytes,
+          mode: "replace",
+          source: Stream.fromIterable(backup)
+        }).pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Deferred.await(committed)
+        armed = false
+
+        const queued = yield* Effect.forkChild(replica.get(Task, created.value))
+        yield* Effect.yieldNow
+
+        const shed = yield* Effect.flip(replica.get(Task, created.value))
+        assert.strictEqual(shed.reason._tag, "QuotaExceeded")
+        if (shed.reason._tag === "QuotaExceeded") {
+          assert.strictEqual(shed.reason.resource, "queued permits")
+          assert.strictEqual(shed.reason.limit, 1)
+        }
+
+        yield* release.open
+        yield* Fiber.join(restore)
+        assert.strictEqual((yield* Fiber.join(queued)).value.title, "before")
+      }).pipe(Effect.scoped, Effect.provide(services))
+    }).pipe(TestClock.withLive))
 
   it.effect("invalidates reactive consumers when interruption arrives after a restore commits", () =>
     Effect.gen(function*() {

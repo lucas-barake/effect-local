@@ -15,6 +15,7 @@ import * as DocumentStore from "../src/DocumentStore.js"
 import * as ProjectionStore from "../src/ProjectionStore.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
+import { withGateLimits } from "./fixtures/limits.js"
 
 describe("CommandExecutor never-typed error schema", () => {
   const Task = Document.make("Task", {
@@ -42,7 +43,7 @@ describe("CommandExecutor never-typed error schema", () => {
   )
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Base = Layer.merge(Database, Bootstrap)
-  const Gate = ReplicaGate.layer.pipe(Layer.provide(Base))
+  const Gate = ReplicaGate.layer.pipe(withGateLimits, Layer.provide(Base))
   const Store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Base, Gate)))
   const Projections = ProjectionStore.layer([]).pipe(Layer.provide(Base))
   const Handlers = Rename.toLayer(({ draft, payload }) => {

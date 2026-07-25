@@ -18,6 +18,7 @@ import * as ProjectionStore from "../src/ProjectionStore.js"
 import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
+import { withGateLimits } from "./fixtures/limits.js"
 
 describe("Compaction", () => {
   const Task = Document.make("Task", {
@@ -37,7 +38,7 @@ describe("Compaction", () => {
   )
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Base = Layer.merge(Database, Bootstrap)
-  const Gate = ReplicaGate.layer.pipe(Layer.provide(Base))
+  const Gate = ReplicaGate.layer.pipe(withGateLimits, Layer.provide(Base))
   const StoreService = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Base, Gate)))
   const RecoveryService = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(Base, Gate)))
   const CompactionService = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Base, Gate, RecoveryService)))

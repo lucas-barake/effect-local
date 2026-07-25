@@ -65,6 +65,7 @@ describe("DocumentEntity", () => {
     maxStreamsPerSession: 4,
     maxInFlightPerSession: 16,
     maxQueuedRpc: 32,
+    maxQueuedPermits: 32,
     maxActiveRestores: 32,
     maxRestoresPerSession: 16,
     maxRestoreMillis: 30_000,
@@ -110,6 +111,7 @@ describe("DocumentEntity", () => {
     ReplicaGate.ReplicaGate.of({
       current: Effect.succeed(permit),
       shared: Effect.die("unused"),
+      admit: Effect.die("unused"),
       claim: (use) => use(permit),
       refresh: Effect.succeed(permit),
       validate: () => Effect.void

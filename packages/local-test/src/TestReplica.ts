@@ -42,6 +42,7 @@ export const defaultLimits: ReplicaLimits.Values = {
   maxStreamsPerSession: 32,
   maxInFlightPerSession: 128,
   maxQueuedRpc: 1024,
+  maxQueuedPermits: 1024,
   maxActiveRestores: 1024,
   maxRestoresPerSession: 128,
   maxRestoreMillis: 30_000,

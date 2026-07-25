@@ -28,6 +28,7 @@ describe("ReplicaLimits", () => {
     maxStreamsPerSession: 2,
     maxInFlightPerSession: 8,
     maxQueuedRpc: 32,
+    maxQueuedPermits: 32,
     maxActiveRestores: 32,
     maxRestoresPerSession: 8,
     maxRestoreMillis: 30_000,
@@ -99,6 +100,7 @@ describe("ReplicaLimits", () => {
   it.effect("rejects nonpositive and unsafe limits", () =>
     Effect.gen(function*() {
       assert.strictEqual((yield* Effect.exit(ReplicaLimits.make({ ...values, maxSessions: 0 })))._tag, "Failure")
+      assert.strictEqual((yield* Effect.exit(ReplicaLimits.make({ ...values, maxQueuedPermits: 0 })))._tag, "Failure")
       assert.strictEqual(
         (yield* Effect.exit(ReplicaLimits.make({ ...values, maxBackupBytes: Number.MAX_VALUE })))._tag,
         "Failure"

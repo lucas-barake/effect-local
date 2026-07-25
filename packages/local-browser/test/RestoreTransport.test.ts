@@ -45,6 +45,7 @@ const limits = {
   maxStreamsPerSession: 1,
   maxInFlightPerSession: 1,
   maxQueuedRpc: 2,
+  maxQueuedPermits: 2,
   maxActiveRestores: 2,
   maxRestoresPerSession: 1,
   maxRestoreMillis: 30_000,

@@ -65,6 +65,7 @@ describe("PeerSync", () => {
     maxStreamsPerSession: 10,
     maxInFlightPerSession: 1,
     maxQueuedRpc: 100,
+    maxQueuedPermits: 100,
     maxActiveRestores: 100,
     maxRestoresPerSession: 1,
     maxRestoreMillis: 30_000,
@@ -78,7 +79,7 @@ describe("PeerSync", () => {
   )
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Base = Layer.merge(Database, Bootstrap)
-  const Gate = ReplicaGate.layer.pipe(Layer.provide(Base))
+  const Gate = ReplicaGate.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)), Layer.provide(Base))
   const Limits = ReplicaLimits.layer(limits)
   const Infrastructure = Layer.mergeAll(Base, Gate, Limits)
   const StoreService = DocumentStore.layer.pipe(Layer.provide(Infrastructure))
@@ -2126,7 +2127,7 @@ describe("PeerSync", () => {
       )
       const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(database))
       const base = Layer.merge(database, bootstrap)
-      const gate = ReplicaGate.layer.pipe(Layer.provide(base))
+      const gate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(base))
       const infrastructure = Layer.mergeAll(base, gate, Limits)
       const store = DocumentStore.layer.pipe(Layer.provide(infrastructure))
       const services = Layer.merge(infrastructure, store)

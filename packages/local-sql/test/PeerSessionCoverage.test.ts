@@ -41,6 +41,7 @@ it.layer(NodeCrypto.layer)("PeerSession coverage", (it) => {
     maxStreamsPerSession: 4,
     maxInFlightPerSession: 1,
     maxQueuedRpc: 32,
+    maxQueuedPermits: 32,
     maxActiveRestores: 32,
     maxRestoresPerSession: 1,
     maxRestoreMillis: 30_000,
@@ -57,6 +58,7 @@ it.layer(NodeCrypto.layer)("PeerSession coverage", (it) => {
   const gate = ReplicaGate.ReplicaGate.of({
     current: Effect.succeed(permit),
     shared: Effect.acquireRelease(Effect.succeed(permit), () => Effect.void),
+    admit: Effect.acquireRelease(Effect.succeed(permit), () => Effect.void),
     claim: (use) => use(permit),
     refresh: Effect.succeed(permit),
     validate: () => Effect.void
