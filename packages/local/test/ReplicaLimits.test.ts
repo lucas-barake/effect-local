@@ -1,5 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
+import * as Schema from "effect/Schema"
 import * as ReplicaLimits from "../src/ReplicaLimits.js"
 
 describe("ReplicaLimits", () => {
@@ -34,11 +35,66 @@ describe("ReplicaLimits", () => {
     maxRestoreCoalesceMillis: 25,
     maxRestoreErrorBytes: 4_096
   }
+  const restoreLimitKeys = [
+    "maxActiveRestores",
+    "maxRestoresPerSession",
+    "maxRestoreMillis",
+    "maxRestorePullMillis",
+    "maxRestoreCoalesceMillis",
+    "maxRestoreErrorBytes"
+  ] as const
 
   it.effect("requires and provides validated owner limits", () =>
     Effect.gen(function*() {
       assert.deepStrictEqual(yield* ReplicaLimits.ReplicaLimits, values)
     }).pipe(Effect.provide(ReplicaLimits.layer(values))))
+
+  it.effect("accepts feasible safe integer boundaries and rejects fractions", () =>
+    Effect.gen(function*() {
+      const lowerBoundaries = {
+        ...values,
+        maxActiveRestores: 1,
+        maxRestoresPerSession: 1,
+        maxRestoreMillis: 1,
+        maxRestorePullMillis: 2,
+        maxRestoreCoalesceMillis: 1,
+        maxRestoreErrorBytes: ReplicaLimits.minimumRestoreErrorBytes
+      }
+      const upperBoundaries = {
+        ...values,
+        maxActiveRestores: Number.MAX_SAFE_INTEGER,
+        maxRestoresPerSession: Number.MAX_SAFE_INTEGER,
+        maxRestoreMillis: Number.MAX_SAFE_INTEGER,
+        maxRestorePullMillis: Number.MAX_SAFE_INTEGER,
+        maxRestoreCoalesceMillis: Number.MAX_SAFE_INTEGER - 1,
+        maxRestoreErrorBytes: Number.MAX_SAFE_INTEGER
+      }
+
+      assert.strictEqual((yield* Effect.exit(ReplicaLimits.make(lowerBoundaries)))._tag, "Success")
+      assert.strictEqual((yield* Effect.exit(ReplicaLimits.make(upperBoundaries)))._tag, "Success")
+
+      for (const key of restoreLimitKeys) {
+        assert.strictEqual(
+          (yield* Effect.exit(ReplicaLimits.make({
+            ...lowerBoundaries,
+            [key]: lowerBoundaries[key] + 0.5
+          })))._tag,
+          "Failure"
+        )
+      }
+    }))
+
+  it.effect("requires every restore limit at the runtime schema boundary", () =>
+    Effect.gen(function*() {
+      for (const key of restoreLimitKeys) {
+        const input: Record<string, unknown> = { ...values }
+        delete input[key]
+
+        const error = yield* Schema.decodeUnknownEffect(ReplicaLimits.Values)(input).pipe(Effect.flip)
+        assert.include(error.message, "Missing key")
+        assert.include(error.message, `at ["${key}"]`)
+      }
+    }))
 
   it.effect("rejects nonpositive and unsafe limits", () =>
     Effect.gen(function*() {
@@ -65,10 +121,6 @@ describe("ReplicaLimits", () => {
       )
       assert.strictEqual(
         (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestoreCoalesceMillis: 0 })))._tag,
-        "Failure"
-      )
-      assert.strictEqual(
-        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestoreErrorBytes: 0 })))._tag,
         "Failure"
       )
       assert.strictEqual(

@@ -1,7 +1,7 @@
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
-import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
+import * as SchemaGetter from "effect/SchemaGetter"
 
 export const RestoreNonce = Schema.String.check(
   Schema.isPattern(/^rst_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
@@ -18,6 +18,8 @@ export const BoundedErrorDescription = Schema.Struct({
   message: Schema.String
 })
 export type BoundedErrorDescription = typeof BoundedErrorDescription.Type
+
+export const maxPageStagingBytes = 64 * 1024
 
 const DocumentNotFound = Schema.TaggedStruct("DocumentNotFound", {
   documentId: Identity.DocumentId
@@ -142,26 +144,8 @@ export const SourceFailure = Schema.TaggedStruct("SourceFailure", {
 })
 export type SourceFailure = typeof SourceFailure.Type
 
-export const TerminalSuccess = Schema.TaggedStruct("TerminalSuccess", fields)
-export type TerminalSuccess = typeof TerminalSuccess.Type
-
-export const TerminalSessionFailure = Schema.TaggedStruct("TerminalSessionFailure", {
-  ...fields,
-  error: RestoreWireError
-})
-export type TerminalSessionFailure = typeof TerminalSessionFailure.Type
-
-export const TerminalRestoreFailure = Schema.TaggedStruct("TerminalRestoreFailure", {
-  ...fields,
-  error: RestoreWireError
-})
-export type TerminalRestoreFailure = typeof TerminalRestoreFailure.Type
-
-export const TerminalDefect = Schema.TaggedStruct("TerminalDefect", {
-  ...fields,
-  defect: BoundedErrorDescription
-})
-export type TerminalDefect = typeof TerminalDefect.Type
+export const TerminalReady = Schema.TaggedStruct("TerminalReady", fields)
+export type TerminalReady = typeof TerminalReady.Type
 
 export const TerminalAck = Schema.TaggedStruct("TerminalAck", fields)
 export type TerminalAck = typeof TerminalAck.Type
@@ -184,37 +168,82 @@ export type PageToOwnerFrame = typeof PageToOwnerFrame.Type
 
 export const OwnerToPageFrame = Schema.Union([
   Pull,
-  TerminalSuccess,
-  TerminalSessionFailure,
-  TerminalRestoreFailure,
-  TerminalDefect,
+  TerminalReady,
   Released
 ])
 export type OwnerToPageFrame = typeof OwnerToPageFrame.Type
 
-export const RestoreFrame = Schema.Union([PageToOwnerFrame, OwnerToPageFrame])
-export type RestoreFrame = typeof RestoreFrame.Type
+type StructWithFields = {
+  readonly fields: Readonly<Record<string, unknown>>
+}
+
+const fieldMetadata = (
+  schemas: Readonly<Record<string, StructWithFields>>
+): Readonly<Record<string, ReadonlySet<string>>> =>
+  Object.freeze(
+    Object.fromEntries(
+      Object.entries(schemas).map(([tag, schema]) => [
+        tag,
+        new Set(Object.keys(schema.fields))
+      ])
+    )
+  )
+
+export const restoreWireErrorFields = fieldMetadata({
+  DocumentNotFound,
+  DocumentDecodeError,
+  DocumentEncodeError,
+  UnsupportedDocumentVersion,
+  ProjectionBlocked,
+  CommandIdConflict,
+  ReceiptOperationMismatch,
+  StorageUnavailable,
+  CanonicalEncodeError,
+  StorageCorrupt,
+  QuotaExceeded,
+  MigrationFailed,
+  BackupInvalid,
+  BackupTooLarge,
+  RestoreBusy,
+  RestoreFailed,
+  ProtocolMismatch,
+  ReplicaFenced,
+  OperationTimeout
+})
+
+export const boundedErrorDescriptionFields: ReadonlySet<string> = new Set(
+  Object.keys(BoundedErrorDescription.fields)
+)
+
+export const pageToOwnerFrameFields = fieldMetadata({
+  Start,
+  Chunk,
+  End,
+  SourceFailure,
+  TerminalAck,
+  ReleasedAck
+})
+
+export const ownerToPageFrameFields = fieldMetadata({
+  Pull,
+  TerminalReady,
+  Released
+})
 
 const encoder = new TextEncoder()
 const utf8Bytes = (value: string): number => encoder.encode(value).byteLength
 
 const truncateUtf8 = (value: string, maxBytes: number): string => {
   if (maxBytes <= 0) return ""
-  if (encoder.encode(value).byteLength <= maxBytes) return value
   let result = ""
+  let bytes = 0
   for (const character of value) {
-    if (encoder.encode(result + character).byteLength > maxBytes) break
+    const characterBytes = utf8Bytes(character)
+    if (bytes + characterBytes > maxBytes) break
     result += character
+    bytes += characterBytes
   }
   return result
-}
-
-const safeString = (value: unknown, fallback: string): string => {
-  try {
-    return typeof value === "string" ? value : String(value)
-  } catch {
-    return fallback
-  }
 }
 
 const emptyErrorDescription: BoundedErrorDescription = { name: "", message: "" }
@@ -229,20 +258,9 @@ const payloadStringBytes = (value: unknown): number => {
   return total
 }
 
-const encodeDefectText = (defect: unknown, maxBytes: number): BoundedErrorDescription => {
-  let name = "Error"
-  let message = "Unknown failure"
-  try {
-    if (typeof defect === "object" && defect !== null) {
-      name = safeString(Reflect.get(defect, "name"), "Error")
-      message = safeString(Reflect.get(defect, "message"), "Unknown failure")
-    } else {
-      message = safeString(defect, "Unknown failure")
-    }
-  } catch {
-    name = "Error"
-    message = "Unknown failure"
-  }
+const encodeDefectText = (_defect: unknown, maxBytes: number): BoundedErrorDescription => {
+  const name = "Error"
+  const message = "Failure details redacted"
   const nameBudget = Math.min(128, Math.max(0, Math.floor(maxBytes / 4)))
   const boundedName = truncateUtf8(name, nameBudget)
   const remaining = Math.max(0, maxBytes - utf8Bytes(boundedName))
@@ -549,11 +567,87 @@ export const replicaErrorFromWire = (wire: RestoreWireError): ReplicaError.Repli
   return new ReplicaError.ReplicaError({ reason })
 }
 
-export const decodeReplicaError = (
-  wire: RestoreWireError
-): Effect.Effect<never, ReplicaError.ReplicaError> => Effect.fail(replicaErrorFromWire(wire))
+export class RestoreResultSessionFailure extends Schema.TaggedErrorClass<RestoreResultSessionFailure>(
+  "@lucas-barake/effect-local-browser/RestoreResultSessionFailure"
+)("RestoreResultSessionFailure", {
+  error: RestoreWireError
+}) {}
 
-export const preflight = (
+export class RestoreResultRestoreFailure extends Schema.TaggedErrorClass<RestoreResultRestoreFailure>(
+  "@lucas-barake/effect-local-browser/RestoreResultRestoreFailure"
+)("RestoreResultRestoreFailure", {
+  error: RestoreWireError
+}) {}
+
+export const RestoreResultFailure = Schema.Union([
+  RestoreResultSessionFailure,
+  RestoreResultRestoreFailure
+])
+export type RestoreResultFailure = typeof RestoreResultFailure.Type
+
+const RedactedRestoreDefect = Schema.Struct({
+  _tag: Schema.Literal("RestoreDefect")
+})
+
+export const RestoreResultDefect = Schema.Unknown.pipe(
+  Schema.encodeTo(RedactedRestoreDefect, {
+    decode: SchemaGetter.transform(() => new Error("Restore failure details redacted")),
+    encode: SchemaGetter.transform(() => ({ _tag: "RestoreDefect" as const }))
+  })
+)
+
+const ownExactProperties = (
+  input: unknown,
+  fields: ReadonlySet<string>
+): ReadonlyMap<string, unknown> | undefined => {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return undefined
+  try {
+    const properties = new Map<string, unknown>()
+    for (const key in input) {
+      if (!Object.prototype.hasOwnProperty.call(input, key)) continue
+      if (properties.size >= fields.size || !fields.has(key)) return undefined
+      const descriptor = Object.getOwnPropertyDescriptor(input, key)
+      if (descriptor === undefined || !("value" in descriptor)) return undefined
+      properties.set(key, descriptor.value)
+    }
+    return properties.size === fields.size ? properties : undefined
+  } catch {
+    return undefined
+  }
+}
+
+const preflightBoundedErrorDescription = (
+  input: unknown
+): boolean => {
+  const properties = ownExactProperties(input, boundedErrorDescriptionFields)
+  return properties !== undefined &&
+    typeof properties.get("name") === "string" &&
+    typeof properties.get("message") === "string"
+}
+
+export const preflightReplicaError = (
+  input: unknown,
+  maxStringBytes: number
+): boolean => {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return false
+  let tag: unknown
+  try {
+    tag = Reflect.get(input, "_tag")
+  } catch {
+    return false
+  }
+  if (typeof tag !== "string") return false
+  const fields = restoreWireErrorFields[tag]
+  if (fields === undefined) return false
+  const properties = ownExactProperties(input, fields)
+  if (properties === undefined) return false
+  if (properties.has("cause") && !preflightBoundedErrorDescription(properties.get("cause"))) {
+    return false
+  }
+  return preflightPayload(input, maxStringBytes)
+}
+
+const preflightPayload = (
   input: unknown,
   maxStringBytes: number
 ): boolean => {
@@ -596,14 +690,18 @@ export const preflight = (
             pending.push([Reflect.get(value, index), depth + 1])
           }
         } else {
-          const keys = Reflect.ownKeys(value)
-          if (keys.length > 16 || keys.some((key) => typeof key !== "string")) return false
-          for (const key of keys) {
+          let propertyCount = 0
+          for (const key in value) {
+            if (!Object.prototype.hasOwnProperty.call(value, key)) continue
+            propertyCount += 1
+            if (propertyCount > 16) return false
             const remaining = maxStringBytes - stringBytes
-            if ((key as string).length > remaining) return false
-            stringBytes += encoder.encode(key as string).byteLength
+            if (key.length > remaining) return false
+            stringBytes += encoder.encode(key).byteLength
             if (stringBytes > maxStringBytes) return false
-            pending.push([Reflect.get(value, key), depth + 1])
+            const descriptor = Object.getOwnPropertyDescriptor(value, key)
+            if (descriptor === undefined || !("value" in descriptor)) return false
+            pending.push([descriptor.value, depth + 1])
           }
         }
       }
@@ -612,4 +710,22 @@ export const preflight = (
   } catch {
     return false
   }
+}
+
+export const preflight = (
+  input: unknown,
+  maxStringBytes: number
+): boolean => {
+  if (typeof input === "object" && input !== null && !Array.isArray(input)) {
+    let tag: unknown
+    try {
+      tag = Reflect.get(input, "_tag")
+    } catch {
+      return false
+    }
+    if (typeof tag === "string" && restoreWireErrorFields[tag] !== undefined) {
+      return preflightReplicaError(input, maxStringBytes)
+    }
+  }
+  return preflightPayload(input, maxStringBytes)
 }

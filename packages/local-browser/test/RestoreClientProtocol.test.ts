@@ -27,7 +27,9 @@ const rpcClient = (
     readonly nonce: RestoreProtocol.RestoreNonce
     readonly port: MessagePort
   }>,
-  maxRestoreErrorBytes = 4_096
+  maxRestoreErrorBytes = 4_096,
+  maxChunkBytes = 4,
+  finish: () => Effect.Effect<void, RestoreProtocol.RestoreResultFailure> = () => Effect.void
 ) =>
   ({
     OpenSession: () =>
@@ -36,13 +38,14 @@ const rpcClient = (
         protocolVersion: ReplicaRpc.protocolVersion,
         definitionHash: definition.hash,
         ownerEpoch: "owner",
-        maxChunkBytes: 4,
+        maxChunkBytes,
         maxRestoreCoalesceMillis: 25,
         maxRestoreErrorBytes
       }),
     RenewSession: () => Effect.succeed({ leaseMillis: 10_000 }),
     CloseSession: () => Effect.void,
-    BeginRestoreBackupV4: begin
+    BeginRestoreBackupV4: begin,
+    FinishRestoreBackupV4: finish
   }) as unknown as RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>
 
 it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
@@ -81,8 +84,8 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
               return
             case "End":
               channel.port2.postMessage(
-                Schema.encodeSync(RestoreProtocol.TerminalSuccess)({
-                  _tag: "TerminalSuccess",
+                Schema.encodeSync(RestoreProtocol.TerminalReady)({
+                  _tag: "TerminalReady",
                   nonce,
                   sequence: sequence(frame.sequence + 1)
                 })
@@ -140,6 +143,117 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       assert.deepStrictEqual(Array.from(backing), [99, 1, 2, 3, 88])
     })))
 
+  it.effect("does not allocate the advertised chunk limit for an empty source", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const channel = new MessageChannel()
+      yield* Effect.addFinalizer(() => Effect.sync(() => channel.port2.close()))
+      channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
+        const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
+        if (frame._tag === "Start") {
+          channel.port2.postMessage(
+            Schema.encodeSync(RestoreProtocol.Pull)({
+              _tag: "Pull",
+              nonce,
+              sequence: sequence(1)
+            })
+          )
+        } else if (frame._tag === "End") {
+          channel.port2.postMessage(
+            Schema.encodeSync(RestoreProtocol.TerminalReady)({
+              _tag: "TerminalReady",
+              nonce,
+              sequence: sequence(2)
+            })
+          )
+        } else if (frame._tag === "TerminalAck") {
+          channel.port2.postMessage(
+            Schema.encodeSync(RestoreProtocol.Released)({
+              _tag: "Released",
+              nonce,
+              sequence: sequence(3)
+            })
+          )
+        }
+      })
+      channel.port2.start()
+      const client = yield* ReplicaClient.fromRpcClient(
+        definition,
+        rpcClient(
+          () => Effect.succeed({ nonce, port: channel.port1 }),
+          4_096,
+          Number.MAX_SAFE_INTEGER
+        )
+      )
+
+      yield* client.restoreBackup({
+        source: Stream.empty,
+        mode: "replace",
+        maxBytes: Number.MAX_SAFE_INTEGER,
+        expectedDefinitionHash: definition.hash,
+        installationId
+      })
+    })))
+
+  it.effect("does not acknowledge TerminalReady until the Finish result is accepted", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const channel = new MessageChannel()
+      yield* Effect.addFinalizer(() => Effect.sync(() => channel.port2.close()))
+      const finishStarted = yield* Deferred.make<void>()
+      const completeFinish = yield* Deferred.make<void>()
+      const terminalSent = yield* Deferred.make<void>()
+      const terminalAck = yield* Deferred.make<void>()
+      channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
+        const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
+        if (frame._tag === "Start") {
+          channel.port2.postMessage(
+            Schema.encodeSync(RestoreProtocol.TerminalReady)({
+              _tag: "TerminalReady",
+              nonce,
+              sequence: sequence(1)
+            })
+          )
+          Deferred.doneUnsafe(terminalSent, Effect.void)
+        } else if (frame._tag === "TerminalAck") {
+          Deferred.doneUnsafe(terminalAck, Effect.void)
+          channel.port2.postMessage(
+            Schema.encodeSync(RestoreProtocol.Released)({
+              _tag: "Released",
+              nonce,
+              sequence: sequence(2)
+            })
+          )
+        }
+      })
+      channel.port2.start()
+      const client = yield* ReplicaClient.fromRpcClient(
+        definition,
+        rpcClient(
+          () => Effect.succeed({ nonce, port: channel.port1 }),
+          4_096,
+          4,
+          () =>
+            Deferred.succeed(finishStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(completeFinish))
+            )
+        )
+      )
+      const restore = yield* client.restoreBackup({
+        source: Stream.never,
+        mode: "replace",
+        maxBytes: 64,
+        expectedDefinitionHash: definition.hash,
+        installationId
+      }).pipe(Effect.forkChild({ startImmediately: true }))
+
+      yield* Deferred.await(finishStarted)
+      yield* Deferred.await(terminalSent)
+      yield* Effect.yieldNow
+      assert.isFalse(yield* Deferred.isDone(terminalAck))
+      yield* Deferred.succeed(completeFinish, undefined)
+      yield* Deferred.await(terminalAck)
+      yield* Fiber.join(restore)
+    })))
+
   it.effect("fails closed on an out of order owner frame", () =>
     Effect.scoped(Effect.gen(function*() {
       const channel = new MessageChannel()
@@ -158,7 +272,12 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       channel.port2.start()
       const client = yield* ReplicaClient.fromRpcClient(
         definition,
-        rpcClient(() => Effect.succeed({ nonce, port: channel.port1 }))
+        rpcClient(
+          () => Effect.succeed({ nonce, port: channel.port1 }),
+          4_096,
+          4,
+          () => Effect.never
+        )
       )
       const error = yield* client.restoreBackup({
         source: Stream.never,
@@ -191,7 +310,12 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       channel.port2.start()
       const client = yield* ReplicaClient.fromRpcClient(
         definition,
-        rpcClient(() => Effect.succeed({ nonce, port: channel.port1 }))
+        rpcClient(
+          () => Effect.succeed({ nonce, port: channel.port1 }),
+          4_096,
+          4,
+          () => Effect.never
+        )
       )
       const restore = yield* client.restoreBackup({
         source: Stream.fromEffect(
@@ -244,7 +368,12 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       channel.port2.start()
       const client = yield* ReplicaClient.fromRpcClient(
         definition,
-        rpcClient(() => Effect.succeed({ nonce, port: channel.port1 }))
+        rpcClient(
+          () => Effect.succeed({ nonce, port: channel.port1 }),
+          4_096,
+          4,
+          () => Effect.never
+        )
       )
       const source = Stream.make(Uint8Array.of(1)).pipe(
         Stream.concat(Stream.fromEffect(
@@ -271,49 +400,864 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       if (Exit.isFailure(exit)) assert.strictEqual(Cause.squash(exit.cause), sentinel)
     })))
 
-  it.effect("closes the transferred port once when interrupted at its acquisition boundary", () =>
+  it.effect("preserves a retained source pull typed failure combined with a defect", () =>
     Effect.scoped(Effect.gen(function*() {
-      const beginReady = yield* Deferred.make<void>()
-      const releaseBegin = yield* Deferred.make<void>()
-      const acquired = yield* Deferred.make<void>()
-      let peerCloseCount = 0
-      let restore: Fiber.Fiber<void, ReplicaError.ReplicaError> | undefined
-      const port = {
-        addEventListener() {},
-        removeEventListener() {},
-        start() {},
-        postMessage() {},
-        get close() {
-          queueMicrotask(() => Deferred.doneUnsafe(acquired, Effect.void))
-          return () => {
-            peerCloseCount++
-          }
+      const channel = new MessageChannel()
+      yield* Effect.addFinalizer(() => Effect.sync(() => channel.port2.close()))
+      const pendingStarted = yield* Deferred.make<void>()
+      const releaseFailure = yield* Deferred.make<void>()
+      const firstChunk = yield* Deferred.make<void>()
+      const sentinel = new Error("retained composite source defect")
+      const sourceFailure = new ReplicaError.ReplicaError({
+        reason: new ReplicaError.RestoreBusy({ replica: "retained" })
+      })
+      channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
+        const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
+        if (frame._tag === "Start") {
+          channel.port2.postMessage(
+            Schema.encodeSync(RestoreProtocol.Pull)({
+              _tag: "Pull",
+              nonce,
+              sequence: sequence(1)
+            })
+          )
+        } else if (frame._tag === "Chunk") {
+          assert.deepStrictEqual(Array.from(frame.bytes), [1])
+          Deferred.doneUnsafe(firstChunk, Effect.void)
         }
-      } as unknown as MessagePort
+      })
+      channel.port2.start()
       const client = yield* ReplicaClient.fromRpcClient(
         definition,
-        rpcClient(() =>
-          Deferred.succeed(beginReady, undefined).pipe(
-            Effect.andThen(Deferred.await(releaseBegin)),
-            Effect.as({ nonce, port }),
-            Effect.uninterruptible
-          )
+        rpcClient(
+          () => Effect.succeed({ nonce, port: channel.port1 }),
+          4_096,
+          4,
+          () => Effect.never
         )
       )
-      restore = yield* client.restoreBackup({
-        source: Stream.never,
+      const composite = Cause.fromReasons([
+        Cause.makeFailReason(sourceFailure),
+        Cause.makeDieReason(sentinel)
+      ])
+      const source = Stream.make(Uint8Array.of(1)).pipe(
+        Stream.concat(Stream.fromEffect(
+          Deferred.succeed(pendingStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseFailure)),
+            Effect.andThen(Effect.failCause(composite))
+          )
+        ))
+      )
+      const restore = yield* client.restoreBackup({
+        source,
         mode: "replace",
         maxBytes: 64,
         expectedDefinitionHash: definition.hash,
         installationId
       }).pipe(Effect.forkChild)
 
-      yield* Deferred.await(beginReady)
-      yield* Deferred.succeed(releaseBegin, undefined)
-      yield* Deferred.await(acquired)
+      yield* Deferred.await(pendingStarted)
+      yield* TestClock.adjust(25)
+      yield* Deferred.await(firstChunk)
+      yield* Deferred.succeed(releaseFailure, undefined)
+      const exit = yield* Fiber.await(restore)
+      assert.isTrue(Exit.isFailure(exit))
+      if (Exit.isFailure(exit)) {
+        assert.deepStrictEqual(exit.cause.reasons.map((reason) => reason._tag), ["Fail", "Die"])
+        assert.strictEqual(Cause.findErrorOption(exit.cause)._tag, "Some")
+        const defect = exit.cause.reasons.find(Cause.isDieReason)
+        assert.strictEqual(defect?.defect, sentinel)
+      }
+    })))
+
+  it.effect("finalizes the transferred port, source pull, and Finish work when interrupted", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const channel = new MessageChannel()
+      yield* Effect.addFinalizer(() => Effect.sync(() => channel.port2.close()))
+      const startReceived = yield* Deferred.make<void>()
+      const sourceStarted = yield* Deferred.make<void>()
+      const sourceFinalized = yield* Deferred.make<void>()
+      const finishStarted = yield* Deferred.make<void>()
+      const finishFinalized = yield* Deferred.make<void>()
+      const peerClosed = yield* Deferred.make<void>()
+      channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
+        const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
+        if (frame._tag === "Start") Deferred.doneUnsafe(startReceived, Effect.void)
+      })
+      channel.port2.addEventListener("close", () => {
+        Deferred.doneUnsafe(peerClosed, Effect.void)
+      })
+      channel.port2.start()
+      const client = yield* ReplicaClient.fromRpcClient(
+        definition,
+        rpcClient(
+          () => Effect.succeed({ nonce, port: channel.port1 }),
+          4_096,
+          4,
+          () =>
+            Deferred.succeed(finishStarted, undefined).pipe(
+              Effect.andThen(Effect.never),
+              Effect.ensuring(Deferred.succeed(finishFinalized, undefined))
+            )
+        )
+      )
+      const source = Stream.fromEffect(
+        Deferred.succeed(sourceStarted, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.ensuring(Deferred.succeed(sourceFinalized, undefined))
+        )
+      )
+      const restore = yield* client.restoreBackup({
+        source,
+        mode: "replace",
+        maxBytes: 64,
+        expectedDefinitionHash: definition.hash,
+        installationId
+      }).pipe(Effect.forkChild({ startImmediately: true }))
+
+      yield* Deferred.await(startReceived)
+      channel.port2.postMessage(
+        Schema.encodeSync(RestoreProtocol.Pull)({
+          _tag: "Pull",
+          nonce,
+          sequence: sequence(1)
+        })
+      )
+      yield* Deferred.await(sourceStarted)
+      yield* Deferred.await(finishStarted)
       yield* Fiber.interrupt(restore)
 
-      assert.strictEqual(peerCloseCount, 1)
+      yield* Deferred.await(peerClosed)
+      yield* Effect.yieldNow
+      assert.isTrue(yield* Deferred.isDone(finishFinalized))
+      assert.isTrue(yield* Deferred.isDone(sourceFinalized))
+    })))
+
+  it.effect("times out pending Finish work after TerminalReady and releases the source and port", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const channel = new MessageChannel()
+      yield* Effect.addFinalizer(() => Effect.sync(() => channel.port2.close()))
+      const startReceived = yield* Deferred.make<void>()
+      const sourceStarted = yield* Deferred.make<void>()
+      const sourceFinalized = yield* Deferred.make<void>()
+      const finishStarted = yield* Deferred.make<void>()
+      const finishFinalized = yield* Deferred.make<void>()
+      const peerClosed = yield* Deferred.make<void>()
+      channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
+        const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
+        if (frame._tag === "Start") Deferred.doneUnsafe(startReceived, Effect.void)
+      })
+      channel.port2.addEventListener("close", () => {
+        Deferred.doneUnsafe(peerClosed, Effect.void)
+      })
+      channel.port2.start()
+      const client = yield* ReplicaClient.fromRpcClient(
+        definition,
+        rpcClient(
+          () => Effect.succeed({ nonce, port: channel.port1 }),
+          4_096,
+          4,
+          () =>
+            Deferred.succeed(finishStarted, undefined).pipe(
+              Effect.andThen(Effect.never),
+              Effect.ensuring(Deferred.succeed(finishFinalized, undefined))
+            )
+        ),
+        { operationTimeout: "1 second" }
+      )
+      const source = Stream.fromEffect(
+        Deferred.succeed(sourceStarted, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.ensuring(Deferred.succeed(sourceFinalized, undefined))
+        )
+      )
+      const restore = yield* client.restoreBackup({
+        source,
+        mode: "replace",
+        maxBytes: 64,
+        expectedDefinitionHash: definition.hash,
+        installationId
+      }).pipe(Effect.forkChild({ startImmediately: true }))
+
+      yield* Deferred.await(startReceived)
+      channel.port2.postMessage(
+        Schema.encodeSync(RestoreProtocol.Pull)({
+          _tag: "Pull",
+          nonce,
+          sequence: sequence(1)
+        })
+      )
+      yield* Deferred.await(sourceStarted)
+      yield* Deferred.await(finishStarted)
+      channel.port2.postMessage(
+        Schema.encodeSync(RestoreProtocol.TerminalReady)({
+          _tag: "TerminalReady",
+          nonce,
+          sequence: sequence(2)
+        })
+      )
+      yield* Effect.yieldNow
+      yield* TestClock.adjust("1 second")
+      const error = yield* Fiber.join(restore).pipe(Effect.flip)
+
+      assert.strictEqual(error.reason._tag, "OperationTimeout")
+      if (error.reason._tag === "OperationTimeout") {
+        assert.strictEqual(error.reason.operation, "RestoreBackup")
+        assert.strictEqual(error.reason.timeoutMillis, 1_000)
+      }
+      yield* Deferred.await(peerClosed)
+      yield* Deferred.await(sourceFinalized)
+      yield* Deferred.await(finishFinalized)
+    })))
+
+  it.effect("fails without replay and finalizes pending work on messageerror before TerminalReady", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const channel = new MessageChannel()
+      yield* Effect.addFinalizer(() => Effect.sync(() => channel.port2.close()))
+      const startReceived = yield* Deferred.make<void>()
+      const releaseSource = yield* Deferred.make<void>()
+      const sourceStarted = yield* Deferred.make<void>()
+      const sourceFinalized = yield* Deferred.make<void>()
+      const releaseFinish = yield* Deferred.make<void>()
+      const finishStarted = yield* Deferred.make<void>()
+      const finishFinalized = yield* Deferred.make<void>()
+      let beginCalls = 0
+      let finishCalls = 0
+      let sourcePulls = 0
+      channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
+        const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
+        if (frame._tag === "Start") Deferred.doneUnsafe(startReceived, Effect.void)
+      })
+      channel.port2.start()
+      const client = yield* ReplicaClient.fromRpcClient(
+        definition,
+        rpcClient(
+          () =>
+            Effect.sync(() => {
+              beginCalls++
+              return { nonce, port: channel.port1 }
+            }),
+          4_096,
+          4,
+          () =>
+            Effect.sync(() => {
+              finishCalls++
+            }).pipe(
+              Effect.andThen(Deferred.succeed(finishStarted, undefined)),
+              Effect.andThen(Deferred.await(releaseFinish)),
+              Effect.ensuring(Deferred.succeed(finishFinalized, undefined))
+            )
+        )
+      )
+      const restore = yield* client.restoreBackup({
+        source: Stream.fromEffect(
+          Effect.sync(() => {
+            sourcePulls++
+          }).pipe(
+            Effect.andThen(Deferred.succeed(sourceStarted, undefined)),
+            Effect.andThen(Deferred.await(releaseSource)),
+            Effect.as(Uint8Array.of(1)),
+            Effect.ensuring(Deferred.succeed(sourceFinalized, undefined))
+          )
+        ),
+        mode: "replace",
+        maxBytes: 64,
+        expectedDefinitionHash: definition.hash,
+        installationId
+      }).pipe(Effect.forkChild({ startImmediately: true }))
+
+      yield* Deferred.await(startReceived)
+      channel.port2.postMessage(
+        Schema.encodeSync(RestoreProtocol.Pull)({
+          _tag: "Pull",
+          nonce,
+          sequence: sequence(1)
+        })
+      )
+      yield* Deferred.await(sourceStarted)
+      yield* Deferred.await(finishStarted)
+      channel.port1.dispatchEvent(new MessageEvent("messageerror"))
+      const error = yield* Fiber.join(restore).pipe(Effect.flip)
+
+      assert.strictEqual(error.reason._tag, "StorageUnavailable")
+      if (error.reason._tag === "StorageUnavailable") {
+        assert.instanceOf(error.reason.cause, Error)
+        if (error.reason.cause instanceof Error) {
+          assert.strictEqual(error.reason.cause.message, "restore channel message decoding failed")
+        }
+      }
+      yield* Deferred.await(sourceFinalized)
+      yield* Deferred.await(finishFinalized)
+      channel.port2.postMessage(
+        Schema.encodeSync(RestoreProtocol.Pull)({
+          _tag: "Pull",
+          nonce,
+          sequence: sequence(2)
+        })
+      )
+      yield* Effect.yieldNow
+      assert.strictEqual(sourcePulls, 1)
+      assert.strictEqual(finishCalls, 1)
+      assert.strictEqual(beginCalls, 1)
+    })))
+
+  it.effect("preserves an authoritative Finish failure when the peer closes before TerminalReady", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const channel = new MessageChannel()
+      yield* Effect.addFinalizer(() => Effect.sync(() => channel.port2.close()))
+      const startReceived = yield* Deferred.make<void>()
+      const releaseSource = yield* Deferred.make<void>()
+      const sourceStarted = yield* Deferred.make<void>()
+      const sourceFinalized = yield* Deferred.make<void>()
+      const finishResult = yield* Deferred.make<void, RestoreProtocol.RestoreResultFailure>()
+      const finishStarted = yield* Deferred.make<void>()
+      const finishFinalized = yield* Deferred.make<void>()
+      let beginCalls = 0
+      let finishCalls = 0
+      let sourcePulls = 0
+      let terminalAckCalls = 0
+      channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
+        const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
+        if (frame._tag === "Start") {
+          Deferred.doneUnsafe(startReceived, Effect.void)
+        } else if (frame._tag === "TerminalAck") {
+          terminalAckCalls++
+        }
+      })
+      channel.port2.start()
+      const client = yield* ReplicaClient.fromRpcClient(
+        definition,
+        rpcClient(
+          () =>
+            Effect.sync(() => {
+              beginCalls++
+              return { nonce, port: channel.port1 }
+            }),
+          4_096,
+          4,
+          () =>
+            Effect.sync(() => {
+              finishCalls++
+            }).pipe(
+              Effect.andThen(Deferred.succeed(finishStarted, undefined)),
+              Effect.andThen(Deferred.await(finishResult)),
+              Effect.ensuring(Deferred.succeed(finishFinalized, undefined))
+            )
+        )
+      )
+      const restore = yield* client.restoreBackup({
+        source: Stream.fromEffect(
+          Effect.sync(() => {
+            sourcePulls++
+          }).pipe(
+            Effect.andThen(Deferred.succeed(sourceStarted, undefined)),
+            Effect.andThen(Deferred.await(releaseSource)),
+            Effect.as(Uint8Array.of(1)),
+            Effect.ensuring(Deferred.succeed(sourceFinalized, undefined))
+          )
+        ),
+        mode: "replace",
+        maxBytes: 64,
+        expectedDefinitionHash: definition.hash,
+        installationId
+      }).pipe(Effect.forkChild({ startImmediately: true }))
+
+      yield* Deferred.await(startReceived)
+      channel.port2.postMessage(
+        Schema.encodeSync(RestoreProtocol.Pull)({
+          _tag: "Pull",
+          nonce,
+          sequence: sequence(1)
+        })
+      )
+      yield* Deferred.await(sourceStarted)
+      yield* Deferred.await(finishStarted)
+      yield* Deferred.fail(
+        finishResult,
+        new RestoreProtocol.RestoreResultRestoreFailure({
+          error: {
+            _tag: "BackupTooLarge",
+            limit: 64,
+            observed: 65
+          }
+        })
+      )
+      yield* Deferred.await(finishFinalized)
+      yield* Effect.yieldNow
+      channel.port2.close()
+      const error = yield* Fiber.join(restore).pipe(Effect.flip)
+
+      assert.strictEqual(error.reason._tag, "BackupTooLarge")
+      if (error.reason._tag === "BackupTooLarge") {
+        assert.strictEqual(error.reason.limit, 64)
+        assert.strictEqual(error.reason.observed, 65)
+      }
+      yield* Deferred.await(sourceFinalized)
+      assert.strictEqual(terminalAckCalls, 0)
+      assert.strictEqual(sourcePulls, 1)
+      assert.strictEqual(finishCalls, 1)
+      assert.strictEqual(beginCalls, 1)
+    })))
+
+  it.effect("preserves an authoritative Finish failure when an outstanding source pull defects", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const channel = new MessageChannel()
+      yield* Effect.addFinalizer(() => Effect.sync(() => channel.port2.close()))
+      const startReceived = yield* Deferred.make<void>()
+      const peerClosed = yield* Deferred.make<void>()
+      const releaseSource = yield* Deferred.make<void>()
+      const sourceStarted = yield* Deferred.make<void>()
+      const sourceFinalized = yield* Deferred.make<void>()
+      const finishResult = yield* Deferred.make<void, RestoreProtocol.RestoreResultFailure>()
+      const finishStarted = yield* Deferred.make<void>()
+      const finishFinalized = yield* Deferred.make<void>()
+      const sourceDefect = new Error("source failed after authoritative Finish")
+      let beginCalls = 0
+      let finishCalls = 0
+      let sourcePulls = 0
+      let terminalAckCalls = 0
+      channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
+        const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
+        if (frame._tag === "Start") {
+          Deferred.doneUnsafe(startReceived, Effect.void)
+        } else if (frame._tag === "TerminalAck") {
+          terminalAckCalls++
+        }
+      })
+      channel.port2.addEventListener("close", () => {
+        Deferred.doneUnsafe(peerClosed, Effect.void)
+      })
+      channel.port2.start()
+      const client = yield* ReplicaClient.fromRpcClient(
+        definition,
+        rpcClient(
+          () =>
+            Effect.sync(() => {
+              beginCalls++
+              return { nonce, port: channel.port1 }
+            }),
+          4_096,
+          4,
+          () =>
+            Effect.sync(() => {
+              finishCalls++
+            }).pipe(
+              Effect.andThen(Deferred.succeed(finishStarted, undefined)),
+              Effect.andThen(Deferred.await(finishResult)),
+              Effect.ensuring(Deferred.succeed(finishFinalized, undefined))
+            )
+        )
+      )
+      const restore = yield* client.restoreBackup({
+        source: Stream.fromEffect(
+          Effect.sync(() => {
+            sourcePulls++
+          }).pipe(
+            Effect.andThen(Deferred.succeed(sourceStarted, undefined)),
+            Effect.andThen(Deferred.await(releaseSource)),
+            Effect.andThen(Effect.die(sourceDefect)),
+            Effect.ensuring(Deferred.succeed(sourceFinalized, undefined))
+          )
+        ),
+        mode: "replace",
+        maxBytes: 64,
+        expectedDefinitionHash: definition.hash,
+        installationId
+      }).pipe(Effect.forkChild({ startImmediately: true }))
+
+      yield* Deferred.await(startReceived)
+      channel.port2.postMessage(
+        Schema.encodeSync(RestoreProtocol.Pull)({
+          _tag: "Pull",
+          nonce,
+          sequence: sequence(1)
+        })
+      )
+      yield* Deferred.await(sourceStarted)
+      yield* Deferred.await(finishStarted)
+      yield* Deferred.fail(
+        finishResult,
+        new RestoreProtocol.RestoreResultRestoreFailure({
+          error: {
+            _tag: "BackupTooLarge",
+            limit: 64,
+            observed: 65
+          }
+        })
+      )
+      yield* Deferred.await(finishFinalized)
+      yield* Effect.yieldNow
+      yield* Deferred.succeed(releaseSource, undefined)
+      const error = yield* Fiber.join(restore).pipe(Effect.flip)
+
+      assert.strictEqual(error.reason._tag, "BackupTooLarge")
+      if (error.reason._tag === "BackupTooLarge") {
+        assert.strictEqual(error.reason.limit, 64)
+        assert.strictEqual(error.reason.observed, 65)
+      }
+      yield* Deferred.await(sourceFinalized)
+      yield* Deferred.await(peerClosed)
+      assert.strictEqual(terminalAckCalls, 0)
+      assert.strictEqual(sourcePulls, 1)
+      assert.strictEqual(finishCalls, 1)
+      assert.strictEqual(beginCalls, 1)
+    })))
+
+  it.effect("preserves an accepted Finish failure when the peer closes before Released", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const channel = new MessageChannel()
+      yield* Effect.addFinalizer(() => Effect.sync(() => channel.port2.close()))
+      const startReceived = yield* Deferred.make<void>()
+      const terminalAckReceived = yield* Deferred.make<void>()
+      const releaseSource = yield* Deferred.make<void>()
+      const sourceStarted = yield* Deferred.make<void>()
+      const sourceFinalized = yield* Deferred.make<void>()
+      const finishResult = yield* Deferred.make<void, RestoreProtocol.RestoreResultFailure>()
+      const finishStarted = yield* Deferred.make<void>()
+      const finishFinalized = yield* Deferred.make<void>()
+      let beginCalls = 0
+      let finishCalls = 0
+      let sourcePulls = 0
+      channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
+        const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
+        if (frame._tag === "Start") {
+          Deferred.doneUnsafe(startReceived, Effect.void)
+        } else if (frame._tag === "TerminalAck") {
+          Deferred.doneUnsafe(terminalAckReceived, Effect.void)
+        }
+      })
+      channel.port2.start()
+      const client = yield* ReplicaClient.fromRpcClient(
+        definition,
+        rpcClient(
+          () =>
+            Effect.sync(() => {
+              beginCalls++
+              return { nonce, port: channel.port1 }
+            }),
+          4_096,
+          4,
+          () =>
+            Effect.sync(() => {
+              finishCalls++
+            }).pipe(
+              Effect.andThen(Deferred.succeed(finishStarted, undefined)),
+              Effect.andThen(Deferred.await(finishResult)),
+              Effect.ensuring(Deferred.succeed(finishFinalized, undefined))
+            )
+        )
+      )
+      const restore = yield* client.restoreBackup({
+        source: Stream.fromEffect(
+          Effect.sync(() => {
+            sourcePulls++
+          }).pipe(
+            Effect.andThen(Deferred.succeed(sourceStarted, undefined)),
+            Effect.andThen(Deferred.await(releaseSource)),
+            Effect.as(Uint8Array.of(1)),
+            Effect.ensuring(Deferred.succeed(sourceFinalized, undefined))
+          )
+        ),
+        mode: "replace",
+        maxBytes: 64,
+        expectedDefinitionHash: definition.hash,
+        installationId
+      }).pipe(Effect.forkChild({ startImmediately: true }))
+
+      yield* Deferred.await(startReceived)
+      channel.port2.postMessage(
+        Schema.encodeSync(RestoreProtocol.Pull)({
+          _tag: "Pull",
+          nonce,
+          sequence: sequence(1)
+        })
+      )
+      yield* Deferred.await(sourceStarted)
+      yield* Deferred.await(finishStarted)
+      channel.port2.postMessage(
+        Schema.encodeSync(RestoreProtocol.TerminalReady)({
+          _tag: "TerminalReady",
+          nonce,
+          sequence: sequence(2)
+        })
+      )
+      yield* Deferred.await(sourceFinalized)
+      yield* Deferred.fail(
+        finishResult,
+        new RestoreProtocol.RestoreResultRestoreFailure({
+          error: {
+            _tag: "BackupTooLarge",
+            limit: 64,
+            observed: 65
+          }
+        })
+      )
+      yield* Deferred.await(terminalAckReceived)
+      channel.port2.close()
+      const error = yield* Fiber.join(restore).pipe(Effect.flip)
+
+      assert.strictEqual(error.reason._tag, "BackupTooLarge")
+      if (error.reason._tag === "BackupTooLarge") {
+        assert.strictEqual(error.reason.limit, 64)
+        assert.strictEqual(error.reason.observed, 65)
+      }
+      yield* Deferred.await(finishFinalized)
+      assert.strictEqual(sourcePulls, 1)
+      assert.strictEqual(finishCalls, 1)
+      assert.strictEqual(beginCalls, 1)
+    })))
+
+  it.effect("fails closed on wrong nonce and wrong phase frames without pulling or replaying", () =>
+    Effect.gen(function*() {
+      const wrongNonce = RestoreProtocol.RestoreNonce.make(
+        "rst_43c8d2f4-58ce-4c9a-9155-9d21019f5e9e"
+      )
+      const hostileFrames: ReadonlyArray<{
+        readonly label: string
+        readonly observed: string
+        readonly encode: () => unknown
+      }> = [
+        {
+          label: "wrong nonce",
+          observed: "invalid restore owner sequence",
+          encode: () =>
+            Schema.encodeSync(RestoreProtocol.Pull)({
+              _tag: "Pull",
+              nonce: wrongNonce,
+              sequence: sequence(1)
+            })
+        },
+        {
+          label: "Released before TerminalReady",
+          observed: "unexpected restore release",
+          encode: () =>
+            Schema.encodeSync(RestoreProtocol.Released)({
+              _tag: "Released",
+              nonce,
+              sequence: sequence(1)
+            })
+        }
+      ]
+
+      for (const hostile of hostileFrames) {
+        yield* Effect.scoped(Effect.gen(function*() {
+          const channel = new MessageChannel()
+          yield* Effect.addFinalizer(() => Effect.sync(() => channel.port2.close()))
+          const peerClosed = yield* Deferred.make<void>()
+          let beginCalls = 0
+          let sourcePulls = 0
+          channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
+            const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
+            if (frame._tag === "Start") channel.port2.postMessage(hostile.encode())
+          })
+          channel.port2.addEventListener("close", () => {
+            Deferred.doneUnsafe(peerClosed, Effect.void)
+          })
+          channel.port2.start()
+          const client = yield* ReplicaClient.fromRpcClient(
+            definition,
+            rpcClient(
+              () =>
+                Effect.sync(() => {
+                  beginCalls++
+                  return { nonce, port: channel.port1 }
+                }),
+              4_096,
+              4,
+              () => Effect.never
+            )
+          )
+          const exit = yield* client.restoreBackup({
+            source: Stream.fromEffect(
+              Effect.sync(() => {
+                sourcePulls++
+                return Uint8Array.of(1)
+              })
+            ),
+            mode: "replace",
+            maxBytes: 64,
+            expectedDefinitionHash: definition.hash,
+            installationId
+          }).pipe(Effect.exit)
+
+          assert.isTrue(Exit.isFailure(exit), hostile.label)
+          if (Exit.isFailure(exit)) {
+            const error = Cause.findErrorOption(exit.cause)
+            assert.strictEqual(error._tag, "Some", hostile.label)
+            if (error._tag === "Some") {
+              assert.strictEqual(error.value.reason._tag, "ProtocolMismatch", hostile.label)
+              if (error.value.reason._tag === "ProtocolMismatch") {
+                assert.strictEqual(error.value.reason.observed, hostile.observed, hostile.label)
+              }
+            }
+          }
+          yield* Deferred.await(peerClosed)
+          assert.strictEqual(sourcePulls, 0, hostile.label)
+          assert.strictEqual(beginCalls, 1, hostile.label)
+        }))
+      }
+    }))
+
+  it.effect("fails closed on a duplicate Pull before a second source pull or replay", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const channel = new MessageChannel()
+      yield* Effect.addFinalizer(() => Effect.sync(() => channel.port2.close()))
+      const startReceived = yield* Deferred.make<void>()
+      const sourceStarted = yield* Deferred.make<void>()
+      const sourceFinalized = yield* Deferred.make<void>()
+      const finishFinalized = yield* Deferred.make<void>()
+      const peerClosed = yield* Deferred.make<void>()
+      let beginCalls = 0
+      let sourcePulls = 0
+      channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
+        const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
+        if (frame._tag === "Start") Deferred.doneUnsafe(startReceived, Effect.void)
+      })
+      channel.port2.addEventListener("close", () => {
+        Deferred.doneUnsafe(peerClosed, Effect.void)
+      })
+      channel.port2.start()
+      const client = yield* ReplicaClient.fromRpcClient(
+        definition,
+        rpcClient(
+          () =>
+            Effect.sync(() => {
+              beginCalls++
+              return { nonce, port: channel.port1 }
+            }),
+          4_096,
+          4,
+          () => Effect.never.pipe(Effect.ensuring(Deferred.succeed(finishFinalized, undefined)))
+        )
+      )
+      const restore = yield* client.restoreBackup({
+        source: Stream.fromEffect(
+          Effect.sync(() => {
+            sourcePulls++
+          }).pipe(
+            Effect.andThen(Deferred.succeed(sourceStarted, undefined)),
+            Effect.andThen(Effect.never),
+            Effect.ensuring(Deferred.succeed(sourceFinalized, undefined))
+          )
+        ),
+        mode: "replace",
+        maxBytes: 64,
+        expectedDefinitionHash: definition.hash,
+        installationId
+      }).pipe(Effect.forkChild({ startImmediately: true }))
+
+      yield* Deferred.await(startReceived)
+      channel.port2.postMessage(
+        Schema.encodeSync(RestoreProtocol.Pull)({
+          _tag: "Pull",
+          nonce,
+          sequence: sequence(1)
+        })
+      )
+      yield* Deferred.await(sourceStarted)
+      channel.port2.postMessage(
+        Schema.encodeSync(RestoreProtocol.Pull)({
+          _tag: "Pull",
+          nonce,
+          sequence: sequence(2)
+        })
+      )
+      const error = yield* Fiber.join(restore).pipe(Effect.flip)
+
+      assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+      if (error.reason._tag === "ProtocolMismatch") {
+        assert.strictEqual(error.reason.observed, "unsolicited restore pull")
+      }
+      yield* Deferred.await(peerClosed)
+      yield* Deferred.await(sourceFinalized)
+      yield* Deferred.await(finishFinalized)
+      assert.strictEqual(sourcePulls, 1)
+      assert.strictEqual(beginCalls, 1)
+    })))
+
+  it.effect("fails closed on duplicate TerminalReady without another source pull or replay", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const channel = new MessageChannel()
+      yield* Effect.addFinalizer(() => Effect.sync(() => channel.port2.close()))
+      const peerClosed = yield* Deferred.make<void>()
+      const finishFinalized = yield* Deferred.make<void>()
+      let beginCalls = 0
+      let sourcePulls = 0
+      let terminalAckCalls = 0
+      channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
+        const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
+        if (frame._tag === "Start") {
+          channel.port2.postMessage(
+            Schema.encodeSync(RestoreProtocol.TerminalReady)({
+              _tag: "TerminalReady",
+              nonce,
+              sequence: sequence(1)
+            })
+          )
+          channel.port2.postMessage(
+            Schema.encodeSync(RestoreProtocol.TerminalReady)({
+              _tag: "TerminalReady",
+              nonce,
+              sequence: sequence(2)
+            })
+          )
+        } else if (frame._tag === "TerminalAck") {
+          terminalAckCalls++
+        }
+      })
+      channel.port2.addEventListener("close", () => {
+        Deferred.doneUnsafe(peerClosed, Effect.void)
+      })
+      channel.port2.start()
+      const client = yield* ReplicaClient.fromRpcClient(
+        definition,
+        rpcClient(
+          () =>
+            Effect.sync(() => {
+              beginCalls++
+              return { nonce, port: channel.port1 }
+            }),
+          4_096,
+          4,
+          () =>
+            Deferred.await(peerClosed).pipe(
+              Effect.andThen(
+                Effect.fail(
+                  new RestoreProtocol.RestoreResultRestoreFailure({
+                    error: {
+                      _tag: "ProtocolMismatch",
+                      expected: "single TerminalReady",
+                      observed: "duplicate TerminalReady"
+                    }
+                  })
+                )
+              ),
+              Effect.ensuring(Deferred.succeed(finishFinalized, undefined))
+            )
+        )
+      )
+      const error = yield* client.restoreBackup({
+        source: Stream.fromEffect(
+          Effect.sync(() => {
+            sourcePulls++
+            return Uint8Array.of(1)
+          })
+        ),
+        mode: "replace",
+        maxBytes: 64,
+        expectedDefinitionHash: definition.hash,
+        installationId
+      }).pipe(Effect.flip)
+
+      assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+      if (error.reason._tag === "ProtocolMismatch") {
+        assert.strictEqual(error.reason.observed, "duplicate TerminalReady")
+      }
+      assert.isTrue(yield* Deferred.isDone(peerClosed))
+      assert.isTrue(yield* Deferred.isDone(finishFinalized))
+      assert.strictEqual(sourcePulls, 0)
+      assert.strictEqual(terminalAckCalls, 0)
+      assert.strictEqual(beginCalls, 1)
     })))
 
   it.effect("preserves a source failure combined with a defect", () =>
@@ -336,8 +1280,8 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
           )
         } else if (frame._tag === "SourceFailure") {
           channel.port2.postMessage(
-            Schema.encodeSync(RestoreProtocol.TerminalSuccess)({
-              _tag: "TerminalSuccess",
+            Schema.encodeSync(RestoreProtocol.TerminalReady)({
+              _tag: "TerminalReady",
               nonce,
               sequence: sequence(2)
             })
@@ -355,7 +1299,12 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       channel.port2.start()
       const client = yield* ReplicaClient.fromRpcClient(
         definition,
-        rpcClient(() => Effect.succeed({ nonce, port: channel.port1 }))
+        rpcClient(
+          () => Effect.succeed({ nonce, port: channel.port1 }),
+          4_096,
+          4,
+          () => Effect.never
+        )
       )
       const composite = Cause.fromReasons([
         Cause.makeFailReason(sourceFailure),
@@ -400,8 +1349,8 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
           )
         } else if (frame._tag === "SourceFailure") {
           channel.port2.postMessage(
-            Schema.encodeSync(RestoreProtocol.TerminalSuccess)({
-              _tag: "TerminalSuccess",
+            Schema.encodeSync(RestoreProtocol.TerminalReady)({
+              _tag: "TerminalReady",
               nonce,
               sequence: sequence(2)
             })
@@ -419,7 +1368,12 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       channel.port2.start()
       const client = yield* ReplicaClient.fromRpcClient(
         definition,
-        rpcClient(() => Effect.succeed({ nonce, port: channel.port1 }))
+        rpcClient(
+          () => Effect.succeed({ nonce, port: channel.port1 }),
+          4_096,
+          4,
+          () => Effect.never
+        )
       )
       const composite = Cause.fromReasons([
         Cause.makeFailReason(sourceFailure),
@@ -449,11 +1403,10 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
         const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
         if (frame._tag === "Start") {
           channel.port2.postMessage(
-            Schema.encodeSync(RestoreProtocol.TerminalSessionFailure)({
-              _tag: "TerminalSessionFailure",
+            Schema.encodeSync(RestoreProtocol.TerminalReady)({
+              _tag: "TerminalReady",
               nonce,
-              sequence: sequence(1),
-              error: { _tag: "RestoreBusy", replica: "a".repeat(89) }
+              sequence: sequence(1)
             })
           )
         } else if (frame._tag === "TerminalAck") {
@@ -471,7 +1424,14 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
         definition,
         rpcClient(
           () => Effect.succeed({ nonce, port: channel.port1 }),
-          ReplicaLimits.minimumRestoreErrorBytes
+          ReplicaLimits.minimumRestoreErrorBytes,
+          4,
+          () =>
+            Effect.fail(
+              new RestoreProtocol.RestoreResultSessionFailure({
+                error: { _tag: "RestoreBusy", replica: "a".repeat(89) }
+              })
+            )
         )
       )
       const error = yield* client.restoreBackup({
@@ -493,15 +1453,10 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
         const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
         if (frame._tag === "Start") {
           channel.port2.postMessage(
-            Schema.encodeSync(RestoreProtocol.TerminalSessionFailure)({
-              _tag: "TerminalSessionFailure",
+            Schema.encodeSync(RestoreProtocol.TerminalReady)({
+              _tag: "TerminalReady",
               nonce,
-              sequence: sequence(1),
-              error: {
-                _tag: "ProtocolMismatch",
-                expected: `${"é".repeat(37)}a`,
-                observed: ""
-              }
+              sequence: sequence(1)
             })
           )
         } else if (frame._tag === "TerminalAck") {
@@ -519,7 +1474,18 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
         definition,
         rpcClient(
           () => Effect.succeed({ nonce, port: channel.port1 }),
-          ReplicaLimits.minimumRestoreErrorBytes
+          ReplicaLimits.minimumRestoreErrorBytes,
+          4,
+          () =>
+            Effect.fail(
+              new RestoreProtocol.RestoreResultSessionFailure({
+                error: {
+                  _tag: "ProtocolMismatch",
+                  expected: `${"é".repeat(37)}a`,
+                  observed: ""
+                }
+              })
+            )
         )
       )
       const error = yield* client.restoreBackup({
@@ -587,6 +1553,79 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
         assert.strictEqual(error.reason.cause, sentinel)
       }
     })))
+
+  it.effect("rejects every invalid advertised chunk and coalesce limit before opening the transport", () =>
+    Effect.gen(function*() {
+      const invalidLimits: ReadonlyArray<{
+        readonly field: "maxChunkBytes" | "maxRestoreCoalesceMillis"
+        readonly label: string
+        readonly value?: number
+      }> = [
+        { field: "maxChunkBytes", label: "missing" },
+        { field: "maxChunkBytes", label: "zero", value: 0 },
+        { field: "maxChunkBytes", label: "fractional", value: 1.5 },
+        { field: "maxRestoreCoalesceMillis", label: "missing" },
+        { field: "maxRestoreCoalesceMillis", label: "zero", value: 0 },
+        {
+          field: "maxRestoreCoalesceMillis",
+          label: "unsafe",
+          value: Number.MAX_SAFE_INTEGER + 1
+        }
+      ]
+
+      for (const invalid of invalidLimits) {
+        let beginCalls = 0
+        let closeCalls = 0
+        const advertised = {
+          maxChunkBytes: 4,
+          maxRestoreCoalesceMillis: 25
+        } as {
+          maxChunkBytes?: number
+          maxRestoreCoalesceMillis?: number
+        }
+        if (invalid.value === undefined) {
+          delete advertised[invalid.field]
+        } else {
+          advertised[invalid.field] = invalid.value
+        }
+        const invalidRpc = {
+          OpenSession: () =>
+            Effect.succeed({
+              leaseMillis: 10_000,
+              protocolVersion: ReplicaRpc.protocolVersion,
+              definitionHash: definition.hash,
+              ownerEpoch: "owner",
+              ...advertised,
+              maxRestoreErrorBytes: 4_096
+            }),
+          CloseSession: () => Effect.sync(() => closeCalls++),
+          BeginRestoreBackupV4: () =>
+            Effect.sync(() => {
+              beginCalls++
+              return { nonce, port: new MessageChannel().port1 }
+            })
+        } as unknown as RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>
+
+        const exit = yield* Effect.scoped(
+          ReplicaClient.fromRpcClient(definition, invalidRpc)
+        ).pipe(Effect.exit)
+
+        assert.isTrue(Exit.isFailure(exit), `${invalid.field} ${invalid.label}`)
+        if (Exit.isFailure(exit)) {
+          const error = Cause.findErrorOption(exit.cause)
+          assert.strictEqual(error._tag, "Some", `${invalid.field} ${invalid.label}`)
+          if (error._tag === "Some") {
+            assert.strictEqual(
+              error.value.reason._tag,
+              "ProtocolMismatch",
+              `${invalid.field} ${invalid.label}`
+            )
+          }
+        }
+        assert.strictEqual(closeCalls, 1, `${invalid.field} ${invalid.label}`)
+        assert.strictEqual(beginCalls, 0, `${invalid.field} ${invalid.label}`)
+      }
+    }))
 
   it.effect("rejects missing and undersized advertised restore error limits", () =>
     Effect.gen(function*() {

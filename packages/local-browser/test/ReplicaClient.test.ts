@@ -10,19 +10,23 @@ import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
+import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
 import { Headers } from "effect/unstable/http"
-import { Rpc, RpcTest } from "effect/unstable/rpc"
+import { Rpc, type RpcClient as EffectRpcClient, RpcTest } from "effect/unstable/rpc"
 import * as RpcClientError from "effect/unstable/rpc/RpcClientError"
 import { RequestId } from "effect/unstable/rpc/RpcMessage"
 import * as WorkerError from "effect/unstable/workers/WorkerError"
+import * as RestoreProtocol from "../src/internal/restoreProtocol.js"
 import * as ReplicaClient from "../src/ReplicaClient.js"
 import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
@@ -90,6 +94,51 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
   const protocolMismatch = (observed: string) =>
     new ReplicaError.ReplicaError({
       reason: new ReplicaError.ProtocolMismatch({ expected: "active session", observed })
+    })
+  type TestReplicaRpcClient = EffectRpcClient.FromGroup<
+    typeof ReplicaRpc.group,
+    RpcClientError.RpcClientError
+  >
+  type FinishRestore = TestReplicaRpcClient["FinishRestoreBackupV4"]
+  const dropTerminalReady = (
+    rpc: TestReplicaRpcClient,
+    terminalDropped: Deferred.Deferred<void>,
+    finish: FinishRestore = rpc.FinishRestoreBackupV4
+  ): TestReplicaRpcClient =>
+    new Proxy(rpc, {
+      get(target, property, receiver) {
+        const value = Reflect.get(target, property, receiver)
+        if (property === "FinishRestoreBackupV4") return finish
+        if (property !== "BeginRestoreBackupV4") return value
+        return (payload: Parameters<typeof target.BeginRestoreBackupV4>[0]) =>
+          target.BeginRestoreBackupV4(payload).pipe(
+            Effect.flatMap(({ nonce, port: ownerPort }) =>
+              Effect.gen(function*() {
+                const channel = new MessageChannel()
+                yield* Effect.addFinalizer(() =>
+                  Effect.sync(() => {
+                    ownerPort.close()
+                    channel.port2.close()
+                  })
+                )
+                ownerPort.addEventListener("message", (event: MessageEvent<unknown>) => {
+                  const frame = Schema.decodeUnknownSync(RestoreProtocol.OwnerToPageFrame)(event.data)
+                  if (frame._tag === "TerminalReady") {
+                    Deferred.doneUnsafe(terminalDropped, Effect.void)
+                    return
+                  }
+                  channel.port2.postMessage(event.data)
+                })
+                channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
+                  ownerPort.postMessage(event.data)
+                })
+                ownerPort.start()
+                channel.port2.start()
+                return { nonce, port: channel.port1 }
+              })
+            )
+          )
+      }
     })
 
   it.effect("round trips typed replica operations and releases its session", () =>
@@ -936,6 +985,395 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     })).pipe(Effect.provide(BackupOwner))
   })
 
+  it.effect("applies maxBytes exactly once and rejects maxBytes plus one without applying", () => {
+    const maxBytes = 1_024
+    const applications: Array<ReadonlyArray<Uint8Array>> = []
+    const BoundaryOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provideMerge(Sessions),
+      Layer.provide(Layer.merge(
+        Publisher,
+        Layer.succeed(Replica.Replica, {
+          ...replica,
+          restoreBackup: ({ source }) =>
+            Stream.runCollect(source).pipe(
+              Effect.tap((chunks) =>
+                Effect.sync(() => {
+                  applications.push(Array.from(chunks))
+                })
+              ),
+              Effect.asVoid
+            )
+        })
+      ))
+    )
+    return Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
+      yield* client.restoreBackup({
+        source: Stream.make(new Uint8Array(maxBytes)),
+        mode: "replace",
+        maxBytes,
+        expectedDefinitionHash: definition.hash,
+        installationId: Identity.BackupInstallationId.make("bak_36b854b7-100d-4dcc-bcae-05fb2a829121")
+      })
+      assert.strictEqual(applications.length, 1)
+      assert.strictEqual(
+        applications[0]?.reduce((total, chunk) => total + chunk.byteLength, 0),
+        maxBytes
+      )
+
+      const error = yield* client.restoreBackup({
+        source: Stream.make(new Uint8Array(maxBytes + 1)),
+        mode: "replace",
+        maxBytes,
+        expectedDefinitionHash: definition.hash,
+        installationId: Identity.BackupInstallationId.make("bak_b3293647-175a-415c-890e-3cd8ac7e86e8")
+      }).pipe(Effect.flip)
+      assert.strictEqual(error.reason._tag, "BackupTooLarge")
+      if (error.reason._tag === "BackupTooLarge") {
+        assert.strictEqual(error.reason.limit, maxBytes)
+        assert.strictEqual(error.reason.observed, maxBytes + 1)
+      }
+      assert.strictEqual(applications.length, 1)
+    })).pipe(Effect.provide(BoundaryOwner))
+  })
+
+  it.effect("returns the encoded Finish success when TerminalReady is lost", () => {
+    const ResultOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provideMerge(Sessions),
+      Layer.provide(Layer.merge(
+        Publisher,
+        Layer.succeed(Replica.Replica, {
+          ...replica,
+          restoreBackup: ({ source }) => Stream.runDrain(source)
+        })
+      ))
+    )
+    return Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const finishDelivered = yield* Deferred.make<void>()
+      const terminalDropped = yield* Deferred.make<void>()
+      const bridged = dropTerminalReady(
+        rpc,
+        terminalDropped,
+        ((payload) =>
+          rpc.FinishRestoreBackupV4(payload).pipe(
+            Effect.tap(() => Deferred.succeed(finishDelivered, undefined))
+          )) as FinishRestore
+      )
+      const client = yield* ReplicaClient.fromRpcClient(
+        definition,
+        bridged,
+        { operationTimeout: "1 second" }
+      )
+      const restore = yield* client.restoreBackup({
+        source: Stream.empty,
+        mode: "replace",
+        maxBytes: 1024,
+        expectedDefinitionHash: definition.hash,
+        installationId: Identity.BackupInstallationId.make("bak_114c1fb0-4d69-4ed8-858c-1e844c673456")
+      }).pipe(Effect.forkChild({ startImmediately: true }))
+
+      yield* Deferred.await(finishDelivered)
+      yield* Deferred.await(terminalDropped)
+      yield* TestClock.adjust("1 second")
+      const exit = yield* Fiber.await(restore)
+      yield* TestClock.adjust(limits.maxRestorePullMillis + 1)
+      assert.strictEqual(yield* (yield* SessionManager.SessionManager).activeRestoreCount, 0)
+      return yield* exit
+    })).pipe(Effect.provide(ResultOwner))
+  })
+
+  interface TerminalCauseScenario {
+    readonly name: string
+    readonly cause: Cause.Cause<ReplicaError.ReplicaError>
+    readonly expectedTags: ReadonlyArray<Cause.Reason<ReplicaError.ReplicaError>["_tag"]>
+    readonly expectedFailureTags: ReadonlyArray<ReplicaError.ReplicaError["reason"]["_tag"]>
+  }
+
+  const lostTerminalCauseScenarios: ReadonlyArray<TerminalCauseScenario> = [
+    {
+      name: "preserves a typed Finish failure when TerminalReady is lost",
+      cause: Cause.fail(
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.RestoreBusy({ replica: "typed-lost-terminal" })
+        })
+      ),
+      expectedTags: ["Fail"],
+      expectedFailureTags: ["RestoreBusy"]
+    },
+    {
+      name: "preserves a composite Finish failure when TerminalReady is lost",
+      cause: Cause.fromReasons<ReplicaError.ReplicaError>([
+        Cause.makeFailReason(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.RestoreBusy({ replica: "composite-lost-terminal" })
+          })
+        ),
+        Cause.makeDieReason(new Error("composite restore defect"))
+      ]),
+      expectedTags: ["Fail", "Die"],
+      expectedFailureTags: ["RestoreBusy"]
+    }
+  ]
+
+  for (const [index, scenario] of lostTerminalCauseScenarios.entries()) {
+    it.effect(scenario.name, () => {
+      const ResultOwner = ReplicaOwner.layerHandlers(definition).pipe(
+        Layer.provideMerge(Sessions),
+        Layer.provide(Layer.merge(
+          Publisher,
+          Layer.succeed(Replica.Replica, {
+            ...replica,
+            restoreBackup: ({ source }) =>
+              Stream.runDrain(source).pipe(
+                Effect.andThen(Effect.failCause(scenario.cause))
+              )
+          })
+        ))
+      )
+      return Effect.scoped(Effect.gen(function*() {
+        const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+        const terminalDropped = yield* Deferred.make<void>()
+        const client = yield* ReplicaClient.fromRpcClient(
+          definition,
+          dropTerminalReady(rpc, terminalDropped),
+          { operationTimeout: "1 second" }
+        )
+        const restore = yield* client.restoreBackup({
+          source: Stream.empty,
+          mode: "replace",
+          maxBytes: 1024,
+          expectedDefinitionHash: definition.hash,
+          installationId: Identity.BackupInstallationId.make(
+            `bak_821390d7-e9af-4edb-b26a-10000000000${index + 1}`
+          )
+        }).pipe(Effect.forkChild({ startImmediately: true }))
+
+        yield* Deferred.await(terminalDropped)
+        yield* TestClock.adjust("1 second")
+        const exit = yield* Fiber.await(restore)
+        assert.isTrue(Exit.isFailure(exit))
+        if (Exit.isSuccess(exit)) return
+        assert.deepStrictEqual(
+          exit.cause.reasons.map((reason) => reason._tag),
+          scenario.expectedTags
+        )
+        assert.deepStrictEqual(
+          exit.cause.reasons
+            .filter(Cause.isFailReason)
+            .map((reason) => reason.error.reason._tag),
+          scenario.expectedFailureTags
+        )
+        yield* TestClock.adjust(limits.maxRestorePullMillis + 1)
+      })).pipe(Effect.provide(ResultOwner))
+    })
+  }
+
+  it.effect("does not accept a Finish RpcClientError when TerminalReady is lost", () => {
+    const ResultOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provideMerge(Sessions),
+      Layer.provide(Layer.merge(
+        Publisher,
+        Layer.succeed(Replica.Replica, {
+          ...replica,
+          restoreBackup: ({ source }) => Stream.runDrain(source)
+        })
+      ))
+    )
+    return Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const finishScope = yield* Scope.Scope
+      const terminalDropped = yield* Deferred.make<void>()
+      const completed = yield* Deferred.make<
+        Exit.Exit<void, ReplicaError.ReplicaError>
+      >()
+      const client = yield* ReplicaClient.fromRpcClient(
+        definition,
+        dropTerminalReady(
+          rpc,
+          terminalDropped,
+          (payload) =>
+            rpc.FinishRestoreBackupV4(payload).pipe(
+              Effect.forkIn(finishScope, { startImmediately: true }),
+              Effect.andThen(Effect.fail(disconnected()))
+            )
+        ),
+        { operationTimeout: "1 second" }
+      )
+      yield* client.restoreBackup({
+        source: Stream.empty,
+        mode: "replace",
+        maxBytes: 1024,
+        expectedDefinitionHash: definition.hash,
+        installationId: Identity.BackupInstallationId.make("bak_6a7d87ae-b296-4d68-94c9-28e7fa3e402d")
+      }).pipe(
+        Effect.onExit((exit) => Deferred.succeed(completed, exit)),
+        Effect.forkChild({ startImmediately: true })
+      )
+
+      yield* Deferred.await(terminalDropped)
+      yield* TestClock.adjust("999 millis")
+      assert.isFalse(yield* Deferred.isDone(completed))
+      yield* TestClock.adjust("1 millis")
+      const exit = yield* Deferred.await(completed)
+      assert.isTrue(Exit.isFailure(exit))
+      if (Exit.isSuccess(exit)) return
+      const failures = exit.cause.reasons.filter(Cause.isFailReason)
+      assert.strictEqual(failures.length, 1)
+      const error = failures[0]?.error
+      assert.strictEqual(error?._tag, "ReplicaError")
+      if (error?._tag === "ReplicaError") {
+        assert.strictEqual(error.reason._tag, "OperationTimeout")
+      }
+      yield* TestClock.adjust(limits.maxRestorePullMillis + 1)
+    })).pipe(Effect.provide(ResultOwner))
+  })
+
+  const terminalCauseScenarios: ReadonlyArray<TerminalCauseScenario> = [
+    {
+      name: "preserves two typed restore failures through the public client",
+      cause: Cause.fromReasons([
+        Cause.makeFailReason(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.RestoreBusy({ replica: "first" })
+          })
+        ),
+        Cause.makeFailReason(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.QuotaExceeded({ resource: "restores", limit: 2 })
+          })
+        )
+      ]),
+      expectedTags: ["Fail", "Fail"],
+      expectedFailureTags: ["RestoreBusy", "QuotaExceeded"]
+    },
+    {
+      name: "preserves a typed restore failure and defect through the public client",
+      cause: Cause.fromReasons([
+        Cause.makeFailReason(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.RestoreBusy({ replica: "typed" })
+          })
+        ),
+        Cause.makeDieReason(new Error("secret sql SELECT credential=/private/archive"))
+      ]),
+      expectedTags: ["Fail", "Die"],
+      expectedFailureTags: ["RestoreBusy"]
+    },
+    {
+      name: "preserves a typed restore failure and interrupt through the public client",
+      cause: Cause.fromReasons([
+        Cause.makeFailReason(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.RestoreBusy({ replica: "typed" })
+          })
+        ),
+        Cause.makeInterruptReason(987)
+      ]),
+      expectedTags: ["Fail", "Interrupt"],
+      expectedFailureTags: ["RestoreBusy"]
+    },
+    {
+      name: "preserves a pure defect through the public client",
+      cause: Cause.fromReasons([
+        Cause.makeDieReason(new Error("secret password=/private/archive"))
+      ]),
+      expectedTags: ["Die"],
+      expectedFailureTags: []
+    },
+    {
+      name: "preserves more than eight distinct reasons through the public client",
+      cause: Cause.fromReasons(
+        Array.from({ length: 9 }, (_, reasonIndex) =>
+          Cause.makeFailReason(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.RestoreBusy({ replica: `replica-${reasonIndex}` })
+            })
+          ))
+      ),
+      expectedTags: Array.from({ length: 9 }, () => "Fail" as const),
+      expectedFailureTags: Array.from({ length: 9 }, () => "RestoreBusy" as const)
+    }
+  ]
+
+  for (const [index, scenario] of terminalCauseScenarios.entries()) {
+    it.effect(scenario.name, () => {
+      const failureLimits = {
+        ...limits,
+        maxBackupBytes: 64 * 1024
+      } satisfies ReplicaLimits.Values
+      const FailureSessions = SessionManager.layer.pipe(
+        Layer.provide(ReplicaLimits.layer(failureLimits))
+      )
+      const failureDefinition = ReplicaDefinition.make({
+        name: `terminal-cause-${index}`,
+        documents: DocumentSet.make(Task),
+        mutations: [],
+        projections: [],
+        queries: []
+      })
+      const Sql = SqlReplica.layerWithBindings(failureDefinition, { projections: [] }).pipe(
+        Layer.provide(Layer.merge(
+          SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+          ReplicaLimits.layer(failureLimits)
+        ))
+      )
+      return Effect.scoped(Effect.gen(function*() {
+        const sql = yield* Layer.build(Sql)
+        const productionReplica = Context.get(sql, Replica.Replica)
+        const publisher = Context.get(sql, CommitPublisher.CommitPublisher)
+        const archive = Array.from(
+          yield* Stream.runCollect(
+            productionReplica.exportBackup({ maxBytes: failureLimits.maxBackupBytes })
+          )
+        )
+        const decoratedReplica = Replica.Replica.of({
+          ...productionReplica,
+          restoreBackup: (options) =>
+            productionReplica.restoreBackup(options).pipe(
+              Effect.andThen(Effect.failCause(scenario.cause))
+            )
+        })
+        const FailingOwner = ReplicaOwner.layerHandlers(failureDefinition).pipe(
+          Layer.provideMerge(FailureSessions),
+          Layer.provide(Layer.merge(
+            Layer.succeed(CommitPublisher.CommitPublisher, publisher),
+            Layer.succeed(Replica.Replica, decoratedReplica)
+          ))
+        )
+        yield* Effect.scoped(Effect.gen(function*() {
+          const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+          const client = yield* ReplicaClient.fromRpcClient(failureDefinition, rpc)
+          const exit = yield* client.restoreBackup({
+            source: Stream.fromIterable(archive),
+            mode: "replace",
+            maxBytes: failureLimits.maxBackupBytes,
+            expectedDefinitionHash: failureDefinition.hash,
+            installationId: Identity.BackupInstallationId.make(
+              `bak_00000000-0000-4000-8000-00000000000${index + 1}`
+            )
+          }).pipe(Effect.exit)
+
+          assert.isTrue(Exit.isFailure(exit))
+          if (Exit.isSuccess(exit)) return
+          assert.deepStrictEqual(
+            exit.cause.reasons.map((reason) => reason._tag),
+            scenario.expectedTags
+          )
+          assert.deepStrictEqual(
+            exit.cause.reasons
+              .filter(Cause.isFailReason)
+              .map((reason) => reason.error.reason._tag),
+            scenario.expectedFailureTags
+          )
+          const interrupt = exit.cause.reasons.find(Cause.isInterruptReason)
+          if (interrupt !== undefined) assert.strictEqual(interrupt.fiberId, 987)
+        })).pipe(Effect.provide(FailingOwner))
+      }))
+    })
+  }
+
   it.effect("dispatches restore before the source completes", () => {
     const backupLimits = {
       ...limits,
@@ -1110,8 +1548,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                           return
                         }
                         const sequence = Reflect.get(event.data, "sequence")
-                        if (sequence === 1) Effect.runSync(Deferred.succeed(firstPull, undefined))
-                        if (sequence === 2) Effect.runSync(Deferred.succeed(secondPull, undefined))
+                        if (sequence === 1) Deferred.doneUnsafe(firstPull, Effect.void)
+                        if (sequence === 2) Deferred.doneUnsafe(secondPull, Effect.void)
                       })
                     })
                   )
@@ -1373,6 +1811,68 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     })).pipe(Effect.provide(CountingOwner))
   })
 
+  it.effect("bounds transient restore session replacement by the restore deadline", () => {
+    let beginCalls = 0
+    return Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const replacementFailed = yield* Deferred.make<void>()
+      const completed = yield* Deferred.make<ReplicaError.ReplicaError>()
+      let openSessions = 0
+      const faulted = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property === "OpenSession") {
+            return (payload: never) => {
+              openSessions++
+              return openSessions === 1
+                ? value(payload)
+                : Effect.fail(transientDisconnected()).pipe(
+                  Effect.tapError(() => Deferred.succeed(replacementFailed, undefined))
+                )
+            }
+          }
+          if (property === "BeginRestoreBackupV4") {
+            return () => {
+              beginCalls++
+              return Effect.fail(protocolMismatch("restore"))
+            }
+          }
+          return value
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(
+        definition,
+        faulted,
+        { operationTimeout: "1 second" }
+      )
+      yield* client.restoreBackup({
+        source: Stream.make(Uint8Array.of(1, 2, 3)),
+        mode: "replace",
+        maxBytes: 1024,
+        expectedDefinitionHash: definition.hash,
+        installationId: Identity.BackupInstallationId.make("bak_9e214b56-413c-4c63-84a8-3f0105987ea1")
+      }).pipe(
+        Effect.flip,
+        Effect.tap((error) => Deferred.succeed(completed, error)),
+        Effect.forkChild
+      )
+
+      yield* Deferred.await(replacementFailed)
+      yield* TestClock.adjust("999 millis")
+      assert.isFalse(yield* Deferred.isDone(completed))
+      yield* TestClock.adjust("1 millis")
+      assert.isTrue(yield* Deferred.isDone(completed))
+      const error = yield* Deferred.await(completed)
+      assert.strictEqual(error.reason._tag, "OperationTimeout")
+      if (error.reason._tag === "OperationTimeout") {
+        assert.strictEqual(error.reason.operation, "RestoreBackup")
+        assert.strictEqual(error.reason.timeoutMillis, 1_000)
+      }
+      assert.strictEqual(beginCalls, 1)
+      assert.isAtLeast(openSessions, 2)
+    })).pipe(Effect.provide(Owner))
+  })
+
   it.effect("surfaces a fatal reopen error without replaying restore", () => {
     let applications = 0
     let restoreCalls = 0
@@ -1595,4 +2095,184 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.notStrictEqual(openedSessionIds[1], openedSessionIds[0])
       assert.deepStrictEqual(getSessionIds, [openedSessionIds[0], openedSessionIds[1]])
     })).pipe(Effect.provide(Owner)))
+
+  const lostReleasedScenarios = [
+    {
+      name: "replaces a stale session when an accepted restore result outlives Released",
+      replacementPending: false,
+      expected: "ProtocolMismatch"
+    },
+    {
+      name: "returns a typed timeout when an accepted replacement is interrupted at the deadline",
+      replacementPending: true,
+      expected: "OperationTimeout"
+    }
+  ] as const
+
+  for (const scenario of lostReleasedScenarios) {
+    it.effect(scenario.name, () => {
+      let beginCalls = 0
+      const ExpiringOwner = ReplicaOwner.layerHandlers(definition).pipe(
+        Layer.provideMerge(Sessions),
+        Layer.provide(Layer.merge(
+          Publisher,
+          Layer.succeed(Replica.Replica, {
+            ...replica,
+            restoreBackup: () => Effect.never
+          })
+        ))
+      )
+      return Effect.gen(function*() {
+        yield* TestClock.setTime(0)
+        const sessions = yield* SessionManager.SessionManager
+        const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+        const start = yield* Deferred.make<Identity.SessionId>()
+        const terminalAck = yield* Deferred.make<void>()
+        const replacementStarted = yield* Deferred.make<void>()
+        const openedSessionIds: Array<Identity.SessionId> = []
+        const observed = new Proxy(rpc, {
+          get(target, property, receiver) {
+            const value = Reflect.get(target, property, receiver)
+            if (property === "OpenSession") {
+              return (payload: { readonly sessionId: Identity.SessionId }) =>
+                Effect.sync(() => {
+                  openedSessionIds.push(payload.sessionId)
+                  return openedSessionIds.length
+                }).pipe(
+                  Effect.flatMap((opened) =>
+                    opened === 1
+                      ? value(payload)
+                      : Deferred.succeed(replacementStarted, undefined).pipe(
+                        Effect.andThen(scenario.replacementPending ? Effect.never : value(payload))
+                      )
+                  )
+                )
+            }
+            if (property === "RenewSession") return () => Effect.never
+            if (property === "BeginRestoreBackupV4") {
+              return (payload: Parameters<typeof target.BeginRestoreBackupV4>[0]) =>
+                Effect.sync(() => {
+                  beginCalls += 1
+                }).pipe(
+                  Effect.andThen(target.BeginRestoreBackupV4(payload)),
+                  Effect.map(({ nonce, port }) => {
+                    const add = port.addEventListener.bind(port)
+                    const remove = port.removeEventListener.bind(port)
+                    const post = port.postMessage.bind(port)
+                    const listeners = new Map<EventListenerOrEventListenerObject, EventListener>()
+                    Object.defineProperties(port, {
+                      addEventListener: {
+                        configurable: true,
+                        value: (
+                          type: string,
+                          listener: EventListenerOrEventListenerObject,
+                          options?: boolean | AddEventListenerOptions
+                        ) => {
+                          if (type !== "message") {
+                            add(type, listener, options)
+                            return
+                          }
+                          const wrapped: EventListener = (event) => {
+                            const tag = typeof (event as MessageEvent<unknown>).data === "object" &&
+                                (event as MessageEvent<unknown>).data !== null
+                              ? Reflect.get((event as MessageEvent<unknown>).data as object, "_tag")
+                              : undefined
+                            if (tag === "Released") return
+                            if (typeof listener === "function") listener.call(port, event)
+                            else listener.handleEvent(event)
+                          }
+                          listeners.set(listener, wrapped)
+                          add(type, wrapped, options)
+                        }
+                      },
+                      removeEventListener: {
+                        configurable: true,
+                        value: (
+                          type: string,
+                          listener: EventListenerOrEventListenerObject,
+                          options?: boolean | EventListenerOptions
+                        ) => remove(type, listeners.get(listener) ?? listener, options)
+                      },
+                      postMessage: {
+                        configurable: true,
+                        value: (message: unknown, transfer?: ReadonlyArray<Transferable>) => {
+                          if (
+                            typeof message === "object" &&
+                            message !== null &&
+                            Reflect.get(message, "_tag") === "Start"
+                          ) {
+                            Deferred.doneUnsafe(start, Effect.succeed(payload.sessionId))
+                          }
+                          if (
+                            typeof message === "object" &&
+                            message !== null &&
+                            Reflect.get(message, "_tag") === "TerminalAck"
+                          ) {
+                            Deferred.doneUnsafe(terminalAck, Effect.void)
+                          }
+                          post(message, transfer === undefined ? [] : [...transfer])
+                        }
+                      }
+                    })
+                    return { nonce, port }
+                  })
+                )
+            }
+            return value
+          }
+        })
+        const client = yield* ReplicaClient.fromRpcClient(definition, observed, {
+          operationTimeout: 1_000
+        })
+        const restored = yield* client.restoreBackup({
+          source: Stream.never,
+          mode: "replace",
+          maxBytes: 1_024,
+          expectedDefinitionHash: definition.hash,
+          installationId: Identity.BackupInstallationId.make(
+            scenario.replacementPending
+              ? "bak_e8fe506a-2f58-463f-8ef4-a52f363b6314"
+              : "bak_3eb7f6c1-53fb-48a7-b292-a1faeb46d507"
+          )
+        }).pipe(Effect.forkChild)
+
+        const pulled = yield* Effect.raceFirst(
+          Deferred.await(start).pipe(Effect.map((sessionId) => ({ _tag: "Start" as const, sessionId }))),
+          Fiber.await(restored).pipe(Effect.map((exit) => ({ _tag: "Exit" as const, exit })))
+        )
+        assert.strictEqual(pulled._tag, "Start")
+        if (pulled._tag !== "Start") return
+        const staleSessionId = pulled.sessionId
+        assert.deepStrictEqual(openedSessionIds, [staleSessionId])
+        yield* sessions.close(staleSessionId, 0)
+        const ready = yield* Effect.raceFirst(
+          Deferred.await(terminalAck).pipe(Effect.as("Ack" as const)),
+          Fiber.await(restored).pipe(Effect.map((exit) => ({ _tag: "Exit" as const, exit })))
+        )
+        assert.strictEqual(ready, "Ack")
+        assert.deepStrictEqual(openedSessionIds, [staleSessionId])
+        yield* Deferred.await(replacementStarted)
+        yield* TestClock.adjust(1_000)
+        const exit = yield* Fiber.await(restored)
+        assert.isTrue(Exit.isFailure(exit))
+        if (Exit.isSuccess(exit)) return
+        assert.strictEqual(exit.cause.reasons.length, 1)
+        const reason = exit.cause.reasons[0]
+        assert.isTrue(Cause.isFailReason(reason))
+        if (!Cause.isFailReason(reason)) return
+        assert.strictEqual(reason.error.reason._tag, scenario.expected)
+        if (reason.error.reason._tag === "ProtocolMismatch") {
+          assert.strictEqual(reason.error.reason.expected, "active session")
+          assert.strictEqual(reason.error.reason.observed, staleSessionId)
+        }
+        if (reason.error.reason._tag === "OperationTimeout") {
+          assert.strictEqual(reason.error.reason.operation, "RestoreBackup")
+          assert.strictEqual(reason.error.reason.timeoutMillis, 1_000)
+        }
+        assert.strictEqual(beginCalls, 1)
+        assert.strictEqual(openedSessionIds.length, 2)
+        assert.notStrictEqual(openedSessionIds[1], openedSessionIds[0])
+      }).pipe(Effect.scoped, Effect.provide(ExpiringOwner))
+    })
+  }
 })

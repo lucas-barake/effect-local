@@ -2,6 +2,7 @@ import type * as Backup from "@lucas-barake/effect-local/Backup"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
@@ -9,6 +10,7 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
+import * as Latch from "effect/Latch"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
@@ -27,14 +29,33 @@ export interface BeginResult {
   readonly port: MessagePort
 }
 
+export interface FinishOptions {
+  readonly sessionId: Identity.SessionId
+  readonly clientId: number
+  readonly nonce: RestoreProtocol.RestoreNonce
+}
+
 export class RestoreTransport extends Context.Service<RestoreTransport, {
   readonly begin: (options: BeginOptions) => Effect.Effect<BeginResult, ReplicaError.ReplicaError>
+  readonly finish: (
+    options: FinishOptions
+  ) => Effect.Effect<Deferred.Deferred<void, RestoreProtocol.RestoreResultFailure>>
   readonly activeControllerCount: Effect.Effect<number>
 }>()("@lucas-barake/effect-local-browser/RestoreTransport") {}
 
-type WorkFailure =
-  | { readonly _tag: "SessionFailure"; readonly error: ReplicaError.ReplicaError }
-  | { readonly _tag: "RestoreFailure"; readonly error: ReplicaError.ReplicaError }
+class SessionFailure extends Schema.TaggedErrorClass<SessionFailure>(
+  "@lucas-barake/effect-local-browser/RestoreTransport/SessionFailure"
+)("SessionFailure", {
+  error: ReplicaError.ReplicaError
+}) {}
+
+class RestoreFailure extends Schema.TaggedErrorClass<RestoreFailure>(
+  "@lucas-barake/effect-local-browser/RestoreTransport/RestoreFailure"
+)("RestoreFailure", {
+  error: ReplicaError.ReplicaError
+}) {}
+
+type WorkFailure = SessionFailure | RestoreFailure
 
 type AwaitingFrame = {
   readonly _tag: "Start"
@@ -60,15 +81,17 @@ type AwaitingFrame = {
 type ControllerPhase = "SettingUp" | "Running" | "Finishing" | "ShutdownRequested" | "Closed"
 
 interface Controller {
-  readonly id: symbol
   readonly nonce: RestoreProtocol.RestoreNonce
   readonly options: BeginOptions
   readonly lease: SessionManager.RestoreLease
   readonly operationScope: Scope.Closeable
   readonly setupReady: Deferred.Deferred<void>
-  readonly supervisorStarted: Deferred.Deferred<void>
   readonly shutdown: Deferred.Deferred<ReplicaError.ReplicaError>
   readonly cleanupComplete: Deferred.Deferred<void>
+  readonly start: Deferred.Deferred<RestoreProtocol.Start, ReplicaError.ReplicaError>
+  readonly resultClaimed: Deferred.Deferred<void>
+  result: Deferred.Deferred<void, RestoreProtocol.RestoreResultFailure> | undefined
+  shutdownReason: ReplicaError.ReplicaError | undefined
   phase: ControllerPhase
   port: MessagePort | undefined
   peerPort: MessagePort | undefined
@@ -100,19 +123,19 @@ const timeout = (operation: string, timeoutMillis: number) =>
     reason: new ReplicaError.OperationTimeout({ operation, timeoutMillis })
   })
 
-const failSync = <A,>(deferred: Deferred.Deferred<A, ReplicaError.ReplicaError>, error: ReplicaError.ReplicaError) =>
-  Effect.runSync(Deferred.fail(deferred, error))
-
-const succeedSync = <A, E,>(deferred: Deferred.Deferred<A, E>, value: A) =>
-  Effect.runSync(Deferred.succeed(deferred, value))
-
-const frameFields: Readonly<Record<string, ReadonlySet<string>>> = {
-  Start: new Set(["_tag", "nonce", "sequence"]),
-  Chunk: new Set(["_tag", "nonce", "sequence", "bytes"]),
-  End: new Set(["_tag", "nonce", "sequence"]),
-  SourceFailure: new Set(["_tag", "nonce", "sequence", "error"]),
-  TerminalAck: new Set(["_tag", "nonce", "sequence"]),
-  ReleasedAck: new Set(["_tag", "nonce", "sequence"])
+const ownExactProperties = (
+  input: object,
+  fields: ReadonlySet<string>
+): ReadonlyMap<string, unknown> | undefined => {
+  const properties = new Map<string, unknown>()
+  for (const key in input) {
+    if (!Object.prototype.hasOwnProperty.call(input, key)) continue
+    if (properties.size >= fields.size || !fields.has(key)) return undefined
+    const descriptor = Object.getOwnPropertyDescriptor(input, key)
+    if (descriptor === undefined || !("value" in descriptor)) return undefined
+    properties.set(key, descriptor.value)
+  }
+  return properties.size === fields.size ? properties : undefined
 }
 
 const preflightFrame = (
@@ -122,19 +145,16 @@ const preflightFrame = (
 ): boolean => {
   try {
     if (typeof input !== "object" || input === null || Array.isArray(input)) return false
-    const tag = Reflect.get(input, "_tag")
+    const tagDescriptor = Object.getOwnPropertyDescriptor(input, "_tag")
+    if (tagDescriptor === undefined || !("value" in tagDescriptor)) return false
+    const tag = tagDescriptor.value
     if (typeof tag !== "string") return false
-    const allowedFields = frameFields[tag]
+    const allowedFields = RestoreProtocol.pageToOwnerFrameFields[tag]
     if (allowedFields === undefined) return false
-    const keys = Reflect.ownKeys(input)
-    if (
-      keys.length !== allowedFields.size ||
-      keys.some((key) => typeof key !== "string" || !allowedFields.has(key))
-    ) {
-      return false
-    }
+    const properties = ownExactProperties(input, allowedFields)
+    if (properties === undefined) return false
     if (tag === "Chunk") {
-      const bytes = Reflect.get(input, "bytes")
+      const bytes = properties.get("bytes")
       if (
         !(bytes instanceof Uint8Array) ||
         bytes.byteLength === 0 ||
@@ -147,7 +167,7 @@ const preflightFrame = (
       }
     }
     if (tag === "SourceFailure") {
-      return RestoreProtocol.preflight(Reflect.get(input, "error"), maxErrorBytes)
+      return RestoreProtocol.preflightReplicaError(properties.get("error"), maxErrorBytes)
     }
     return true
   } catch {
@@ -213,22 +233,17 @@ const makeLayer = Layer.effect(
       const supervisorScope = yield* Scope.make("parallel")
       const finishingCapacity = sessions.effectiveRestoreCapacity
       const finishing = yield* Semaphore.make(finishingCapacity)
-      const initialStartingZero = yield* Deferred.make<void>()
-      yield* Deferred.succeed(initialStartingZero, undefined)
+      const startingZero = yield* Latch.make(true)
 
       let closed = false
       let starting = 0
-      let startingZero = initialStartingZero
-      const controllers = new Map<symbol, Controller>()
+      const controllers = new Map<RestoreProtocol.RestoreNonce, Controller>()
 
-      const enterStarting = Effect.gen(function*() {
-        const nextZero = yield* Deferred.make<void>()
-        return yield* Effect.sync(() => {
-          if (closed) return false
-          if (starting === 0) startingZero = nextZero
-          starting += 1
-          return true
-        })
+      const enterStarting = Effect.sync(() => {
+        if (closed) return false
+        if (starting === 0) startingZero.closeUnsafe()
+        starting += 1
+        return true
       }).pipe(
         Effect.filterOrFail(
           (entered) => entered,
@@ -241,12 +256,13 @@ const makeLayer = Layer.effect(
           if (!owned.value) return
           owned.value = false
           starting -= 1
-          if (starting === 0) succeedSync(startingZero, undefined)
+          if (starting === 0) startingZero.openUnsafe()
         })
 
       const stopIngress = (controller: Controller) => {
         const port = controller.port
         if (port === undefined) return
+        controller.port = undefined
         if (controller.listenersInstalled) {
           if (controller.messageListener !== undefined) {
             port.removeEventListener("message", controller.messageListener)
@@ -265,24 +281,25 @@ const makeLayer = Layer.effect(
       const failAwaiting = (awaiting: AwaitingFrame, error: ReplicaError.ReplicaError) => {
         switch (awaiting._tag) {
           case "Start":
-            failSync(awaiting.deferred, error)
+            Deferred.doneUnsafe(awaiting.deferred, Effect.fail(error))
             break
           case "Source":
-            failSync(awaiting.deferred, error)
+            Deferred.doneUnsafe(awaiting.deferred, Effect.fail(error))
             break
           case "TerminalAck":
-            failSync(awaiting.deferred, error)
+            Deferred.doneUnsafe(awaiting.deferred, Effect.fail(error))
             break
           case "ReleasedAck":
-            failSync(awaiting.deferred, error)
+            Deferred.doneUnsafe(awaiting.deferred, Effect.fail(error))
         }
       }
 
       const beginShutdown = (controller: Controller, error: ReplicaError.ReplicaError) => {
         if (controller.phase === "Closed" || controller.phase === "Finishing") return
         controller.phase = "ShutdownRequested"
+        controller.shutdownReason = error
         stopIngress(controller)
-        succeedSync(controller.shutdown, error)
+        Deferred.doneUnsafe(controller.shutdown, Effect.succeed(error))
         if (controller.awaiting !== undefined) {
           failAwaiting(controller.awaiting, error)
         }
@@ -291,6 +308,16 @@ const makeLayer = Layer.effect(
       const invalidFrame = (controller: Controller) => {
         const error = protocolFailure()
         if (controller.phase === "Finishing") {
+          stopIngress(controller)
+          if (controller.awaiting !== undefined) failAwaiting(controller.awaiting, error)
+          return
+        }
+        beginShutdown(controller, error)
+      }
+
+      const disconnect = (controller: Controller, error: ReplicaError.ReplicaError) => {
+        if (controller.phase === "Finishing") {
+          controller.shutdownReason = error
           stopIngress(controller)
           if (controller.awaiting !== undefined) failAwaiting(controller.awaiting, error)
           return
@@ -319,7 +346,7 @@ const makeLayer = Layer.effect(
         if (awaiting._tag === "Start" && frame._tag === "Start") {
           controller.awaiting = undefined
           controller.lastSequence = frame.sequence
-          if (!succeedSync(awaiting.deferred, frame)) invalidFrame(controller)
+          if (!Deferred.doneUnsafe(awaiting.deferred, Effect.succeed(frame))) invalidFrame(controller)
           return
         }
         if (
@@ -343,17 +370,17 @@ const makeLayer = Layer.effect(
           }
           controller.awaiting = undefined
           controller.lastSequence = frame.sequence
-          if (!succeedSync(awaiting.deferred, frame)) invalidFrame(controller)
+          if (!Deferred.doneUnsafe(awaiting.deferred, Effect.succeed(frame))) invalidFrame(controller)
           return
         }
         if (awaiting._tag === "TerminalAck" && frame._tag === "TerminalAck") {
           controller.awaiting = undefined
-          if (!succeedSync(awaiting.deferred, frame)) invalidFrame(controller)
+          if (!Deferred.doneUnsafe(awaiting.deferred, Effect.succeed(frame))) invalidFrame(controller)
           return
         }
         if (awaiting._tag === "ReleasedAck" && frame._tag === "ReleasedAck") {
           controller.awaiting = undefined
-          if (!succeedSync(awaiting.deferred, frame)) invalidFrame(controller)
+          if (!Deferred.doneUnsafe(awaiting.deferred, Effect.succeed(frame))) invalidFrame(controller)
           return
         }
         invalidFrame(controller)
@@ -379,12 +406,12 @@ const makeLayer = Layer.effect(
           acceptFrame(controller, decoded.value)
         }
         const onMessageError = () =>
-          beginShutdown(
+          disconnect(
             controller,
             unavailable(new Error("restore transport message decoding failed"))
           )
         const onClose = () =>
-          beginShutdown(
+          disconnect(
             controller,
             unavailable(new Error("restore transport peer closed"))
           )
@@ -399,17 +426,22 @@ const makeLayer = Layer.effect(
       }
 
       const awaitStart = (controller: Controller) =>
-        Effect.gen(function*() {
-          const deferred = yield* Deferred.make<RestoreProtocol.Start, ReplicaError.ReplicaError>()
-          controller.awaiting = { _tag: "Start", sequence: 0, deferred }
-          return yield* boundWait(
-            Deferred.await(deferred),
-            "RestoreBackupStart",
-            sessions.maxRestorePullMillis
-          ).pipe(
-            Effect.tapError((error) => Effect.sync(() => beginShutdown(controller, error)))
-          )
-        })
+        boundWait(
+          Deferred.await(controller.start),
+          "RestoreBackupStart",
+          sessions.maxRestorePullMillis
+        ).pipe(
+          Effect.tapError((error) => Effect.sync(() => beginShutdown(controller, error)))
+        )
+
+      const awaitResultClaim = (controller: Controller) =>
+        boundWait(
+          Deferred.await(controller.resultClaimed),
+          "RestoreBackupResultClaim",
+          sessions.maxRestorePullMillis
+        ).pipe(
+          Effect.tapError((error) => Effect.sync(() => beginShutdown(controller, error)))
+        )
 
       const source = (controller: Controller) =>
         Stream.unfold(1, (sequence) =>
@@ -438,7 +470,7 @@ const makeLayer = Layer.effect(
             controller.ignoredOutstandingSequence = undefined
             if (frame._tag === "End") return undefined
             if (frame._tag === "SourceFailure") {
-              return yield* RestoreProtocol.decodeReplicaError(frame.error)
+              return yield* Effect.fail(RestoreProtocol.replicaErrorFromWire(frame.error))
             }
             return [frame.bytes, sequence + 1] as const
           }))
@@ -447,6 +479,7 @@ const makeLayer = Layer.effect(
         Effect.gen(function*() {
           const restore = Effect.gen(function*() {
             yield* awaitStart(controller)
+            yield* awaitResultClaim(controller)
             controller.phase = "Running"
             return yield* replica.restoreBackup({
               source: source(controller),
@@ -459,7 +492,7 @@ const makeLayer = Layer.effect(
             Effect.catchCause((cause) =>
               Effect.failCause(Cause.map(
                 cause,
-                (error): WorkFailure => ({ _tag: "RestoreFailure", error })
+                (error): WorkFailure => new RestoreFailure({ error })
               ))
             )
           )
@@ -467,7 +500,7 @@ const makeLayer = Layer.effect(
             Effect.catchCause((cause) =>
               Effect.failCause(Cause.map(
                 cause,
-                (error): WorkFailure => ({ _tag: "SessionFailure", error })
+                (error): WorkFailure => new SessionFailure({ error })
               ))
             )
           )
@@ -475,61 +508,27 @@ const makeLayer = Layer.effect(
         })
 
       const sendTerminalAndAwaitAck = (
-        controller: Controller,
-        exit: Exit.Exit<void, WorkFailure>
-      ): Effect.Effect<void, ReplicaError.ReplicaError | WorkFailure> =>
+        controller: Controller
+      ): Effect.Effect<void, ReplicaError.ReplicaError> =>
         Effect.gen(function*() {
           controller.phase = "Finishing"
-          if (Exit.isFailure(exit)) {
-            const reasons = exit.cause.reasons
-            if (reasons.length !== 1 || Cause.isInterruptReason(reasons[0]!)) {
-              return yield* Effect.failCause(exit.cause)
-            }
-          }
           const sequence = controller.lastSequence + 1
           const ack = yield* Deferred.make<RestoreProtocol.TerminalAck, ReplicaError.ReplicaError>()
           controller.awaiting = { _tag: "TerminalAck", sequence, deferred: ack }
-          if (Exit.isSuccess(exit)) {
-            yield* post(controller, RestoreProtocol.TerminalSuccess, {
-              _tag: "TerminalSuccess",
-              nonce: controller.nonce,
-              sequence
-            })
-          } else {
-            const reason = exit.cause.reasons[0]!
-            if (Cause.isDieReason(reason)) {
-              yield* post(controller, RestoreProtocol.TerminalDefect, {
-                _tag: "TerminalDefect",
-                nonce: controller.nonce,
-                sequence,
-                defect: RestoreProtocol.encodeDefect(reason.defect, sessions.maxRestoreErrorBytes)
-              })
-            } else if (Cause.isFailReason(reason) && reason.error._tag === "SessionFailure") {
-              yield* post(controller, RestoreProtocol.TerminalSessionFailure, {
-                _tag: "TerminalSessionFailure",
-                nonce: controller.nonce,
-                sequence,
-                error: RestoreProtocol.encodeReplicaError(reason.error.error, sessions.maxRestoreErrorBytes)
-              })
-            } else if (Cause.isFailReason(reason) && reason.error._tag === "RestoreFailure") {
-              yield* post(controller, RestoreProtocol.TerminalRestoreFailure, {
-                _tag: "TerminalRestoreFailure",
-                nonce: controller.nonce,
-                sequence,
-                error: RestoreProtocol.encodeReplicaError(reason.error.error, sessions.maxRestoreErrorBytes)
-              })
-            } else {
-              return yield* Effect.die(new Error("restore work failed without a Cause reason"))
-            }
-          }
+          yield* post(controller, RestoreProtocol.TerminalReady, {
+            _tag: "TerminalReady",
+            nonce: controller.nonce,
+            sequence
+          })
           yield* Deferred.await(ack)
+          controller.lastSequence = sequence
         })
 
       const sendReleasedAndAwaitAck = (
         controller: Controller
       ): Effect.Effect<void, ReplicaError.ReplicaError> =>
         Effect.gen(function*() {
-          const sequence = controller.lastSequence + 2
+          const sequence = controller.lastSequence + 1
           yield* controller.lease.release
           const releasedAck = yield* Deferred.make<RestoreProtocol.ReleasedAck, ReplicaError.ReplicaError>()
           controller.awaiting = { _tag: "ReleasedAck", sequence, deferred: releasedAck }
@@ -552,15 +551,31 @@ const makeLayer = Layer.effect(
             controller.awaiting = undefined
             stopIngress(controller)
             controller.peerPort = undefined
+            const result = controller.result
+            if (result !== undefined && !(yield* Deferred.isDone(result))) {
+              const error = controller.shutdownReason ??
+                unavailable(new Error("restore operation ended before producing a result"))
+              yield* Deferred.fail(
+                result,
+                new RestoreProtocol.RestoreResultRestoreFailure({
+                  error: RestoreProtocol.encodeReplicaError(
+                    error,
+                    sessions.maxRestoreErrorBytes
+                  )
+                })
+              )
+            }
+            controller.result = undefined
             yield* Scope.close(controller.operationScope, exit)
-            controllers.delete(controller.id)
+            if (controllers.get(controller.nonce) === controller) {
+              controllers.delete(controller.nonce)
+            }
             yield* Deferred.succeed(controller.cleanupComplete, undefined)
           })
         )
 
       const supervise = (controller: Controller) =>
         Effect.gen(function*() {
-          yield* Deferred.succeed(controller.supervisorStarted, undefined)
           const setup = yield* Effect.raceFirst(
             Deferred.await(controller.setupReady).pipe(Effect.as("Ready" as const)),
             Deferred.await(controller.shutdown).pipe(Effect.as("Shutdown" as const))
@@ -591,28 +606,55 @@ const makeLayer = Layer.effect(
             return
           }
           if (controller.phase === "ShutdownRequested") return
+          const result = controller.result
+          if (result === undefined) return
+          const resultExit = Exit.isSuccess(outcome.exit)
+            ? Exit.void
+            : Exit.failCause(
+              Cause.map(outcome.exit.cause, (failure): RestoreProtocol.RestoreResultFailure =>
+                failure._tag === "SessionFailure"
+                  ? new RestoreProtocol.RestoreResultSessionFailure({
+                    error: RestoreProtocol.encodeReplicaError(
+                      failure.error,
+                      sessions.maxRestoreErrorBytes
+                    )
+                  })
+                  : new RestoreProtocol.RestoreResultRestoreFailure({
+                    error: RestoreProtocol.encodeReplicaError(
+                      failure.error,
+                      sessions.maxRestoreErrorBytes
+                    )
+                  }))
+            )
+          yield* Deferred.done(result, resultExit)
           controller.phase = "Finishing"
           controller.ignoredOutstandingSequence = controller.awaiting?._tag === "Source"
             ? controller.awaiting.sequence
             : undefined
           const acquireFinishing = Effect.acquireRelease(
             finishing.take(1),
-            () => finishing.release(1),
+            () =>
+              finishing.release(1),
             { interruptible: true }
           ).pipe(
             Effect.provideService(Scope.Scope, controller.operationScope),
             Effect.asVoid
           )
           yield* boundWait(
-            acquireFinishing.pipe(
-              Effect.andThen(sendTerminalAndAwaitAck(controller, outcome.exit))
-            ),
+            acquireFinishing,
+            "RestoreBackupFinishingCapacity",
+            sessions.maxRestorePullMillis
+          )
+          yield* boundWait(
+            sendTerminalAndAwaitAck(controller),
             "RestoreBackupTerminalAck",
             sessions.maxRestorePullMillis
           )
           yield* sendReleasedAndAwaitAck(controller)
         }).pipe(
-          Effect.onExit((exit) => cleanup(controller, exit))
+          Effect.onExit((exit) =>
+            cleanup(controller, exit)
+          )
         )
 
       const begin: RestoreTransport["Service"]["begin"] = (options) =>
@@ -623,7 +665,6 @@ const makeLayer = Layer.effect(
             let operationScope: Scope.Closeable | undefined
             let controller: Controller | undefined
             let supervisorLive = false
-            let published = false
             yield* enterStarting
             const attempt = Effect.gen(function*() {
               lease = yield* sessions.acquireRestore(options.sessionId, options.clientId)
@@ -633,20 +674,26 @@ const makeLayer = Layer.effect(
               const nonce = RestoreProtocol.RestoreNonce.make(`rst_${uuid}`)
               operationScope = yield* Scope.make("sequential")
               yield* Scope.addFinalizer(operationScope, lease.release)
+              const start = yield* Deferred.make<
+                RestoreProtocol.Start,
+                ReplicaError.ReplicaError
+              >()
               controller = {
-                id: Symbol(),
                 nonce,
                 options,
                 lease,
                 operationScope,
                 setupReady: yield* Deferred.make<void>(),
-                supervisorStarted: yield* Deferred.make<void>(),
                 shutdown: yield* Deferred.make<ReplicaError.ReplicaError>(),
                 cleanupComplete: yield* Deferred.make<void>(),
+                start,
+                resultClaimed: yield* Deferred.make<void>(),
+                result: yield* Deferred.make<void, RestoreProtocol.RestoreResultFailure>(),
+                shutdownReason: undefined,
                 phase: "SettingUp",
                 port: undefined,
                 peerPort: undefined,
-                awaiting: undefined,
+                awaiting: { _tag: "Start", sequence: 0, deferred: start },
                 lastSequence: 0,
                 cumulativeBytes: 0,
                 listenersInstalled: false,
@@ -659,11 +706,9 @@ const makeLayer = Layer.effect(
                 Effect.forkIn(supervisorScope, { startImmediately: true })
               )
               supervisorLive = true
-              yield* Deferred.await(controller.supervisorStarted)
               const accepted = yield* Effect.sync(() => {
-                if (closed) return false
-                controllers.set(controller!.id, controller!)
-                published = true
+                if (closed || controllers.has(controller!.nonce)) return false
+                controllers.set(controller!.nonce, controller!)
                 return true
               })
               if (!accepted) {
@@ -671,12 +716,23 @@ const makeLayer = Layer.effect(
                 yield* Deferred.await(controller.cleanupComplete)
                 return yield* unavailable(new Error("restore transport is closed"))
               }
-              yield* leaveStarting(startingOwned)
               const channel = yield* Effect.sync(() => new MessageChannel())
+              if (
+                closed ||
+                controller.phase !== "SettingUp" ||
+                controllers.get(controller.nonce) !== controller
+              ) {
+                channel.port1.close()
+                channel.port2.close()
+                beginShutdown(controller, unavailable(new Error("restore transport is closed")))
+                yield* Deferred.await(controller.cleanupComplete)
+                return yield* unavailable(new Error("restore transport is closed"))
+              }
               controller.port = channel.port1
               controller.peerPort = channel.port2
               installIngress(controller, channel.port1)
               yield* Deferred.succeed(controller.setupReady, undefined)
+              yield* leaveStarting(startingOwned)
               return yield* restore(
                 Effect.succeed({ nonce, port: channel.port2 }).pipe(
                   Effect.onInterrupt(() =>
@@ -691,6 +747,9 @@ const makeLayer = Layer.effect(
                 Effect.gen(function*() {
                   if (Exit.isSuccess(exit)) return
                   if (controller !== undefined && supervisorLive) {
+                    const peerPort = controller.peerPort
+                    controller.peerPort = undefined
+                    if (peerPort !== undefined) peerPort.close()
                     beginShutdown(controller, unavailable(Cause.squash(exit.cause)))
                     yield* Deferred.await(controller.cleanupComplete)
                   } else if (operationScope !== undefined) {
@@ -698,12 +757,65 @@ const makeLayer = Layer.effect(
                   } else if (lease !== undefined) {
                     yield* lease.release
                   }
-                  if (!published) yield* leaveStarting(startingOwned)
+                  yield* leaveStarting(startingOwned)
                 })
               )
             )
           })
         )
+
+      const finish: RestoreTransport["Service"]["finish"] = (options) =>
+        Effect.gen(function*() {
+          const claimed = yield* Effect.sync(() => {
+            const controller = controllers.get(options.nonce)
+            if (
+              controller === undefined ||
+              controller.options.sessionId !== options.sessionId ||
+              controller.options.clientId !== options.clientId ||
+              controller.phase === "Closed" ||
+              controller.result === undefined
+            ) {
+              return undefined
+            }
+            const result = controller.result
+            if (!Deferred.doneUnsafe(controller.resultClaimed, Effect.void)) return undefined
+            return { controller, result }
+          })
+          if (claimed === undefined) {
+            const result = yield* Deferred.make<void, RestoreProtocol.RestoreResultFailure>()
+            const validSession = yield* sessions.contains(options.sessionId)
+            const maxErrorBytes = validSession
+              ? sessions.maxRestoreErrorBytes
+              : ReplicaLimits.minimumRestoreErrorBytes
+            yield* Deferred.fail(
+              result,
+              new RestoreProtocol.RestoreResultSessionFailure({
+                error: RestoreProtocol.encodeReplicaError(
+                  protocolFailure(),
+                  maxErrorBytes
+                )
+              })
+            )
+            return result
+          }
+          const rpcResult = yield* Deferred.make<void, RestoreProtocol.RestoreResultFailure>()
+          yield* Deferred.completeWith(
+            rpcResult,
+            Deferred.await(claimed.result).pipe(
+              Effect.exit,
+              Effect.onInterrupt(() =>
+                Effect.sync(() =>
+                  beginShutdown(
+                    claimed.controller,
+                    unavailable(new Error("restore result consumer interrupted"))
+                  )
+                )
+              ),
+              Effect.flatMap((exit) => exit)
+            )
+          )
+          return rpcResult
+        })
 
       const shutdown = Effect.uninterruptible(
         Effect.gen(function*() {
@@ -715,7 +827,7 @@ const makeLayer = Layer.effect(
             }
             return snapshot
           })
-          yield* Deferred.await(startingZero)
+          yield* startingZero.await
           yield* Effect.forEach(
             snapshot,
             (controller) => Deferred.await(controller.cleanupComplete),
@@ -728,6 +840,7 @@ const makeLayer = Layer.effect(
       return {
         service: {
           begin,
+          finish,
           activeControllerCount: Effect.sync(() => controllers.size)
         } satisfies RestoreTransport["Service"],
         shutdown

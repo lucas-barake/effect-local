@@ -8,6 +8,7 @@ import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
@@ -15,6 +16,7 @@ import * as Stream from "effect/Stream"
 import { Headers } from "effect/unstable/http"
 import { Rpc, RpcTest } from "effect/unstable/rpc"
 import { RequestId } from "effect/unstable/rpc/RpcMessage"
+import type * as RestoreProtocol from "../src/internal/restoreProtocol.js"
 import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
@@ -65,11 +67,13 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore version 4", (it) => {
       })
     })
   )
-  const ReplicaLayer = Layer.succeed(Replica.Replica, replica)
-  const ownerLayer = () =>
+  const ownerLayer = (replicaService: Replica.Replica["Service"] = replica) =>
     ReplicaOwner.layerHandlers(definition).pipe(
       Layer.provideMerge(Sessions),
-      Layer.provide(Layer.merge(Publisher, ReplicaLayer))
+      Layer.provide(Layer.merge(
+        Publisher,
+        Layer.succeed(Replica.Replica, replicaService)
+      ))
     )
   const restoreOptions = {
     mode: "replace" as const,
@@ -173,6 +177,52 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore version 4", (it) => {
       assert.strictEqual(yield* sessions.activeRestoreCount, 1)
       started.port.close()
     })).pipe(Effect.provide(ownerLayer())))
+
+  it.effect("releases restore admission when the Finish RPC is interrupted", () =>
+    Effect.gen(function*() {
+      const restoreStarted = yield* Deferred.make<void>()
+      const stalledReplica: Replica.Replica["Service"] = {
+        ...replica,
+        restoreBackup: () =>
+          Deferred.succeed(restoreStarted, undefined).pipe(
+            Effect.andThen(Effect.never)
+          )
+      }
+      return yield* Effect.scoped(Effect.gen(function*() {
+        const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+        const sessions = yield* SessionManager.SessionManager
+        const sessionId = yield* Identity.makeSessionId
+        yield* rpc.OpenSession({
+          sessionId,
+          protocolVersion: ReplicaRpc.protocolVersion,
+          definitionHash: definition.hash
+        })
+        const started = yield* rpc.BeginRestoreBackupV4({ sessionId, ...restoreOptions })
+        yield* Effect.addFinalizer(() => Effect.sync(() => started.port.close()))
+        started.port.start()
+
+        const finish = yield* rpc.FinishRestoreBackupV4({
+          sessionId,
+          nonce: started.nonce
+        }).pipe(Effect.forkChild({ startImmediately: true }))
+        started.port.postMessage(
+          {
+            _tag: "Start",
+            nonce: started.nonce,
+            sequence: 0
+          } satisfies RestoreProtocol.Start
+        )
+        yield* Deferred.await(restoreStarted)
+        assert.strictEqual(yield* sessions.activeRestoreCount, 1)
+
+        yield* Fiber.interrupt(finish)
+        yield* Effect.yieldNow
+        const activeAfterInterrupt = yield* sessions.activeRestoreCount
+        started.port.close()
+        yield* Effect.yieldNow
+        assert.strictEqual(activeAfterInterrupt, 0)
+      })).pipe(Effect.provide(ownerLayer(stalledReplica)))
+    }))
 
   it.effect("builds an independent restore transport for each owner layer", () =>
     Effect.scoped(Effect.gen(function*() {

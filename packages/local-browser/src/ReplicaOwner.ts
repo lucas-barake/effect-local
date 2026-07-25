@@ -270,6 +270,12 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
             })
           )
         ),
+      FinishRestoreBackupV4: ({ nonce, sessionId }, { client }) =>
+        restoreTransport.finish({
+          sessionId,
+          clientId: client.id,
+          nonce
+        }),
       ExportDocument: ({ document, documentId, sessionId }, { client }) =>
         sessions.run(
           sessionId,
@@ -304,7 +310,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           )
         )
     })
-  })).pipe(Layer.provide(Layer.fresh(RestoreTransport.layer)))
+  })).pipe(Layer.provide(RestoreTransport.freshLayer))
 
 export const layer = (definition: ReplicaDefinition.Any) =>
   RpcServer.layer(ReplicaRpc.group).pipe(Layer.provide(layerHandlers(definition)))

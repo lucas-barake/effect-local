@@ -200,6 +200,14 @@ export const group = RpcGroup.make(
     }),
     error: ReplicaError.ReplicaError
   }),
+  Rpc.make("FinishRestoreBackupV4", {
+    payload: {
+      sessionId: Identity.SessionId,
+      nonce: RestoreProtocol.RestoreNonce
+    },
+    error: RestoreProtocol.RestoreResultFailure,
+    defect: RestoreProtocol.RestoreResultDefect
+  }),
   Rpc.make("ExportDocument", {
     payload: { sessionId: Identity.SessionId, document: Schema.String, documentId: Identity.DocumentId },
     success: ExportedDocument,

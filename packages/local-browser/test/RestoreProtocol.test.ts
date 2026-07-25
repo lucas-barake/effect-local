@@ -2,9 +2,11 @@ import { assert, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Schema from "effect/Schema"
+import * as Rpc from "effect/unstable/rpc/Rpc"
 import * as RestoreProtocol from "../src/internal/restoreProtocol.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 
@@ -19,6 +21,97 @@ it.effect("round trips a typed restore error through its wire schema", () =>
     const encoded = RestoreProtocol.encodeReplicaError(original, 4_096)
     const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
     assert.deepStrictEqual(RestoreProtocol.replicaErrorFromWire(decoded), original)
+  }))
+
+const finishRpc = ReplicaRpc.group.requests.get("FinishRestoreBackupV4")!
+const finishExitCodec = Schema.toCodecJson(Rpc.exitSchema(finishRpc))
+const restoreFailure = (replica: string) =>
+  new RestoreProtocol.RestoreResultRestoreFailure({
+    error: { _tag: "RestoreBusy", replica }
+  })
+const restoreFailureReasonTag = (
+  reason: Cause.Reason<unknown>
+): ReplicaError.ReplicaError["reason"]["_tag"] | undefined => {
+  if (
+    !Cause.isFailReason(reason) ||
+    !Schema.is(RestoreProtocol.RestoreResultRestoreFailure)(reason.error)
+  ) {
+    return undefined
+  }
+  return RestoreProtocol.replicaErrorFromWire(reason.error.error).reason._tag
+}
+const roundTripFinishExit = (
+  exit: Exit.Exit<void, RestoreProtocol.RestoreResultFailure>
+) =>
+  Schema.encodeUnknownEffect(finishExitCodec)(exit).pipe(
+    Effect.flatMap(Schema.decodeUnknownEffect(finishExitCodec))
+  )
+
+it.effect("preserves more than eight typed reasons through the production Finish RPC codec", () =>
+  Effect.gen(function*() {
+    const original = Exit.failCause(Cause.fromReasons(
+      Array.from(
+        { length: 9 },
+        (_, index) => Cause.makeFailReason(restoreFailure(`replica-${index}`))
+      )
+    ))
+    const decoded = yield* roundTripFinishExit(original)
+    assert.isTrue(Exit.isFailure(decoded))
+    if (Exit.isFailure(decoded)) {
+      assert.deepStrictEqual(
+        decoded.cause.reasons.map((reason) => reason._tag),
+        Array.from({ length: 9 }, () => "Fail")
+      )
+      assert.deepStrictEqual(
+        decoded.cause.reasons.flatMap((reason) => {
+          const tag = restoreFailureReasonTag(reason)
+          return tag === undefined ? [] : [tag]
+        }),
+        Array.from({ length: 9 }, () => "RestoreBusy")
+      )
+    }
+  }))
+
+it.effect("preserves mixed failure, redacted defect, and interruption through the production Finish RPC codec", () =>
+  Effect.gen(function*() {
+    const secret = "SELECT password=credential FROM /private/archive"
+    const mixed = yield* roundTripFinishExit(
+      Exit.failCause(Cause.fromReasons([
+        Cause.makeFailReason(restoreFailure("typed")),
+        Cause.makeDieReason(new Error(secret))
+      ]))
+    )
+    assert.isTrue(Exit.isFailure(mixed))
+    if (Exit.isFailure(mixed)) {
+      assert.deepStrictEqual(mixed.cause.reasons.map((reason) => reason._tag), ["Fail", "Die"])
+      const failureTag = mixed.cause.reasons
+        .map(restoreFailureReasonTag)
+        .find((tag) => tag !== undefined)
+      assert.strictEqual(
+        failureTag,
+        "RestoreBusy"
+      )
+      const defect = mixed.cause.reasons.find(Cause.isDieReason)
+      assert.notInclude(String(defect?.defect), "SELECT")
+      assert.notInclude(String(defect?.defect), "password")
+      assert.notInclude(String(defect?.defect), "/private/archive")
+    }
+
+    const interrupted = yield* roundTripFinishExit(
+      Exit.failCause(Cause.fromReasons([
+        Cause.makeFailReason(restoreFailure("typed")),
+        Cause.makeInterruptReason(987)
+      ]))
+    )
+    assert.isTrue(Exit.isFailure(interrupted))
+    if (Exit.isFailure(interrupted)) {
+      assert.deepStrictEqual(
+        interrupted.cause.reasons.map((reason) => reason._tag),
+        ["Fail", "Interrupt"]
+      )
+      const interrupt = interrupted.cause.reasons.find(Cause.isInterruptReason)
+      assert.strictEqual(interrupt?.fiberId, 987)
+    }
   }))
 
 it.effect("bounds a multi-field restore error by the complete UTF-8 string budget", () =>
@@ -124,6 +217,14 @@ it.effect("validates branded identities before reconstructing a typed error", ()
   }))
 
 it("bounds redacted defects and rejects hostile preflight values", () => {
+  const secret = "SELECT password=credential FROM /private/archive"
+  const redacted = RestoreProtocol.encodeDefect(new Error(secret), 4_096)
+  assert.notInclude(redacted.name, secret)
+  assert.notInclude(redacted.message, "SELECT")
+  assert.notInclude(redacted.message, "password")
+  assert.notInclude(redacted.message, "credential")
+  assert.notInclude(redacted.message, "/private/archive")
+
   const throwing = Object.create(null)
   Object.defineProperty(throwing, "name", {
     get() {
@@ -152,6 +253,19 @@ it("bounds redacted defects and rejects hostile preflight values", () => {
     }
   })
   assert.isFalse(RestoreProtocol.preflight(hostile, 4_096))
+})
+
+it("rejects excess nested ArrayBuffer properties before schema decoding", () => {
+  assert.isFalse(
+    RestoreProtocol.preflight({
+      _tag: "StorageUnavailable",
+      cause: {
+        name: "Error",
+        message: "bounded",
+        excess: new ArrayBuffer(1)
+      }
+    }, 4_096)
+  )
 })
 
 it.effect("guards transferred MessagePort values", () =>

@@ -736,20 +736,23 @@ export const BrowserLive = BrowserReplica.layerWithReactivity(definition, {
 ```
 
 Session timeout applies to open, renewal, and close. Operation timeout applies independently to each unary RPC
-attempt, including durable command receipt lookup. Status, invalidation, and backup export streams are intentionally
-unbounded.
+attempt, including durable command receipt lookup. Restore is the exception. It uses one end to end operation deadline
+across Begin, source transfer, Finish, cleanup, and stale session replacement. Status, invalidation, and backup export
+streams are intentionally unbounded.
 
-Browser restore protocol version 4 begins with a short unary request. The owner returns a dedicated `MessagePort`,
-then drives archive input with `Start` and one outstanding `Pull` credit. The page sends one bounded chunk per credit.
-An authoritative terminal result is acknowledged before the owner confirms that active restore admission was
-released. This lets the unary worker slot return before the archive source is subscribed and preserves backpressure
-when the source uses the same client.
+Browser restore protocol version 4 begins with a short unary request. The owner returns a restore nonce and dedicated
+`MessagePort`. The page immediately starts a pending `FinishRestoreBackupV4` result RPC and sends `Start`. After the
+owner has both signals, it drives archive input with one outstanding `Pull` credit. The page sends one bounded chunk
+per credit. When the owner sends `TerminalReady`, the page accepts the authoritative Exit from the result RPC before
+acknowledging the terminal. The owner then releases restore admission and sends `Released`. This lets the Begin RPC
+worker slot return before the archive source is subscribed and preserves backpressure when the source uses the same
+client.
 
 Restore admission is fail fast and separate from ordinary stream, in flight, and queued RPC permits. The global limit
 is `maxActiveRestores`. Each session is also bounded by `maxRestoresPerSession`. `maxRestoreMillis` bounds owner work
 before cancellation begins. `maxRestorePullMillis` bounds individual protocol waits.
 `maxRestoreCoalesceMillis` bounds how long a partial frame waits for more immediately available bytes.
-`maxRestoreErrorBytes` bounds encoded private channel error details.
+`maxRestoreErrorBytes` bounds encoded source and result error details.
 
 The `Attach` message is application ownership protocol, not hidden library behavior. Production applications must also
 handle liveness, expiring provisioning nonces, OPFS worker creation, database port transfer, and provider loss.
@@ -852,8 +855,9 @@ local identity. Portable document import validates the document name and schema 
 history.
 
 For conforming browser clients, each admitted restore retains at most one owner payload of `P`, one page staging buffer
-of `P`, and the caller owned current source chunk. `P` is the smaller of the advertised `maxChunkBytes` and the caller
-validated `maxBytes`. Across the owner, archive payload retained by the transport is bounded by `R × P`.
+of `P`, and the caller owned current emitted source batch. The client drains that batch before pulling another. `P` is
+the smallest of the fixed 64 KiB page staging cap, the advertised `maxChunkBytes`, and the caller validated `maxBytes`.
+Across the owner, archive payload retained by the transport is bounded by `R × P`.
 `R` is the smaller of `maxActiveRestores` and `maxSessions × maxRestoresPerSession`. Active and finishing control
 scopes are bounded by `2R`. Finishing scopes retain no archive payload. A hostile raw peer causes synchronous listener
 removal and channel closure on the first invalid frame. Messages already queued by the browser before that closure are
@@ -1453,7 +1457,7 @@ composition recipes.
 | `Replica`           | `Replica` service                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `ReplicaDefinition` | `ReplicaDefinition`, `Any`, `invalidationKeys`, `make`                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `ReplicaError`      | Reason schemas `DocumentNotFound`, `DocumentDecodeError`, `DocumentEncodeError`, `UnsupportedDocumentVersion`, `ProjectionBlocked`, `CommandIdConflict`, `ReceiptOperationMismatch`, `StorageUnavailable`, `StorageCorrupt`, `QuotaExceeded`, `MigrationFailed`, `BackupInvalid`, `BackupTooLarge`, `RestoreBusy`, `RestoreFailed`, `ProtocolMismatch`, `ReplicaFenced`, `OperationTimeout`. Causal reasons use `Schema.Defect()` for transportable arbitrary failures. `Reason`, tagged `ReplicaError` |
-| `ReplicaLimits`     | `Values`, `ReplicaLimits` service, `make`, `layer`                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `ReplicaLimits`     | `Values`, `minimumRestoreErrorBytes`, `ReplicaLimits` service, `make`, `layer`                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `ReplicaStatus`     | `Starting`, `Ready`, `ReadOnly`, `Degraded`, `ProjectionBlocked`, `Restoring`, `Failed`, `ReplicaStatus` schemas and types                                                                                                                                                                                                                                                                                                                                                                              |
 | `Snapshot`          | `ProjectionState`, `Snapshot`, `FromDocument`                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
@@ -1505,15 +1509,15 @@ not expose them. It maps unexpected defects to its fixed `InternalError` sentine
 
 Core constructor rules:
 
-| Constructor              | Defaults and validation                                                                                                                                                                                  |
-| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Document.make`          | Requires a nonempty durable name, an Automerge encodable schema, and a positive safe integer version                                                                                                     |
-| `DocumentSet.make`       | Variadic. Rejects duplicate document names. `get` may return `undefined`                                                                                                                                 |
-| `Mutation.make`          | Payload `Schema.Void`, success `Schema.Void`, error `Schema.Never`, version `1`. Rejects names starting with `$`. Handler is synchronous and mutates one Automerge draft                                 |
-| `Projection.make`        | Validates only a nonempty name and positive safe integer version. The caller must make `project` deterministic. `Projection.evaluate` decodes every row through `Row` and rejects duplicate `key` values |
-| `Query.make`             | Payload `Schema.Void`, success `Schema.Void`, error `Schema.Never`, version `1`. `dependsOn` is required and unique by projection name                                                                   |
-| `ReplicaDefinition.make` | Omitted mutations, projections, and queries become empty collections. Rejects duplicate names and every unregistered cross reference                                                                     |
-| `ReplicaLimits.make`     | Decodes every configured bound as a positive integer. `layer` installs the validated service                                                                                                             |
+| Constructor              | Defaults and validation                                                                                                                                                                                                   |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Document.make`          | Requires a nonempty durable name, an Automerge encodable schema, and a positive safe integer version                                                                                                                      |
+| `DocumentSet.make`       | Variadic. Rejects duplicate document names. `get` may return `undefined`                                                                                                                                                  |
+| `Mutation.make`          | Payload `Schema.Void`, success `Schema.Void`, error `Schema.Never`, version `1`. Rejects names starting with `$`. Handler is synchronous and mutates one Automerge draft                                                  |
+| `Projection.make`        | Validates only a nonempty name and positive safe integer version. The caller must make `project` deterministic. `Projection.evaluate` decodes every row through `Row` and rejects duplicate `key` values                  |
+| `Query.make`             | Payload `Schema.Void`, success `Schema.Void`, error `Schema.Never`, version `1`. `dependsOn` is required and unique by projection name                                                                                    |
+| `ReplicaDefinition.make` | Omitted mutations, projections, and queries become empty collections. Rejects duplicate names and every unregistered cross reference                                                                                      |
+| `ReplicaLimits.make`     | Decodes every configured bound as a positive integer, requires `maxRestoreErrorBytes >= minimumRestoreErrorBytes`, and requires `maxRestoreCoalesceMillis < maxRestorePullMillis`. `layer` installs the validated service |
 
 Mutation and query descriptors each expose a generated handler service, `of`, and `toLayer`. `toLayer` accepts either
 a handler or an Effect that builds one, preserving its Context requirements. Definitions are inert. Installing a
@@ -1605,41 +1609,43 @@ service directly because `PeerSession` owns sequencing, whole document allowlist
 
 ### `@lucas-barake/effect-local-browser`
 
-| Namespace        | Public API                                                                                                              |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `BrowserReplica` | `layer`, `layerWith`, `layerWithReactivity`, `layerWithReactivityOptions`                                               |
-| `BrowserSqlite`  | `DatabasePort` service, `layer`, `layerMessagePort`                                                                     |
-| `PeerSession`    | Compatibility reexport of the SQL package session API                                                                   |
-| `Presence`       | `Entry`, `Presence`, `make`                                                                                             |
-| `ReplicaAtom`    | `layerReactivity`, `documentFamily`, `queryFamily`, `mutation`, `status`                                                |
-| `ReplicaClient`  | `ReplicaClient` service, `TimeoutOptions`, `defaultSessionTimeout`, `defaultOperationTimeout`, `fromRpcClient`, `layer` |
-| `ReplicaOwner`   | `layerHandlers`, `layer`, `layerWorker`                                                                                 |
-| `ReplicaRpc`     | `protocolVersion`, `Invalidation`, `InvalidationMessage`, `ReplicaQueryError`, `group`                                  |
-| `SessionManager` | `leaseDurationMillis`, `SessionManager` service, `layer`                                                                |
+| Namespace        | Public API                                                                                                                      |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `BrowserReplica` | `layer`, `layerWith`, `layerWithReactivity`, `layerWithReactivityOptions`                                                       |
+| `BrowserSqlite`  | `DatabasePort` service, `layer`, `layerMessagePort`                                                                             |
+| `PeerSession`    | Compatibility reexport of the SQL package session API                                                                           |
+| `Presence`       | `Entry`, `Presence`, `make`                                                                                                     |
+| `ReplicaAtom`    | `layerReactivity`, `documentFamily`, `queryFamily`, `mutation`, `status`                                                        |
+| `ReplicaClient`  | `ReplicaClient` service, `TimeoutOptions`, `defaultSessionTimeout`, `defaultOperationTimeout`, `fromRpcClient`, `layer`         |
+| `ReplicaOwner`   | `layerHandlers`, `layer`, `layerWorker`                                                                                         |
+| `ReplicaRpc`     | `protocolVersion`, `SessionHandshake`, `MessagePortSchema`, `Invalidation`, `InvalidationMessage`, `ReplicaQueryError`, `group` |
+| `SessionManager` | `leaseDurationMillis`, `RestoreLease`, `SessionManager` service, `layer`                                                        |
 
 `ReplicaRpc.group` is the page to owner protocol. Every request carries `sessionId`. Except where shown, failures are
 `ReplicaError` and success is `void`.
 
-| Procedure        | Additional request fields                                   | Success and error differences                                            |
-| ---------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `OpenSession`    | optional `protocolVersion`, `definitionHash`                | `{ leaseMillis, protocolVersion, definitionHash, ownerEpoch }`           |
-| `RenewSession`   | None                                                        | `{ leaseMillis }`                                                        |
-| `CloseSession`   | None                                                        | `void`                                                                   |
-| `Create`         | `document`, `commandId`, JSON `value`                       | `CommandOutcome<DocumentId, never>`                                      |
-| `Get`            | `document`, `documentId`                                    | JSON `Snapshot`                                                          |
-| `Mutate`         | `mutation`, `commandId`, `documentId`, JSON `payload`       | `CommandOutcome<Json, Json>`                                             |
-| `Delete`         | `document`, `commandId`, `documentId`                       | `CommandOutcome<Json, Json>`                                             |
-| `Query`          | `query`, JSON `payload`                                     | JSON. Error is `ReplicaQueryError \| ReplicaError`                       |
-| `LookupMutation` | `mutation`, `commandId`                                     | `CommandOutcome<Json, Json>`                                             |
-| `LookupCreate`   | `document`, `commandId`                                     | `CommandOutcome<DocumentId, never>`                                      |
-| `LookupDelete`   | `document`, `commandId`                                     | `CommandOutcome<Json, Json>`                                             |
-| `Flush`          | None                                                        | `void`                                                                   |
-| `Invalidations`  | `ownerEpoch`                                                | Stream of `InvalidationsReady`, `Invalidation`, or `FullRefreshRequired` |
-| `Status`         | None                                                        | Stream of `ReplicaStatus`                                                |
-| `ExportBackup`   | `maxBytes`                                                  | Stream of transferable byte chunks                                       |
-| `RestoreBackup`  | byte `chunks`, `mode`, `maxBytes`, `expectedDefinitionHash` | `void`                                                                   |
-| `ExportDocument` | `document`, `documentId`                                    | `{ documentName, schemaVersion, value: Json }`                           |
-| `ImportDocument` | `document`, `commandId`, exported document value            | `CommandOutcome<DocumentId, never>`                                      |
+| Procedure               | Additional request fields                                      | Success and error differences                                                                                                             |
+| ----------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `OpenSession`           | optional `protocolVersion`, `definitionHash`                   | `{ leaseMillis, protocolVersion, definitionHash, ownerEpoch, maxChunkBytes, maxRestoreCoalesceMillis, maxRestoreErrorBytes }`             |
+| `RenewSession`          | None                                                           | `{ leaseMillis }`                                                                                                                         |
+| `CloseSession`          | None                                                           | `void`                                                                                                                                    |
+| `Create`                | `document`, `commandId`, JSON `value`                          | `CommandOutcome<DocumentId, never>`                                                                                                       |
+| `Get`                   | `document`, `documentId`                                       | JSON `Snapshot`                                                                                                                           |
+| `Mutate`                | `mutation`, `commandId`, `documentId`, JSON `payload`          | `CommandOutcome<Json, Json>`                                                                                                              |
+| `Delete`                | `document`, `commandId`, `documentId`                          | `CommandOutcome<Json, Json>`                                                                                                              |
+| `Query`                 | `query`, JSON `payload`                                        | JSON. Error is `ReplicaQueryError \| ReplicaError`                                                                                        |
+| `LookupMutation`        | `mutation`, `commandId`                                        | `CommandOutcome<Json, Json>`                                                                                                              |
+| `LookupCreate`          | `document`, `commandId`                                        | `CommandOutcome<DocumentId, never>`                                                                                                       |
+| `LookupDelete`          | `document`, `commandId`                                        | `CommandOutcome<Json, Json>`                                                                                                              |
+| `Flush`                 | None                                                           | `void`                                                                                                                                    |
+| `Invalidations`         | `ownerEpoch`                                                   | Stream of `InvalidationsReady`, `Invalidation`, or `FullRefreshRequired`                                                                  |
+| `Status`                | None                                                           | Stream of `ReplicaStatus`                                                                                                                 |
+| `ExportBackup`          | `maxBytes`                                                     | Stream of transferable byte chunks                                                                                                        |
+| `RestoreBackup`         | None                                                           | Legacy protocol rejection. Always fails with `ProtocolMismatch` after session ownership validation                                        |
+| `BeginRestoreBackupV4`  | `mode`, `maxBytes`, `expectedDefinitionHash`, `installationId` | `{ nonce, port }`. The page sends Start, then the owner drives Pull, chunk, terminal readiness, acknowledgement, and release confirmation |
+| `FinishRestoreBackupV4` | `nonce`                                                        | Pending authoritative restore result. The page accepts its Exit before acknowledging `TerminalReady`                                      |
+| `ExportDocument`        | `document`, `documentId`                                       | `{ documentName, schemaVersion, value: Json }`                                                                                            |
+| `ImportDocument`        | `document`, `commandId`, exported document value               | `CommandOutcome<DocumentId, never>`                                                                                                       |
 
 `Invalidation` is either `{ _tag: "Invalidation", ownerEpoch, sequence, keys }` or
 `{ _tag: "FullRefreshRequired", ownerEpoch, keys }`. `InvalidationMessage` also admits
@@ -1648,15 +1654,15 @@ service directly because `PeerSession` owns sequencing, whole document allowlist
 
 Browser composition contracts:
 
-| Module           | Contract                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BrowserSqlite`  | `DatabasePort` is the transferred dedicated worker capability. `layerMessagePort` installs a concrete port. Neither API opens a second database connection                                                                                                                                                                                                                                                                      |
-| `ReplicaOwner`   | `layerHandlers` serves the internal `ReplicaRpc.group`. `layer` composes ownership services. `layerWorker` hosts them in the Effect Worker environment                                                                                                                                                                                                                                                                          |
-| `SessionManager` | `open`, `renew`, `close`, `contains`, `activeCount`, `run`, and `stream` enforce client ownership, the exported 60 second lease, per session in flight limits, stream limits, and global queued RPC bounds                                                                                                                                                                                                                      |
-| `ReplicaClient`  | Extends the core `Replica` service with `ownerEpoch` and invalidations. `fromRpcClient` owns session open, renewal, close, transient reconnect, command ambiguity recovery, and invalidation resubscription. `layer` builds the internal generated client. Session lifecycle RPCs default to 10 second timeouts. Unary operations default to 30 seconds. `Invalidations`, `Status`, and `ExportBackup` streams remain unbounded |
-| `BrowserReplica` | `layer` is the standard page service. Every constructor accepts optional `TimeoutOptions`. `layerWith` and `layerWithReactivityOptions` also accept Worker options. Reactivity variants provide invalidation bridging                                                                                                                                                                                                           |
-| `ReplicaAtom`    | `documentFamily`, `queryFamily`, `mutation`, and `status` build reactive views over an Atom runtime. `layerReactivity` connects commit invalidations. Atom state remains rebuildable                                                                                                                                                                                                                                            |
-| `Presence`       | `make` validates a positive finite TTL and returns `receive`, scoped `publish`, `remove`, and `values`. Presence is ephemeral and never authorization state                                                                                                                                                                                                                                                                     |
+| Module           | Contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BrowserSqlite`  | `DatabasePort` is the transferred dedicated worker capability. `layerMessagePort` installs a concrete port. Neither API opens a second database connection                                                                                                                                                                                                                                                                                                                                                     |
+| `ReplicaOwner`   | `layerHandlers` serves the internal `ReplicaRpc.group`. `layer` composes ownership services. `layerWorker` hosts them in the Effect Worker environment                                                                                                                                                                                                                                                                                                                                                         |
+| `SessionManager` | `open`, `renew`, `close`, `contains`, `activeCount`, `run`, and `stream` enforce client ownership, the exported 60 second lease, per session in flight limits, stream limits, and global queued RPC bounds. The exported restore limit fields, `acquireRestore`, `activeRestoreCount`, and `activeRestoreCountForSession` expose atomic restore admission and diagnostics                                                                                                                                      |
+| `ReplicaClient`  | Extends the core `Replica` service with `ownerEpoch` and invalidations. `fromRpcClient` owns session open, renewal, close, transient reconnect, command ambiguity recovery, and invalidation resubscription. `layer` builds the internal generated client. Session lifecycle RPCs default to 10 second timeouts. Unary operations default to 30 seconds. Restore uses one end to end deadline across transport and session replacement. `Invalidations`, `Status`, and `ExportBackup` streams remain unbounded |
+| `BrowserReplica` | `layer` is the standard page service. Every constructor accepts optional `TimeoutOptions`. `layerWith` and `layerWithReactivityOptions` also accept Worker options. Reactivity variants provide invalidation bridging                                                                                                                                                                                                                                                                                          |
+| `ReplicaAtom`    | `documentFamily`, `queryFamily`, `mutation`, and `status` build reactive views over an Atom runtime. `layerReactivity` connects commit invalidations. Atom state remains rebuildable                                                                                                                                                                                                                                                                                                                           |
+| `Presence`       | `make` validates a positive finite TTL and returns `receive`, scoped `publish`, `remove`, and `values`. Presence is ephemeral and never authorization state                                                                                                                                                                                                                                                                                                                                                    |
 
 The internal browser `ReplicaRpc` protocol and the external peer `PeerRpc` protocol are different contracts. The
 first connects a page to its SharedWorker owned local replica. The second connects independent canonical replicas.
