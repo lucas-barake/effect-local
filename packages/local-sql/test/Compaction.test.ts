@@ -898,6 +898,40 @@ describe("Compaction", () => {
       assert.deepStrictEqual((yield* rewriteMarkers).map((row) => row.lineage), [first as string, second as string])
     }).pipe(Effect.provide(Services)))
 
+  it.effect("refuses a stale operation marker after a later rewrite", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      yield* churn(documentId, 20)
+      yield* compaction.compact(Task, documentId)
+
+      yield* compaction.rewriteHistory(Task, documentId, operationId)
+      const currentLineage = yield* compaction.rewriteHistory(
+        Task,
+        documentId,
+        Compaction.OperationId.make("rewrite-history-again")
+      )
+      const checkpointBefore = yield* rewrittenCheckpointOf(documentId)
+      const changesBefore = yield* changesOf(documentId)
+      const markersBefore = yield* rewriteMarkers
+      const metadataBefore = yield* sql<{ readonly commit_sequence: number }>`
+        SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`
+
+      const error = yield* Effect.flip(compaction.rewriteHistory(Task, documentId, operationId))
+
+      assert.strictEqual(error.reason._tag, "StorageCorrupt")
+      assert.strictEqual((yield* documentRowOf(documentId)).lineage, currentLineage)
+      assert.deepStrictEqual(yield* rewrittenCheckpointOf(documentId), checkpointBefore)
+      assert.deepStrictEqual(yield* changesOf(documentId), changesBefore)
+      assert.deepStrictEqual(yield* rewriteMarkers, markersBefore)
+      assert.deepStrictEqual(
+        yield* sql<{ readonly commit_sequence: number }>`
+          SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`,
+        metadataBefore
+      )
+    }).pipe(Effect.provide(Services)))
+
   it.effect("stamps the document's current lineage on a checkpoint published after a rewrite", () =>
     Effect.gen(function*() {
       const compaction = yield* Compaction.Compaction
