@@ -86,6 +86,14 @@ export const replay = <E,>(
   changes: ReadonlyArray<Uint8Array>
 ): Automerge.Doc<Root<E>> => Automerge.applyChanges(base, [...changes])[0]
 
+/**
+ * Forks a new handle over the same state. The actor is required: `Automerge.clone`
+ * generates a random one when it is omitted, which would drop the replica scoped
+ * actor every handle returned from this module carries.
+ */
+export const clone = <E,>(document: Automerge.Doc<Root<E>>, actor: string): Automerge.Doc<Root<E>> =>
+  Automerge.clone(document, { actor })
+
 export const heads = <E,>(document: Automerge.Doc<Root<E>>): ReadonlyArray<string> => Automerge.getHeads(document)
 
 export const save = <E,>(document: Automerge.Doc<Root<E>>): Uint8Array => Automerge.save(document)

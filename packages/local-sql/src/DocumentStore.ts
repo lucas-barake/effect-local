@@ -8,11 +8,13 @@ import * as Context from "effect/Context"
 import type * as Crypto from "effect/Crypto"
 import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
+import * as Equal from "effect/Equal"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as Rows from "./internal/rows.js"
 import * as Recovery from "./Recovery.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
@@ -116,53 +118,223 @@ export const layer: Layer.Layer<
       })
     )
 
+    const findPersistedChanges = SqlSchema.findAll({
+      Request: Schema.Struct({
+        commitSequence: Identity.CommitSequence,
+        documentId: Identity.DocumentId
+      }),
+      Result: Rows.ChangeRow,
+      execute: (request) =>
+        sql`SELECT
+            actor, accepted_at, applied, bytes, change_hash, commit_sequence, dependencies,
+            document_id, document_type, peer_id, sequence, writer_definition_hash, writer_schema_version
+          FROM effect_local_changes
+          WHERE document_id = ${request.documentId} AND commit_sequence = ${request.commitSequence}`
+    })
+
+    const findPersistedDocument = SqlSchema.findOne({
+      Request: Identity.DocumentId,
+      Result: Rows.DocumentRow,
+      execute: (documentId) =>
+        sql`SELECT
+            accepted_heads, checkpoint_hash,
+            (SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1) AS commit_sequence,
+            document_id, document_type, materialized_heads, observed_versions,
+            projection_status, schema_version, tombstone
+          FROM effect_local_documents WHERE document_id = ${documentId}`
+    })
+
+    /**
+     * Re-reads what the current `persist` just wrote and checks it round tripped.
+     *
+     * The recovery this replaces verified the whole retained history on every
+     * write. Everything older than this commit sequence was already verified by
+     * the load that opened the same transaction, so only the new rows and the
+     * document row need re-reading, which keeps the check independent of history
+     * length.
+     */
+    const verifyPersisted = <D extends Document.Any,>(options: {
+      readonly changes: ReadonlyArray<InternalAutomerge.Change>
+      readonly definitionHash: string
+      readonly document: D
+      readonly documentId: Identity.DocumentId
+      readonly heads: ReadonlyArray<string>
+      readonly sequence: Identity.CommitSequence
+      readonly tombstone: boolean
+    }) =>
+      Effect.gen(function*() {
+        const stored = yield* findPersistedChanges({
+          commitSequence: options.sequence,
+          documentId: options.documentId
+        })
+        const row = yield* findPersistedDocument(options.documentId).pipe(
+          Effect.catchTag("NoSuchElementError", () =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.DocumentNotFound({ documentId: options.documentId })
+              })
+            ))
+        )
+        return yield* Effect.try({
+          try: () => {
+            const expected = new Set(options.changes.map((change) => change.hash))
+            if (stored.length !== expected.size) {
+              throw new TypeError(`Unexpected stored change count for ${options.documentId}`)
+            }
+            for (const change of stored) {
+              const decoded = InternalAutomerge.decode(change.bytes)
+              if (
+                !expected.has(change.change_hash) ||
+                change.applied !== 1 || change.commit_sequence !== options.sequence ||
+                change.document_id !== options.documentId ||
+                change.document_type !== options.document.name ||
+                change.writer_schema_version !== options.document.version ||
+                change.writer_definition_hash !== options.definitionHash ||
+                change.peer_id !== null ||
+                decoded.hash !== change.change_hash || decoded.actor !== change.actor ||
+                decoded.sequence !== change.sequence ||
+                Schema.encodeSync(Heads)(decoded.dependencies) !== change.dependencies
+              ) throw new TypeError(`Invalid stored change: ${change.change_hash}`)
+            }
+            if (
+              row.document_type !== options.document.name ||
+              row.schema_version !== options.document.version ||
+              row.commit_sequence !== options.sequence ||
+              (row.tombstone === 1) !== options.tombstone ||
+              !Equal.equals(Schema.decodeUnknownSync(Heads)(row.materialized_heads), options.heads) ||
+              !Equal.equals(Schema.decodeUnknownSync(Heads)(row.accepted_heads), options.heads)
+            ) throw new TypeError(`Invalid stored document: ${options.documentId}`)
+            // Sourced from the row rather than carried over from `durable`: the
+            // recovery this replaces reported the status the document had at
+            // persist time, and another writer can block it in between.
+            return row.projection_status
+          },
+          catch: (cause) =>
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+        })
+      })
+
     const persist = <D extends Document.Any,>(
       document: D,
       documentId: Identity.DocumentId,
       durable: Stored<D>,
       staged: Automerge.Doc<InternalAutomerge.Root<D["schema"]["Encoded"]>>
     ): Effect.Effect<Stored<D>, ReplicaError.ReplicaError> =>
-      sql.withTransaction(Effect.gen(function*() {
-        const changes = InternalAutomerge.changesSince(staged, durable.materializedHeads)
-        if (changes.length === 0) return durable
-        const encoded = InternalAutomerge.value(staged)
-        yield* Document.decode(document, documentId, encoded)
-        yield* requireAutomergeValue(documentId, encoded)
-        const heads = InternalAutomerge.heads(staged)
-        const sequence = yield* nextSequence
-        const acceptedAt = DateTime.formatIso(yield* DateTime.now)
-        const definitionHash = yield* currentDefinitionHash
-        for (const change of changes) {
-          yield* sql`INSERT INTO effect_local_changes (
-            change_hash, document_id, document_type, writer_schema_version, writer_definition_hash,
-            actor, sequence, dependencies, bytes, applied, peer_id, accepted_at, commit_sequence
-          ) VALUES (
-            ${change.hash}, ${documentId}, ${document.name}, ${document.version}, ${definitionHash},
-            ${change.actor}, ${change.sequence}, ${Schema.encodeSync(Heads)(change.dependencies)}, ${change.bytes}, 1,
-            NULL, ${acceptedAt}, ${sequence}
-          )`
-        }
-        yield* sql`UPDATE effect_local_documents SET
-          schema_version = ${document.version},
-          observed_versions = ${Schema.encodeSync(Versions)([document.version])},
-          materialized_heads = ${Schema.encodeSync(Heads)(heads)},
-          accepted_heads = ${Schema.encodeSync(Heads)(heads)}
-          , tombstone = ${InternalAutomerge.tombstone(staged) ? 1 : 0}
-          WHERE document_id = ${documentId}`
-        yield* sql`INSERT INTO effect_local_commit_outbox (
-          commit_sequence, document_id, invalidation_keys, published
-        ) VALUES (${sequence}, ${documentId}, ${Schema.encodeSync(Heads)([document.name])}, 0)`
-        return yield* recovery.recover(document, documentId)
-      })).pipe(
-        Effect.catchTag("SqlError", (cause) =>
-          Effect.fail(
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.StorageUnavailable({
-                cause
+      // `owned` is per run, so the finalizer below can only ever free a handle
+      // this invocation forked. It stays undefined on the early return, whose
+      // handle belongs to the caller.
+      Effect.suspend(() => {
+        let owned: Automerge.Doc<InternalAutomerge.Root<D["schema"]["Encoded"]>> | undefined
+        return sql.withTransaction(Effect.gen(function*() {
+          const changes = InternalAutomerge.changesSince(staged, durable.materializedHeads)
+          if (changes.length === 0) return durable
+          const encoded = InternalAutomerge.value(staged)
+          const value = yield* Document.decode(document, documentId, encoded)
+          yield* requireAutomergeValue(documentId, encoded)
+          const heads = InternalAutomerge.heads(staged)
+          const tombstone = InternalAutomerge.tombstone(staged)
+          const sequence = yield* nextSequence
+          const acceptedAt = DateTime.formatIso(yield* DateTime.now)
+          const definitionHash = yield* currentDefinitionHash
+          for (const change of changes) {
+            yield* sql`INSERT INTO effect_local_changes (
+              change_hash, document_id, document_type, writer_schema_version, writer_definition_hash,
+              actor, sequence, dependencies, bytes, applied, peer_id, accepted_at, commit_sequence
+            ) VALUES (
+              ${change.hash}, ${documentId}, ${document.name}, ${document.version}, ${definitionHash},
+              ${change.actor}, ${change.sequence}, ${Schema.encodeSync(Heads)(change.dependencies)}, ${change.bytes}, 1,
+              NULL, ${acceptedAt}, ${sequence}
+            )`
+          }
+          // Guarded on the heads `durable` observed, the same way `PeerSync` and
+          // `Compaction` guard their head transitions. The recovery this replaces
+          // rejected a commit whose published heads the retained history could not
+          // reproduce; without the guard a stale `durable` would publish heads that
+          // orphan an applied change, and no later load could recover the document.
+          // A stale `durable` matches no row, so the stored heads stay behind and
+          // the verification below reports them.
+          yield* sql`UPDATE effect_local_documents SET
+            schema_version = ${document.version},
+            observed_versions = ${Schema.encodeSync(Versions)([document.version])},
+            materialized_heads = ${Schema.encodeSync(Heads)(heads)},
+            accepted_heads = ${Schema.encodeSync(Heads)(heads)}
+            , tombstone = ${tombstone ? 1 : 0}
+            WHERE document_id = ${documentId}
+              AND materialized_heads = ${Schema.encodeSync(Heads)(durable.materializedHeads)}`
+          yield* sql`INSERT INTO effect_local_commit_outbox (
+            commit_sequence, document_id, invalidation_keys, published
+          ) VALUES (${sequence}, ${documentId}, ${Schema.encodeSync(Heads)([document.name])}, 0)`
+
+          // The permit is sampled after the writes because that is where the
+          // trailing recovery used to sample it. `materialize` holds no gate
+          // lock, so an earlier sample could fence against a stale permit.
+          const permit = yield* gate.current
+          yield* gate.validate(permit)
+          const projection = yield* verifyPersisted({
+            changes,
+            definitionHash,
+            document,
+            documentId,
+            heads,
+            sequence,
+            tombstone
+          })
+
+          // Acquire last: nothing fallible runs between the fork and the return,
+          // and the assignment shares the fork's synchronous step so an interrupt
+          // cannot land between them.
+          const automerge = yield* Effect.try({
+            try: () => {
+              owned = InternalAutomerge.clone(
+                staged,
+                InternalAutomerge.actorId(permit.replicaId, permit.writerGeneration, documentId)
+              )
+              return owned
+            },
+            catch: (cause) =>
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause })
               })
-            })
-          ))
-      )
+          })
+          return {
+            automerge,
+            encoded,
+            snapshot: {
+              documentId,
+              value,
+              version: document.version,
+              heads,
+              tombstone,
+              projection
+            },
+            materializedHeads: heads,
+            acceptedHeads: heads,
+            commitSequence: sequence
+          }
+        })).pipe(
+          Effect.catchTags({
+            SqlError: (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause
+                  })
+                })
+              ),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageCorrupt({ cause })
+                })
+              )
+          }),
+          // Outside the transaction: a failing commit is turned into a defect,
+          // which the handlers above cannot observe.
+          Effect.onError(() => Effect.sync(() => owned !== undefined && InternalAutomerge.free(owned)))
+        )
+      })
 
     const materialize = <D extends Document.Any,>(
       document: D,
