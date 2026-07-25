@@ -9,7 +9,10 @@ import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Cause from "effect/Cause"
+import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -172,7 +175,10 @@ describe("DurableRuntime", () => {
 
       const result = yield* runtime.poll(execution)
       assert.isTrue(Option.isSome(result))
-      if (Option.isSome(result)) assert.strictEqual(result.value._tag, "Complete")
+      if (Option.isSome(result)) {
+        assert.strictEqual(result.value._tag, "Complete")
+        if (result.value._tag === "Complete") assert.isTrue(Exit.isSuccess(result.value.exit))
+      }
       const checkpoints = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
         FROM effect_local_checkpoints WHERE document_id = ${documentId}`
       assert.strictEqual(checkpoints[0]?.count, 1)
@@ -408,4 +414,319 @@ describe("DurableRuntime", () => {
         assert.isTrue(Option.isSome(yield* Deferred.poll(claimRan)))
       }).pipe(Effect.scoped, Effect.provide(live), TestClock.withLive)
     }), 20_000)
+
+  // Rebuilds the production runtime around a decorated `Recovery` service. Every other service,
+  // including every `Compaction` method, stays production code.
+  const servicesWithRecovery = <E,>(recoveryLayer: Layer.Layer<Recovery.Recovery, E>) => {
+    const compaction = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate, recoveryLayer)))
+    const inputs = Layer.mergeAll(Database, Bootstrap, Executor, Limits, Gate, Store, recoveryLayer, compaction)
+    return Layer.merge(inputs, DurableRuntime.layer(definition).pipe(Layer.provide(inputs)))
+  }
+
+  // Drives the real checkpoint-install CAS to a miss. `Compaction.prepare` reads the prepared
+  // `commitSequence` through `recovery.recover`, so a real commit performed after `recover` returns
+  // lands inside the prepare -> publish window and makes the CAS at Compaction.ts:144 miss.
+  const supersedingServices = (options: {
+    readonly injections: number
+    readonly target?: () => Identity.DocumentId | undefined
+  }) =>
+    Effect.gen(function*() {
+      const injected = yield* Ref.make(0)
+      return servicesWithRecovery(
+        Layer.effect(
+          Recovery.Recovery,
+          Effect.gen(function*() {
+            const recovery = yield* Recovery.Recovery
+            const store = yield* DocumentStore.DocumentStore
+            const crypto = yield* Crypto.Crypto
+            const freshDocumentId = Identity.makeDocumentId.pipe(
+              Effect.provideService(Crypto.Crypto, crypto),
+              Effect.orDie
+            )
+            return Recovery.Recovery.of({
+              ...recovery,
+              recover: <D extends Document.Any,>(document: D, documentId: Identity.DocumentId) =>
+                recovery.recover(document, documentId).pipe(
+                  Effect.flatMap((stored) => {
+                    const targeted = options.target?.()
+                    if (targeted !== undefined && targeted !== documentId) return Effect.succeed(stored)
+                    return Effect.gen(function*() {
+                      if ((yield* Ref.getAndUpdate(injected, (count) => count + 1)) >= options.injections) {
+                        return stored
+                      }
+                      const other = yield* store.create(Task, yield* freshDocumentId, { title: "concurrent" })
+                      InternalAutomerge.free(other.automerge)
+                      return stored
+                    }).pipe(Effect.orDie)
+                  })
+                )
+            })
+          })
+        ).pipe(Layer.provide(Layer.mergeAll(Database, RecoveryService, Store)))
+      )
+    })
+
+  // Fails every `recover` with a non-superseded error, after freeing: `prepare` only installs its
+  // finalizer once `recover` returns. `recoverCalls` counts real attempts so a test can prove the
+  // retry predicate did not widen and re-attempt a permanent failure.
+  const failingRecoveryServices = (error: ReplicaError.ReplicaError) =>
+    Effect.gen(function*() {
+      const recoverCalls = yield* Ref.make(0)
+      const services = servicesWithRecovery(
+        Layer.effect(
+          Recovery.Recovery,
+          Effect.gen(function*() {
+            const recovery = yield* Recovery.Recovery
+            return Recovery.Recovery.of({
+              ...recovery,
+              recover: <D extends Document.Any,>(document: D, documentId: Identity.DocumentId) =>
+                recovery.recover(document, documentId).pipe(
+                  Effect.flatMap((stored) =>
+                    Ref.update(recoverCalls, (count) => count + 1).pipe(
+                      Effect.andThen(Effect.sync(() => InternalAutomerge.free(stored.automerge))),
+                      Effect.andThen(Effect.fail(error))
+                    )
+                  )
+                )
+            })
+          })
+        ).pipe(Layer.provide(Layer.mergeAll(Database, RecoveryService)))
+      )
+      return { services, recoverCalls }
+    })
+
+  const drive = Effect.gen(function*() {
+    const sharding = yield* Sharding.Sharding
+    for (let round = 0; round < 4; round++) {
+      yield* sharding.pollStorage
+      yield* TestClock.adjust(5_000)
+    }
+  })
+
+  // `injections: 8` leaves exactly one usable attempt, pinning the retry budget from below: it fails
+  // if `times` is anything less than `compactionPublishAttempts - 1`.
+  it.effect(
+    "publishes the checkpoint on the ninth attempt when the first eight are superseded",
+    () =>
+      Effect.gen(function*() {
+        const services = yield* supersedingServices({ injections: 8 })
+        yield* Effect.gen(function*() {
+          const runtime = yield* ReplicaWorkflow.CompactionWorkflow
+          const store = yield* DocumentStore.DocumentStore
+          const sql = yield* SqlClient.SqlClient
+          const documentId = yield* Identity.makeDocumentId
+          const stored = yield* store.create(Task, documentId, { title: "retried" })
+          InternalAutomerge.free(stored.automerge)
+
+          const execution = yield* runtime.execute(ReplicaWorkflow.OperationId.make("retried-compaction"))
+          yield* drive
+
+          const result = yield* runtime.poll(execution)
+          assert.isTrue(Option.isSome(result))
+          if (!Option.isSome(result)) return
+          assert.strictEqual(result.value._tag, "Complete")
+          if (result.value._tag !== "Complete") return
+          assert.isTrue(Exit.isSuccess(result.value.exit))
+
+          const checkpoints = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_checkpoints WHERE document_id = ${documentId}`
+          assert.strictEqual(checkpoints[0]?.count, 1)
+        }).pipe(Effect.provide(services))
+      }),
+    20_000
+  )
+
+  it.effect("keeps compacting later documents when an earlier document is superseded", () =>
+    Effect.gen(function*() {
+      let blocking: Identity.DocumentId | undefined
+      const services = yield* supersedingServices({
+        injections: Number.MAX_SAFE_INTEGER,
+        target: () => blocking
+      })
+      yield* Effect.gen(function*() {
+        const runtime = yield* ReplicaWorkflow.CompactionWorkflow
+        const store = yield* DocumentStore.DocumentStore
+        const sql = yield* SqlClient.SqlClient
+        // The workflow iterates ORDER BY document_id, so sort to make the blocked document deterministic.
+        const sorted = [yield* Identity.makeDocumentId, yield* Identity.makeDocumentId].toSorted()
+        blocking = sorted[0]
+        const later = sorted[1]
+        for (const documentId of sorted) {
+          const stored = yield* store.create(Task, documentId, { title: "ordered" })
+          InternalAutomerge.free(stored.automerge)
+        }
+
+        const execution = yield* runtime.execute(ReplicaWorkflow.OperationId.make("partial-compaction"))
+        yield* drive
+
+        const result = yield* runtime.poll(execution)
+        assert.isTrue(Option.isSome(result))
+        if (!Option.isSome(result)) return
+        assert.strictEqual(result.value._tag, "Complete")
+        if (result.value._tag !== "Complete") return
+        assert.isTrue(Exit.isFailure(result.value.exit))
+        if (!Exit.isFailure(result.value.exit)) return
+        const error = Option.getOrThrow(Cause.findErrorOption(result.value.exit.cause))
+        assert.strictEqual(error.reason._tag, "CheckpointSuperseded")
+        if (error.reason._tag !== "CheckpointSuperseded") return
+        assert.deepStrictEqual(error.reason.documentIds, [blocking])
+
+        const laterCheckpoints = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_checkpoints WHERE document_id = ${later}`
+        assert.strictEqual(laterCheckpoints[0]?.count, 1)
+      }).pipe(Effect.provide(services))
+    }), 20_000)
+
+  it.effect("aggregates every superseded document into one workflow failure", () =>
+    Effect.gen(function*() {
+      const services = yield* supersedingServices({ injections: Number.MAX_SAFE_INTEGER })
+      yield* Effect.gen(function*() {
+        const runtime = yield* ReplicaWorkflow.CompactionWorkflow
+        const store = yield* DocumentStore.DocumentStore
+        const sql = yield* SqlClient.SqlClient
+        const sorted = [yield* Identity.makeDocumentId, yield* Identity.makeDocumentId].toSorted()
+        for (const documentId of sorted) {
+          const stored = yield* store.create(Task, documentId, { title: "aggregated" })
+          InternalAutomerge.free(stored.automerge)
+        }
+
+        const execution = yield* runtime.execute(ReplicaWorkflow.OperationId.make("aggregated-supersede"))
+        yield* drive
+
+        const result = yield* runtime.poll(execution)
+        assert.isTrue(Option.isSome(result))
+        if (!Option.isSome(result)) return
+        assert.strictEqual(result.value._tag, "Complete")
+        if (result.value._tag !== "Complete") return
+        assert.isTrue(Exit.isFailure(result.value.exit))
+        if (!Exit.isFailure(result.value.exit)) return
+        const error = Option.getOrThrow(Cause.findErrorOption(result.value.exit.cause))
+        assert.strictEqual(error.reason._tag, "CheckpointSuperseded")
+        if (error.reason._tag !== "CheckpointSuperseded") return
+        assert.deepStrictEqual(error.reason.documentIds, sorted)
+        assert.strictEqual(error.reason.attempts, 9)
+
+        const checkpoints = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_checkpoints`
+        assert.strictEqual(checkpoints[0]?.count, 0)
+      }).pipe(Effect.provide(services))
+    }), 20_000)
+
+  // The issue-13 regression: the workflow used to report success here. `injections: 9` also pins the
+  // retry budget from above, so this subsumes an unbounded-injection variant of the same scenario.
+  it.effect("fails the compaction workflow after the ninth superseded publish attempt", () =>
+    Effect.gen(function*() {
+      const services = yield* supersedingServices({ injections: 9 })
+      yield* Effect.gen(function*() {
+        const runtime = yield* ReplicaWorkflow.CompactionWorkflow
+        const store = yield* DocumentStore.DocumentStore
+        const sql = yield* SqlClient.SqlClient
+        const documentId = yield* Identity.makeDocumentId
+        const stored = yield* store.create(Task, documentId, { title: "exhausted" })
+        InternalAutomerge.free(stored.automerge)
+
+        const execution = yield* runtime.execute(ReplicaWorkflow.OperationId.make("exhausted-compaction"))
+        yield* drive
+
+        const result = yield* runtime.poll(execution)
+        assert.isTrue(Option.isSome(result))
+        if (!Option.isSome(result)) return
+        assert.strictEqual(result.value._tag, "Complete")
+        if (result.value._tag !== "Complete") return
+        assert.isTrue(Exit.isFailure(result.value.exit))
+        if (!Exit.isFailure(result.value.exit)) return
+        const error = Option.getOrThrow(Cause.findErrorOption(result.value.exit.cause))
+        assert.strictEqual(error.reason._tag, "CheckpointSuperseded")
+        if (error.reason._tag !== "CheckpointSuperseded") return
+        assert.deepStrictEqual(error.reason.documentIds, [documentId])
+        assert.strictEqual(error.reason.attempts, 9)
+
+        const checkpoints = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_checkpoints WHERE document_id = ${documentId}`
+        assert.strictEqual(checkpoints[0]?.count, 0)
+      }).pipe(Effect.provide(services))
+    }), 20_000)
+
+  it.effect(
+    "prunes changes dominated by the retained checkpoints after a published compaction",
+    () =>
+      Effect.gen(function*() {
+        const runtime = yield* ReplicaWorkflow.CompactionWorkflow
+        const store = yield* DocumentStore.DocumentStore
+        const sql = yield* SqlClient.SqlClient
+        const documentId = yield* Identity.makeDocumentId
+        const created = yield* store.create(Task, documentId, { title: "one" })
+
+        yield* runtime.execute(ReplicaWorkflow.OperationId.make("prune-first")).pipe(Effect.andThen(drive))
+
+        const staged = yield* store.stage(created, (draft) => {
+          draft.title = "two"
+        })
+        const persisted = yield* store.persist(Task, documentId, created, staged)
+        InternalAutomerge.free(staged)
+        InternalAutomerge.free(created.automerge)
+
+        const execution = yield* runtime.execute(ReplicaWorkflow.OperationId.make("prune-second"))
+        yield* drive
+
+        const result = yield* runtime.poll(execution)
+        assert.isTrue(Option.isSome(result))
+        if (!Option.isSome(result)) return
+        assert.strictEqual(result.value._tag, "Complete")
+        if (result.value._tag !== "Complete") return
+        assert.isTrue(Exit.isSuccess(result.value.exit))
+
+        // Prune deletes applied changes dominated by both retained checkpoints. Without the prune call
+        // the superseded rows survive, so this pins that the published path still reclaims them.
+        const changes = yield* sql<{ readonly change_hash: string }>`SELECT change_hash
+        FROM effect_local_changes WHERE document_id = ${documentId} ORDER BY change_hash`
+        assert.deepStrictEqual(changes.map((row) => row.change_hash), persisted.materializedHeads)
+        InternalAutomerge.free(persisted.automerge)
+      }).pipe(Effect.provide(Services)),
+    20_000
+  )
+
+  it.effect(
+    "propagates a non-superseded compaction failure without retrying or aggregating it",
+    () =>
+      Effect.gen(function*() {
+        const { recoverCalls, services } = yield* failingRecoveryServices(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({ cause: new Error("probe") })
+          })
+        )
+        yield* Effect.gen(function*() {
+          const runtime = yield* ReplicaWorkflow.CompactionWorkflow
+          const store = yield* DocumentStore.DocumentStore
+          const sql = yield* SqlClient.SqlClient
+          const sorted = [yield* Identity.makeDocumentId, yield* Identity.makeDocumentId].toSorted()
+          for (const documentId of sorted) {
+            const stored = yield* store.create(Task, documentId, { title: "corrupt" })
+            InternalAutomerge.free(stored.automerge)
+          }
+
+          const execution = yield* runtime.execute(ReplicaWorkflow.OperationId.make("corrupt-compaction"))
+          yield* drive
+
+          const result = yield* runtime.poll(execution)
+          assert.isTrue(Option.isSome(result))
+          if (!Option.isSome(result)) return
+          assert.strictEqual(result.value._tag, "Complete")
+          if (result.value._tag !== "Complete") return
+          assert.isTrue(Exit.isFailure(result.value.exit))
+          if (!Exit.isFailure(result.value.exit)) return
+          const error = Option.getOrThrow(Cause.findErrorOption(result.value.exit.cause))
+          assert.strictEqual(error.reason._tag, "StorageCorrupt")
+
+          // The retry predicate must narrow to CheckpointSuperseded. A widened predicate would burn all
+          // nine attempts on a permanent failure, which the final tag alone cannot detect.
+          assert.strictEqual(yield* Ref.get(recoverCalls), 1)
+
+          const laterCheckpoints = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_checkpoints WHERE document_id = ${sorted[1]}`
+          assert.strictEqual(laterCheckpoints[0]?.count, 0)
+        }).pipe(Effect.provide(services))
+      }),
+    20_000
+  )
 })

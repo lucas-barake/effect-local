@@ -46,6 +46,22 @@ describe("ReplicaError", () => {
     assert.deepStrictEqual(Schema.decodeUnknownSync(ReplicaError.ReplicaError)(encoded), error)
   })
 
+  it("round trips superseded checkpoint metadata", () => {
+    const error = new ReplicaError.ReplicaError({
+      reason: new ReplicaError.CheckpointSuperseded({
+        documentIds: [Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")],
+        attempts: 9
+      })
+    })
+    const encoded = Schema.encodeSync(ReplicaError.ReplicaError)(error)
+    assert.deepStrictEqual(encoded.reason, {
+      _tag: "CheckpointSuperseded",
+      documentIds: ["doc_00000000-0000-4000-8000-000000000001"],
+      attempts: 9
+    })
+    assert.deepStrictEqual(Schema.decodeUnknownSync(ReplicaError.ReplicaError)(encoded), error)
+  })
+
   it("round trips operation timeout metadata", () => {
     const error = new ReplicaError.ReplicaError({
       reason: new ReplicaError.OperationTimeout({

@@ -23,6 +23,48 @@ it.effect("round trips a typed restore error through its wire schema", () =>
     assert.deepStrictEqual(RestoreProtocol.replicaErrorFromWire(decoded), original)
   }))
 
+it.effect("round trips a superseded checkpoint reason through the restore wire", () =>
+  Effect.gen(function*() {
+    const original = new ReplicaError.ReplicaError({
+      reason: new ReplicaError.CheckpointSuperseded({
+        documentIds: [
+          Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001"),
+          Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000002")
+        ],
+        attempts: 9
+      })
+    })
+    const encoded = RestoreProtocol.encodeReplicaError(original, 4_096)
+    const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
+    assert.deepStrictEqual(RestoreProtocol.replicaErrorFromWire(decoded), original)
+  }))
+
+it.effect("drops whole document ids rather than truncating them when the budget is tight", () =>
+  Effect.gen(function*() {
+    const encoded = RestoreProtocol.encodeReplicaError(
+      new ReplicaError.ReplicaError({
+        reason: new ReplicaError.CheckpointSuperseded({
+          documentIds: [
+            Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001"),
+            Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000002")
+          ],
+          attempts: 9
+        })
+      }),
+      ReplicaLimits.minimumRestoreErrorBytes
+    )
+    assert.isTrue(RestoreProtocol.preflight(encoded, ReplicaLimits.minimumRestoreErrorBytes))
+    // Every surviving id must still decode as a branded DocumentId, so none may be truncated.
+    const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
+    const reason = RestoreProtocol.replicaErrorFromWire(decoded).reason
+    assert.strictEqual(reason._tag, "CheckpointSuperseded")
+    if (reason._tag !== "CheckpointSuperseded") return
+    assert.strictEqual(reason.attempts, 9)
+    for (const documentId of reason.documentIds) {
+      assert.isTrue(Schema.is(Identity.DocumentId)(documentId))
+    }
+  }))
+
 const finishRpc = ReplicaRpc.group.requests.get("FinishRestoreBackupV4")!
 const finishExitCodec = Schema.toCodecJson(Rpc.exitSchema(finishRpc))
 const restoreFailure = (replica: string) =>
@@ -172,7 +214,11 @@ it.effect("encodes every restore error and defect at the minimum configured budg
         observedGeneration: Identity.WriterGeneration.make(2)
       }),
       new ReplicaError.OperationTimeout({ operation: "operation".repeat(32), timeoutMillis: 1 }),
-      new ReplicaError.UnsupportedStorageFormatVersion({ observedVersion: 2, supportedVersion: 1 })
+      new ReplicaError.UnsupportedStorageFormatVersion({ observedVersion: 2, supportedVersion: 1 }),
+      new ReplicaError.CheckpointSuperseded({
+        documentIds: Array.from({ length: 32 }, () => documentId),
+        attempts: 9
+      })
     ]
 
     for (const reason of reasons) {

@@ -95,6 +95,10 @@ const UnsupportedStorageFormatVersion = Schema.TaggedStruct("UnsupportedStorageF
   observedVersion: Schema.Int,
   supportedVersion: Schema.Int
 })
+const CheckpointSuperseded = Schema.TaggedStruct("CheckpointSuperseded", {
+  documentIds: Schema.Array(Identity.DocumentId),
+  attempts: Schema.Int
+})
 
 export const RestoreWireError = Schema.Union([
   DocumentNotFound,
@@ -116,7 +120,8 @@ export const RestoreWireError = Schema.Union([
   ProtocolMismatch,
   ReplicaFenced,
   OperationTimeout,
-  UnsupportedStorageFormatVersion
+  UnsupportedStorageFormatVersion,
+  CheckpointSuperseded
 ])
 export type RestoreWireError = typeof RestoreWireError.Type
 
@@ -214,7 +219,8 @@ export const restoreWireErrorFields = fieldMetadata({
   ProtocolMismatch,
   ReplicaFenced,
   OperationTimeout,
-  UnsupportedStorageFormatVersion
+  UnsupportedStorageFormatVersion,
+  CheckpointSuperseded
 })
 
 export const boundedErrorDescriptionFields: ReadonlySet<string> = new Set(
@@ -494,6 +500,19 @@ export const encodeReplicaError = (
           supportedVersion: reason.supportedVersion
         })
       )
+    case "CheckpointSuperseded":
+      // `documentIds` are branded identifiers, so they are dropped whole rather than truncated: a
+      // partially written id would fail its own pattern check when the peer decodes it. `text`
+      // returns the value unchanged only when it fit the remaining budget.
+      return encodeWithinBudget(
+        maxBytes,
+        { _tag: reason._tag, documentIds: [], attempts: reason.attempts },
+        ({ text }) => ({
+          _tag: reason._tag,
+          documentIds: reason.documentIds.filter((documentId) => text(documentId) === documentId),
+          attempts: reason.attempts
+        })
+      )
   }
 }
 
@@ -587,6 +606,12 @@ export const replicaErrorFromWire = (wire: RestoreWireError): ReplicaError.Repli
       reason = new ReplicaError.UnsupportedStorageFormatVersion({
         observedVersion: wire.observedVersion,
         supportedVersion: wire.supportedVersion
+      })
+      break
+    case "CheckpointSuperseded":
+      reason = new ReplicaError.CheckpointSuperseded({
+        documentIds: wire.documentIds,
+        attempts: wire.attempts
       })
       break
   }

@@ -77,6 +77,15 @@ const DocumentReference = Schema.Struct({
   documentType: Schema.String
 })
 
+/**
+ * Total number of publish attempts made for one document before its checkpoint publication is
+ * reported as superseded. The checkpoint install is an optimistic compare and set against the
+ * global commit sequence, so a concurrent commit anywhere in the replica makes it miss. Retrying
+ * re-prepares from fresh durable state, which is safe because a lost install is a committed no-op.
+ * Expressed as a total so the retry count and the reported `attempts` cannot disagree.
+ */
+const compactionPublishAttempts = 9
+
 export const layerRegistration = (
   definition: ReplicaDefinition.Any
 ): Layer.Layer<
@@ -124,6 +133,7 @@ export const layerRegistration = (
         )
       )
     })
+    const superseded: Array<Identity.DocumentId> = []
     for (const reference of documents) {
       const document = DocumentSet.get(definition.documents, reference.documentType)
       if (document === undefined) {
@@ -140,11 +150,43 @@ export const layerRegistration = (
         execute: withActivityPermit(
           gate,
           payload.replicaIncarnation,
-          compaction.compact(document, reference.documentId).pipe(
-            Effect.andThen(compaction.prune(reference.documentId)),
-            Effect.asVoid
-          )
+          Effect.gen(function*() {
+            const compacted = yield* compaction.compact(document, reference.documentId)
+            if (!compacted.published) {
+              yield* Effect.logDebug("Checkpoint publication superseded by a concurrent commit").pipe(
+                Effect.annotateLogs(reference)
+              )
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.CheckpointSuperseded({
+                  documentIds: [reference.documentId],
+                  attempts: compactionPublishAttempts
+                })
+              })
+            }
+            yield* compaction.prune(reference.documentId)
+          })
+        ).pipe(
+          Effect.retry({
+            times: compactionPublishAttempts - 1,
+            while: (error) => error.reason._tag === "CheckpointSuperseded"
+          })
         )
+      }).pipe(
+        Effect.catchReason("ReplicaError", "CheckpointSuperseded", () =>
+          Effect.gen(function*() {
+            yield* Effect.logWarning("Checkpoint publication superseded after every attempt").pipe(
+              Effect.annotateLogs(reference)
+            )
+            superseded.push(reference.documentId)
+          }))
+      )
+    }
+    if (superseded.length > 0) {
+      return yield* new ReplicaError.ReplicaError({
+        reason: new ReplicaError.CheckpointSuperseded({
+          documentIds: superseded,
+          attempts: compactionPublishAttempts
+        })
       })
     }
   }))

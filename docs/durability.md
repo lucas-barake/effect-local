@@ -29,13 +29,27 @@ Compaction has separate prepare, compare and publish, and prune phases. It retai
 changes dominated by both retained recovery paths. A crash before publish leaves the old checkpoint authoritative. A
 crash after publish leaves enough history to recover.
 
+Publish installs the checkpoint with an optimistic compare and set against the global commit sequence, so a
+concurrent commit anywhere in the replica supersedes a prepared checkpoint. A superseded publish is a committed no
+op, which makes re-preparing safe. Prune runs only after a checkpoint is published.
+
 ## Workflows
 
 `ClusterWorkflowEngine` uses the same SQL backed single runner composition as document entities. Message and runner
 storage use private `effect_local_cluster` and `effect_local_runner` table prefixes. The registered
 compaction workflow derives its execution identity from replica incarnation and operation identity. It journals a
-document listing activity and one compact and prune activity per document. `CompactionWorkflow` exposes execute, poll,
+document listing activity and one compact activity per document. `CompactionWorkflow` exposes execute, poll,
 and resume while rejecting handles from a prior replica incarnation.
+
+A compact activity retries a bounded number of times when its checkpoint publication is superseded. If every attempt
+is superseded the document is recorded and the run continues, and the workflow fails once at the end with
+`CheckpointSuperseded` listing every superseded document. A failed exit therefore means partial compaction, not
+zero. That continuation guarantee covers a superseded publish only. Any other failure stops the run at the document
+that raised it. Because the outcome is journaled per execution identity, retrying needs a new operation identity.
+
+Adding a reason to `ReplicaError` is backward compatible for records an older build wrote, but not forward
+compatible. A record carrying a reason a build does not know fails to decode and becomes a defect, so a local
+replica database must not be opened by a build older than the one that wrote its workflow records.
 
 Projection rebuild, backup, and restore definitions reserve stable identities but are not registered operations in
 the current beta. Backup creation needs an explicit durable destination contract. Restore needs an explicit durable
