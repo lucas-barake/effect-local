@@ -834,6 +834,13 @@ const makeService = Effect.gen(function*() {
     })
   }
 
+  const claimMessages = sql.onDialectOrElse({
+    sqlite: () =>
+      sql`effect_local_relay_messages m
+        INDEXED BY effect_local_relay_messages_claim_admission`,
+    orElse: () => sql`effect_local_relay_messages m`
+  })
+
   const findCandidate = SqlSchema.findOneOption({
     Request: Schema.Struct({
       tenantId: Schema.String,
@@ -895,7 +902,7 @@ const makeService = Effect.gen(function*() {
           m.created_at AS "createdAt",
           m.next_eligible_at AS "nextEligibleAt",
           m.retry_count AS "retryCount"
-        FROM effect_local_relay_messages m
+        FROM ${claimMessages}
         JOIN effect_local_relay_channels c ON c.channel_id = m.channel_id
         JOIN effect_local_relay_reservations r ON r.message_id = m.message_id
         WHERE m.tenant_id = ${request.tenantId}

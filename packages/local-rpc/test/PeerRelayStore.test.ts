@@ -1097,6 +1097,7 @@ describe("PeerRelayStore", () => {
         EXPLAIN QUERY PLAN
         SELECT m.message_id
         FROM effect_local_relay_messages m
+          INDEXED BY effect_local_relay_messages_claim_admission
         JOIN effect_local_relay_channels c ON c.channel_id = m.channel_id
         JOIN effect_local_relay_reservations r ON r.message_id = m.message_id
         WHERE m.tenant_id = 'tenant-plan'
