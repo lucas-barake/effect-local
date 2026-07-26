@@ -19,6 +19,8 @@ declare global {
       readonly replicaId: string
       readonly writerGeneration: number
     }
+    __effectLocalSessionCount?: () => Promise<number>
+    __effectLocalTerminateDatabase?: () => void
   }
 }
 
@@ -50,14 +52,16 @@ const WorkerLive = BrowserWorker.layer(() => {
     const message = event.data as
       | ({ readonly _tag: "Attached" } & NonNullable<Window["__effectLocalOwnerInfo"]>)
       | { readonly _tag: "OwnerError"; readonly message: string }
-      | { readonly _tag: "Ping"; readonly nonce: string }
+      | { readonly _tag: "Reattach" }
       | { readonly _tag: "ProvisionAccepted"; readonly nonce: string }
       | { readonly _tag: "ProvisionRejected"; readonly nonce: string }
       | { readonly _tag: "Provision"; readonly nonce: string }
-    if (message._tag === "Ping") {
-      replica.port.postMessage({ _tag: "Alive", nonce: message.nonce })
+      | { readonly _tag: "Sessions"; readonly nonce: string; readonly count: number }
+    if (message._tag === "Reattach") {
+      window.location.reload()
       return
     }
+    if (message._tag === "Sessions") return
     if (message._tag === "Provision") {
       const database = new Worker(new URL("./opfs.worker.ts", import.meta.url), {
         name: "effect-local-tasks-opfs",
@@ -205,7 +209,34 @@ export const restoreBackup = runtime.fn<Uint8Array>()(
 export const dispose = () => {
   for (const worker of workers) {
     worker.database?.terminate()
+    worker.replica.port.postMessage({ _tag: "Detach" })
     worker.replica.port.close()
   }
   workers.clear()
+}
+
+window.__effectLocalSessionCount = () =>
+  new Promise<number>((resolve) => {
+    const worker = workers.values().next().value
+    if (worker === undefined) {
+      resolve(0)
+      return
+    }
+    const nonce = crypto.randomUUID()
+    const onMessage = (event: MessageEvent) => {
+      const message = event.data as { readonly _tag: string; readonly nonce?: string; readonly count?: number }
+      if (message._tag !== "Sessions" || message.nonce !== nonce) return
+      worker.replica.port.removeEventListener("message", onMessage)
+      resolve(message.count ?? 0)
+    }
+    worker.replica.port.addEventListener("message", onMessage)
+    worker.replica.port.postMessage({ _tag: "Sessions", nonce })
+  })
+
+window.__effectLocalTerminateDatabase = () => {
+  for (const worker of workers) {
+    worker.database?.terminate()
+    worker.database = undefined
+    worker.provisioning = undefined
+  }
 }

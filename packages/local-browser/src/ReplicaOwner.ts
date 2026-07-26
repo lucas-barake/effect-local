@@ -1,5 +1,6 @@
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import type * as Document from "@lucas-barake/effect-local/Document"
+import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import type * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
@@ -48,6 +49,14 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
         })
       )
     )
+    const connectionSessions = new Map<Identity.SessionId, number>()
+    yield* Effect.addFinalizer(() =>
+      Effect.forEach(
+        connectionSessions,
+        ([sessionId, clientId]) => Effect.ignore(sessions.close(sessionId, clientId)),
+        { discard: true }
+      )
+    )
     const documents = new Map<string, Document.Any>(
       definition.documents.documents.map((document: Document.Any) => [document.name, document])
     )
@@ -61,12 +70,15 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
     return ReplicaRpc.group.of({
       OpenSession: ({ definitionHash, protocolVersion, sessionId }, { client }) =>
         protocolVersion === ReplicaRpc.protocolVersion && definitionHash === definition.hash
-          ? sessions.open(sessionId, client.id).pipe(Effect.as({
-            leaseMillis: SessionManager.leaseDurationMillis,
-            protocolVersion: ReplicaRpc.protocolVersion,
-            definitionHash: definition.hash,
-            ownerEpoch
-          }))
+          ? sessions.open(sessionId, client.id).pipe(
+            Effect.tap(() => Effect.sync(() => connectionSessions.set(sessionId, client.id))),
+            Effect.as({
+              leaseMillis: SessionManager.leaseDurationMillis,
+              protocolVersion: ReplicaRpc.protocolVersion,
+              definitionHash: definition.hash,
+              ownerEpoch
+            })
+          )
           : Effect.fail(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.ProtocolMismatch({
@@ -77,7 +89,10 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           ),
       RenewSession: ({ sessionId }, { client }) =>
         sessions.renew(sessionId, client.id).pipe(Effect.as({ leaseMillis: SessionManager.leaseDurationMillis })),
-      CloseSession: ({ sessionId }, { client }) => sessions.close(sessionId, client.id),
+      CloseSession: ({ sessionId }, { client }) =>
+        sessions.close(sessionId, client.id).pipe(
+          Effect.tap(() => Effect.sync(() => connectionSessions.delete(sessionId)))
+        ),
       Create: ({ commandId, document, sessionId, value }, { client }) =>
         sessions.run(
           sessionId,
