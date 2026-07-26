@@ -23,6 +23,21 @@ export interface Connection {
   readonly capabilities: Capabilities
   readonly receive: Stream.Stream<Uint8Array, ReplicaError.ReplicaError>
   readonly send: (message: Uint8Array) => Effect.Effect<void, ReplicaError.ReplicaError>
+  /**
+   * Terminates `receive`. A fiber parked consuming it observes an interrupt only `Exit`, never a normal end and
+   * never a failure. A normal end would be read as a retryable transport fault, and a failure would be reported as
+   * a session failure, so neither is a valid way to honour this.
+   *
+   * Must not wait on the consumer of `receive`, which calls `close` from that consumer's own fiber. An
+   * implementation may still suspend on its own in-flight work: `RpcPeerTransport` awaits the cleanup of an
+   * in-flight `send`, and makes a concurrent caller await the first. It is idempotent, and a consumer already
+   * inside its element handler finishes that handler and observes the interrupt on its next pull.
+   *
+   * `close` only initiates termination, and it is not the release path an implementation may rely on: closing the
+   * connection scope must on its own release every transport resource, including revoking or ceasing to renew any
+   * credential or lease the connection holds. Whether `send` still succeeds after `close` is implementation
+   * defined.
+   */
   readonly close: Effect.Effect<void>
 }
 
