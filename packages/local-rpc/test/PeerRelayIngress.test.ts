@@ -1,6 +1,6 @@
 import { NodeSocket, NodeSocketServer } from "@effect/platform-node"
 import { assert, describe, it } from "@effect/vitest"
-import { Context, Deferred, Effect, Exit, Fiber, Layer, Scope } from "effect"
+import { Context, Deferred, Effect, Exit, Fiber, Layer, Scheduler, Scope } from "effect"
 import { TestClock } from "effect/testing"
 import type * as RpcMessage from "effect/unstable/rpc/RpcMessage"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
@@ -307,6 +307,94 @@ describe("PeerRelayIngress", () => {
       yield* Scope.close(server.scope, Exit.void)
     })))
 
+  it.effect("releases an interrupted reservation during ownership handoff", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const server = yield* buildServer(testLimits())
+      const reservation = yield* Effect.forkDetach(
+        server.ingress.reserveOutbound(1).pipe(
+          Effect.provideService(Scheduler.MaxOpsBeforeYield, 8)
+        )
+      )
+      let observedHandoff = false
+      for (let attempt = 0; attempt < 10_000; attempt++) {
+        const usage = yield* server.ingress.usage
+        if (usage.reservedBytes === 1 && reservation.pollUnsafe() === undefined) {
+          observedHandoff = true
+          break
+        }
+        yield* Effect.yieldNow
+      }
+      assert.strictEqual(observedHandoff, true)
+
+      yield* Fiber.interrupt(reservation)
+      assert.deepStrictEqual(yield* server.ingress.usage, {
+        connections: 0,
+        reservedBytes: 0,
+        byteReservationWaiters: 0
+      })
+      yield* Scope.close(server.scope, Exit.void)
+    })))
+
+  it.effect("retains active request capacity through a defect and rejects unknown client tags", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const received = Deferred.makeUnsafe<void>()
+      const defectSent = Deferred.makeUnsafe<void>()
+      const messages: Array<RpcMessage.FromClientEncoded> = []
+      const server = yield* buildServer(testLimits({
+        maximumRawChunkBytes: 2 * 1_024
+      }))
+      yield* Effect.forkIn(
+        server.protocol.run((clientId, message) =>
+          Effect.gen(function*() {
+            messages.push(message)
+            if (message._tag !== "Request") return
+            if (message.id === 1) {
+              Deferred.doneUnsafe(received, Effect.void)
+              return
+            }
+            if (message.id === 2) {
+              yield* server.protocol.send(clientId, {
+                _tag: "Defect",
+                defect: "request-defect"
+              })
+              Deferred.doneUnsafe(defectSent, Effect.void)
+            }
+          })
+        ),
+        server.scope
+      )
+      const clientScope = yield* Scope.make()
+      const client = yield* connect(tcpPort(server.ingress.address), clientScope)
+      const encodedRequest = frame(request(1, "x".repeat(1_024)))
+
+      yield* client.write(encodedRequest)
+      yield* Deferred.await(received)
+      assert.strictEqual(
+        (yield* server.ingress.usage).reservedBytes,
+        encodedRequest.byteLength - 4
+      )
+
+      yield* client.write(frame(request(2)))
+      yield* Deferred.await(defectSent)
+      assert.strictEqual(
+        (yield* server.ingress.usage).reservedBytes,
+        encodedRequest.byteLength - 4
+      )
+
+      yield* client.write(frame({ _tag: "Bogus" }))
+      const clientExit = yield* Fiber.await(client.readFiber!)
+
+      assert.match(clientExit._tag, /^(Failure|Success)$/)
+      assert.deepStrictEqual(messages.map((message) => message._tag), ["Request", "Request"])
+      assert.deepStrictEqual(yield* server.ingress.usage, {
+        connections: 0,
+        reservedBytes: 0,
+        byteReservationWaiters: 0
+      })
+      yield* Scope.close(clientScope, Exit.void)
+      yield* Scope.close(server.scope, Exit.void)
+    })))
+
   it.effect("reserves outbound capacity before serializing a response", () =>
     Effect.scoped(Effect.gen(function*() {
       const values = testLimits()
@@ -399,7 +487,7 @@ describe("PeerRelayIngress", () => {
               values.maximumSharedPayloadBytes - inboundBytes - 1
             )
             yield* Deferred.succeed(ready, { blocker, clientId })
-          })
+          }).pipe(Effect.orDie)
         ),
         server.scope
       )
@@ -456,7 +544,7 @@ describe("PeerRelayIngress", () => {
                 yield* Deferred.succeed(transferSucceeded, succeeded)
               })
             )
-          })
+          }).pipe(Effect.orDie)
         ),
         server.scope
       )
@@ -477,6 +565,65 @@ describe("PeerRelayIngress", () => {
         byteReservationWaiters: 0
       })
       yield* Scope.close(clientScope, Exit.void)
+      yield* Scope.close(server.scope, Exit.void)
+    })))
+
+  it.effect("keeps accepting connections when a waiting protocol runner takes ownership", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const firstReceived = Deferred.makeUnsafe<void>()
+      const secondReceived = Deferred.makeUnsafe<void>()
+      const server = yield* buildServer(testLimits())
+      const firstRunner = yield* Effect.forkIn(
+        server.protocol.run(() => Deferred.succeed(firstReceived, undefined)),
+        server.scope
+      )
+      const firstClientScope = yield* Scope.make()
+      const firstClient = yield* connect(tcpPort(server.ingress.address), firstClientScope)
+      yield* firstClient.write(frame({ _tag: "Ping" }))
+      yield* Deferred.await(firstReceived)
+
+      yield* Effect.forkIn(
+        server.protocol.run(() => Deferred.succeed(secondReceived, undefined)),
+        server.scope
+      )
+      yield* Effect.yieldNow
+      yield* Fiber.interrupt(firstRunner)
+
+      const secondClientScope = yield* Scope.make()
+      const secondClient = yield* connect(tcpPort(server.ingress.address), secondClientScope)
+      yield* secondClient.write(frame({ _tag: "Ping" }))
+      yield* Deferred.await(secondReceived)
+
+      assert.strictEqual((yield* server.ingress.usage).connections, 2)
+      yield* Scope.close(secondClientScope, Exit.void)
+      yield* Scope.close(firstClientScope, Exit.void)
+      yield* Scope.close(server.scope, Exit.void)
+    })))
+
+  it.effect("reserves disconnect queue capacity before accepting a connection", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const server = yield* buildServer(testLimits({
+        maxRelayConnections: 1,
+        maximumByteReservationWaiters: 1,
+        maxSessionsPerSubject: 1,
+        maxInFlightOpen: 1,
+        maxInFlightOpenPerSubject: 1
+      }))
+      yield* Effect.forkIn(server.protocol.run(() => Effect.void), server.scope)
+
+      const firstScope = yield* Scope.make()
+      yield* connect(tcpPort(server.ingress.address), firstScope)
+      yield* awaitConnections(server.ingress, 1)
+      yield* Scope.close(firstScope, Exit.void)
+      yield* awaitConnections(server.ingress, 0)
+
+      const secondScope = yield* Scope.make()
+      const second = yield* connect(tcpPort(server.ingress.address), secondScope)
+      const secondExit = yield* Fiber.await(second.readFiber!)
+
+      assert.match(secondExit._tag, /^(Failure|Success)$/)
+      assert.strictEqual((yield* server.ingress.usage).connections, 0)
+      yield* Scope.close(secondScope, Exit.void)
       yield* Scope.close(server.scope, Exit.void)
     })))
 

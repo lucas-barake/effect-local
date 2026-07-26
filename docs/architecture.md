@@ -39,9 +39,52 @@ for reconstructing the session in place.
 4. Workflow journals are durable orchestration records.
 5. Atom values are reactive caches.
 6. Presence and tab sessions are ephemeral.
+7. Optional sender relay outbox rows are temporary durable transfer state.
+8. Optional relay custody rows are temporary durable delivery state owned by one SQLite authority per shard.
 
 Cluster and Workflow do not replace Automerge. They serialize local effects, resolve retry ambiguity, and resume
 operations after process loss. Automerge remains responsible for causal history, conflicts, and convergence.
+
+## Relay topology
+
+The direct RPC deployment and optional store and forward deployment have separate protocols and listeners. Direct
+version `2` continues through the application owned protocol and `PeerRpcServer.layerHandlers`. Relay version `3`
+uses `PeerRelayRpc.Rpcs`, the bounded `PeerRelayIngress` socket protocol, and a distinct socket Layer through
+`PeerRpcServer.layerStoreAndForwardDeployment`.
+
+```mermaid
+flowchart LR
+  Sender["Sender SQL replica"] --> Outbox["Stable sender relay outbox"]
+  Outbox --> RelayListener["Relay protocol v3 listener"]
+  RelayListener --> Custody["Single authority relay SQLite"]
+  Custody --> RecipientListener["Recipient relay session"]
+  RecipientListener --> Receipt["Recipient SQL sync and receipt"]
+  Receipt --> Ack["Fenced relay acknowledgement"]
+  Ack --> Custody
+```
+
+One relay SQLite database is authoritative for one shard. The application must route every custody write and claim
+for that shard to one process and one durable volume. This topology does not include leader election, quorum
+replication, automatic failover, shard rebalance, network file system sharing, or split brain recovery.
+
+Relay ordering is FIFO within one exact directed peer channel. Distinct channels can progress concurrently. Claims
+are finite fences. A stale claim may duplicate delivery, but its old token cannot retire a newer claim. See
+[Store and forward](store-and-forward.md) for delivery, capacity, security, and lifecycle details.
+
+Relay infrastructure treats the Automerge message as opaque. It validates bounded framing, envelope Schema, endpoint
+and document routing, hashes, outer digest, and writer provenance shape. Relay enabled `PeerSync` performs the one
+semantic Automerge decode.
+
+That boundary is explicit because Automerge `3.3.2` has no allocation bounded decode API. Ordinary authentication and
+document authorization do not imply resource trust. `PeerRelayAuthorization` requires a second exact
+`UnsafeUnboundedAutomerge3DecodeGrant` for relay admission and delivery. Its principal, remote, direction, documents,
+finite lease, and revocation Effect are all scoped and validated. Default deny is
+`denyUnsafeUnboundedAutomerge3Decode`.
+
+Fresh ordinary and unsafe grants feed a local operation gate. Revocation that reaches the gate first prevents SQL
+mutation or payload emission. An operation admitted first may finish and returns its real result. Revocation drains
+that bounded in flight work and blocks later work. This is a local ordering boundary, not an atomic transaction
+between SQLite and an external policy authority.
 
 ## Domain API
 

@@ -560,6 +560,77 @@ describe("Migrations", () => {
       assert.deepStrictEqual(replicaUsage, { message_count: 1, encoded_bytes: 3 })
     }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
 
+  it.effect("prevents legacy receipt cleanup from deleting relay receipts", () =>
+    Effect.gen(function*() {
+      yield* Migrations.run
+      const sql = yield* SqlClient.SqlClient
+      yield* sql`INSERT INTO effect_local_documents (
+        document_id, document_type, schema_version, observed_versions, materialized_heads,
+        accepted_heads, tombstone, projection_status
+      ) VALUES (
+        'doc_00000000-0000-4000-8000-000000000001',
+        'Task',
+        1,
+        '[]',
+        '[]',
+        '[]',
+        0,
+        'Ready'
+      )`
+      yield* sql`INSERT INTO effect_local_peer_receipts (
+        replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id,
+        message_hash, heads, accepted_heads, commit_sequence, accepted_at, writer_provenance,
+        relay_sender_tenant_id, relay_sender_subject_id, relay_sender_peer_id,
+        relay_message_id, relay_outer_envelope_digest, relay_receipt_expires_at, relay_encoded_size
+      ) VALUES (
+        0, 'peer-relay', 'epoch-relay', 0,
+        'doc_00000000-0000-4000-8000-000000000001',
+        ${"a".repeat(64)}, '[]', '[]', 0, '2026-01-01T00:00:00.000Z', '[]',
+        'tenant-1', 'subject-1', 'peer-sender', 'relay-id-1',
+        ${"b".repeat(64)}, '2026-01-09T00:00:00.000Z', 32
+      )`
+      yield* sql`INSERT INTO effect_local_peer_relay_receipt_usage (
+        replica_incarnation, sender_tenant_id, sender_subject_id, sender_peer_id,
+        receipt_count, encoded_bytes
+      ) VALUES (0, 'tenant-1', 'subject-1', 'peer-sender', 1, 32)`
+      yield* sql`INSERT INTO effect_local_peer_receipts (
+        replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id,
+        message_hash, heads, accepted_heads, commit_sequence, accepted_at, writer_provenance
+      ) VALUES (
+        0, 'peer-direct', 'epoch-direct', 0,
+        'doc_00000000-0000-4000-8000-000000000001',
+        ${"c".repeat(64)}, '[]', '[]', 0, '2026-01-01T00:00:00.000Z', '[]'
+      )`
+
+      assert.strictEqual(
+        (yield* Effect.exit(sql`DELETE FROM effect_local_peer_receipts
+          WHERE pending_message IS NULL`))._tag,
+        "Failure"
+      )
+      assert.strictEqual(
+        (yield* Effect.exit(sql`DELETE FROM effect_local_documents
+          WHERE document_id = 'doc_00000000-0000-4000-8000-000000000001'`))._tag,
+        "Failure"
+      )
+      yield* sql`DELETE FROM effect_local_peer_receipts
+        WHERE relay_message_id IS NULL`
+
+      assert.deepStrictEqual(
+        yield* sql`SELECT relay_message_id FROM effect_local_peer_receipts`,
+        [{ relay_message_id: "relay-id-1" }]
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT receipt_count, encoded_bytes
+          FROM effect_local_peer_relay_receipt_usage`,
+        [{ receipt_count: 1, encoded_bytes: 32 }]
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT receipt_row_id
+          FROM effect_local_peer_relay_receipt_delete_tokens`,
+        []
+      )
+    }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
+
   it.effect("rejects a changed relay migration checksum", () =>
     Effect.gen(function*() {
       yield* Migrations.run

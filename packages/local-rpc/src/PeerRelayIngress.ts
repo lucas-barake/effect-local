@@ -45,6 +45,7 @@ const CurrentRequestKey = Context.Reference<RequestKey | undefined>(
 )
 
 interface InternalReservation extends Reservation {
+  readonly releaseUnsafe: () => void
   readonly shrinkTo: (bytes: number) => Effect.Effect<void>
   readonly transfer: (key: RequestKey) => Effect.Effect<void, PeerRpcError.SessionUnavailable>
 }
@@ -65,23 +66,19 @@ const makeByteBudget = (
   let waiterId = 0
   const waiters = new Map<number, ByteWaiter>()
 
-  const releaseBytes = (bytes: number) =>
-    Effect.sync(() => {
-      reservedBytes -= bytes
-      drain()
-    })
-
   const makeReservation = (bytes: number): InternalReservation => {
     let reserved = bytes
     let released = false
     let transferred = false
-    const release = Effect.suspend(() => {
-      if (released) return Effect.void
+    const releaseUnsafe = () => {
+      if (released) return
       released = true
-      return releaseBytes(reserved)
-    })
+      reservedBytes -= reserved
+      drain()
+    }
+    const release = Effect.sync(releaseUnsafe)
     const shrinkTo = (target: number) =>
-      Effect.suspend(() => {
+      Effect.sync(() => {
         if (
           released ||
           transferred ||
@@ -89,12 +86,13 @@ const makeByteBudget = (
           target <= 0 ||
           target > reserved
         ) {
-          return Effect.die(new Error("Invalid relay byte reservation shrink"))
+          throw new Error("Invalid relay byte reservation shrink")
         }
-        if (target === reserved) return Effect.void
+        if (target === reserved) return
         const releasedBytes = reserved - target
         reserved = target
-        return releaseBytes(releasedBytes)
+        reservedBytes -= releasedBytes
+        drain()
       })
     const transfer = (key: RequestKey) =>
       Effect.suspend(() => {
@@ -118,6 +116,7 @@ const makeByteBudget = (
         return reserved
       },
       release,
+      releaseUnsafe,
       shrinkTo,
       transfer,
       transferToCurrentRequest: Effect.flatMap(CurrentRequestKey, (key) =>
@@ -155,48 +154,86 @@ const makeByteBudget = (
       }
     })
 
+  const acquire = (
+    bytes: number
+  ): Effect.Effect<
+    InternalReservation,
+    PeerRpcError.RequestLimitExceeded | PeerRpcError.RequestCapacityExceeded
+  > =>
+    Effect.suspend<
+      InternalReservation,
+      PeerRpcError.RequestLimitExceeded | PeerRpcError.RequestCapacityExceeded,
+      never
+    >(() => {
+      if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > capacity) {
+        return Effect.fail(new PeerRpcError.RequestLimitExceeded())
+      }
+      if (waiters.size === 0 && reservedBytes + bytes <= capacity) {
+        reservedBytes += bytes
+        return Effect.succeed(makeReservation(bytes))
+      }
+      if (waiters.size >= maximumWaiters) {
+        return Effect.fail(new PeerRpcError.RequestCapacityExceeded())
+      }
+      const id = waiterId++
+      const waiter: ByteWaiter = {
+        bytes,
+        deferred: Deferred.makeUnsafe(),
+        state: "Waiting"
+      }
+      waiters.set(id, waiter)
+      return Effect.interruptible(Deferred.await(waiter.deferred)).pipe(
+        Effect.onInterrupt(() => cancelWaiter(id, waiter)),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            waiter.state = "Delivered"
+          })
+        )
+      )
+    })
+
   const reserve = (
     bytes: number
   ): Effect.Effect<
     InternalReservation,
     PeerRpcError.RequestLimitExceeded | PeerRpcError.RequestCapacityExceeded
   > =>
-    Effect.uninterruptibleMask((restore) => {
-      const acquire = (): Effect.Effect<
-        InternalReservation,
-        PeerRpcError.RequestLimitExceeded | PeerRpcError.RequestCapacityExceeded
-      > => {
-        if (!Number.isSafeInteger(bytes) || bytes <= 0 || bytes > capacity) {
-          return Effect.fail(new PeerRpcError.RequestLimitExceeded())
-        }
-        if (waiters.size === 0 && reservedBytes + bytes <= capacity) {
-          reservedBytes += bytes
-          return Effect.succeed(makeReservation(bytes))
-        }
-        if (waiters.size >= maximumWaiters) {
-          return Effect.fail(new PeerRpcError.RequestCapacityExceeded())
-        }
-        const id = waiterId++
-        const waiter: ByteWaiter = {
-          bytes,
-          deferred: Deferred.makeUnsafe(),
-          state: "Waiting"
-        }
-        waiters.set(id, waiter)
-        return restore(Deferred.await(waiter.deferred)).pipe(
-          Effect.onInterrupt(() => cancelWaiter(id, waiter)),
-          Effect.tap(() =>
+    Effect.suspend(() => {
+      let acquired: InternalReservation | undefined
+      return Effect.uninterruptibleMask(() =>
+        acquire(bytes).pipe(
+          Effect.tap((reservation) =>
             Effect.sync(() => {
-              waiter.state = "Delivered"
+              acquired = reservation
             })
           )
         )
-      }
-      return Effect.suspend(acquire)
+      ).pipe(
+        Effect.onInterrupt(() => acquired?.release ?? Effect.void)
+      )
     })
+
+  const use = <A, E, R,>(
+    bytes: number,
+    f: (reservation: InternalReservation) => Effect.Effect<A, E, R>
+  ): Effect.Effect<
+    A,
+    E | PeerRpcError.RequestLimitExceeded | PeerRpcError.RequestCapacityExceeded,
+    R
+  > =>
+    Effect.uninterruptibleMask((restore) =>
+      acquire(bytes).pipe(
+        Effect.flatMap((reservation) =>
+          restore(f(reservation)).pipe(
+            Effect.ensuring(reservation.release)
+          )
+        )
+      )
+    )
 
   return {
     reserve,
+    use,
     usage: () => ({
       reservedBytes,
       byteReservationWaiters: waiters.size
@@ -401,18 +438,25 @@ const removeReservation = (
   return reservation
 }
 
+const removeAndReleaseReservation = (
+  reservations: Map<number, Map<string | number, InternalReservation>>,
+  key: RequestKey
+) =>
+  Effect.sync(() => {
+    removeReservation(reservations, key)?.releaseUnsafe()
+  })
+
 const releaseClientReservations = (
   reservations: Map<number, Map<string | number, InternalReservation>>,
   clientId: number
 ) =>
-  Effect.suspend(() => {
+  Effect.sync(() => {
     const client = reservations.get(clientId)
-    if (client === undefined) return Effect.void
+    if (client === undefined) return
     reservations.delete(clientId)
-    return Effect.forEach(client.values(), (reservation) => reservation.release, {
-      concurrency: 1,
-      discard: true
-    })
+    for (const reservation of client.values()) {
+      reservation.releaseUnsafe()
+    }
   })
 
 const makeServerProtocol = (
@@ -438,7 +482,7 @@ const makeServerProtocol = (
     )
     let connections = 0
     let nextClientId = 0
-    let protocolReady = false
+    let protocolRunners = 0
     let writeRequest!: (
       clientId: number,
       message: RpcMessage.FromClientEncoded
@@ -460,64 +504,71 @@ const makeServerProtocol = (
       return Effect.succeed({
         disconnects,
         send: (clientId, response) =>
-          Effect.suspend(() => {
-            const key = "requestId" in response
-              ? { clientId, requestId: response.requestId }
-              : undefined
-            const transferred = key === undefined
-              ? undefined
-              : removeReservation(outbound, key)
-            return Effect.gen(function*() {
-              const client = clients.get(clientId)
-              if (client === undefined) {
-                return
-              }
+          Effect.uninterruptibleMask((restore) =>
+            Effect.flatMap(CurrentRequestKey, (currentRequest) =>
+              Effect.sync(() => {
+                const key = "requestId" in response
+                  ? { clientId, requestId: response.requestId }
+                  : response._tag === "Defect"
+                  ? currentRequest
+                  : undefined
+                const transferred = key === undefined
+                  ? undefined
+                  : removeReservation(outbound, key)
+                return { key, transferred }
+              })).pipe(
+                Effect.flatMap(({ key, transferred }) =>
+                  restore(Effect.gen(function*() {
+                    const client = clients.get(clientId)
+                    if (client === undefined) {
+                      return
+                    }
 
-              const maximumAdditional = transferred === undefined
-                ? limits.maximumDeclaredFrameBytes
-                : Math.max(0, limits.maximumDeclaredFrameBytes - transferred.bytes)
-              const extra = maximumAdditional === 0
-                ? undefined
-                : yield* budget.reserve(maximumAdditional).pipe(
-                  Effect.match({
-                    onFailure: () => undefined,
-                    onSuccess: (reservation) => reservation
-                  })
+                    const maximumAdditional = transferred === undefined
+                      ? limits.maximumDeclaredFrameBytes
+                      : Math.max(0, limits.maximumDeclaredFrameBytes - transferred.bytes)
+                    const sendWithExtra = (extra: InternalReservation | undefined) =>
+                      Effect.gen(function*() {
+                        let encoded: ReturnType<typeof encodeFrame>
+                        try {
+                          encoded = encodeFrame(response, limits.maximumDeclaredFrameBytes)
+                        } catch {
+                          yield* client.write(new Socket.CloseEvent(1009)).pipe(Effect.ignore)
+                          return
+                        }
+
+                        const additional = transferred === undefined
+                          ? encoded.bodyBytes
+                          : Math.max(0, encoded.bodyBytes - transferred.bytes)
+                        if (extra !== undefined && additional > 0) {
+                          yield* extra.shrinkTo(additional)
+                        } else if (extra !== undefined) {
+                          yield* extra.release
+                        }
+
+                        yield* client.write(encoded.frame).pipe(Effect.ignore)
+
+                        if (
+                          (response._tag === "Exit" || response._tag === "Defect") &&
+                          key !== undefined
+                        ) {
+                          yield* removeAndReleaseReservation(inbound, key)
+                        }
+                      })
+                    if (maximumAdditional === 0) {
+                      yield* sendWithExtra(undefined)
+                    } else {
+                      yield* budget.use(
+                        maximumAdditional,
+                        sendWithExtra
+                      ).pipe(
+                        Effect.catch(() => client.write(new Socket.CloseEvent(1013)).pipe(Effect.ignore))
+                      )
+                    }
+                  })).pipe(Effect.ensuring(transferred?.release ?? Effect.void))
                 )
-              if (maximumAdditional > 0 && extra === undefined) {
-                yield* client.write(new Socket.CloseEvent(1013)).pipe(Effect.ignore)
-                return
-              }
-
-              yield* Effect.gen(function*() {
-                let encoded: ReturnType<typeof encodeFrame>
-                try {
-                  encoded = encodeFrame(response, limits.maximumDeclaredFrameBytes)
-                } catch {
-                  yield* client.write(new Socket.CloseEvent(1009)).pipe(Effect.ignore)
-                  return
-                }
-
-                const additional = transferred === undefined
-                  ? encoded.bodyBytes
-                  : Math.max(0, encoded.bodyBytes - transferred.bytes)
-                if (extra !== undefined && additional > 0) {
-                  yield* extra.shrinkTo(additional)
-                } else if (extra !== undefined) {
-                  yield* extra.release
-                }
-
-                yield* client.write(encoded.frame).pipe(Effect.ignore)
-
-                if (response._tag === "Exit" && key !== undefined) {
-                  const retained = removeReservation(inbound, key)
-                  if (retained !== undefined) yield* retained.release
-                } else if (response._tag === "Defect") {
-                  yield* releaseClientReservations(inbound, clientId)
-                }
-              }).pipe(Effect.ensuring(extra?.release ?? Effect.void))
-            }).pipe(Effect.ensuring(transferred?.release ?? Effect.void))
-          }),
+              )
+          ),
         end: (clientId) =>
           Effect.gen(function*() {
             const client = clients.get(clientId)
@@ -536,22 +587,25 @@ const makeServerProtocol = (
     const protocol: RpcServer.Protocol["Service"] = {
       ...baseProtocol,
       run: (handler) =>
-        Effect.suspend(() => {
-          protocolReady = true
-          return baseProtocol.run(handler).pipe(
-            Effect.onExit(() =>
-              Effect.sync(() => {
-                protocolReady = false
-              })
-            )
-          )
-        })
+        Effect.acquireUseRelease(
+          Effect.sync(() => {
+            protocolRunners++
+          }),
+          () => baseProtocol.run(handler),
+          () =>
+            Effect.sync(() => {
+              protocolRunners--
+            })
+        )
     }
 
     const onSocket = (socket: Socket.Socket) =>
       Effect.scoped(
         Effect.suspend(() => {
-          if (!protocolReady || connections >= limits.maxRelayConnections) {
+          if (
+            protocolRunners === 0 ||
+            connections + Queue.sizeUnsafe(disconnects) >= limits.maxRelayConnections
+          ) {
             return Effect.gen(function*() {
               const write = yield* socket.writer
               yield* socket.runRaw(
@@ -577,6 +631,16 @@ const makeServerProtocol = (
                   value === null ||
                   Array.isArray(value) ||
                   !("_tag" in value)
+                ) {
+                  return Effect.andThen(reservation.release, Effect.fail(invalidFrame()))
+                }
+                const tag = value._tag
+                if (
+                  tag !== "Request" &&
+                  tag !== "Ack" &&
+                  tag !== "Interrupt" &&
+                  tag !== "Ping" &&
+                  tag !== "Eof"
                 ) {
                   return Effect.andThen(reservation.release, Effect.fail(invalidFrame()))
                 }
@@ -608,8 +672,7 @@ const makeServerProtocol = (
                 ).pipe(
                   Effect.onExit((exit) => {
                     if (exit._tag === "Success") return Effect.void
-                    removeReservation(inbound, key)
-                    return reservation.release
+                    return removeAndReleaseReservation(inbound, key)
                   })
                 )
               }
@@ -741,23 +804,29 @@ export const makeProtocolSocket = Effect.gen(function*() {
         send: (clientId: number, request: RpcMessage.FromClientEncoded) =>
           Effect.gen(function*() {
             if (currentError !== undefined) return yield* Effect.fail(currentError)
-            const reservation = yield* budget.reserve(limits.maximumDeclaredFrameBytes).pipe(
-              Effect.mapError((cause) => toClientError("Relay request capacity is exhausted", cause))
-            )
-            yield* Effect.gen(function*() {
-              let encoded: ReturnType<typeof encodeFrame>
-              try {
-                encoded = encodeFrame(request, limits.maximumDeclaredFrameBytes)
-              } catch (cause) {
-                return yield* Effect.fail(toClientError("Relay request frame is invalid", cause))
-              }
-              yield* reservation.shrinkTo(encoded.bodyBytes)
-              if (request._tag === "Request") requestClients.set(request.id, clientId)
-              yield* write(encoded.frame).pipe(
-                Effect.mapError((cause) => toClientError("Relay socket write failed", cause))
-              )
-            }).pipe(
-              Effect.ensuring(reservation.release)
+            yield* budget.use(
+              limits.maximumDeclaredFrameBytes,
+              (reservation) =>
+                Effect.gen(function*() {
+                  let encoded: ReturnType<typeof encodeFrame>
+                  try {
+                    encoded = encodeFrame(request, limits.maximumDeclaredFrameBytes)
+                  } catch (cause) {
+                    return yield* Effect.fail(toClientError("Relay request frame is invalid", cause))
+                  }
+                  yield* reservation.shrinkTo(encoded.bodyBytes)
+                  if (request._tag === "Request") requestClients.set(request.id, clientId)
+                  yield* write(encoded.frame).pipe(
+                    Effect.mapError((cause) => toClientError("Relay socket write failed", cause))
+                  )
+                })
+            ).pipe(
+              Effect.catchTags({
+                RequestLimitExceeded: (cause) =>
+                  Effect.fail(toClientError("Relay request capacity is exhausted", cause)),
+                RequestCapacityExceeded: (cause) =>
+                  Effect.fail(toClientError("Relay request capacity is exhausted", cause))
+              })
             )
           }),
         supportsAck: true,

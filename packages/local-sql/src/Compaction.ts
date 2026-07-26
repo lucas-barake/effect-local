@@ -91,6 +91,18 @@ const InstalledDocumentRow = Schema.Struct({
 })
 const CheckpointHashRow = Schema.Struct({ checkpoint_hash: Schema.String })
 const CountRow = Schema.Struct({ count: Schema.Int })
+const RelayReceiptRewriteRow = Schema.Struct({
+  encoded_size: Schema.Int.check(Schema.isGreaterThan(0)),
+  replica_incarnation: Identity.ReplicaIncarnation,
+  row_id: Schema.Int.check(Schema.isGreaterThan(0)),
+  sender_peer_id: Identity.PeerId,
+  sender_subject_id: Schema.String,
+  sender_tenant_id: Schema.String
+})
+const RelayReceiptUsageRow = Schema.Struct({
+  encoded_bytes: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  receipt_count: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+})
 /** Only the columns `rewriteHistory`'s in-transaction guard and compare-and-swap read. */
 const RewriteGuardRow = Schema.Struct({
   accepted_heads: Schema.String,
@@ -153,9 +165,11 @@ export class Compaction extends Context.Service<Compaction, {
    * `Automerge.getConflicts` would still report on the old document are gone.
    *
    * Refuses unless the document's canonical history is complete and settled: no unapplied change
-   * rows, no peer receipt holding an undecoded pending message, no pending peer outbox row, and
-   * materialized heads equal to accepted heads. An orphan peer change leaves no change row at all,
-   * so the pending message is its only durable record and dropping it would lose an accepted write.
+   * rows, no peer receipt holding an undecoded pending message, no pending peer outbox row, no relay
+   * outbox row, no unexpired relay receipt, and materialized heads equal to accepted heads. An orphan
+   * peer change leaves no change row at all, so the pending message is its only durable record and
+   * dropping it would lose an accepted write. An unexpired relay receipt is retained because it is
+   * the duplicate evidence promised through its receipt horizon.
    *
    * Acquires no gate lock. The caller owns the lock, exactly as `prune` and `pruneCommandReceipts`
    * do, so this must be entered under an already held shared or write permit. The permit is only
@@ -397,6 +411,110 @@ export const layer: Layer.Layer<
       execute: (documentId) =>
         sql`SELECT COUNT(*) AS count FROM effect_local_peer_outbox
           WHERE document_id = ${documentId} AND status = 'Pending'`
+    })
+    // Every relay outbox row is still sender custody. Unlike the direct outbox there is no settled
+    // state to ignore, so any row carrying this document blocks a lineage change.
+    const relayOutboxCount = SqlSchema.findOneOption({
+      Request: Identity.DocumentId,
+      Result: CountRow,
+      execute: (documentId) =>
+        sql`SELECT COUNT(*) AS count FROM effect_local_peer_relay_outbox
+          WHERE document_id = ${documentId}`
+    })
+    const unexpiredRelayReceiptCount = SqlSchema.findOneOption({
+      Request: Schema.Struct({
+        documentId: Identity.DocumentId,
+        expiresAt: Schema.String
+      }),
+      Result: CountRow,
+      execute: (request) =>
+        sql`SELECT COUNT(*) AS count FROM effect_local_peer_receipts
+          WHERE document_id = ${request.documentId}
+            AND relay_message_id IS NOT NULL
+            AND relay_receipt_expires_at > ${request.expiresAt}`
+    })
+    const expiredRelayReceipts = SqlSchema.findAll({
+      Request: Schema.Struct({
+        documentId: Identity.DocumentId,
+        expiresAt: Schema.String
+      }),
+      Result: RelayReceiptRewriteRow,
+      execute: (request) =>
+        sql`SELECT relay_encoded_size AS encoded_size, replica_incarnation, row_id,
+          relay_sender_peer_id AS sender_peer_id,
+          relay_sender_subject_id AS sender_subject_id,
+          relay_sender_tenant_id AS sender_tenant_id
+          FROM effect_local_peer_receipts
+          WHERE document_id = ${request.documentId}
+            AND relay_message_id IS NOT NULL
+            AND pending_message IS NULL
+            AND relay_receipt_expires_at <= ${request.expiresAt}
+          ORDER BY replica_incarnation, relay_sender_tenant_id, relay_sender_subject_id,
+            relay_sender_peer_id, relay_message_id, row_id`
+    })
+    const decrementRelayReceiptUsage = SqlSchema.findAll({
+      Request: Schema.Struct({
+        encodedBytes: Schema.Int.check(Schema.isGreaterThan(0)),
+        receiptCount: Schema.Int.check(Schema.isGreaterThan(0)),
+        replicaIncarnation: Identity.ReplicaIncarnation,
+        senderPeerId: Identity.PeerId,
+        senderSubjectId: Schema.String,
+        senderTenantId: Schema.String
+      }),
+      Result: RelayReceiptUsageRow,
+      execute: (request) =>
+        sql`UPDATE effect_local_peer_relay_receipt_usage
+          SET receipt_count = receipt_count - ${request.receiptCount},
+            encoded_bytes = encoded_bytes - ${request.encodedBytes}
+          WHERE replica_incarnation = ${request.replicaIncarnation}
+            AND sender_tenant_id = ${request.senderTenantId}
+            AND sender_subject_id = ${request.senderSubjectId}
+            AND sender_peer_id = ${request.senderPeerId}
+            AND receipt_count >= ${request.receiptCount}
+            AND encoded_bytes >= ${request.encodedBytes}
+          RETURNING receipt_count, encoded_bytes`
+    })
+    const deleteZeroRelayReceiptUsage = SqlSchema.findAll({
+      Request: Schema.Struct({
+        replicaIncarnation: Identity.ReplicaIncarnation,
+        senderPeerId: Identity.PeerId,
+        senderSubjectId: Schema.String,
+        senderTenantId: Schema.String
+      }),
+      Result: Schema.Struct({ sender_peer_id: Identity.PeerId }),
+      execute: (request) =>
+        sql`DELETE FROM effect_local_peer_relay_receipt_usage
+          WHERE replica_incarnation = ${request.replicaIncarnation}
+            AND sender_tenant_id = ${request.senderTenantId}
+            AND sender_subject_id = ${request.senderSubjectId}
+            AND sender_peer_id = ${request.senderPeerId}
+            AND receipt_count = 0
+            AND encoded_bytes = 0
+          RETURNING sender_peer_id`
+    })
+    const authorizeRelayReceiptDelete = SqlSchema.findAll({
+      Request: Schema.Int.check(Schema.isGreaterThan(0)),
+      Result: Schema.Struct({ receipt_row_id: Schema.Int.check(Schema.isGreaterThan(0)) }),
+      execute: (rowId) =>
+        sql`INSERT INTO effect_local_peer_relay_receipt_delete_tokens (receipt_row_id)
+          VALUES (${rowId})
+          RETURNING receipt_row_id`
+    })
+    const deleteExpiredRelayReceipt = SqlSchema.findAll({
+      Request: Schema.Struct({
+        documentId: Identity.DocumentId,
+        expiresAt: Schema.String,
+        rowId: Schema.Int.check(Schema.isGreaterThan(0))
+      }),
+      Result: Schema.Struct({ row_id: Schema.Int.check(Schema.isGreaterThan(0)) }),
+      execute: (request) =>
+        sql`DELETE FROM effect_local_peer_receipts
+          WHERE row_id = ${request.rowId}
+            AND document_id = ${request.documentId}
+            AND relay_message_id IS NOT NULL
+            AND pending_message IS NULL
+            AND relay_receipt_expires_at <= ${request.expiresAt}
+          RETURNING row_id`
     })
     /**
      * The fail closed fence for a history rewrite.
@@ -1112,16 +1230,20 @@ export const layer: Layer.Layer<
           const row = guard.value
           // Re-read from SQL rather than reused from the `recover` above: that read committed its
           // own transaction and released the connection, so anything it observed is stale here.
-          const [unapplied, receipts, outbox, priorChanges] = yield* Effect.all([
+          const receiptExpiryCutoff = DateTime.formatIso(yield* DateTime.now)
+          const [unapplied, receipts, outbox, relayOutbox, unexpiredRelayReceipts, priorChanges] = yield* Effect.all([
             pendingCount(documentId),
             pendingReceiptCount(documentId),
             pendingOutboxCount(documentId),
+            relayOutboxCount(documentId),
+            unexpiredRelayReceiptCount({ documentId, expiresAt: receiptExpiryCutoff }),
             changeCount(documentId)
           ])
           const nonZero = (count: Option.Option<typeof CountRow.Type>) => Option.exists(count, (row) => row.count !== 0)
           if (
             row.document_type !== document.name || row.materialized_heads !== row.accepted_heads ||
-            nonZero(unapplied) || nonZero(receipts) || nonZero(outbox)
+            nonZero(unapplied) || nonZero(receipts) || nonZero(outbox) || nonZero(relayOutbox) ||
+            nonZero(unexpiredRelayReceipts)
           ) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
@@ -1168,10 +1290,81 @@ export const layer: Layer.Layer<
             Effect.map((row) => row.commit_sequence),
             Effect.catchTag("NoSuchElementError", () => Effect.die(new Error("Replica metadata was not initialized")))
           )
+          const settledRelayReceipts = yield* expiredRelayReceipts({
+            documentId,
+            expiresAt: receiptExpiryCutoff
+          })
           yield* sql`DELETE FROM effect_local_changes WHERE document_id = ${documentId}`
           yield* sql`DELETE FROM effect_local_checkpoints WHERE document_id = ${documentId}`
           yield* sql`DELETE FROM effect_local_peer_outbox WHERE document_id = ${documentId}`
-          yield* sql`DELETE FROM effect_local_peer_receipts WHERE document_id = ${documentId}`
+          // Relay receipts are quota reservations as well as duplicate evidence. Decrement each
+          // exact sender reservation before deleting its expired receipts. Any mismatch fails the
+          // transaction, which restores the document root, receipts, and usage together.
+          const usage = new Map<string, {
+            readonly encodedBytes: number
+            readonly receiptCount: number
+            readonly replicaIncarnation: Identity.ReplicaIncarnation
+            readonly senderPeerId: Identity.PeerId
+            readonly senderSubjectId: string
+            readonly senderTenantId: string
+          }>()
+          for (const receipt of settledRelayReceipts) {
+            const key = JSON.stringify([
+              receipt.replica_incarnation,
+              receipt.sender_tenant_id,
+              receipt.sender_subject_id,
+              receipt.sender_peer_id
+            ])
+            const current = usage.get(key)
+            usage.set(key, {
+              encodedBytes: (current?.encodedBytes ?? 0) + receipt.encoded_size,
+              receiptCount: (current?.receiptCount ?? 0) + 1,
+              replicaIncarnation: receipt.replica_incarnation,
+              senderPeerId: receipt.sender_peer_id,
+              senderSubjectId: receipt.sender_subject_id,
+              senderTenantId: receipt.sender_tenant_id
+            })
+          }
+          const zeroUsage: Array<{
+            readonly replicaIncarnation: Identity.ReplicaIncarnation
+            readonly senderPeerId: Identity.PeerId
+            readonly senderSubjectId: string
+            readonly senderTenantId: string
+          }> = []
+          for (const entry of usage.values()) {
+            const updated = yield* decrementRelayReceiptUsage(entry)
+            if (updated.length !== 1) {
+              return yield* failStorageCorrupt(new Error("Relay receipt usage is inconsistent"))
+            }
+            if (updated[0]!.receipt_count === 0) {
+              zeroUsage.push(entry)
+            }
+          }
+          // Remove zero reservations before the receipts they accounted for. Both statements are
+          // still invisible outside this transaction, and a later delete failure rolls them back.
+          for (const entry of zeroUsage) {
+            const deleted = yield* deleteZeroRelayReceiptUsage(entry)
+            if (deleted.length !== 1) {
+              return yield* failStorageCorrupt(new Error("Zero relay receipt usage disappeared"))
+            }
+          }
+          for (const receipt of settledRelayReceipts) {
+            const authorized = yield* authorizeRelayReceiptDelete(receipt.row_id)
+            if (authorized.length !== 1) {
+              return yield* failStorageCorrupt(new Error("Relay receipt deletion was not authorized"))
+            }
+            const deleted = yield* deleteExpiredRelayReceipt({
+              documentId,
+              expiresAt: receiptExpiryCutoff,
+              rowId: receipt.row_id
+            })
+            if (deleted.length !== 1) {
+              return yield* failStorageCorrupt(new Error("Relay receipt disappeared during history rewrite"))
+            }
+          }
+          yield* sql`DELETE FROM effect_local_peer_receipts
+            WHERE document_id = ${documentId}
+              AND relay_message_id IS NULL`
           // `effect_local_command_receipts` is deliberately retained. Its `heads` column goes stale,
           // but nothing reads it: `CommandExecutor` selects only `request_hash`, `mutation_name` and
           // `result`. Deleting the rows would break command idempotency, so a retried command that

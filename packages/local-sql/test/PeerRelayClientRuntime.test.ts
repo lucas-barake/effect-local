@@ -86,6 +86,7 @@ describe("PeerRelayClientRuntime", () => {
     maintenanceIntervalMillis: 1_000
   }
   const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000011")
+  const lineage = Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000015")
   const endpoint: PeerRelayOutbox.Endpoint = {
     expectedLocal: {
       tenantId: "tenant-a",
@@ -103,6 +104,8 @@ describe("PeerRelayClientRuntime", () => {
   const fakePeerSync = (
     pruneRelayReceipts: PeerSync.PeerSync["Service"]["pruneRelayReceipts"]
   ): PeerSync.PeerSync["Service"] => ({
+    withDocumentInvalidation: (_documentId, effect) => effect,
+    invalidateDocument: () => Effect.void,
     open: () => Effect.die(new Error("unused")),
     reset: () => Effect.die(new Error("unused")),
     generate: () => Effect.die(new Error("unused")),
@@ -170,6 +173,7 @@ describe("PeerRelayClientRuntime", () => {
       documentType: "Task",
       messageHash: yield* Canonical.digest(message),
       message,
+      lineage,
       writerProvenance: changes.map((change) => ({
         changeHash: change.hash,
         writerSchemaVersion: 1,

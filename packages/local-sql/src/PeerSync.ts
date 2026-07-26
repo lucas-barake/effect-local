@@ -843,6 +843,8 @@ const make = (
             }
           }
           for (const row of rows) {
+            yield* sql`INSERT INTO effect_local_peer_relay_receipt_delete_tokens (receipt_row_id)
+              VALUES (${row.row_id})`
             const deleted = yield* deleteRelayReceipt({ rowId: row.row_id })
             if (deleted.length !== 1) {
               return yield* failStorageCorrupt(new Error("Relay receipt disappeared during pruning"))
@@ -1496,8 +1498,7 @@ const make = (
                       relay !== undefined &&
                       (
                         !("relay_outer_envelope_digest" in receipt) ||
-                        receipt.relay_outer_envelope_digest !== relay.outerEnvelopeDigest ||
-                        receipt.relay_encoded_size !== relay.encodedSize
+                        receipt.relay_outer_envelope_digest !== relay.outerEnvelopeDigest
                       )
                     ) {
                       return yield* new ReplicaError.ReplicaError({
@@ -2251,6 +2252,16 @@ const make = (
                               messageHash: yield* digest(generated[1]),
                               heads: materializedHeads
                             }
+                          const pendingMessage = unresolvedBytes === 0 ? null : message
+                          const encodedWriterProvenance = Schema.encodeSync(
+                            WriterProvenance.StoredChangeProvenances
+                          )(writerProvenance)
+                          const relayRetainedSize = relay === undefined
+                            ? null
+                            : relay.encodedSize +
+                              (reply?.message.byteLength ?? 0) +
+                              (pendingMessage?.byteLength ?? 0) +
+                              new TextEncoder().encode(encodedWriterProvenance).byteLength
                           yield* sql`INSERT INTO effect_local_peer_receipts (
             replica_incarnation, peer_id, connection_epoch, receive_sequence,
             document_id, message_hash, reply, reply_hash, pending_message,
@@ -2262,13 +2273,13 @@ const make = (
             ${receiptSession.replicaIncarnation}, ${receiptSession.peerId}, ${receiptSession.connectionEpoch},
             ${receiveSequence},
             ${documentId}, ${messageHash}, ${reply?.message ?? null}, ${reply?.messageHash ?? null},
-            ${unresolvedBytes === 0 ? null : message}, ${Schema.encodeSync(Heads)(materializedHeads)},
+            ${pendingMessage}, ${Schema.encodeSync(Heads)(materializedHeads)},
             ${Schema.encodeSync(Heads)(acceptedHeads)}, ${commitSequence}, ${acceptedAt},
-            ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(writerProvenance)},
+            ${encodedWriterProvenance},
             ${relay?.senderTenantId ?? null}, ${relay?.senderSubjectId ?? null},
             ${relay?.senderPeerId ?? null}, ${relay?.relayMessageId ?? null},
             ${relay?.outerEnvelopeDigest ?? null}, ${relay?.receiptExpiresAt ?? null},
-            ${relay?.encodedSize ?? null}
+            ${relayRetainedSize}
           )`
                           if (relay !== undefined) {
                             yield* sql`INSERT INTO effect_local_peer_relay_receipt_usage (
@@ -2276,7 +2287,7 @@ const make = (
               receipt_count, encoded_bytes
             ) VALUES (
               ${receiptSession.replicaIncarnation}, ${relay.senderTenantId}, ${relay.senderSubjectId},
-              ${relay.senderPeerId}, 1, ${relay.encodedSize}
+              ${relay.senderPeerId}, 1, ${relayRetainedSize!}
             ) ON CONFLICT(replica_incarnation, sender_tenant_id, sender_subject_id, sender_peer_id)
             DO UPDATE SET
               receipt_count = effect_local_peer_relay_receipt_usage.receipt_count + 1,

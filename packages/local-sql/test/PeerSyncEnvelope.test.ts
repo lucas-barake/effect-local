@@ -1,8 +1,8 @@
 import * as Automerge from "@automerge/automerge"
-import * as Canonical from "@lucas-barake/effect-local/Canonical"
-import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto"
 import { assert, describe, it } from "@effect/vitest"
+import * as Canonical from "@lucas-barake/effect-local/Canonical"
+import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as PeerSyncEnvelope from "../src/PeerSyncEnvelope.js"
@@ -13,6 +13,8 @@ const limits: PeerSyncEnvelope.SyncEnvelopeLimits = {
   maxSyncDependencyEdgesPerMessage: 1_000,
   maxSyncOperationsPerMessage: 10_000
 }
+
+const rewrittenLineage = Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000011")
 
 const makeSyncEnvelope = Effect.gen(function*() {
   let source = Automerge.from(
@@ -37,6 +39,7 @@ const makeSyncEnvelope = Effect.gen(function*() {
     documentType: "Task",
     messageHash: yield* Canonical.digest(message),
     message,
+    lineage: rewrittenLineage,
     writerProvenance
   })
   Automerge.free(source)
@@ -51,13 +54,44 @@ describe("PeerSyncEnvelope", () => {
       const bytes = yield* PeerSyncEnvelope.encodeSyncEnvelope(envelope)
       const decoded = yield* PeerSyncEnvelope.decodeSyncEnvelope(bytes, limits)
       assert.deepStrictEqual(decoded, envelope)
+      assert.strictEqual(decoded.lineage, rewrittenLineage)
       assert.deepStrictEqual(PeerSyncEnvelope.syncEnvelopeDocument(decoded), {
         documentId: envelope.documentId,
         documentType: "Task"
       })
     }).pipe(Effect.provide(NodeCrypto.layer)))
 
-  it.effect("rejects oversized, malformed, conflicting, and unprovenanced payloads", () =>
+  it.effect("accepts an opaque standard V2 Document sync envelope without semantic expansion", () =>
+    Effect.gen(function*() {
+      const envelope = yield* makeSyncEnvelope
+      const chunks = Automerge.decodeSyncMessage(envelope.message).changes
+      assert.strictEqual(chunks.length, 1)
+      assert.throws(() => Automerge.decodeChange(chunks[0]!))
+      const document = Automerge.load(chunks[0]!)
+      try {
+        assert.strictEqual(Automerge.getAllChanges(document).length, 1)
+      } finally {
+        Automerge.free(document)
+      }
+      const bytes = yield* PeerSyncEnvelope.encodeSyncEnvelope(envelope)
+      const decoded = yield* PeerSyncEnvelope.decodeSyncEnvelope(bytes, {
+        ...limits,
+        maxSyncOperationsPerMessage: 0
+      })
+      assert.deepStrictEqual(decoded, envelope)
+      assert.deepStrictEqual(
+        yield* PeerSyncEnvelope.validateSyncEnvelope({
+          ...envelope,
+          writerProvenance: []
+        }, limits),
+        {
+          ...envelope,
+          writerProvenance: []
+        }
+      )
+    }).pipe(Effect.provide(NodeCrypto.layer)))
+
+  it.effect("rejects oversized, malformed, conflicting, and excess-provenance payloads", () =>
     Effect.gen(function*() {
       const envelope = yield* makeSyncEnvelope
       const bytes = yield* PeerSyncEnvelope.encodeSyncEnvelope(envelope)
@@ -82,7 +116,10 @@ describe("PeerSyncEnvelope", () => {
       assert.strictEqual(
         (yield* Effect.exit(PeerSyncEnvelope.validateSyncEnvelope({
           ...envelope,
-          writerProvenance: []
+          writerProvenance: Array.from(
+            { length: limits.maxSyncChangesPerMessage + 1 },
+            () => envelope.writerProvenance[0]!
+          )
         }, limits)))._tag,
         "Failure"
       )
@@ -114,6 +151,7 @@ describe("RelayOuterEnvelope", () => {
       documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000005"),
       documentType: "Task"
     },
+    lineage: rewrittenLineage,
     writerProvenance: [
       {
         changeHash: "b".repeat(64),
@@ -145,7 +183,7 @@ describe("RelayOuterEnvelope", () => {
         expectedLocal: { ...base.expectedLocal },
         remote: { ...base.remote },
         document: { ...base.document },
-        writerProvenance: [...base.writerProvenance].reverse()
+        writerProvenance: base.writerProvenance.toReversed()
       })
       assert.deepStrictEqual(
         yield* PeerSyncEnvelope.encodeRelayOuterEnvelope(base),
@@ -156,7 +194,7 @@ describe("RelayOuterEnvelope", () => {
         yield* PeerSyncEnvelope.encodeRelayOuterEnvelope(recipientReplay)
       )
       const digest = yield* PeerSyncEnvelope.digestRelayOuterEnvelope(base)
-      assert.strictEqual(digest, "8e52edf067d2fdbc9be0c5f266f53cb9f12c4557c976e47bdc567c4d4f4efa1b")
+      assert.strictEqual(digest, "bf6947413c2a682c4a99718e168954df367d445fdbb5524050df97f39cfe1db0")
       assert.strictEqual(
         yield* PeerSyncEnvelope.digestRelayOuterEnvelope(relayAdmission),
         digest
@@ -167,31 +205,39 @@ describe("RelayOuterEnvelope", () => {
       )
       assert.deepStrictEqual(PeerSyncEnvelope.relayOuterEnvelopeDocument(base), base.document)
       assert.strictEqual(
-        (yield* Effect.exit(Schema.decodeUnknownEffect(PeerSyncEnvelope.RelayOuterEnvelope)({
-          ...base,
-          domain: "unrelated-domain"
-        })))._tag,
+        (yield* Effect.exit(
+          Schema.decodeUnknownEffect(PeerSyncEnvelope.RelayOuterEnvelope)({
+            ...base,
+            domain: "unrelated-domain"
+          })
+        ))._tag,
         "Failure"
       )
       assert.strictEqual(
-        (yield* Effect.exit(Schema.decodeUnknownEffect(PeerSyncEnvelope.RelayOuterEnvelope)({
-          ...base,
-          version: 2
-        })))._tag,
+        (yield* Effect.exit(
+          Schema.decodeUnknownEffect(PeerSyncEnvelope.RelayOuterEnvelope)({
+            ...base,
+            version: 2
+          })
+        ))._tag,
         "Failure"
       )
       assert.strictEqual(
-        (yield* Effect.exit(Schema.decodeUnknownEffect(PeerSyncEnvelope.RelayOuterEnvelope)({
-          ...base,
-          protocolVersion: 4
-        })))._tag,
+        (yield* Effect.exit(
+          Schema.decodeUnknownEffect(PeerSyncEnvelope.RelayOuterEnvelope)({
+            ...base,
+            protocolVersion: 4
+          })
+        ))._tag,
         "Failure"
       )
       assert.strictEqual(
-        (yield* Effect.exit(Schema.decodeUnknownEffect(PeerSyncEnvelope.RelayOuterEnvelope)({
-          ...base,
-          payloadVersion: 2
-        })))._tag,
+        (yield* Effect.exit(
+          Schema.decodeUnknownEffect(PeerSyncEnvelope.RelayOuterEnvelope)({
+            ...base,
+            payloadVersion: 2
+          })
+        ))._tag,
         "Failure"
       )
     }).pipe(Effect.provide(NodeCrypto.layer)))
@@ -236,6 +282,10 @@ describe("RelayOuterEnvelope", () => {
             ...base.document,
             documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000010")
           }
+        },
+        {
+          ...base,
+          lineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000012")
         },
         {
           ...base,

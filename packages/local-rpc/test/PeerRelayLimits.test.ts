@@ -9,7 +9,8 @@ describe("PeerRelayLimits", () => {
     Effect.gen(function*() {
       const limits = yield* PeerRelayLimits.PeerRelayLimits
       assert.deepStrictEqual(limits, PeerRelayLimits.defaults)
-      assert.strictEqual(Object.keys(limits).length, 93)
+      assert.strictEqual(Object.keys(limits).length, 94)
+      assert.strictEqual(limits.maximumDeliveryAttempts, 16)
     }).pipe(Effect.provide(PeerRelayLimits.layerDefaults)))
 
   it.effect.each(
@@ -17,6 +18,7 @@ describe("PeerRelayLimits", () => {
       ["maxActiveMessagesPerShard", 0, "Expected a value greater than 0, got 0"],
       ["maxRetainedBytesPerTenant", -1, "Expected a value greater than 0, got -1"],
       ["claimLeaseMillis", 1.5, "Expected an integer, got 1.5"],
+      ["maximumDeliveryAttempts", 0, "Expected a value greater than 0, got 0"],
       ["openRatePerSecond", Number.NaN, "Expected a finite number, got NaN"],
       [
         "terminalResponseRatePerSecond",

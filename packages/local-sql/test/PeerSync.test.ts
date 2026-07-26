@@ -99,6 +99,16 @@ describe("PeerSync", () => {
   )
   const RelaySyncService = PeerSync.layerRelay.pipe(Layer.provide(RelayServices))
   const RelayTestLayer = Layer.merge(RelayServices, RelaySyncService)
+  const TightRelayServices = Layer.merge(
+    Services,
+    PeerRelayReceiptLimits.layer({
+      ...PeerRelayReceiptLimits.defaults,
+      maxEncodedBytesPerRemote: 256,
+      maxEncodedBytesPerReplica: 256
+    })
+  )
+  const TightRelaySyncService = PeerSync.layerRelay.pipe(Layer.provide(TightRelayServices))
+  const TightRelayTestLayer = Layer.merge(TightRelayServices, TightRelaySyncService)
   const RecoveryService = Recovery.layer.pipe(Layer.provide(Services))
   const CompactionService = Compaction.layer.pipe(
     Layer.provide(Layer.merge(Services, RecoveryService))
@@ -291,14 +301,40 @@ describe("PeerSync", () => {
 
       const duplicate = yield* sync.receive(Task, documentId, sessionOne, {
         ...input,
-        relay: relay(senderOne, "sender-one", "a".repeat(64))
+        relay: {
+          ...relay(senderOne, "sender-one", "a".repeat(64)),
+          encodedSize: message.byteLength + 10_000
+        }
       })
       assert.isTrue(duplicate.duplicate)
+      const originalCharge = yield* sql<{
+        readonly pendingMessage: Uint8Array | null
+        readonly reply: Uint8Array | null
+        readonly retainedBytes: number
+        readonly writerProvenance: string
+      }>`SELECT
+        pending_message AS pendingMessage,
+        reply,
+        relay_encoded_size AS retainedBytes,
+        writer_provenance AS writerProvenance
+      FROM effect_local_peer_receipts
+      WHERE relay_sender_peer_id = ${senderOne}
+        AND relay_message_id = ${relayMessageId}`
+      assert.strictEqual(originalCharge.length, 1)
+      assert.strictEqual(
+        originalCharge[0]!.retainedBytes,
+        message.byteLength +
+          (originalCharge[0]!.reply?.byteLength ?? 0) +
+          (originalCharge[0]!.pendingMessage?.byteLength ?? 0) +
+          new TextEncoder().encode(originalCharge[0]!.writerProvenance).byteLength
+      )
 
       const beforePrune = yield* sql<{
+        readonly deleteTokens: number
         readonly directReceipts: number
         readonly relayBytes: number
         readonly relayReceipts: number
+        readonly retainedBytes: number
         readonly usageRows: number
       }>`SELECT
         (SELECT COUNT(*) FROM effect_local_peer_receipts
@@ -307,20 +343,49 @@ describe("PeerSync", () => {
           WHERE relay_message_id IS NOT NULL) AS relayReceipts,
         (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS usageRows,
         (SELECT COALESCE(SUM(encoded_bytes), 0)
-          FROM effect_local_peer_relay_receipt_usage) AS relayBytes`
-      assert.deepStrictEqual(beforePrune, [{
+          FROM effect_local_peer_relay_receipt_usage) AS relayBytes,
+        (SELECT COALESCE(SUM(relay_encoded_size), 0)
+          FROM effect_local_peer_receipts WHERE relay_message_id IS NOT NULL) AS retainedBytes,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_delete_tokens) AS deleteTokens`
+      assert.deepStrictEqual(beforePrune.map(({ relayBytes: _, retainedBytes: __, ...row }) => row), [{
+        deleteTokens: 0,
         directReceipts: 1,
-        relayBytes: message.byteLength * 2,
         relayReceipts: 2,
         usageRows: 2
       }])
+      assert.strictEqual(beforePrune[0]!.relayBytes, beforePrune[0]!.retainedBytes)
+      assert.isAbove(beforePrune[0]!.relayBytes, message.byteLength * 2)
 
       yield* sql`UPDATE effect_local_peer_receipts
         SET relay_receipt_expires_at = '1970-01-01T00:00:00.000Z'
         WHERE relay_message_id IS NOT NULL`
+      yield* sql`CREATE TRIGGER fail_relay_receipt_prune
+        BEFORE DELETE ON effect_local_peer_receipts
+        WHEN OLD.relay_message_id IS NOT NULL
+        BEGIN
+          SELECT RAISE(ABORT, 'Injected relay receipt prune failure');
+        END`
+      assert.strictEqual((yield* Effect.exit(sync.pruneRelayReceipts!))._tag, "Failure")
+      yield* sql`DROP TRIGGER fail_relay_receipt_prune`
+      assert.deepStrictEqual(
+        yield* sql`SELECT
+          (SELECT COUNT(*) FROM effect_local_peer_receipts
+            WHERE relay_message_id IS NOT NULL) AS relayReceipts,
+          (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS usageRows,
+          (SELECT COALESCE(SUM(encoded_bytes), 0)
+            FROM effect_local_peer_relay_receipt_usage) AS relayBytes,
+          (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_delete_tokens) AS deleteTokens`,
+        [{
+          deleteTokens: 0,
+          relayBytes: beforePrune[0]!.relayBytes,
+          relayReceipts: 2,
+          usageRows: 2
+        }]
+      )
       assert.strictEqual(yield* sync.pruneRelayReceipts!, 1)
 
       const afterFirstBatch = yield* sql<{
+        readonly deleteTokens: number
         readonly directReceipts: number
         readonly relayReceipts: number
         readonly usageRows: number
@@ -329,8 +394,10 @@ describe("PeerSync", () => {
           WHERE relay_message_id IS NULL) AS directReceipts,
         (SELECT COUNT(*) FROM effect_local_peer_receipts
           WHERE relay_message_id IS NOT NULL) AS relayReceipts,
-        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS usageRows`
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS usageRows,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_delete_tokens) AS deleteTokens`
       assert.deepStrictEqual(afterFirstBatch, [{
+        deleteTokens: 0,
         directReceipts: 1,
         relayReceipts: 1,
         usageRows: 1
@@ -338,6 +405,7 @@ describe("PeerSync", () => {
       assert.strictEqual(yield* sync.pruneRelayReceipts!, 1)
 
       const afterPrune = yield* sql<{
+        readonly deleteTokens: number
         readonly directReceipts: number
         readonly relayReceipts: number
         readonly usageRows: number
@@ -346,8 +414,10 @@ describe("PeerSync", () => {
           WHERE relay_message_id IS NULL) AS directReceipts,
         (SELECT COUNT(*) FROM effect_local_peer_receipts
           WHERE relay_message_id IS NOT NULL) AS relayReceipts,
-        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS usageRows`
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS usageRows,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_delete_tokens) AS deleteTokens`
       assert.deepStrictEqual(afterPrune, [{
+        deleteTokens: 0,
         directReceipts: 1,
         relayReceipts: 0,
         usageRows: 0
@@ -355,6 +425,81 @@ describe("PeerSync", () => {
       InternalAutomerge.free(remote)
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(RelayTestLayer)))
+
+  it.effect("charges retained relay replies before committing receipt quota usage", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const senderPeerId = yield* Identity.makePeerId
+      const relayPeerId = yield* Identity.makePeerId
+      const created = yield* store.create(Task, documentId, {
+        title: "x".repeat(8_000),
+        labels: []
+      })
+      const remote = Automerge.init<InternalAutomerge.Root<{ title: string; labels: Array<string> }>>()
+      const generated = Automerge.generateSyncMessage(remote, Automerge.initSyncState())
+      assert.isNotNull(generated[1])
+      const message = generated[1]!
+      assert.isBelow(message.byteLength, 256)
+      const before = yield* sql<{
+        readonly changes: number
+        readonly commitOutbox: number
+        readonly receipts: number
+        readonly usageRows: number
+      }>`SELECT
+        (SELECT COUNT(*) FROM effect_local_changes) AS changes,
+        (SELECT COUNT(*) FROM effect_local_commit_outbox) AS commitOutbox,
+        (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS usageRows`
+      const session = yield* sync.open(senderPeerId)
+      const messageHash = yield* Canonical.digest(message)
+      const error = yield* Effect.flip(sync.receive(Task, documentId, session, {
+        remoteConnectionEpoch: "sender-epoch",
+        receiveSequence: 0,
+        message,
+        lineage: Identity.genesisLineage,
+        writerProvenance: [],
+        relay: {
+          relayMessageId: yield* Identity.makeRelayMessageId,
+          relayPeerId,
+          senderTenantId: "tenant",
+          senderSubjectId: "sender",
+          senderPeerId,
+          senderReplicaIncarnation: Identity.ReplicaIncarnation.make(1),
+          messageHash,
+          outerEnvelopeDigest: "a".repeat(64),
+          receiptExpiresAt: new Date(
+            (yield* Clock.currentTimeMillis) + PeerRelayReceiptLimits.defaults.receiptRetentionMillis
+          ).toISOString(),
+          encodedSize: message.byteLength
+        }
+      }))
+      assert.strictEqual(error.reason._tag, "QuotaExceeded")
+      if (error.reason._tag === "QuotaExceeded") {
+        assert.strictEqual(error.reason.resource, "relay receipt bytes per remote")
+      }
+      const after = yield* sql<{
+        readonly changes: number
+        readonly commitOutbox: number
+        readonly receipts: number
+        readonly usageRows: number
+      }>`SELECT
+        (SELECT COUNT(*) FROM effect_local_changes) AS changes,
+        (SELECT COUNT(*) FROM effect_local_commit_outbox) AS commitOutbox,
+        (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS usageRows`
+      assert.deepStrictEqual(after, before)
+      const reloaded = yield* store.load(Task, documentId)
+      assert.deepStrictEqual(reloaded.snapshot.value, {
+        title: "x".repeat(8_000),
+        labels: []
+      })
+      InternalAutomerge.free(reloaded.automerge)
+      InternalAutomerge.free(remote)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(TightRelayTestLayer)))
 
   it.effect("persists inbound application and exact retransmission replies", () =>
     Effect.gen(function*() {

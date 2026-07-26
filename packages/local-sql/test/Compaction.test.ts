@@ -745,6 +745,198 @@ describe("Compaction", () => {
       assert.strictEqual((yield* documentRowOf(documentId)).lineage, "")
     }).pipe(Effect.provide(Services)))
 
+  it.effect("refuses to rewrite while a relay outbox row still carries the document lineage", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      InternalAutomerge.free(created.automerge)
+      yield* compaction.compact(Task, documentId)
+      const permit = yield* gate.current
+      const relayMessageId = yield* Identity.makeRelayMessageId
+      const payload = new Uint8Array([1, 2, 3])
+      yield* sql`INSERT INTO effect_local_peer_relay_outbox (
+        replica_id, replica_incarnation, writer_generation,
+        expected_local_tenant_id, expected_local_subject_id, expected_local_peer_id,
+        remote_tenant_id, remote_subject_id, remote_peer_id, relay_peer_id,
+        relay_message_id, outer_envelope_digest, protocol_version, payload_version,
+        sender_connection_epoch, sender_sequence, document_id, document_type,
+        writer_provenance, message_hash, payload, encoded_size, created_at,
+        retry_deadline, next_attempt_at, custody_state
+      ) VALUES (
+        ${permit.replicaId}, ${permit.incarnation}, ${permit.writerGeneration},
+        ${"tenant-a"}, ${"subject-local"}, ${"peer-local"},
+        ${"tenant-a"}, ${"subject-remote"}, ${"peer-remote"}, ${"peer-relay"},
+        ${relayMessageId}, ${"a".repeat(64)}, ${3}, ${1},
+        ${"epoch-1"}, ${0}, ${documentId}, ${Task.name},
+        ${"[]"}, ${"b".repeat(64)}, ${payload}, ${payload.byteLength},
+        ${"2020-01-01T00:00:00.000Z"}, ${"2999-01-01T00:00:00.000Z"},
+        ${"2020-01-01T00:00:00.000Z"}, ${"Pending"}
+      )`
+
+      const error = yield* Effect.flip(compaction.rewriteHistory(Task, documentId, operationId))
+      assert.strictEqual(error.reason._tag, "StorageCorrupt")
+      const retained = yield* sql<{ readonly relay_message_id: string }>`
+        SELECT relay_message_id FROM effect_local_peer_relay_outbox
+        WHERE document_id = ${documentId}
+      `
+      assert.deepStrictEqual(retained, [{ relay_message_id: relayMessageId as string }])
+      assert.strictEqual((yield* documentRowOf(documentId)).lineage, "")
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("refuses to rewrite while an unexpired relay receipt preserves duplicate evidence", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      InternalAutomerge.free(created.automerge)
+      yield* compaction.compact(Task, documentId)
+      const permit = yield* gate.current
+      const peerId = yield* Identity.makePeerId
+      const senderPeerId = yield* Identity.makePeerId
+      const relayMessageId = yield* Identity.makeRelayMessageId
+      yield* sql`INSERT INTO effect_local_peer_receipts (
+        replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id,
+        message_hash, reply, reply_hash, pending_message, heads, accepted_heads,
+        commit_sequence, accepted_at, writer_provenance,
+        relay_sender_tenant_id, relay_sender_subject_id, relay_sender_peer_id,
+        relay_message_id, relay_outer_envelope_digest, relay_receipt_expires_at,
+        relay_encoded_size
+      ) VALUES (
+        ${permit.incarnation}, ${peerId}, ${"epoch-1"}, ${1}, ${documentId},
+        ${"c".repeat(64)}, NULL, NULL, NULL, ${"[]"}, ${"[]"},
+        ${1}, ${"2020-01-01T00:00:00.000Z"}, ${"[]"},
+        ${"tenant-a"}, ${"subject-a"}, ${senderPeerId},
+        ${relayMessageId}, ${"d".repeat(64)}, ${"2999-01-01T00:00:00.000Z"}, ${128}
+      )`
+      yield* sql`INSERT INTO effect_local_peer_relay_receipt_usage (
+        replica_incarnation, sender_tenant_id, sender_subject_id, sender_peer_id,
+        receipt_count, encoded_bytes
+      ) VALUES (
+        ${permit.incarnation}, ${"tenant-a"}, ${"subject-a"}, ${senderPeerId}, ${1}, ${128}
+      )`
+
+      const error = yield* Effect.flip(compaction.rewriteHistory(Task, documentId, operationId))
+      assert.strictEqual(error.reason._tag, "StorageCorrupt")
+      const retained = yield* sql<{
+        readonly encoded_bytes: number
+        readonly receipt_count: number
+        readonly relay_message_id: string
+      }>`SELECT relay_message_id,
+          (SELECT receipt_count FROM effect_local_peer_relay_receipt_usage
+            WHERE sender_peer_id = ${senderPeerId}) AS receipt_count,
+          (SELECT encoded_bytes FROM effect_local_peer_relay_receipt_usage
+            WHERE sender_peer_id = ${senderPeerId}) AS encoded_bytes
+        FROM effect_local_peer_receipts
+        WHERE document_id = ${documentId}`
+      assert.deepStrictEqual(retained, [{
+        encoded_bytes: 128,
+        receipt_count: 1,
+        relay_message_id: relayMessageId as string
+      }])
+      assert.strictEqual((yield* documentRowOf(documentId)).lineage, "")
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("conserves relay receipts and sender usage when removing expired document receipts", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const survivorDocumentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      const survivor = yield* store.create(Task, survivorDocumentId, { title: "two", labels: [] })
+      InternalAutomerge.free(survivor.automerge)
+      InternalAutomerge.free(created.automerge)
+      yield* compaction.compact(Task, documentId)
+      const permit = yield* gate.current
+      const peerId = yield* Identity.makePeerId
+      const senderAPeerId = yield* Identity.makePeerId
+      const senderBPeerId = yield* Identity.makePeerId
+      const targetA = yield* Identity.makeRelayMessageId
+      const targetB = yield* Identity.makeRelayMessageId
+      const survivorA = yield* Identity.makeRelayMessageId
+      for (
+        const [receiveSequence, receiptDocumentId, senderPeerId, senderSubjectId, relayMessageId, encodedSize] of [
+          [1, documentId, senderAPeerId, "subject-a", targetA, 120],
+          [2, documentId, senderBPeerId, "subject-b", targetB, 40],
+          [3, survivorDocumentId, senderAPeerId, "subject-a", survivorA, 80]
+        ] as const
+      ) {
+        yield* sql`INSERT INTO effect_local_peer_receipts (
+          replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id,
+          message_hash, reply, reply_hash, pending_message, heads, accepted_heads,
+          commit_sequence, accepted_at, writer_provenance,
+          relay_sender_tenant_id, relay_sender_subject_id, relay_sender_peer_id,
+          relay_message_id, relay_outer_envelope_digest, relay_receipt_expires_at,
+          relay_encoded_size
+        ) VALUES (
+          ${permit.incarnation}, ${peerId}, ${"epoch-1"}, ${receiveSequence}, ${receiptDocumentId},
+          ${relayMessageId.slice(4).replaceAll("-", "")}, NULL, NULL, NULL, ${"[]"}, ${"[]"},
+          ${1}, ${"2020-01-01T00:00:00.000Z"}, ${"[]"},
+          ${"tenant-a"}, ${senderSubjectId}, ${senderPeerId},
+          ${relayMessageId}, ${"e".repeat(64)}, ${"1970-01-01T00:00:00.000Z"}, ${encodedSize}
+        )`
+      }
+      yield* sql`INSERT INTO effect_local_peer_relay_receipt_usage (
+        replica_incarnation, sender_tenant_id, sender_subject_id, sender_peer_id,
+        receipt_count, encoded_bytes
+      ) VALUES
+        (${permit.incarnation}, ${"tenant-a"}, ${"subject-a"}, ${senderAPeerId}, ${2}, ${200}),
+        (${permit.incarnation}, ${"tenant-a"}, ${"subject-b"}, ${senderBPeerId}, ${1}, ${40})`
+      yield* sql.unsafe(`CREATE TRIGGER fail_target_relay_receipt_delete
+        BEFORE DELETE ON effect_local_peer_receipts
+        WHEN OLD.relay_message_id = '${targetB}'
+        BEGIN
+          SELECT RAISE(ABORT, 'delete failed');
+        END`)
+
+      const error = yield* Effect.flip(compaction.rewriteHistory(Task, documentId, operationId))
+      assert.strictEqual(error.reason._tag, "StorageUnavailable")
+      assert.deepStrictEqual(
+        yield* sql`SELECT receipt_count, encoded_bytes
+          FROM effect_local_peer_relay_receipt_usage
+          ORDER BY sender_subject_id`,
+        [{ receipt_count: 2, encoded_bytes: 200 }, { receipt_count: 1, encoded_bytes: 40 }]
+      )
+      assert.strictEqual(
+        (yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM effect_local_peer_receipts`)[0]!.count,
+        3
+      )
+      assert.strictEqual((yield* documentRowOf(documentId)).lineage, "")
+
+      yield* sql`DROP TRIGGER fail_target_relay_receipt_delete`
+      const lineage = yield* compaction.rewriteHistory(Task, documentId, operationId)
+      assert.notStrictEqual(lineage, "")
+      assert.deepStrictEqual(
+        yield* sql`SELECT relay_message_id, document_id, relay_encoded_size
+          FROM effect_local_peer_receipts ORDER BY relay_message_id`,
+        [{
+          relay_message_id: survivorA,
+          document_id: survivorDocumentId,
+          relay_encoded_size: 80
+        }]
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT sender_subject_id, sender_peer_id, receipt_count, encoded_bytes
+          FROM effect_local_peer_relay_receipt_usage ORDER BY sender_subject_id`,
+        [{
+          sender_subject_id: "subject-a",
+          sender_peer_id: senderAPeerId,
+          receipt_count: 1,
+          encoded_bytes: 80
+        }]
+      )
+      assert.strictEqual((yield* documentRowOf(documentId)).lineage, lineage)
+    }).pipe(Effect.provide(Services)))
+
   it.effect("refuses to rewrite when the document advances between recovery and the transaction", () =>
     Effect.gen(function*() {
       const compaction = yield* Compaction.Compaction

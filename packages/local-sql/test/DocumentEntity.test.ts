@@ -404,7 +404,10 @@ describe("DocumentEntity", () => {
         const sync = peerSync((_document, _documentId, _session, input) =>
           Effect.all([
             Ref.set(receivedProvenance, input.writerProvenance),
-            Ref.update(receivedLineages, (lineages) => [...lineages, input.lineage]),
+            Ref.update(receivedLineages, (lineages) => [
+              ...lineages,
+              input.lineage ?? Identity.genesisLineage
+            ]),
             Ref.set(receivedRelay, input.relay)
           ]).pipe(Effect.as(syncResult))
         )

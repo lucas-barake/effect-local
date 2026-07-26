@@ -494,6 +494,7 @@ const make = Effect.gen(function*() {
           documentId: row.document_id,
           documentType: row.document_type
         },
+        lineage: syncEnvelope.lineage,
         writerProvenance: row.writer_provenance,
         messageHash: row.message_hash,
         payload: row.payload
@@ -588,6 +589,7 @@ const make = Effect.gen(function*() {
         senderConnectionEpoch: syncEnvelope.connectionEpoch,
         senderSequence: syncEnvelope.sequence,
         document: PeerSyncEnvelope.syncEnvelopeDocument(syncEnvelope),
+        lineage: syncEnvelope.lineage,
         writerProvenance: syncEnvelope.writerProvenance,
         messageHash: syncEnvelope.messageHash,
         payload: input.payload

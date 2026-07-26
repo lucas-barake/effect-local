@@ -5,6 +5,7 @@ import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
@@ -85,6 +86,26 @@ const adapterResult = (exit: Exit.Exit<unknown, ReplicaError.ReplicaError>) => {
     )
     ? "ProtocolRejected" as const
     : "Failure" as const
+}
+
+const adapterAcknowledgeResult = (
+  success: "Acknowledged" | "DeadLettered"
+) =>
+(exit: Exit.Exit<unknown, ReplicaError.ReplicaError>) => {
+  if (Exit.isSuccess(exit)) return success
+  const error = PeerRpcObservability.failure(exit)
+  if (error === undefined) return "Failure" as const
+  switch (error.reason._tag) {
+    case "ProtocolMismatch":
+    case "DocumentLineageChanged":
+      return "ProtocolRejected" as const
+    case "QuotaExceeded":
+      return "CapacityRejected" as const
+    case "StorageUnavailable":
+      return "Unavailable" as const
+    default:
+      return "Failure" as const
+  }
 }
 
 export const layer = (
@@ -305,7 +326,8 @@ const validateRelayOptions = (options: StoreAndForwardOptions) =>
 const validateStoredMessage = (
   event: PeerRelayRpc.StoredMessage,
   options: StoreAndForwardOptions,
-  crypto: Crypto.Crypto
+  crypto: Crypto.Crypto,
+  limits: ReplicaLimits.Values
 ) =>
   Effect.gen(function*() {
     const expectedRecipient: PeerSyncEnvelope.RelayPeerPrincipal = {
@@ -328,6 +350,10 @@ const validateStoredMessage = (
       entry.documentId === event.document.documentId
     )
     if (!selected) return yield* protocolFailure("selected relay document")
+    const decoded = yield* PeerSyncEnvelope.decodeSyncEnvelope(
+      event.payload,
+      limits
+    ).pipe(Effect.provideService(Crypto.Crypto, crypto))
     const digest = yield* PeerSyncEnvelope.digestRelayOuterEnvelope({
       domain: PeerSyncEnvelope.relayOuterEnvelopeDomain,
       version: PeerSyncEnvelope.relayOuterEnvelopeVersion,
@@ -341,6 +367,7 @@ const validateStoredMessage = (
       senderConnectionEpoch: event.sender.connectionEpoch,
       senderSequence: event.sender.sequence,
       document: event.document,
+      lineage: decoded.lineage,
       writerProvenance: event.writerProvenance,
       messageHash: event.messageHash,
       payload: event.payload
@@ -359,6 +386,7 @@ export const layerStoreAndForward = (
     Effect.gen(function*() {
       const runtime = yield* PeerRelayClientRuntime.PeerRelayClientRuntime
       const crypto = yield* Crypto.Crypto
+      const limits = yield* ReplicaLimits.ReplicaLimits
       const endpoint = {
         expectedLocal: options.expectedLocal,
         remote: {
@@ -627,7 +655,7 @@ export const layerStoreAndForward = (
                             Stream.mapEffect((event) =>
                               event._tag !== "StoredMessage"
                                 ? Effect.fail(protocolFailure(event._tag))
-                                : validateStoredMessage(event, options, crypto).pipe(
+                                : validateStoredMessage(event, options, crypto, limits).pipe(
                                   Effect.as(
                                     {
                                       message: event.payload,
@@ -643,25 +671,45 @@ export const layerStoreAndForward = (
                                       },
                                       receiptRetentionMillis: options.receiptRetentionMillis,
                                       acknowledge: terminalCall(
-                                        client.AcknowledgeRelay({
-                                          sessionId: handshake.sessionId,
-                                          relayMessageId: event.relayMessageId,
-                                          claimToken: event.claimToken,
-                                          messageHash: event.messageHash
-                                        }).pipe(
-                                          Effect.mapError(mapError),
-                                          Effect.andThen(runtime.signalReceiptPrune)
-                                        )
-                                      ),
-                                      reject: (reason: PeerTransport.PermanentRejectReason) =>
-                                        terminalCall(
-                                          client.RejectRelay({
+                                        PeerRpcObservability.observeRelay({
+                                          effect: client.AcknowledgeRelay({
                                             sessionId: handshake.sessionId,
                                             relayMessageId: event.relayMessageId,
                                             claimToken: event.claimToken,
-                                            messageHash: event.messageHash,
-                                            reason
-                                          }).pipe(Effect.mapError(mapError))
+                                            messageHash: event.messageHash
+                                          }).pipe(
+                                            Effect.mapError(mapError),
+                                            Effect.andThen(runtime.signalReceiptPrune)
+                                          ),
+                                          operation: "AdapterAcknowledge",
+                                          direction: "Receive",
+                                          facts: () => ({
+                                            bytes: event.payload.byteLength,
+                                            items: 1,
+                                            version: event.payloadVersion
+                                          }),
+                                          result: adapterAcknowledgeResult("Acknowledged")
+                                        })
+                                      ),
+                                      reject: (reason: PeerTransport.PermanentRejectReason) =>
+                                        terminalCall(
+                                          PeerRpcObservability.observeRelay({
+                                            effect: client.RejectRelay({
+                                              sessionId: handshake.sessionId,
+                                              relayMessageId: event.relayMessageId,
+                                              claimToken: event.claimToken,
+                                              messageHash: event.messageHash,
+                                              reason
+                                            }).pipe(Effect.mapError(mapError)),
+                                            operation: "AdapterAcknowledge",
+                                            direction: "Receive",
+                                            facts: () => ({
+                                              bytes: event.payload.byteLength,
+                                              items: 1,
+                                              version: event.payloadVersion
+                                            }),
+                                            result: adapterAcknowledgeResult("DeadLettered")
+                                          })
                                         )
                                     } satisfies PeerTransport.AcknowledgedDelivery
                                   )

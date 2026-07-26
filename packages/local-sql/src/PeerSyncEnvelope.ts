@@ -1,9 +1,8 @@
-import * as Automerge from "@automerge/automerge"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
-import * as Crypto from "effect/Crypto"
+import type * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as WriterProvenance from "./internal/writerProvenance.js"
@@ -26,12 +25,13 @@ export const SyncEnvelope = Schema.Struct({
   documentType: BoundedName,
   messageHash: MessageHash,
   message: Schema.Uint8ArrayFromBase64,
+  lineage: Identity.DocumentLineage,
   writerProvenance: WriterProvenance.ChangeProvenances
 })
 export type SyncEnvelope = typeof SyncEnvelope.Type
 
-export interface SyncEnvelopeLimits
-  extends Pick<
+export interface SyncEnvelopeLimits extends
+  Pick<
     ReplicaLimits.Values,
     | "maxSyncMessageBytes"
     | "maxSyncChangesPerMessage"
@@ -63,27 +63,6 @@ export const encodeSyncEnvelope = (
     Effect.mapError(() => protocolMismatch("encodable sync envelope", "invalid sync envelope"))
   )
 
-const decodeSyncChanges = (message: Uint8Array): ReadonlyArray<Automerge.DecodedChange> => {
-  const changes = new Map<string, Automerge.DecodedChange>()
-  for (const chunk of Automerge.decodeSyncMessage(message).changes) {
-    try {
-      const change = Automerge.decodeChange(chunk)
-      changes.set(change.hash, change)
-    } catch {
-      const document = Automerge.load(chunk)
-      try {
-        for (const bytes of Automerge.getAllChanges(document)) {
-          const change = Automerge.decodeChange(bytes)
-          changes.set(change.hash, change)
-        }
-      } finally {
-        Automerge.free(document)
-      }
-    }
-  }
-  return [...changes.values()]
-}
-
 export const validateSyncEnvelope = (
   envelope: SyncEnvelope,
   limits: SyncEnvelopeLimits
@@ -101,40 +80,6 @@ export const validateSyncEnvelope = (
         "excess writer provenance"
       )
     }
-    const changes = yield* Effect.try({
-      try: () => decodeSyncChanges(envelope.message),
-      catch: () => protocolMismatch("valid Automerge sync message", "invalid Automerge sync message")
-    })
-    if (changes.length > limits.maxSyncChangesPerMessage) {
-      return yield* protocolMismatch(
-        `at most ${limits.maxSyncChangesPerMessage} sync changes`,
-        "excess sync changes"
-      )
-    }
-    const dependencyEdges = changes.reduce((total, change) => total + change.deps.length, 0)
-    if (dependencyEdges > limits.maxSyncDependencyEdgesPerMessage) {
-      return yield* protocolMismatch(
-        `at most ${limits.maxSyncDependencyEdgesPerMessage} sync dependency edges`,
-        "excess sync dependency edges"
-      )
-    }
-    const operations = changes.reduce((total, change) => total + change.ops.length, 0)
-    if (operations > limits.maxSyncOperationsPerMessage) {
-      return yield* protocolMismatch(
-        `at most ${limits.maxSyncOperationsPerMessage} sync operations`,
-        "excess sync operations"
-      )
-    }
-    yield* Effect.try({
-      try: () => WriterProvenance.validateExact(
-        changes.map((change) => change.hash),
-        envelope.writerProvenance
-      ),
-      catch: () => protocolMismatch(
-        "one canonical writer provenance entry per sync change",
-        "invalid writer provenance"
-      )
-    })
     const messageHash = yield* Canonical.digest(envelope.message)
     if (messageHash !== envelope.messageHash) {
       return yield* protocolMismatch("matching sync message hash", "conflicting sync message hash")
@@ -194,6 +139,7 @@ export const RelayOuterEnvelope = Schema.Struct({
     documentId: Identity.DocumentId,
     documentType: BoundedName
   }),
+  lineage: Identity.DocumentLineage,
   writerProvenance: WriterProvenance.ChangeProvenances.check(
     Schema.isMaxLength(maximumWriterProvenanceEntries)
   ),

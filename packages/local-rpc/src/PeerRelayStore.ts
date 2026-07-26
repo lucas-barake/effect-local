@@ -1,12 +1,11 @@
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
-import type * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
-import type * as PlatformError from "effect/PlatformError"
 import * as Random from "effect/Random"
 import * as Schema from "effect/Schema"
 import type * as Migrator from "effect/unstable/sql/Migrator"
@@ -19,6 +18,8 @@ import {
   make as makeImmediateTransaction,
   type NestedPeerRelayTransactionError
 } from "./internal/peerRelaySqliteTransaction.js"
+import { mapStoreErrors } from "./internal/peerRelayStoreErrors.js"
+import * as PeerRpcObservability from "./internal/peerRpcObservability.js"
 import * as PeerRelayLimits from "./PeerRelayLimits.js"
 import * as PeerRelayRpc from "./PeerRelayRpc.js"
 
@@ -200,11 +201,6 @@ interface UsageScope {
   readonly retainedBytesLimit: number
 }
 
-const storageUnavailable = (cause: unknown) =>
-  new ReplicaError.ReplicaError({
-    reason: new ReplicaError.StorageUnavailable({ cause })
-  })
-
 const storageCorrupt = (cause: unknown) =>
   new ReplicaError.ReplicaError({
     reason: new ReplicaError.StorageCorrupt({ cause })
@@ -220,20 +216,51 @@ const quotaExceeded = (resource: string, limit: number) =>
     reason: new ReplicaError.QuotaExceeded({ resource, limit })
   })
 
-type BoundaryError =
-  | StoreError
-  | SqlError.SqlError
-  | Schema.SchemaError
-  | PlatformError.PlatformError
-  | Cause.NoSuchElementError
+const relayFailureResult = (exit: Exit.Exit<unknown, StoreError>) => {
+  const error = PeerRpcObservability.failure(exit)
+  if (error?._tag !== "ReplicaError") return "Failure" as const
+  switch (error.reason._tag) {
+    case "ProtocolMismatch":
+      return "ProtocolRejected" as const
+    case "QuotaExceeded":
+      return "CapacityRejected" as const
+    case "StorageUnavailable":
+      return "Unavailable" as const
+    default:
+      return "Failure" as const
+  }
+}
 
-const mapStorageErrors = <A, R,>(effect: Effect.Effect<A, BoundaryError, R>) =>
-  effect.pipe(
-    Effect.catchTag("SqlError", (cause) => Effect.fail(storageUnavailable(cause))),
-    Effect.catchTag("SchemaError", (cause) => Effect.fail(storageCorrupt(cause))),
-    Effect.catchTag("PlatformError", (cause) => Effect.fail(storageUnavailable(cause))),
-    Effect.catchTag("NoSuchElementError", (cause) => Effect.fail(storageCorrupt(cause)))
-  )
+const relayQuotaDomain = (
+  error: StoreError
+): Option.Option<PeerRpcObservability.RelayQuotaDomain> => {
+  if (error._tag !== "ReplicaError" || error.reason._tag !== "QuotaExceeded") {
+    return Option.none()
+  }
+  const resource = error.reason.resource
+  if (resource === "relay payload bytes") return Option.some("Payload")
+  for (
+    const domain of [
+      "SenderPeer",
+      "RecipientPeer",
+      "RecipientSubject",
+      "Tenant",
+      "Shard"
+    ] as const
+  ) {
+    if (resource === `${domain} relay custody`) return Option.some(domain)
+  }
+  return Option.none()
+}
+
+const recordQuotaRejection = (error: StoreError) =>
+  Option.match(relayQuotaDomain(error), {
+    onNone: () => Effect.void,
+    onSome: (domain) =>
+      PeerRpcObservability.recordRelayQuotaRejection(domain).pipe(
+        Effect.catchCause(() => Effect.void)
+      )
+  })
 
 const encodeKey = (...parts: ReadonlyArray<string | number>) => JSON.stringify(parts)
 
@@ -596,6 +623,13 @@ const makeService = Effect.gen(function*() {
         if (changed.length !== 1) {
           return yield* storageCorrupt(new Error("Invalid retained relay quota reservation"))
         }
+        yield* sql`DELETE FROM effect_local_relay_usage
+          WHERE scope_kind = ${kind}
+            AND scope_key = ${key}
+            AND active_count = 0
+            AND active_bytes = 0
+            AND retained_count = 0
+            AND retained_bytes = 0`
       }
       yield* sql`UPDATE effect_local_relay_reservations
         SET retained_consumed = 1
@@ -639,10 +673,14 @@ const makeService = Effect.gen(function*() {
         WHERE claimed_message_id = ${messageId}`
     })
 
-  const admit: Service["admit"] = (unsafeInput) =>
-    mapStorageErrors(Effect.gen(function*() {
+  const admit: Service["admit"] = (unsafeInput) => {
+    let observedBytes: number | undefined
+    let observedVersion: number | undefined
+    const effect = mapStoreErrors(Effect.gen(function*() {
       const input = yield* validateInput(Admission, unsafeInput)
       const payloadBytes = input.payload.byteLength
+      observedBytes = payloadBytes
+      observedVersion = input.payloadVersion
       if (
         input.messageTtlMillis > limits.messageTtlMillis ||
         input.senderRetryHorizonMillis > limits.maximumSenderRetryHorizonMillis ||
@@ -731,6 +769,8 @@ const makeService = Effect.gen(function*() {
                 tenant_id,
                 sender_subject_id,
                 sender_peer_id,
+                recipient_subject_id,
+                recipient_peer_id,
                 relay_message_id,
                 relay_peer_id,
                 sender_connection_epoch,
@@ -752,6 +792,8 @@ const makeService = Effect.gen(function*() {
                 ${input.channel.tenantId},
                 ${input.channel.senderSubjectId},
                 ${input.channel.senderPeerId},
+                ${input.channel.recipientSubjectId},
+                ${input.channel.recipientPeerId},
                 ${input.relayMessageId},
                 ${input.relayPeerId},
                 ${input.senderConnectionEpoch},
@@ -805,7 +847,22 @@ const makeService = Effect.gen(function*() {
           lane: "New"
         })
       }))
-    })).pipe(Effect.withSpan("PeerRelayStore.admit"))
+    })).pipe(Effect.tapError(recordQuotaRejection))
+    return PeerRpcObservability.observeRelay({
+      effect,
+      operation: "RelayAdmit",
+      direction: "Send",
+      facts: () => ({
+        ...(observedBytes === undefined ? {} : { bytes: observedBytes }),
+        ...(observedVersion === undefined ? {} : { version: observedVersion }),
+        items: observedBytes === undefined ? 0 : 1
+      }),
+      result: (exit) =>
+        Exit.isSuccess(exit)
+          ? exit.value.status
+          : relayFailureResult(exit)
+    })
+  }
 
   const findCandidate = SqlSchema.findOneOption({
     Request: Schema.Struct({
@@ -843,7 +900,12 @@ const makeService = Effect.gen(function*() {
         FROM effect_local_relay_messages m
         JOIN effect_local_relay_channels c ON c.channel_id = m.channel_id
         JOIN effect_local_relay_reservations r ON r.message_id = m.message_id
-        WHERE c.tenant_id = ${request.tenantId}
+        WHERE m.tenant_id = ${request.tenantId}
+          AND m.sender_subject_id = ${request.senderSubjectId}
+          AND m.sender_peer_id = ${request.senderPeerId}
+          AND m.recipient_subject_id = ${request.recipientSubjectId}
+          AND m.recipient_peer_id = ${request.recipientPeerId}
+          AND c.tenant_id = ${request.tenantId}
           AND c.recipient_subject_id = ${request.recipientSubjectId}
           AND c.recipient_peer_id = ${request.recipientPeerId}
           AND c.sender_subject_id = ${request.senderSubjectId}
@@ -851,6 +913,8 @@ const makeService = Effect.gen(function*() {
           AND m.tenant_id = c.tenant_id
           AND m.sender_subject_id = c.sender_subject_id
           AND m.sender_peer_id = c.sender_peer_id
+          AND m.recipient_subject_id = c.recipient_subject_id
+          AND m.recipient_peer_id = c.recipient_peer_id
           AND c.claimed_message_id IS NULL
           AND m.state = 'Pending'
           AND m.next_eligible_at <= ${request.now}
@@ -876,8 +940,9 @@ const makeService = Effect.gen(function*() {
         LIMIT 1`
   })
 
-  const claim: Service["claim"] = (unsafeInput) =>
-    mapStorageErrors(Effect.gen(function*() {
+  const claim: Service["claim"] = (unsafeInput) => {
+    let observedAttempt: number | undefined
+    const effect = mapStoreErrors(Effect.gen(function*() {
       const input = yield* validateInput(ClaimRequest, unsafeInput)
       return yield* write(Effect.gen(function*() {
         const now = (yield* nowQuery(sql)).now
@@ -899,6 +964,7 @@ const makeService = Effect.gen(function*() {
           }
         }
         const candidate = candidateOption.value
+        observedAttempt = candidate.retryCount + 1
         const documentIds = yield* parseDocuments(candidate.documentIds)
         const uuid = yield* crypto.randomUUIDv4
         const token = PeerRelayRpc.ClaimToken.make(`clm_${uuid}`)
@@ -964,10 +1030,32 @@ const makeService = Effect.gen(function*() {
           lane: candidate.retryCount === 0 ? "New" as const : "Retry" as const
         }
       }))
-    })).pipe(Effect.withSpan("PeerRelayStore.claim"))
+    }))
+    return PeerRpcObservability.observeRelay({
+      effect,
+      operation: "RelayClaim",
+      direction: "Receive",
+      facts: (exit) => {
+        if (Exit.isFailure(exit) || Option.isNone(exit.value.message)) {
+          return { items: 0 }
+        }
+        const message = exit.value.message.value
+        return {
+          bytes: message.payloadBytes,
+          items: 1,
+          ...(observedAttempt === undefined ? {} : { attempt: observedAttempt }),
+          version: message.payloadVersion
+        }
+      },
+      result: (exit) =>
+        Exit.isSuccess(exit)
+          ? Option.isSome(exit.value.message) ? "Claimed" : "Empty"
+          : relayFailureResult(exit)
+    })
+  }
 
   const loadClaimedPayload: Service["loadClaimedPayload"] = (unsafeInput) =>
-    mapStorageErrors(Effect.gen(function*() {
+    mapStoreErrors(Effect.gen(function*() {
       const input = yield* validateInput(LoadClaimedPayloadRequest, unsafeInput)
       const rows = yield* SqlSchema.findAll({
         Request: Schema.Void,
@@ -1005,7 +1093,7 @@ const makeService = Effect.gen(function*() {
         return yield* protocolMismatch("active relay claim", "stale relay claim")
       }
       return rows[0]!.payload
-    })).pipe(Effect.withSpan("PeerRelayStore.loadClaimedPayload"))
+    }))
 
   const TerminalRow = Schema.Struct({
     messageId: PositiveInt,
@@ -1015,6 +1103,7 @@ const makeService = Effect.gen(function*() {
     claimToken: Schema.NullOr(PeerRelayRpc.ClaimToken),
     claimSessionGeneration: Schema.NullOr(NonNegativeInt),
     claimDeadline: Schema.NullOr(NonNegativeInt),
+    createdAt: NonNegativeInt,
     expiresAt: NonNegativeInt,
     channelClaimedMessageId: Schema.NullOr(PositiveInt),
     channelClaimToken: Schema.NullOr(PeerRelayRpc.ClaimToken),
@@ -1040,6 +1129,7 @@ const makeService = Effect.gen(function*() {
           m.claim_token AS claimToken,
           m.claim_session_generation AS claimSessionGeneration,
           m.claim_deadline AS claimDeadline,
+          m.created_at AS createdAt,
           m.expires_at AS expiresAt,
           c.claimed_message_id AS channelClaimedMessageId,
           c.claim_token AS channelClaimToken,
@@ -1116,9 +1206,10 @@ const makeService = Effect.gen(function*() {
   const terminalTransition = (
     unsafeInput: TerminalRequest,
     state: "Acknowledged" | "DeadLettered",
-    reason: string
+    reason: string,
+    onChanged?: (latencyMillis: number) => void
   ): Effect.Effect<TransitionResult, StoreError> =>
-    mapStorageErrors(Effect.gen(function*() {
+    mapStoreErrors(Effect.gen(function*() {
       const input = yield* validateInput(TerminalRequest, unsafeInput)
       if (
         input.recipient.tenantId !== input.channel.tenantId ||
@@ -1164,6 +1255,9 @@ const makeService = Effect.gen(function*() {
             sessionGeneration: input.sessionGeneration,
             reason
           })
+          if (onChanged !== undefined) {
+            yield* Effect.sync(() => onChanged(now - row.createdAt))
+          }
           const hint = yield* nextReady(input.channel, now)
           return { status: "Changed", ...hint } as const
         }
@@ -1185,13 +1279,39 @@ const makeService = Effect.gen(function*() {
       }))
     }))
 
-  const acknowledge: Service["acknowledge"] = (input) =>
-    terminalTransition(input, "Acknowledged", "Acknowledged").pipe(
-      Effect.withSpan("PeerRelayStore.acknowledge")
+  const acknowledge: Service["acknowledge"] = (input) => {
+    let latencyMillis: number | undefined
+    const effect = terminalTransition(
+      input,
+      "Acknowledged",
+      "Acknowledged",
+      (latency) => {
+        latencyMillis = latency
+      }
     )
+    return PeerRpcObservability.observeRelay({
+      effect,
+      operation: "RelayAcknowledge",
+      direction: "Receive",
+      facts: (exit) => ({
+        items: Exit.isSuccess(exit) && exit.value.status !== "Stale" ? 1 : 0,
+        ...(Exit.isSuccess(exit) &&
+            exit.value.status === "Changed" &&
+            latencyMillis !== undefined
+          ? { latencyMillis }
+          : {})
+      }),
+      result: (exit) =>
+        Exit.isSuccess(exit)
+          ? exit.value.status === "Changed"
+            ? "Acknowledged"
+            : exit.value.status
+          : relayFailureResult(exit)
+    })
+  }
 
-  const reject: Service["reject"] = (unsafeInput) =>
-    mapStorageErrors(Effect.gen(function*() {
+  const reject: Service["reject"] = (unsafeInput) => {
+    const effect = mapStoreErrors(Effect.gen(function*() {
       const input = yield* validateInput(RejectRequest, unsafeInput)
       return yield* terminalTransition(
         TerminalRequest.make({
@@ -1205,10 +1325,25 @@ const makeService = Effect.gen(function*() {
         "DeadLettered",
         input.reason
       )
-    })).pipe(Effect.withSpan("PeerRelayStore.reject"))
+    }))
+    return PeerRpcObservability.observeRelay({
+      effect,
+      operation: "RelayAcknowledge",
+      direction: "Receive",
+      facts: (exit) => ({
+        items: Exit.isSuccess(exit) && exit.value.status !== "Stale" ? 1 : 0
+      }),
+      result: (exit) =>
+        Exit.isSuccess(exit)
+          ? exit.value.status === "Changed"
+            ? "DeadLettered"
+            : exit.value.status
+          : relayFailureResult(exit)
+    })
+  }
 
-  const release: Service["release"] = (unsafeInput) =>
-    mapStorageErrors(Effect.gen(function*() {
+  const release: Service["release"] = (unsafeInput) => {
+    const effect = mapStoreErrors(Effect.gen(function*() {
       const input = yield* validateInput(ReleaseRequest, unsafeInput)
       return yield* write(Effect.gen(function*() {
         const now = (yield* nowQuery(sql)).now
@@ -1237,7 +1372,6 @@ const makeService = Effect.gen(function*() {
             lane: "Retry"
           } as const
         }
-        const random = yield* Random.next
         const retry = yield* SqlSchema.findOne({
           Request: Schema.Void,
           Result: Schema.Struct({ retryCount: PositiveInt }),
@@ -1246,6 +1380,24 @@ const makeService = Effect.gen(function*() {
               FROM effect_local_relay_messages
               WHERE message_id = ${row.messageId}`
         })(undefined)
+        if (retry.retryCount >= limits.maximumDeliveryAttempts) {
+          yield* sql`UPDATE effect_local_relay_messages
+            SET retry_count = ${retry.retryCount}
+            WHERE message_id = ${row.messageId}
+              AND state = 'Claimed'
+              AND claim_token = ${input.claimToken}
+              AND claim_session_generation = ${input.sessionGeneration}`
+          yield* terminalize(row.messageId, "DeadLettered", now, {
+            reason: "MaximumDeliveryAttempts"
+          })
+          return {
+            status: "Changed",
+            ready: false,
+            nextEligibleAt: Option.none(),
+            lane: "Retry"
+          } as const
+        }
+        const random = yield* Random.next
         const maximum = Math.min(
           limits.retryMaximumDelayMillis,
           limits.retryBaseDelayMillis * 2 ** Math.min(retry.retryCount - 1, 30)
@@ -1279,7 +1431,20 @@ const makeService = Effect.gen(function*() {
           lane: "Retry"
         } as const
       }))
-    })).pipe(Effect.withSpan("PeerRelayStore.release"))
+    }))
+    return PeerRpcObservability.observeRelay({
+      effect,
+      operation: "RelayRelease",
+      direction: "Receive",
+      facts: (exit) => ({
+        items: Exit.isSuccess(exit) && exit.value.status === "Changed" ? 1 : 0
+      }),
+      result: (exit) =>
+        Exit.isSuccess(exit)
+          ? exit.value.status === "Changed" ? "Released" : exit.value.status
+          : relayFailureResult(exit)
+    })
+  }
 
   const maintenanceResult = (
     ids: ReadonlyArray<number>,
@@ -1297,37 +1462,50 @@ const makeService = Effect.gen(function*() {
   }
 
   const recover: Service["recover"] = (unsafeInput) =>
-    mapStorageErrors(Effect.gen(function*() {
-      const input = yield* validateInput(MaintenanceRequest, unsafeInput)
-      const effectiveBatch = Math.min(input.batchSize, limits.claimRecoveryBatchSize)
-      return yield* write(Effect.gen(function*() {
-        const now = (yield* nowQuery(sql)).now
-        const rows = yield* SqlSchema.findAll({
-          Request: Schema.Void,
-          Result: Schema.Struct({
-            messageId: PositiveInt,
-            retryCount: NonNegativeInt
-          }),
-          execute: () =>
-            sql`SELECT
+    Effect.suspend(() => {
+      let deadLettered = 0
+      const effect = mapStoreErrors(Effect.gen(function*() {
+        const input = yield* validateInput(MaintenanceRequest, unsafeInput)
+        const effectiveBatch = Math.min(input.batchSize, limits.claimRecoveryBatchSize)
+        return yield* write(Effect.gen(function*() {
+          const now = (yield* nowQuery(sql)).now
+          const rows = yield* SqlSchema.findAll({
+            Request: Schema.Void,
+            Result: Schema.Struct({
+              messageId: PositiveInt,
+              retryCount: NonNegativeInt
+            }),
+            execute: () =>
+              sql`SELECT
                 message_id AS messageId,
                 retry_count AS retryCount
               FROM effect_local_relay_messages
-              WHERE message_id > ${input.cursor ?? 0}
-                AND state = 'Claimed'
+              WHERE state = 'Claimed'
                 AND claim_deadline <= ${now}
-              ORDER BY message_id
+              ORDER BY claim_deadline, message_id
               LIMIT ${effectiveBatch + 1}`
-        })(undefined)
-        for (const row of rows.slice(0, effectiveBatch)) {
-          const random = yield* Random.next
-          const retryCount = row.retryCount + 1
-          const maximum = Math.min(
-            limits.retryMaximumDelayMillis,
-            limits.retryBaseDelayMillis * 2 ** Math.min(retryCount - 1, 30)
-          )
-          const delay = Math.max(1, Math.floor(maximum / 2 + random * maximum / 2))
-          yield* sql`UPDATE effect_local_relay_messages
+          })(undefined)
+          for (const row of rows.slice(0, effectiveBatch)) {
+            const retryCount = row.retryCount + 1
+            if (retryCount >= limits.maximumDeliveryAttempts) {
+              deadLettered += 1
+              yield* sql`UPDATE effect_local_relay_messages
+              SET retry_count = ${retryCount}
+              WHERE message_id = ${row.messageId}
+                AND state = 'Claimed'
+                AND claim_deadline <= ${now}`
+              yield* terminalize(row.messageId, "DeadLettered", now, {
+                reason: "MaximumDeliveryAttempts"
+              })
+              continue
+            }
+            const random = yield* Random.next
+            const maximum = Math.min(
+              limits.retryMaximumDelayMillis,
+              limits.retryBaseDelayMillis * 2 ** Math.min(retryCount - 1, 30)
+            )
+            const delay = Math.max(1, Math.floor(maximum / 2 + random * maximum / 2))
+            yield* sql`UPDATE effect_local_relay_messages
             SET state = 'Pending',
                 retry_count = ${retryCount},
                 next_eligible_at = ${now + delay},
@@ -1337,20 +1515,34 @@ const makeService = Effect.gen(function*() {
             WHERE message_id = ${row.messageId}
               AND state = 'Claimed'
               AND claim_deadline <= ${now}`
-          yield* sql`UPDATE effect_local_relay_channels
+            yield* sql`UPDATE effect_local_relay_channels
             SET claimed_message_id = NULL,
                 claim_session_generation = NULL,
                 claim_token = NULL,
                 claim_deadline = NULL
             WHERE claimed_message_id = ${row.messageId}
               AND claim_deadline <= ${now}`
-        }
-        return maintenanceResult(rows.map((row) => row.messageId), effectiveBatch)
+          }
+          return maintenanceResult(rows.map((row) => row.messageId), effectiveBatch)
+        }))
       }))
-    })).pipe(Effect.withSpan("PeerRelayStore.recover"))
+      return PeerRpcObservability.observeRelay({
+        effect,
+        operation: "RelayMaintenance",
+        direction: "Receive",
+        stage: "Recover",
+        facts: (exit) => ({
+          items: Exit.isSuccess(exit) ? exit.value.processed : 0
+        }),
+        result: (exit) =>
+          Exit.isSuccess(exit)
+            ? deadLettered > 0 ? "DeadLettered" : "Released"
+            : relayFailureResult(exit)
+      })
+    })
 
-  const expire: Service["expire"] = (unsafeInput) =>
-    mapStorageErrors(Effect.gen(function*() {
+  const expire: Service["expire"] = (unsafeInput) => {
+    const effect = mapStoreErrors(Effect.gen(function*() {
       const input = yield* validateInput(MaintenanceRequest, unsafeInput)
       const effectiveBatch = Math.min(input.batchSize, limits.expiryBatchSize)
       return yield* write(Effect.gen(function*() {
@@ -1361,10 +1553,9 @@ const makeService = Effect.gen(function*() {
           execute: () =>
             sql`SELECT message_id AS messageId
               FROM effect_local_relay_messages
-              WHERE message_id > ${input.cursor ?? 0}
-                AND state IN ('Pending', 'Claimed')
+              WHERE state IN ('Pending', 'Claimed')
                 AND expires_at <= ${now}
-              ORDER BY message_id
+              ORDER BY expires_at, message_id
               LIMIT ${effectiveBatch + 1}`
         })(undefined)
         for (const row of rows.slice(0, effectiveBatch)) {
@@ -1372,17 +1563,32 @@ const makeService = Effect.gen(function*() {
         }
         return maintenanceResult(rows.map((row) => row.messageId), effectiveBatch)
       }))
-    })).pipe(Effect.withSpan("PeerRelayStore.expire"))
+    }))
+    return PeerRpcObservability.observeRelay({
+      effect,
+      operation: "RelayMaintenance",
+      direction: "Receive",
+      stage: "Expire",
+      facts: (exit) => ({
+        items: Exit.isSuccess(exit) ? exit.value.processed : 0
+      }),
+      result: (exit) => Exit.isSuccess(exit) ? "Expired" : relayFailureResult(exit)
+    })
+  }
 
   const IntegrityRow = Schema.Struct({
     messageId: PositiveInt,
     state: Schema.String,
     messageTenantId: Schema.NonEmptyString,
-    channelTenantId: Schema.NonEmptyString,
+    channelTenantId: Schema.NullOr(Schema.NonEmptyString),
     messageSenderSubjectId: Schema.NonEmptyString,
-    channelSenderSubjectId: Schema.NonEmptyString,
+    channelSenderSubjectId: Schema.NullOr(Schema.NonEmptyString),
     messageSenderPeerId: Schema.String,
-    channelSenderPeerId: Schema.String,
+    channelSenderPeerId: Schema.NullOr(Schema.String),
+    messageRecipientSubjectId: Schema.NullOr(Schema.String),
+    channelRecipientSubjectId: Schema.NullOr(Schema.String),
+    messageRecipientPeerId: Schema.NullOr(Schema.String),
+    channelRecipientPeerId: Schema.NullOr(Schema.String),
     payloadLength: NonNegativeInt,
     actualLength: Schema.NullOr(NonNegativeInt),
     reservationPresent: Schema.Literals([0, 1]),
@@ -1390,8 +1596,8 @@ const makeService = Effect.gen(function*() {
     retainedConsumed: Schema.NullOr(Schema.Literals([0, 1]))
   })
 
-  const repair: Service["repair"] = (unsafeInput) =>
-    mapStorageErrors(Effect.gen(function*() {
+  const repair: Service["repair"] = (unsafeInput) => {
+    const effect = mapStoreErrors(Effect.gen(function*() {
       const input = yield* validateInput(MaintenanceRequest, unsafeInput)
       const effectiveBatch = Math.min(input.batchSize, limits.integrityBatchSize)
       return yield* write(Effect.gen(function*() {
@@ -1409,13 +1615,17 @@ const makeService = Effect.gen(function*() {
                 c.sender_subject_id AS channelSenderSubjectId,
                 m.sender_peer_id AS messageSenderPeerId,
                 c.sender_peer_id AS channelSenderPeerId,
+                m.recipient_subject_id AS messageRecipientSubjectId,
+                c.recipient_subject_id AS channelRecipientSubjectId,
+                m.recipient_peer_id AS messageRecipientPeerId,
+                c.recipient_peer_id AS channelRecipientPeerId,
                 m.payload_length AS payloadLength,
                 length(m.payload) AS actualLength,
                 CASE WHEN r.message_id IS NULL THEN 0 ELSE 1 END AS reservationPresent,
                 r.active_consumed AS activeConsumed,
                 r.retained_consumed AS retainedConsumed
               FROM effect_local_relay_messages m
-              JOIN effect_local_relay_channels c ON c.channel_id = m.channel_id
+              LEFT JOIN effect_local_relay_channels c ON c.channel_id = m.channel_id
               LEFT JOIN effect_local_relay_reservations r ON r.message_id = m.message_id
               WHERE m.message_id > ${input.cursor ?? 0}
               ORDER BY m.message_id
@@ -1443,6 +1653,8 @@ const makeService = Effect.gen(function*() {
             row.messageTenantId !== row.channelTenantId ||
             row.messageSenderSubjectId !== row.channelSenderSubjectId ||
             row.messageSenderPeerId !== row.channelSenderPeerId ||
+            row.messageRecipientSubjectId !== row.channelRecipientSubjectId ||
+            row.messageRecipientPeerId !== row.channelRecipientPeerId ||
             (active && (
               row.actualLength === null ||
               row.actualLength !== row.payloadLength
@@ -1459,168 +1671,133 @@ const makeService = Effect.gen(function*() {
         }
         return maintenanceResult(rows.map((row) => row.messageId), effectiveBatch)
       }))
-    })).pipe(Effect.withSpan("PeerRelayStore.repair"))
+    }))
+    return PeerRpcObservability.observeRelay({
+      effect,
+      operation: "RelayMaintenance",
+      direction: "Receive",
+      stage: "Repair",
+      facts: (exit) => ({
+        items: Exit.isSuccess(exit) ? exit.value.processed : 0
+      }),
+      result: (exit) => Exit.isSuccess(exit) ? "DeadLettered" : relayFailureResult(exit)
+    })
+  }
 
-  const reconcile: Service["reconcile"] = (unsafeInput) =>
-    mapStorageErrors(Effect.gen(function*() {
+  const reconcile: Service["reconcile"] = (unsafeInput) => {
+    const effect = mapStoreErrors(Effect.gen(function*() {
       const input = yield* validateInput(MaintenanceRequest, unsafeInput)
       const effectiveBatch = Math.min(input.batchSize, limits.reconciliationBatchSize)
       return yield* write(Effect.gen(function*() {
-        const rows = yield* SqlSchema.findAll({
-          Request: Schema.Void,
-          Result: KeyRow,
-          execute: () =>
-            sql`SELECT m.message_id AS messageId
-              FROM effect_local_relay_messages m
-              LEFT JOIN effect_local_relay_reservations r ON r.message_id = m.message_id
-              WHERE m.message_id > ${input.cursor ?? 0}
-                AND r.message_id IS NULL
-              ORDER BY m.message_id
-              LIMIT ${effectiveBatch + 1}`
-        })(undefined)
-        if (rows.length > 0) {
-          return yield* storageCorrupt(new Error("Missing immutable relay quota reservation"))
-        }
-        if (input.cursor === undefined || input.cursor === 0) {
-          const orphanReservations = yield* SqlSchema.findAll({
-            Request: Schema.Void,
-            Result: KeyRow,
-            execute: () =>
-              sql`SELECT r.message_id AS messageId
-                FROM effect_local_relay_reservations r
-                LEFT JOIN effect_local_relay_messages m ON m.message_id = r.message_id
-                WHERE m.message_id IS NULL
-                ORDER BY r.message_id
-                LIMIT ${effectiveBatch + 1}`
-          })(undefined)
-          if (orphanReservations.length > 0) {
-            return yield* storageCorrupt(new Error("Orphan relay quota reservation"))
-          }
-        }
-        yield* sql`DELETE FROM effect_local_relay_usage`
-        yield* sql`INSERT INTO effect_local_relay_usage (
-            scope_kind,
-            scope_key,
-            active_count,
-            active_bytes,
-            retained_count,
-            retained_bytes
-          )
-          SELECT
-            scope_kind,
-            scope_key,
-            SUM(CASE WHEN active_consumed = 0 THEN active_count_delta ELSE 0 END),
-            SUM(CASE WHEN active_consumed = 0 THEN active_bytes_delta ELSE 0 END),
-            SUM(CASE WHEN retained_consumed = 0 THEN retained_count_delta ELSE 0 END),
-            SUM(CASE WHEN retained_consumed = 0 THEN retained_bytes_delta ELSE 0 END)
-          FROM (
-            SELECT
-              'SenderPeer' AS scope_kind,
-              sender_peer_usage_key AS scope_key,
-              active_count_delta,
-              active_bytes_delta,
-              retained_count_delta,
-              retained_bytes_delta,
-              active_consumed,
-              retained_consumed
-            FROM effect_local_relay_reservations
-            UNION ALL
-            SELECT
-              'RecipientPeer',
-              recipient_peer_usage_key,
-              active_count_delta,
-              active_bytes_delta,
-              retained_count_delta,
-              retained_bytes_delta,
-              active_consumed,
-              retained_consumed
-            FROM effect_local_relay_reservations
-            UNION ALL
-            SELECT
-              'RecipientSubject',
-              recipient_subject_usage_key,
-              active_count_delta,
-              active_bytes_delta,
-              retained_count_delta,
-              retained_bytes_delta,
-              active_consumed,
-              retained_consumed
-            FROM effect_local_relay_reservations
-            UNION ALL
-            SELECT
-              'Tenant',
-              tenant_usage_key,
-              active_count_delta,
-              active_bytes_delta,
-              retained_count_delta,
-              retained_bytes_delta,
-              active_consumed,
-              retained_consumed
-            FROM effect_local_relay_reservations
-            UNION ALL
-            SELECT
-              'Shard',
-              shard_usage_key,
-              active_count_delta,
-              active_bytes_delta,
-              retained_count_delta,
-              retained_bytes_delta,
-              active_consumed,
-              retained_consumed
-            FROM effect_local_relay_reservations
-          )
-          GROUP BY scope_kind, scope_key
-          HAVING
-            SUM(CASE WHEN active_consumed = 0 THEN active_count_delta ELSE 0 END) > 0
-            OR SUM(CASE WHEN retained_consumed = 0 THEN retained_count_delta ELSE 0 END) > 0`
-        return { processed: 0, hasMore: false }
-      }))
-    })).pipe(Effect.withSpan("PeerRelayStore.reconcile"))
-
-  const collect: Service["collect"] = (unsafeInput) =>
-    mapStorageErrors(Effect.gen(function*() {
-      const input = yield* validateInput(MaintenanceRequest, unsafeInput)
-      const effectiveBatch = Math.min(input.batchSize, limits.terminalCollectionBatchSize)
-      return yield* write(Effect.gen(function*() {
-        const now = (yield* nowQuery(sql)).now
-        const rows = yield* SqlSchema.findAll({
+        const messageRows = yield* SqlSchema.findAll({
           Request: Schema.Void,
           Result: KeyRow,
           execute: () =>
             sql`SELECT message_id AS messageId
               FROM effect_local_relay_messages
               WHERE message_id > ${input.cursor ?? 0}
-                AND state IN ('Acknowledged', 'DeadLettered', 'Expired')
-                AND deduplicate_until <= ${now}
               ORDER BY message_id
+              LIMIT ${effectiveBatch + 1}`
+        })(undefined)
+        const reservationRows = yield* SqlSchema.findAll({
+          Request: Schema.Void,
+          Result: KeyRow,
+          execute: () =>
+            sql`SELECT message_id AS messageId
+              FROM effect_local_relay_reservations
+              WHERE message_id > ${input.cursor ?? 0}
+              ORDER BY message_id
+              LIMIT ${effectiveBatch + 1}`
+        })(undefined)
+        if (
+          messageRows.length !== reservationRows.length ||
+          messageRows.some((row, index) => row.messageId !== reservationRows[index]?.messageId)
+        ) {
+          return yield* storageCorrupt(new Error("Relay reservation bijection is corrupt"))
+        }
+        return maintenanceResult(messageRows.map((row) => row.messageId), effectiveBatch)
+      }))
+    }))
+    return PeerRpcObservability.observeRelay({
+      effect,
+      operation: "RelayMaintenance",
+      direction: "Receive",
+      stage: "Reconcile",
+      facts: (exit) => ({
+        items: Exit.isSuccess(exit) ? exit.value.processed : 0
+      }),
+      result: (exit) => Exit.isSuccess(exit) ? "Success" : relayFailureResult(exit)
+    })
+  }
+
+  const collect: Service["collect"] = (unsafeInput) => {
+    const effect = mapStoreErrors(Effect.gen(function*() {
+      const input = yield* validateInput(MaintenanceRequest, unsafeInput)
+      const effectiveBatch = Math.min(input.batchSize, limits.terminalCollectionBatchSize)
+      return yield* write(Effect.gen(function*() {
+        const now = (yield* nowQuery(sql)).now
+        const rows = yield* SqlSchema.findAll({
+          Request: Schema.Void,
+          Result: Schema.Struct({
+            messageId: PositiveInt,
+            channelId: PositiveInt
+          }),
+          execute: () =>
+            sql`SELECT
+                message_id AS messageId,
+                channel_id AS channelId
+              FROM effect_local_relay_messages
+              WHERE state IN ('Acknowledged', 'DeadLettered', 'Expired')
+                AND deduplicate_until <= ${now}
+              ORDER BY deduplicate_until, message_id
               LIMIT ${effectiveBatch + 1}`
         })(undefined)
         for (const row of rows.slice(0, effectiveBatch)) {
           yield* releaseRetainedUsage(row.messageId)
+          const reservationDeleted = yield* SqlSchema.findAll({
+            Request: Schema.Void,
+            Result: UnitRow,
+            execute: () =>
+              sql`DELETE FROM effect_local_relay_reservations
+                WHERE message_id = ${row.messageId}
+                  AND active_consumed = 1
+                  AND retained_consumed = 1
+                RETURNING 1 AS value`
+          })(undefined)
+          if (reservationDeleted.length !== 1) {
+            return yield* storageCorrupt(new Error("Invalid collected relay quota reservation"))
+          }
           yield* sql`DELETE FROM effect_local_relay_messages
             WHERE message_id = ${row.messageId}
               AND state IN ('Acknowledged', 'DeadLettered', 'Expired')
               AND deduplicate_until <= ${now}`
+          yield* sql`DELETE FROM effect_local_relay_channels
+            WHERE channel_id = ${row.channelId}
+              AND claimed_message_id IS NULL
+              AND NOT EXISTS (
+                SELECT 1
+                FROM effect_local_relay_messages m
+                WHERE m.channel_id = ${row.channelId}
+              )`
         }
-        yield* sql`DELETE FROM effect_local_relay_usage
-          WHERE active_count = 0
-            AND active_bytes = 0
-            AND retained_count = 0
-            AND retained_bytes = 0`
-        yield* sql`DELETE FROM effect_local_relay_channels
-          WHERE claimed_message_id IS NULL
-            AND NOT EXISTS (
-              SELECT 1
-              FROM effect_local_relay_messages m
-              WHERE m.channel_id = effect_local_relay_channels.channel_id
-            )
-          LIMIT ${limits.orphanChannelCleanupBatchSize}`
         return maintenanceResult(rows.map((row) => row.messageId), effectiveBatch)
       }))
-    })).pipe(Effect.withSpan("PeerRelayStore.collect"))
+    }))
+    return PeerRpcObservability.observeRelay({
+      effect,
+      operation: "RelayMaintenance",
+      direction: "Receive",
+      stage: "Collect",
+      facts: (exit) => ({
+        items: Exit.isSuccess(exit) ? exit.value.processed : 0
+      }),
+      result: (exit) => Exit.isSuccess(exit) ? "Success" : relayFailureResult(exit)
+    })
+  }
 
-  const usage: Service["usage"] = (unsafeInput) =>
-    mapStorageErrors(Effect.gen(function*() {
+  const usage: Service["usage"] = (unsafeInput) => {
+    const exactShard = unsafeInput === undefined
+    const effect = mapStoreErrors(Effect.gen(function*() {
       const input = unsafeInput === undefined
         ? UsageRequest.make({ scopeKind: "Shard", scopeKey: encodeKey("local") })
         : yield* validateInput(UsageRequest, unsafeInput)
@@ -1643,7 +1820,28 @@ const makeService = Effect.gen(function*() {
         retainedCount: 0,
         retainedBytes: 0
       }))
-    })).pipe(Effect.withSpan("PeerRelayStore.usage"))
+    }))
+    return PeerRpcObservability.observeRelay({
+      effect,
+      operation: "RelayMaintenance",
+      direction: "Receive",
+      stage: "Usage",
+      facts: (exit) => ({
+        items: Exit.isSuccess(exit) ? exit.value.activeCount : 0,
+        ...(Exit.isSuccess(exit) ? { bytes: exit.value.activeBytes, version: 1 } : {})
+      }),
+      result: (exit) => Exit.isSuccess(exit) ? "Success" : relayFailureResult(exit)
+    }).pipe(
+      Effect.tap((value) =>
+        exactShard
+          ? PeerRpcObservability.setRelayPending(
+            value.activeCount,
+            value.activeBytes
+          ).pipe(Effect.catchCause(() => Effect.void))
+          : Effect.void
+      )
+    )
+  }
 
   return PeerRelayStore.of({
     admit,

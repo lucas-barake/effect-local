@@ -18,7 +18,7 @@ export const peerWriterProvenanceChecksum = "sha256:effect-local-peer-writer-pro
 export const replicaHealthIndexesChecksum = "sha256:effect-local-replica-health-indexes-v1"
 export const documentLineageChecksum = "sha256:effect-local-document-lineage-v1"
 export const historyRewriteMarkersChecksum = "sha256:effect-local-history-rewrite-markers-v1"
-export const peerRelayStateChecksum = "sha256:effect-local-peer-relay-state-v2"
+export const peerRelayStateChecksum = "sha256:effect-local-peer-relay-state-v3"
 
 const migration = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
@@ -526,6 +526,27 @@ const peerRelayStateMigration = Effect.gen(function*() {
       row_id
     )
     WHERE relay_message_id IS NOT NULL`
+  yield* sql`CREATE TABLE effect_local_peer_relay_receipt_delete_tokens (
+    receipt_row_id INTEGER PRIMARY KEY
+  )`
+  yield* sql`CREATE TRIGGER effect_local_peer_relay_receipt_delete_guard
+    BEFORE DELETE ON effect_local_peer_receipts
+    WHEN OLD.relay_message_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1
+        FROM effect_local_peer_relay_receipt_delete_tokens
+        WHERE receipt_row_id = OLD.row_id
+      )
+    BEGIN
+      SELECT RAISE(ABORT, 'Relay receipt deletion requires an exact token');
+    END`
+  yield* sql`CREATE TRIGGER effect_local_peer_relay_receipt_delete_consume
+    AFTER DELETE ON effect_local_peer_receipts
+    WHEN OLD.relay_message_id IS NOT NULL
+    BEGIN
+      DELETE FROM effect_local_peer_relay_receipt_delete_tokens
+      WHERE receipt_row_id = OLD.row_id;
+    END`
   yield* sql`CREATE TABLE effect_local_peer_relay_receipt_usage (
     replica_incarnation INTEGER NOT NULL CHECK (replica_incarnation >= 0),
     sender_tenant_id TEXT NOT NULL CHECK (length(sender_tenant_id) > 0),

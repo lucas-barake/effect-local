@@ -658,6 +658,7 @@ describe("BackupStore", () => {
       })
 
       const rows = yield* sql<{
+        readonly deleteTokens: number
         readonly messages: number
         readonly outbox: number
         readonly outboxRemoteUsage: number
@@ -672,8 +673,10 @@ describe("BackupStore", () => {
         (SELECT COUNT(*) FROM effect_local_peer_relay_outbox_remote_usage) AS outboxRemoteUsage,
         (SELECT COUNT(*) FROM effect_local_peer_relay_outbox_replica_usage) AS outboxReplicaUsage,
         (SELECT COUNT(*) FROM effect_local_peer_receipts WHERE relay_message_id IS NOT NULL) AS receipts,
-        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS receiptUsage`
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS receiptUsage,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_delete_tokens) AS deleteTokens`
       assert.deepStrictEqual(rows[0], {
+        deleteTokens: 0,
         messages: 0,
         outbox: 0,
         outboxRemoteUsage: 0,
@@ -740,6 +743,7 @@ describe("BackupStore", () => {
       `
       assert.strictEqual(installations.length, 0)
       const relayRows = yield* sql<{
+        readonly deleteTokens: number
         readonly outbox: number
         readonly outboxRemoteUsage: number
         readonly outboxReplicaUsage: number
@@ -750,8 +754,10 @@ describe("BackupStore", () => {
         (SELECT COUNT(*) FROM effect_local_peer_relay_outbox_remote_usage) AS outboxRemoteUsage,
         (SELECT COUNT(*) FROM effect_local_peer_relay_outbox_replica_usage) AS outboxReplicaUsage,
         (SELECT COUNT(*) FROM effect_local_peer_receipts WHERE relay_message_id IS NOT NULL) AS receipts,
-        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS receiptUsage`
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS receiptUsage,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_delete_tokens) AS deleteTokens`
       assert.deepStrictEqual(relayRows, [{
+        deleteTokens: 0,
         outbox: 1,
         outboxRemoteUsage: 1,
         outboxReplicaUsage: 1,

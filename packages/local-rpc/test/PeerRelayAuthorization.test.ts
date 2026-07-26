@@ -64,7 +64,240 @@ const result = (
   invalidated
 })
 
+const authorizationLayer = (
+  authorize: PeerRelayAuthorization.Authorize,
+  authorizeUnsafeUnboundedAutomerge3Decode: PeerRelayAuthorization.AuthorizeUnsafeUnboundedAutomerge3Decode =
+    PeerRelayAuthorization.denyUnsafeUnboundedAutomerge3Decode
+) => PeerRelayAuthorization.layer(authorize, authorizeUnsafeUnboundedAutomerge3Decode)
+
+const unsafeRequest = (
+  direction: PeerRelayAuthorization.Direction,
+  selectedDocuments: PeerRelayAuthorization.UnsafeUnboundedAutomerge3DecodeRequest["documents"] = documents
+): PeerRelayAuthorization.UnsafeUnboundedAutomerge3DecodeRequest => ({
+  risk: PeerRelayAuthorization.unsafeUnboundedAutomerge3DecodeRisk,
+  direction,
+  principal,
+  remote,
+  documents: selectedDocuments
+})
+
+const unsafeGrant = (
+  overrides: Partial<PeerRelayAuthorization.UnsafeUnboundedAutomerge3DecodeGrant> = {}
+): PeerRelayAuthorization.UnsafeUnboundedAutomerge3DecodeGrant => ({
+  _tag: "UnsafeUnboundedAutomerge3DecodeGrant",
+  risk: PeerRelayAuthorization.unsafeUnboundedAutomerge3DecodeRisk,
+  principal,
+  remote: resolvedRemote,
+  direction: "Send",
+  documents: [documents[0], documents[1]],
+  validUntil: Number.MAX_SAFE_INTEGER,
+  invalidated: Effect.void,
+  ...overrides
+})
+
 describe("PeerRelayAuthorization", () => {
+  it.effect("does not promote ordinary authorization into unsafe Automerge decode trust", () => {
+    let unsafeCalls = 0
+    return Effect.gen(function*() {
+      const authorization = yield* PeerRelayAuthorization.PeerRelayAuthorization
+      yield* authorization.authorize(request("Send"))
+      assert.strictEqual(unsafeCalls, 0)
+      const error = yield* authorization.authorizeUnsafeUnboundedAutomerge3Decode(
+        unsafeRequest("Send")
+      ).pipe(Effect.flip)
+      assert.deepStrictEqual(error, new PeerRpcError.AccessDenied())
+      assert.strictEqual(unsafeCalls, 1)
+    }).pipe(
+      Effect.provide(
+        authorizationLayer(
+          () => Effect.succeed(result()),
+          (input) => {
+            unsafeCalls++
+            return PeerRelayAuthorization.denyUnsafeUnboundedAutomerge3Decode(input)
+          }
+        )
+      )
+    )
+  })
+
+  it.effect.each(["Send", "Receive"] as const)(
+    "validates and canonicalizes the explicit unsafe Automerge decode grant for %s",
+    (direction) =>
+      Effect.gen(function*() {
+        const invalidated = yield* Deferred.make<void>()
+        let observed:
+          | PeerRelayAuthorization.UnsafeUnboundedAutomerge3DecodeRequest
+          | undefined
+        const authorization = yield* PeerRelayAuthorization.PeerRelayAuthorization.pipe(
+          Effect.provide(
+            authorizationLayer(
+              () => Effect.succeed(result()),
+              (input) => {
+                observed = input
+                return Effect.succeed(unsafeGrant({
+                  direction,
+                  documents: [documents[0], documents[1]],
+                  validUntil: 2_000,
+                  invalidated: Deferred.await(invalidated)
+                }))
+              }
+            )
+          )
+        )
+        yield* TestClock.setTime(1_000)
+        const grant = yield* authorization.authorizeUnsafeUnboundedAutomerge3Decode(
+          unsafeRequest(direction, [documents[1], documents[0]])
+        )
+        assert.deepStrictEqual(observed, unsafeRequest(direction, [documents[1], documents[0]]))
+        assert.deepStrictEqual(grant, {
+          _tag: "UnsafeUnboundedAutomerge3DecodeGrant",
+          risk: "Automerge3.3.2DecodeIsNotAllocationBounded",
+          principal,
+          remote: resolvedRemote,
+          direction,
+          documents: [documents[1], documents[0]],
+          validUntil: 2_000,
+          invalidated: grant.invalidated
+        })
+        yield* Deferred.succeed(invalidated, undefined)
+        yield* grant.invalidated
+      })
+  )
+
+  it.effect("rejects malformed and duplicate unsafe requests before policy evaluation", () => {
+    let calls = 0
+    const cases = [
+      { ...unsafeRequest("Send"), risk: "AutomergeDecodeIsSafe" },
+      { ...unsafeRequest("Send"), direction: "Forward" },
+      { ...unsafeRequest("Send"), principal: { ...principal, tenantId: "" } },
+      { ...unsafeRequest("Send"), remote: { ...remote, subjectId: "" } },
+      { ...unsafeRequest("Send"), documents: [] },
+      {
+        ...unsafeRequest("Send"),
+        documents: [documents[0], documents[0]]
+      },
+      {
+        ...unsafeRequest("Send"),
+        documents: [
+          documents[0],
+          { documentType: note.name, documentId: taskId }
+        ]
+      },
+      {
+        ...unsafeRequest("Send"),
+        documents: [{ ...documents[0], documentType: "" }]
+      },
+      {
+        ...unsafeRequest("Send"),
+        documents: [{ ...documents[0], documentId: "doc_invalid" }]
+      }
+    ] as const
+    return Effect.gen(function*() {
+      const authorization = yield* PeerRelayAuthorization.PeerRelayAuthorization
+      for (const invalid of cases) {
+        const error = yield* authorization.authorizeUnsafeUnboundedAutomerge3Decode(
+          invalid as unknown as PeerRelayAuthorization.UnsafeUnboundedAutomerge3DecodeRequest
+        ).pipe(Effect.flip)
+        assert.deepStrictEqual(error, new PeerRpcError.AccessDenied())
+      }
+      assert.strictEqual(calls, 0)
+    }).pipe(
+      Effect.provide(
+        authorizationLayer(
+          () => Effect.succeed(result()),
+          () => {
+            calls++
+            return Effect.never
+          }
+        )
+      )
+    )
+  })
+
+  it.effect("rejects principal remote direction and document substitutions in unsafe grants", () =>
+    Effect.gen(function*() {
+      const cases = [
+        unsafeGrant({ principal: { ...principal, tenantId: "other-tenant" } }),
+        unsafeGrant({ principal: { ...principal, subjectId: "other-subject" } }),
+        unsafeGrant({ principal: { ...principal, peerId: otherPeerId } }),
+        unsafeGrant({ remote: { ...resolvedRemote, tenantId: "other-tenant" } }),
+        unsafeGrant({ remote: { ...resolvedRemote, subjectId: "other-subject" } }),
+        unsafeGrant({ remote: { ...resolvedRemote, peerId: otherPeerId } }),
+        unsafeGrant({ direction: "Receive" }),
+        unsafeGrant({ documents: [documents[0]] }),
+        unsafeGrant({ documents: [documents[0], documents[0]] }),
+        unsafeGrant({
+          documents: [
+            documents[0],
+            { documentType: note.name, documentId: taskId }
+          ]
+        }),
+        unsafeGrant({
+          documents: [
+            documents[0],
+            {
+              documentType: note.name,
+              documentId: Identity.DocumentId.make(
+                "doc_00000000-0000-4000-8000-000000000003"
+              )
+            }
+          ]
+        })
+      ]
+      for (const invalid of cases) {
+        const authorization = yield* PeerRelayAuthorization.PeerRelayAuthorization.pipe(
+          Effect.provide(
+            authorizationLayer(
+              () => Effect.succeed(result()),
+              () => Effect.succeed(invalid)
+            )
+          )
+        )
+        const error = yield* authorization.authorizeUnsafeUnboundedAutomerge3Decode(
+          unsafeRequest("Send")
+        ).pipe(Effect.flip)
+        assert.deepStrictEqual(error, new PeerRpcError.AccessDenied())
+        assert.deepStrictEqual(Object.keys(error), ["_tag"])
+      }
+    }))
+
+  const missingTagGrant = Object.fromEntries(
+    Object.entries(unsafeGrant()).filter(([key]) => key !== "_tag")
+  )
+
+  it.effect.each(
+    [
+      ["expired", unsafeGrant({ validUntil: 1_000 })],
+      ["past", unsafeGrant({ validUntil: 999 })],
+      ["NaN", unsafeGrant({ validUntil: Number.NaN })],
+      ["positive infinity", unsafeGrant({ validUntil: Number.POSITIVE_INFINITY })],
+      ["negative infinity", unsafeGrant({ validUntil: Number.NEGATIVE_INFINITY })],
+      ["missing tag", missingTagGrant],
+      ["wrong tag", { ...unsafeGrant(), _tag: "UnsafeAutomergeGrant" }],
+      ["wrong risk", { ...unsafeGrant(), risk: "AutomergeDecodeIsSafe" }],
+      ["missing invalidation", { ...unsafeGrant(), invalidated: undefined }],
+      ["malformed invalidation", { ...unsafeGrant(), invalidated: "not-an-effect" }]
+    ] as const
+  )("rejects an unsafe grant with %s", ([, grant]) =>
+    Effect.gen(function*() {
+      yield* TestClock.setTime(1_000)
+      const authorization = yield* PeerRelayAuthorization.PeerRelayAuthorization
+      const error = yield* authorization.authorizeUnsafeUnboundedAutomerge3Decode(
+        unsafeRequest("Send")
+      ).pipe(Effect.flip)
+      assert.deepStrictEqual(error, new PeerRpcError.AccessDenied())
+    }).pipe(
+      Effect.provide(
+        authorizationLayer(
+          () => Effect.succeed(result()),
+          () =>
+            Effect.succeed(
+              grant as unknown as PeerRelayAuthorization.UnsafeUnboundedAutomerge3DecodeGrant
+            )
+        )
+      )
+    ))
+
   it.effect.each(["Send", "Receive"] as const)(
     "resolves the exact duplex endpoint and document set for %s",
     (direction) => {
@@ -80,7 +313,7 @@ describe("PeerRelayAuthorization", () => {
         ])
       }).pipe(
         Effect.provide(
-          PeerRelayAuthorization.layer((input) => {
+          authorizationLayer((input) => {
             observed = input
             return Effect.succeed(result([
               { document: note, documentId: noteId },
@@ -122,7 +355,7 @@ describe("PeerRelayAuthorization", () => {
       assert.strictEqual(calls, 0)
     }).pipe(
       Effect.provide(
-        PeerRelayAuthorization.layer(() => {
+        authorizationLayer(() => {
           calls++
           return Effect.never
         })
@@ -154,7 +387,7 @@ describe("PeerRelayAuthorization", () => {
       ]
       for (const selected of cases) {
         const authorization = yield* PeerRelayAuthorization.PeerRelayAuthorization.pipe(
-          Effect.provide(PeerRelayAuthorization.layer(() => Effect.succeed(result(selected))))
+          Effect.provide(authorizationLayer(() => Effect.succeed(result(selected))))
         )
         const error = yield* authorization.authorize(request("Send")).pipe(Effect.flip)
         assert.deepStrictEqual(error, new PeerRpcError.AccessDenied())
@@ -171,7 +404,7 @@ describe("PeerRelayAuthorization", () => {
       for (const endpoint of endpoints) {
         const authorization = yield* PeerRelayAuthorization.PeerRelayAuthorization.pipe(
           Effect.provide(
-            PeerRelayAuthorization.layer(() => Effect.succeed(result(undefined, endpoint)))
+            authorizationLayer(() => Effect.succeed(result(undefined, endpoint)))
           )
         )
         const error = yield* authorization.authorize(request("Receive")).pipe(Effect.flip)
@@ -195,7 +428,7 @@ describe("PeerRelayAuthorization", () => {
       assert.deepStrictEqual(error, new PeerRpcError.AccessDenied())
     }).pipe(
       Effect.provide(
-        PeerRelayAuthorization.layer(() => Effect.succeed(result(undefined, undefined, validUntil)))
+        authorizationLayer(() => Effect.succeed(result(undefined, undefined, validUntil)))
       )
     ))
 
@@ -205,7 +438,7 @@ describe("PeerRelayAuthorization", () => {
       let allowed = true
       const authorization = yield* PeerRelayAuthorization.PeerRelayAuthorization.pipe(
         Effect.provide(
-          PeerRelayAuthorization.layer(() =>
+          authorizationLayer(() =>
             allowed
               ? Effect.succeed(result(undefined, undefined, 2_000, Deferred.await(invalidated)))
               : Effect.fail(new PeerRpcError.AccessDenied())
@@ -226,7 +459,7 @@ describe("PeerRelayAuthorization", () => {
     Effect.gen(function*() {
       const unavailable = yield* PeerRelayAuthorization.PeerRelayAuthorization.pipe(
         Effect.provide(
-          PeerRelayAuthorization.layer(() => Effect.fail(new PeerRpcError.ServerUnavailable()))
+          authorizationLayer(() => Effect.fail(new PeerRpcError.ServerUnavailable()))
         )
       )
       assert.deepStrictEqual(
@@ -236,7 +469,7 @@ describe("PeerRelayAuthorization", () => {
 
       const defect = new Error("policy defect")
       const defective = yield* PeerRelayAuthorization.PeerRelayAuthorization.pipe(
-        Effect.provide(PeerRelayAuthorization.layer(() => Effect.die(defect)))
+        Effect.provide(authorizationLayer(() => Effect.die(defect)))
       )
       const cause = yield* defective.authorize(request("Send")).pipe(
         Effect.sandbox,
@@ -244,5 +477,37 @@ describe("PeerRelayAuthorization", () => {
       )
       assert.isTrue(Cause.hasDies(cause))
       assert.strictEqual(Cause.squash(cause), defect)
+
+      const unsafeUnavailable = yield* PeerRelayAuthorization.PeerRelayAuthorization.pipe(
+        Effect.provide(
+          authorizationLayer(
+            () => Effect.succeed(result()),
+            () => Effect.fail(new PeerRpcError.ServerUnavailable())
+          )
+        )
+      )
+      assert.deepStrictEqual(
+        yield* unsafeUnavailable.authorizeUnsafeUnboundedAutomerge3Decode(
+          unsafeRequest("Send")
+        ).pipe(Effect.flip),
+        new PeerRpcError.ServerUnavailable()
+      )
+
+      const unsafeDefective = yield* PeerRelayAuthorization.PeerRelayAuthorization.pipe(
+        Effect.provide(
+          authorizationLayer(
+            () => Effect.succeed(result()),
+            () => Effect.die(defect)
+          )
+        )
+      )
+      const unsafeCause = yield* unsafeDefective.authorizeUnsafeUnboundedAutomerge3Decode(
+        unsafeRequest("Send")
+      ).pipe(
+        Effect.sandbox,
+        Effect.flip
+      )
+      assert.isTrue(Cause.hasDies(unsafeCause))
+      assert.strictEqual(Cause.squash(unsafeCause), defect)
     }))
 })

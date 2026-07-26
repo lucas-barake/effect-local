@@ -784,6 +784,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 yield* sql`DELETE FROM effect_local_peer_relay_outbox`
                 yield* sql`DELETE FROM effect_local_peer_relay_outbox_remote_usage`
                 yield* sql`DELETE FROM effect_local_peer_relay_outbox_replica_usage`
+                yield* sql`INSERT INTO effect_local_peer_relay_receipt_delete_tokens (receipt_row_id)
+                  SELECT row_id
+                  FROM effect_local_peer_receipts
+                  WHERE relay_message_id IS NOT NULL`
                 yield* sql`DELETE FROM effect_local_peer_receipts
                   WHERE relay_message_id IS NOT NULL`
                 yield* sql`DELETE FROM effect_local_peer_relay_receipt_usage`

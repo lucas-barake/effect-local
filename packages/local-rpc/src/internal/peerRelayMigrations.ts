@@ -8,6 +8,10 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 
 export const relayCustodyChecksum = "sha256:effect-local-relay-custody-v1"
 export const relayMaintenanceIndexesChecksum = "sha256:effect-local-relay-maintenance-indexes-v1"
+export const relayClaimAdmissionIndexChecksum = "sha256:effect-local-relay-claim-admission-index-v1"
+export const relayClaimRecipientRouteChecksum = "sha256:effect-local-relay-claim-recipient-route-v1"
+
+const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 
 const custody = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
@@ -131,9 +135,73 @@ const maintenanceIndexes = Effect.gen(function*() {
     VALUES (2, 'relay_maintenance_indexes', ${relayMaintenanceIndexesChecksum})`
 })
 
+const claimAdmissionIndex = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`CREATE INDEX effect_local_relay_messages_claim_admission
+    ON effect_local_relay_messages(
+      tenant_id,
+      sender_subject_id,
+      sender_peer_id,
+      created_at,
+      message_id
+    )
+    WHERE state = 'Pending' AND payload IS NOT NULL`
+  yield* sql`INSERT INTO effect_local_relay_migration_catalog (migration_id, name, checksum)
+    VALUES (3, 'relay_claim_admission_index', ${relayClaimAdmissionIndexChecksum})`
+})
+
+const claimRecipientRoute = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`DROP INDEX effect_local_relay_messages_claim_admission`
+  yield* sql`ALTER TABLE effect_local_relay_messages
+    ADD COLUMN recipient_subject_id TEXT`
+  yield* sql`ALTER TABLE effect_local_relay_messages
+    ADD COLUMN recipient_peer_id TEXT`
+  yield* sql`UPDATE effect_local_relay_messages
+    SET recipient_subject_id = (
+          SELECT c.recipient_subject_id
+          FROM effect_local_relay_channels c
+          WHERE c.channel_id = effect_local_relay_messages.channel_id
+        ),
+        recipient_peer_id = (
+          SELECT c.recipient_peer_id
+          FROM effect_local_relay_channels c
+          WHERE c.channel_id = effect_local_relay_messages.channel_id
+        )`
+  const invalid = yield* SqlSchema.findOne({
+    Request: Schema.Void,
+    Result: Schema.Struct({ count: NonNegativeInt }),
+    execute: () =>
+      sql`SELECT COUNT(*) AS count
+        FROM effect_local_relay_messages
+        WHERE recipient_subject_id IS NULL OR recipient_peer_id IS NULL`
+  })(undefined)
+  if (invalid.count !== 0) {
+    return yield* new Migrator.MigrationError({
+      kind: "BadState",
+      message: "Relay recipient route backfill is incomplete"
+    })
+  }
+  yield* sql`CREATE INDEX effect_local_relay_messages_claim_admission
+    ON effect_local_relay_messages(
+      tenant_id,
+      sender_subject_id,
+      sender_peer_id,
+      recipient_subject_id,
+      recipient_peer_id,
+      created_at,
+      message_id
+    )
+    WHERE state = 'Pending' AND payload IS NOT NULL`
+  yield* sql`INSERT INTO effect_local_relay_migration_catalog (migration_id, name, checksum)
+    VALUES (4, 'relay_claim_recipient_route', ${relayClaimRecipientRouteChecksum})`
+})
+
 export const loader = Migrator.fromRecord({
   "1_relay_custody": custody,
-  "2_relay_maintenance_indexes": maintenanceIndexes
+  "2_relay_maintenance_indexes": maintenanceIndexes,
+  "3_relay_claim_admission_index": claimAdmissionIndex,
+  "4_relay_claim_recipient_route": claimRecipientRoute
 })
 
 const migrate = Migrator.make({})({
@@ -153,6 +221,18 @@ const expectedCatalog = [
     name: "relay_maintenance_indexes",
     checksum: relayMaintenanceIndexesChecksum,
     label: "Relay maintenance indexes"
+  },
+  {
+    id: 3,
+    name: "relay_claim_admission_index",
+    checksum: relayClaimAdmissionIndexChecksum,
+    label: "Relay claim admission index"
+  },
+  {
+    id: 4,
+    name: "relay_claim_recipient_route",
+    checksum: relayClaimRecipientRouteChecksum,
+    label: "Relay claim recipient route"
   }
 ] as const
 

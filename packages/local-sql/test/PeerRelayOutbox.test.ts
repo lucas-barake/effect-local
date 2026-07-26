@@ -76,6 +76,7 @@ describe("PeerRelayOutbox", () => {
     pruneBatchSize: 10
   }
   const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
+  const lineage = Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000005")
   const endpoint: PeerRelayOutbox.Endpoint = {
     expectedLocal: {
       tenantId: "tenant-a",
@@ -142,6 +143,7 @@ describe("PeerRelayOutbox", () => {
         documentType: "Task",
         messageHash: yield* Canonical.digest(message),
         message,
+        lineage,
         writerProvenance: changes.map((change) => ({
           changeHash: change.hash,
           writerSchemaVersion: 1,
@@ -159,6 +161,29 @@ describe("PeerRelayOutbox", () => {
       const outbox = yield* PeerRelayOutbox.PeerRelayOutbox
       const payload = yield* makePayload(1)
       const first = yield* outbox.admit({ ...endpoint, payload, retryHorizonMillis: 30_000 })
+      const decoded = yield* PeerSyncEnvelope.decodeSyncEnvelope(payload, replicaLimits)
+      assert.strictEqual(decoded.lineage, lineage)
+      assert.strictEqual(
+        first.outerEnvelopeDigest,
+        yield* PeerSyncEnvelope.digestRelayOuterEnvelope({
+          domain: PeerSyncEnvelope.relayOuterEnvelopeDomain,
+          version: PeerSyncEnvelope.relayOuterEnvelopeVersion,
+          expectedLocal: first.expectedLocal,
+          remote: first.remote,
+          relayPeerId: first.relayPeerId,
+          relayMessageId: first.relayMessageId,
+          protocolVersion: first.protocolVersion,
+          payloadVersion: first.payloadVersion,
+          senderReplicaIncarnation: first.replicaIncarnation,
+          senderConnectionEpoch: first.senderConnectionEpoch,
+          senderSequence: first.senderSequence,
+          document: first.document,
+          lineage: decoded.lineage,
+          writerProvenance: first.writerProvenance,
+          messageHash: first.messageHash,
+          payload: first.payload
+        })
+      )
       yield* TestClock.adjust("10 seconds")
       const duplicate = yield* outbox.admit({
         ...endpoint,

@@ -134,3 +134,41 @@ Projection failure rolls back the replacement.
 
 Browser persistence does not make backup optional. OPFS may be evicted while its origin storage bucket remains best
 effort. A complete product must expose export, restore, duplicate, and deletion flows to the person who owns the data.
+
+## Store and forward custody
+
+Store and forward adds three different durable boundaries.
+
+1. Sender admission commits a stable relay message identity and complete outer envelope to the local relay outbox
+   before a network attempt.
+2. `PushRelay` succeeds only after the relay SQLite authority commits the envelope and immutable quota reservation.
+3. `AcknowledgeRelay` is attempted only after the recipient commits the Automerge application result and sender
+   scoped replay receipt through the production sync path.
+
+Relay admission and delivery require the ordinary authorization lease and a separate exact unsafe Automerge resource
+trust lease. After fresh grants, a bounded server operation and policy expiry or revocation contend on a local gate.
+Revocation that wins before admission prevents the SQL mutation or payload emission. An operation that wins is in
+flight, may finish its durable commit or delivery, and returns its real result. Revocation drains that operation and
+prevents later work. It does not retroactively cancel the winner. SQLite and the external policy authority do not
+share an atomic transaction. The extra grant exists because Automerge `3.3.2` does not expose allocation bounded
+semantic decode. Authentication and document access alone do not satisfy it.
+
+These boundaries provide at least once transfer. They do not provide exactly once delivery. A response can be lost
+after any commit. A claim can expire while an old recipient worker still runs. The durable identities and claim
+tokens make retries and stale acknowledgements safe, while retained recipient receipts make duplicate application
+idempotent during the negotiated window.
+
+Relay FIFO ordering is scoped to one exact directed peer channel. One claimed head blocks later rows in that channel.
+Unrelated channels do not share that ordering fence.
+
+Recipient delivery attempts are durable and bounded by `PeerRelayLimits.maximumDeliveryAttempts`, which defaults to
+`16`. Failed, interrupted, disconnected, and expired claims advance the count. Reaching the cap changes the message
+to `DeadLettered` and erases the payload. Restart cannot reset this poison bound.
+
+Active payloads expire at `PeerRelayLimits.messageTtlMillis`. Acknowledged, rejected, and expired rows erase their
+payload and retain bounded deduplication evidence until their retention deadline. Sender outbox rows expire at their
+configured retry horizon. Recipient receipts expire according to `PeerRelayReceiptLimits`.
+
+Relay custody rows and client relay outbox or receipt rows are not canonical document history and are not included in
+canonical backup archives. Restore fences the previous incarnation, removes stale relay client state, and reconciles
+usage before installing the new incarnation. See [Store and forward](store-and-forward.md) for the complete contract.

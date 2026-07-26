@@ -124,14 +124,35 @@ export const make = (
       }
       return yield* Effect.suspend(() => {
         let bodyCause: Cause.Cause<E> | undefined
+        let commitCause: Cause.Cause<SqlError.SqlError> | undefined
         let rollbackCause: Cause.Cause<SqlError.SqlError> | undefined
+        const commitTelemetryMarker = new Error("Peer relay transaction commit failed")
         const withTransaction = SqlClient.makeWithTransaction({
           transactionService: sql.transactionService,
           spanAttributes: [["db.system", "sqlite"]],
           acquireConnection: acquireImmediate(sql, options),
           begin: () => Effect.void,
           savepoint: () => Effect.die(new Error("Nested relay transactions are forbidden")),
-          commit: (connection) => execute(connection, "COMMIT"),
+          commit: (connection) =>
+            execute(connection, "COMMIT").pipe(
+              Effect.exit,
+              Effect.flatMap((commitExit) => {
+                if (Exit.isSuccess(commitExit)) {
+                  return Effect.void
+                }
+                return execute(connection, "ROLLBACK").pipe(
+                  Effect.exit,
+                  Effect.flatMap((rollbackExit) => {
+                    const combined = Exit.isFailure(rollbackExit)
+                      ? Cause.combine(commitExit.cause, rollbackExit.cause)
+                      : commitExit.cause
+                    return Effect.sync(() => {
+                      commitCause = combined
+                    }).pipe(Effect.andThen(Effect.die(commitTelemetryMarker)))
+                  })
+                )
+              })
+            ),
           rollback: (connection) =>
             execute(connection, "ROLLBACK").pipe(
               Effect.exit,
@@ -154,10 +175,26 @@ export const make = (
           )
         )
         return withTransaction(observed).pipe(
-          Effect.catchCause((cause) => {
+          Effect.exit,
+          Effect.flatMap((exit) => {
+            if (Exit.isSuccess(exit)) {
+              return commitCause === undefined
+                ? Effect.succeed(exit.value)
+                : Effect.failCause(commitCause)
+            }
+            const returnedCause = commitCause === undefined
+              ? exit.cause
+              : Cause.fromReasons(
+                exit.cause.reasons.filter((reason) =>
+                  !(Cause.isDieReason(reason) && reason.defect === commitTelemetryMarker)
+                )
+              )
             let combined = bodyCause === undefined
-              ? cause
-              : Cause.combine(bodyCause, cause)
+              ? returnedCause
+              : Cause.combine(bodyCause, returnedCause)
+            if (commitCause !== undefined) {
+              combined = Cause.combine(combined, commitCause)
+            }
             if (rollbackCause !== undefined) {
               combined = Cause.combine(combined, rollbackCause)
             }

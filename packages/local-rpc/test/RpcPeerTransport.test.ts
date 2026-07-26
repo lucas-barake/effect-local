@@ -1,14 +1,18 @@
+import * as Automerge from "@automerge/automerge"
 import { NodeCrypto } from "@effect/platform-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as PeerRelayClientRuntime from "@lucas-barake/effect-local-sql/PeerRelayClientRuntime"
 import type * as PeerRelayOutbox from "@lucas-barake/effect-local-sql/PeerRelayOutbox"
 import * as PeerSyncEnvelope from "@lucas-barake/effect-local-sql/PeerSyncEnvelope"
+import * as TestReplica from "@lucas-barake/effect-local-test/TestReplica"
+import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
@@ -46,6 +50,7 @@ const relayMessageId = Identity.RelayMessageId.make("rly_00000000-0000-4000-8000
 const senderReplicaIncarnation = Identity.ReplicaIncarnation.make(1)
 const claimToken = PeerRelayRpc.ClaimToken.make("clm_00000000-0000-4000-8000-000000000001")
 const relayMessageHash = "1".repeat(64)
+const rewrittenLineage = Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000001")
 const documents = [{ document: Task, documentId }]
 const definition = ReplicaDefinition.make({
   name: "rpc-peer-transport-test",
@@ -162,8 +167,48 @@ const relayEntry = (payload: Uint8Array): PeerRelayOutbox.Entry => ({
   nextAttemptAt: "2026-07-25T00:00:00.000Z"
 })
 
-const makeStoredMessage = (payload: Uint8Array) =>
+const makeStoredMessage = (
+  payloadSeed: Uint8Array,
+  lineage: Identity.DocumentLineage = Identity.genesisLineage
+) =>
   Effect.gen(function*() {
+    let source = Automerge.from(
+      { value: [...payloadSeed] },
+      { actor: "a".repeat(32) }
+    )
+    const remote = Automerge.init()
+    const handshake = Automerge.generateSyncMessage(
+      remote,
+      Automerge.initSyncState()
+    )[1]!
+    const received = Automerge.receiveSyncMessage(
+      source,
+      Automerge.initSyncState(),
+      handshake
+    )
+    source = received[0]
+    const message = Automerge.generateSyncMessage(source, received[1])[1]!
+    const writerProvenance = Automerge.getAllChanges(source).map((bytes) => {
+      const change = Automerge.decodeChange(bytes)
+      return {
+        changeHash: change.hash,
+        writerSchemaVersion: 1,
+        writerDefinitionHash: definition.hash
+      }
+    })
+    Automerge.free(source)
+    Automerge.free(remote)
+    const messageHash = yield* Canonical.digest(message)
+    const payload = yield* PeerSyncEnvelope.encodeSyncEnvelope({
+      connectionEpoch: "remote-epoch",
+      sequence: 3,
+      documentId,
+      documentType: Task.name,
+      messageHash,
+      message,
+      lineage,
+      writerProvenance
+    })
     const envelope: PeerSyncEnvelope.RelayOuterEnvelope = {
       domain: PeerSyncEnvelope.relayOuterEnvelopeDomain,
       version: PeerSyncEnvelope.relayOuterEnvelopeVersion,
@@ -181,8 +226,9 @@ const makeStoredMessage = (payload: Uint8Array) =>
       senderConnectionEpoch: "remote-epoch",
       senderSequence: 3,
       document: { documentType: Task.name, documentId },
-      writerProvenance: [],
-      messageHash: relayMessageHash,
+      lineage,
+      writerProvenance,
+      messageHash,
       payload
     }
     const outerEnvelopeDigest = yield* PeerSyncEnvelope.digestRelayOuterEnvelope(envelope)
@@ -257,7 +303,10 @@ const connectRelay = (
       RpcPeerTransport.layerStoreAndForward(client, relayOptions).pipe(
         Layer.provide(Layer.merge(
           Layer.succeed(PeerRelayClientRuntime.PeerRelayClientRuntime, runtime),
-          NodeCrypto.layer
+          Layer.merge(
+            NodeCrypto.layer,
+            ReplicaLimits.layer(TestReplica.defaultLimits)
+          )
         ))
       )
     )
@@ -1277,7 +1326,10 @@ describe("RpcPeerTransport store and forward", () => {
           maximumPendingHorizon: () => Effect.succeed(relayOptions.senderRetryHorizonMillis + 1)
         })
       ).pipe(Effect.flip)
-      assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+      assert.strictEqual(error._tag, "ReplicaError")
+      if (error._tag === "ReplicaError") {
+        assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+      }
       assert.strictEqual(yield* Ref.get(opens), 0)
     })))
 
@@ -1298,7 +1350,10 @@ describe("RpcPeerTransport store and forward", () => {
           )
       )
       const error = yield* connectRelay(client, makeRuntime()).pipe(Effect.flip)
-      assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+      assert.strictEqual(error._tag, "ReplicaError")
+      if (error._tag === "ReplicaError") {
+        assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+      }
       assert.strictEqual(yield* Ref.get(finalized), 1)
     })))
 
@@ -1326,6 +1381,25 @@ describe("RpcPeerTransport store and forward", () => {
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
+  it.effect("reconstructs a non-genesis lineage when verifying the outer digest", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const stored = yield* makeStoredMessage(
+          Uint8Array.of(2, 3, 4),
+          rewrittenLineage
+        )
+        const client = makeRelayClient(
+          () => Stream.fromIterable([relayOpened, stored]).pipe(Stream.rechunk(1))
+        )
+        const connection = yield* connectRelay(client, makeRuntime())
+        const delivery = yield* Stream.runHead(
+          connection.receiveWithAcknowledgement!
+        ).pipe(Effect.map(Option.getOrThrow))
+        assert.deepStrictEqual(delivery.message, stored.payload)
+        yield* connection.close
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
   it.effect("defers Ack until the delivery consumer commits and closes on Ack failure", () =>
     Effect.scoped(
       Effect.gen(function*() {
@@ -1344,7 +1418,7 @@ describe("RpcPeerTransport store and forward", () => {
             assert.strictEqual(request.sessionId, sessionId)
             assert.strictEqual(request.relayMessageId, relayMessageId)
             assert.strictEqual(request.claimToken, claimToken)
-            assert.strictEqual(request.messageHash, relayMessageHash)
+            assert.strictEqual(request.messageHash, stored.messageHash)
             return Ref.update(acknowledgements, (count) => count + 1).pipe(
               Effect.andThen(Effect.fail(new PeerRpcError.ServerUnavailable()))
             )
@@ -1420,7 +1494,7 @@ describe("RpcPeerTransport store and forward", () => {
           sessionId,
           relayMessageId,
           claimToken,
-          messageHash: relayMessageHash,
+          messageHash: stored.messageHash,
           reason: "ApplicationRejected"
         })
         yield* connection.close
@@ -1487,6 +1561,107 @@ describe("RpcPeerTransport store and forward", () => {
         if (Option.isSome(error)) assert.strictEqual(error.value, fatalError)
       }
     })))
+
+  it.effect("records fixed adapter acknowledgement outcomes and bounded facts", () => {
+    const spans: Array<Tracer.NativeSpan> = []
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options)
+        spans.push(span)
+        return span
+      }
+    })
+    return Effect.scoped(Effect.gen(function*() {
+      const stored = yield* makeStoredMessage(Uint8Array.of(7, 8, 9))
+      const ackClient = makeRelayClient(
+        () => Stream.fromIterable([relayOpened, stored]).pipe(Stream.rechunk(1))
+      )
+      const ackConnection = yield* connectRelay(ackClient, makeRuntime())
+      const acknowledged = yield* Stream.runHead(
+        ackConnection.receiveWithAcknowledgement!
+      ).pipe(Effect.map(Option.getOrThrow))
+      yield* acknowledged.acknowledge
+      yield* ackConnection.close
+
+      const rejectClient = makeRelayClient(
+        () => Stream.fromIterable([relayOpened, stored]).pipe(Stream.rechunk(1))
+      )
+      const rejectConnection = yield* connectRelay(rejectClient, makeRuntime())
+      const rejected = yield* Stream.runHead(
+        rejectConnection.receiveWithAcknowledgement!
+      ).pipe(Effect.map(Option.getOrThrow))
+      yield* rejected.reject("ApplicationRejected")
+      yield* rejectConnection.close
+
+      const unavailableClient = makeRelayClient(
+        () => Stream.fromIterable([relayOpened, stored]).pipe(Stream.rechunk(1)),
+        undefined,
+        () => Effect.fail(new PeerRpcError.ServerUnavailable())
+      )
+      const unavailableConnection = yield* connectRelay(
+        unavailableClient,
+        makeRuntime()
+      )
+      const unavailable = yield* Stream.runHead(
+        unavailableConnection.receiveWithAcknowledgement!
+      ).pipe(Effect.map(Option.getOrThrow))
+      assert.isTrue(Exit.isFailure(yield* unavailable.acknowledge.pipe(Effect.exit)))
+
+      const terminalSpans = spans.filter((span) => span.name === "effect_local_rpc.adapter.relay_acknowledge")
+      assert.strictEqual(terminalSpans.length, 3)
+      assert.deepStrictEqual(
+        terminalSpans.map((span) => {
+          const attributes = Object.fromEntries(span.attributes)
+          return {
+            name: span.name,
+            operation: attributes["rpc.operation"],
+            direction: attributes["rpc.direction"],
+            result: attributes["rpc.result"],
+            bytes: attributes["rpc.bytes"],
+            items: attributes["rpc.items"],
+            version: attributes["rpc.version"],
+            latencyMillis: attributes["rpc.latency_millis"]
+          }
+        }),
+        [
+          {
+            name: "effect_local_rpc.adapter.relay_acknowledge",
+            operation: "AdapterAcknowledge",
+            direction: "Receive",
+            result: "Acknowledged",
+            bytes: stored.payload.byteLength,
+            items: 1,
+            version: String(stored.payloadVersion),
+            latencyMillis: undefined
+          },
+          {
+            name: "effect_local_rpc.adapter.relay_acknowledge",
+            operation: "AdapterAcknowledge",
+            direction: "Receive",
+            result: "DeadLettered",
+            bytes: stored.payload.byteLength,
+            items: 1,
+            version: String(stored.payloadVersion),
+            latencyMillis: undefined
+          },
+          {
+            name: "effect_local_rpc.adapter.relay_acknowledge",
+            operation: "AdapterAcknowledge",
+            direction: "Receive",
+            result: "Unavailable",
+            bytes: stored.payload.byteLength,
+            items: 1,
+            version: String(stored.payloadVersion),
+            latencyMillis: undefined
+          }
+        ]
+      )
+    })).pipe(
+      Effect.provideService(Metric.MetricRegistry, new Map()),
+      Effect.provideService(Tracer.Tracer, tracer),
+      Effect.provide(NodeCrypto.layer)
+    )
+  })
 
   it.effect("records relay boundaries without endpoint payload or claim values", () => {
     const spans: Array<Tracer.NativeSpan> = []
