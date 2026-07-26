@@ -20,12 +20,14 @@ import * as Fiber from "effect/Fiber"
 import * as Latch from "effect/Latch"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as PrimaryKey from "effect/PrimaryKey"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
 import * as TestClock from "effect/testing/TestClock"
 import * as MessageStorage from "effect/unstable/cluster/MessageStorage"
 import * as Runners from "effect/unstable/cluster/Runners"
 import * as Sharding from "effect/unstable/cluster/Sharding"
+import * as Snowflake from "effect/unstable/cluster/Snowflake"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as DurableClock from "effect/unstable/workflow/DurableClock"
 import * as Workflow from "effect/unstable/workflow/Workflow"
@@ -39,6 +41,7 @@ import * as DocumentEntity from "../src/DocumentEntity.js"
 import * as DocumentStore from "../src/DocumentStore.js"
 import * as DurableRuntime from "../src/DurableRuntime.js"
 import * as InternalAutomerge from "../src/internal/automerge.js"
+import * as WriterProvenance from "../src/internal/writerProvenance.js"
 import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
@@ -61,11 +64,29 @@ describe("DurableRuntime", () => {
     projections: [],
     queries: []
   })
+  const provenanceFor = (message: Uint8Array) =>
+    WriterProvenance.syncMessageChangeHashes(message).map((changeHash) => ({
+      changeHash,
+      writerSchemaVersion: Task.version,
+      writerDefinitionHash: definition.hash
+    }))
+  const keyOf = (payload: unknown) => {
+    if (!PrimaryKey.isPrimaryKey(payload)) throw new TypeError("Expected a primary key payload")
+    return PrimaryKey.value(payload)
+  }
+  type MetadataRow = {
+    readonly commit_sequence: Identity.CommitSequence
+    readonly definition_hash: string
+    readonly replica_id: Identity.ReplicaId
+    readonly replica_incarnation: Identity.ReplicaIncarnation
+    readonly singleton: number
+    readonly storage_format_version: number
+    readonly writer_generation: Identity.WriterGeneration
+  }
   const Database = Layer.merge(
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
     NodeCrypto.layer
   )
-  const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Executor = Layer.succeed(
     CommandExecutor.CommandExecutor,
     CommandExecutor.CommandExecutor.of({
@@ -78,7 +99,7 @@ describe("DurableRuntime", () => {
       lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id))
     })
   )
-  const Limits = ReplicaLimits.layer({
+  const limits: ReplicaLimits.Values = {
     maxBackupBytes: 1_000_000,
     maxChunkBytes: 64_000,
     maxArchiveRecords: 1_000,
@@ -109,14 +130,110 @@ describe("DurableRuntime", () => {
     maxRestorePullMillis: 10_000,
     maxRestoreCoalesceMillis: 25,
     maxRestoreErrorBytes: 4_096
+  }
+  const Limits = ReplicaLimits.layer(limits)
+  const servicesWithDatabase = <E, R,>(
+    database: Layer.Layer<SqlClient.SqlClient | Crypto.Crypto, E, R>
+  ) => {
+    const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(database))
+    const gate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(Layer.merge(database, bootstrap)))
+    const store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(database, gate)))
+    const recovery = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(database, gate)))
+    const compaction = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(database, gate, recovery)))
+    const inputs = Layer.mergeAll(database, bootstrap, Executor, Limits, gate, store, recovery, compaction)
+    const live = DurableRuntime.layer(definition).pipe(Layer.provide(inputs))
+    return { bootstrap, compaction, gate, inputs, layer: Layer.merge(inputs, live), live, recovery, store }
+  }
+  const Default = servicesWithDatabase(Database)
+  const Bootstrap = Default.bootstrap
+  const Gate = Default.gate
+  const Store = Default.store
+  const RecoveryService = Default.recovery
+  const CompactionService = Default.compaction
+  const Live = Default.live
+  const Services = Default.layer
+
+  const rollbackServices = Effect.gen(function*() {
+    const completed = yield* Deferred.make<Exit.Exit<unknown, unknown>>()
+    const rolledBack = yield* Deferred.make<void>()
+    let armed = false
+    let targetConnection: unknown | undefined
+    const baseDatabase = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+    const instrumentedDatabase = Layer.effect(
+      SqlClient.SqlClient,
+      Effect.gen(function*() {
+        const sql = yield* SqlClient.SqlClient
+        const call = ((...args: ReadonlyArray<unknown>) => {
+          const statement = (sql as any)(...args)
+          const text = Array.isArray(args[0]) ? args[0].join("") : ""
+          if (!text.includes("UPDATE effect_local_metadata SET writer_generation = writer_generation")) {
+            return statement
+          }
+          return Effect.serviceOption(sql.transactionService).pipe(
+            Effect.tap((transaction) =>
+              Effect.sync(() => {
+                if (armed && Option.isSome(transaction)) targetConnection = transaction.value[0]
+              })
+            ),
+            Effect.andThen(statement)
+          )
+        }) as SqlClient.SqlClient
+        return Object.assign(
+          call,
+          sql,
+          {
+            withTransaction: <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
+              Effect.suspend(() => {
+                let connection: unknown | undefined
+                return Effect.serviceOption(sql.transactionService).pipe(
+                  Effect.flatMap((parent) =>
+                    sql.withTransaction(
+                      Effect.serviceOption(sql.transactionService).pipe(
+                        Effect.tap((transaction) =>
+                          Effect.sync(() => {
+                            if (Option.isSome(transaction)) connection = transaction.value[0]
+                          })
+                        ),
+                        Effect.andThen(effect)
+                      )
+                    ).pipe(
+                      Effect.onExit((exit) => {
+                        if (
+                          !armed ||
+                          Option.isSome(parent) ||
+                          connection === undefined ||
+                          connection !== targetConnection
+                        ) {
+                          return Effect.void
+                        }
+                        return Deferred.succeed(completed, exit).pipe(
+                          Effect.andThen(
+                            Exit.isFailure(exit) ? Deferred.succeed(rolledBack, undefined) : Effect.void
+                          )
+                        )
+                      })
+                    )
+                  )
+                )
+              })
+          }
+        )
+      })
+    ).pipe(Layer.provideMerge(baseDatabase))
+    const database = Layer.merge(instrumentedDatabase, NodeCrypto.layer)
+    return {
+      arm: Effect.sync(() => {
+        armed = true
+      }),
+      completed,
+      database,
+      disarm: Effect.sync(() => {
+        armed = false
+      }),
+      rolledBack,
+      services: servicesWithDatabase(database).layer
+    }
   })
-  const Gate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(Layer.merge(Database, Bootstrap)))
-  const Store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Database, Gate)))
-  const RecoveryService = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate)))
-  const CompactionService = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate, RecoveryService)))
-  const Inputs = Layer.mergeAll(Database, Bootstrap, Executor, Limits, Gate, Store, RecoveryService, CompactionService)
-  const Live = DurableRuntime.layer(definition).pipe(Layer.provide(Inputs))
-  const Services = Layer.merge(Inputs, Live)
 
   const servicesAtWith = <A, E, R,>(filename: string, workflowRegistrations: Layer.Layer<A, E, R>) => {
     const database = Layer.merge(SqliteClient.layer({ filename, disableWAL: true }), NodeCrypto.layer)
@@ -411,6 +528,358 @@ describe("DurableRuntime", () => {
       const forged = { ...first, executionId: second.executionId }
       assert.strictEqual((yield* Effect.exit(runtime.interrupt(forged)))._tag, "Failure")
     }).pipe(Effect.provide(Services)))
+
+  it.effect("keeps missing metadata ApplySync messages retryable", () =>
+    Effect.gen(function*() {
+      const harness = yield* rollbackServices
+      yield* Effect.gen(function*() {
+        const entity = yield* DocumentEntity.DocumentEntity.client
+        const gate = yield* ReplicaGate.ReplicaGate
+        const sharding = yield* Sharding.Sharding
+        const sql = yield* SqlClient.SqlClient
+        const store = yield* DocumentStore.DocumentStore
+        const documentId = yield* Identity.makeDocumentId
+        const peerId = yield* Identity.makePeerId
+        const created = yield* store.create(Task, documentId, { title: "local" })
+        yield* Effect.addFinalizer(() => Effect.sync(() => InternalAutomerge.free(created.automerge)))
+        let remote = Automerge.change(
+          Automerge.clone(created.automerge, { actor: "1".repeat(32) }),
+          (draft) => {
+            ;(draft.value as { title: string }).title = "remote"
+          }
+        )
+        yield* Effect.addFinalizer(() => Effect.sync(() => InternalAutomerge.free(remote)))
+        const emptyPeer = Automerge.init<InternalAutomerge.Root<{ title: string }>>()
+        yield* Effect.addFinalizer(() => Effect.sync(() => InternalAutomerge.free(emptyPeer)))
+        const localHandshake = Automerge.generateSyncMessage(emptyPeer, Automerge.initSyncState())[1]!
+        const receivedHandshake = Automerge.receiveSyncMessage(
+          remote,
+          Automerge.initSyncState(),
+          localHandshake
+        )
+        remote = receivedHandshake[0]
+        const message = Automerge.generateSyncMessage(remote, receivedHandshake[1])[1]!
+        assert.isAbove(Automerge.decodeSyncMessage(message).changes.length, 0)
+        const messageHash = yield* Canonical.digest(message)
+        const writerProvenance = provenanceFor(message)
+        const permit = yield* gate.current
+        const payload = {
+          replicaIncarnation: permit.incarnation,
+          peerId,
+          connectionEpoch: "remote-epoch",
+          localConnectionEpoch: "local-epoch",
+          receiveSequence: 0,
+          documentType: Task.name,
+          messageHash,
+          message,
+          writerProvenance
+        } as const
+        const metadata = yield* sql<MetadataRow>`SELECT * FROM effect_local_metadata WHERE singleton = 1`
+        assert.lengthOf(metadata, 1)
+        const before = yield* sql<{
+          readonly changes: number
+          readonly commitSequence: number
+          readonly outbox: number
+        }>`SELECT
+          (SELECT COUNT(*) FROM effect_local_changes) AS changes,
+          (SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1) AS commitSequence,
+          (SELECT COUNT(*) FROM effect_local_commit_outbox) AS outbox`
+        const primaryKey = keyOf(DocumentEntity.ApplySync.payloadSchema.make(payload))
+        const messageId = `EffectLocal/Document/${documentId}/ApplySync/${primaryKey}`
+        yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
+        yield* harness.arm
+
+        const first = yield* entity(documentId).ApplySync(payload).pipe(
+          Effect.result,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Effect.addFinalizer(() =>
+          Fiber.interrupt(first).pipe(
+            Effect.andThen(Fiber.await(first)),
+            Effect.asVoid
+          )
+        )
+        const transactionExit = yield* Deferred.await(harness.completed)
+        assert.isTrue(Exit.isFailure(transactionExit))
+        if (!Exit.isFailure(transactionExit)) return
+        assert.isTrue(Cause.hasFails(transactionExit.cause))
+        assert.isFalse(Cause.hasDies(transactionExit.cause))
+        const failure = Option.getOrThrow(Cause.findErrorOption(transactionExit.cause))
+        assert.strictEqual((failure as { readonly _tag?: string })._tag, "ReplicaError")
+        if ((failure as { readonly _tag?: string })._tag !== "ReplicaError") return
+        assert.strictEqual(
+          (failure as { readonly reason: { readonly _tag: string } }).reason._tag,
+          "ReplicaMetadataMissing"
+        )
+        yield* Deferred.await(harness.rolledBack)
+
+        const pending = yield* sql<{
+          readonly missing_reply: number
+          readonly processed: number
+          readonly replies: number
+        }>`SELECT processed, last_reply_id IS NULL AS missing_reply, (
+            SELECT COUNT(*) FROM effect_local_cluster_replies
+            WHERE request_id = effect_local_cluster_messages.id
+          ) AS replies
+          FROM effect_local_cluster_messages WHERE message_id = ${messageId}`
+        assert.lengthOf(pending, 1)
+        assert.strictEqual(pending[0]!.processed, 0)
+        assert.strictEqual(pending[0]!.missing_reply, 1)
+        assert.strictEqual(pending[0]!.replies, 0)
+        const requestIds = yield* sql<{ readonly id: bigint }>`SELECT id
+          FROM effect_local_cluster_messages
+          WHERE message_id = ${messageId}`.pipe(
+          Effect.provideService(SqlClient.SafeIntegers, true)
+        )
+        assert.lengthOf(requestIds, 1)
+
+        yield* sql`INSERT INTO effect_local_metadata ${sql.insert(metadata[0]!)}`
+        yield* harness.disarm
+        assert.isTrue(yield* sharding.reset(Snowflake.Snowflake(requestIds[0]!.id)))
+        yield* sharding.pollStorage
+        yield* Effect.gen(function*() {
+          while (true) {
+            const rows = yield* sql<{
+              readonly processed: number
+              readonly replies: number
+            }>`SELECT processed, (
+                SELECT COUNT(*) FROM effect_local_cluster_replies
+                WHERE request_id = effect_local_cluster_messages.id
+              ) AS replies
+              FROM effect_local_cluster_messages WHERE message_id = ${messageId}`
+            if (rows[0]?.processed === 1 && rows[0]?.replies === 1) return
+          }
+        }).pipe(Effect.timeout("5 seconds"), TestClock.withLive)
+        const retriedResult = yield* entity(documentId).ApplySync(payload).pipe(
+          Effect.timeout("5 seconds"),
+          TestClock.withLive
+        )
+        assert.isFalse(retriedResult.duplicate)
+
+        const receipts = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_peer_receipts
+          WHERE replica_incarnation = ${permit.incarnation}
+            AND peer_id = ${peerId}
+            AND connection_epoch = ${payload.connectionEpoch}
+            AND receive_sequence = ${payload.receiveSequence}`
+        assert.strictEqual(receipts[0]?.count, 1)
+        const completed = yield* sql<{
+          readonly has_reply: number
+          readonly processed: number
+        }>`SELECT processed, EXISTS (
+            SELECT 1 FROM effect_local_cluster_replies
+            WHERE id = effect_local_cluster_messages.last_reply_id
+          ) AS has_reply
+          FROM effect_local_cluster_messages WHERE message_id = ${messageId}`
+        assert.lengthOf(completed, 1)
+        assert.strictEqual(completed[0]!.processed, 1)
+        assert.strictEqual(completed[0]!.has_reply, 1)
+        const replies = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_cluster_replies
+          WHERE request_id = (
+            SELECT id FROM effect_local_cluster_messages WHERE message_id = ${messageId}
+          )`
+        assert.strictEqual(replies[0]?.count, 1)
+        const after = yield* sql<{
+          readonly changes: number
+          readonly commitSequence: number
+          readonly outbox: number
+        }>`SELECT
+          (SELECT COUNT(*) FROM effect_local_changes) AS changes,
+          (SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1) AS commitSequence,
+          (SELECT COUNT(*) FROM effect_local_commit_outbox) AS outbox`
+        assert.deepStrictEqual(after[0], {
+          changes: before[0]!.changes + 1,
+          commitSequence: before[0]!.commitSequence + 1,
+          outbox: before[0]!.outbox + 1
+        })
+      }).pipe(Effect.scoped, Effect.provide(harness.services))
+    }))
+
+  it.effect("rejects duplicate ApplySync when metadata is absent", () =>
+    Effect.gen(function*() {
+      const harness = yield* rollbackServices
+      yield* Effect.gen(function*() {
+        const entity = yield* DocumentEntity.DocumentEntity.client
+        const gate = yield* ReplicaGate.ReplicaGate
+        const sharding = yield* Sharding.Sharding
+        const sql = yield* SqlClient.SqlClient
+        const store = yield* DocumentStore.DocumentStore
+        const documentId = yield* Identity.makeDocumentId
+        const peerId = yield* Identity.makePeerId
+        const created = yield* store.create(Task, documentId, { title: "local" })
+        yield* Effect.addFinalizer(() => Effect.sync(() => InternalAutomerge.free(created.automerge)))
+        const remote = Automerge.change(
+          Automerge.clone(created.automerge, { actor: "2".repeat(32) }),
+          (draft) => {
+            ;(draft.value as { title: string }).title = "remote"
+          }
+        )
+        yield* Effect.addFinalizer(() => Effect.sync(() => InternalAutomerge.free(remote)))
+        const generated = Automerge.generateSyncMessage(remote, Automerge.initSyncState())
+        assert.isNotNull(generated[1])
+        const message = generated[1]!
+        const messageHash = yield* Canonical.digest(message)
+        const writerProvenance = provenanceFor(message)
+        const permit = yield* gate.current
+        const metadata = yield* sql<MetadataRow>`SELECT * FROM effect_local_metadata WHERE singleton = 1`
+        assert.lengthOf(metadata, 1)
+        const documentBefore = yield* sql`SELECT * FROM effect_local_documents WHERE document_id = ${documentId}`
+        assert.lengthOf(documentBefore, 1)
+        const document = documentBefore[0]!
+        const expiredAt = new Date(0).toISOString()
+        const activeAt = new Date(limits.maxPendingAgeMillis + 1).toISOString()
+
+        yield* sql`INSERT INTO effect_local_changes (
+          change_hash, document_id, document_type, writer_schema_version, writer_definition_hash,
+          actor, sequence, dependencies, bytes, applied, peer_id, accepted_at, commit_sequence
+        ) VALUES (
+          ${"e".repeat(64)}, ${documentId}, ${Task.name}, ${Task.version}, ${definition.hash},
+          ${"f".repeat(32)}, 100, '[]', ${new Uint8Array([9])}, 0, ${peerId}, ${expiredAt},
+          ${metadata[0]!.commit_sequence}
+        )`
+        yield* sql`INSERT INTO effect_local_peer_receipts (
+          replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id,
+          message_hash, reply, reply_hash, pending_message, heads,
+          accepted_heads, commit_sequence, accepted_at, writer_provenance
+        ) VALUES (
+          ${permit.incarnation}, ${peerId}, 'remote-epoch', 1, ${documentId},
+          'expired-pending', NULL, NULL, ${new Uint8Array([8])}, ${document.materialized_heads},
+          ${document.accepted_heads}, ${metadata[0]!.commit_sequence}, ${expiredAt}, '[]'
+        )`
+        yield* sql`INSERT INTO effect_local_peer_receipts (
+          replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id,
+          message_hash, reply, reply_hash, pending_message, heads,
+          accepted_heads, commit_sequence, accepted_at, writer_provenance
+        ) VALUES (
+          ${permit.incarnation}, ${peerId}, 'remote-epoch', 0, ${documentId},
+          ${messageHash}, NULL, NULL, NULL, ${document.materialized_heads},
+          ${document.accepted_heads}, ${metadata[0]!.commit_sequence}, ${activeAt},
+          ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(writerProvenance)}
+        )`
+        const expiredChangeBefore = yield* sql`SELECT * FROM effect_local_changes
+          WHERE change_hash = ${"e".repeat(64)}`
+        const receiptsBefore = yield* sql`SELECT * FROM effect_local_peer_receipts
+          WHERE replica_incarnation = ${permit.incarnation}
+            AND peer_id = ${peerId}
+            AND connection_epoch = 'remote-epoch'
+          ORDER BY receive_sequence`
+        const outboxBefore = yield* sql`SELECT * FROM effect_local_commit_outbox ORDER BY commit_sequence`
+        const quarantineBefore = yield* sql`SELECT * FROM effect_local_quarantine ORDER BY id`
+        yield* TestClock.setTime(limits.maxPendingAgeMillis + 1)
+        const payload = {
+          replicaIncarnation: permit.incarnation,
+          peerId,
+          connectionEpoch: "remote-epoch",
+          localConnectionEpoch: "local-epoch",
+          receiveSequence: 0,
+          documentType: Task.name,
+          messageHash,
+          message,
+          writerProvenance
+        } as const
+        const primaryKey = keyOf(DocumentEntity.ApplySync.payloadSchema.make(payload))
+        const messageId = `EffectLocal/Document/${documentId}/ApplySync/${primaryKey}`
+        yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
+        yield* harness.arm
+
+        const requested = yield* entity(documentId).ApplySync(payload).pipe(
+          Effect.result,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Effect.addFinalizer(() =>
+          Fiber.interrupt(requested).pipe(
+            Effect.andThen(Fiber.await(requested)),
+            Effect.asVoid
+          )
+        )
+        const transactionExit = yield* Deferred.await(harness.completed)
+        assert.isTrue(Exit.isFailure(transactionExit))
+        if (!Exit.isFailure(transactionExit)) return
+        assert.isTrue(Cause.hasFails(transactionExit.cause))
+        assert.isFalse(Cause.hasDies(transactionExit.cause))
+        const failure = Option.getOrThrow(Cause.findErrorOption(transactionExit.cause))
+        assert.strictEqual((failure as { readonly _tag?: string })._tag, "ReplicaError")
+        if ((failure as { readonly _tag?: string })._tag !== "ReplicaError") return
+        assert.strictEqual(
+          (failure as { readonly reason: { readonly _tag: string } }).reason._tag,
+          "ReplicaMetadataMissing"
+        )
+        yield* Deferred.await(harness.rolledBack)
+
+        const pending = yield* sql<{
+          readonly missing_reply: number
+          readonly processed: number
+          readonly replies: number
+        }>`SELECT processed, last_reply_id IS NULL AS missing_reply, (
+            SELECT COUNT(*) FROM effect_local_cluster_replies
+            WHERE request_id = effect_local_cluster_messages.id
+          ) AS replies
+          FROM effect_local_cluster_messages WHERE message_id = ${messageId}`
+        assert.lengthOf(pending, 1)
+        assert.strictEqual(pending[0]!.processed, 0)
+        assert.strictEqual(pending[0]!.missing_reply, 1)
+        assert.strictEqual(pending[0]!.replies, 0)
+
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM effect_local_metadata WHERE singleton = 1`,
+          []
+        )
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM effect_local_changes WHERE change_hash = ${"e".repeat(64)}`,
+          expiredChangeBefore
+        )
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM effect_local_peer_receipts
+            WHERE replica_incarnation = ${permit.incarnation}
+              AND peer_id = ${peerId}
+              AND connection_epoch = 'remote-epoch'
+            ORDER BY receive_sequence`,
+          receiptsBefore
+        )
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM effect_local_documents WHERE document_id = ${documentId}`,
+          documentBefore
+        )
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM effect_local_commit_outbox ORDER BY commit_sequence`,
+          outboxBefore
+        )
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM effect_local_quarantine ORDER BY id`,
+          quarantineBefore
+        )
+        const requestIds = yield* sql<{ readonly id: bigint }>`SELECT id
+          FROM effect_local_cluster_messages
+          WHERE message_id = ${messageId}`.pipe(
+          Effect.provideService(SqlClient.SafeIntegers, true)
+        )
+        assert.lengthOf(requestIds, 1)
+
+        yield* sql`INSERT INTO effect_local_metadata ${sql.insert(metadata[0]!)}`
+        yield* harness.disarm
+        assert.isTrue(yield* sharding.reset(Snowflake.Snowflake(requestIds[0]!.id)))
+        yield* sharding.pollStorage
+        yield* Effect.gen(function*() {
+          while (true) {
+            const rows = yield* sql<{
+              readonly processed: number
+              readonly replies: number
+            }>`SELECT processed, (
+                SELECT COUNT(*) FROM effect_local_cluster_replies
+                WHERE request_id = effect_local_cluster_messages.id
+              ) AS replies
+              FROM effect_local_cluster_messages WHERE message_id = ${messageId}`
+            if (rows[0]?.processed === 1 && rows[0]?.replies === 1) return
+          }
+        }).pipe(Effect.timeout("5 seconds"), TestClock.withLive)
+        const retried = yield* entity(documentId).ApplySync(payload).pipe(
+          Effect.timeout("5 seconds"),
+          TestClock.withLive
+        )
+        assert.isTrue(retried.duplicate)
+      }).pipe(Effect.scoped, Effect.provide(harness.services))
+    }))
 
   it.effect("serves ApplySync without holding the connection across the gate", () =>
     Effect.gen(function*() {

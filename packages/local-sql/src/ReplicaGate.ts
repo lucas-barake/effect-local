@@ -1,6 +1,7 @@
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as DateTime from "effect/DateTime"
 import * as Deferred from "effect/Deferred"
@@ -15,6 +16,7 @@ import * as TxReentrantLock from "effect/TxReentrantLock"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as InternalReplicaError from "./internal/replicaError.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
 
 export interface Permit {
@@ -51,6 +53,7 @@ export class ReplicaGate extends Context.Service<ReplicaGate, {
     use: (permit: Permit) => Effect.Effect<A, E, R>
   ) => Effect.Effect<A, E | ReplicaError.ReplicaError | SqlError.SqlError, R>
   readonly refresh: Effect.Effect<Permit, ReplicaError.ReplicaError>
+  readonly preflight: (expected: Permit) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly validate: (expected: Permit) => Effect.Effect<void, ReplicaError.ReplicaError>
 }>()("@lucas-barake/effect-local-sql/ReplicaGate") {}
 
@@ -274,8 +277,8 @@ export const layer: Layer.Layer<
           incarnation: row.replica_incarnation,
           writerGeneration: row.writer_generation
         })),
+        Effect.catchIf(Cause.isNoSuchElementError, InternalReplicaError.metadataMissing),
         Effect.catchTags({
-          NoSuchElementError: () => Effect.die(new Error("Replica metadata was not initialized")),
           SchemaError: (cause) =>
             Effect.fail(
               new ReplicaError.ReplicaError({
@@ -310,6 +313,15 @@ export const layer: Layer.Layer<
               AND writer_generation = ${expected.writerGeneration}
             RETURNING replica_incarnation, writer_generation`
       })
+      const fenced = (expected: Permit, observed: Permit) =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ReplicaFenced({
+              expectedGeneration: expected.writerGeneration,
+              observedGeneration: observed.writerGeneration
+            })
+          })
+        )
       // A shed acquirer never reaches `readLock` or `release`, because `Effect.acquireUseRelease` installs
       // its release only after `acquire` succeeds. So the gate's own occupancy is untouched by a shed.
       const sharedWith = <E,>(admission: Effect.Effect<void, E>) => {
@@ -331,6 +343,15 @@ export const layer: Layer.Layer<
         // here proves `state` already carries the generation of the last claim that touched the database.
         claiming: Ref.get(writer).pipe(Effect.map((owner) => owner !== null)),
         refresh: readState.pipe(Effect.tap((next) => Ref.set(state, next))),
+        preflight: (expected) =>
+          readState.pipe(
+            Effect.flatMap((observed) =>
+              observed.incarnation === expected.incarnation &&
+                observed.writerGeneration === expected.writerGeneration
+                ? Effect.void
+                : fenced(expected, observed)
+            )
+          ),
         shared: sharedWith(acquire),
         admit: sharedWith(acquireBounded),
         claim: (use) =>
@@ -381,16 +402,7 @@ export const layer: Layer.Layer<
           validateState(expected).pipe(
             Effect.flatMap((rows) =>
               rows.length === 1 ? Effect.void : readState.pipe(
-                Effect.flatMap((observed) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.ReplicaFenced({
-                        expectedGeneration: expected.writerGeneration,
-                        observedGeneration: observed.writerGeneration
-                      })
-                    })
-                  )
-                )
+                Effect.flatMap((observed) => fenced(expected, observed))
               )
             ),
             Effect.catchTags({

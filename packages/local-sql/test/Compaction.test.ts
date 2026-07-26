@@ -6,8 +6,10 @@ import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
+import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as CommandExecutor from "../src/CommandExecutor.js"
@@ -49,6 +51,50 @@ describe("Compaction", () => {
     Layer.provide(Layer.mergeAll(Base, Gate, StoreService, Projections))
   )
   const Services = Layer.mergeAll(Base, Gate, StoreService, RecoveryService, CompactionService, Executor)
+  const servicesWithDefinitionHashRace = Effect.sync(() => {
+    let armed = false
+    const sqlite = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+    const instrumented = Layer.effect(
+      SqlClient.SqlClient,
+      Effect.map(SqlClient.SqlClient, (sql) =>
+        new Proxy(sql, {
+          apply(target, thisArg, args: Array<unknown>) {
+            const statement = Reflect.apply(target as never, thisArg, args) as Effect.Effect<
+              unknown,
+              unknown,
+              never
+            >
+            const strings = args[0]
+            if (
+              !armed ||
+              !Array.isArray(strings) ||
+              !(strings as ReadonlyArray<string>).join("").includes(
+                "SELECT definition_hash FROM effect_local_metadata"
+              )
+            ) {
+              return statement
+            }
+            armed = false
+            return sql`DELETE FROM effect_local_metadata WHERE singleton = 1`.pipe(
+              Effect.andThen(statement)
+            )
+          }
+        }) as typeof sql)
+    ).pipe(Layer.provide(sqlite))
+    const database = Layer.merge(instrumented, NodeCrypto.layer)
+    const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(database))
+    const base = Layer.merge(database, bootstrap)
+    const gate = ReplicaGate.layer.pipe(withGateLimits, Layer.provide(base))
+    const store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(base, gate)))
+    const recovery = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(base, gate)))
+    const compaction = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(base, gate, recovery)))
+    return {
+      arm: Effect.sync(() => {
+        armed = true
+      }),
+      services: Layer.mergeAll(base, gate, store, recovery, compaction)
+    }
+  })
 
   /** Commits a real create command under the current incarnation and reports the receipt it wrote. */
   const commitReceipt = Effect.gen(function*() {
@@ -535,6 +581,84 @@ describe("Compaction", () => {
       const error = yield* Effect.flip(compaction.pruneCommandReceipts)
       assert.strictEqual(error.reason._tag, "StorageUnavailable")
       assert.deepStrictEqual(yield* listReceipts, byKey([superseded, live]))
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("reports ReplicaMetadataMissing when metadata disappears after rewrite recovery", () =>
+    Effect.gen(function*() {
+      const harness = yield* servicesWithDefinitionHashRace
+      yield* Effect.gen(function*() {
+        const compaction = yield* Compaction.Compaction
+        const sql = yield* SqlClient.SqlClient
+        const store = yield* DocumentStore.DocumentStore
+        const documentId = yield* Identity.makeDocumentId
+        const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+        InternalAutomerge.free(created.automerge)
+        yield* compaction.compact(Task, documentId)
+        const metadata = yield* sql`SELECT * FROM effect_local_metadata WHERE singleton = 1`
+        assert.lengthOf(metadata, 1)
+        yield* Effect.addFinalizer(() =>
+          sql`INSERT OR IGNORE INTO effect_local_metadata ${sql.insert(metadata[0]!)}`.pipe(
+            Effect.asVoid,
+            Effect.orDie
+          )
+        )
+        const documentBefore = yield* documentRowOf(documentId)
+        const checkpointsBefore = yield* checkpointsOf(documentId)
+        const changesBefore = yield* changesOf(documentId)
+        const outboxBefore = yield* commitOutboxOf(documentId)
+        const markersBefore = yield* rewriteMarkers
+        yield* harness.arm
+
+        const exit = yield* Effect.exit(compaction.rewriteHistory(Task, documentId, operationId))
+        assert.strictEqual(exit._tag, "Failure")
+        if (exit._tag !== "Failure") return
+        assert.isFalse(Cause.hasDies(exit.cause))
+        const error = Option.getOrThrow(Cause.findErrorOption(exit.cause))
+        assert.strictEqual(error.reason._tag, "ReplicaMetadataMissing")
+        assert.deepStrictEqual(yield* documentRowOf(documentId), documentBefore)
+        assert.deepStrictEqual(yield* checkpointsOf(documentId), checkpointsBefore)
+        assert.deepStrictEqual(yield* changesOf(documentId), changesBefore)
+        assert.deepStrictEqual(yield* commitOutboxOf(documentId), outboxBefore)
+        assert.deepStrictEqual(yield* rewriteMarkers, markersBefore)
+      }).pipe(Effect.scoped, Effect.provide(harness.services))
+    }))
+
+  it.effect("reports ReplicaMetadataMissing when metadata disappears before the rewrite commit sequence", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const sql = yield* SqlClient.SqlClient
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      InternalAutomerge.free(created.automerge)
+      yield* compaction.compact(Task, documentId)
+      const metadataBefore = yield* sql`SELECT * FROM effect_local_metadata WHERE singleton = 1`
+      const documentBefore = yield* documentRowOf(documentId)
+      const checkpointsBefore = yield* checkpointsOf(documentId)
+      const changesBefore = yield* changesOf(documentId)
+      const outboxBefore = yield* commitOutboxOf(documentId)
+      const markersBefore = yield* rewriteMarkers
+      yield* sql`CREATE TRIGGER drop_metadata_before_rewrite_sequence
+        AFTER UPDATE ON effect_local_documents
+        BEGIN
+          DELETE FROM effect_local_metadata WHERE singleton = 1;
+        END`
+
+      const exit = yield* Effect.exit(compaction.rewriteHistory(Task, documentId, operationId))
+      assert.strictEqual(exit._tag, "Failure")
+      if (exit._tag !== "Failure") return
+      assert.isFalse(Cause.hasDies(exit.cause))
+      const error = Option.getOrThrow(Cause.findErrorOption(exit.cause))
+      assert.strictEqual(error.reason._tag, "ReplicaMetadataMissing")
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM effect_local_metadata WHERE singleton = 1`,
+        metadataBefore
+      )
+      assert.deepStrictEqual(yield* documentRowOf(documentId), documentBefore)
+      assert.deepStrictEqual(yield* checkpointsOf(documentId), checkpointsBefore)
+      assert.deepStrictEqual(yield* changesOf(documentId), changesBefore)
+      assert.deepStrictEqual(yield* commitOutboxOf(documentId), outboxBefore)
+      assert.deepStrictEqual(yield* rewriteMarkers, markersBefore)
     }).pipe(Effect.provide(Services)))
 
   it.effect("rewrites a high-churn document down to a single change and checkpoint", () =>

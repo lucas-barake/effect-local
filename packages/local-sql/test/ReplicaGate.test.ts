@@ -14,6 +14,7 @@ import * as Option from "effect/Option"
 import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
+import { TestClock } from "effect/testing"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
@@ -668,5 +669,75 @@ describe("ReplicaGate", () => {
       const result = yield* Effect.result(gate.refresh)
       assert.isTrue(Result.isFailure(result))
       if (Result.isFailure(result)) assert.strictEqual(result.failure.reason._tag, "StorageCorrupt")
+    }).pipe(Effect.provide(Gate)))
+
+  it.effect("releases claim admission after ReplicaMetadataMissing", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      const initial = yield* gate.current
+      const metadata = (yield* sql<{
+        readonly commit_sequence: number
+        readonly definition_hash: string
+        readonly replica_id: string
+        readonly replica_incarnation: number
+        readonly storage_format_version: number
+        readonly writer_generation: number
+      }>`SELECT
+        commit_sequence, definition_hash, replica_id, replica_incarnation,
+        storage_format_version, writer_generation
+        FROM effect_local_metadata WHERE singleton = 1`)[0]!
+      const generationsBefore = (yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count FROM effect_local_writer_generations
+      `)[0]!.count
+      yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
+
+      const validation = yield* Effect.result(gate.validate(initial))
+      assert.isTrue(Result.isFailure(validation))
+      if (Result.isFailure(validation)) {
+        assert.strictEqual(validation.failure.reason._tag as string, "ReplicaMetadataMissing")
+      }
+      const failedClaim = yield* Effect.result(gate.claim(() => Effect.void))
+      assert.isTrue(Result.isFailure(failedClaim))
+      if (Result.isFailure(failedClaim) && failedClaim.failure._tag === "ReplicaError") {
+        assert.strictEqual(failedClaim.failure.reason._tag as string, "ReplicaMetadataMissing")
+      }
+      assert.isFalse(yield* gate.claiming)
+      assert.strictEqual(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM effect_local_writer_generations
+        `)[0]!.count,
+        generationsBefore
+      )
+
+      yield* sql`INSERT INTO effect_local_metadata (
+        singleton, storage_format_version, replica_id, replica_incarnation,
+        writer_generation, definition_hash, commit_sequence
+      ) VALUES (
+        1, ${metadata.storage_format_version}, ${metadata.replica_id}, ${metadata.replica_incarnation},
+        ${metadata.writer_generation}, ${metadata.definition_hash}, ${metadata.commit_sequence}
+      )`
+      const callback = yield* Deferred.make<ReplicaGate.Permit>()
+      const claim = yield* gate.claim((permit) => Deferred.succeed(callback, permit).pipe(Effect.as(permit))).pipe(
+        Effect.result,
+        Effect.timeoutOption("1 second"),
+        Effect.forkChild({ startImmediately: true })
+      )
+      const claimed = yield* Effect.gen(function*() {
+        yield* TestClock.adjust("1 second")
+        return yield* Fiber.join(claim)
+      }).pipe(Effect.ensuring(Fiber.interrupt(claim)))
+      assert.isTrue(Option.isSome(claimed))
+      if (Option.isSome(claimed)) {
+        assert.isTrue(Result.isSuccess(claimed.value))
+      }
+      assert.isTrue(Option.isSome(yield* Deferred.poll(callback)))
+      assert.isFalse(yield* gate.claiming)
+      assert.strictEqual(
+        (yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM effect_local_writer_generations
+        `)[0]!.count,
+        generationsBefore + 1
+      )
     }).pipe(Effect.provide(Gate)))
 })

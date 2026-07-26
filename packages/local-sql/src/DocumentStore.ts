@@ -4,6 +4,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Snapshot from "@lucas-barake/effect-local/Snapshot"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import type * as Crypto from "effect/Crypto"
 import * as DateTime from "effect/DateTime"
@@ -14,6 +15,7 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as InternalReplicaError from "./internal/replicaError.js"
 import * as Rows from "./internal/rows.js"
 import * as Recovery from "./Recovery.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -93,8 +95,8 @@ export const layer: Layer.Layer<
           WHERE singleton = 1 RETURNING commit_sequence`
     })(undefined).pipe(
       Effect.map((row) => row.commit_sequence),
+      Effect.catchIf(Cause.isNoSuchElementError, InternalReplicaError.metadataMissing),
       Effect.catchTags({
-        NoSuchElementError: () => Effect.die(new Error("Replica metadata was not initialized")),
         SchemaError: (cause) =>
           Effect.fail(
             new ReplicaError.ReplicaError({
@@ -107,8 +109,8 @@ export const layer: Layer.Layer<
     )
     const currentDefinitionHash = findDefinitionHash(undefined).pipe(
       Effect.map((row) => row.definition_hash),
+      Effect.catchIf(Cause.isNoSuchElementError, InternalReplicaError.metadataMissing),
       Effect.catchTags({
-        NoSuchElementError: () => Effect.die(new Error("Replica metadata was not initialized")),
         SchemaError: (cause) =>
           Effect.fail(
             new ReplicaError.ReplicaError({

@@ -24,7 +24,7 @@ const ExportedDocument = Schema.Struct({
 
 const JsonOutcome = CommandOutcome.schema(Schema.Json, Schema.Json)
 const DocumentIdOutcome = CommandOutcome.schema(Identity.DocumentId, Schema.Never)
-export const protocolVersion = 4
+export const protocolVersion = 5
 const SessionLease = Schema.Struct({ leaseMillis: Schema.Int })
 export const SessionHandshake = Schema.Struct({
   leaseMillis: Schema.Int,

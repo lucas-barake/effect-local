@@ -97,7 +97,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 })
               })
             ),
-            Effect.flatMap((lock) => lock.withPermit(f(permit)))
+            Effect.flatMap((lock) => lock.withPermit(gate.preflight(permit).pipe(Effect.andThen(f(permit)))))
           )
         )
 

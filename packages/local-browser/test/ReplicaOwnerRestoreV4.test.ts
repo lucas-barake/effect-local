@@ -99,7 +99,7 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore version 4", (it) => {
         protocolVersion: ReplicaRpc.protocolVersion,
         definitionHash: definition.hash
       })
-      assert.strictEqual(handshake.protocolVersion, 4)
+      assert.strictEqual(handshake.protocolVersion, 5)
       assert.strictEqual(handshake.maxChunkBytes, limits.maxChunkBytes)
       assert.strictEqual(handshake.maxRestoreCoalesceMillis, limits.maxRestoreCoalesceMillis)
       assert.strictEqual(handshake.maxRestoreErrorBytes, limits.maxRestoreErrorBytes)

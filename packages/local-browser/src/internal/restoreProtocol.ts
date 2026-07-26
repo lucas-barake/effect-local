@@ -58,6 +58,7 @@ const CanonicalEncodeError = Schema.TaggedStruct("CanonicalEncodeError", {
 const StorageCorrupt = Schema.TaggedStruct("StorageCorrupt", {
   cause: BoundedErrorDescription
 })
+const ReplicaMetadataMissing = Schema.TaggedStruct("ReplicaMetadataMissing", {})
 const QuotaExceeded = Schema.TaggedStruct("QuotaExceeded", {
   resource: Schema.String,
   limit: Schema.Int
@@ -116,6 +117,7 @@ export const RestoreWireError = Schema.Union([
   StorageUnavailable,
   CanonicalEncodeError,
   StorageCorrupt,
+  ReplicaMetadataMissing,
   QuotaExceeded,
   MigrationFailed,
   BackupInvalid,
@@ -216,6 +218,7 @@ export const restoreWireErrorFields = fieldMetadata({
   StorageUnavailable,
   CanonicalEncodeError,
   StorageCorrupt,
+  ReplicaMetadataMissing,
   QuotaExceeded,
   MigrationFailed,
   BackupInvalid,
@@ -427,6 +430,12 @@ export const encodeReplicaError = (
         { _tag: reason._tag, cause: emptyErrorDescription },
         ({ defect }) => ({ _tag: reason._tag, cause: defect(reason.cause) })
       )
+    case "ReplicaMetadataMissing":
+      return encodeWithinBudget(
+        maxBytes,
+        { _tag: reason._tag },
+        () => ({ _tag: reason._tag })
+      )
     case "QuotaExceeded":
       return encodeWithinBudget(
         maxBytes,
@@ -598,6 +607,9 @@ export const replicaErrorFromWire = (wire: RestoreWireError): ReplicaError.Repli
       break
     case "StorageCorrupt":
       reason = new ReplicaError.StorageCorrupt({ cause: decodeDefect(wire.cause) })
+      break
+    case "ReplicaMetadataMissing":
+      reason = new ReplicaError.ReplicaMetadataMissing()
       break
     case "QuotaExceeded":
       reason = new ReplicaError.QuotaExceeded({ resource: wire.resource, limit: wire.limit })

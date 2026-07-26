@@ -62,6 +62,7 @@ it.layer(NodeCrypto.layer)("PeerSession coverage", (it) => {
     admit: Effect.acquireRelease(Effect.succeed(permit), () => Effect.void),
     claim: (use) => use(permit),
     refresh: Effect.succeed(permit),
+    preflight: () => Effect.void,
     validate: () => Effect.void
   })
   const result = {

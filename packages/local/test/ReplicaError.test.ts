@@ -14,6 +14,15 @@ describe("ReplicaError", () => {
     assert.deepStrictEqual(Schema.decodeUnknownSync(ReplicaError.ReplicaError)(encoded), error)
   })
 
+  it("round trips ReplicaMetadataMissing", () => {
+    const error = new ReplicaError.ReplicaError({
+      reason: new ReplicaError.ReplicaMetadataMissing()
+    })
+    const encoded = Schema.encodeSync(ReplicaError.ReplicaError)(error)
+    assert.deepStrictEqual(encoded.reason, { _tag: "ReplicaMetadataMissing" })
+    assert.deepStrictEqual(Schema.decodeUnknownSync(ReplicaError.ReplicaError)(encoded), error)
+  })
+
   it("round trips arbitrary defect causes", () => {
     const error = new ReplicaError.ReplicaError({
       reason: new ReplicaError.StorageUnavailable({

@@ -23,6 +23,16 @@ it.effect("round trips a typed restore error through its wire schema", () =>
     assert.deepStrictEqual(RestoreProtocol.replicaErrorFromWire(decoded), original)
   }))
 
+it.effect("reconstructs ReplicaMetadataMissing from the wire", () =>
+  Effect.gen(function*() {
+    const original = new ReplicaError.ReplicaError({
+      reason: new ReplicaError.ReplicaMetadataMissing()
+    })
+    const encoded = RestoreProtocol.encodeReplicaError(original, 4_096)
+    const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
+    assert.deepStrictEqual(RestoreProtocol.replicaErrorFromWire(decoded), original)
+  }))
+
 it.effect("round trips a superseded checkpoint reason through the restore wire", () =>
   Effect.gen(function*() {
     const original = new ReplicaError.ReplicaError({
@@ -237,6 +247,7 @@ it.effect("encodes every restore error and defect at the minimum configured budg
       new ReplicaError.StorageUnavailable({ cause }),
       new ReplicaError.CanonicalEncodeError({ cause }),
       new ReplicaError.StorageCorrupt({ cause }),
+      new ReplicaError.ReplicaMetadataMissing(),
       new ReplicaError.QuotaExceeded({ resource: "resource".repeat(32), limit: 1 }),
       new ReplicaError.MigrationFailed({ migration: "migration".repeat(32), cause }),
       new ReplicaError.BackupInvalid({ cause }),

@@ -117,6 +117,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
     admit: Effect.acquireRelease(Effect.succeed(permit), () => Effect.void),
     claim: (use) => use(permit),
     refresh: Effect.succeed(permit),
+    preflight: () => Effect.void,
     validate: () => Effect.void
   })
 
@@ -1566,6 +1567,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         ),
         claim: (use) => Ref.get(current).pipe(Effect.flatMap(use)),
         refresh: Ref.get(current),
+        preflight: () => Effect.void,
         validate: () => Effect.void
       })
       const sync = PeerSync.PeerSync.of({

@@ -118,6 +118,7 @@ describe("DocumentEntity", () => {
       admit: Effect.die("unused"),
       claim: (use) => use(permit),
       refresh: Effect.succeed(permit),
+      preflight: () => Effect.void,
       validate: () => Effect.void
     })
 

@@ -3,16 +3,19 @@ import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import type * as Crypto from "effect/Crypto"
 import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import type * as Migrator from "effect/unstable/sql/Migrator"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as InternalReplicaError from "./internal/replicaError.js"
 import { storageFormatVersion } from "./internal/schema.js"
 import * as Migrations from "./Migrations.js"
 
@@ -26,14 +29,6 @@ export interface State {
 export class ReplicaBootstrap extends Context.Service<ReplicaBootstrap, State>()(
   "@lucas-barake/effect-local-sql/ReplicaBootstrap"
 ) {}
-
-// A function, not a shared instance, so each failure captures its own stack at the site that observed it.
-const metadataMissing = () =>
-  new ReplicaError.ReplicaError({
-    reason: new ReplicaError.StorageCorrupt({
-      cause: new Error("Replica metadata is missing")
-    })
-  })
 
 const failStorageCorrupt = (cause: unknown) =>
   Effect.fail(
@@ -63,12 +58,7 @@ export const make = (definition: ReplicaDefinition.Any) =>
       Result: Schema.Struct({ storage_format_version: Schema.Int }),
       execute: () => sql`SELECT storage_format_version FROM effect_local_metadata WHERE singleton = 1`
     })
-    // Migration 1 creates the metadata table together with every canonical store table, so whenever the
-    // metadata table exists these are readable too. A populated replica whose metadata singleton is gone is
-    // corrupt, and must be rejected before the migrator touches it rather than after. The peer tables are
-    // deliberately absent here because migration 2 creates them and they may not exist yet; findPopulated
-    // below covers them and stays the authoritative check.
-    const findPopulatedBeforeMigrating = SqlSchema.findOneOption({
+    const findCanonicalPopulation = SqlSchema.findOne({
       Request: Schema.Void,
       Result: Schema.Struct({ populated: Schema.Int }),
       execute: () =>
@@ -85,31 +75,63 @@ export const make = (definition: ReplicaDefinition.Any) =>
           UNION ALL SELECT 1 FROM effect_local_backup_installations
         ) AS populated`
     })
-    // The storage format version decides whether this build may touch the database at all, so it has to be
-    // checked before Migrations.run, which commits its own transaction. Checking afterwards would mean a build
-    // that refuses to open a replica has already migrated it. A database with no tables yet is a fresh one and
-    // is left to the migrator. This runs outside the bootstrap transaction below, so it maps its own SchemaError.
-    yield* Effect.gen(function*() {
-      const table = yield* findMetadataTable(undefined)
-      if (table.length === 0) return
-      const stored = (yield* findStorageFormat(undefined))[0]
-      if (stored === undefined) {
-        const populated = yield* findPopulatedBeforeMigrating(undefined)
-        if (populated._tag === "Some" && populated.value.populated === 1) {
-          return yield* metadataMissing()
-        }
-        return
-      }
-      if (stored.storage_format_version === storageFormatVersion) return
-      return yield* unsupportedStorageFormat(stored.storage_format_version)
-    }).pipe(Effect.catchTag("SchemaError", failStorageCorrupt))
-    yield* Migrations.run
+    const findOptionalTables = SqlSchema.findAll({
+      Request: Schema.Void,
+      Result: Schema.Struct({
+        name: Schema.Literals([
+          "effect_local_peer_receipts",
+          "effect_local_peer_outbox",
+          "effect_local_history_rewrites"
+        ])
+      }),
+      execute: () =>
+        sql`SELECT name FROM sqlite_master
+          WHERE type = 'table'
+            AND name IN (
+              'effect_local_peer_receipts',
+              'effect_local_peer_outbox',
+              'effect_local_history_rewrites'
+            )`
+    })
+    const findPeerReceiptPopulation = SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: Schema.Struct({ populated: Schema.Int }),
+      execute: () => sql`SELECT EXISTS (SELECT 1 FROM effect_local_peer_receipts) AS populated`
+    })
+    const findPeerOutboxPopulation = SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: Schema.Struct({ populated: Schema.Int }),
+      execute: () => sql`SELECT EXISTS (SELECT 1 FROM effect_local_peer_outbox) AS populated`
+    })
+    const findHistoryRewritePopulation = SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: Schema.Struct({ populated: Schema.Int }),
+      execute: () => sql`SELECT EXISTS (SELECT 1 FROM effect_local_history_rewrites) AS populated`
+    })
+    const isPopulated = <E, R,>(
+      effect: Effect.Effect<{ readonly populated: number }, E, R>
+    ) =>
+      effect.pipe(
+        Effect.catchNoSuchElement,
+        Effect.flatMap((option) =>
+          Option.isNone(option)
+            ? failStorageCorrupt(new TypeError("Population query returned no row"))
+            : Effect.succeed(option.value)
+        ),
+        Effect.flatMap((row) =>
+          row.populated === 0
+            ? Effect.succeed(false)
+            : row.populated === 1
+            ? Effect.succeed(true)
+            : failStorageCorrupt(new TypeError(`Invalid population result: ${row.populated}`))
+        )
+      )
     const findMetadata = SqlSchema.findAll({
       Request: Schema.Void,
       Result: Schema.Struct({ singleton: Schema.Int }),
       execute: () => sql`SELECT singleton FROM effect_local_metadata WHERE singleton = 1`
     })
-    const findPopulated = SqlSchema.findOneOption({
+    const findPopulated = SqlSchema.findOne({
       Request: Schema.Void,
       Result: Schema.Struct({ populated: Schema.Int }),
       execute: () =>
@@ -124,6 +146,7 @@ export const make = (definition: ReplicaDefinition.Any) =>
           UNION ALL SELECT 1 FROM effect_local_commit_outbox
           UNION ALL SELECT 1 FROM effect_local_quarantine
           UNION ALL SELECT 1 FROM effect_local_backup_installations
+          UNION ALL SELECT 1 FROM effect_local_history_rewrites
           UNION ALL SELECT 1 FROM effect_local_peer_receipts
           UNION ALL SELECT 1 FROM effect_local_peer_outbox
         ) AS populated`
@@ -155,12 +178,45 @@ export const make = (definition: ReplicaDefinition.Any) =>
         sql`SELECT replica_id, replica_incarnation, writer_generation
           FROM effect_local_metadata WHERE singleton = 1`
     })
+    yield* sql.withTransaction(Effect.gen(function*() {
+      const table = yield* findMetadataTable(undefined)
+      if (table.length !== 0) {
+        const stored = (yield* findStorageFormat(undefined))[0]
+        if (stored === undefined) {
+          if (yield* isPopulated(findCanonicalPopulation(undefined))) {
+            return yield* InternalReplicaError.metadataMissing()
+          }
+          const optionalTables = new Set((yield* findOptionalTables(undefined)).map((row) => row.name))
+          if (
+            optionalTables.has("effect_local_peer_receipts") &&
+            (yield* isPopulated(findPeerReceiptPopulation(undefined)))
+          ) {
+            return yield* InternalReplicaError.metadataMissing()
+          }
+          if (
+            optionalTables.has("effect_local_peer_outbox") &&
+            (yield* isPopulated(findPeerOutboxPopulation(undefined)))
+          ) {
+            return yield* InternalReplicaError.metadataMissing()
+          }
+          if (
+            optionalTables.has("effect_local_history_rewrites") &&
+            (yield* isPopulated(findHistoryRewritePopulation(undefined)))
+          ) {
+            return yield* InternalReplicaError.metadataMissing()
+          }
+        } else if (stored.storage_format_version !== storageFormatVersion) {
+          return yield* unsupportedStorageFormat(stored.storage_format_version)
+        }
+      }
+      yield* Migrations.run
+    })).pipe(Effect.catchTag("SchemaError", failStorageCorrupt))
+
     return yield* sql.withTransaction(Effect.gen(function*() {
       const metadata = yield* findMetadata(undefined)
       if (metadata.length === 0) {
-        const populated = yield* findPopulated(undefined)
-        if (populated._tag === "Some" && populated.value.populated === 1) {
-          return yield* metadataMissing()
+        if (yield* isPopulated(findPopulated(undefined))) {
+          return yield* InternalReplicaError.metadataMissing()
         }
         yield* sql`INSERT INTO effect_local_metadata (
           singleton,
@@ -182,7 +238,7 @@ export const make = (definition: ReplicaDefinition.Any) =>
       }
       const format = (yield* findFormat(undefined))[0]
       if (format === undefined) {
-        return yield* metadataMissing()
+        return yield* InternalReplicaError.metadataMissing()
       }
       if (format.storage_format_version !== storageFormatVersion) {
         return yield* unsupportedStorageFormat(format.storage_format_version)
@@ -207,7 +263,7 @@ export const make = (definition: ReplicaDefinition.Any) =>
       }
       yield* sql`UPDATE effect_local_metadata SET writer_generation = writer_generation + 1 WHERE singleton = 1`
       const row = yield* findPermit(undefined).pipe(
-        Effect.catchTag("NoSuchElementError", () => metadataMissing())
+        Effect.catchIf(Cause.isNoSuchElementError, InternalReplicaError.metadataMissing)
       )
       yield* sql`INSERT INTO effect_local_writer_generations (generation, claimed_at)
         VALUES (${row.writer_generation}, ${DateTime.formatIso(yield* DateTime.now)})`

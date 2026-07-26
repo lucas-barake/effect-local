@@ -9,6 +9,7 @@ import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import { vi } from "vitest"
@@ -78,6 +79,46 @@ describe("DocumentStore", () => {
       // A failed create must free the document it initialized; a freed document
       // throws on any access, a leaked one is still usable.
       assert.throws(() => InternalAutomerge.heads(leaked!))
+    }).pipe(Effect.provide(Store)))
+
+  it.effect("fails create with ReplicaMetadataMissing when metadata is absent", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
+
+      const result = yield* Effect.result(
+        store.create(Task, yield* Identity.makeDocumentId, { title: "missing", labels: [] })
+      )
+
+      assert.isTrue(Result.isFailure(result))
+      if (!Result.isFailure(result)) return
+      assert.strictEqual(result.failure.reason._tag as string, "ReplicaMetadataMissing")
+      const rows = yield* sql<{
+        readonly changes: number
+        readonly documents: number
+        readonly outbox: number
+      }>`SELECT
+        (SELECT COUNT(*) FROM effect_local_changes) AS changes,
+        (SELECT COUNT(*) FROM effect_local_documents) AS documents,
+        (SELECT COUNT(*) FROM effect_local_commit_outbox) AS outbox`
+      assert.deepStrictEqual(rows[0], { changes: 0, documents: 0, outbox: 0 })
+    }).pipe(Effect.provide(Store)))
+
+  it.effect("fails load with ReplicaMetadataMissing when metadata is absent", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      InternalAutomerge.free(created.automerge)
+      yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
+
+      const result = yield* Effect.result(store.load(Task, documentId))
+
+      assert.isTrue(Result.isFailure(result))
+      if (!Result.isFailure(result)) return
+      assert.strictEqual(result.failure.reason._tag as string, "ReplicaMetadataMissing")
     }).pipe(Effect.provide(Store)))
 
   it.effect("rolls application rows back with an outer transaction", () =>

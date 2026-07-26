@@ -4,6 +4,7 @@ import type * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
@@ -18,6 +19,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as DocumentStore from "./DocumentStore.js"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as InternalReplicaError from "./internal/replicaError.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -138,10 +140,6 @@ const CheckpointProvenanceRow = Schema.Struct({
 
 const CheckpointHashRow = Schema.Struct({
   checkpoint_hash: Schema.String
-})
-
-const CommitSequenceRow = Schema.Struct({
-  commit_sequence: Schema.Number
 })
 
 const CountRow = Schema.Struct({
@@ -486,14 +484,14 @@ export const layer: Layer.Layer<
           Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(request.writerProvenance)
         }`
     })
-    const findCommitSequence = SqlSchema.findAll({
+    const findCommitSequence = SqlSchema.findOne({
       Request: Schema.Void,
-      Result: CommitSequenceRow,
+      Result: Schema.Struct({ commit_sequence: Identity.CommitSequence }),
       execute: () => sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`
     })
-    const incrementCommitSequence = SqlSchema.findAll({
+    const incrementCommitSequence = SqlSchema.findOne({
       Request: Schema.Void,
-      Result: CommitSequenceRow,
+      Result: Schema.Struct({ commit_sequence: Identity.CommitSequence }),
       execute: () =>
         sql`UPDATE effect_local_metadata SET commit_sequence = commit_sequence + 1
           WHERE singleton = 1 RETURNING commit_sequence`
@@ -808,17 +806,15 @@ export const layer: Layer.Layer<
             AND accepted_at < ${cutoff}`
       }))
 
-    const nextSequence = incrementCommitSequence(undefined).pipe(Effect.flatMap((rows) =>
-      rows[0] === undefined
-        ? Effect.die(new Error("Replica metadata was not initialized"))
-        : Effect.succeed(Identity.CommitSequence.make(rows[0].commit_sequence))
-    ))
+    const nextSequence = incrementCommitSequence(undefined).pipe(
+      Effect.map((row) => row.commit_sequence),
+      Effect.catchIf(Cause.isNoSuchElementError, InternalReplicaError.metadataMissing)
+    )
 
-    const currentSequence = findCommitSequence(undefined).pipe(Effect.flatMap((rows) =>
-      rows[0] === undefined
-        ? Effect.die(new Error("Replica metadata was not initialized"))
-        : Effect.succeed(Identity.CommitSequence.make(rows[0].commit_sequence))
-    ))
+    const currentSequence = findCommitSequence(undefined).pipe(
+      Effect.map((row) => row.commit_sequence),
+      Effect.catchIf(Cause.isNoSuchElementError, InternalReplicaError.metadataMissing)
+    )
 
     const loadWriterProvenance = (documentId: Identity.DocumentId, message: Uint8Array) =>
       Effect.gen(function*() {
@@ -1177,15 +1173,6 @@ export const layer: Layer.Layer<
                 yield* validateSession(permit, session)
                 const nowMillis = yield* Clock.currentTimeMillis
                 const acceptedAt = new Date(nowMillis).toISOString()
-                yield* quotaLock.withPermit(Effect.gen(function*() {
-                  yield* validateSessionGeneration(generation, sessionGeneration)
-                  yield* expirePending(
-                    receiptSession,
-                    documentId,
-                    acceptedAt,
-                    new Date(nowMillis - limits.maxPendingAgeMillis).toISOString()
-                  ).pipe(Effect.catchTag("SqlError", failStorageUnavailable))
-                }))
                 const messageHash = yield* digest(message)
                 const validateReceipt = (receipt: typeof ReceiptRow.Type) =>
                   Effect.gen(function*() {
@@ -1214,21 +1201,35 @@ export const layer: Layer.Layer<
                       })
                     }
                   })
-                const receiptRows = yield* findReceipts({
-                  replicaIncarnation: receiptSession.replicaIncarnation,
-                  peerId: receiptSession.peerId,
-                  connectionEpoch: receiptSession.connectionEpoch,
-                  receiveSequence
-                }).pipe(
-                  Effect.catchTags({
-                    SqlError: failStorageUnavailable,
-                    SchemaError: failStorageCorrupt
-                  })
+                const receipt = yield* quotaLock.withPermit(
+                  sql.withTransaction(
+                    Effect.gen(function*() {
+                      yield* validateSessionGeneration(generation, sessionGeneration)
+                      yield* gate.validate(permit)
+                      yield* expirePending(
+                        receiptSession,
+                        documentId,
+                        acceptedAt,
+                        new Date(nowMillis - limits.maxPendingAgeMillis).toISOString()
+                      ).pipe(Effect.catchTag("SqlError", failStorageUnavailable))
+                      const receiptRows = yield* findReceipts({
+                        replicaIncarnation: receiptSession.replicaIncarnation,
+                        peerId: receiptSession.peerId,
+                        connectionEpoch: receiptSession.connectionEpoch,
+                        receiveSequence
+                      }).pipe(
+                        Effect.catchTags({
+                          SqlError: failStorageUnavailable,
+                          SchemaError: failStorageCorrupt
+                        })
+                      )
+                      const receipt = receiptRows[0]
+                      if (receipt !== undefined) yield* validateReceipt(receipt)
+                      return receipt
+                    })
+                  ).pipe(Effect.catchTag("SqlError", failStorageUnavailable))
                 )
-                const receipt = receiptRows[0]
                 if (receipt !== undefined) {
-                  yield* validateReceipt(receipt)
-                  yield* quotaLock.withPermit(validateSessionGeneration(generation, sessionGeneration))
                   return receivedFromReceipt(documentId, receipt)
                 }
                 const validateReceiptQuota = Effect.gen(function*() {
@@ -1785,6 +1786,7 @@ export const layer: Layer.Layer<
                       const result = yield* quotaLock.withPermit(Effect.gen(function*() {
                         const result = yield* sql.withTransaction(Effect.gen(function*() {
                           yield* validateSessionGeneration(generation, sessionGeneration)
+                          yield* gate.validate(permit)
                           const receiptRows = yield* findReceipts({
                             replicaIncarnation: receiptSession.replicaIncarnation,
                             peerId: receiptSession.peerId,
@@ -1805,7 +1807,6 @@ export const layer: Layer.Layer<
                             }))
                           })
                           const committedChangeMap = yield* validateExistingChanges(committedChanges)
-                          yield* gate.validate(permit)
                           const commitSequence = transition ? yield* nextSequence : yield* currentSequence
                           for (let index = 0; index < changes.length; index++) {
                             const change = changes[index]!

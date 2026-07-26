@@ -3,6 +3,7 @@ import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as DateTime from "effect/DateTime"
@@ -14,6 +15,7 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as InternalReplicaError from "./internal/replicaError.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as Recovery from "./Recovery.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -1058,7 +1060,7 @@ export const layer: Layer.Layer<
         }
         const definitionHash = yield* findDefinitionHash(undefined).pipe(
           Effect.map((row) => row.definition_hash),
-          Effect.catchTag("NoSuchElementError", () => Effect.die(new Error("Replica metadata was not initialized")))
+          Effect.catchIf(Cause.isNoSuchElementError, InternalReplicaError.metadataMissing)
         )
         // The stored schema version, not `document.version`: `recover` decodes at the version the
         // row records and does not migrate, so the value the re-rooted change carries is encoded at
@@ -1166,7 +1168,7 @@ export const layer: Layer.Layer<
           }
           const commitSequence = yield* nextCommitSequence(undefined).pipe(
             Effect.map((row) => row.commit_sequence),
-            Effect.catchTag("NoSuchElementError", () => Effect.die(new Error("Replica metadata was not initialized")))
+            Effect.catchIf(Cause.isNoSuchElementError, InternalReplicaError.metadataMissing)
           )
           yield* sql`DELETE FROM effect_local_changes WHERE document_id = ${documentId}`
           yield* sql`DELETE FROM effect_local_checkpoints WHERE document_id = ${documentId}`

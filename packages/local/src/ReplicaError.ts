@@ -62,6 +62,10 @@ export class StorageCorrupt extends Schema.TaggedErrorClass<StorageCorrupt>(
   "@lucas-barake/effect-local/ReplicaError/StorageCorrupt"
 )("StorageCorrupt", { cause: Schema.Defect() }) {}
 
+export class ReplicaMetadataMissing extends Schema.TaggedErrorClass<ReplicaMetadataMissing>(
+  "@lucas-barake/effect-local/ReplicaError/ReplicaMetadataMissing"
+)("ReplicaMetadataMissing", {}) {}
+
 export class QuotaExceeded extends Schema.TaggedErrorClass<QuotaExceeded>(
   "@lucas-barake/effect-local/ReplicaError/QuotaExceeded"
 )("QuotaExceeded", {
@@ -149,6 +153,7 @@ export const Reason = Schema.Union([
   StorageUnavailable,
   CanonicalEncodeError,
   StorageCorrupt,
+  ReplicaMetadataMissing,
   QuotaExceeded,
   MigrationFailed,
   BackupInvalid,

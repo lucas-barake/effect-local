@@ -198,10 +198,10 @@ export const make = Effect.gen(function*() {
   ) =>
     Effect.gen(function*() {
       const { changes, checkpoints, option } = yield* sql.withTransaction(Effect.gen(function*() {
+        yield* gate.validate(permit)
         const option = yield* findDocument(documentId)
         const checkpoints = yield* findVerifiedCheckpoints(documentId)
         const changes = yield* findChanges(documentId)
-        yield* gate.validate(permit)
         return { changes, checkpoints, option }
       })).pipe(
         Effect.catchTags({

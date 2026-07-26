@@ -100,6 +100,10 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     typeof ReplicaRpc.group,
     RpcClientError.RpcClientError
   >
+  const resolveRpcResponse = <A, E, R,>(
+    effect: Effect.Effect<A | Deferred.Deferred<A, E>, E, R>
+  ) =>
+    Effect.flatMap(effect, (value) => Deferred.isDeferred<A, E>(value) ? Deferred.await(value) : Effect.succeed(value))
   type FinishRestore = TestReplicaRpcClient["FinishRestoreBackupV4"]
   const dropTerminalReady = (
     rpc: TestReplicaRpcClient,
@@ -236,6 +240,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
 
   it.effect("decodes and rejects owners using an older protocol", () =>
     Effect.scoped(Effect.gen(function*() {
+      const sessions = yield* SessionManager.SessionManager
+      assert.strictEqual(ReplicaRpc.protocolVersion, 5)
       const open = ReplicaRpc.group.requests.get("OpenSession")
       if (open?._tag !== "OpenSession") return yield* Effect.die(new Error("OpenSession RPC not found"))
       yield* Schema.decodeUnknownEffect(open.successSchema)({
@@ -263,7 +269,63 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       })
       const error = yield* Effect.flip(ReplicaClient.fromRpcClient(definition, older))
       assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+      if (error.reason._tag === "ProtocolMismatch") {
+        assert.strictEqual(error.reason.expected, "protocol version 5")
+        assert.strictEqual(error.reason.observed, "protocol version 4")
+      }
+      assert.strictEqual(yield* sessions.activeCount, 0)
     })).pipe(Effect.provide(Owner)))
+
+  it.effect("decodes and rejects owners using a newer protocol", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sessions = yield* SessionManager.SessionManager
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const newer = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property !== "OpenSession") return value
+          return (payload: never) =>
+            value(payload).pipe(Effect.map((lease) => ({
+              ...(lease as {
+                readonly leaseMillis: number
+                readonly protocolVersion: number
+                readonly definitionHash: string
+                readonly ownerEpoch: string
+              }),
+              protocolVersion: ReplicaRpc.protocolVersion + 1
+            })))
+        }
+      })
+      const error = yield* Effect.flip(ReplicaClient.fromRpcClient(definition, newer))
+      assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+      if (error.reason._tag === "ProtocolMismatch") {
+        assert.strictEqual(error.reason.expected, "protocol version 5")
+        assert.strictEqual(error.reason.observed, "protocol version 6")
+      }
+      assert.strictEqual(yield* sessions.activeCount, 0)
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("owner rejects an explicit older client protocol before opening a session", () =>
+    Effect.gen(function*() {
+      const open = yield* ReplicaRpc.group.accessHandler("OpenSession")
+      const sessions = yield* SessionManager.SessionManager
+      const response = open({
+        sessionId: yield* Identity.makeSessionId,
+        protocolVersion: 4,
+        definitionHash: definition.hash
+      }, {
+        client: new Rpc.ServerClient(1),
+        requestId: RequestId("old-client"),
+        headers: Headers.empty
+      })
+      const error = yield* Effect.flip(resolveRpcResponse(response))
+      assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+      if (error.reason._tag === "ProtocolMismatch") {
+        assert.strictEqual(error.reason.expected, `5:${definition.hash}`)
+        assert.strictEqual(error.reason.observed, `4:${definition.hash}`)
+      }
+      assert.strictEqual(yield* sessions.activeCount, 0)
+    }).pipe(Effect.provide(Owner)))
 
   it.effect("recovers ambiguous commands through typed receipt lookup", () =>
     Effect.scoped(Effect.gen(function*() {

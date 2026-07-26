@@ -1,11 +1,13 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
+import * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import * as Projection from "@lucas-barake/effect-local/Projection"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
@@ -18,6 +20,7 @@ import * as Latch from "effect/Latch"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
+import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
@@ -28,6 +31,7 @@ import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as CommitPublisher from "../src/CommitPublisher.js"
 import * as DocumentStore from "../src/DocumentStore.js"
 import * as ClusterStorage from "../src/internal/clusterStorage.js"
+import * as PeerSession from "../src/PeerSession.js"
 import * as ProjectionStore from "../src/ProjectionStore.js"
 import * as QueryExecutor from "../src/QueryExecutor.js"
 import * as Recovery from "../src/Recovery.js"
@@ -76,6 +80,15 @@ describe("SqlReplica", () => {
     projections: [],
     queries: []
   })
+  type MetadataRow = {
+    readonly commit_sequence: Identity.CommitSequence
+    readonly definition_hash: string
+    readonly replica_id: Identity.ReplicaId
+    readonly replica_incarnation: Identity.ReplicaIncarnation
+    readonly singleton: number
+    readonly storage_format_version: number
+    readonly writer_generation: Identity.WriterGeneration
+  }
   const limits: ReplicaLimits.Values = {
     maxBackupBytes: 1024 * 1024,
     maxChunkBytes: 64 * 1024,
@@ -255,6 +268,286 @@ describe("SqlReplica", () => {
         (SELECT COUNT(*) FROM effect_local_command_receipts) AS receipts`
       assert.deepStrictEqual(rows[0], { changes: 6, clusterMessages: 8, documents: 4, receipts: 7 })
     }).pipe(Effect.provide(Live), Effect.provide(Database), TestClock.withLive))
+
+  it.effect("keeps missing metadata Mutate messages retryable", () =>
+    Effect.gen(function*() {
+      const replica = yield* Replica.Replica
+      const sql = yield* SqlClient.SqlClient
+      const created = yield* replica.create(Task, {
+        commandId: yield* Identity.makeCommandId,
+        value: { title: "before" }
+      })
+      assert.strictEqual(created._tag, "DurablyCommittedLocal")
+      if (created._tag !== "DurablyCommittedLocal") return
+      const metadata = yield* sql<MetadataRow>`SELECT * FROM effect_local_metadata WHERE singleton = 1`
+      assert.lengthOf(metadata, 1)
+      const before = yield* sql<{
+        readonly changes: number
+        readonly commitSequence: number
+      }>`SELECT
+        (SELECT COUNT(*) FROM effect_local_changes) AS changes,
+        (SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1) AS commitSequence`
+      yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
+      yield* Effect.addFinalizer(() =>
+        sql`INSERT OR IGNORE INTO effect_local_metadata ${sql.insert(metadata[0]!)}`.pipe(Effect.orDie)
+      )
+
+      const commandId = yield* Identity.makeCommandId
+      const requestHash = yield* CommandExecutor.mutationRequestHash({
+        incarnation: metadata[0]!.replica_incarnation,
+        commandId,
+        documentId: created.value,
+        mutation: Rename,
+        payload: "after"
+      })
+      const messageId = `EffectLocal/Document/${created.value}/Mutate/${
+        metadata[0]!.replica_incarnation
+      }:${commandId}:${requestHash}`
+      const first = yield* replica.mutate(Rename, {
+        commandId,
+        documentId: created.value,
+        payload: "after"
+      }).pipe(
+        Effect.result,
+        Effect.timeoutOption("1 second"),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Effect.addFinalizer(() =>
+        Fiber.interrupt(first).pipe(
+          Effect.andThen(Fiber.await(first)),
+          Effect.asVoid
+        )
+      )
+      let dispatched = false
+      yield* Effect.gen(function*() {
+        while (!first.pollUnsafe()) {
+          const rows = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+            FROM effect_local_cluster_messages WHERE message_id = ${messageId}`
+          if (rows[0]?.count === 1) {
+            dispatched = true
+            return
+          }
+          yield* sql`SELECT 1`
+        }
+      }).pipe(Effect.timeout("2 seconds"), TestClock.withLive)
+      if (dispatched) yield* TestClock.adjust("1 second")
+      const timed = yield* Fiber.join(first)
+      assert.isTrue(Option.isSome(timed))
+      if (!Option.isSome(timed)) return
+      assert.isTrue(Result.isFailure(timed.value))
+      if (!Result.isFailure(timed.value)) return
+      assert.strictEqual(timed.value.failure._tag, "ReplicaError")
+      if (timed.value.failure._tag !== "ReplicaError") return
+      assert.strictEqual(timed.value.failure.reason._tag, "ReplicaMetadataMissing")
+      assert.strictEqual(
+        (yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_cluster_messages WHERE message_id = ${messageId}`)[0]?.count,
+        0
+      )
+
+      yield* sql`INSERT INTO effect_local_metadata ${sql.insert(metadata[0]!)}`
+      const retried = yield* replica.mutate(Rename, {
+        commandId,
+        documentId: created.value,
+        payload: "after"
+      }).pipe(Effect.timeout("5 seconds"), TestClock.withLive)
+      assert.deepStrictEqual(retried, CommandOutcome.durablyCommitted(commandId, undefined))
+      assert.strictEqual((yield* replica.get(Task, created.value)).value.title, "after")
+      assert.strictEqual(
+        (yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_command_receipts
+          WHERE replica_incarnation = ${metadata[0]!.replica_incarnation}
+            AND command_id = ${commandId}`)[0]?.count,
+        1
+      )
+      const after = yield* sql<{
+        readonly changes: number
+        readonly commitSequence: number
+      }>`SELECT
+        (SELECT COUNT(*) FROM effect_local_changes) AS changes,
+        (SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1) AS commitSequence`
+      assert.deepStrictEqual(after[0], {
+        changes: before[0]!.changes + 1,
+        commitSequence: before[0]!.commitSequence + 1
+      })
+      const newest = yield* sql<{
+        readonly commitSequence: number
+        readonly documentId: Identity.DocumentId
+      }>`SELECT commit_sequence AS commitSequence, document_id AS documentId
+        FROM effect_local_commit_outbox ORDER BY commit_sequence DESC LIMIT 1`
+      assert.deepStrictEqual(newest[0], {
+        commitSequence: after[0]!.commitSequence,
+        documentId: created.value
+      })
+    }).pipe(Effect.scoped, Effect.provide(Live), Effect.provide(Database)))
+
+  it.effect("does not adopt a foreign writer during command preflight", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const replica = yield* Replica.Replica
+      const sql = yield* SqlClient.SqlClient
+      const created = yield* replica.create(Task, {
+        commandId: yield* Identity.makeCommandId,
+        value: { title: "before" }
+      })
+      assert.strictEqual(created._tag, "DurablyCommittedLocal")
+      if (created._tag !== "DurablyCommittedLocal") return
+      const local = yield* gate.current
+      yield* sql`UPDATE effect_local_metadata SET writer_generation = writer_generation + 1 WHERE singleton = 1`
+      yield* Effect.addFinalizer(() =>
+        sql`UPDATE effect_local_metadata SET writer_generation = ${local.writerGeneration}
+          WHERE singleton = 1`.pipe(Effect.orDie)
+      )
+
+      const attempt = (commandId: Identity.CommandId, payload: string) =>
+        Effect.gen(function*() {
+          const requestHash = yield* CommandExecutor.mutationRequestHash({
+            incarnation: local.incarnation,
+            commandId,
+            documentId: created.value,
+            mutation: Rename,
+            payload
+          })
+          const messageId =
+            `EffectLocal/Document/${created.value}/Mutate/${local.incarnation}:${commandId}:${requestHash}`
+          const fiber = yield* replica.mutate(Rename, {
+            commandId,
+            documentId: created.value,
+            payload
+          }).pipe(
+            Effect.result,
+            Effect.timeoutOption("1 second"),
+            Effect.forkChild({ startImmediately: true })
+          )
+          yield* Effect.addFinalizer(() =>
+            Fiber.interrupt(fiber).pipe(
+              Effect.andThen(Fiber.await(fiber)),
+              Effect.asVoid
+            )
+          )
+          let dispatched = false
+          yield* Effect.gen(function*() {
+            while (!fiber.pollUnsafe()) {
+              const rows = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+                FROM effect_local_cluster_messages WHERE message_id = ${messageId}`
+              if (rows[0]?.count === 1) {
+                dispatched = true
+                return
+              }
+              yield* sql`SELECT 1`
+            }
+          }).pipe(Effect.timeout("2 seconds"), TestClock.withLive)
+          if (dispatched) yield* TestClock.adjust("1 second")
+          return [yield* Fiber.join(fiber), messageId] as const
+        })
+
+      const [first, firstMessageId] = yield* attempt(yield* Identity.makeCommandId, "first")
+      const [second, secondMessageId] = yield* attempt(yield* Identity.makeCommandId, "second")
+      for (const result of [first, second]) {
+        assert.isTrue(Option.isSome(result))
+        if (!Option.isSome(result)) return
+        assert.isTrue(Result.isFailure(result.value))
+        if (!Result.isFailure(result.value)) return
+        assert.strictEqual(result.value.failure._tag, "ReplicaError")
+        if (result.value.failure._tag !== "ReplicaError") return
+        assert.strictEqual(result.value.failure.reason._tag, "ReplicaFenced")
+      }
+      assert.deepStrictEqual(yield* gate.current, local)
+      for (const messageId of [firstMessageId, secondMessageId]) {
+        assert.strictEqual(
+          (yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+            FROM effect_local_cluster_messages WHERE message_id = ${messageId}`)[0]?.count,
+          0
+        )
+      }
+    }).pipe(Effect.scoped, Effect.provide(Live), Effect.provide(Database)))
+
+  it.effect("rejects missing replica metadata before dispatching inbound ApplySync", () =>
+    Effect.gen(function*() {
+      const replica = yield* Replica.Replica
+      const sql = yield* SqlClient.SqlClient
+      const created = yield* replica.create(Task, {
+        commandId: yield* Identity.makeCommandId,
+        value: { title: "before" }
+      })
+      assert.strictEqual(created._tag, "DurablyCommittedLocal")
+      if (created._tag !== "DurablyCommittedLocal") return
+      const peerId = yield* Identity.makePeerId
+      const inbound = yield* Queue.unbounded<Uint8Array>()
+      yield* Effect.addFinalizer(() => Queue.shutdown(inbound))
+      const transport = PeerTransport.PeerTransport.of({
+        capabilities: { storeAndForward: false },
+        connect: () =>
+          Effect.succeed({
+            peerId,
+            capabilities: { storeAndForward: false },
+            receive: Stream.fromQueue(inbound),
+            send: () => Effect.void,
+            close: Effect.void
+          })
+      })
+      const session = yield* PeerSession.makeSupervised({
+        peerId,
+        documents: [{ document: Task, documentId: created.value }]
+      }).pipe(
+        Effect.provideService(PeerTransport.PeerTransport, transport),
+        Effect.provideService(ReplicaLimits.ReplicaLimits, limits)
+      )
+      const disconnected = yield* Effect.result(session.awaitDisconnect).pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Effect.addFinalizer(() =>
+        Fiber.interrupt(disconnected).pipe(
+          Effect.andThen(Fiber.await(disconnected)),
+          Effect.asVoid
+        )
+      )
+      const metadata = yield* sql<MetadataRow>`SELECT * FROM effect_local_metadata WHERE singleton = 1`
+      assert.lengthOf(metadata, 1)
+      const before = yield* sql<{ readonly sequence: number }>`SELECT
+        COALESCE(MAX(commit_sequence), 0) AS sequence FROM effect_local_commit_outbox`
+      yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
+      yield* Effect.addFinalizer(() =>
+        sql`INSERT OR IGNORE INTO effect_local_metadata ${sql.insert(metadata[0]!)}`.pipe(Effect.orDie)
+      )
+      const message = Uint8Array.of(1)
+      const messageHash = yield* Canonical.digest(message)
+      const encoded = yield* Schema.encodeEffect(
+        Schema.fromJsonString(Schema.toCodecJson(PeerSession.SyncEnvelope))
+      )({
+        connectionEpoch: "remote-epoch",
+        sequence: 0,
+        documentId: created.value,
+        documentType: Task.name,
+        messageHash,
+        message,
+        lineage: Identity.genesisLineage,
+        writerProvenance: []
+      }).pipe(Effect.map((value) => new TextEncoder().encode(value)))
+      yield* Queue.offer(inbound, encoded)
+
+      const timed = yield* Fiber.join(disconnected).pipe(
+        Effect.timeoutOption("2 seconds"),
+        TestClock.withLive
+      )
+      assert.isTrue(Option.isSome(timed))
+      if (!Option.isSome(timed)) return
+      assert.isTrue(Result.isFailure(timed.value))
+      if (!Result.isFailure(timed.value)) return
+      assert.strictEqual(timed.value.failure._tag, "ReplicaError")
+      assert.strictEqual(timed.value.failure.reason._tag, "ReplicaMetadataMissing")
+      assert.strictEqual(
+        (yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_cluster_messages
+          WHERE message_id LIKE ${`EffectLocal/Document/${created.value}/ApplySync/%`}`)[0]?.count,
+        0
+      )
+      assert.deepStrictEqual(
+        yield* sql<{ readonly sequence: number }>`SELECT
+          COALESCE(MAX(commit_sequence), 0) AS sequence FROM effect_local_commit_outbox`,
+        before
+      )
+    }).pipe(Effect.scoped, Effect.provide(Live), Effect.provide(Database)))
 
   it.effect("provides nonempty projection bindings", () =>
     Effect.gen(function*() {

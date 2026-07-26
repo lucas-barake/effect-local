@@ -453,6 +453,7 @@ const makeWithTerminal = (
           Effect.gen(function*() {
             const incarnation = yield* Effect.scoped(Effect.gen(function*() {
               const permit = yield* gate.shared
+              yield* gate.preflight(permit)
               if (permit.incarnation !== session.replicaIncarnation) {
                 return yield* new ReplicaError.ReplicaError({
                   reason: new ReplicaError.ProtocolMismatch({

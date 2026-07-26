@@ -10,6 +10,7 @@ import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
+import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import type * as Exit from "effect/Exit"
@@ -1704,6 +1705,99 @@ describe("PeerSync", () => {
       InternalAutomerge.free(remote)
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(TestLayer)))
+
+  it.effect("fences a raced duplicate when metadata disappears before commit", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const sql = yield* SqlClient.SqlClient
+        const store = yield* DocumentStore.DocumentStore
+        const documentId = yield* Identity.makeDocumentId
+        const peerId = yield* Identity.makePeerId
+        const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+        yield* Effect.addFinalizer(() => Effect.sync(() => InternalAutomerge.free(created.automerge)))
+        const remote = Automerge.change(
+          Automerge.clone(created.automerge, { actor: "7".repeat(32) }),
+          (draft) => {
+            ;(draft.value as { title: string }).title = "two"
+          }
+        )
+        yield* Effect.addFinalizer(() => Effect.sync(() => InternalAutomerge.free(remote)))
+        const message = Automerge.generateSyncMessage(remote, Automerge.initSyncState())[1]!
+        const input = {
+          remoteConnectionEpoch: "raced-remote",
+          receiveSequence: 0,
+          lineage: Identity.genesisLineage,
+          message,
+          writerProvenance: provenanceFor(message, Task.version, definition.hash)
+        }
+        const loaded = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined).pipe(Effect.asVoid))
+        const blockingStore = new Proxy(store, {
+          get(target, property, receiver) {
+            if (property !== "load") return Reflect.get(target, property, receiver)
+            const load: typeof store.load = (document, documentId) =>
+              store.load(document, documentId).pipe(
+                Effect.tap(() =>
+                  Deferred.succeed(loaded, undefined).pipe(
+                    Effect.andThen(Deferred.await(release))
+                  )
+                )
+              )
+            return load
+          }
+        })
+        const loserContext = yield* Layer.build(
+          Layer.fresh(PeerSync.layer).pipe(
+            Layer.provide(Layer.succeed(DocumentStore.DocumentStore, blockingStore)),
+            Layer.provide(Services)
+          )
+        )
+        const winnerContext = yield* Layer.build(
+          Layer.fresh(PeerSync.layer).pipe(Layer.provide(Services))
+        )
+        const loser = Context.get(loserContext, PeerSync.PeerSync)
+        const winner = Context.get(winnerContext, PeerSync.PeerSync)
+        const loserSession = yield* loser.open(peerId)
+        const winnerSession = yield* winner.open(peerId)
+        const metadata = yield* sql`SELECT * FROM effect_local_metadata WHERE singleton = 1`
+        assert.lengthOf(metadata, 1)
+        yield* Effect.addFinalizer(() =>
+          sql`INSERT OR IGNORE INTO effect_local_metadata ${sql.insert(metadata[0]!)}`.pipe(Effect.orDie)
+        )
+
+        const losing = yield* loser.receive(Task, documentId, loserSession, input).pipe(
+          Effect.result,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Effect.addFinalizer(() =>
+          Fiber.interrupt(losing).pipe(
+            Effect.andThen(Fiber.await(losing)),
+            Effect.asVoid
+          )
+        )
+        yield* Deferred.await(loaded)
+        const won = yield* winner.receive(Task, documentId, winnerSession, input)
+        assert.isFalse(won.duplicate)
+        yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
+        yield* Deferred.succeed(release, undefined)
+
+        const lost = yield* Fiber.join(losing)
+        assert.isTrue(Result.isFailure(lost))
+        if (!Result.isFailure(lost)) return
+        assert.strictEqual(lost.failure._tag, "ReplicaError")
+        if (lost.failure._tag === "ReplicaError") {
+          assert.strictEqual(lost.failure.reason._tag as string, "ReplicaMetadataMissing")
+        }
+        const receipts = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+        FROM effect_local_peer_receipts
+        WHERE replica_incarnation = ${loserSession.replicaIncarnation}
+          AND peer_id = ${peerId}
+          AND connection_epoch = ${input.remoteConnectionEpoch}
+          AND receive_sequence = ${input.receiveSequence}`
+        assert.strictEqual(receipts[0]?.count, 1)
+      }).pipe(Effect.provide(Services))
+    ))
 
   it.effect("serializes one document across sessions without blocking independent documents", () =>
     Effect.gen(function*() {
