@@ -578,6 +578,7 @@ export const layerHandlers = (
     const sessionTransport = (entry: Entry) => {
       let currentInbound: number | undefined
       let started = false
+      const closeRequested = Deferred.makeUnsafe<never>()
       const receive = Stream.fromPull(Effect.succeed(
         Effect.gen(function*() {
           if (currentInbound !== undefined) {
@@ -588,7 +589,7 @@ export const layerHandlers = (
             started = true
             yield* Deferred.succeed(entry.inboundConsumerStarted, undefined)
           }
-          const item = yield* Queue.take(entry.inbound)
+          const item = yield* Effect.raceFirst(Deferred.await(closeRequested), Queue.take(entry.inbound))
           currentInbound = item.id
           return Arr.of(item.payload)
         })
@@ -696,7 +697,7 @@ export const layerHandlers = (
               capabilities: { storeAndForward: false, lineageAware: entry.lineageAware },
               receive,
               send,
-              close: Effect.void
+              close: Deferred.interrupt(closeRequested).pipe(Effect.asVoid)
             })
       })
     }
