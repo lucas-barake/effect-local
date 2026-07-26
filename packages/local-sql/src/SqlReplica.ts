@@ -23,6 +23,7 @@ import * as DocumentStore from "./DocumentStore.js"
 import * as DurableRuntime from "./DurableRuntime.js"
 import * as EntityReplica from "./EntityReplica.js"
 import * as InternalAutomerge from "./internal/automerge.js"
+import type * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
 import type * as PeerSync from "./PeerSync.js"
 import * as ProjectionStore from "./ProjectionStore.js"
 import * as QueryExecutor from "./QueryExecutor.js"
@@ -174,26 +175,13 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
     })
   )
 
-export const layer = <D extends ReplicaDefinition.Any, const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
+const makeBase = <
+  D extends ReplicaDefinition.Any,
+  const Bindings extends ReadonlyArray<SqlProjection.Any>,
+>(
   definition: D,
   options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
-): Layer.Layer<
-  | CommitPublisher.CommitPublisher
-  | PeerSync.PeerSync
-  | Replica.Replica
-  | ReplicaEvolution.ReplicaEvolution
-  | ReplicaGate.ReplicaGate
-  | ReplicaWorkflow.CompactionWorkflow
-  | ReplicaWorkflow.HistoryRewriteWorkflow
-  | Sharding.Sharding,
-  ConfigError | Migrator.MigrationError | ReplicaError.ReplicaError | SqlError.SqlError,
-  | CommandExecutor.MutationHandlers<D>
-  | ProjectionStore.BindingServices<Bindings>
-  | QueryExecutor.QueryHandlers<D>
-  | ReplicaLimits.ReplicaLimits
-  | Crypto.Crypto
-  | SqlClient.SqlClient
-> => {
+) => {
   const expected = new Set(definition.projections)
   const actual = new Set(options.projections.map((binding) => binding.projection))
   if (
@@ -218,7 +206,62 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   )
   const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
   const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
+  return { backups, compaction }
+}
+
+export const layer = <D extends ReplicaDefinition.Any, const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
+  definition: D,
+  options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
+): Layer.Layer<
+  | CommitPublisher.CommitPublisher
+  | PeerSync.PeerSync
+  | Replica.Replica
+  | ReplicaEvolution.ReplicaEvolution
+  | ReplicaGate.ReplicaGate
+  | ReplicaWorkflow.CompactionWorkflow
+  | ReplicaWorkflow.HistoryRewriteWorkflow
+  | Sharding.Sharding,
+  ConfigError | Migrator.MigrationError | ReplicaError.ReplicaError | SqlError.SqlError,
+  | CommandExecutor.MutationHandlers<D>
+  | ProjectionStore.BindingServices<Bindings>
+  | QueryExecutor.QueryHandlers<D>
+  | ReplicaLimits.ReplicaLimits
+  | Crypto.Crypto
+  | SqlClient.SqlClient
+> => {
+  const { backups, compaction } = makeBase(definition, options)
   const durable = DurableRuntime.layer(definition).pipe(
+    Layer.provideMerge(Layer.merge(backups, compaction))
+  )
+  return EntityReplica.layer(definition).pipe(Layer.provideMerge(durable))
+}
+
+export const layerRelay = <
+  D extends ReplicaDefinition.Any,
+  const Bindings extends ReadonlyArray<SqlProjection.Any>,
+>(
+  definition: D,
+  options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
+): Layer.Layer<
+  | CommitPublisher.CommitPublisher
+  | PeerSync.PeerSync
+  | Replica.Replica
+  | ReplicaEvolution.ReplicaEvolution
+  | ReplicaGate.ReplicaGate
+  | ReplicaWorkflow.CompactionWorkflow
+  | ReplicaWorkflow.HistoryRewriteWorkflow
+  | Sharding.Sharding,
+  ConfigError | Migrator.MigrationError | ReplicaError.ReplicaError | SqlError.SqlError,
+  | CommandExecutor.MutationHandlers<D>
+  | ProjectionStore.BindingServices<Bindings>
+  | QueryExecutor.QueryHandlers<D>
+  | ReplicaLimits.ReplicaLimits
+  | PeerRelayReceiptLimits.PeerRelayReceiptLimits
+  | Crypto.Crypto
+  | SqlClient.SqlClient
+> => {
+  const { backups, compaction } = makeBase(definition, options)
+  const durable = DurableRuntime.layerRelay(definition).pipe(
     Layer.provideMerge(Layer.merge(backups, compaction))
   )
   return EntityReplica.layer(definition).pipe(Layer.provideMerge(durable))

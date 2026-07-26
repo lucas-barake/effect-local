@@ -18,6 +18,7 @@ export const peerWriterProvenanceChecksum = "sha256:effect-local-peer-writer-pro
 export const replicaHealthIndexesChecksum = "sha256:effect-local-replica-health-indexes-v1"
 export const documentLineageChecksum = "sha256:effect-local-document-lineage-v1"
 export const historyRewriteMarkersChecksum = "sha256:effect-local-history-rewrite-markers-v1"
+export const peerRelayStateChecksum = "sha256:effect-local-peer-relay-state-v2"
 
 const migration = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
@@ -422,6 +423,203 @@ const historyRewriteMarkersMigration = Effect.gen(function*() {
     VALUES (9, 'history_rewrite_markers', ${historyRewriteMarkersChecksum})`
 })
 
+const peerRelayStateMigration = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`CREATE TABLE effect_local_peer_receipts_relay (
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    replica_incarnation INTEGER NOT NULL,
+    peer_id TEXT NOT NULL,
+    connection_epoch TEXT NOT NULL,
+    receive_sequence INTEGER NOT NULL,
+    document_id TEXT NOT NULL REFERENCES effect_local_documents(document_id) ON DELETE CASCADE,
+    message_hash TEXT NOT NULL,
+    reply BLOB,
+    reply_hash TEXT,
+    pending_message BLOB,
+    heads TEXT NOT NULL,
+    accepted_heads TEXT NOT NULL,
+    commit_sequence INTEGER NOT NULL,
+    accepted_at TEXT NOT NULL,
+    writer_provenance TEXT NOT NULL DEFAULT '[]',
+    relay_sender_tenant_id TEXT,
+    relay_sender_subject_id TEXT,
+    relay_sender_peer_id TEXT,
+    relay_message_id TEXT,
+    relay_outer_envelope_digest TEXT,
+    relay_receipt_expires_at TEXT,
+    relay_encoded_size INTEGER,
+    CHECK (
+      (
+        relay_sender_tenant_id IS NULL
+        AND relay_sender_subject_id IS NULL
+        AND relay_sender_peer_id IS NULL
+        AND relay_message_id IS NULL
+        AND relay_outer_envelope_digest IS NULL
+        AND relay_receipt_expires_at IS NULL
+        AND relay_encoded_size IS NULL
+      )
+      OR (
+        relay_sender_tenant_id IS NOT NULL
+        AND length(relay_sender_tenant_id) > 0
+        AND relay_sender_subject_id IS NOT NULL
+        AND length(relay_sender_subject_id) > 0
+        AND relay_sender_peer_id IS NOT NULL
+        AND length(relay_sender_peer_id) > 0
+        AND relay_message_id IS NOT NULL
+        AND length(relay_message_id) > 0
+        AND relay_outer_envelope_digest IS NOT NULL
+        AND length(relay_outer_envelope_digest) = 64
+        AND relay_receipt_expires_at IS NOT NULL
+        AND length(relay_receipt_expires_at) > 0
+        AND relay_encoded_size > 0
+      )
+    )
+  )`
+  yield* sql`INSERT INTO effect_local_peer_receipts_relay (
+    replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id,
+    message_hash, reply, reply_hash, pending_message, heads, accepted_heads,
+    commit_sequence, accepted_at, writer_provenance
+  )
+  SELECT
+    replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id,
+    message_hash, reply, reply_hash, pending_message, heads, accepted_heads,
+    commit_sequence, accepted_at, writer_provenance
+  FROM effect_local_peer_receipts`
+  yield* sql`DROP TABLE effect_local_peer_receipts`
+  yield* sql`ALTER TABLE effect_local_peer_receipts_relay
+    RENAME TO effect_local_peer_receipts`
+  yield* sql`CREATE UNIQUE INDEX effect_local_peer_receipts_direct_identity
+    ON effect_local_peer_receipts(
+      replica_incarnation,
+      peer_id,
+      connection_epoch,
+      receive_sequence
+    )
+    WHERE relay_message_id IS NULL`
+  yield* sql`CREATE UNIQUE INDEX effect_local_peer_receipts_relay_identity
+    ON effect_local_peer_receipts(
+      replica_incarnation,
+      relay_sender_tenant_id,
+      relay_sender_subject_id,
+      relay_sender_peer_id,
+      relay_message_id
+    )
+    WHERE relay_message_id IS NOT NULL`
+  yield* sql`CREATE INDEX effect_local_peer_receipts_document_sequence
+    ON effect_local_peer_receipts(document_id, commit_sequence)`
+  yield* sql`CREATE INDEX effect_local_peer_receipts_incarnation_accepted
+    ON effect_local_peer_receipts(replica_incarnation, accepted_at)`
+  yield* sql`CREATE INDEX effect_local_peer_receipts_pending_document
+    ON effect_local_peer_receipts(replica_incarnation, document_id)
+    WHERE pending_message IS NOT NULL`
+  yield* sql`CREATE INDEX effect_local_peer_receipts_pending_peer
+    ON effect_local_peer_receipts(replica_incarnation, peer_id)
+    WHERE pending_message IS NOT NULL`
+  yield* sql`CREATE INDEX effect_local_peer_receipts_relay_expiry
+    ON effect_local_peer_receipts(
+      replica_incarnation,
+      relay_receipt_expires_at,
+      relay_sender_tenant_id,
+      relay_sender_subject_id,
+      relay_sender_peer_id,
+      relay_message_id,
+      row_id
+    )
+    WHERE relay_message_id IS NOT NULL`
+  yield* sql`CREATE TABLE effect_local_peer_relay_receipt_usage (
+    replica_incarnation INTEGER NOT NULL CHECK (replica_incarnation >= 0),
+    sender_tenant_id TEXT NOT NULL CHECK (length(sender_tenant_id) > 0),
+    sender_subject_id TEXT NOT NULL CHECK (length(sender_subject_id) > 0),
+    sender_peer_id TEXT NOT NULL CHECK (length(sender_peer_id) > 0),
+    receipt_count INTEGER NOT NULL CHECK (receipt_count >= 0),
+    encoded_bytes INTEGER NOT NULL CHECK (encoded_bytes >= 0),
+    PRIMARY KEY(replica_incarnation, sender_tenant_id, sender_subject_id, sender_peer_id),
+    CHECK (
+      (receipt_count = 0 AND encoded_bytes = 0)
+      OR (receipt_count > 0 AND encoded_bytes > 0)
+    )
+  )`
+  yield* sql`CREATE TABLE effect_local_peer_relay_outbox (
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    replica_id TEXT NOT NULL CHECK (length(replica_id) > 0),
+    replica_incarnation INTEGER NOT NULL CHECK (replica_incarnation >= 0),
+    writer_generation INTEGER NOT NULL CHECK (writer_generation >= 0),
+    expected_local_tenant_id TEXT NOT NULL CHECK (length(expected_local_tenant_id) > 0),
+    expected_local_subject_id TEXT NOT NULL CHECK (length(expected_local_subject_id) > 0),
+    expected_local_peer_id TEXT NOT NULL CHECK (length(expected_local_peer_id) > 0),
+    remote_tenant_id TEXT NOT NULL CHECK (length(remote_tenant_id) > 0),
+    remote_subject_id TEXT NOT NULL CHECK (length(remote_subject_id) > 0),
+    remote_peer_id TEXT NOT NULL CHECK (length(remote_peer_id) > 0),
+    relay_peer_id TEXT NOT NULL CHECK (length(relay_peer_id) > 0),
+    relay_message_id TEXT NOT NULL CHECK (length(relay_message_id) > 0),
+    outer_envelope_digest TEXT NOT NULL CHECK (length(outer_envelope_digest) = 64),
+    protocol_version INTEGER NOT NULL CHECK (protocol_version = 3),
+    payload_version INTEGER NOT NULL CHECK (payload_version = 1),
+    sender_connection_epoch TEXT NOT NULL CHECK (length(sender_connection_epoch) > 0),
+    sender_sequence INTEGER NOT NULL CHECK (sender_sequence >= 0),
+    document_id TEXT NOT NULL REFERENCES effect_local_documents(document_id) ON DELETE RESTRICT,
+    document_type TEXT NOT NULL CHECK (length(document_type) > 0),
+    writer_provenance TEXT NOT NULL,
+    message_hash TEXT NOT NULL CHECK (length(message_hash) = 64),
+    payload BLOB NOT NULL,
+    encoded_size INTEGER NOT NULL CHECK (encoded_size > 0 AND encoded_size = length(payload)),
+    created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+    retry_deadline TEXT NOT NULL CHECK (length(retry_deadline) > 0),
+    next_attempt_at TEXT NOT NULL CHECK (length(next_attempt_at) > 0),
+    custody_state TEXT NOT NULL CHECK (custody_state IN ('Pending', 'InFlight')),
+    CHECK (expected_local_tenant_id = remote_tenant_id),
+    UNIQUE(replica_id, replica_incarnation, relay_message_id),
+    UNIQUE(
+      replica_id,
+      replica_incarnation,
+      relay_peer_id,
+      remote_tenant_id,
+      remote_subject_id,
+      remote_peer_id,
+      sender_connection_epoch,
+      sender_sequence
+    )
+  )`
+  yield* sql`CREATE INDEX effect_local_peer_relay_outbox_due_endpoint
+    ON effect_local_peer_relay_outbox(
+      replica_id,
+      replica_incarnation,
+      relay_peer_id,
+      remote_tenant_id,
+      remote_subject_id,
+      remote_peer_id,
+      custody_state,
+      next_attempt_at,
+      row_id
+    )`
+  yield* sql`CREATE INDEX effect_local_peer_relay_outbox_retry_deadline
+    ON effect_local_peer_relay_outbox(replica_id, replica_incarnation, retry_deadline, row_id)`
+  yield* sql`CREATE TABLE effect_local_peer_relay_outbox_remote_usage (
+    replica_incarnation INTEGER NOT NULL CHECK (replica_incarnation >= 0),
+    remote_tenant_id TEXT NOT NULL CHECK (length(remote_tenant_id) > 0),
+    remote_subject_id TEXT NOT NULL CHECK (length(remote_subject_id) > 0),
+    remote_peer_id TEXT NOT NULL CHECK (length(remote_peer_id) > 0),
+    message_count INTEGER NOT NULL CHECK (message_count >= 0),
+    encoded_bytes INTEGER NOT NULL CHECK (encoded_bytes >= 0),
+    PRIMARY KEY(replica_incarnation, remote_tenant_id, remote_subject_id, remote_peer_id),
+    CHECK (
+      (message_count = 0 AND encoded_bytes = 0)
+      OR (message_count > 0 AND encoded_bytes > 0)
+    )
+  )`
+  yield* sql`CREATE TABLE effect_local_peer_relay_outbox_replica_usage (
+    replica_incarnation INTEGER PRIMARY KEY CHECK (replica_incarnation >= 0),
+    message_count INTEGER NOT NULL CHECK (message_count >= 0),
+    encoded_bytes INTEGER NOT NULL CHECK (encoded_bytes >= 0),
+    CHECK (
+      (message_count = 0 AND encoded_bytes = 0)
+      OR (message_count > 0 AND encoded_bytes > 0)
+    )
+  )`
+  yield* sql`INSERT INTO effect_local_migration_catalog (migration_id, name, checksum)
+    VALUES (10, 'peer_relay_state', ${peerRelayStateChecksum})`
+})
+
 export const loader = Migrator.fromRecord({
   "1_canonical_store": migration,
   "2_peer_sync": peerSyncMigration,
@@ -431,7 +629,8 @@ export const loader = Migrator.fromRecord({
   "6_peer_writer_provenance": peerWriterProvenanceMigration,
   "7_replica_health_indexes": replicaHealthIndexesMigration,
   "8_document_lineage": documentLineageMigration,
-  "9_history_rewrite_markers": historyRewriteMarkersMigration
+  "9_history_rewrite_markers": historyRewriteMarkersMigration,
+  "10_peer_relay_state": peerRelayStateMigration
 })
 
 const migrate = Migrator.make({})({ loader, table: "effect_local_migrations" })
@@ -473,6 +672,12 @@ export const run = Effect.gen(function*() {
       name: "history_rewrite_markers",
       checksum: historyRewriteMarkersChecksum,
       label: "History rewrite markers"
+    },
+    {
+      id: 10,
+      name: "peer_relay_state",
+      checksum: peerRelayStateChecksum,
+      label: "Peer relay state"
     }
   ] as const
   // One transaction over migrate + validation so a rejected catalog rolls back

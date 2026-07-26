@@ -1,6 +1,9 @@
 import { assert, describe, it } from "@effect/vitest"
+import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
-import { Document, DocumentSet, Mutation, Query, SchemaDescriptor } from "../src/index.js"
+import * as Stream from "effect/Stream"
+import { Document, DocumentSet, Identity, Mutation, PeerTransport, Query, SchemaDescriptor } from "../src/index.js"
+import type * as ReplicaError from "../src/ReplicaError.js"
 
 type Equal<A, B,> = (<T,>() => T extends A ? 1 : 2) extends <T,>() => T extends B ? 1 : 2 ? true : false
 
@@ -86,5 +89,67 @@ describe("public API types", () => {
   it("exports the schema descriptor contract", () => {
     const descriptor: SchemaDescriptor.Descriptor = SchemaDescriptor.make(Schema.String)
     assert.isDefined(descriptor)
+  })
+
+  it("adds acknowledged relay delivery without changing the direct transport shape", () => {
+    const peerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000002")
+    const relayMessageId = Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000003")
+    const relayPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000004")
+    const directConnection = {
+      peerId,
+      capabilities: { storeAndForward: false },
+      receive: Stream.empty,
+      send: () => Effect.void,
+      close: Effect.void
+    } satisfies PeerTransport.Connection
+    const directConnectionApi: PeerTransport.Connection = directConnection
+    const directTransport = PeerTransport.PeerTransport.of({
+      capabilities: { storeAndForward: false },
+      connect: () => Effect.succeed(directConnection)
+    })
+    const identity: PeerTransport.RelayDeliveryIdentity = {
+      relayMessageId,
+      relayPeerId: peerId,
+      senderTenantId: "tenant",
+      senderSubjectId: "subject",
+      senderPeerId: peerId,
+      senderReplicaIncarnation: Identity.ReplicaIncarnation.make(1),
+      messageHash: "a".repeat(64),
+      outerEnvelopeDigest: "b".repeat(64)
+    }
+    const delivery: PeerTransport.AcknowledgedDelivery = {
+      message: new Uint8Array([1]),
+      identity,
+      receiptRetentionMillis: 1,
+      acknowledge: Effect.void,
+      reject: (_reason) => Effect.void
+    }
+    const relayConnection = {
+      ...directConnection,
+      relayPeerId,
+      capabilities: { storeAndForward: true },
+      receiveWithAcknowledgement: Stream.make(delivery)
+    } satisfies PeerTransport.Connection
+    const optionalAcknowledgedReceive: Equal<
+      PeerTransport.Connection["receiveWithAcknowledgement"],
+      Stream.Stream<PeerTransport.AcknowledgedDelivery, ReplicaError.ReplicaError> | undefined
+    > = true
+    const optionalRelayPeerId: Equal<
+      PeerTransport.Connection["relayPeerId"],
+      Identity.PeerId | undefined
+    > = true
+    const protocolRejection = delivery.reject("ProtocolInvalid")
+    const applicationRejection = delivery.reject("ApplicationRejected")
+    assert.isDefined(directTransport)
+    assert.isUndefined(directConnectionApi.relayPeerId)
+    assert.isUndefined(directConnectionApi.receiveWithAcknowledgement)
+    assert.strictEqual(relayConnection.relayPeerId, relayPeerId)
+    assert.isDefined(relayConnection.receiveWithAcknowledgement)
+    assert.isTrue(optionalAcknowledgedReceive)
+    assert.isTrue(optionalRelayPeerId)
+    assert.isFalse(directConnection.capabilities.storeAndForward)
+    assert.isTrue(relayConnection.capabilities.storeAndForward)
+    assert.isDefined(protocolRejection)
+    assert.isDefined(applicationRejection)
   })
 })

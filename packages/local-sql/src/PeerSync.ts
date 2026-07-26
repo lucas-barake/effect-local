@@ -2,6 +2,7 @@ import * as Automerge from "@automerge/automerge"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import type * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Clock from "effect/Clock"
@@ -19,6 +20,7 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as DocumentStore from "./DocumentStore.js"
 import * as InternalAutomerge from "./internal/automerge.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
+import * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
@@ -68,6 +70,11 @@ export interface Received {
   readonly duplicate: boolean
 }
 
+export interface RelayReceipt extends PeerTransport.RelayDeliveryIdentity {
+  readonly receiptExpiresAt: string
+  readonly encodedSize: number
+}
+
 const Heads = Schema.fromJsonString(Schema.Array(Schema.String))
 
 class ConcurrentDocumentWrite extends Schema.TaggedErrorClass<ConcurrentDocumentWrite>(
@@ -85,6 +92,27 @@ const ReceiptRow = Schema.Struct({
   writer_provenance: WriterProvenance.StoredChangeProvenances
 })
 
+const RelayReceiptRow = Schema.Struct({
+  ...ReceiptRow.fields,
+  relay_encoded_size: Schema.Int,
+  relay_outer_envelope_digest: Schema.String,
+  relay_receipt_expires_at: Schema.String
+})
+
+const RelayReceiptPruneRow = Schema.Struct({
+  encoded_size: Schema.Int,
+  relay_message_id: Identity.RelayMessageId,
+  row_id: Schema.Int,
+  sender_peer_id: Identity.PeerId,
+  sender_subject_id: Schema.String,
+  sender_tenant_id: Schema.String
+})
+
+const RelayReceiptUsageRow = Schema.Struct({
+  encoded_bytes: Schema.Int,
+  receipt_count: Schema.Int
+})
+
 const PendingRow = Schema.Struct({
   actor: Schema.String,
   bytes: Schema.Uint8Array,
@@ -97,9 +125,7 @@ const PendingRow = Schema.Struct({
 
 const PendingReceiptRow = Schema.Struct({
   accepted_heads: Heads,
-  connection_epoch: Schema.String,
-  peer_id: Schema.String,
-  receive_sequence: Schema.Number,
+  row_id: Schema.Int,
   writer_provenance: WriterProvenance.StoredChangeProvenances
 })
 
@@ -257,9 +283,14 @@ export class PeerSync extends Context.Service<PeerSync, {
     input: {
       readonly remoteConnectionEpoch: string
       readonly receiveSequence: number
-      readonly lineage: Identity.DocumentLineage
+      /**
+       * Absent for persisted requests and relay envelopes created before lineage was introduced.
+       * Those inputs describe the genesis lineage, matching the wire compatibility behavior.
+       */
+      readonly lineage?: Identity.DocumentLineage
       readonly message: Uint8Array
       readonly writerProvenance: ReadonlyArray<WriterProvenance.ChangeProvenance>
+      readonly relay?: RelayReceipt
     }
   ) => Effect.Effect<Received, ReplicaError.ReplicaError>
   readonly enqueue: (session: Session, reply: Reply) => Effect.Effect<Outbound, ReplicaError.ReplicaError>
@@ -291,20 +322,22 @@ export class PeerSync extends Context.Service<PeerSync, {
    * interleave with a `generate` or `receive` for that document.
    */
   readonly invalidateDocument: (documentId: Identity.DocumentId) => Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly pruneRelayReceipts?: Effect.Effect<number, ReplicaError.ReplicaError>
 }>()("@lucas-barake/effect-local-sql/PeerSync") {}
 
-export const layer: Layer.Layer<
-  PeerSync,
-  ReplicaError.ReplicaError,
+type Requirements =
   | DocumentStore.DocumentStore
   | ReplicaBootstrap.ReplicaBootstrap
   | ReplicaGate.ReplicaGate
   | ReplicaLimits.ReplicaLimits
   | Crypto.Crypto
   | SqlClient.SqlClient
-> = Layer.effect(
-  PeerSync,
+
+const make = (
+  relayReceiptLimits: PeerRelayReceiptLimits.Values | null
+) =>
   Effect.gen(function*() {
+    void relayReceiptLimits
     const sql = yield* SqlClient.SqlClient
     const store = yield* DocumentStore.DocumentStore
     const bootstrap = yield* ReplicaBootstrap.ReplicaBootstrap
@@ -340,7 +373,106 @@ export const layer: Layer.Layer<
           WHERE replica_incarnation = ${request.replicaIncarnation}
             AND peer_id = ${request.peerId}
             AND connection_epoch = ${request.connectionEpoch}
-            AND receive_sequence = ${request.receiveSequence}`
+            AND receive_sequence = ${request.receiveSequence}
+            AND relay_message_id IS NULL`
+    })
+    const findRelayReceipts = SqlSchema.findAll({
+      Request: Schema.Struct({
+        relayMessageId: Identity.RelayMessageId,
+        replicaIncarnation: Identity.ReplicaIncarnation,
+        senderPeerId: Identity.PeerId,
+        senderSubjectId: Schema.String,
+        senderTenantId: Schema.String
+      }),
+      Result: RelayReceiptRow,
+      execute: (request) =>
+        sql`SELECT accepted_heads, commit_sequence, document_id, heads, message_hash, reply, reply_hash,
+          writer_provenance, relay_encoded_size, relay_outer_envelope_digest, relay_receipt_expires_at
+          FROM effect_local_peer_receipts
+          WHERE replica_incarnation = ${request.replicaIncarnation}
+            AND relay_sender_tenant_id = ${request.senderTenantId}
+            AND relay_sender_subject_id = ${request.senderSubjectId}
+            AND relay_sender_peer_id = ${request.senderPeerId}
+            AND relay_message_id = ${request.relayMessageId}
+          LIMIT 1`
+    })
+    const findRelayReceiptsToPrune = SqlSchema.findAll({
+      Request: Schema.Struct({
+        expiresAt: Schema.String,
+        limit: Schema.Int.check(Schema.isGreaterThan(0)),
+        replicaIncarnation: Identity.ReplicaIncarnation
+      }),
+      Result: RelayReceiptPruneRow,
+      execute: (request) =>
+        sql`SELECT relay_encoded_size AS encoded_size, relay_message_id, row_id,
+          relay_sender_peer_id AS sender_peer_id,
+          relay_sender_subject_id AS sender_subject_id,
+          relay_sender_tenant_id AS sender_tenant_id
+          FROM effect_local_peer_receipts
+          WHERE replica_incarnation = ${request.replicaIncarnation}
+            AND relay_message_id IS NOT NULL
+            AND relay_receipt_expires_at <= ${request.expiresAt}
+          ORDER BY relay_receipt_expires_at, relay_sender_tenant_id, relay_sender_subject_id,
+            relay_sender_peer_id, relay_message_id, row_id
+          LIMIT ${request.limit}`
+    })
+    const decrementRelayReceiptUsage = SqlSchema.findAll({
+      Request: Schema.Struct({
+        encodedBytes: Schema.Int.check(Schema.isGreaterThan(0)),
+        receiptCount: Schema.Int.check(Schema.isGreaterThan(0)),
+        replicaIncarnation: Identity.ReplicaIncarnation,
+        senderPeerId: Identity.PeerId,
+        senderSubjectId: Schema.String,
+        senderTenantId: Schema.String
+      }),
+      Result: RelayReceiptUsageRow,
+      execute: (request) =>
+        sql`UPDATE effect_local_peer_relay_receipt_usage
+          SET receipt_count = receipt_count - ${request.receiptCount},
+            encoded_bytes = encoded_bytes - ${request.encodedBytes}
+          WHERE replica_incarnation = ${request.replicaIncarnation}
+            AND sender_tenant_id = ${request.senderTenantId}
+            AND sender_subject_id = ${request.senderSubjectId}
+            AND sender_peer_id = ${request.senderPeerId}
+            AND receipt_count >= ${request.receiptCount}
+            AND encoded_bytes >= ${request.encodedBytes}
+          RETURNING receipt_count, encoded_bytes`
+    })
+    const deleteRelayReceipt = SqlSchema.findAll({
+      Request: Schema.Struct({
+        rowId: Schema.Int
+      }),
+      Result: Schema.Struct({ row_id: Schema.Int }),
+      execute: (request) =>
+        sql`DELETE FROM effect_local_peer_receipts
+          WHERE row_id = ${request.rowId}
+            AND relay_message_id IS NOT NULL
+          RETURNING row_id`
+    })
+    const findRelayReceiptUsage = SqlSchema.findAll({
+      Request: Schema.Struct({
+        replicaIncarnation: Identity.ReplicaIncarnation,
+        senderPeerId: Identity.PeerId,
+        senderSubjectId: Schema.String,
+        senderTenantId: Schema.String
+      }),
+      Result: RelayReceiptUsageRow,
+      execute: (request) =>
+        sql`SELECT receipt_count, encoded_bytes
+          FROM effect_local_peer_relay_receipt_usage
+          WHERE replica_incarnation = ${request.replicaIncarnation}
+            AND sender_tenant_id = ${request.senderTenantId}
+            AND sender_subject_id = ${request.senderSubjectId}
+            AND sender_peer_id = ${request.senderPeerId}`
+    })
+    const findRelayReplicaReceiptUsage = SqlSchema.findAll({
+      Request: Identity.ReplicaIncarnation,
+      Result: TotalsRow,
+      execute: (replicaIncarnation) =>
+        sql`SELECT COALESCE(SUM(receipt_count), 0) AS count,
+          COALESCE(SUM(encoded_bytes), 0) AS bytes
+          FROM effect_local_peer_relay_receipt_usage
+          WHERE replica_incarnation = ${replicaIncarnation}`
     })
     const findExistingChanges = SqlSchema.findAll({
       Request: Schema.Struct({
@@ -376,7 +508,7 @@ export const layer: Layer.Layer<
       }),
       Result: PendingReceiptRow,
       execute: (request) =>
-        sql`SELECT accepted_heads, connection_epoch, peer_id, receive_sequence, writer_provenance
+        sql`SELECT accepted_heads, row_id, writer_provenance
           FROM effect_local_peer_receipts
           WHERE replica_incarnation = ${request.replicaIncarnation}
             AND document_id = ${request.documentId}
@@ -671,6 +803,57 @@ export const layer: Layer.Layer<
             AND status = 'Pending'
           RETURNING send_sequence`
     })
+    const pruneRelayReceiptsInTransaction = (
+      replicaIncarnation: Identity.ReplicaIncarnation,
+      expiresAt: string
+    ) =>
+      relayReceiptLimits === null
+        ? Effect.succeed(0)
+        : Effect.gen(function*() {
+          const rows = yield* findRelayReceiptsToPrune({
+            expiresAt,
+            limit: relayReceiptLimits.pruneBatchSize,
+            replicaIncarnation
+          })
+          const usage = new Map<string, {
+            readonly encodedBytes: number
+            readonly receiptCount: number
+            readonly senderPeerId: Identity.PeerId
+            readonly senderSubjectId: string
+            readonly senderTenantId: string
+          }>()
+          for (const row of rows) {
+            const key = JSON.stringify([row.sender_tenant_id, row.sender_subject_id, row.sender_peer_id])
+            const current = usage.get(key)
+            usage.set(key, {
+              encodedBytes: (current?.encodedBytes ?? 0) + row.encoded_size,
+              receiptCount: (current?.receiptCount ?? 0) + 1,
+              senderPeerId: row.sender_peer_id,
+              senderSubjectId: row.sender_subject_id,
+              senderTenantId: row.sender_tenant_id
+            })
+          }
+          for (const entry of usage.values()) {
+            const updated = yield* decrementRelayReceiptUsage({
+              ...entry,
+              replicaIncarnation
+            })
+            if (updated.length !== 1) {
+              return yield* failStorageCorrupt(new Error("Relay receipt usage is inconsistent"))
+            }
+          }
+          for (const row of rows) {
+            const deleted = yield* deleteRelayReceipt({ rowId: row.row_id })
+            if (deleted.length !== 1) {
+              return yield* failStorageCorrupt(new Error("Relay receipt disappeared during pruning"))
+            }
+          }
+          yield* sql`DELETE FROM effect_local_peer_relay_receipt_usage
+            WHERE replica_incarnation = ${replicaIncarnation}
+              AND receipt_count = 0
+              AND encoded_bytes = 0`
+          return rows.length
+        })
     yield* sql.withTransaction(Effect.gen(function*() {
       yield* sql`INSERT INTO effect_local_quarantine (document_id, peer_id, reason, bytes, created_at)
         SELECT document_id, peer_id, 'Expired pending sync change', bytes, ${startupAt}
@@ -682,6 +865,7 @@ export const layer: Layer.Layer<
         SELECT document_id, peer_id, 'Expired pending sync message', pending_message, ${startupAt}
         FROM effect_local_peer_receipts
         WHERE replica_incarnation = ${bootstrap.incarnation}
+          AND relay_message_id IS NULL
           AND pending_message IS NOT NULL
           AND accepted_at < ${startupCutoff}`
       yield* sql`INSERT INTO effect_local_quarantine (document_id, peer_id, reason, bytes, created_at)
@@ -691,10 +875,19 @@ export const layer: Layer.Layer<
           AND status = 'Pending'
           AND created_at < ${startupCutoff}`
       yield* sql`DELETE FROM effect_local_peer_receipts
-        WHERE replica_incarnation != ${bootstrap.incarnation} OR accepted_at < ${startupCutoff}`
+        WHERE relay_message_id IS NULL
+          AND (replica_incarnation != ${bootstrap.incarnation} OR accepted_at < ${startupCutoff})`
       yield* sql`DELETE FROM effect_local_peer_outbox
         WHERE replica_incarnation != ${bootstrap.incarnation} OR created_at < ${startupCutoff}`
-    })).pipe(Effect.catchTag("SqlError", failStorageUnavailable))
+      if (relayReceiptLimits !== null) {
+        yield* pruneRelayReceiptsInTransaction(bootstrap.incarnation, startupAt)
+      }
+    })).pipe(
+      Effect.catchTags({
+        SchemaError: failStorageCorrupt,
+        SqlError: failStorageUnavailable
+      })
+    )
 
     const readState = (session: Session, documentId: Identity.DocumentId) =>
       Ref.get(states).pipe(
@@ -799,11 +992,13 @@ export const layer: Layer.Layer<
           FROM effect_local_peer_receipts
           WHERE replica_incarnation = ${session.replicaIncarnation}
             AND document_id = ${documentId}
+            AND relay_message_id IS NULL
             AND pending_message IS NOT NULL
             AND accepted_at < ${cutoff}`
         yield* sql`DELETE FROM effect_local_peer_receipts
           WHERE replica_incarnation = ${session.replicaIncarnation}
             AND document_id = ${documentId}
+            AND relay_message_id IS NULL
             AND pending_message IS NOT NULL
             AND accepted_at < ${cutoff}`
       }))
@@ -1083,9 +1278,10 @@ export const layer: Layer.Layer<
       input: {
         readonly remoteConnectionEpoch: string
         readonly receiveSequence: number
-        readonly lineage: Identity.DocumentLineage
+        readonly lineage?: Identity.DocumentLineage
         readonly message: Uint8Array
         readonly writerProvenance: ReadonlyArray<WriterProvenance.ChangeProvenance>
+        readonly relay?: RelayReceipt
       }
     ) =>
       withSessionGeneration(session, (generation) =>
@@ -1096,6 +1292,15 @@ export const layer: Layer.Layer<
               Effect.scoped(Effect.gen(function*() {
                 const receiptSession = { ...session, connectionEpoch: input.remoteConnectionEpoch }
                 const { message, receiveSequence } = input
+                const relay = input.relay
+                if (relay !== undefined && relayReceiptLimits === null) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.ProtocolMismatch({
+                      expected: "direct peer receipt",
+                      observed: "relay peer receipt"
+                    })
+                  })
+                }
                 const writerProvenance = yield* Schema.decodeUnknownEffect(
                   WriterProvenance.ChangeProvenances
                 )(input.writerProvenance).pipe(
@@ -1113,7 +1318,7 @@ export const layer: Layer.Layer<
                 // peer controlled, and a direct caller of `receive` has not necessarily passed it
                 // through the wire schema that already checks it.
                 const remoteLineage = yield* Schema.decodeUnknownEffect(Identity.DocumentLineage)(
-                  input.lineage
+                  input.lineage ?? Identity.genesisLineage
                 ).pipe(
                   Effect.mapError(() =>
                     new ReplicaError.ReplicaError({
@@ -1177,6 +1382,40 @@ export const layer: Layer.Layer<
                 yield* validateSession(permit, session)
                 const nowMillis = yield* Clock.currentTimeMillis
                 const acceptedAt = new Date(nowMillis).toISOString()
+                if (relay !== undefined) {
+                  if (relay.senderPeerId !== session.peerId) {
+                    return yield* new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.ProtocolMismatch({
+                        expected: session.peerId,
+                        observed: relay.senderPeerId
+                      })
+                    })
+                  }
+                  if (
+                    !Number.isSafeInteger(relay.encodedSize) ||
+                    relay.encodedSize <= 0
+                  ) {
+                    return yield* new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.ProtocolMismatch({
+                        expected: "positive safe relay receipt encoded size",
+                        observed: String(relay.encodedSize)
+                      })
+                    })
+                  }
+                  const receiptExpiresAtMillis = Date.parse(relay.receiptExpiresAt)
+                  if (
+                    !Number.isFinite(receiptExpiresAtMillis) ||
+                    receiptExpiresAtMillis <= nowMillis ||
+                    receiptExpiresAtMillis - nowMillis > relayReceiptLimits!.receiptRetentionMillis
+                  ) {
+                    return yield* new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.ProtocolMismatch({
+                        expected: "bounded future relay receipt expiry",
+                        observed: "invalid relay receipt expiry"
+                      })
+                    })
+                  }
+                }
                 yield* quotaLock.withPermit(Effect.gen(function*() {
                   yield* validateSessionGeneration(generation, sessionGeneration)
                   yield* expirePending(
@@ -1185,8 +1424,27 @@ export const layer: Layer.Layer<
                     acceptedAt,
                     new Date(nowMillis - limits.maxPendingAgeMillis).toISOString()
                   ).pipe(Effect.catchTag("SqlError", failStorageUnavailable))
+                  if (relayReceiptLimits !== null) {
+                    yield* sql.withTransaction(Effect.gen(function*() {
+                      yield* pruneRelayReceiptsInTransaction(permit.incarnation, acceptedAt)
+                      yield* gate.validate(permit)
+                    })).pipe(
+                      Effect.catchTags({
+                        SqlError: failStorageUnavailable,
+                        SchemaError: failStorageCorrupt
+                      })
+                    )
+                  }
                 }))
                 const messageHash = yield* digest(message)
+                if (relay !== undefined && relay.messageHash !== messageHash) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.ProtocolMismatch({
+                      expected: messageHash,
+                      observed: relay.messageHash
+                    })
+                  })
+                }
                 const validateReceipt = (receipt: typeof ReceiptRow.Type) =>
                   Effect.gen(function*() {
                     if (receipt.document_id !== documentId) {
@@ -1214,12 +1472,43 @@ export const layer: Layer.Layer<
                       })
                     }
                   })
-                const receiptRows = yield* findReceipts({
-                  replicaIncarnation: receiptSession.replicaIncarnation,
-                  peerId: receiptSession.peerId,
-                  connectionEpoch: receiptSession.connectionEpoch,
-                  receiveSequence
-                }).pipe(
+                const loadReceipt = () =>
+                  relay === undefined
+                    ? findReceipts({
+                      replicaIncarnation: receiptSession.replicaIncarnation,
+                      peerId: receiptSession.peerId,
+                      connectionEpoch: receiptSession.connectionEpoch,
+                      receiveSequence
+                    })
+                    : findRelayReceipts({
+                      relayMessageId: relay.relayMessageId,
+                      replicaIncarnation: receiptSession.replicaIncarnation,
+                      senderPeerId: relay.senderPeerId,
+                      senderSubjectId: relay.senderSubjectId,
+                      senderTenantId: relay.senderTenantId
+                    })
+                const validateStoredReceipt = (
+                  receipt: typeof ReceiptRow.Type | typeof RelayReceiptRow.Type
+                ) =>
+                  Effect.gen(function*() {
+                    yield* validateReceipt(receipt)
+                    if (
+                      relay !== undefined &&
+                      (
+                        !("relay_outer_envelope_digest" in receipt) ||
+                        receipt.relay_outer_envelope_digest !== relay.outerEnvelopeDigest ||
+                        receipt.relay_encoded_size !== relay.encodedSize
+                      )
+                    ) {
+                      return yield* new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.ProtocolMismatch({
+                          expected: "matching relay receipt identity",
+                          observed: "conflicting relay receipt identity"
+                        })
+                      })
+                    }
+                  })
+                const receiptRows = yield* loadReceipt().pipe(
                   Effect.catchTags({
                     SqlError: failStorageUnavailable,
                     SchemaError: failStorageCorrupt
@@ -1227,7 +1516,7 @@ export const layer: Layer.Layer<
                 )
                 const receipt = receiptRows[0]
                 if (receipt !== undefined) {
-                  yield* validateReceipt(receipt)
+                  yield* validateStoredReceipt(receipt)
                   yield* quotaLock.withPermit(validateSessionGeneration(generation, sessionGeneration))
                   return receivedFromReceipt(documentId, receipt)
                 }
@@ -1268,6 +1557,51 @@ export const layer: Layer.Layer<
                     })
                   }
                 })
+                const validateRelayReceiptQuota = relay === undefined
+                  ? Effect.void
+                  : Effect.gen(function*() {
+                    const remote = (yield* findRelayReceiptUsage({
+                      replicaIncarnation: receiptSession.replicaIncarnation,
+                      senderPeerId: relay.senderPeerId,
+                      senderSubjectId: relay.senderSubjectId,
+                      senderTenantId: relay.senderTenantId
+                    }))[0]
+                    const replica = (yield* findRelayReplicaReceiptUsage(
+                      receiptSession.replicaIncarnation
+                    ))[0]
+                    if ((remote?.receipt_count ?? 0) > relayReceiptLimits!.maxReceiptsPerRemote) {
+                      return yield* new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.QuotaExceeded({
+                          resource: "relay receipts per remote",
+                          limit: relayReceiptLimits!.maxReceiptsPerRemote
+                        })
+                      })
+                    }
+                    if ((remote?.encoded_bytes ?? 0) > relayReceiptLimits!.maxEncodedBytesPerRemote) {
+                      return yield* new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.QuotaExceeded({
+                          resource: "relay receipt bytes per remote",
+                          limit: relayReceiptLimits!.maxEncodedBytesPerRemote
+                        })
+                      })
+                    }
+                    if ((replica?.count ?? 0) > relayReceiptLimits!.maxReceiptsPerReplica) {
+                      return yield* new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.QuotaExceeded({
+                          resource: "relay receipts per replica",
+                          limit: relayReceiptLimits!.maxReceiptsPerReplica
+                        })
+                      })
+                    }
+                    if ((replica?.bytes ?? 0) > relayReceiptLimits!.maxEncodedBytesPerReplica) {
+                      return yield* new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.QuotaExceeded({
+                          resource: "relay receipt bytes per replica",
+                          limit: relayReceiptLimits!.maxEncodedBytesPerReplica
+                        })
+                      })
+                    }
+                  })
                 const decoded = yield* Effect.try({
                   try: () => Automerge.decodeSyncMessage(message),
                   catch: (cause) =>
@@ -1785,15 +2119,13 @@ export const layer: Layer.Layer<
                       const result = yield* quotaLock.withPermit(Effect.gen(function*() {
                         const result = yield* sql.withTransaction(Effect.gen(function*() {
                           yield* validateSessionGeneration(generation, sessionGeneration)
-                          const receiptRows = yield* findReceipts({
-                            replicaIncarnation: receiptSession.replicaIncarnation,
-                            peerId: receiptSession.peerId,
-                            connectionEpoch: receiptSession.connectionEpoch,
-                            receiveSequence
-                          })
+                          if (relayReceiptLimits !== null) {
+                            yield* pruneRelayReceiptsInTransaction(permit.incarnation, acceptedAt)
+                          }
+                          const receiptRows = yield* loadReceipt()
                           const receipt = receiptRows[0]
                           if (receipt !== undefined) {
-                            yield* validateReceipt(receipt)
+                            yield* validateStoredReceipt(receipt)
                             return { _tag: "Duplicate" as const, received: receivedFromReceipt(documentId, receipt) }
                           }
                           const committedChanges = validationChanges.length === 0 ? [] : yield* findExistingChanges({
@@ -1855,10 +2187,7 @@ export const layer: Layer.Layer<
                           for (const row of pendingReceiptRows) {
                             if (Automerge.hasHeads(staged, [...row.accepted_heads])) {
                               yield* sql`UPDATE effect_local_peer_receipts SET pending_message = NULL
-                WHERE replica_incarnation = ${receiptSession.replicaIncarnation}
-                  AND peer_id = ${row.peer_id}
-                  AND connection_epoch = ${row.connection_epoch}
-                  AND receive_sequence = ${row.receive_sequence}`
+                WHERE row_id = ${row.row_id}`
                             }
                           }
                           if (checkpoint !== null) {
@@ -1925,15 +2254,35 @@ export const layer: Layer.Layer<
                           yield* sql`INSERT INTO effect_local_peer_receipts (
             replica_incarnation, peer_id, connection_epoch, receive_sequence,
             document_id, message_hash, reply, reply_hash, pending_message,
-            heads, accepted_heads, commit_sequence, accepted_at, writer_provenance
+            heads, accepted_heads, commit_sequence, accepted_at, writer_provenance,
+            relay_sender_tenant_id, relay_sender_subject_id, relay_sender_peer_id,
+            relay_message_id, relay_outer_envelope_digest, relay_receipt_expires_at,
+            relay_encoded_size
           ) VALUES (
             ${receiptSession.replicaIncarnation}, ${receiptSession.peerId}, ${receiptSession.connectionEpoch},
             ${receiveSequence},
             ${documentId}, ${messageHash}, ${reply?.message ?? null}, ${reply?.messageHash ?? null},
             ${unresolvedBytes === 0 ? null : message}, ${Schema.encodeSync(Heads)(materializedHeads)},
             ${Schema.encodeSync(Heads)(acceptedHeads)}, ${commitSequence}, ${acceptedAt},
-            ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(writerProvenance)}
+            ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(writerProvenance)},
+            ${relay?.senderTenantId ?? null}, ${relay?.senderSubjectId ?? null},
+            ${relay?.senderPeerId ?? null}, ${relay?.relayMessageId ?? null},
+            ${relay?.outerEnvelopeDigest ?? null}, ${relay?.receiptExpiresAt ?? null},
+            ${relay?.encodedSize ?? null}
           )`
+                          if (relay !== undefined) {
+                            yield* sql`INSERT INTO effect_local_peer_relay_receipt_usage (
+              replica_incarnation, sender_tenant_id, sender_subject_id, sender_peer_id,
+              receipt_count, encoded_bytes
+            ) VALUES (
+              ${receiptSession.replicaIncarnation}, ${relay.senderTenantId}, ${relay.senderSubjectId},
+              ${relay.senderPeerId}, 1, ${relay.encodedSize}
+            ) ON CONFLICT(replica_incarnation, sender_tenant_id, sender_subject_id, sender_peer_id)
+            DO UPDATE SET
+              receipt_count = effect_local_peer_relay_receipt_usage.receipt_count + 1,
+              encoded_bytes = effect_local_peer_relay_receipt_usage.encoded_bytes + excluded.encoded_bytes`
+                            yield* validateRelayReceiptQuota
+                          }
                           if (unresolvedBytes !== 0) {
                             yield* validateReceiptQuota
                             yield* validatePendingQuota
@@ -1981,6 +2330,26 @@ export const layer: Layer.Layer<
           )
         ))
 
+    const pruneRelayReceipts = relayReceiptLimits === null
+      ? {}
+      : {
+        pruneRelayReceipts: Effect.scoped(Effect.gen(function*() {
+          const permit = yield* gate.shared
+          const expiresAt = new Date(yield* Clock.currentTimeMillis).toISOString()
+          return yield* quotaLock.withPermit(
+            sql.withTransaction(Effect.gen(function*() {
+              const pruned = yield* pruneRelayReceiptsInTransaction(permit.incarnation, expiresAt)
+              yield* gate.validate(permit)
+              return pruned
+            })).pipe(
+              Effect.catchTags({
+                SqlError: failStorageUnavailable,
+                SchemaError: failStorageCorrupt
+              })
+            )
+          )
+        }))
+      }
     return PeerSync.of({
       open: (peerId) =>
         Effect.scoped(Effect.gen(function*() {
@@ -2009,7 +2378,8 @@ export const layer: Layer.Layer<
                 yield* sql`DELETE FROM effect_local_peer_receipts
               WHERE replica_incarnation = ${session.replicaIncarnation}
                 AND peer_id = ${session.peerId}
-                AND connection_epoch = ${session.connectionEpoch}`
+                AND connection_epoch = ${session.connectionEpoch}
+                AND relay_message_id IS NULL`
               })).pipe(Effect.catchTag("SqlError", failStorageUnavailable))
               yield* Ref.update(generation, (current) => current + 1)
               yield* removeState(session)
@@ -2056,6 +2426,7 @@ export const layer: Layer.Layer<
             })
           )
         })),
+      ...pruneRelayReceipts,
       markSent: (session, sendSequence, messageHash) =>
         Effect.scoped(Effect.gen(function*() {
           const permit = yield* gate.shared
@@ -2086,5 +2457,22 @@ export const layer: Layer.Layer<
           )
         }))
     })
+  })
+
+export const layer: Layer.Layer<
+  PeerSync,
+  ReplicaError.ReplicaError,
+  Requirements
+> = Layer.effect(PeerSync, make(null))
+
+export const layerRelay: Layer.Layer<
+  PeerSync,
+  ReplicaError.ReplicaError,
+  Requirements | PeerRelayReceiptLimits.PeerRelayReceiptLimits
+> = Layer.effect(
+  PeerSync,
+  Effect.gen(function*() {
+    const relayReceiptLimits = yield* PeerRelayReceiptLimits.PeerRelayReceiptLimits
+    return yield* make(relayReceiptLimits)
   })
 )

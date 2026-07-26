@@ -1,5 +1,7 @@
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as PeerSession from "@lucas-barake/effect-local-sql/PeerSession"
+import * as PeerSyncEnvelope from "@lucas-barake/effect-local-sql/PeerSyncEnvelope"
+import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
@@ -8,20 +10,31 @@ import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Arr from "effect/Array"
 import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
+import * as Context from "effect/Context"
+import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
+import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
+import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
+import * as RpcServer from "effect/unstable/rpc/RpcServer"
+import type * as SocketServer from "effect/unstable/socket/SocketServer"
 import * as PeerAuthorizationValidation from "./internal/peerAuthorization.js"
 import * as PeerRpcObservability from "./internal/peerRpcObservability.js"
 import * as PeerAuthentication from "./PeerAuthentication.js"
 import * as PeerAuthorization from "./PeerAuthorization.js"
+import * as PeerRelayAuthorization from "./PeerRelayAuthorization.js"
+import * as PeerRelayIngress from "./PeerRelayIngress.js"
+import * as PeerRelayLimits from "./PeerRelayLimits.js"
+import * as PeerRelayRpc from "./PeerRelayRpc.js"
+import * as PeerRelayStore from "./PeerRelayStore.js"
 import * as PeerRpc from "./PeerRpc.js"
 import * as PeerRpcError from "./PeerRpcError.js"
 import * as PeerRpcLimits from "./PeerRpcLimits.js"
@@ -1216,3 +1229,1415 @@ export const layerHandlers = (
       Push: push
     })
   }))
+
+type RelaySqlLane = "Admission" | "Terminal" | "Delivery" | "Maintenance"
+
+interface RelaySqlTask {
+  state: "Queued" | "Acquired" | "Cancelled" | "Completed"
+  readonly cancel: Deferred.Deferred<void>
+  readonly execute: Effect.Effect<void>
+}
+
+interface RelaySqlScheduler {
+  readonly submit: <A, E,>(
+    lane: RelaySqlLane,
+    effect: Effect.Effect<A, E>
+  ) => Effect.Effect<A, E | PeerRpcError.RequestCapacityExceeded>
+  readonly shutdown: Effect.Effect<void>
+}
+
+const drainRelayQueue = <A, E,>(
+  queue: Queue.Dequeue<A, E>
+): Effect.Effect<Array<A>> =>
+  Effect.gen(function*() {
+    const items: Array<A> = []
+    while (true) {
+      const item = yield* Queue.poll(queue)
+      if (Option.isNone(item)) return items
+      items.push(item.value)
+    }
+  })
+
+const makeRelaySqlScheduler = (
+  limits: PeerRelayLimits.Values,
+  runtimeScope: Scope.Scope,
+  onFatal: (cause: Cause.Cause<unknown>) => Effect.Effect<void>
+): Effect.Effect<RelaySqlScheduler> =>
+  Effect.gen(function*() {
+    const capacities: Record<RelaySqlLane, number> = {
+      Admission: limits.sqlAdmissionQueueCapacity,
+      Terminal: limits.sqlTerminalQueueCapacity,
+      Delivery: limits.sqlDeliveryQueueCapacity,
+      Maintenance: limits.sqlMaintenanceQueueCapacity
+    }
+    const queues = {
+      Admission: yield* Queue.dropping<RelaySqlTask, Cause.Done>(capacities.Admission),
+      Terminal: yield* Queue.dropping<RelaySqlTask, Cause.Done>(capacities.Terminal),
+      Delivery: yield* Queue.dropping<RelaySqlTask, Cause.Done>(capacities.Delivery),
+      Maintenance: yield* Queue.dropping<RelaySqlTask, Cause.Done>(capacities.Maintenance)
+    } satisfies Record<RelaySqlLane, Queue.Queue<RelaySqlTask, Cause.Done>>
+    const wake = yield* Queue.dropping<void, Cause.Done>(
+      capacities.Admission + capacities.Terminal + capacities.Delivery + capacities.Maintenance
+    )
+    const lock = yield* Semaphore.make(1)
+    const globalPermits = yield* Semaphore.make(limits.maxInFlightSqlTransactions)
+    const lanePermits = {
+      Admission: yield* Semaphore.make(limits.maxInFlightSqlAdmission),
+      Terminal: yield* Semaphore.make(limits.maxInFlightSqlTerminal),
+      Delivery: yield* Semaphore.make(limits.maxInFlightSqlDelivery),
+      Maintenance: yield* Semaphore.make(limits.maxInFlightSqlMaintenance)
+    } satisfies Record<RelaySqlLane, Semaphore.Semaphore>
+    let accepting = true
+
+    const cancelTask = (task: RelaySqlTask) =>
+      lock.withPermit(Effect.sync(() => {
+        if (task.state === "Completed" || task.state === "Cancelled") return
+        task.state = "Cancelled"
+        Deferred.doneUnsafe(task.cancel, Effect.void)
+      }))
+
+    const submit: RelaySqlScheduler["submit"] = (lane, effect) =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function*() {
+          const result = yield* Deferred.make<Effect.Success<typeof effect>, Effect.Error<typeof effect>>()
+          const cancel = yield* Deferred.make<void>()
+          const task: RelaySqlTask = {
+            state: "Queued",
+            cancel,
+            execute: Effect.uninterruptibleMask((restoreTask) =>
+              lock.withPermit(Effect.sync(() => {
+                if (task.state !== "Queued") return false
+                task.state = "Acquired"
+                return true
+              })).pipe(
+                Effect.flatMap((acquired) => {
+                  if (!acquired) return Effect.void
+                  const cancelled = Deferred.await(cancel).pipe(Effect.flatMap(() => Effect.interrupt))
+                  return Effect.raceFirst(restoreTask(effect), cancelled).pipe(
+                    Effect.exit,
+                    Effect.flatMap((exit) => Deferred.done(result, exit)),
+                    Effect.ensuring(lock.withPermit(Effect.sync(() => {
+                      task.state = "Completed"
+                    })))
+                  )
+                })
+              )
+            )
+          }
+          const offered = yield* lock.withPermit(
+            Effect.suspend(() => {
+              if (!accepting) return Effect.succeed(false)
+              return Queue.offer(queues[lane], task)
+            })
+          )
+          if (!offered) return yield* new PeerRpcError.RequestCapacityExceeded()
+          yield* Queue.offer(wake, undefined)
+          return yield* restore(Deferred.await(result)).pipe(
+            Effect.onInterrupt(() => cancelTask(task))
+          )
+        })
+      )
+
+    const lanes = [
+      "Terminal",
+      "Admission",
+      "Delivery",
+      "Maintenance"
+    ] as const satisfies ReadonlyArray<RelaySqlLane>
+
+    const worker = Effect.suspend(() => {
+      let cursor = 0
+      const take = (): Effect.Effect<readonly [RelaySqlLane, RelaySqlTask], Cause.Done> =>
+        Effect.gen(function*() {
+          for (let offset = 0; offset < lanes.length; offset++) {
+            const index = (cursor + offset) % lanes.length
+            const lane = lanes[index]!
+            const task = yield* Queue.poll(queues[lane])
+            if (Option.isSome(task)) {
+              cursor = (index + 1) % lanes.length
+              return [lane, task.value] as const
+            }
+          }
+          yield* Queue.take(wake)
+          return yield* take()
+        })
+      return Effect.forever(
+        take().pipe(
+          Effect.flatMap(([lane, task]) =>
+            task.execute.pipe(
+              lanePermits[lane].withPermits(1),
+              globalPermits.withPermits(1)
+            )
+          )
+        )
+      )
+    })
+
+    const workerFibers: Array<Fiber.Fiber<unknown, unknown>> = []
+    for (let index = 0; index < limits.maxInFlightSqlTransactions; index++) {
+      const fiber = yield* Effect.forkIn(worker, runtimeScope)
+      workerFibers.push(fiber)
+      yield* Effect.forkIn(
+        Fiber.await(fiber).pipe(
+          Effect.flatMap((exit) =>
+            lock.withPermit(Effect.sync(() => accepting)).pipe(
+              Effect.flatMap((wasAccepting) =>
+                wasAccepting && Exit.isFailure(exit)
+                  ? onFatal(exit.cause)
+                  : Effect.void
+              )
+            )
+          )
+        ),
+        runtimeScope
+      )
+    }
+
+    const shutdown = Effect.uninterruptible(
+      lock.withPermit(Effect.sync(() => {
+        accepting = false
+      })).pipe(
+        Effect.andThen(Effect.forEach(Object.values(queues), (queue) =>
+          drainRelayQueue(queue).pipe(
+            Effect.flatMap((tasks) => Effect.forEach(tasks, cancelTask, { discard: true })),
+            Effect.andThen(Queue.shutdown(queue))
+          ), { discard: true })),
+        Effect.andThen(Queue.shutdown(wake)),
+        Effect.andThen(Effect.forEach(workerFibers, Fiber.interrupt, { discard: true }))
+      )
+    ).pipe(Effect.ignore)
+
+    return { submit, shutdown }
+  })
+
+interface RelaySubjectState {
+  tokens: number
+  updatedAt: number
+  lastUsedAt: number
+  inFlight: number
+}
+
+interface RelayAdmissionLane {
+  readonly run: <A, E, R,>(
+    subjectId: string,
+    effect: Effect.Effect<A, E, R>
+  ) => Effect.Effect<A, E | PeerRpcError.RequestCapacityExceeded, R>
+  readonly clear: Effect.Effect<void>
+}
+
+const makeRelayAdmissionLane = (options: {
+  readonly maximumInFlight: number
+  readonly maximumInFlightPerSubject: number
+  readonly ratePerSecond: number
+  readonly burst: number
+  readonly maximumSubjects: number
+  readonly idleRetentionMillis: number
+}): Effect.Effect<RelayAdmissionLane> =>
+  Effect.gen(function*() {
+    const lock = yield* Semaphore.make(1)
+    const permits = yield* Semaphore.make(options.maximumInFlight)
+    const subjects = new Map<string, RelaySubjectState>()
+    const inactive = new Map<string, RelaySubjectState>()
+
+    const removeExpired = (now: number) => {
+      while (inactive.size > 0) {
+        const oldest = inactive.entries().next().value!
+        if (now - oldest[1].lastUsedAt < options.idleRetentionMillis) return
+        inactive.delete(oldest[0])
+        subjects.delete(oldest[0])
+      }
+    }
+
+    const admit = (subjectId: string, now: number) =>
+      lock.withPermit(Effect.sync(() => {
+        removeExpired(now)
+        let state = subjects.get(subjectId)
+        if (state?.inFlight === 0) inactive.delete(subjectId)
+        if (state === undefined) {
+          while (subjects.size >= options.maximumSubjects) {
+            const evictable = inactive.entries().next().value
+            if (evictable === undefined) return false
+            inactive.delete(evictable[0])
+            subjects.delete(evictable[0])
+          }
+          state = {
+            tokens: options.burst,
+            updatedAt: now,
+            lastUsedAt: now,
+            inFlight: 0
+          }
+          subjects.set(subjectId, state)
+        }
+        const effectiveNow = Math.max(now, state.updatedAt, state.lastUsedAt)
+        state.tokens = Math.min(
+          options.burst,
+          state.tokens + ((effectiveNow - state.updatedAt) / 1_000) * options.ratePerSecond
+        )
+        state.updatedAt = effectiveNow
+        state.lastUsedAt = effectiveNow
+        if (state.inFlight >= options.maximumInFlightPerSubject || state.tokens < 1) {
+          if (state.inFlight === 0) inactive.set(subjectId, state)
+          return false
+        }
+        state.tokens -= 1
+        state.inFlight += 1
+        return true
+      }))
+
+    const release = (subjectId: string) =>
+      Clock.currentTimeMillis.pipe(
+        Effect.flatMap((now) =>
+          lock.withPermit(Effect.sync(() => {
+            const state = subjects.get(subjectId)
+            if (state === undefined) return
+            state.inFlight -= 1
+            state.lastUsedAt = Math.max(now, state.lastUsedAt)
+            if (state.inFlight === 0) {
+              inactive.delete(subjectId)
+              inactive.set(subjectId, state)
+            }
+          }))
+        )
+      )
+
+    const run: RelayAdmissionLane["run"] = (subjectId, effect) =>
+      Effect.gen(function*() {
+        const admittedAt = yield* Clock.currentTimeMillis
+        if (!(yield* admit(subjectId, admittedAt))) {
+          return yield* new PeerRpcError.RequestCapacityExceeded()
+        }
+        const result = yield* effect.pipe(permits.withPermitsIfAvailable(1))
+        if (Option.isNone(result)) return yield* new PeerRpcError.RequestCapacityExceeded()
+        return result.value
+      }).pipe(Effect.ensuring(release(subjectId)))
+
+    return {
+      run,
+      clear: lock.withPermit(Effect.sync(() => {
+        subjects.clear()
+        inactive.clear()
+      }))
+    }
+  })
+
+export interface PeerRelayServerUsage {
+  readonly accepting: boolean
+  readonly sessions: number
+  readonly subjects: number
+  readonly activeClaims: number
+  readonly queuedChannels: number
+}
+
+export class PeerRelayServerRuntime extends Context.Service<PeerRelayServerRuntime, {
+  readonly health: Effect.Effect<void, PeerRpcError.ServerUnavailable>
+  readonly owner: Effect.Effect<never, unknown>
+  readonly shutdown: Effect.Effect<void>
+  readonly usage: Effect.Effect<PeerRelayServerUsage>
+}>()("@lucas-barake/effect-local-rpc/PeerRelayServerRuntime") {}
+
+class PeerRelayFatalSignal extends Context.Service<PeerRelayFatalSignal, {
+  readonly signal: (cause: Cause.Cause<unknown>) => Effect.Effect<void>
+}>()("@lucas-barake/effect-local-rpc/PeerRelayFatalSignal") {}
+
+interface RelayWorkSelector {
+  readonly recipient: {
+    readonly tenantId: string
+    readonly subjectId: string
+    readonly peerId: Identity.PeerId
+  }
+  readonly sender: {
+    readonly subjectId: string
+    readonly peerId: Identity.PeerId
+  }
+}
+
+interface RelayOutboundItem {
+  readonly event: PeerRelayRpc.StoredMessage
+  readonly reservation: PeerRelayIngress.Reservation
+  transferred: boolean
+}
+
+interface RelayEntry {
+  readonly sessionId: Identity.SessionId
+  readonly generation: number
+  readonly principal: PeerAuthentication.PeerPrincipal
+  readonly senderReplicaIncarnation: Identity.ReplicaIncarnation
+  readonly remote: PeerRelayAuthorization.RemotePeer
+  readonly documents: ReadonlyArray<PeerRpc.RequestedDocument>
+  readonly receiptRetentionMillis: number
+  readonly senderRetryHorizonMillis: number
+  readonly outbound: Queue.Queue<RelayOutboundItem, PeerRpcError.PeerRpcError | Cause.Done>
+  readonly claims: Map<Identity.RelayMessageId, PeerRelayStore.ClaimedMessage>
+  readonly watcherFibers: Array<Fiber.Fiber<void, unknown>>
+  active: boolean
+}
+
+type RelayWorkOwner =
+  | {
+    readonly _tag: "Worker"
+    readonly lane: "New" | "Retry"
+    pending: boolean
+  }
+  | {
+    readonly _tag: "Entry"
+    readonly generation: number
+    pending: boolean
+  }
+  | {
+    readonly _tag: "Terminal"
+  }
+
+const relaySelectorKey = (selector: RelayWorkSelector) =>
+  JSON.stringify([
+    selector.recipient.tenantId,
+    selector.recipient.subjectId,
+    selector.recipient.peerId,
+    selector.sender.subjectId,
+    selector.sender.peerId
+  ])
+
+const relayEntryKey = (
+  principal: PeerAuthentication.PeerPrincipal,
+  remote: PeerRelayAuthorization.RemotePeer
+) =>
+  JSON.stringify([
+    principal.tenantId,
+    principal.subjectId,
+    principal.peerId,
+    remote.subjectId,
+    remote.peerId
+  ])
+
+const relayIncarnationKey = (
+  principal: PeerAuthentication.PeerPrincipal,
+  incarnation: Identity.ReplicaIncarnation,
+  remote: PeerRelayAuthorization.RemotePeer
+) =>
+  JSON.stringify([
+    principal.tenantId,
+    principal.subjectId,
+    principal.peerId,
+    incarnation,
+    remote.subjectId,
+    remote.peerId
+  ])
+
+const relaySelectorForEntry = (entry: RelayEntry): RelayWorkSelector => ({
+  recipient: entry.principal,
+  sender: entry.remote
+})
+
+const sameRelayPrincipal = (
+  left: PeerAuthentication.PeerPrincipal,
+  right: PeerAuthentication.PeerPrincipal
+) =>
+  left.tenantId === right.tenantId &&
+  left.subjectId === right.subjectId &&
+  left.peerId === right.peerId
+
+const relayStoreFailure = (error: PeerRelayStore.StoreError): PeerRpcError.PeerRpcError => {
+  if (error._tag !== "ReplicaError") {
+    return new PeerRpcError.ServerUnavailable()
+  }
+  switch (error.reason._tag) {
+    case "QuotaExceeded":
+      return new PeerRpcError.RequestCapacityExceeded()
+    case "ProtocolMismatch":
+      return new PeerRpcError.InvalidRequest()
+    default:
+      return new PeerRpcError.ServerUnavailable()
+  }
+}
+
+const SyncEnvelopeJson = Schema.fromJsonString(Schema.toCodecJson(PeerSession.SyncEnvelope))
+
+const decodeRelayEnvelope = (payload: Uint8Array) =>
+  Schema.decodeUnknownEffect(SyncEnvelopeJson)(new TextDecoder().decode(payload)).pipe(
+    Effect.mapError(() => new PeerRpcError.InvalidRequest())
+  )
+
+export const layerRelayHandlers = (
+  options: {
+    readonly tenantId: string
+    readonly peerId: Identity.PeerId
+  }
+) =>
+  Layer.effectContext(Effect.gen(function*() {
+    const serverScope = yield* Scope.Scope
+    const runtimeScope = yield* Scope.fork(serverScope, "sequential")
+    const authorization = yield* PeerRelayAuthorization.PeerRelayAuthorization
+    const store = yield* PeerRelayStore.PeerRelayStore
+    const limits = yield* PeerRelayLimits.PeerRelayLimits
+    const ingress = yield* PeerRelayIngress.PeerRelayIngress
+    yield* Crypto.Crypto
+    const lock = yield* Semaphore.make(1)
+    const fatal = yield* Deferred.make<never, unknown>()
+    const shutdownStarted = yield* Deferred.make<void>()
+    const shutdownFinished = yield* Deferred.make<void>()
+    const sessions = new Map<Identity.SessionId, RelayEntry>()
+    const endpoints = new Map<string, Identity.SessionId>()
+    const incarnations = new Map<string, Identity.SessionId>()
+    const subjectSessions = new Map<string, number>()
+    const workOwners = new Map<string, RelayWorkOwner>()
+    const selectors = new Map<string, RelayWorkSelector>()
+    const newWork = yield* Queue.dropping<RelayWorkSelector, Cause.Done>(limits.newWorkQueueCapacity)
+    const retryWork = yield* Queue.dropping<RelayWorkSelector, Cause.Done>(limits.retryQueueCapacity)
+    const workWake = yield* Queue.dropping<void, Cause.Done>(
+      limits.newWorkQueueCapacity + limits.retryQueueCapacity
+    )
+    let accepting = true
+    let generation = 0
+    let compensationCursor = 0
+
+    const signalFatal = (cause: Cause.Cause<unknown>) => Deferred.done(fatal, Exit.failCause(cause)).pipe(Effect.asVoid)
+
+    const sql = yield* makeRelaySqlScheduler(limits, runtimeScope, signalFatal)
+    const openLane = yield* makeRelayAdmissionLane({
+      maximumInFlight: limits.maxInFlightOpen,
+      maximumInFlightPerSubject: limits.maxInFlightOpenPerSubject,
+      ratePerSecond: limits.openRatePerSecond,
+      burst: limits.openBurst,
+      maximumSubjects: limits.maxRetainedRateLimitedSubjects,
+      idleRetentionMillis: limits.rateLimitIdleRetentionMillis
+    })
+    const pushLane = yield* makeRelayAdmissionLane({
+      maximumInFlight: limits.maxInFlightPush,
+      maximumInFlightPerSubject: limits.maxInFlightPushPerSubject,
+      ratePerSecond: limits.admissionRatePerSecond,
+      burst: limits.admissionBurst,
+      maximumSubjects: limits.maxRetainedRateLimitedSubjects,
+      idleRetentionMillis: limits.rateLimitIdleRetentionMillis
+    })
+    const terminalLane = yield* makeRelayAdmissionLane({
+      maximumInFlight: limits.maxInFlightTerminalResponses,
+      maximumInFlightPerSubject: limits.maxInFlightTerminalResponsesPerSubject,
+      ratePerSecond: limits.terminalResponseRatePerSecond,
+      burst: limits.terminalResponseBurst,
+      maximumSubjects: limits.maxRetainedTerminalResponseSubjects,
+      idleRetentionMillis: limits.terminalResponseSubjectIdleRetentionMillis
+    })
+
+    const storeEffect = <A,>(effect: Effect.Effect<A, PeerRelayStore.StoreError>) =>
+      effect.pipe(Effect.mapError(relayStoreFailure))
+
+    const releaseClaim = (
+      entry: RelayEntry,
+      claim: PeerRelayStore.ClaimedMessage
+    ) =>
+      store.release({
+        channel: claim.channel,
+        relayMessageId: claim.relayMessageId,
+        claimToken: claim.claimToken,
+        sessionGeneration: entry.generation
+      }).pipe(
+        Effect.timeoutOrElse({
+          duration: limits.shutdownReleaseTimeoutMillis,
+          orElse: () => Effect.succeed(undefined)
+        }),
+        Effect.ignore
+      )
+
+    const detachEntry = (
+      entry: RelayEntry,
+      fromWatcher: boolean
+    ): Effect.Effect<void> =>
+      Effect.uninterruptible(Effect.gen(function*() {
+        const cleanup = yield* lock.withPermit(Effect.sync(() => {
+          if (!entry.active) return undefined
+          entry.active = false
+          sessions.delete(entry.sessionId)
+          const endpoint = relayEntryKey(entry.principal, entry.remote)
+          if (endpoints.get(endpoint) === entry.sessionId) endpoints.delete(endpoint)
+          const incarnation = relayIncarnationKey(
+            entry.principal,
+            entry.senderReplicaIncarnation,
+            entry.remote
+          )
+          if (incarnations.get(incarnation) === entry.sessionId) incarnations.delete(incarnation)
+          const current = subjectSessions.get(entry.principal.subjectId) ?? 0
+          if (current <= 1) subjectSessions.delete(entry.principal.subjectId)
+          else subjectSessions.set(entry.principal.subjectId, current - 1)
+          const selector = relaySelectorForEntry(entry)
+          const key = relaySelectorKey(selector)
+          const owner = workOwners.get(key)
+          if (owner?._tag === "Entry" && owner.generation === entry.generation) {
+            workOwners.delete(key)
+          }
+          if (endpoints.get(endpoint) === undefined) {
+            selectors.delete(key)
+          }
+          const claims = [...entry.claims.values()]
+          entry.claims.clear()
+          return { claims }
+        }))
+        if (cleanup === undefined) return
+        const buffered = yield* drainRelayQueue(entry.outbound)
+        yield* Effect.forEach(buffered, (item) => item.reservation.release, {
+          concurrency: 1,
+          discard: true
+        })
+        yield* Queue.fail(entry.outbound, new PeerRpcError.SessionUnavailable())
+        yield* Queue.shutdown(entry.outbound)
+        yield* Effect.forEach(
+          cleanup.claims,
+          (claim) => releaseClaim(entry, claim),
+          { concurrency: limits.shutdownReleaseConcurrency, discard: true }
+        )
+        if (!fromWatcher) {
+          yield* Effect.forEach(entry.watcherFibers, Fiber.interrupt, { discard: true })
+        }
+      }))
+
+    const notify = (
+      selector: RelayWorkSelector,
+      lane: "New" | "Retry"
+    ): Effect.Effect<void> =>
+      Effect.gen(function*() {
+        const key = relaySelectorKey(selector)
+        const shouldOffer = yield* lock.withPermit(Effect.sync(() => {
+          if (!accepting) return false
+          if (
+            endpoints.get(relayEntryKey(selector.recipient, selector.sender)) === undefined
+          ) {
+            return false
+          }
+          selectors.set(key, selector)
+          const current = workOwners.get(key)
+          if (current === undefined || current._tag === "Terminal") {
+            workOwners.set(key, { _tag: "Worker", lane, pending: false })
+            return true
+          }
+          current.pending = true
+          return false
+        }))
+        if (!shouldOffer) return
+        const queue = lane === "New" ? newWork : retryWork
+        const offered = yield* Queue.offer(queue, selector)
+        if (!offered) {
+          yield* lock.withPermit(Effect.sync(() => {
+            const current = workOwners.get(key)
+            if (current?._tag === "Worker" && current.lane === lane) {
+              workOwners.delete(key)
+            }
+          }))
+          return
+        }
+        yield* Queue.offer(workWake, undefined)
+      })
+
+    const freshEntry = (
+      sessionId: Identity.SessionId,
+      authenticated: Context.Service.Shape<typeof PeerAuthentication.AuthenticatedPeer>
+    ) =>
+      Effect.gen(function*() {
+        const now = yield* Clock.currentTimeMillis
+        if (authenticated.validUntil <= now) {
+          return yield* new PeerRpcError.SessionUnavailable()
+        }
+        const entry = yield* lock.withPermit(Effect.sync(() => sessions.get(sessionId)))
+        if (
+          entry === undefined ||
+          !entry.active ||
+          !sameRelayPrincipal(entry.principal, authenticated.principal) ||
+          endpoints.get(relayEntryKey(entry.principal, entry.remote)) !== entry.sessionId ||
+          incarnations.get(
+              relayIncarnationKey(
+                entry.principal,
+                entry.senderReplicaIncarnation,
+                entry.remote
+              )
+            ) !== entry.sessionId
+        ) {
+          return yield* new PeerRpcError.SessionUnavailable()
+        }
+        return entry
+      })
+
+    const authorizeEntry = (
+      entry: RelayEntry,
+      direction: PeerRelayAuthorization.Direction,
+      documents: ReadonlyArray<PeerRpc.RequestedDocument>
+    ) =>
+      authorization.authorize({
+        direction,
+        principal: entry.principal,
+        remote: entry.remote,
+        documents
+      })
+
+    const validateClaimPayload = (
+      claim: PeerRelayStore.ClaimedMessage,
+      payload: Uint8Array
+    ) =>
+      Effect.gen(function*() {
+        if (payload.byteLength !== claim.payloadBytes) {
+          return yield* new PeerRpcError.ServerUnavailable()
+        }
+        const envelope = yield* decodeRelayEnvelope(payload)
+        if (
+          claim.relayPeerId !== options.peerId ||
+          envelope.connectionEpoch !== claim.senderConnectionEpoch ||
+          envelope.sequence !== claim.senderSequence ||
+          envelope.messageHash !== claim.messageHash ||
+          claim.documentIds.length !== 1 ||
+          envelope.documentId !== claim.documentIds[0]
+        ) {
+          return yield* new PeerRpcError.ServerUnavailable()
+        }
+        const digest = yield* PeerSyncEnvelope.digestRelayOuterEnvelope({
+          domain: PeerSyncEnvelope.relayOuterEnvelopeDomain,
+          version: PeerSyncEnvelope.relayOuterEnvelopeVersion,
+          expectedLocal: {
+            tenantId: claim.channel.tenantId,
+            subjectId: claim.channel.senderSubjectId,
+            peerId: claim.channel.senderPeerId
+          },
+          remote: {
+            tenantId: claim.channel.tenantId,
+            subjectId: claim.channel.recipientSubjectId,
+            peerId: claim.channel.recipientPeerId
+          },
+          relayPeerId: claim.relayPeerId,
+          relayMessageId: claim.relayMessageId,
+          protocolVersion: PeerRelayRpc.protocolVersion,
+          payloadVersion: claim.payloadVersion,
+          senderReplicaIncarnation: claim.channel.senderReplicaIncarnation,
+          senderConnectionEpoch: claim.senderConnectionEpoch,
+          senderSequence: claim.senderSequence,
+          document: {
+            documentId: envelope.documentId,
+            documentType: envelope.documentType
+          },
+          writerProvenance: envelope.writerProvenance,
+          messageHash: envelope.messageHash,
+          payload
+        }).pipe(Effect.mapError(relayStoreFailure))
+        if (digest !== claim.outerEnvelopeDigest) {
+          return yield* new PeerRpcError.ServerUnavailable()
+        }
+        return envelope
+      })
+
+    const abandonClaim = (
+      entry: RelayEntry,
+      claim: PeerRelayStore.ClaimedMessage
+    ) =>
+      lock.withPermit(Effect.sync(() => {
+        if (entry.claims.get(claim.relayMessageId) === claim) {
+          entry.claims.delete(claim.relayMessageId)
+          const key = relaySelectorKey(relaySelectorForEntry(entry))
+          const owner = workOwners.get(key)
+          if (
+            owner?._tag === "Worker" ||
+            owner?._tag === "Entry" && owner.generation === entry.generation
+          ) {
+            workOwners.delete(key)
+          }
+          return true
+        }
+        return false
+      })).pipe(
+        Effect.flatMap((removed) => removed ? releaseClaim(entry, claim) : Effect.void)
+      )
+
+    const deliver = (selector: RelayWorkSelector) =>
+      Effect.gen(function*() {
+        const key = relaySelectorKey(selector)
+        const entry = yield* lock.withPermit(Effect.sync(() => {
+          const sessionId = endpoints.get(relayEntryKey(selector.recipient, selector.sender))
+          return sessionId === undefined ? undefined : sessions.get(sessionId)
+        }))
+        if (entry === undefined || !entry.active) {
+          yield* lock.withPermit(Effect.sync(() => {
+            workOwners.delete(key)
+          }))
+          return
+        }
+        const allowed = yield* authorizeEntry(entry, "Receive", entry.documents)
+        const authorizedDocumentIds = allowed.documents.map((document) => document.documentId)
+        type ClaimAcquisition = {
+          readonly claimed: PeerRelayStore.ClaimResult
+          readonly claim: PeerRelayStore.ClaimedMessage | undefined
+          readonly recorded: boolean
+        }
+        const acquisition = yield* Effect.uninterruptibleMask((restore) =>
+          restore(sql.submit(
+            "Delivery",
+            storeEffect(store.claim({
+              recipient: selector.recipient,
+              sender: selector.sender,
+              sessionGeneration: entry.generation,
+              authorizedDocumentIds
+            }))
+          )).pipe(
+            Effect.flatMap((claimed) => {
+              if (Option.isNone(claimed.message)) {
+                return Effect.succeed({
+                  claimed,
+                  claim: undefined,
+                  recorded: true
+                } as ClaimAcquisition)
+              }
+              const claim = claimed.message.value
+              return lock.withPermit(Effect.sync(() => {
+                if (
+                  sessions.get(entry.sessionId) !== entry ||
+                  !entry.active ||
+                  endpoints.get(relayEntryKey(entry.principal, entry.remote)) !== entry.sessionId
+                ) {
+                  return { claimed, claim, recorded: false } as ClaimAcquisition
+                }
+                entry.claims.set(claim.relayMessageId, claim)
+                return { claimed, claim, recorded: true } as ClaimAcquisition
+              }))
+            })
+          )
+        )
+        if (acquisition.claim === undefined) {
+          const pending = yield* lock.withPermit(Effect.sync(() => {
+            const current = workOwners.get(key)
+            workOwners.delete(key)
+            return current?._tag === "Worker" && current.pending
+          }))
+          if (pending) yield* notify(selector, acquisition.claimed.lane)
+          return
+        }
+        const claim = acquisition.claim
+        if (!acquisition.recorded) {
+          yield* releaseClaim(entry, claim)
+          return
+        }
+        let pendingReservation: PeerRelayIngress.Reservation | undefined
+        yield* Effect.gen(function*() {
+          const reservation = yield* ingress.reserveOutbound(claim.payloadBytes).pipe(
+            Effect.onError(() => abandonClaim(entry, claim))
+          )
+          pendingReservation = reservation
+          const payload = yield* sql.submit(
+            "Delivery",
+            storeEffect(store.loadClaimedPayload({
+              channel: claim.channel,
+              rowId: claim.rowId,
+              relayMessageId: claim.relayMessageId,
+              claimToken: claim.claimToken,
+              sessionGeneration: entry.generation,
+              payloadBytes: claim.payloadBytes
+            }))
+          ).pipe(Effect.onError(() => Effect.andThen(reservation.release, abandonClaim(entry, claim))))
+          const envelope = yield* validateClaimPayload(claim, payload).pipe(
+            Effect.onError(() => Effect.andThen(reservation.release, abandonClaim(entry, claim)))
+          )
+          const event = PeerRelayRpc.StoredMessage.make({
+            _tag: "StoredMessage",
+            relayMessageId: claim.relayMessageId,
+            claimToken: claim.claimToken,
+            relayPeerId: claim.relayPeerId,
+            sender: {
+              tenantId: claim.channel.tenantId,
+              subjectId: claim.channel.senderSubjectId,
+              peerId: claim.channel.senderPeerId,
+              replicaIncarnation: claim.channel.senderReplicaIncarnation,
+              connectionEpoch: claim.senderConnectionEpoch,
+              sequence: claim.senderSequence
+            },
+            recipient: selector.recipient,
+            payloadVersion: 1,
+            document: {
+              documentType: envelope.documentType,
+              documentId: envelope.documentId
+            },
+            writerProvenance: envelope.writerProvenance,
+            messageHash: envelope.messageHash,
+            outerEnvelopeDigest: claim.outerEnvelopeDigest,
+            payload
+          })
+          const transferred = yield* lock.withPermit(Effect.sync(() => {
+            const currentSession = sessions.get(entry.sessionId)
+            const owner = workOwners.get(key)
+            if (
+              currentSession !== entry ||
+              !entry.active ||
+              owner?._tag !== "Worker"
+            ) {
+              return false
+            }
+            workOwners.set(key, {
+              _tag: "Entry",
+              generation: entry.generation,
+              pending: owner.pending
+            })
+            return true
+          }))
+          if (!transferred) {
+            yield* reservation.release
+            yield* abandonClaim(entry, claim)
+            return
+          }
+          const offered = yield* Queue.offer(entry.outbound, {
+            event,
+            reservation,
+            transferred: false
+          })
+          if (!offered) {
+            yield* lock.withPermit(Effect.sync(() => {
+              const owner = workOwners.get(key)
+              if (owner?._tag === "Entry" && owner.generation === entry.generation) {
+                workOwners.delete(key)
+              }
+            }))
+            yield* reservation.release
+            yield* abandonClaim(entry, claim)
+          }
+        }).pipe(
+          Effect.onInterrupt(() =>
+            Effect.andThen(
+              pendingReservation?.release ?? Effect.void,
+              abandonClaim(entry, claim)
+            )
+          )
+        )
+      }).pipe(
+        Effect.catchTags({
+          AccessDenied: () =>
+            lock.withPermit(Effect.sync(() => {
+              workOwners.delete(relaySelectorKey(selector))
+            })),
+          RequestCapacityExceeded: () =>
+            lock.withPermit(Effect.sync(() => {
+              workOwners.delete(relaySelectorKey(selector))
+            }))
+        }),
+        Effect.catchCause((cause) => signalFatal(cause))
+      )
+
+    const workOrder = [
+      ...Array.from({ length: limits.newWorkWeight }, () => "New" as const),
+      ...Array.from({ length: limits.retryWorkWeight }, () => "Retry" as const)
+    ]
+    const makeWorker = Effect.suspend(() => {
+      let cursor = 0
+      const take = (): Effect.Effect<RelayWorkSelector, Cause.Done> =>
+        Effect.gen(function*() {
+          for (let offset = 0; offset < workOrder.length; offset++) {
+            const index = (cursor + offset) % workOrder.length
+            const lane = workOrder[index]!
+            const item = yield* Queue.poll(lane === "New" ? newWork : retryWork)
+            if (Option.isSome(item)) {
+              cursor = (index + 1) % workOrder.length
+              return item.value
+            }
+          }
+          yield* Queue.take(workWake)
+          return yield* take()
+        })
+      return Effect.forever(take().pipe(Effect.flatMap(deliver)))
+    })
+
+    const workerFibers: Array<Fiber.Fiber<void, Cause.Done>> = []
+    for (let index = 0; index < limits.relayWorkerConcurrency; index++) {
+      const fiber = yield* Effect.forkIn(makeWorker, runtimeScope)
+      workerFibers.push(fiber)
+      yield* Effect.forkIn(
+        Fiber.await(fiber).pipe(
+          Effect.flatMap((exit) =>
+            lock.withPermit(Effect.sync(() => accepting)).pipe(
+              Effect.flatMap((wasAccepting) =>
+                wasAccepting && Exit.isFailure(exit)
+                  ? signalFatal(exit.cause)
+                  : Effect.void
+              )
+            )
+          )
+        ),
+        runtimeScope
+      )
+    }
+
+    const compensationFiber = yield* Effect.forkIn(
+      Effect.forever(
+        Effect.sleep(limits.compensationIntervalMillis).pipe(
+          Effect.andThen(lock.withPermit(Effect.sync(() => {
+            const active = [...selectors.values()]
+            if (active.length === 0) return []
+            const batch: Array<RelayWorkSelector> = []
+            for (
+              let index = 0;
+              index < Math.min(limits.compensationBatchSize, active.length);
+              index++
+            ) {
+              batch.push(active[(compensationCursor + index) % active.length]!)
+            }
+            compensationCursor = (compensationCursor + batch.length) % active.length
+            return batch
+          }))),
+          Effect.flatMap((batch) =>
+            Effect.forEach(batch, (selector) => notify(selector, "Retry"), {
+              discard: true
+            })
+          )
+        )
+      ),
+      runtimeScope
+    )
+
+    type MaintenanceStage = {
+      cursor: number | undefined
+      readonly batchSize: number
+      readonly run: (
+        request: PeerRelayStore.MaintenanceRequest
+      ) => Effect.Effect<PeerRelayStore.MaintenanceResult, PeerRelayStore.StoreError>
+    }
+    const maintenanceStages: Array<MaintenanceStage> = [
+      { cursor: undefined, batchSize: limits.claimRecoveryBatchSize, run: store.recover },
+      { cursor: undefined, batchSize: limits.expiryBatchSize, run: store.expire },
+      { cursor: undefined, batchSize: limits.integrityBatchSize, run: store.repair },
+      { cursor: undefined, batchSize: limits.reconciliationBatchSize, run: store.reconcile },
+      { cursor: undefined, batchSize: limits.terminalCollectionBatchSize, run: store.collect }
+    ]
+    const maintenanceFiber = yield* Effect.forkIn(
+      Effect.forever(
+        Effect.sleep(limits.maintenanceIntervalMillis).pipe(
+          Effect.andThen(Effect.forEach(maintenanceStages, (stage) =>
+            sql.submit(
+              "Maintenance",
+              storeEffect(stage.run({
+                ...(stage.cursor === undefined ? {} : { cursor: stage.cursor }),
+                batchSize: stage.batchSize
+              }))
+            ).pipe(
+              Effect.tap((result) =>
+                Effect.sync(() => {
+                  stage.cursor = result.hasMore ? result.cursor : undefined
+                })
+              )
+            ), { discard: true }))
+        )
+      ).pipe(Effect.catchCause(signalFatal)),
+      runtimeScope
+    )
+
+    const open = (
+      request: typeof PeerRelayRpc.OpenRelayRpc.payloadSchema.Type
+    ) =>
+      Effect.gen(function*() {
+        const authenticated = yield* PeerAuthentication.AuthenticatedPeer
+        return yield* openLane.run(
+          authenticated.principal.subjectId,
+          Effect.gen(function*() {
+            const principal = authenticated.principal
+            const now = yield* Clock.currentTimeMillis
+            if (authenticated.validUntil <= now) {
+              return yield* new PeerRpcError.AuthenticationFailure()
+            }
+            if (request.version !== PeerRelayRpc.protocolVersion) {
+              return yield* new PeerRpcError.UnsupportedVersion()
+            }
+            if (
+              request.expectedRelayPeerId !== options.peerId ||
+              request.expectedLocal.tenantId !== principal.tenantId ||
+              request.expectedLocal.subjectId !== principal.subjectId ||
+              request.expectedLocal.peerId !== principal.peerId
+            ) {
+              return yield* new PeerRpcError.PeerMismatch()
+            }
+            if (principal.tenantId !== options.tenantId) {
+              return yield* new PeerRpcError.AccessDenied()
+            }
+            if (
+              request.senderRetryHorizonMillis > limits.maximumSenderRetryHorizonMillis ||
+              request.receiptRetentionMillis > limits.maximumReceiptRetentionMillis ||
+              request.receiptRetentionMillis <
+                Math.max(limits.messageTtlMillis, request.senderRetryHorizonMillis) +
+                  limits.minimumTerminalRetentionMillis
+            ) {
+              return yield* new PeerRpcError.InvalidRequest()
+            }
+            const send = yield* authorization.authorize({
+              direction: "Send",
+              principal,
+              remote: request.remote,
+              documents: request.documents
+            })
+            const receive = yield* authorization.authorize({
+              direction: "Receive",
+              principal,
+              remote: request.remote,
+              documents: request.documents
+            })
+            const outbound = yield* Queue.dropping<
+              RelayOutboundItem,
+              PeerRpcError.PeerRpcError | Cause.Done
+            >(1)
+            const sessionId = yield* Identity.makeSessionId.pipe(
+              Effect.mapError(() => new PeerRpcError.ServerUnavailable())
+            )
+            const entry = yield* lock.withPermit(Effect.gen(function*() {
+              if (!accepting) return yield* new PeerRpcError.ServerUnavailable()
+              const current = subjectSessions.get(principal.subjectId) ?? 0
+              const endpoint = relayEntryKey(principal, request.remote)
+              const replacedId = endpoints.get(endpoint)
+              const replaced = replacedId === undefined ? undefined : sessions.get(replacedId)
+              if (replaced === undefined && current >= limits.maxSessionsPerSubject) {
+                return yield* new PeerRpcError.RequestCapacityExceeded()
+              }
+              if (replaced === undefined && endpoints.size >= limits.maxActiveChannels) {
+                return yield* new PeerRpcError.RequestCapacityExceeded()
+              }
+              const entry: RelayEntry = {
+                sessionId,
+                generation: generation++,
+                principal,
+                senderReplicaIncarnation: request.senderReplicaIncarnation,
+                remote: request.remote,
+                documents: request.documents,
+                receiptRetentionMillis: request.receiptRetentionMillis,
+                senderRetryHorizonMillis: request.senderRetryHorizonMillis,
+                outbound,
+                claims: new Map(),
+                watcherFibers: [],
+                active: true
+              }
+              sessions.set(sessionId, entry)
+              endpoints.set(endpoint, sessionId)
+              incarnations.set(
+                relayIncarnationKey(principal, request.senderReplicaIncarnation, request.remote),
+                sessionId
+              )
+              subjectSessions.set(principal.subjectId, current + 1)
+              selectors.set(
+                relaySelectorKey(relaySelectorForEntry(entry)),
+                relaySelectorForEntry(entry)
+              )
+              return { entry, replaced }
+            }))
+            if (entry.replaced !== undefined) yield* detachEntry(entry.replaced, false)
+            const validUntil = Math.min(
+              authenticated.validUntil,
+              send.validUntil,
+              receive.validUntil
+            )
+            const watcher = Effect.raceFirst(
+              Effect.raceFirst(authenticated.invalidated, send.invalidated),
+              Effect.raceFirst(
+                receive.invalidated,
+                Effect.sleep(Math.max(0, validUntil - now))
+              )
+            ).pipe(
+              Effect.andThen(detachEntry(entry.entry, true)),
+              Effect.forkIn(runtimeScope)
+            )
+            entry.entry.watcherFibers.push(yield* watcher)
+            yield* notify(relaySelectorForEntry(entry.entry), "Retry")
+            const opened = PeerRelayRpc.RelayOpened.make({
+              _tag: "RelayOpened",
+              version: PeerRelayRpc.protocolVersion,
+              sessionId,
+              remotePeerId: entry.entry.remote.peerId,
+              authenticatedLocal: principal,
+              capabilities: { storeAndForward: true }
+            })
+            const deliveries = Stream.fromQueue(entry.entry.outbound).pipe(
+              Stream.mapEffect((item) =>
+                item.reservation.transferToCurrentRequest.pipe(
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      item.transferred = true
+                    })
+                  ),
+                  Effect.as(item.event),
+                  Effect.onError(() => item.reservation.release)
+                )
+              )
+            )
+            return Stream.concat(Stream.make(opened), deliveries).pipe(
+              Stream.ensuring(detachEntry(entry.entry, false))
+            )
+          })
+        )
+      })
+
+    const push = (request: typeof PeerRelayRpc.PushRelayRpc.payloadSchema.Type) =>
+      Effect.gen(function*() {
+        const authenticated = yield* PeerAuthentication.AuthenticatedPeer
+        return yield* pushLane.run(
+          authenticated.principal.subjectId,
+          Effect.gen(function*() {
+            const entry = yield* freshEntry(request.sessionId, authenticated)
+            const envelope = yield* decodeRelayEnvelope(request.payload)
+            const document = entry.documents.find((candidate) =>
+              candidate.documentId === envelope.documentId &&
+              candidate.documentType === envelope.documentType
+            )
+            if (document === undefined || !/^[0-9a-f]{64}$/.test(envelope.messageHash)) {
+              return yield* new PeerRpcError.InvalidRequest()
+            }
+            const messageHash = yield* Canonical.digest(envelope.message).pipe(
+              Effect.mapError(relayStoreFailure)
+            )
+            if (messageHash !== envelope.messageHash) {
+              return yield* new PeerRpcError.InvalidRequest()
+            }
+            yield* authorizeEntry(entry, "Send", [document])
+            const outerEnvelopeDigest = yield* PeerSyncEnvelope.digestRelayOuterEnvelope({
+              domain: PeerSyncEnvelope.relayOuterEnvelopeDomain,
+              version: PeerSyncEnvelope.relayOuterEnvelopeVersion,
+              expectedLocal: entry.principal,
+              remote: {
+                tenantId: entry.principal.tenantId,
+                subjectId: entry.remote.subjectId,
+                peerId: entry.remote.peerId
+              },
+              relayPeerId: options.peerId,
+              relayMessageId: request.relayMessageId,
+              protocolVersion: PeerRelayRpc.protocolVersion,
+              payloadVersion: 1,
+              senderReplicaIncarnation: entry.senderReplicaIncarnation,
+              senderConnectionEpoch: envelope.connectionEpoch,
+              senderSequence: envelope.sequence,
+              document: {
+                documentId: envelope.documentId,
+                documentType: envelope.documentType
+              },
+              writerProvenance: envelope.writerProvenance,
+              messageHash: envelope.messageHash,
+              payload: request.payload
+            }).pipe(Effect.mapError(relayStoreFailure))
+            const channel: PeerRelayStore.ChannelKey = {
+              tenantId: entry.principal.tenantId,
+              senderSubjectId: entry.principal.subjectId,
+              senderPeerId: entry.principal.peerId,
+              senderReplicaIncarnation: entry.senderReplicaIncarnation,
+              recipientSubjectId: entry.remote.subjectId,
+              recipientPeerId: entry.remote.peerId
+            }
+            const result = yield* sql.submit(
+              "Admission",
+              storeEffect(store.admit({
+                channel,
+                relayMessageId: request.relayMessageId,
+                relayPeerId: options.peerId,
+                documentIds: [envelope.documentId],
+                senderConnectionEpoch: envelope.connectionEpoch,
+                senderSequence: envelope.sequence,
+                payloadVersion: 1,
+                messageHash: envelope.messageHash,
+                outerEnvelopeDigest,
+                payload: request.payload,
+                messageTtlMillis: limits.messageTtlMillis,
+                senderRetryHorizonMillis: entry.senderRetryHorizonMillis,
+                minimumTerminalRetentionMillis: limits.minimumTerminalRetentionMillis
+              }))
+            )
+            if (result.ready) {
+              yield* notify({
+                recipient: {
+                  tenantId: channel.tenantId,
+                  subjectId: channel.recipientSubjectId,
+                  peerId: channel.recipientPeerId
+                },
+                sender: {
+                  subjectId: channel.senderSubjectId,
+                  peerId: channel.senderPeerId
+                }
+              }, "New")
+            }
+          })
+        )
+      })
+
+    const terminal = (
+      request:
+        | typeof PeerRelayRpc.AcknowledgeRelayRpc.payloadSchema.Type
+        | typeof PeerRelayRpc.RejectRelayRpc.payloadSchema.Type,
+      reason: PeerRelayRpc.RejectReason | undefined
+    ) =>
+      Effect.gen(function*() {
+        const authenticated = yield* PeerAuthentication.AuthenticatedPeer
+        return yield* terminalLane.run(
+          authenticated.principal.subjectId,
+          Effect.gen(function*() {
+            const entry = yield* freshEntry(request.sessionId, authenticated)
+            const claim = yield* lock.withPermit(Effect.sync(() => entry.claims.get(request.relayMessageId)))
+            if (
+              claim === undefined ||
+              claim.claimToken !== request.claimToken ||
+              claim.messageHash !== request.messageHash
+            ) {
+              return yield* new PeerRpcError.SessionUnavailable()
+            }
+            const document = entry.documents.filter((candidate) => claim.documentIds.includes(candidate.documentId))
+            yield* authorizeEntry(entry, "Receive", document)
+            const transition = yield* sql.submit(
+              "Terminal",
+              storeEffect(
+                reason === undefined
+                  ? store.acknowledge({
+                    channel: claim.channel,
+                    relayMessageId: claim.relayMessageId,
+                    claimToken: claim.claimToken,
+                    messageHash: claim.messageHash,
+                    sessionGeneration: entry.generation,
+                    recipient: entry.principal
+                  })
+                  : store.reject({
+                    channel: claim.channel,
+                    relayMessageId: claim.relayMessageId,
+                    claimToken: claim.claimToken,
+                    messageHash: claim.messageHash,
+                    sessionGeneration: entry.generation,
+                    recipient: entry.principal,
+                    reason
+                  })
+              )
+            )
+            if (transition.status === "Stale") {
+              return yield* new PeerRpcError.SessionUnavailable()
+            }
+            const selector = relaySelectorForEntry(entry)
+            const shouldNotify = yield* lock.withPermit(Effect.sync(() => {
+              entry.claims.delete(claim.relayMessageId)
+              const key = relaySelectorKey(selector)
+              const owner = workOwners.get(key)
+              if (owner?._tag === "Entry" && owner.generation === entry.generation) {
+                workOwners.delete(key)
+              }
+              return transition.ready || owner?._tag === "Entry" && owner.pending
+            }))
+            if (shouldNotify) yield* notify(selector, transition.lane)
+          })
+        )
+      })
+
+    const shutdown = Effect.uninterruptibleMask(() =>
+      Effect.gen(function*() {
+        const first = yield* Deferred.succeed(shutdownStarted, undefined)
+        if (!first) return yield* Deferred.await(shutdownFinished)
+        yield* lock.withPermit(Effect.sync(() => {
+          accepting = false
+        }))
+        yield* Fiber.interrupt(compensationFiber)
+        yield* Fiber.interrupt(maintenanceFiber)
+        yield* Effect.forEach(workerFibers, Fiber.interrupt, { discard: true })
+        yield* Queue.shutdown(newWork)
+        yield* Queue.shutdown(retryWork)
+        yield* Queue.shutdown(workWake)
+        const active = yield* lock.withPermit(Effect.sync(() => [...sessions.values()]))
+        yield* Effect.forEach(active, (entry) => detachEntry(entry, false), {
+          concurrency: limits.shutdownReleaseConcurrency,
+          discard: true
+        })
+        yield* lock.withPermit(Effect.sync(() => {
+          workOwners.clear()
+          selectors.clear()
+        }))
+        yield* sql.shutdown
+        yield* openLane.clear
+        yield* pushLane.clear
+        yield* terminalLane.clear
+        yield* Scope.close(runtimeScope, Exit.void)
+        yield* Deferred.succeed(shutdownFinished, undefined)
+      })
+    )
+
+    yield* Effect.addFinalizer(() => shutdown)
+    yield* Effect.forkIn(
+      Deferred.await(fatal).pipe(
+        Effect.ensuring(shutdown)
+      ),
+      serverScope
+    )
+
+    const runtime = PeerRelayServerRuntime.of({
+      health: Deferred.poll(fatal).pipe(
+        Effect.flatMap((exit) =>
+          Option.isNone(exit)
+            ? Effect.void
+            : Effect.fail(new PeerRpcError.ServerUnavailable())
+        )
+      ),
+      owner: Deferred.await(fatal),
+      shutdown,
+      usage: lock.withPermit(Effect.sync(() => ({
+        accepting,
+        sessions: sessions.size,
+        subjects: subjectSessions.size,
+        activeClaims: [...sessions.values()].reduce((sum, entry) => sum + entry.claims.size, 0),
+        queuedChannels: workOwners.size
+      })))
+    })
+    const handlerContext = yield* PeerRelayRpc.Rpcs.toHandlers(PeerRelayRpc.Rpcs.of({
+      OpenRelay: (request) => Stream.unwrap(open(request)),
+      PushRelay: push,
+      AcknowledgeRelay: (request) => terminal(request, undefined),
+      RejectRelay: (request) => terminal(request, request.reason)
+    }))
+    return Context.add(handlerContext, PeerRelayServerRuntime, runtime).pipe(
+      Context.add(PeerRelayFatalSignal, PeerRelayFatalSignal.of({ signal: signalFatal }))
+    )
+  }))
+
+export const layerRelayServer = Layer.effectDiscard(Effect.gen(function*() {
+  const scope = yield* Scope.Scope
+  const runtime = yield* PeerRelayServerRuntime
+  const fatalSignal = yield* PeerRelayFatalSignal
+  const ingress = yield* PeerRelayIngress.PeerRelayIngress
+  let stopping = false
+  const serverFiber = yield* Effect.forkIn(
+    RpcServer.make(PeerRelayRpc.Rpcs),
+    scope
+  )
+  const ingressFiber = yield* Effect.forkIn(ingress.await, scope)
+  const stop = Effect.uninterruptible(
+    Effect.sync(() => {
+      stopping = true
+    }).pipe(
+      Effect.andThen(runtime.shutdown),
+      Effect.andThen(Fiber.interrupt(serverFiber)),
+      Effect.andThen(Fiber.interrupt(ingressFiber))
+    )
+  )
+  const observe = <A, E,>(fiber: Fiber.Fiber<A, E>) =>
+    Fiber.await(fiber).pipe(
+      Effect.flatMap((exit) =>
+        stopping || Exit.isSuccess(exit)
+          ? Effect.void
+          : fatalSignal.signal(exit.cause)
+      )
+    )
+  yield* Effect.forkIn(observe(serverFiber), scope)
+  yield* Effect.forkIn(observe(ingressFiber), scope)
+  yield* Effect.forkIn(
+    runtime.owner.pipe(
+      Effect.catchCause(() => stop)
+    ),
+    scope
+  )
+  yield* Effect.addFinalizer(() => stop)
+}))
+
+export const layerStoreAndForwardDeployment = <
+  DirectOut,
+  DirectError,
+  DirectRequirements,
+  RelaySocketError,
+  RelaySocketRequirements,
+>(options: {
+  readonly directDeployment: Layer.Layer<DirectOut, DirectError, DirectRequirements>
+  readonly relaySocketLayer: Layer.Layer<
+    SocketServer.SocketServer,
+    RelaySocketError,
+    RelaySocketRequirements
+  >
+  readonly relay: {
+    readonly tenantId: string
+    readonly peerId: Identity.PeerId
+  }
+}) => {
+  const ingress = PeerRelayIngress.layerProtocolSocketServer(options.relaySocketLayer)
+  const handlers = layerRelayHandlers(options.relay)
+  const relay = layerRelayServer.pipe(
+    Layer.provideMerge(handlers),
+    Layer.provideMerge(ingress)
+  )
+  return Layer.merge(options.directDeployment, relay)
+}

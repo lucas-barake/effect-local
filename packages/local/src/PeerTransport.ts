@@ -18,10 +18,35 @@ export interface Capabilities {
   readonly lineageAware?: boolean
 }
 
+export type PermanentRejectReason = "ProtocolInvalid" | "ApplicationRejected"
+
+export interface RelayDeliveryIdentity {
+  readonly relayMessageId: Identity.RelayMessageId
+  readonly relayPeerId: Identity.PeerId
+  readonly senderTenantId: string
+  readonly senderSubjectId: string
+  readonly senderPeerId: Identity.PeerId
+  readonly senderReplicaIncarnation: Identity.ReplicaIncarnation
+  readonly messageHash: string
+  readonly outerEnvelopeDigest: string
+}
+
+export interface AcknowledgedDelivery {
+  readonly message: Uint8Array
+  readonly identity: RelayDeliveryIdentity
+  readonly receiptRetentionMillis: number
+  readonly acknowledge: Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly reject: (
+    reason: PermanentRejectReason
+  ) => Effect.Effect<void, ReplicaError.ReplicaError>
+}
+
 export interface Connection {
   readonly peerId: Identity.PeerId
+  readonly relayPeerId?: Identity.PeerId
   readonly capabilities: Capabilities
   readonly receive: Stream.Stream<Uint8Array, ReplicaError.ReplicaError>
+  readonly receiveWithAcknowledgement?: Stream.Stream<AcknowledgedDelivery, ReplicaError.ReplicaError>
   readonly send: (message: Uint8Array) => Effect.Effect<void, ReplicaError.ReplicaError>
   /**
    * Terminates `receive`. A fiber parked consuming it observes an interrupt only `Exit`, never a normal end and

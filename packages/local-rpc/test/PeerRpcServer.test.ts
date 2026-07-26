@@ -3,6 +3,7 @@ import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher
 import type * as DocumentEntity from "@lucas-barake/effect-local-sql/DocumentEntity"
 import * as PeerSession from "@lucas-barake/effect-local-sql/PeerSession"
 import * as PeerSync from "@lucas-barake/effect-local-sql/PeerSync"
+import * as PeerSyncEnvelope from "@lucas-barake/effect-local-sql/PeerSyncEnvelope"
 import * as ReplicaGate from "@lucas-barake/effect-local-sql/ReplicaGate"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Document from "@lucas-barake/effect-local/Document"
@@ -33,6 +34,7 @@ import * as TestClock from "effect/testing/TestClock"
 import * as Tracer from "effect/Tracer"
 import * as Sharding from "effect/unstable/cluster/Sharding"
 import type * as Rpc from "effect/unstable/rpc/Rpc"
+import * as RpcServer from "effect/unstable/rpc/RpcServer"
 import * as RpcTest from "effect/unstable/rpc/RpcTest"
 import { createHash, randomBytes } from "node:crypto"
 import * as PeerRpcObservability from "../src/internal/peerRpcObservability.js"
@@ -40,6 +42,11 @@ import * as PeerAuthentication from "../src/PeerAuthentication.js"
 import * as PeerAuthenticator from "../src/PeerAuthenticator.js"
 import * as PeerAuthorization from "../src/PeerAuthorization.js"
 import * as PeerCredentials from "../src/PeerCredentials.js"
+import * as PeerRelayAuthorization from "../src/PeerRelayAuthorization.js"
+import * as PeerRelayIngress from "../src/PeerRelayIngress.js"
+import * as PeerRelayLimits from "../src/PeerRelayLimits.js"
+import * as PeerRelayRpc from "../src/PeerRelayRpc.js"
+import * as PeerRelayStore from "../src/PeerRelayStore.js"
 import * as PeerRpc from "../src/PeerRpc.js"
 import * as PeerRpcError from "../src/PeerRpcError.js"
 import * as PeerRpcLimits from "../src/PeerRpcLimits.js"
@@ -2752,5 +2759,314 @@ describe("PeerRpcServer", () => {
       assert.deepStrictEqual(new Set(refreshed), new Set([taskId, noteId]))
       yield* Fiber.interrupt(task.fiber)
       yield* Fiber.interrupt(note.fiber)
+    })))
+})
+
+describe("PeerRpcServer relay", () => {
+  it.effect("reports the logical remote recipient separately from the relay endpoint", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const localPrincipal: PeerAuthentication.PeerPrincipal = {
+        tenantId: "tenant",
+        subjectId: "sender",
+        peerId: remotePeerA
+      }
+      let authorizationDefect: unknown | undefined
+      const relayAuthorization = PeerRelayAuthorization.PeerRelayAuthorization.of({
+        authorize: (request) =>
+          authorizationDefect === undefined
+            ? Effect.succeed({
+              remote: {
+                tenantId: request.principal.tenantId,
+                subjectId: request.remote.subjectId,
+                peerId: request.remote.peerId
+              },
+              documents: request.documents.map((document) => ({
+                document: Task,
+                documentId: document.documentId
+              })),
+              validUntil: Number.MAX_SAFE_INTEGER,
+              invalidated: Effect.never
+            })
+            : Effect.die(authorizationDefect)
+      })
+      const transition: PeerRelayStore.TransitionResult = {
+        status: "Changed",
+        ready: false,
+        nextEligibleAt: Option.none(),
+        lane: "Retry"
+      }
+      let maintenanceDefect: unknown | undefined
+      const admitted = yield* Deferred.make<PeerRelayStore.Admission>()
+      const acknowledgeCalls = yield* Ref.make(0)
+      const relayStore = PeerRelayStore.PeerRelayStore.of({
+        admit: (input) =>
+          Deferred.succeed(admitted, input).pipe(
+            Effect.as({
+              status: "Accepted",
+              channel: input.channel,
+              ready: false,
+              nextEligibleAt: 0,
+              lane: "New"
+            })
+          ),
+        claim: () =>
+          Effect.succeed({
+            message: Option.none(),
+            ready: false,
+            nextEligibleAt: Option.none(),
+            lane: "Retry"
+          }),
+        loadClaimedPayload: () => Effect.succeed(new Uint8Array()),
+        acknowledge: () => Ref.update(acknowledgeCalls, (count) => count + 1).pipe(Effect.as(transition)),
+        reject: () => Effect.succeed(transition),
+        release: () => Effect.succeed(transition),
+        recover: ({ cursor }) =>
+          maintenanceDefect === undefined
+            ? Effect.succeed({
+              ...(cursor === undefined ? {} : { cursor }),
+              processed: 0,
+              hasMore: false
+            })
+            : Effect.die(maintenanceDefect),
+        expire: ({ cursor }) =>
+          Effect.succeed({ ...(cursor === undefined ? {} : { cursor }), processed: 0, hasMore: false }),
+        repair: ({ cursor }) =>
+          Effect.succeed({ ...(cursor === undefined ? {} : { cursor }), processed: 0, hasMore: false }),
+        reconcile: ({ cursor }) =>
+          Effect.succeed({ ...(cursor === undefined ? {} : { cursor }), processed: 0, hasMore: false }),
+        collect: ({ cursor }) =>
+          Effect.succeed({ ...(cursor === undefined ? {} : { cursor }), processed: 0, hasMore: false }),
+        usage: () =>
+          Effect.succeed({
+            activeCount: 0,
+            activeBytes: 0,
+            retainedCount: 0,
+            retainedBytes: 0
+          })
+      })
+      const relayIngress = PeerRelayIngress.PeerRelayIngress.of({
+        address: { _tag: "UnixAddress", path: "relay-test" },
+        reserveOutbound: () => Effect.fail(new PeerRpcError.RequestCapacityExceeded()),
+        usage: Effect.succeed({ connections: 0, reservedBytes: 0, byteReservationWaiters: 0 }),
+        await: Effect.never
+      })
+      const handlers = PeerRpcServer.layerRelayHandlers({
+        tenantId: "tenant",
+        peerId: serverPeerId
+      }).pipe(
+        Layer.provide(Layer.mergeAll(
+          Layer.succeed(Crypto.Crypto, crypto),
+          Layer.succeed(PeerRelayLimits.PeerRelayLimits, PeerRelayLimits.defaults),
+          Layer.succeed(PeerRelayAuthorization.PeerRelayAuthorization, relayAuthorization),
+          Layer.succeed(PeerRelayStore.PeerRelayStore, relayStore),
+          Layer.succeed(PeerRelayIngress.PeerRelayIngress, relayIngress)
+        ))
+      )
+      const context = yield* Layer.build(handlers)
+      const openHandler = context.mapUnsafe.get(PeerRelayRpc.OpenRelayRpc.key) as Rpc.Handler<"OpenRelay">
+      const pushHandler = context.mapUnsafe.get(PeerRelayRpc.PushRelayRpc.key) as Rpc.Handler<"PushRelay">
+      const acknowledgeHandler = context.mapUnsafe.get(
+        PeerRelayRpc.AcknowledgeRelayRpc.key
+      ) as Rpc.Handler<"AcknowledgeRelay">
+      const runtime = Context.get(context, PeerRpcServer.PeerRelayServerRuntime)
+      const protocolStopped = yield* Deferred.make<void>()
+      const ingressStopped = yield* Deferred.make<void>()
+      const baseProtocol = yield* RpcServer.Protocol.make(() =>
+        Effect.succeed({
+          disconnects: Queue.unbounded<number>().pipe(Effect.runSync),
+          send: () => Effect.void,
+          end: () => Effect.void,
+          clientIds: Effect.succeed(new Set<number>()),
+          initialMessage: Effect.succeed(Option.none()),
+          supportsAck: true,
+          supportsTransferables: false,
+          supportsSpanPropagation: true
+        })
+      )
+      const protocol: RpcServer.Protocol["Service"] = {
+        ...baseProtocol,
+        run: (handler) =>
+          baseProtocol.run(handler).pipe(
+            Effect.ensuring(Deferred.succeed(protocolStopped, undefined))
+          )
+      }
+      const openRequest = {
+        version: PeerRelayRpc.protocolVersion,
+        expectedRelayPeerId: serverPeerId,
+        expectedLocal: localPrincipal,
+        senderReplicaIncarnation: Identity.ReplicaIncarnation.make(1),
+        remote: {
+          subjectId: "recipient",
+          peerId: remotePeerB
+        },
+        documents: [{ documentType: Task.name, documentId: taskId }],
+        receiptRetentionMillis: PeerRelayLimits.defaults.maximumReceiptRetentionMillis,
+        senderRetryHorizonMillis: PeerRelayLimits.defaults.maximumSenderRetryHorizonMillis
+      } satisfies typeof PeerRelayRpc.OpenRelayRpc.payloadSchema.Type
+      const authenticated = {
+        principal: localPrincipal,
+        validUntil: Number.MAX_SAFE_INTEGER,
+        invalidated: Effect.never
+      }
+      const stream = openHandler.handler(
+        openRequest,
+        {} as never
+      ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>
+      const events = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+      const openFiber = yield* Stream.runForEach(
+        stream.pipe(
+          Stream.provideContext(Context.add(
+            openHandler.context,
+            PeerAuthentication.AuthenticatedPeer,
+            authenticated
+          ))
+        ),
+        (event) => Queue.offer(events, event)
+      ).pipe(Effect.forkScoped)
+      const opened = yield* Queue.take(events)
+      assert.strictEqual(opened._tag, "RelayOpened")
+      assert.strictEqual(
+        (opened as PeerRelayRpc.RelayOpened).remotePeerId,
+        remotePeerB
+      )
+      const relayMessageId = Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000001")
+      const message = Uint8Array.of(1, 2, 3)
+      const messageHash = yield* Canonical.digest(message).pipe(
+        Effect.provideService(Crypto.Crypto, crypto)
+      )
+      const payload = new TextEncoder().encode(
+        yield* Schema.encodeEffect(SyncEnvelopeJson)({
+          connectionEpoch: "epoch",
+          sequence: 0,
+          documentId: taskId,
+          documentType: Task.name,
+          messageHash,
+          message,
+          writerProvenance: []
+        })
+      )
+      const expectedDigest = yield* PeerSyncEnvelope.digestRelayOuterEnvelope({
+        domain: PeerSyncEnvelope.relayOuterEnvelopeDomain,
+        version: PeerSyncEnvelope.relayOuterEnvelopeVersion,
+        expectedLocal: localPrincipal,
+        remote: {
+          tenantId: "tenant",
+          subjectId: "recipient",
+          peerId: remotePeerB
+        },
+        relayPeerId: serverPeerId,
+        relayMessageId,
+        protocolVersion: PeerRelayRpc.protocolVersion,
+        payloadVersion: 1,
+        senderReplicaIncarnation: Identity.ReplicaIncarnation.make(1),
+        senderConnectionEpoch: "epoch",
+        senderSequence: 0,
+        document: {
+          documentId: taskId,
+          documentType: Task.name
+        },
+        writerProvenance: [],
+        messageHash,
+        payload
+      }).pipe(Effect.provideService(Crypto.Crypto, crypto))
+      yield* (pushHandler.handler({
+        sessionId: (opened as PeerRelayRpc.RelayOpened).sessionId,
+        relayMessageId,
+        payload
+      }, {} as never) as Effect.Effect<void, PeerRpcError.PeerRpcError>).pipe(
+        Effect.provideContext(Context.add(
+          pushHandler.context,
+          PeerAuthentication.AuthenticatedPeer,
+          authenticated
+        ))
+      )
+      assert.strictEqual((yield* Deferred.await(admitted)).outerEnvelopeDigest, expectedDigest)
+      const defect = new Error("relay authorization defect")
+      authorizationDefect = defect
+      const defectExit = yield* Stream.runHead(
+        (openHandler.handler(
+          openRequest,
+          {} as never
+        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>).pipe(
+          Stream.provideContext(Context.add(
+            openHandler.context,
+            PeerAuthentication.AuthenticatedPeer,
+            authenticated
+          ))
+        )
+      ).pipe(Effect.exit)
+      assert.isTrue(Exit.isFailure(defectExit))
+      if (Exit.isFailure(defectExit)) {
+        assert.strictEqual(Cause.squash(defectExit.cause), defect)
+      }
+      authorizationDefect = undefined
+      const ownerContext = yield* Layer.build(Layer.fresh(handlers))
+      const ownerRuntime = Context.get(ownerContext, PeerRpcServer.PeerRelayServerRuntime)
+      const serverContext = Context.add(
+        Context.add(
+          Context.add(
+            ownerContext,
+            RpcServer.Protocol,
+            protocol
+          ),
+          PeerRelayIngress.PeerRelayIngress,
+          {
+            ...relayIngress,
+            await: Effect.never.pipe(
+              Effect.ensuring(Deferred.succeed(ingressStopped, undefined))
+            )
+          }
+        ),
+        PeerAuthentication.PeerAuthentication,
+        PeerAuthentication.PeerAuthentication.of((effect) =>
+          Effect.provideService(effect, PeerAuthentication.AuthenticatedPeer, {
+            principal: localPrincipal,
+            validUntil: Number.MAX_SAFE_INTEGER,
+            invalidated: Effect.never
+          })
+        )
+      )
+      yield* Layer.build(
+        PeerRpcServer.layerRelayServer.pipe(
+          Layer.provide(Layer.succeedContext(serverContext))
+        )
+      )
+      const ownerDefect = new Error("relay maintenance defect")
+      maintenanceDefect = ownerDefect
+      yield* TestClock.adjust(PeerRelayLimits.defaults.maintenanceIntervalMillis)
+      const ownerExit = yield* ownerRuntime.owner.pipe(Effect.exit)
+      assert.isTrue(Exit.isFailure(ownerExit))
+      if (Exit.isFailure(ownerExit)) {
+        assert.strictEqual(Cause.squash(ownerExit.cause), ownerDefect)
+      }
+      yield* Effect.yieldNow
+      yield* Effect.yieldNow
+      assert.isTrue(Option.isSome(yield* Deferred.poll(protocolStopped)))
+      assert.isTrue(Option.isSome(yield* Deferred.poll(ingressStopped)))
+      yield* runtime.shutdown
+      yield* runtime.shutdown
+      const stale = yield* (acknowledgeHandler.handler({
+        sessionId: (opened as PeerRelayRpc.RelayOpened).sessionId,
+        relayMessageId,
+        claimToken: PeerRelayRpc.ClaimToken.make("clm_00000000-0000-4000-8000-000000000001"),
+        messageHash
+      }, {} as never) as Effect.Effect<void, PeerRpcError.PeerRpcError>).pipe(
+        Effect.provideContext(Context.add(
+          acknowledgeHandler.context,
+          PeerAuthentication.AuthenticatedPeer,
+          authenticated
+        )),
+        Effect.flip
+      )
+      assert.strictEqual(stale._tag, "SessionUnavailable")
+      assert.strictEqual(yield* Ref.get(acknowledgeCalls), 0)
+      assert.deepStrictEqual(yield* runtime.usage, {
+        accepting: false,
+        sessions: 0,
+        subjects: 0,
+        activeClaims: 0,
+        queuedChannels: 0
+      })
+      yield* Fiber.interrupt(openFiber)
     })))
 })

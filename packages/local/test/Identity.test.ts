@@ -12,12 +12,16 @@ describe("Identity", () => {
       const commandId = yield* Identity.makeCommandId
       const documentId = yield* Identity.makeDocumentId
       const peerId = yield* Identity.makePeerId
+      const relayMessageId = yield* Identity.makeRelayMessageId
       assert.strictEqual(Schema.decodeUnknownSync(Identity.ReplicaId)(replicaId), replicaId)
       assert.strictEqual(Schema.decodeUnknownSync(Identity.SessionId)(sessionId), sessionId)
       assert.strictEqual(Schema.decodeUnknownSync(Identity.CommandId)(commandId), commandId)
       assert.strictEqual(Schema.decodeUnknownSync(Identity.DocumentId)(documentId), documentId)
       assert.strictEqual(Schema.decodeUnknownSync(Identity.PeerId)(peerId), peerId)
+      assert.strictEqual(Schema.decodeUnknownSync(Identity.RelayMessageId)(relayMessageId), relayMessageId)
+      assert.isTrue(relayMessageId.startsWith("rly_"))
       assert.throws(() => Schema.decodeUnknownSync(Identity.DocumentId)(commandId as unknown as Identity.DocumentId))
+      assert.throws(() => Schema.decodeUnknownSync(Identity.PeerId)(relayMessageId))
     }).pipe(Effect.provide(NodeCrypto.layer)))
 
   it("rejects empty and malformed identifiers", () => {

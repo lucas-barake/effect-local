@@ -10,6 +10,7 @@ import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
+import * as Clock from "effect/Clock"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import type * as Exit from "effect/Exit"
@@ -26,6 +27,7 @@ import { join } from "node:path"
 import * as Compaction from "../src/Compaction.js"
 import * as DocumentStore from "../src/DocumentStore.js"
 import * as InternalAutomerge from "../src/internal/automerge.js"
+import * as PeerRelayReceiptLimits from "../src/PeerRelayReceiptLimits.js"
 import * as PeerSync from "../src/PeerSync.js"
 import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
@@ -88,6 +90,15 @@ describe("PeerSync", () => {
   const Services = Layer.merge(Infrastructure, StoreService)
   const SyncService = PeerSync.layer.pipe(Layer.provide(Services))
   const TestLayer = Layer.merge(Services, SyncService)
+  const RelayServices = Layer.merge(
+    Services,
+    PeerRelayReceiptLimits.layer({
+      ...PeerRelayReceiptLimits.defaults,
+      pruneBatchSize: 1
+    })
+  )
+  const RelaySyncService = PeerSync.layerRelay.pipe(Layer.provide(RelayServices))
+  const RelayTestLayer = Layer.merge(RelayServices, RelaySyncService)
   const RecoveryService = Recovery.layer.pipe(Layer.provide(Services))
   const CompactionService = Compaction.layer.pipe(
     Layer.provide(Layer.merge(Services, RecoveryService))
@@ -202,6 +213,148 @@ describe("PeerSync", () => {
       const session = yield* sync.open(yield* Identity.makePeerId)
       assert.strictEqual(session.replicaIncarnation, permit.incarnation)
     })).pipe(Effect.provide(TestLayer)))
+
+  it.effect("exposes relay receipt maintenance only from the relay layer", () =>
+    Effect.gen(function*() {
+      assert.isUndefined((yield* PeerSync.PeerSync).pruneRelayReceipts)
+    }).pipe(Effect.provide(TestLayer)).pipe(
+      Effect.andThen(
+        Effect.gen(function*() {
+          assert.isDefined((yield* PeerSync.PeerSync).pruneRelayReceipts)
+        }).pipe(Effect.provide(RelayTestLayer))
+      )
+    ))
+
+  it.effect("scopes relay deduplication by sender without colliding with direct receipts and prunes usage", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const senderOne = yield* Identity.makePeerId
+      const senderTwo = yield* Identity.makePeerId
+      const relayPeerId = yield* Identity.makePeerId
+      const relayMessageId = yield* Identity.makeRelayMessageId
+      const sessionOne = yield* sync.open(senderOne)
+      const sessionTwo = yield* sync.open(senderTwo)
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      const remote = Automerge.change(
+        Automerge.clone(created.automerge, { actor: "1".repeat(32) }),
+        (draft) => {
+          ;(draft.value as { title: string }).title = "relayed"
+        }
+      )
+      const generated = Automerge.generateSyncMessage(remote, Automerge.initSyncState())
+      assert.isNotNull(generated[1])
+      const message = generated[1]!
+      const messageHash = yield* Canonical.digest(message)
+      const receiptExpiresAt = new Date(
+        (yield* Clock.currentTimeMillis) + PeerRelayReceiptLimits.defaults.receiptRetentionMillis
+      ).toISOString()
+      const relay = (
+        senderPeerId: Identity.PeerId,
+        senderSubjectId: string,
+        outerEnvelopeDigest: string
+      ): PeerSync.RelayReceipt => ({
+        relayMessageId,
+        relayPeerId,
+        senderTenantId: "tenant",
+        senderSubjectId,
+        senderPeerId,
+        senderReplicaIncarnation: Identity.ReplicaIncarnation.make(7),
+        messageHash,
+        outerEnvelopeDigest,
+        receiptExpiresAt,
+        encodedSize: message.byteLength
+      })
+      const input = {
+        remoteConnectionEpoch: "shared-epoch",
+        receiveSequence: 0,
+        message,
+        writerProvenance: provenanceFor(message, Task.version, definition.hash)
+      }
+
+      const firstRelay = yield* sync.receive(Task, documentId, sessionOne, {
+        ...input,
+        relay: relay(senderOne, "sender-one", "a".repeat(64))
+      })
+      assert.isFalse(firstRelay.duplicate)
+
+      const direct = yield* sync.receive(Task, documentId, sessionOne, input)
+      assert.isFalse(direct.duplicate)
+
+      const secondRelay = yield* sync.receive(Task, documentId, sessionTwo, {
+        ...input,
+        relay: relay(senderTwo, "sender-two", "b".repeat(64))
+      })
+      assert.isFalse(secondRelay.duplicate)
+
+      const duplicate = yield* sync.receive(Task, documentId, sessionOne, {
+        ...input,
+        relay: relay(senderOne, "sender-one", "a".repeat(64))
+      })
+      assert.isTrue(duplicate.duplicate)
+
+      const beforePrune = yield* sql<{
+        readonly directReceipts: number
+        readonly relayBytes: number
+        readonly relayReceipts: number
+        readonly usageRows: number
+      }>`SELECT
+        (SELECT COUNT(*) FROM effect_local_peer_receipts
+          WHERE relay_message_id IS NULL) AS directReceipts,
+        (SELECT COUNT(*) FROM effect_local_peer_receipts
+          WHERE relay_message_id IS NOT NULL) AS relayReceipts,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS usageRows,
+        (SELECT COALESCE(SUM(encoded_bytes), 0)
+          FROM effect_local_peer_relay_receipt_usage) AS relayBytes`
+      assert.deepStrictEqual(beforePrune, [{
+        directReceipts: 1,
+        relayBytes: message.byteLength * 2,
+        relayReceipts: 2,
+        usageRows: 2
+      }])
+
+      yield* sql`UPDATE effect_local_peer_receipts
+        SET relay_receipt_expires_at = '1970-01-01T00:00:00.000Z'
+        WHERE relay_message_id IS NOT NULL`
+      assert.strictEqual(yield* sync.pruneRelayReceipts!, 1)
+
+      const afterFirstBatch = yield* sql<{
+        readonly directReceipts: number
+        readonly relayReceipts: number
+        readonly usageRows: number
+      }>`SELECT
+        (SELECT COUNT(*) FROM effect_local_peer_receipts
+          WHERE relay_message_id IS NULL) AS directReceipts,
+        (SELECT COUNT(*) FROM effect_local_peer_receipts
+          WHERE relay_message_id IS NOT NULL) AS relayReceipts,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS usageRows`
+      assert.deepStrictEqual(afterFirstBatch, [{
+        directReceipts: 1,
+        relayReceipts: 1,
+        usageRows: 1
+      }])
+      assert.strictEqual(yield* sync.pruneRelayReceipts!, 1)
+
+      const afterPrune = yield* sql<{
+        readonly directReceipts: number
+        readonly relayReceipts: number
+        readonly usageRows: number
+      }>`SELECT
+        (SELECT COUNT(*) FROM effect_local_peer_receipts
+          WHERE relay_message_id IS NULL) AS directReceipts,
+        (SELECT COUNT(*) FROM effect_local_peer_receipts
+          WHERE relay_message_id IS NOT NULL) AS relayReceipts,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS usageRows`
+      assert.deepStrictEqual(afterPrune, [{
+        directReceipts: 1,
+        relayReceipts: 0,
+        usageRows: 0
+      }])
+      InternalAutomerge.free(remote)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(RelayTestLayer)))
 
   it.effect("persists inbound application and exact retransmission replies", () =>
     Effect.gen(function*() {

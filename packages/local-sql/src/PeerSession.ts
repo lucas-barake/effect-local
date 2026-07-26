@@ -5,6 +5,7 @@ import * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
+import * as Clock from "effect/Clock"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -18,7 +19,9 @@ import type * as Sharding from "effect/unstable/cluster/Sharding"
 import * as CommitPublisher from "./CommitPublisher.js"
 import * as DocumentEntity from "./DocumentEntity.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
+import * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
 import * as PeerSync from "./PeerSync.js"
+import * as PeerSyncEnvelope from "./PeerSyncEnvelope.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
 export interface SelectedDocument {
@@ -62,25 +65,13 @@ const SyncEnvelopeJson = Schema.fromJsonString(Schema.toCodecJson(SyncEnvelope))
 
 const key = (documentType: string, documentId: Identity.DocumentId) => `${documentType}:${documentId}`
 
-const encode = (envelope: typeof SyncEnvelope.Type) =>
+const encodeDirect = (envelope: typeof SyncEnvelope.Type) =>
   Schema.encodeEffect(SyncEnvelopeJson)(envelope).pipe(
     Effect.map((value) => new TextEncoder().encode(value)),
     Effect.mapError((cause) =>
       new ReplicaError.ReplicaError({
         reason: new ReplicaError.ProtocolMismatch({
           expected: "encodable sync envelope",
-          observed: String(cause)
-        })
-      })
-    )
-  )
-
-const decode = (bytes: Uint8Array) =>
-  Schema.decodeUnknownEffect(SyncEnvelopeJson)(new TextDecoder().decode(bytes)).pipe(
-    Effect.mapError((cause) =>
-      new ReplicaError.ReplicaError({
-        reason: new ReplicaError.ProtocolMismatch({
-          expected: "sync envelope",
           observed: String(cause)
         })
       })
@@ -132,6 +123,37 @@ const makeWithTerminal = (
     const transport = yield* PeerTransport.PeerTransport
     const sync = yield* PeerSync.PeerSync
     const crypto = yield* Crypto.Crypto
+    const relayReceiptLimits = yield* Effect.serviceOption(PeerRelayReceiptLimits.PeerRelayReceiptLimits)
+    const decodeDirect = (bytes: Uint8Array) => {
+      const maximumBytes = maximumSyncEnvelopeBytes(
+        limits.maxSyncMessageBytes,
+        limits.maxSyncChangesPerMessage
+      )
+      if (bytes.byteLength > maximumBytes) {
+        return Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: `sync envelope at most ${maximumBytes} bytes`,
+              observed: String(bytes.byteLength)
+            })
+          })
+        )
+      }
+      return Schema.decodeUnknownEffect(SyncEnvelopeJson)(new TextDecoder().decode(bytes)).pipe(
+        Effect.mapError(() =>
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: "sync envelope",
+              observed: "invalid sync envelope"
+            })
+          })
+        )
+      )
+    }
+    const decodeRelay = (bytes: Uint8Array) =>
+      PeerSyncEnvelope.decodeSyncEnvelope(bytes, limits).pipe(
+        Effect.provideService(Crypto.Crypto, crypto)
+      )
     const selected = new Set(options.documents.map((entry) => key(entry.document.name, entry.documentId)))
     const selectedDocumentIds = new Set(options.documents.map((entry) => entry.documentId))
     if (
@@ -236,7 +258,11 @@ const makeWithTerminal = (
         Effect.gen(function*() {
           if (!(yield* Ref.get(active))) return
           const entry = yield* selectedById(outbound.documentId)
-          const bytes = yield* encode({
+          const bytes = yield* (
+            connection.receiveWithAcknowledgement === undefined
+              ? encodeDirect
+              : PeerSyncEnvelope.encodeSyncEnvelope
+          )({
             connectionEpoch: session.connectionEpoch,
             sequence: outbound.sendSequence,
             documentId: outbound.documentId,
@@ -397,33 +423,56 @@ const makeWithTerminal = (
       )
     const guardedFlush = guardTerminal(flush)
 
-    const receive = (bytes: Uint8Array) =>
+    const bindRemoteEpoch = (connectionEpoch: string, rotate: boolean) =>
       Effect.gen(function*() {
-        const maximumBytes = maximumSyncEnvelopeBytes(
-          limits.maxSyncMessageBytes,
-          limits.maxSyncChangesPerMessage
-        )
-        if (bytes.byteLength > maximumBytes) {
-          return yield* new ReplicaError.ReplicaError({
-            reason: new ReplicaError.ProtocolMismatch({
-              expected: `sync envelope at most ${maximumBytes} bytes`,
-              observed: String(bytes.byteLength)
-            })
-          })
-        }
-        const envelope = yield* decode(bytes)
-        const boundEpoch = yield* Ref.modify(
+        const transition = yield* Ref.modify(
           remoteEpoch,
-          (current) => current === null ? [envelope.connectionEpoch, envelope.connectionEpoch] : [current, current]
+          (current): [{ readonly bound: string; readonly previous: string | null }, string] => {
+            if (current === null) return [{ bound: connectionEpoch, previous: null }, connectionEpoch]
+            if (current === connectionEpoch) return [{ bound: current, previous: null }, current]
+            if (rotate) return [{ bound: connectionEpoch, previous: current }, connectionEpoch]
+            return [{ bound: current, previous: null }, current]
+          }
         )
-        if (boundEpoch !== envelope.connectionEpoch) {
+        if (transition.bound !== connectionEpoch) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.ProtocolMismatch({
-              expected: boundEpoch,
-              observed: envelope.connectionEpoch
+              expected: transition.bound,
+              observed: connectionEpoch
             })
           })
         }
+        if (transition.previous !== null) {
+          yield* sync.reset({
+            peerId: connection.peerId,
+            connectionEpoch: transition.previous,
+            replicaIncarnation: session.replicaIncarnation
+          })
+        }
+        return transition.bound
+      })
+
+    const processReceive = (
+      bytes: Uint8Array,
+      delivery?: PeerTransport.AcknowledgedDelivery
+    ) =>
+      Effect.gen(function*() {
+        const envelope = yield* (
+          delivery === undefined
+            ? decodeDirect(bytes).pipe(
+              Effect.map((envelope) => ({
+                ...envelope,
+                lineage: envelope.lineage ?? Identity.genesisLineage
+              }))
+            )
+            : decodeRelay(bytes).pipe(
+              Effect.map((envelope) => ({
+                ...envelope,
+                lineage: Identity.genesisLineage
+              }))
+            )
+        )
+        const boundEpoch = yield* bindRemoteEpoch(envelope.connectionEpoch, delivery !== undefined)
         const selectedDocument = selected.has(key(envelope.documentType, envelope.documentId))
         // Dropped before the digest and entity dispatch, not after. Nothing can restore the refused
         // lineage inside this session, so hashing and dispatching every further message the peer
@@ -465,6 +514,63 @@ const makeWithTerminal = (
             }))
             const observationRevision = (yield* Ref.get(observed)).get(envelope.documentId)?.revision ?? 0
             const client = yield* entity(envelope.documentId)
+            const relay = delivery === undefined
+              ? undefined
+              : yield* Effect.gen(function*() {
+                if (relayReceiptLimits._tag === "None") {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.ProtocolMismatch({
+                      expected: "relay-enabled peer session",
+                      observed: "direct peer session"
+                    })
+                  })
+                }
+                if (
+                  !Number.isSafeInteger(delivery.receiptRetentionMillis) ||
+                  delivery.receiptRetentionMillis <= 0 ||
+                  delivery.receiptRetentionMillis > relayReceiptLimits.value.receiptRetentionMillis
+                ) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.ProtocolMismatch({
+                      expected: "bounded relay receipt retention",
+                      observed: String(delivery.receiptRetentionMillis)
+                    })
+                  })
+                }
+                if (
+                  connection.relayPeerId === undefined ||
+                  delivery.identity.relayPeerId !== connection.relayPeerId
+                ) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.ProtocolMismatch({
+                      expected: connection.relayPeerId ?? "relay peer identity",
+                      observed: delivery.identity.relayPeerId
+                    })
+                  })
+                }
+                if (delivery.identity.senderPeerId !== connection.peerId) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.ProtocolMismatch({
+                      expected: connection.peerId,
+                      observed: delivery.identity.senderPeerId
+                    })
+                  })
+                }
+                if (delivery.identity.messageHash !== envelope.messageHash) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.ProtocolMismatch({
+                      expected: envelope.messageHash,
+                      observed: delivery.identity.messageHash
+                    })
+                  })
+                }
+                const nowMillis = yield* Clock.currentTimeMillis
+                return {
+                  ...delivery.identity,
+                  receiptExpiresAt: new Date(nowMillis + delivery.receiptRetentionMillis).toISOString(),
+                  encodedSize: bytes.byteLength
+                } satisfies PeerSync.RelayReceipt
+              })
             const result = yield* client.ApplySync({
               replicaIncarnation: incarnation,
               peerId: connection.peerId,
@@ -476,8 +582,9 @@ const makeWithTerminal = (
               message: envelope.message,
               // The single point an envelope's lineage enters the system, so the single point the
               // absent key of a pre lineage peer becomes the genesis lineage.
-              lineage: envelope.lineage ?? Identity.genesisLineage,
-              writerProvenance: envelope.writerProvenance
+              lineage: envelope.lineage,
+              writerProvenance: envelope.writerProvenance,
+              ...(relay === undefined ? {} : { relay })
             }).pipe(
               Effect.catchTag(
                 ["MailboxFull", "AlreadyProcessingMessage", "PersistenceError"],
@@ -519,6 +626,32 @@ const makeWithTerminal = (
         }
       })
 
+    const relayCall = (
+      operation: string,
+      effect: Effect.Effect<void, ReplicaError.ReplicaError>
+    ) =>
+      effect.pipe(
+        Effect.timeout(limits.maxPeerSendMillis),
+        Effect.catchTag("TimeoutError", () =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.OperationTimeout({
+                operation,
+                timeoutMillis: limits.maxPeerSendMillis
+              })
+            })
+          ))
+      )
+
+    const receiveAcknowledged = (delivery: PeerTransport.AcknowledgedDelivery) =>
+      processReceive(delivery.message, delivery).pipe(
+        Effect.andThen(relayCall("relay acknowledge", delivery.acknowledge)),
+        Effect.catchIf(
+          (error) => error.reason._tag === "ProtocolMismatch",
+          () => relayCall("relay reject", delivery.reject("ProtocolInvalid"))
+        )
+      )
+
     yield* Effect.addFinalizer(() =>
       Effect.gen(function*() {
         const boundEpoch = yield* Ref.get(remoteEpoch)
@@ -540,7 +673,11 @@ const makeWithTerminal = (
     )
     yield* supervise(
       terminalFailure,
-      Stream.runForEach(connection.receive, receive).pipe(
+      (
+        connection.receiveWithAcknowledgement === undefined
+          ? Stream.runForEach(connection.receive, processReceive)
+          : Stream.runForEach(connection.receiveWithAcknowledgement, receiveAcknowledged)
+      ).pipe(
         Effect.andThen(
           Effect.fail(
             new ReplicaError.ReplicaError({

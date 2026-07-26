@@ -30,6 +30,7 @@ import * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
 import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as CommitPublisher from "../src/CommitPublisher.js"
 import * as DocumentEntity from "../src/DocumentEntity.js"
+import * as PeerRelayReceiptLimits from "../src/PeerRelayReceiptLimits.js"
 import * as PeerSession from "../src/PeerSession.js"
 import * as PeerSync from "../src/PeerSync.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
@@ -239,7 +240,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         sequence: Number.MAX_SAFE_INTEGER,
         documentId: yield* Identity.makeDocumentId,
         documentType: "x".repeat(256),
-        messageHash: "x".repeat(256),
+        messageHash: "a".repeat(64),
         message: new Uint8Array(limits.maxSyncMessageBytes),
         lineage: maximalLineage,
         writerProvenance: Array.from(
@@ -693,7 +694,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const reply = {
           documentId,
           message: new Uint8Array([4, 5, 6]),
-          messageHash: "reply-hash",
+          messageHash: "b".repeat(64),
           heads: []
         }
         const replyProvenance = [{
@@ -856,7 +857,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           sendSequence: 0,
           documentId,
           message: Uint8Array.of(2),
-          messageHash: "initial",
+          messageHash: "1".repeat(64),
           heads: [],
           lineage: Identity.genesisLineage,
           writerProvenance: []
@@ -864,14 +865,14 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const reply = {
           documentId,
           message: Uint8Array.of(3),
-          messageHash: "reply",
+          messageHash: "2".repeat(64),
           heads: []
         }
         const generated = {
           sendSequence: 2,
           documentId,
           message: Uint8Array.of(4),
-          messageHash: "generated",
+          messageHash: "3".repeat(64),
           heads: [],
           lineage: Identity.genesisLineage,
           writerProvenance: []
@@ -1038,7 +1039,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                   sendSequence,
                   documentId,
                   message: Uint8Array.of(sendSequence),
-                  messageHash: `hash-${sendSequence}`,
+                  messageHash: sendSequence.toString(16).padStart(64, "0"),
                   heads: [],
                   lineage: Identity.genesisLineage,
                   writerProvenance: []
@@ -1126,7 +1127,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                     sendSequence: 9,
                     documentId,
                     message: Uint8Array.of(9),
-                    messageHash: "hash-9",
+                    messageHash: "9".repeat(64),
                     heads: [],
                     lineage: Identity.genesisLineage,
                     writerProvenance: []
@@ -1201,7 +1202,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         const reply = {
           documentId,
           message: Uint8Array.of(2),
-          messageHash: "reply",
+          messageHash: "2".repeat(64),
           heads: []
         }
         const sync = PeerSync.PeerSync.of({
@@ -1304,7 +1305,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             sequence: 0,
             documentId,
             documentType: Task.name,
-            messageHash: "incorrect-hash",
+            messageHash: "b".repeat(64),
             message,
             writerProvenance: [{
               changeHash: "a".repeat(64),
@@ -1819,7 +1820,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                         reply: {
                           documentId,
                           message,
-                          messageHash: "reply-hash",
+                          messageHash: "b".repeat(64),
                           heads: []
                         }
                       })
@@ -1909,7 +1910,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
               sendSequence: 0,
               documentId,
               message: Uint8Array.of(1),
-              messageHash: "message-hash",
+              messageHash: "a".repeat(64),
               heads: [],
               lineage: Identity.genesisLineage,
               writerProvenance: []
@@ -1995,7 +1996,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                     sendSequence: call,
                     documentId: id,
                     message: new Uint8Array([call]),
-                    messageHash: `hash-${call}`,
+                    messageHash: call.toString(16).padStart(64, "0"),
                     heads: [],
                     lineage: Identity.genesisLineage,
                     writerProvenance: []
@@ -2122,7 +2123,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         sendSequence: 1,
         documentId,
         message: Uint8Array.of(1),
-        messageHash: "message-hash",
+        messageHash: "a".repeat(64),
         heads: [],
         lineage: Identity.genesisLineage,
         writerProvenance: []
@@ -2434,6 +2435,167 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       )
     }).pipe(Effect.provide(NodeCrypto.layer)))
 
+  it.effect("rotates relay sender epochs and acknowledges only after the durable receive workflow", () =>
+    Effect.gen(function*() {
+      const deliveries = yield* Queue.unbounded<PeerTransport.AcknowledgedDelivery>()
+      const events = yield* Queue.unbounded<string>()
+      const resets = yield* Ref.make<ReadonlyArray<string>>([])
+      const received = yield* Ref.make<ReadonlyArray<PeerSync.RelayReceipt>>([])
+      const documentId = yield* Identity.makeDocumentId
+      const senderPeerId = yield* Identity.makePeerId
+      const relayPeerId = yield* Identity.makePeerId
+      const message = yield* Effect.acquireUseRelease(
+        Effect.sync(() => Automerge.init()),
+        (document) =>
+          Effect.sync(() => {
+            const encoded = Automerge.generateSyncMessage(document, Automerge.initSyncState())[1]
+            if (encoded === null) throw new TypeError("Expected an initial sync message")
+            return encoded
+          }),
+        (document) => Effect.sync(() => Automerge.free(document))
+      )
+      const messageHash = yield* Canonical.digest(message)
+      const reply = { documentId, message, messageHash, heads: [] }
+      const sync = PeerSync.PeerSync.of({
+        open: (peerId) =>
+          Effect.succeed({
+            peerId,
+            connectionEpoch: "local-epoch",
+            replicaIncarnation: permit.incarnation
+          }),
+        reset: (session) =>
+          Ref.update(resets, (current) => [...current, session.connectionEpoch]).pipe(
+            Effect.andThen(Queue.offer(events, `reset:${session.connectionEpoch}`)),
+            Effect.asVoid
+          ),
+        generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
+        receive: () => Effect.succeed(result),
+        enqueue: (_session, value) =>
+          Queue.offer(events, "enqueue").pipe(
+            Effect.as({ ...value, sendSequence: 0, writerProvenance: [] })
+          ),
+        pending: () => Effect.succeed([]),
+        markSent: () => Effect.succeed(true),
+        pruneRelayReceipts: Effect.succeed(0)
+      })
+      const transport = PeerTransport.PeerTransport.of({
+        capabilities: { storeAndForward: true },
+        connect: () =>
+          Effect.succeed({
+            peerId: senderPeerId,
+            relayPeerId,
+            capabilities: { storeAndForward: true },
+            receive: Stream.never,
+            receiveWithAcknowledgement: Stream.fromQueue(deliveries),
+            send: () => Effect.void,
+            close: Effect.void
+          })
+      })
+      const publisher = CommitPublisher.CommitPublisher.of({
+        publishPending: Queue.offer(events, "publish").pipe(Effect.as(0)),
+        invalidate: () => Effect.void,
+        subscribe: Effect.succeed({
+          watermark: Identity.CommitSequence.make(0),
+          refreshGeneration: 0,
+          events: Stream.never
+        })
+      })
+      const envelope = (connectionEpoch: string, sequence: number) =>
+        encode({
+          connectionEpoch,
+          sequence,
+          documentId,
+          documentType: Task.name,
+          messageHash,
+          message,
+          writerProvenance: []
+        })
+      const delivery = (
+        connectionEpoch: string,
+        sequence: number,
+        relayMessageId: Identity.RelayMessageId
+      ): Effect.Effect<PeerTransport.AcknowledgedDelivery> =>
+        envelope(connectionEpoch, sequence).pipe(
+          Effect.map((bytes) => ({
+            message: bytes,
+            identity: {
+              relayMessageId,
+              relayPeerId,
+              senderTenantId: "tenant",
+              senderSubjectId: "sender",
+              senderPeerId,
+              senderReplicaIncarnation: Identity.ReplicaIncarnation.make(9),
+              messageHash,
+              outerEnvelopeDigest: "a".repeat(64)
+            },
+            receiptRetentionMillis: PeerRelayReceiptLimits.defaults.receiptRetentionMillis,
+            acknowledge: Queue.offer(events, "ack").pipe(Effect.asVoid),
+            reject: () => Queue.offer(events, "reject").pipe(Effect.asVoid)
+          }))
+        )
+      yield* Effect.scoped(
+        Effect.gen(function*() {
+          yield* PeerSession.makeTestClient(
+            { peerId: senderPeerId, documents: [{ document: Task, documentId }] },
+            () =>
+              Effect.succeed({
+                ApplySync: (request: typeof DocumentEntity.ApplySync.payloadSchema.Type) =>
+                  Queue.offer(events, "apply").pipe(
+                    Effect.andThen(
+                      request.relay === undefined
+                        ? Effect.die("Expected relay receipt")
+                        : Ref.update(received, (current) => [...current, request.relay!])
+                    ),
+                    Effect.as({ ...result, reply })
+                  )
+              } as never)
+          )
+          yield* Queue.offer(
+            deliveries,
+            yield* delivery(
+              "sender-epoch-a",
+              0,
+              Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000001")
+            )
+          )
+          assert.deepStrictEqual(
+            yield* Effect.forEach([0, 1, 2, 3], () => Queue.take(events)),
+            ["apply", "publish", "enqueue", "ack"]
+          )
+          yield* Queue.offer(
+            deliveries,
+            yield* delivery(
+              "sender-epoch-b",
+              0,
+              Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000002")
+            )
+          )
+          assert.deepStrictEqual(
+            yield* Effect.forEach([0, 1, 2, 3, 4], () => Queue.take(events)),
+            ["reset:sender-epoch-a", "apply", "publish", "enqueue", "ack"]
+          )
+          assert.deepStrictEqual(
+            (yield* Ref.get(received)).map((entry) => entry.senderPeerId),
+            [senderPeerId, senderPeerId]
+          )
+        }).pipe(
+          Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provideService(PeerSync.PeerSync, sync),
+          Effect.provideService(ReplicaGate.ReplicaGate, gate),
+          Effect.provideService(CommitPublisher.CommitPublisher, publisher),
+          Effect.provideService(ReplicaLimits.ReplicaLimits, limits),
+          Effect.provideService(
+            PeerRelayReceiptLimits.PeerRelayReceiptLimits,
+            PeerRelayReceiptLimits.defaults
+          )
+        )
+      )
+      assert.deepStrictEqual(
+        (yield* Ref.get(resets)).toSorted(),
+        ["local-epoch", "sender-epoch-a", "sender-epoch-b"]
+      )
+    }).pipe(Effect.provide(NodeCrypto.layer)))
+
   it.effect("retries every unsent dirty output after a send fails", () =>
     Effect.scoped(Effect.gen(function*() {
       const firstDocumentId = yield* Identity.makeDocumentId
@@ -2462,7 +2624,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
                     sendSequence: current.length,
                     documentId,
                     message: new Uint8Array([current.length]),
-                    messageHash: `hash-${current.length}`,
+                    messageHash: current.length.toString(16).padStart(64, "0"),
                     heads: [],
                     lineage: Identity.genesisLineage,
                     writerProvenance: []
@@ -3083,3 +3245,4 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
     }).pipe(Effect.provide(TestGate))
   }, 20_000)
 })
+import * as Automerge from "@automerge/automerge"

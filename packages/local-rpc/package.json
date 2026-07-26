@@ -56,6 +56,7 @@
   },
   "devDependencies": {
     "@effect/platform-node": "4.0.0-beta.99",
+    "@effect/sql-sqlite-node": "4.0.0-beta.99",
     "@lucas-barake/effect-local-test": "workspace:^",
     "effect": "4.0.0-beta.99"
   }
