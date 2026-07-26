@@ -4,7 +4,7 @@ import * as Effect from "effect/Effect"
 import type * as PlatformError from "effect/PlatformError"
 import type * as Schema from "effect/Schema"
 import type * as SqlError from "effect/unstable/sql/SqlError"
-import type { NestedPeerRelayTransactionError } from "./peerRelaySqliteTransaction.js"
+import type { NestedPeerRelayTransactionError } from "./peerRelaySqlTransaction.js"
 
 export type StoreBoundaryError =
   | ReplicaError.ReplicaError
@@ -34,6 +34,7 @@ export const mapStoreErrors = <A, R,>(
         switch (error._tag) {
           case "SqlError":
           case "PlatformError":
+          case "NestedPeerRelayTransactionError":
             return storageUnavailable(error)
           case "SchemaError":
           case "NoSuchElementError":

@@ -6,7 +6,6 @@ import type * as Identity from "./Identity.js"
 import type * as ReplicaError from "./ReplicaError.js"
 
 export interface Capabilities {
-  readonly storeAndForward: boolean
   /**
    * Whether the peer compares document lineage before it merges a sync message.
    *
@@ -43,10 +42,9 @@ export interface AcknowledgedDelivery {
 
 export interface Connection {
   readonly peerId: Identity.PeerId
-  readonly relayPeerId?: Identity.PeerId
+  readonly relayPeerId: Identity.PeerId
   readonly capabilities: Capabilities
-  readonly receive: Stream.Stream<Uint8Array, ReplicaError.ReplicaError>
-  readonly receiveWithAcknowledgement?: Stream.Stream<AcknowledgedDelivery, ReplicaError.ReplicaError>
+  readonly receive: Stream.Stream<AcknowledgedDelivery, ReplicaError.ReplicaError>
   readonly send: (message: Uint8Array) => Effect.Effect<void, ReplicaError.ReplicaError>
   /**
    * Terminates `receive`. A fiber parked consuming it observes an interrupt only `Exit`, never a normal end and

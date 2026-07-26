@@ -2,14 +2,14 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as PeerRelayLimits from "../src/PeerRelayLimits.js"
-import * as PeerRelayRpc from "../src/PeerRelayRpc.js"
+import * as PeerRpc from "../src/PeerRpc.js"
 
 describe("PeerRelayLimits", () => {
   it.effect("publishes the complete validated production defaults through its Layer", () =>
     Effect.gen(function*() {
       const limits = yield* PeerRelayLimits.PeerRelayLimits
       assert.deepStrictEqual(limits, PeerRelayLimits.defaults)
-      assert.strictEqual(Object.keys(limits).length, 94)
+      assert.strictEqual(Object.keys(limits).length, 97)
       assert.strictEqual(limits.maximumDeliveryAttempts, 16)
     }).pipe(Effect.provide(PeerRelayLimits.layerDefaults)))
 
@@ -27,9 +27,9 @@ describe("PeerRelayLimits", () => {
       ],
       [
         "maximumReceiptRetentionMillis",
-        PeerRelayRpc.maximumNegotiatedDurationMillis + 1,
-        `Expected a value less than or equal to ${PeerRelayRpc.maximumNegotiatedDurationMillis}, got ${
-          PeerRelayRpc.maximumNegotiatedDurationMillis + 1
+        PeerRpc.maximumNegotiatedDurationMillis + 1,
+        `Expected a value less than or equal to ${PeerRpc.maximumNegotiatedDurationMillis}, got ${
+          PeerRpc.maximumNegotiatedDurationMillis + 1
         }`
       ],
       ["sqliteCapacityHeadroomPercent", 101, "Expected a value less than or equal to 100, got 101"],
@@ -81,7 +81,7 @@ describe("PeerRelayLimits", () => {
     ],
     [
       "maximumDeclaredFrameBytes",
-      { maximumDeclaredFrameBytes: PeerRelayRpc.maximumRelayPayloadBytes - 1 }
+      { maximumDeclaredFrameBytes: PeerRpc.maximumRelayPayloadBytes - 1 }
     ],
     [
       "maximumSharedPayloadBytes",

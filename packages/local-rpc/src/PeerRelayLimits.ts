@@ -3,12 +3,12 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import type * as SchemaIssue from "effect/SchemaIssue"
-import * as PeerRelayRpc from "./PeerRelayRpc.js"
+import * as PeerRpcProtocol from "./internal/peerRpcProtocol.js"
 
 const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0))
 const PositiveNumber = Schema.Number.check(Schema.isFinite(), Schema.isGreaterThan(0))
 const NegotiatedDuration = PositiveInt.check(
-  Schema.isLessThanOrEqualTo(PeerRelayRpc.maximumNegotiatedDurationMillis)
+  Schema.isLessThanOrEqualTo(PeerRpcProtocol.maximumNegotiatedDurationMillis)
 )
 const Percentage = PositiveNumber.check(Schema.isLessThanOrEqualTo(100))
 
@@ -57,6 +57,9 @@ export const Values = Schema.Struct({
   incompleteFrameTimeoutMillis: PositiveInt,
   maximumSharedPayloadBytes: PositiveInt,
   maximumByteReservationWaiters: PositiveInt,
+  maxInFlightAuthentication: PositiveInt,
+  authenticationRatePerSecond: PositiveNumber,
+  authenticationBurst: PositiveInt,
 
   maxSessionsPerSubject: PositiveInt,
   maxInFlightOpen: PositiveInt,
@@ -169,6 +172,9 @@ export const defaults: Values = Values.make({
   incompleteFrameTimeoutMillis: 10_000,
   maximumSharedPayloadBytes: 64 * mebibyte,
   maximumByteReservationWaiters: 1_024,
+  maxInFlightAuthentication: 64,
+  authenticationRatePerSecond: 16,
+  authenticationBurst: 64,
 
   maxSessionsPerSubject: 4,
   maxInFlightOpen: 32,
@@ -318,14 +324,15 @@ const validate = (values: Values) => {
     ],
     ["maximumRawChunkBytes", values.maximumRawChunkBytes <= values.maximumIncompleteFrameBytes],
     ["maximumDeclaredFrameBytes", values.maximumDeclaredFrameBytes + 4 <= values.maximumIncompleteFrameBytes],
-    ["maximumDeclaredFrameBytes", values.maximumDeclaredFrameBytes >= PeerRelayRpc.maximumRelayPayloadBytes],
+    ["maximumDeclaredFrameBytes", values.maximumDeclaredFrameBytes >= PeerRpcProtocol.maximumRelayPayloadBytes],
     ["maximumSharedPayloadBytes", values.maximumSharedPayloadBytes >= values.maximumIncompleteFrameBytes],
     [
       "maximumSharedPayloadBytes",
-      values.relayWorkerConcurrency * PeerRelayRpc.maximumRelayPayloadBytes <=
+      values.relayWorkerConcurrency * PeerRpcProtocol.maximumRelayPayloadBytes <=
         values.maximumSharedPayloadBytes
     ],
     ["maximumByteReservationWaiters", values.maximumByteReservationWaiters >= values.maxRelayConnections],
+    ["authenticationBurst", values.authenticationBurst >= values.maxInFlightAuthentication],
     ["maxSessionsPerSubject", values.maxSessionsPerSubject <= values.maxRelayConnections],
     ["maxInFlightOpen", values.maxInFlightOpen <= values.maxRelayConnections],
     ["maxInFlightOpenPerSubject", values.maxInFlightOpenPerSubject <= values.maxInFlightOpen],

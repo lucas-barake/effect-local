@@ -12,8 +12,9 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterAll, bench } from "vitest"
 import * as PeerRelayLimits from "../src/PeerRelayLimits.js"
-import * as PeerRelayRpc from "../src/PeerRelayRpc.js"
 import * as PeerRelayStore from "../src/PeerRelayStore.js"
+import * as PeerRpc from "../src/PeerRpc.js"
+import * as SqlPeerRelayStore from "../src/SqlPeerRelayStore.js"
 
 const backlogSizes = [128, 1_024] as const
 const drainBatchSize = 8
@@ -66,7 +67,7 @@ const makeWorkItem = (
       senderSequence: distribution === "Hot" ? index : 0,
       payloadVersion: 1,
       messageHash: `message-${messageNumber}`,
-      outerEnvelopeDigest: PeerRelayRpc.RelayDigest.make(messageNumber.toString(16).padStart(64, "0")),
+      outerEnvelopeDigest: PeerRpc.RelayDigest.make(messageNumber.toString(16).padStart(64, "0")),
       payload,
       messageTtlMillis: PeerRelayLimits.defaults.messageTtlMillis,
       senderRetryHorizonMillis: PeerRelayLimits.defaults.maximumSenderRetryHorizonMillis,
@@ -100,7 +101,7 @@ const benchmarkContext = await Effect.runPromise(
   Layer.build(
     Layer.merge(
       baseLayer,
-      PeerRelayStore.layerSqlite.pipe(Layer.provide(baseLayer))
+      SqlPeerRelayStore.layer.pipe(Layer.provide(baseLayer))
     )
   ).pipe(Effect.provideService(Scope.Scope, scope))
 )

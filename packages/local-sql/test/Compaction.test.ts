@@ -770,7 +770,7 @@ describe("Compaction", () => {
         ${permit.replicaId}, ${permit.incarnation}, ${permit.writerGeneration},
         ${"tenant-a"}, ${"subject-local"}, ${"peer-local"},
         ${"tenant-a"}, ${"subject-remote"}, ${"peer-remote"}, ${"peer-relay"},
-        ${relayMessageId}, ${"a".repeat(64)}, ${3}, ${1},
+        ${relayMessageId}, ${"a".repeat(64)}, ${1}, ${1},
         ${"epoch-1"}, ${0}, ${documentId}, ${Task.name},
         ${"[]"}, ${"b".repeat(64)}, ${payload}, ${payload.byteLength},
         ${"2020-01-01T00:00:00.000Z"}, ${"2999-01-01T00:00:00.000Z"},

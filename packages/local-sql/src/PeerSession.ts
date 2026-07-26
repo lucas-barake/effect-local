@@ -1,6 +1,5 @@
-import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Document from "@lucas-barake/effect-local/Document"
-import * as Identity from "@lucas-barake/effect-local/Identity"
+import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
@@ -18,7 +17,6 @@ import * as Stream from "effect/Stream"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
 import * as CommitPublisher from "./CommitPublisher.js"
 import * as DocumentEntity from "./DocumentEntity.js"
-import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
 import * as PeerSync from "./PeerSync.js"
 import * as PeerSyncEnvelope from "./PeerSyncEnvelope.js"
@@ -46,41 +44,7 @@ class RelayProtocolInvalid extends Schema.TaggedErrorClass<RelayProtocolInvalid>
   "@lucas-barake/effect-local-sql/PeerSession/RelayProtocolInvalid"
 )("RelayProtocolInvalid", {}) {}
 
-export const SyncEnvelope = Schema.Struct({
-  connectionEpoch: Schema.NonEmptyString,
-  sequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  documentId: Identity.DocumentId,
-  documentType: Schema.String,
-  messageHash: Schema.String,
-  message: Schema.Uint8ArrayFromBase64,
-  // `optionalKey`, so an envelope from a peer built before lineage still decodes. An absent key
-  // decodes as absent and never as the genesis lineage, so every reader normalizes it with
-  // `?? Identity.genesisLineage` at the point the envelope enters the system.
-  lineage: Schema.optionalKey(Identity.DocumentLineage),
-  writerProvenance: WriterProvenance.ChangeProvenances
-})
-// The lineage field is bounded by its own schema at 40 characters, so it costs at most ~60 bytes of
-// JSON on top of an envelope that already reserves 4 KiB of fixed headroom.
-export const maximumSyncEnvelopeBytes = (
-  maxSyncMessageBytes: number,
-  maxSyncChangesPerMessage: number
-) => maxSyncMessageBytes * 2 + maxSyncChangesPerMessage * 512 + 4_096
-const SyncEnvelopeJson = Schema.fromJsonString(Schema.toCodecJson(SyncEnvelope))
-
 const key = (documentType: string, documentId: Identity.DocumentId) => `${documentType}:${documentId}`
-
-const encodeDirect = (envelope: typeof SyncEnvelope.Type) =>
-  Schema.encodeEffect(SyncEnvelopeJson)(envelope).pipe(
-    Effect.map((value) => new TextEncoder().encode(value)),
-    Effect.mapError((cause) =>
-      new ReplicaError.ReplicaError({
-        reason: new ReplicaError.ProtocolMismatch({
-          expected: "encodable sync envelope",
-          observed: String(cause)
-        })
-      })
-    )
-  )
 
 const supervise = (
   terminalFailure: Deferred.Deferred<never, ReplicaError.ReplicaError>,
@@ -128,32 +92,6 @@ const makeWithTerminal = (
     const sync = yield* PeerSync.PeerSync
     const crypto = yield* Crypto.Crypto
     const relayReceiptLimits = yield* Effect.serviceOption(PeerRelayReceiptLimits.PeerRelayReceiptLimits)
-    const decodeDirect = (bytes: Uint8Array) => {
-      const maximumBytes = maximumSyncEnvelopeBytes(
-        limits.maxSyncMessageBytes,
-        limits.maxSyncChangesPerMessage
-      )
-      if (bytes.byteLength > maximumBytes) {
-        return Effect.fail(
-          new ReplicaError.ReplicaError({
-            reason: new ReplicaError.ProtocolMismatch({
-              expected: `sync envelope at most ${maximumBytes} bytes`,
-              observed: String(bytes.byteLength)
-            })
-          })
-        )
-      }
-      return Schema.decodeUnknownEffect(SyncEnvelopeJson)(new TextDecoder().decode(bytes)).pipe(
-        Effect.mapError(() =>
-          new ReplicaError.ReplicaError({
-            reason: new ReplicaError.ProtocolMismatch({
-              expected: "sync envelope",
-              observed: "invalid sync envelope"
-            })
-          })
-        )
-      )
-    }
     const decodeRelay = (bytes: Uint8Array) =>
       PeerSyncEnvelope.decodeSyncEnvelope(bytes, limits).pipe(
         Effect.provideService(Crypto.Crypto, crypto),
@@ -267,11 +205,7 @@ const makeWithTerminal = (
         Effect.gen(function*() {
           if (!(yield* Ref.get(active))) return
           const entry = yield* selectedById(outbound.documentId)
-          const bytes = yield* (
-            connection.receiveWithAcknowledgement === undefined
-              ? encodeDirect
-              : PeerSyncEnvelope.encodeSyncEnvelope
-          )({
+          const bytes = yield* PeerSyncEnvelope.encodeSyncEnvelope({
             connectionEpoch: session.connectionEpoch,
             sequence: outbound.sendSequence,
             documentId: outbound.documentId,
@@ -463,40 +397,18 @@ const makeWithTerminal = (
 
     const processReceive = (
       bytes: Uint8Array,
-      delivery?: PeerTransport.AcknowledgedDelivery
+      delivery: PeerTransport.AcknowledgedDelivery
     ) =>
       Effect.gen(function*() {
-        const protocolInvalid = (expected: string, observed: string) =>
-          Effect.fail(
-            delivery === undefined
-              ? new ReplicaError.ReplicaError({
-                reason: new ReplicaError.ProtocolMismatch({ expected, observed })
-              })
-              : new RelayProtocolInvalid()
-          )
-        const envelope = yield* (
-          delivery === undefined
-            ? decodeDirect(bytes).pipe(
-              Effect.map((envelope) => ({
-                ...envelope,
-                lineage: envelope.lineage ?? Identity.genesisLineage
-              }))
-            )
-            : decodeRelay(bytes)
-        )
-        const boundEpoch = yield* bindRemoteEpoch(envelope.connectionEpoch, delivery !== undefined)
+        const protocolInvalid = (expected: string, observed: string) => Effect.fail(new RelayProtocolInvalid())
+        const envelope = yield* decodeRelay(bytes)
+        const boundEpoch = yield* bindRemoteEpoch(envelope.connectionEpoch, true)
         const selectedDocument = selected.has(key(envelope.documentType, envelope.documentId))
-        // Dropped before the digest and entity dispatch, not after. Nothing can restore the refused
-        // lineage inside this session, so hashing and dispatching every further message the peer
-        // sends for it would be a peer driven retry loop over CPU, allocation, and storage.
+        // Dropped after envelope validation but before entity dispatch. Nothing can restore the
+        // refused lineage inside this session, so dispatching every further message the peer sends
+        // for it would be a peer driven retry loop over allocation and storage.
         if (selectedDocument && (yield* Ref.get(refused)).has(envelope.documentId)) {
           return "ApplicationRejected" as const
-        }
-        const messageHash = yield* Canonical.digest(envelope.message).pipe(
-          Effect.provideService(Crypto.Crypto, crypto)
-        )
-        if (messageHash !== envelope.messageHash) {
-          return yield* protocolInvalid(messageHash, envelope.messageHash)
         }
         if (!selectedDocument) {
           return yield* protocolInvalid(
@@ -522,42 +434,37 @@ const makeWithTerminal = (
             }))
             const observationRevision = (yield* Ref.get(observed)).get(envelope.documentId)?.revision ?? 0
             const client = yield* entity(envelope.documentId)
-            const relay = delivery === undefined
-              ? undefined
-              : yield* Effect.gen(function*() {
-                if (relayReceiptLimits._tag === "None") {
-                  return yield* new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageUnavailable({
-                      cause: new Error("Relay receipt limits are unavailable")
-                    })
+            const relay = yield* Effect.gen(function*() {
+              if (relayReceiptLimits._tag === "None") {
+                return yield* new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause: new Error("Relay receipt limits are unavailable")
                   })
-                }
-                if (
-                  !Number.isSafeInteger(delivery.receiptRetentionMillis) ||
-                  delivery.receiptRetentionMillis <= 0 ||
-                  delivery.receiptRetentionMillis > relayReceiptLimits.value.receiptRetentionMillis
-                ) {
-                  return yield* new RelayProtocolInvalid()
-                }
-                if (
-                  connection.relayPeerId === undefined ||
-                  delivery.identity.relayPeerId !== connection.relayPeerId
-                ) {
-                  return yield* new RelayProtocolInvalid()
-                }
-                if (delivery.identity.senderPeerId !== connection.peerId) {
-                  return yield* new RelayProtocolInvalid()
-                }
-                if (delivery.identity.messageHash !== envelope.messageHash) {
-                  return yield* new RelayProtocolInvalid()
-                }
-                const nowMillis = yield* Clock.currentTimeMillis
-                return {
-                  ...delivery.identity,
-                  receiptExpiresAt: new Date(nowMillis + delivery.receiptRetentionMillis).toISOString(),
-                  encodedSize: bytes.byteLength
-                } satisfies PeerSync.RelayReceipt
-              })
+                })
+              }
+              if (
+                !Number.isSafeInteger(delivery.receiptRetentionMillis) ||
+                delivery.receiptRetentionMillis <= 0 ||
+                delivery.receiptRetentionMillis > relayReceiptLimits.value.receiptRetentionMillis
+              ) {
+                return yield* new RelayProtocolInvalid()
+              }
+              if (delivery.identity.relayPeerId !== connection.relayPeerId) {
+                return yield* new RelayProtocolInvalid()
+              }
+              if (delivery.identity.senderPeerId !== connection.peerId) {
+                return yield* new RelayProtocolInvalid()
+              }
+              if (delivery.identity.messageHash !== envelope.messageHash) {
+                return yield* new RelayProtocolInvalid()
+              }
+              const nowMillis = yield* Clock.currentTimeMillis
+              return {
+                ...delivery.identity,
+                receiptExpiresAt: new Date(nowMillis + delivery.receiptRetentionMillis).toISOString(),
+                encodedSize: bytes.byteLength
+              } satisfies PeerSync.RelayReceipt
+            })
             const applySync = client.ApplySync({
               replicaIncarnation: incarnation,
               peerId: connection.peerId,
@@ -571,7 +478,7 @@ const makeWithTerminal = (
               // absent key of a pre lineage peer becomes the genesis lineage.
               lineage: envelope.lineage,
               writerProvenance: envelope.writerProvenance,
-              ...(relay === undefined ? {} : { relay })
+              relay
             }).pipe(
               Effect.catchTag(
                 ["MailboxFull", "AlreadyProcessingMessage", "PersistenceError"],
@@ -585,29 +492,25 @@ const makeWithTerminal = (
                   )
               )
             )
-            const result = yield* (
-              delivery === undefined
-                ? applySync
-                : applySync.pipe(
-                  Effect.catchReason(
-                    "ReplicaError",
-                    "ProtocolMismatch",
-                    () =>
-                      Effect.gen(function*() {
-                        const current = yield* gate.current
-                        if (current.incarnation === session.replicaIncarnation) {
-                          return yield* new RelayProtocolInvalid()
-                        }
-                        return yield* new ReplicaError.ReplicaError({
-                          reason: new ReplicaError.StorageUnavailable({
-                            cause: new Error(
-                              `Replica incarnation changed from ${session.replicaIncarnation} to ${current.incarnation}`
-                            )
-                          })
-                        })
+            const result = yield* applySync.pipe(
+              Effect.catchReason(
+                "ReplicaError",
+                "ProtocolMismatch",
+                () =>
+                  Effect.gen(function*() {
+                    const current = yield* gate.current
+                    if (current.incarnation === session.replicaIncarnation) {
+                      return yield* new RelayProtocolInvalid()
+                    }
+                    return yield* new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageUnavailable({
+                        cause: new Error(
+                          `Replica incarnation changed from ${session.replicaIncarnation} to ${current.incarnation}`
+                        )
                       })
-                  )
-                )
+                    })
+                  })
+              )
             )
             yield* Ref.update(observed, (values) => {
               const current = values.get(envelope.documentId)
@@ -667,21 +570,6 @@ const makeWithTerminal = (
           () => relayCall("relay reject", delivery.reject("ProtocolInvalid"))
         )
       )
-    const receiveDirect = (bytes: Uint8Array) =>
-      processReceive(bytes).pipe(
-        Effect.catchTag(
-          "RelayProtocolInvalid",
-          () =>
-            Effect.fail(
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.StorageUnavailable({
-                  cause: new Error("Direct receive entered relay protocol classification")
-                })
-              })
-            )
-        )
-      )
-
     yield* Effect.addFinalizer(() =>
       Effect.gen(function*() {
         const boundEpoch = yield* Ref.get(remoteEpoch)
@@ -703,11 +591,7 @@ const makeWithTerminal = (
     )
     yield* supervise(
       terminalFailure,
-      (
-        connection.receiveWithAcknowledgement === undefined
-          ? Stream.runForEach(connection.receive, receiveDirect)
-          : Stream.runForEach(connection.receiveWithAcknowledgement, receiveAcknowledged)
-      ).pipe(
+      Stream.runForEach(connection.receive, receiveAcknowledged).pipe(
         Effect.andThen(
           Effect.fail(
             new ReplicaError.ReplicaError({

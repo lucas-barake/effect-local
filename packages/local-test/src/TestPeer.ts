@@ -78,6 +78,43 @@ interface Scheduled {
 
 const route = (from: Identity.PeerId, to: Identity.PeerId) => `${from}\u0000${to}`
 
+const fallbackMessageHash = (message: Uint8Array): string =>
+  Array.from(message, (byte) => byte.toString(16).padStart(2, "0"))
+    .join("")
+    .padEnd(64, "0")
+    .slice(0, 64)
+
+const deliveryIdentity = (
+  message: Uint8Array,
+  relayPeerId: Identity.PeerId,
+  senderPeerId: Identity.PeerId
+): PeerTransport.RelayDeliveryIdentity => {
+  let messageHash = fallbackMessageHash(message)
+  try {
+    const decoded = JSON.parse(new TextDecoder().decode(message)) as { readonly messageHash?: unknown }
+    if (typeof decoded.messageHash === "string" && /^[0-9a-f]{64}$/.test(decoded.messageHash)) {
+      messageHash = decoded.messageHash
+    }
+  } catch {
+    // Raw packets are supported by the low level test transport.
+  }
+  const relayMessageId = Identity.RelayMessageId.make(
+    `rly_${messageHash.slice(0, 8)}-${messageHash.slice(8, 12)}-4${messageHash.slice(13, 16)}-8${
+      messageHash.slice(17, 20)
+    }-${messageHash.slice(20, 32)}`
+  )
+  return {
+    relayMessageId,
+    relayPeerId,
+    senderTenantId: "effect-local-test",
+    senderSubjectId: senderPeerId,
+    senderPeerId,
+    senderReplicaIncarnation: Identity.ReplicaIncarnation.make(0),
+    messageHash,
+    outerEnvelopeDigest: messageHash
+  }
+}
+
 const toValidatedMillis = (input: Duration.Input) =>
   typeof input === "number" && Number.isNaN(input)
     ? Number.NaN
@@ -297,7 +334,7 @@ export const make = (
       transport: (peerId) => ({
         // Both ends of this transport are this build, which compares lineage before it merges, so
         // the advertisement is a statement of fact rather than a test convenience.
-        capabilities: { storeAndForward: false, lineageAware: true },
+        capabilities: { lineageAware: true },
         connect: ({ peerId: remotePeerId }) =>
           connect(peerId, remotePeerId).pipe(
             Effect.tap(() =>
@@ -308,8 +345,17 @@ export const make = (
             ),
             Effect.map((connection) => ({
               peerId: remotePeerId,
-              capabilities: { storeAndForward: false, lineageAware: true },
-              receive: connection.receive,
+              relayPeerId: peerId,
+              capabilities: { lineageAware: true },
+              receive: connection.receive.pipe(
+                Stream.map((message): PeerTransport.AcknowledgedDelivery => ({
+                  message,
+                  identity: deliveryIdentity(message, peerId, remotePeerId),
+                  receiptRetentionMillis: 24 * 60 * 60 * 1_000,
+                  acknowledge: Effect.void,
+                  reject: () => Effect.void
+                }))
+              ),
               send: (message) =>
                 connection.send(message).pipe(
                   Effect.mapError((error) =>

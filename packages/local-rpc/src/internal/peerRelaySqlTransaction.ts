@@ -9,7 +9,7 @@ import type * as SqlConnection from "effect/unstable/sql/SqlConnection"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 
 export class NestedPeerRelayTransactionError extends Schema.TaggedErrorClass<NestedPeerRelayTransactionError>(
-  "@lucas-barake/effect-local-rpc/internal/peerRelaySqliteTransaction/NestedPeerRelayTransactionError"
+  "@lucas-barake/effect-local-rpc/internal/peerRelaySqlTransaction/NestedPeerRelayTransactionError"
 )("NestedPeerRelayTransactionError", {}) {}
 
 export interface Options {
@@ -106,7 +106,7 @@ const acquireImmediate = (
     return attempt(options.maxAcquireAttempts, 0)
   })
 
-export const make = (
+export const makeSqlite = (
   sql: SqlClient.SqlClient,
   options: Options
 ) => {
@@ -204,3 +204,35 @@ export const make = (
       })
     })
 }
+
+const makeServer = (sql: SqlClient.SqlClient) =>
+<A, E, R,>(
+  effect: Effect.Effect<A, E, R>
+): Effect.Effect<
+  A,
+  E | SqlError.SqlError | NestedPeerRelayTransactionError,
+  R
+> =>
+  Effect.gen(function*() {
+    const active = yield* Effect.serviceOption(sql.transactionService)
+    if (Option.isSome(active)) {
+      return yield* new NestedPeerRelayTransactionError()
+    }
+    return yield* sql.withTransaction(
+      sql`SELECT lock_id
+          FROM effect_local_relay_write_lock
+          WHERE lock_id = 1
+          FOR UPDATE`.pipe(Effect.andThen(effect))
+    )
+  })
+
+export const make = (
+  sql: SqlClient.SqlClient,
+  options: Options
+) =>
+  sql.onDialectOrElse({
+    sqlite: () => makeSqlite(sql, options),
+    pg: () => makeServer(sql),
+    mysql: () => makeServer(sql),
+    orElse: () => makeServer(sql)
+  })

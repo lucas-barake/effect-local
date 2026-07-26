@@ -38,7 +38,7 @@ import * as PeerSyncEnvelope from "../src/PeerSyncEnvelope.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
 
-it.layer(NodeCrypto.layer)("PeerSession", (it) => {
+it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("PeerSession", (it) => {
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
   const definition = ReplicaDefinition.make({
     name: "tasks",
@@ -122,6 +122,49 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
     refresh: Effect.succeed(permit),
     validate: () => Effect.void
   })
+  const testRelayPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000099")
+  let relayMessageSequence = 0
+  const acknowledged = (
+    peerId: Identity.PeerId,
+    stream: Stream.Stream<Uint8Array, ReplicaError.ReplicaError>
+  ): Stream.Stream<PeerTransport.AcknowledgedDelivery, ReplicaError.ReplicaError> =>
+    Stream.map(stream, (message) => {
+      let messageHash = "0".repeat(64)
+      try {
+        const decoded = JSON.parse(new TextDecoder().decode(message)) as { readonly messageHash?: unknown }
+        if (typeof decoded.messageHash === "string") messageHash = decoded.messageHash
+      } catch {
+        // The production decoder must classify malformed bytes, not this test adapter.
+      }
+      relayMessageSequence += 1
+      const suffix = relayMessageSequence.toString(16).padStart(12, "0").slice(-12)
+      return {
+        message,
+        identity: {
+          relayMessageId: Identity.RelayMessageId.make(`rly_00000000-0000-4000-8000-${suffix}`),
+          relayPeerId: testRelayPeerId,
+          senderTenantId: "tenant",
+          senderSubjectId: "subject",
+          senderPeerId: peerId,
+          senderReplicaIncarnation: permit.incarnation,
+          messageHash,
+          outerEnvelopeDigest: "0".repeat(64)
+        },
+        receiptRetentionMillis: PeerRelayReceiptLimits.defaults.receiptRetentionMillis,
+        acknowledge: Effect.void,
+        reject: (reason) =>
+          reason === "ApplicationRejected"
+            ? Effect.void
+            : Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.ProtocolMismatch({
+                  expected: "valid relay delivery",
+                  observed: "invalid relay delivery"
+                })
+              })
+            )
+      }
+    })
 
   const makeLiveFixture = (documents: ReadonlyArray<PeerSession.SelectedDocument>) =>
     Effect.gen(function*() {
@@ -173,11 +216,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         markSent: () => Effect.succeed(true)
       })
       const transport = PeerTransport.PeerTransport.of({
-        capabilities: { storeAndForward: false },
+        capabilities: {},
         connect: () =>
           Effect.succeed({
             peerId,
-            capabilities: { storeAndForward: false },
+            relayPeerId: testRelayPeerId,
+            capabilities: {},
             receive: Stream.fromEffect(Deferred.await(receiveFailure)),
             send: () => Effect.void,
             close: Ref.update(closed, (count) => count + 1)
@@ -226,14 +270,19 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       }
     })
 
-  const SyncEnvelopeJson = Schema.fromJsonString(Schema.toCodecJson(PeerSession.SyncEnvelope))
+  const SyncEnvelopeJson = Schema.fromJsonString(Schema.toCodecJson(PeerSyncEnvelope.SyncEnvelope))
   // The longest value the lineage schema admits, so the envelope size bound is checked against the
   // worst case rather than against an absent or genesis lineage.
   const maximalLineage = Identity.DocumentLineage.make("lin_ffffffff-ffff-4fff-bfff-ffffffffffff")
-  const encode = (envelope: typeof PeerSession.SyncEnvelope.Type) =>
-    Schema.encodeEffect(SyncEnvelopeJson)(envelope).pipe(
-      Effect.map((value) => new TextEncoder().encode(value))
-    )
+  const encode = (
+    envelope: Omit<PeerSyncEnvelope.SyncEnvelope, "lineage"> & {
+      readonly lineage?: Identity.DocumentLineage
+    }
+  ) =>
+    PeerSyncEnvelope.encodeSyncEnvelope({
+      ...envelope,
+      lineage: envelope.lineage ?? Identity.genesisLineage
+    })
 
   it.effect("bounds a maximum size sync envelope including writer provenance", () =>
     Effect.gen(function*() {
@@ -256,14 +305,14 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       })
       assert.isAtMost(
         encoded.byteLength,
-        PeerSession.maximumSyncEnvelopeBytes(
+        PeerSyncEnvelope.maximumSyncEnvelopeBytes(
           limits.maxSyncMessageBytes,
           limits.maxSyncChangesPerMessage
         )
       )
     }))
 
-  it.effect("decodes a sync envelope with no lineage field as the genesis lineage", () =>
+  it.effect("requires a lineage in the durable sync envelope", () =>
     Effect.gen(function*() {
       const documentId = yield* Identity.makeDocumentId
       const message = Uint8Array.of(1, 2, 3)
@@ -278,13 +327,11 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         writerProvenance: []
       })
       const wire = JSON.parse(new TextDecoder().decode(encoded))
-      // The compatibility claim itself: an envelope from a peer built before lineage carries no
-      // such key at all, rather than carrying an empty one.
-      assert.isFalse("lineage" in wire)
-
-      const withoutLineage = yield* Schema.decodeUnknownEffect(SyncEnvelopeJson)(JSON.stringify(wire))
-      assert.isUndefined(withoutLineage.lineage)
-      assert.strictEqual(withoutLineage.lineage ?? Identity.genesisLineage, Identity.genesisLineage)
+      delete wire.lineage
+      assert.strictEqual(
+        (yield* Effect.exit(Schema.decodeUnknownEffect(SyncEnvelopeJson)(JSON.stringify(wire))))._tag,
+        "Failure"
+      )
 
       const withLineage = yield* Schema.decodeUnknownEffect(SyncEnvelopeJson)(
         JSON.stringify({ ...wire, lineage: maximalLineage })
@@ -327,7 +374,7 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
       const json = JSON.stringify(tampered)
       assert.isBelow(
         new TextEncoder().encode(json).byteLength,
-        PeerSession.maximumSyncEnvelopeBytes(limits.maxSyncMessageBytes, limits.maxSyncChangesPerMessage)
+        PeerSyncEnvelope.maximumSyncEnvelopeBytes(limits.maxSyncMessageBytes, limits.maxSyncChangesPerMessage)
       )
       const exit = yield* Effect.exit(Schema.decodeUnknownEffect(SyncEnvelopeJson)(json))
       assert.strictEqual(exit._tag, "Failure")
@@ -357,12 +404,13 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         markSent: () => Effect.succeed(true)
       })
       const transport = PeerTransport.PeerTransport.of({
-        capabilities: { storeAndForward: false },
+        capabilities: {},
         connect: () =>
           Ref.updateAndGet(connectCalls, (count) => count + 1).pipe(
             Effect.as({
               peerId,
-              capabilities: { storeAndForward: false },
+              relayPeerId: testRelayPeerId,
+              capabilities: {},
               receive: Stream.never,
               send: () => Effect.void,
               close: Effect.void
@@ -448,12 +496,13 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           markSent: () => Effect.succeed(true)
         })
         const transport = PeerTransport.PeerTransport.of({
-          capabilities: { storeAndForward: false },
+          capabilities: {},
           connect: () =>
             Effect.succeed({
               peerId,
-              capabilities: { storeAndForward: false },
-              receive: Stream.fromQueue(inbound),
+              relayPeerId: testRelayPeerId,
+              capabilities: {},
+              receive: acknowledged(peerId, Stream.fromQueue(inbound)),
               send: () => Effect.void,
               close: Effect.void
             })
@@ -577,12 +626,13 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           markSent: () => Effect.succeed(true)
         })
         const transport = PeerTransport.PeerTransport.of({
-          capabilities: { storeAndForward: false },
+          capabilities: {},
           connect: () =>
             Effect.succeed({
               peerId,
-              capabilities: { storeAndForward: false },
-              receive: Stream.fromQueue(inbound),
+              relayPeerId: testRelayPeerId,
+              capabilities: {},
+              receive: acknowledged(peerId, Stream.fromQueue(inbound)),
               send: () => Effect.void,
               close: Effect.void
             })
@@ -741,12 +791,13 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           markSent: () => Ref.set(pending, []).pipe(Effect.as(true))
         })
         const transport = PeerTransport.PeerTransport.of({
-          capabilities: { storeAndForward: false },
+          capabilities: {},
           connect: () =>
             Effect.succeed({
               peerId,
-              capabilities: { storeAndForward: false },
-              receive: Stream.fromQueue(inbound),
+              relayPeerId: testRelayPeerId,
+              capabilities: {},
+              receive: acknowledged(peerId, Stream.fromQueue(inbound)),
               send: (bytes) =>
                 Effect.gen(function*() {
                   assert.isFalse(yield* Ref.get(gateReleased))
@@ -922,12 +973,13 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             )
         })
         const transport = PeerTransport.PeerTransport.of({
-          capabilities: { storeAndForward: false },
+          capabilities: {},
           connect: () =>
             Effect.succeed({
               peerId,
-              capabilities: { storeAndForward: false },
-              receive: Stream.fromQueue(inbound),
+              relayPeerId: testRelayPeerId,
+              capabilities: {},
+              receive: acknowledged(peerId, Stream.fromQueue(inbound)),
               send: (bytes) =>
                 Schema.decodeUnknownEffect(SyncEnvelopeJson)(new TextDecoder().decode(bytes)).pipe(
                   Effect.tap((envelope) => Queue.offer(sent, envelope.sequence)),
@@ -1057,11 +1109,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           markSent: () => Ref.set(pendingCount, 0).pipe(Effect.as(true))
         })
         const transport = PeerTransport.PeerTransport.of({
-          capabilities: { storeAndForward: false },
+          capabilities: {},
           connect: () =>
             Effect.succeed({
               peerId,
-              capabilities: { storeAndForward: false },
+              relayPeerId: testRelayPeerId,
+              capabilities: {},
               receive: Stream.never,
               send: (bytes) =>
                 Schema.decodeUnknownEffect(SyncEnvelopeJson)(new TextDecoder().decode(bytes)).pipe(
@@ -1146,11 +1199,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           markSent: () => Effect.succeed(true)
         })
         const transport = PeerTransport.PeerTransport.of({
-          capabilities: { storeAndForward: false },
+          capabilities: {},
           connect: () =>
             Effect.succeed({
               peerId,
-              capabilities: { storeAndForward: false },
+              relayPeerId: testRelayPeerId,
+              capabilities: {},
               receive: Stream.never,
               send: () =>
                 Ref.updateAndGet(sendCalls, (count) => count + 1).pipe(
@@ -1227,12 +1281,13 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           markSent: () => Effect.succeed(true)
         })
         const transport = PeerTransport.PeerTransport.of({
-          capabilities: { storeAndForward: false },
+          capabilities: {},
           connect: () =>
             Effect.succeed({
               peerId,
-              capabilities: { storeAndForward: false },
-              receive: Stream.fromQueue(inbound),
+              relayPeerId: testRelayPeerId,
+              capabilities: {},
+              receive: acknowledged(peerId, Stream.fromQueue(inbound)),
               send: () => Effect.die(new Error("automatic send defect")),
               close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
             })
@@ -1425,12 +1480,13 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             markSent: () => Effect.succeed(true)
           })
           const transport = PeerTransport.PeerTransport.of({
-            capabilities: { storeAndForward: false },
+            capabilities: {},
             connect: () =>
               Effect.succeed({
                 peerId,
-                capabilities: { storeAndForward: false },
-                receive: Stream.fromQueue(inbound),
+                relayPeerId: testRelayPeerId,
+                capabilities: {},
+                receive: acknowledged(peerId, Stream.fromQueue(inbound)),
                 send: () => Effect.die(`unexpected send for ${testCase.name}`),
                 close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
               })
@@ -1498,12 +1554,13 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         markSent: () => Effect.succeed(true)
       })
       const transport = PeerTransport.PeerTransport.of({
-        capabilities: { storeAndForward: false },
+        capabilities: {},
         connect: () =>
           Effect.acquireRelease(
             Effect.succeed({
               peerId,
-              capabilities: { storeAndForward: false },
+              relayPeerId: testRelayPeerId,
+              capabilities: {},
               receive: Stream.never,
               send: () => Effect.void,
               close: Ref.set(closed, true)
@@ -1591,14 +1648,15 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         markSent: () => Effect.succeed(true)
       })
       const transport = PeerTransport.PeerTransport.of({
-        capabilities: { storeAndForward: false },
+        capabilities: {},
         connect: ({ replicaId }) =>
           Ref.get(sharedHeld).pipe(
             Effect.flatMap((held) => held ? Effect.void : Ref.set(current, nextPermit)),
             Effect.andThen(Ref.set(connectedReplica, replicaId)),
             Effect.as({
               peerId,
-              capabilities: { storeAndForward: false },
+              relayPeerId: testRelayPeerId,
+              capabilities: {},
               receive: Stream.never,
               send: () => Effect.void,
               close: Effect.void
@@ -1652,11 +1710,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         markSent: () => Effect.succeed(true)
       })
       const transport = PeerTransport.PeerTransport.of({
-        capabilities: { storeAndForward: false },
+        capabilities: {},
         connect: () =>
           Effect.succeed({
             peerId,
-            capabilities: { storeAndForward: false },
+            relayPeerId: testRelayPeerId,
+            capabilities: {},
             receive: Stream.empty,
             send: () => Effect.void,
             close: Ref.set(closed, true)
@@ -1722,11 +1781,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           markSent: () => Effect.succeed(true)
         })
         const transport = PeerTransport.PeerTransport.of({
-          capabilities: { storeAndForward: false },
+          capabilities: {},
           connect: () =>
             Effect.succeed({
               peerId,
-              capabilities: { storeAndForward: false },
+              relayPeerId: testRelayPeerId,
+              capabilities: {},
               receive: Stream.fromEffect(Deferred.await(endReceive)).pipe(Stream.drain),
               send: () => Effect.void,
               close: Deferred.succeed(closeStarted, undefined).pipe(
@@ -1795,12 +1855,13 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         markSent: () => Effect.succeed(true)
       })
       const transport = PeerTransport.PeerTransport.of({
-        capabilities: { storeAndForward: false },
+        capabilities: {},
         connect: () =>
           Effect.succeed({
             peerId,
-            capabilities: { storeAndForward: false },
-            receive: Stream.fromQueue(inbound),
+            relayPeerId: testRelayPeerId,
+            capabilities: {},
+            receive: acknowledged(peerId, Stream.fromQueue(inbound)),
             send: () => Ref.update(sends, (count) => count + 1),
             close: Effect.void
           })
@@ -1927,11 +1988,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         markSent: () => Effect.succeed(true)
       })
       const transport = PeerTransport.PeerTransport.of({
-        capabilities: { storeAndForward: false },
+        capabilities: {},
         connect: () =>
           Effect.succeed({
             peerId,
-            capabilities: { storeAndForward: false },
+            relayPeerId: testRelayPeerId,
+            capabilities: {},
             receive: Stream.never,
             send: () => Deferred.succeed(sendStarted, undefined).pipe(Effect.andThen(Effect.never)),
             close: Effect.void
@@ -2015,11 +2077,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         markSent: () => Ref.update(marked, (count) => count + 1).pipe(Effect.as(true))
       })
       const transport = PeerTransport.PeerTransport.of({
-        capabilities: { storeAndForward: false },
+        capabilities: {},
         connect: () =>
           Effect.succeed({
             peerId,
-            capabilities: { storeAndForward: false },
+            relayPeerId: testRelayPeerId,
+            capabilities: {},
             receive: Stream.never,
             send: () =>
               Effect.gen(function*() {
@@ -2154,11 +2217,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         markSent: () => Effect.succeed(true)
       })
       const transport = PeerTransport.PeerTransport.of({
-        capabilities: { storeAndForward: false },
+        capabilities: {},
         connect: () =>
           Effect.succeed({
             peerId,
-            capabilities: { storeAndForward: false },
+            relayPeerId: testRelayPeerId,
+            capabilities: {},
             receive: Stream.never,
             send: () => Ref.update(sends, (count) => count + 1),
             close: Ref.set(closed, true)
@@ -2262,11 +2326,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           markSent: () => Effect.succeed(true)
         })
         const transport = PeerTransport.PeerTransport.of({
-          capabilities: { storeAndForward: false },
+          capabilities: {},
           connect: () =>
             Effect.succeed({
               peerId,
-              capabilities: { storeAndForward: false },
+              relayPeerId: testRelayPeerId,
+              capabilities: {},
               receive: Stream.never,
               send: () => Effect.void,
               close: Ref.set(closed, true)
@@ -2317,124 +2382,6 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
             )
         )
       }
-    }).pipe(Effect.provide(NodeCrypto.layer)))
-
-  it.effect("binds one remote epoch and resets both session directions", () =>
-    Effect.gen(function*() {
-      const inbound = yield* Queue.unbounded<Uint8Array>()
-      const firstReceived = yield* Deferred.make<void>()
-      const receiveEnded = yield* Deferred.make<void>()
-      const receives = yield* Ref.make(0)
-      const resets = yield* Ref.make<ReadonlyArray<PeerSync.Session>>([])
-      const documentId = yield* Identity.makeDocumentId
-      const peerId = yield* Identity.makePeerId
-      const message = new Uint8Array([1])
-      const messageHash = yield* Canonical.digest(message)
-      const sync = PeerSync.PeerSync.of({
-        withDocumentInvalidation: (_documentId, effect) => effect,
-        invalidateDocument: () => Effect.void,
-        open: (id) =>
-          Effect.succeed({
-            peerId: id,
-            connectionEpoch: "local-epoch",
-            replicaIncarnation: permit.incarnation
-          }),
-        reset: (session) => Ref.update(resets, (current) => [...current, session]),
-        generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
-        receive: () =>
-          Ref.updateAndGet(receives, (count) => count + 1).pipe(
-            Effect.tap(() => Deferred.succeed(firstReceived, undefined)),
-            Effect.as(result)
-          ),
-        enqueue: (_session, reply) =>
-          Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
-        pending: () => Effect.succeed([]),
-        markSent: () => Effect.succeed(true)
-      })
-      const transport = PeerTransport.PeerTransport.of({
-        capabilities: { storeAndForward: false },
-        connect: () =>
-          Effect.succeed({
-            peerId,
-            capabilities: { storeAndForward: false },
-            receive: Stream.fromQueue(inbound).pipe(
-              Stream.ensuring(Deferred.succeed(receiveEnded, undefined))
-            ),
-            send: () => Effect.void,
-            close: Effect.void
-          })
-      })
-      yield* Effect.scoped(
-        Effect.gen(function*() {
-          yield* PeerSession.makeTestClient(
-            { peerId, documents: [{ document: Task, documentId }] },
-            () =>
-              Effect.succeed({
-                ApplySync: () =>
-                  sync.receive(
-                    Task,
-                    documentId,
-                    {
-                      peerId,
-                      connectionEpoch: "local-epoch",
-                      replicaIncarnation: permit.incarnation
-                    },
-                    {
-                      remoteConnectionEpoch: "remote-epoch",
-                      receiveSequence: 0,
-                      lineage: Identity.genesisLineage,
-                      message,
-                      writerProvenance: [{
-                        changeHash: "a".repeat(64),
-                        writerSchemaVersion: Task.version,
-                        writerDefinitionHash: definition.hash
-                      }]
-                    }
-                  )
-              } as never)
-          )
-          const envelope = (connectionEpoch: string) =>
-            encode({
-              connectionEpoch,
-              sequence: 0,
-              documentId,
-              documentType: Task.name,
-              messageHash,
-              message,
-              writerProvenance: [{
-                changeHash: "a".repeat(64),
-                writerSchemaVersion: Task.version,
-                writerDefinitionHash: definition.hash
-              }]
-            })
-          yield* Queue.offer(inbound, yield* envelope("remote-epoch"))
-          yield* Deferred.await(firstReceived)
-          yield* Queue.offer(inbound, yield* envelope("changed-epoch"))
-          yield* Deferred.await(receiveEnded)
-          assert.strictEqual(yield* Ref.get(receives), 1)
-        }).pipe(
-          Effect.provideService(PeerTransport.PeerTransport, transport),
-          Effect.provideService(PeerSync.PeerSync, sync),
-          Effect.provideService(ReplicaGate.ReplicaGate, gate),
-          Effect.provideService(
-            CommitPublisher.CommitPublisher,
-            CommitPublisher.CommitPublisher.of({
-              publishPending: Effect.succeed(0),
-              invalidate: () => Effect.void,
-              subscribe: Effect.succeed({
-                watermark: Identity.CommitSequence.make(0),
-                refreshGeneration: 0,
-                events: Stream.never
-              })
-            })
-          ),
-          Effect.provideService(ReplicaLimits.ReplicaLimits, limits)
-        )
-      )
-      assert.deepStrictEqual(
-        (yield* Ref.get(resets)).map((session) => session.connectionEpoch).toSorted(),
-        ["local-epoch", "remote-epoch"]
-      )
     }).pipe(Effect.provide(NodeCrypto.layer)))
 
   it.effect("rotates relay sender epochs and acknowledges only after the durable receive workflow", () =>
@@ -2513,14 +2460,13 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         pruneRelayReceipts: Effect.succeed(0)
       })
       const transport = PeerTransport.PeerTransport.of({
-        capabilities: { storeAndForward: true },
+        capabilities: {},
         connect: () =>
           Effect.succeed({
             peerId: senderPeerId,
             relayPeerId,
-            capabilities: { storeAndForward: true },
-            receive: Stream.never,
-            receiveWithAcknowledgement: Stream.fromQueue(deliveries),
+            capabilities: {},
+            receive: Stream.fromQueue(deliveries),
             send: () => Effect.void,
             close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
           })
@@ -2780,14 +2726,13 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         pruneRelayReceipts: Effect.succeed(0)
       })
       const transport = PeerTransport.PeerTransport.of({
-        capabilities: { storeAndForward: true },
+        capabilities: {},
         connect: () =>
           Effect.succeed({
             peerId: senderPeerId,
             relayPeerId,
-            capabilities: { storeAndForward: true },
-            receive: Stream.never,
-            receiveWithAcknowledgement: Stream.fromQueue(deliveries),
+            capabilities: {},
+            receive: Stream.fromQueue(deliveries),
             send: () => Effect.void,
             close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
           })
@@ -2892,11 +2837,12 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         markSent: () => Effect.succeed(true)
       })
       const transport = PeerTransport.PeerTransport.of({
-        capabilities: { storeAndForward: false },
+        capabilities: {},
         connect: () =>
           Effect.succeed({
             peerId,
-            capabilities: { storeAndForward: false },
+            relayPeerId: testRelayPeerId,
+            capabilities: {},
             receive: Stream.never,
             send: (bytes) =>
               Schema.decodeUnknownEffect(SyncEnvelopeJson)(new TextDecoder().decode(bytes)).pipe(
@@ -3313,12 +3259,13 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
           markSent: () => Effect.succeed(true)
         })
         const transport = PeerTransport.PeerTransport.of({
-          capabilities: { storeAndForward: false, lineageAware: true },
+          capabilities: { lineageAware: true },
           connect: () =>
             Effect.succeed({
               peerId,
-              capabilities: { storeAndForward: false, lineageAware: true },
-              receive: Stream.fromQueue(inbound),
+              relayPeerId: testRelayPeerId,
+              capabilities: { lineageAware: true },
+              receive: acknowledged(peerId, Stream.fromQueue(inbound)),
               send: () => Effect.void,
               close: Ref.update(closed, (count) => count + 1).pipe(
                 Effect.andThen(Deferred.succeed(closeStarted, undefined)),
@@ -3372,14 +3319,14 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         yield* Queue.offer(inbound, yield* envelope(0, refusedId))
         assert.strictEqual(yield* whileOpen(Queue.take(dispatched)), refusedId)
         yield* Ref.set(digestCalls, 0)
-        // The peer keeps pushing the refused document. The second message must be dropped ahead of
-        // the digest and entity, so a hostile peer cannot make the session repeat either cost at will.
+        // The peer keeps pushing the refused document. Its envelope is still validated, but it must
+        // be dropped before entity dispatch.
         yield* Queue.offer(inbound, yield* envelope(1, refusedId))
         yield* Queue.offer(inbound, yield* envelope(2, survivingId))
         // Taken after two further messages, so it is only reachable if the refusal neither ended the
         // session nor stopped the receive loop.
         assert.strictEqual(yield* whileOpen(Queue.take(dispatched)), survivingId)
-        assert.strictEqual(yield* Ref.get(digestCalls), 1)
+        assert.strictEqual(yield* Ref.get(digestCalls), 2)
         assert.strictEqual(yield* Queue.size(dispatched), 0)
         // Only the applied document published, and the connection is still open.
         assert.strictEqual(yield* Ref.get(publications), 1)
@@ -3443,12 +3390,13 @@ it.layer(NodeCrypto.layer)("PeerSession", (it) => {
         markSent: () => Effect.succeed(true)
       })
       const transport = PeerTransport.PeerTransport.of({
-        capabilities: { storeAndForward: false },
+        capabilities: {},
         connect: () =>
           Effect.succeed({
             peerId,
-            capabilities: { storeAndForward: false },
-            receive: Stream.fromQueue(inbound),
+            relayPeerId: testRelayPeerId,
+            capabilities: {},
+            receive: acknowledged(peerId, Stream.fromQueue(inbound)),
             send: () => Effect.void,
             close: Effect.void
           })

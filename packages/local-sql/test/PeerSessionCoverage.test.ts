@@ -55,6 +55,7 @@ it.layer(NodeCrypto.layer)("PeerSession coverage", (it) => {
     writerGeneration: Identity.WriterGeneration.make(2),
     definitionHash: "hash"
   }
+  const testRelayPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000099")
   const gate = ReplicaGate.ReplicaGate.of({
     current: Effect.succeed(permit),
     claiming: Effect.succeed(false),
@@ -88,12 +89,13 @@ it.layer(NodeCrypto.layer)("PeerSession coverage", (it) => {
     })
   const makeScopedTransport = (peerId: Identity.PeerId, closed: Ref.Ref<number>) =>
     PeerTransport.PeerTransport.of({
-      capabilities: { storeAndForward: false },
+      capabilities: {},
       connect: () =>
         Effect.acquireRelease(
           Effect.succeed({
             peerId,
-            capabilities: { storeAndForward: false } as const,
+            relayPeerId: testRelayPeerId,
+            capabilities: {} as const,
             receive: Stream.never,
             send: () => Effect.void,
             close: Ref.update(closed, (count) => count + 1)

@@ -574,7 +574,7 @@ const peerRelayStateMigration = Effect.gen(function*() {
     relay_peer_id TEXT NOT NULL CHECK (length(relay_peer_id) > 0),
     relay_message_id TEXT NOT NULL CHECK (length(relay_message_id) > 0),
     outer_envelope_digest TEXT NOT NULL CHECK (length(outer_envelope_digest) = 64),
-    protocol_version INTEGER NOT NULL CHECK (protocol_version = 3),
+    protocol_version INTEGER NOT NULL CHECK (protocol_version = 1),
     payload_version INTEGER NOT NULL CHECK (payload_version = 1),
     sender_connection_epoch TEXT NOT NULL CHECK (length(sender_connection_epoch) > 0),
     sender_sequence INTEGER NOT NULL CHECK (sender_sequence >= 0),

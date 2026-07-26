@@ -142,7 +142,7 @@ describe("RelayOuterEnvelope", () => {
     },
     relayPeerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000003"),
     relayMessageId: Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000004"),
-    protocolVersion: 3,
+    protocolVersion: PeerSyncEnvelope.relayProtocolVersion,
     payloadVersion: 1,
     senderReplicaIncarnation: Identity.ReplicaIncarnation.make(2),
     senderConnectionEpoch: "epoch-7",
@@ -194,7 +194,7 @@ describe("RelayOuterEnvelope", () => {
         yield* PeerSyncEnvelope.encodeRelayOuterEnvelope(recipientReplay)
       )
       const digest = yield* PeerSyncEnvelope.digestRelayOuterEnvelope(base)
-      assert.strictEqual(digest, "bf6947413c2a682c4a99718e168954df367d445fdbb5524050df97f39cfe1db0")
+      assert.strictEqual(digest, "126090efed19a37f5b4844c5964fcaa35cd0dea5a352c73f0477a6b843caee1e")
       assert.strictEqual(
         yield* PeerSyncEnvelope.digestRelayOuterEnvelope(relayAdmission),
         digest

@@ -43,8 +43,8 @@ export interface Entry extends Endpoint {
   readonly writerGeneration: Identity.WriterGeneration
   readonly relayMessageId: Identity.RelayMessageId
   readonly outerEnvelopeDigest: string
-  readonly protocolVersion: 3
-  readonly payloadVersion: 1
+  readonly protocolVersion: typeof PeerSyncEnvelope.relayProtocolVersion
+  readonly payloadVersion: typeof PeerSyncEnvelope.syncEnvelopeVersion
   readonly senderConnectionEpoch: string
   readonly senderSequence: number
   readonly document: {
@@ -96,8 +96,8 @@ const Row = Schema.Struct({
   relay_peer_id: Identity.PeerId,
   relay_message_id: Identity.RelayMessageId,
   outer_envelope_digest: RelayDigest,
-  protocol_version: Schema.Literal(3),
-  payload_version: Schema.Literal(1),
+  protocol_version: Schema.Literal(PeerSyncEnvelope.relayProtocolVersion),
+  payload_version: Schema.Literal(PeerSyncEnvelope.syncEnvelopeVersion),
   sender_connection_epoch: Schema.String,
   sender_sequence: NonNegativeInt,
   document_id: Identity.DocumentId,
@@ -308,7 +308,8 @@ const make = Effect.gen(function*() {
         ${request.replicaId}, ${request.replicaIncarnation}, ${request.writerGeneration},
         ${request.expectedLocalTenantId}, ${request.expectedLocalSubjectId}, ${request.expectedLocalPeerId},
         ${request.remoteTenantId}, ${request.remoteSubjectId}, ${request.remotePeerId}, ${request.relayPeerId},
-        ${request.relayMessageId}, ${request.outerEnvelopeDigest}, 3, 1,
+        ${request.relayMessageId}, ${request.outerEnvelopeDigest},
+        ${PeerSyncEnvelope.relayProtocolVersion}, ${PeerSyncEnvelope.syncEnvelopeVersion},
         ${request.senderConnectionEpoch}, ${request.senderSequence}, ${request.documentId},
         ${request.documentType}, ${request.writerProvenance}, ${request.messageHash},
         ${request.payload}, ${request.encodedSize}, ${request.createdAt}, ${request.retryDeadline},
@@ -583,7 +584,7 @@ const make = Effect.gen(function*() {
         remote: endpoint.remote,
         relayPeerId: endpoint.relayPeerId,
         relayMessageId,
-        protocolVersion: 3,
+        protocolVersion: PeerSyncEnvelope.relayProtocolVersion,
         payloadVersion: PeerSyncEnvelope.syncEnvelopeVersion,
         senderReplicaIncarnation: permit.incarnation,
         senderConnectionEpoch: syncEnvelope.connectionEpoch,
@@ -703,8 +704,8 @@ const make = Effect.gen(function*() {
           relayPeerId: endpoint.relayPeerId,
           relayMessageId,
           outerEnvelopeDigest,
-          protocolVersion: 3 as const,
-          payloadVersion: 1 as const,
+          protocolVersion: PeerSyncEnvelope.relayProtocolVersion as typeof PeerSyncEnvelope.relayProtocolVersion,
+          payloadVersion: PeerSyncEnvelope.syncEnvelopeVersion as typeof PeerSyncEnvelope.syncEnvelopeVersion,
           senderConnectionEpoch: syncEnvelope.connectionEpoch,
           senderSequence: syncEnvelope.sequence,
           document: PeerSyncEnvelope.syncEnvelopeDocument(syncEnvelope),

@@ -38,11 +38,8 @@ Effect Local does not ship a backend or a server transport. An application suppl
 identity, authentication, authorization, encryption, and routing. The test package supplies a bounded duplex
 transport with deterministic drop, delay, duplicate, reorder, partition, and reconnect behavior.
 
-Direct Effect RPC uses protocol version `2` and remains a live exchange while both peers participate. Its application
-owned listener, protocol, serializer, and `PeerRpcServer.layerHandlers` composition remain unchanged.
-
-Optional store and forward uses protocol version `3` on a distinct bounded listener. The sender first writes a stable
-envelope to its local SQL outbox. Relay acceptance means that the single SQLite relay authority committed custody.
+Effect RPC uses one durable protocol at version `1`. The sender first writes a stable envelope to its local SQLite
+outbox. Relay acceptance means that the configured backend SQL store committed custody.
 The relay then delivers the oldest eligible message for one exact directed channel when the recipient reconnects.
 The recipient acknowledges only after its production sync workflow and sender scoped receipt commit. Lost
 acknowledgements and expired claims can duplicate delivery, so the guarantee is at least once.
@@ -67,13 +64,12 @@ revocation admitted first prevents SQL mutation or payload emission. An operatio
 returns its real result. Revocation drains that in flight operation and prevents later work. SQLite and the external
 policy authority do not share an atomic transaction.
 
-Direct version `2` retains the preexisting authorized peer allocation risk because it has no separate unsafe grant.
-Applications must resource trust the Automerge bytes produced by direct peers. A future allocation bounded Automerge
-decode API should remove the relay unsafe grant.
+The durable protocol requires the separate unsafe grant. A future allocation bounded Automerge decode API should
+remove that grant.
 
-The relay is a single SQLite custody authority per shard. It does not provide quorum replication, automatic failover,
-cross region routing, or peer discovery. See [Store and forward](store-and-forward.md) for the exact contract and
-composition.
+Relay custody uses the injected `PeerRelayStore`. `SqlPeerRelayStore.layer` supports SQLite, PostgreSQL, and MySQL
+through a generic `SqlClient`. It does not add cross region routing or peer discovery. See
+[Store and forward](store-and-forward.md) for the exact contract and composition.
 
 Automerge provides merge infrastructure, not collaboration UX. The public snapshot exposes the decoded value and head
 frontier. History traversal, conflict inspection, review, sharing, and conflict resolution interfaces remain

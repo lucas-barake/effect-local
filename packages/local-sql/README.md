@@ -2,8 +2,9 @@
 
 SQLite persistence, Automerge history, Effect Cluster command execution, and Effect Workflow operations for Effect Local.
 
-Optional relay support adds the stable sender outbox, sender scoped recipient receipts, quota usage, maintenance, and
-restore fencing used by store and forward. Direct SQL composition remains unchanged.
+Durable relay support adds the stable sender outbox, sender scoped recipient receipts, quota usage, maintenance, and
+restore fencing used by store and forward. These frontend and replica stores remain SQLite. The backend relay custody
+store is supplied separately by `@lucas-barake/effect-local-rpc`.
 Relay infrastructure keeps Automerge bytes opaque. Relay enabled `PeerSync` owns the one semantic decode and its
 existing change, dependency, and operation limits.
 Relay SQLite commits are not atomic with an external policy authority. The RPC server local gate decides whether

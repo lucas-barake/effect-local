@@ -91,22 +91,10 @@ describe("public API types", () => {
     assert.isDefined(descriptor)
   })
 
-  it("adds acknowledged relay delivery without changing the direct transport shape", () => {
+  it("requires acknowledged durable relay delivery", () => {
     const peerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000002")
     const relayMessageId = Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000003")
     const relayPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000004")
-    const directConnection = {
-      peerId,
-      capabilities: { storeAndForward: false },
-      receive: Stream.empty,
-      send: () => Effect.void,
-      close: Effect.void
-    } satisfies PeerTransport.Connection
-    const directConnectionApi: PeerTransport.Connection = directConnection
-    const directTransport = PeerTransport.PeerTransport.of({
-      capabilities: { storeAndForward: false },
-      connect: () => Effect.succeed(directConnection)
-    })
     const identity: PeerTransport.RelayDeliveryIdentity = {
       relayMessageId,
       relayPeerId: peerId,
@@ -124,31 +112,33 @@ describe("public API types", () => {
       acknowledge: Effect.void,
       reject: (_reason) => Effect.void
     }
-    const relayConnection = {
-      ...directConnection,
+    const connection = {
+      peerId,
       relayPeerId,
-      capabilities: { storeAndForward: true },
-      receiveWithAcknowledgement: Stream.make(delivery)
+      capabilities: {},
+      receive: Stream.make(delivery),
+      send: () => Effect.void,
+      close: Effect.void
     } satisfies PeerTransport.Connection
-    const optionalAcknowledgedReceive: Equal<
-      PeerTransport.Connection["receiveWithAcknowledgement"],
-      Stream.Stream<PeerTransport.AcknowledgedDelivery, ReplicaError.ReplicaError> | undefined
+    const acknowledgedReceive: Equal<
+      PeerTransport.Connection["receive"],
+      Stream.Stream<PeerTransport.AcknowledgedDelivery, ReplicaError.ReplicaError>
     > = true
-    const optionalRelayPeerId: Equal<
+    const requiredRelayPeerId: Equal<
       PeerTransport.Connection["relayPeerId"],
-      Identity.PeerId | undefined
+      Identity.PeerId
     > = true
+    const transport = PeerTransport.PeerTransport.of({
+      capabilities: {},
+      connect: () => Effect.succeed(connection)
+    })
     const protocolRejection = delivery.reject("ProtocolInvalid")
     const applicationRejection = delivery.reject("ApplicationRejected")
-    assert.isDefined(directTransport)
-    assert.isUndefined(directConnectionApi.relayPeerId)
-    assert.isUndefined(directConnectionApi.receiveWithAcknowledgement)
-    assert.strictEqual(relayConnection.relayPeerId, relayPeerId)
-    assert.isDefined(relayConnection.receiveWithAcknowledgement)
-    assert.isTrue(optionalAcknowledgedReceive)
-    assert.isTrue(optionalRelayPeerId)
-    assert.isFalse(directConnection.capabilities.storeAndForward)
-    assert.isTrue(relayConnection.capabilities.storeAndForward)
+    assert.isDefined(transport)
+    assert.strictEqual(connection.relayPeerId, relayPeerId)
+    assert.isDefined(connection.receive)
+    assert.isTrue(acknowledgedReceive)
+    assert.isTrue(requiredRelayPeerId)
     assert.isDefined(protocolRejection)
     assert.isDefined(applicationRejection)
   })

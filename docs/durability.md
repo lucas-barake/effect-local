@@ -141,7 +141,7 @@ Store and forward adds three different durable boundaries.
 
 1. Sender admission commits a stable relay message identity and complete outer envelope to the local relay outbox
    before a network attempt.
-2. `PushRelay` succeeds only after the relay SQLite authority commits the envelope and immutable quota reservation.
+2. `Push` succeeds only after the backend relay store commits the envelope and immutable quota reservation.
 3. `AcknowledgeRelay` is attempted only after the recipient commits the Automerge application result and sender
    scoped replay receipt through the production sync path.
 

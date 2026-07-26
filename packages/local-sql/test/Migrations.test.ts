@@ -493,7 +493,7 @@ describe("Migrations", () => {
           'rep_00000000-0000-4000-8000-000000000011', 0, ${writerGeneration},
           'tenant-1', 'subject-local', 'peer-local',
           'tenant-1', 'subject-remote', 'peer-remote', 'peer-relay',
-          ${relayMessageId}, ${"d".repeat(64)}, 3, 1,
+          ${relayMessageId}, ${"d".repeat(64)}, 1, 1,
           'epoch-outbound', ${senderSequence},
           'doc_00000000-0000-4000-8000-000000000001', 'Task',
           '[]', ${"e".repeat(64)}, ${payload}, ${payload.byteLength},

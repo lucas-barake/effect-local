@@ -13,8 +13,9 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import * as PeerRpcObservability from "../src/internal/peerRpcObservability.js"
 import * as PeerRelayLimits from "../src/PeerRelayLimits.js"
-import * as PeerRelayRpc from "../src/PeerRelayRpc.js"
 import * as PeerRelayStore from "../src/PeerRelayStore.js"
+import * as PeerRpc from "../src/PeerRpc.js"
+import * as SqlPeerRelayStore from "../src/SqlPeerRelayStore.js"
 
 const peer = (value: string) => Identity.PeerId.make(`peer_00000000-0000-4000-8000-${value}`)
 const relayId = (value: string) => Identity.RelayMessageId.make(`rly_00000000-0000-4000-8000-${value}`)
@@ -29,7 +30,7 @@ const makeLayer = (
     NodeCrypto.layer,
     PeerRelayLimits.layer(limits)
   )
-  const store = PeerRelayStore.layerSqlite.pipe(Layer.provide(base))
+  const store = SqlPeerRelayStore.layer.pipe(Layer.provide(base))
   return Layer.merge(base, store)
 }
 
@@ -55,7 +56,7 @@ const withStore = <A, E,>(
 
 describe("PeerRelayStore", () => {
   it.effect("records fixed relay outcomes, acknowledgement latency, and exact pending gauges", () => {
-    const registry: Metric.MetricRegistry = new Map()
+    const registry = new Map()
     const limits = PeerRelayLimits.Values.make({
       ...PeerRelayLimits.defaults,
       maxActiveMessagesPerSenderPeer: 1,
@@ -86,7 +87,7 @@ describe("PeerRelayStore", () => {
           senderSequence: 0,
           payloadVersion: 1,
           messageHash: "message-hash-observe",
-          outerEnvelopeDigest: PeerRelayRpc.RelayDigest.make("5".repeat(64)),
+          outerEnvelopeDigest: PeerRpc.RelayDigest.make("5".repeat(64)),
           payload: new Uint8Array([5]),
           messageTtlMillis: PeerRelayLimits.defaults.messageTtlMillis,
           senderRetryHorizonMillis: PeerRelayLimits.defaults.maximumSenderRetryHorizonMillis,
@@ -128,7 +129,7 @@ describe("PeerRelayStore", () => {
         const rejected = yield* store.admit(PeerRelayStore.Admission.make({
           ...admission,
           relayMessageId: relayId("000000000054"),
-          outerEnvelopeDigest: PeerRelayRpc.RelayDigest.make("4".repeat(64))
+          outerEnvelopeDigest: PeerRpc.RelayDigest.make("4".repeat(64))
         })).pipe(Effect.exit)
         assert.strictEqual(Exit.isFailure(rejected), true)
         assert.strictEqual(
@@ -182,84 +183,6 @@ describe("PeerRelayStore", () => {
     ).pipe(Effect.provideService(Metric.MetricRegistry, registry))
   })
 
-  it.effect("upgrades the exact version 3 claim index and backfills recipient routes", () =>
-    Effect.gen(function*() {
-      const filename = join(tmpdir(), `effect-local-relay-${globalThis.crypto.randomUUID()}.sqlite`)
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          rmSync(filename, { force: true })
-          rmSync(`${filename}-shm`, { force: true })
-          rmSync(`${filename}-wal`, { force: true })
-        })
-      )
-      const channel = PeerRelayStore.ChannelKey.make({
-        tenantId: "tenant-upgrade",
-        senderSubjectId: "sender-upgrade",
-        senderPeerId: peer("000000000091"),
-        senderReplicaIncarnation: Identity.ReplicaIncarnation.make(1),
-        recipientSubjectId: "recipient-upgrade",
-        recipientPeerId: peer("000000000092")
-      })
-      yield* Effect.scoped(
-        Effect.gen(function*() {
-          const store = yield* PeerRelayStore.PeerRelayStore
-          const sql = yield* SqlClient.SqlClient
-          yield* store.admit(PeerRelayStore.Admission.make({
-            channel,
-            relayMessageId: relayId("000000000091"),
-            relayPeerId: peer("000000000093"),
-            documentIds: [documentId("000000000091")],
-            senderConnectionEpoch: "epoch-upgrade",
-            senderSequence: 0,
-            payloadVersion: 1,
-            messageHash: "message-hash-upgrade",
-            outerEnvelopeDigest: PeerRelayRpc.RelayDigest.make("9".repeat(64)),
-            payload: new Uint8Array([9]),
-            messageTtlMillis: PeerRelayLimits.defaults.messageTtlMillis,
-            senderRetryHorizonMillis: PeerRelayLimits.defaults.maximumSenderRetryHorizonMillis,
-            minimumTerminalRetentionMillis: PeerRelayLimits.defaults.minimumTerminalRetentionMillis
-          }))
-          yield* sql`DROP INDEX effect_local_relay_messages_claim_admission`
-          yield* sql`ALTER TABLE effect_local_relay_messages DROP COLUMN recipient_peer_id`
-          yield* sql`ALTER TABLE effect_local_relay_messages DROP COLUMN recipient_subject_id`
-          yield* sql`CREATE INDEX effect_local_relay_messages_claim_admission
-            ON effect_local_relay_messages(
-              tenant_id,
-              sender_subject_id,
-              sender_peer_id,
-              created_at,
-              message_id
-            )
-            WHERE state = 'Pending' AND payload IS NOT NULL`
-          yield* sql`DELETE FROM effect_local_relay_migration_catalog WHERE migration_id = 4`
-          yield* sql`DELETE FROM effect_local_relay_migrations WHERE migration_id = 4`
-        }).pipe(Effect.provide(makeLayer(filename)))
-      )
-      yield* Effect.scoped(
-        Effect.gen(function*() {
-          const sql = yield* SqlClient.SqlClient
-          const routes = yield* sql<{
-            readonly recipientSubjectId: string
-            readonly recipientPeerId: string
-          }>`SELECT
-              recipient_subject_id AS recipientSubjectId,
-              recipient_peer_id AS recipientPeerId
-            FROM effect_local_relay_messages`
-          assert.deepStrictEqual(routes, [{
-            recipientSubjectId: channel.recipientSubjectId,
-            recipientPeerId: channel.recipientPeerId
-          }])
-          const catalog = yield* sql<{ readonly count: number }>`
-            SELECT COUNT(*) AS count
-            FROM effect_local_relay_migration_catalog
-            WHERE migration_id = 4
-              AND name = 'relay_claim_recipient_route'
-          `
-          assert.strictEqual(catalog[0]?.count, 1)
-        }).pipe(Effect.provide(makeLayer(filename)))
-      )
-    }))
-
   it.effect("migrates a real WAL database and fences claim payload loading and terminal duplicates", () =>
     Effect.gen(function*() {
       const filename = join(tmpdir(), `effect-local-relay-${globalThis.crypto.randomUUID()}.sqlite`)
@@ -292,7 +215,7 @@ describe("PeerRelayStore", () => {
             senderSequence: 0,
             payloadVersion: 1,
             messageHash: "message-hash",
-            outerEnvelopeDigest: PeerRelayRpc.RelayDigest.make("a".repeat(64)),
+            outerEnvelopeDigest: PeerRpc.RelayDigest.make("a".repeat(64)),
             payload,
             messageTtlMillis: PeerRelayLimits.defaults.messageTtlMillis,
             senderRetryHorizonMillis: PeerRelayLimits.defaults.maximumSenderRetryHorizonMillis,
@@ -398,7 +321,7 @@ describe("PeerRelayStore", () => {
           const expiringAdmission = PeerRelayStore.Admission.make({
             ...admission,
             relayMessageId: relayId("000000000002"),
-            outerEnvelopeDigest: PeerRelayRpc.RelayDigest.make("b".repeat(64))
+            outerEnvelopeDigest: PeerRpc.RelayDigest.make("b".repeat(64))
           })
           yield* store.admit(expiringAdmission)
           const expiringClaim = yield* store.claim({
@@ -463,7 +386,7 @@ describe("PeerRelayStore", () => {
           const corruptAdmission = PeerRelayStore.Admission.make({
             ...admission,
             relayMessageId: relayId("000000000003"),
-            outerEnvelopeDigest: PeerRelayRpc.RelayDigest.make("c".repeat(64))
+            outerEnvelopeDigest: PeerRpc.RelayDigest.make("c".repeat(64))
           })
           yield* store.admit(corruptAdmission)
           yield* sql`UPDATE effect_local_relay_messages
@@ -494,7 +417,7 @@ describe("PeerRelayStore", () => {
             ...admission,
             channel: restartedChannel,
             relayMessageId: relayId("000000000004"),
-            outerEnvelopeDigest: PeerRelayRpc.RelayDigest.make("d".repeat(64))
+            outerEnvelopeDigest: PeerRpc.RelayDigest.make("d".repeat(64))
           })
           yield* store.admit(restartedAdmission)
           const discovered = yield* store.claim({
@@ -548,7 +471,7 @@ describe("PeerRelayStore", () => {
             senderSequence: 0,
             payloadVersion: 1,
             messageHash: "message-hash",
-            outerEnvelopeDigest: PeerRelayRpc.RelayDigest.make("e".repeat(64)),
+            outerEnvelopeDigest: PeerRpc.RelayDigest.make("e".repeat(64)),
             payload: new Uint8Array([1]),
             messageTtlMillis: PeerRelayLimits.defaults.messageTtlMillis,
             senderRetryHorizonMillis: PeerRelayLimits.defaults.maximumSenderRetryHorizonMillis,
@@ -633,7 +556,7 @@ describe("PeerRelayStore", () => {
         senderSequence: 0,
         payloadVersion: 1,
         messageHash: "message-hash-orphan",
-        outerEnvelopeDigest: PeerRelayRpc.RelayDigest.make("8".repeat(64)),
+        outerEnvelopeDigest: PeerRpc.RelayDigest.make("8".repeat(64)),
         payload: new Uint8Array([8]),
         messageTtlMillis: PeerRelayLimits.defaults.messageTtlMillis,
         senderRetryHorizonMillis: PeerRelayLimits.defaults.maximumSenderRetryHorizonMillis,
@@ -689,7 +612,7 @@ describe("PeerRelayStore", () => {
         senderSequence: 0,
         payloadVersion: 1,
         messageHash: "message-hash-release-cap",
-        outerEnvelopeDigest: PeerRelayRpc.RelayDigest.make("7".repeat(64)),
+        outerEnvelopeDigest: PeerRpc.RelayDigest.make("7".repeat(64)),
         payload: new Uint8Array([7]),
         messageTtlMillis: limits.messageTtlMillis,
         senderRetryHorizonMillis: limits.maximumSenderRetryHorizonMillis,
@@ -814,7 +737,7 @@ describe("PeerRelayStore", () => {
     }))
 
   it.effect("dead letters an abandoned claim at the delivery attempt cap exactly once", () => {
-    const registry: Metric.MetricRegistry = new Map()
+    const registry = new Map()
     const metricValue = <Input, State,>(metric: Metric.Metric<Input, State>) =>
       Metric.value(metric).pipe(
         Effect.provideService(Metric.CurrentMetricAttributes, {})
@@ -840,7 +763,7 @@ describe("PeerRelayStore", () => {
           senderSequence: 0,
           payloadVersion: 1,
           messageHash: "message-hash-recover-cap",
-          outerEnvelopeDigest: PeerRelayRpc.RelayDigest.make("6".repeat(64)),
+          outerEnvelopeDigest: PeerRpc.RelayDigest.make("6".repeat(64)),
           payload: new Uint8Array([6]),
           messageTtlMillis: PeerRelayLimits.defaults.messageTtlMillis,
           senderRetryHorizonMillis: PeerRelayLimits.defaults.maximumSenderRetryHorizonMillis,
@@ -947,7 +870,7 @@ describe("PeerRelayStore", () => {
         senderSequence: 0,
         payloadVersion: 1,
         messageHash: "message-hash",
-        outerEnvelopeDigest: PeerRelayRpc.RelayDigest.make("f".repeat(64)),
+        outerEnvelopeDigest: PeerRpc.RelayDigest.make("f".repeat(64)),
         payload: new Uint8Array([1]),
         messageTtlMillis: PeerRelayLimits.defaults.messageTtlMillis,
         senderRetryHorizonMillis: PeerRelayLimits.defaults.maximumSenderRetryHorizonMillis,
@@ -1029,7 +952,7 @@ describe("PeerRelayStore", () => {
           senderSequence: index,
           payloadVersion: 1,
           messageHash: `message-hash-${index}`,
-          outerEnvelopeDigest: PeerRelayRpc.RelayDigest.make(String(index).repeat(64)),
+          outerEnvelopeDigest: PeerRpc.RelayDigest.make(String(index).repeat(64)),
           payload: new Uint8Array([index]),
           messageTtlMillis: PeerRelayLimits.defaults.messageTtlMillis,
           senderRetryHorizonMillis: PeerRelayLimits.defaults.maximumSenderRetryHorizonMillis,

@@ -186,7 +186,7 @@ describe("BackupStore", () => {
         ${current.replicaId}, ${current.incarnation}, ${current.writerGeneration},
         'tenant', 'local', ${senderPeerId},
         'tenant', 'remote', ${remotePeerId}, ${senderPeerId}, ${relayMessageId},
-        ${"b".repeat(64)}, 3, 1, 'sender-epoch', 0, ${documentId}, ${Task.name}, '[]',
+        ${"b".repeat(64)}, 1, 1, 'sender-epoch', 0, ${documentId}, ${Task.name}, '[]',
         ${"a".repeat(64)}, ${Uint8Array.of(1)}, 1, '2026-07-25T00:00:00.000Z',
         '2026-08-01T00:00:00.000Z', '2026-07-25T00:00:00.000Z', 'Pending'
       )`

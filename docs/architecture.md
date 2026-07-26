@@ -39,33 +39,31 @@ for reconstructing the session in place.
 4. Workflow journals are durable orchestration records.
 5. Atom values are reactive caches.
 6. Presence and tab sessions are ephemeral.
-7. Optional sender relay outbox rows are temporary durable transfer state.
-8. Optional relay custody rows are temporary durable delivery state owned by one SQLite authority per shard.
+7. Sender relay outbox rows are temporary durable transfer state in frontend SQLite.
+8. Relay custody rows are temporary durable delivery state in the configured backend SQL database.
 
 Cluster and Workflow do not replace Automerge. They serialize local effects, resolve retry ambiguity, and resume
 operations after process loss. Automerge remains responsible for causal history, conflicts, and convergence.
 
 ## Relay topology
 
-The direct RPC deployment and optional store and forward deployment have separate protocols and listeners. Direct
-version `2` continues through the application owned protocol and `PeerRpcServer.layerHandlers`. Relay version `3`
-uses `PeerRelayRpc.Rpcs`, the bounded `PeerRelayIngress` socket protocol, and a distinct socket Layer through
-`PeerRpcServer.layerStoreAndForwardDeployment`.
+Effect RPC uses one durable protocol. Version `1` uses `PeerRpc.Rpcs`, the bounded `PeerRelayIngress` socket
+protocol, `PeerRpcServer.layerHandlers`, and `PeerRpcServer.layerServer`.
 
 ```mermaid
 flowchart LR
   Sender["Sender SQL replica"] --> Outbox["Stable sender relay outbox"]
-  Outbox --> RelayListener["Relay protocol v3 listener"]
-  RelayListener --> Custody["Single authority relay SQLite"]
+  Outbox --> RelayListener["Relay protocol v1 listener"]
+  RelayListener --> Custody["Injected backend SQL custody"]
   Custody --> RecipientListener["Recipient relay session"]
   RecipientListener --> Receipt["Recipient SQL sync and receipt"]
   Receipt --> Ack["Fenced relay acknowledgement"]
   Ack --> Custody
 ```
 
-One relay SQLite database is authoritative for one shard. The application must route every custody write and claim
-for that shard to one process and one durable volume. This topology does not include leader election, quorum
-replication, automatic failover, shard rebalance, network file system sharing, or split brain recovery.
+The application must route every custody write and claim for one shard to the same logical SQL database. The supplied
+`SqlClient` may target SQLite, PostgreSQL, or MySQL. This topology does not itself add leader election, quorum
+replication, automatic failover, shard rebalance, or split brain recovery beyond the selected database.
 
 Relay ordering is FIFO within one exact directed peer channel. Distinct channels can progress concurrently. Claims
 are finite fences. A stale claim may duplicate delivery, but its old token cannot retire a newer claim. See

@@ -6,9 +6,6 @@
       "entry": ["test/crash-durability/childProcess.ts"],
       "ignoreDependencies": ["tsx"]
     },
-    "packages/local-rpc": {
-      "ignore": ["bench/PeerRpcServerPerformance.bench.ts", "bench/vitest.admission.config.ts"]
-    },
     "packages/local-browser": {
       "entry": [
         "test-browser/*/src/*.{ts,tsx}",

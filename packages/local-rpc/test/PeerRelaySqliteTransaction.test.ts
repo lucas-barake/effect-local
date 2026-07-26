@@ -8,7 +8,7 @@ import * as Scope from "effect/Scope"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlConnection from "effect/unstable/sql/SqlConnection"
 import * as SqlError from "effect/unstable/sql/SqlError"
-import { cleanupAcquisition, make } from "../src/internal/peerRelaySqliteTransaction.js"
+import { cleanupAcquisition, makeSqlite as make } from "../src/internal/peerRelaySqlTransaction.js"
 
 describe("peerRelaySqliteTransaction", () => {
   it.effect("preserves interruption together with rollback failure during acquisition", () =>

@@ -32,9 +32,9 @@ describe("TestPeer coverage", () => {
       assert.strictEqual(a.peerId, rightId)
       assert.strictEqual(b.peerId, leftId)
       yield* a.send(bytes(1))
-      assert.deepStrictEqual(Option.getOrThrow(yield* Stream.runHead(b.receive)), bytes(1))
+      assert.deepStrictEqual(Option.getOrThrow(yield* Stream.runHead(b.receive)).message, bytes(1))
       yield* b.send(bytes(2))
-      assert.deepStrictEqual(Option.getOrThrow(yield* Stream.runHead(a.receive)), bytes(2))
+      assert.deepStrictEqual(Option.getOrThrow(yield* Stream.runHead(a.receive)).message, bytes(2))
       yield* a.close
       const error = yield* Effect.flip(a.send(bytes(3)))
       assert.strictEqual(error._tag, "ReplicaError")

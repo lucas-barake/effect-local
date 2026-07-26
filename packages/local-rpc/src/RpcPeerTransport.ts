@@ -19,7 +19,6 @@ import * as Sink from "effect/Sink"
 import * as Stream from "effect/Stream"
 import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
 import * as PeerRpcObservability from "./internal/peerRpcObservability.js"
-import * as PeerRelayRpc from "./PeerRelayRpc.js"
 import * as PeerRpc from "./PeerRpc.js"
 import type * as PeerRpcError from "./PeerRpcError.js"
 
@@ -108,177 +107,7 @@ const adapterAcknowledgeResult = (
   }
 }
 
-export const layer = (
-  client: PeerRpc.RpcClient,
-  options: {
-    readonly documents: ReadonlyArray<PeerSession.SelectedDocument>
-    readonly definition: ReplicaDefinition.Any
-  }
-) =>
-  Layer.succeed(PeerTransport.PeerTransport, {
-    // The connection level value below is whatever the server advertised in its `Opened` frame.
-    // This one describes the local adapter, which compares lineage on every inbound message it
-    // hands to `PeerSession`, so it is true for the same reason the server side is.
-    capabilities: { storeAndForward: false, lineageAware: true },
-    connect: (connectOptions) =>
-      PeerRpcObservability.observe({
-        effect: Effect.gen(function*() {
-          yield* validateDocuments(options.documents, options.definition)
-          const parentScope = yield* Scope.Scope
-          return yield* Effect.uninterruptibleMask((restore) =>
-            Effect.gen(function*() {
-              const lifetimeScope = yield* Scope.fork(parentScope, "sequential")
-              const connectionScope = yield* Scope.make("parallel")
-              const stateLock = yield* Semaphore.make(1)
-              const closeCompleted = yield* Deferred.make<void>()
-              // Effect.interrupt is required. A trigger that succeeds ends the stream normally,
-              // and PeerSession reports a normally ended receive stream as a retryable StorageUnavailable.
-              const interruptOnClose = Deferred.await(closeCompleted).pipe(Effect.andThen(Effect.interrupt))
-              let closing = false
-              const closeConnection = (exit: Exit.Exit<unknown, unknown>) =>
-                Effect.sync(() => {
-                  if (closing) return false
-                  closing = true
-                  return true
-                }).pipe(
-                  stateLock.withPermit,
-                  Effect.flatMap((owner) =>
-                    owner
-                      ? Scope.close(connectionScope, exit).pipe(
-                        Effect.ensuring(Deferred.succeed(closeCompleted, undefined))
-                      )
-                      : Deferred.await(closeCompleted)
-                  ),
-                  Effect.uninterruptible
-                )
-              const closeWithExit = (exit: Exit.Exit<unknown, unknown>) =>
-                closeConnection(exit).pipe(
-                  Effect.ensuring(Scope.close(lifetimeScope, exit))
-                )
-              yield* Scope.addFinalizerExit(lifetimeScope, closeConnection)
-              return yield* restore(Effect.gen(function*() {
-                const openCompleted = yield* Deferred.make<
-                  Exit.Exit<
-                    readonly [
-                      ReadonlyArray<PeerRpc.OpenEvent>,
-                      Stream.Stream<PeerRpc.OpenEvent, ReplicaError.ReplicaError>
-                    ],
-                    ReplicaError.ReplicaError
-                  >
-                >()
-                const openRequest = client.Open({
-                  protocolVersion: PeerRpc.protocolVersion,
-                  expectedPeerId: connectOptions.peerId,
-                  definitionHash: options.definition.hash,
-                  // Truthful for the same reason the adapter level `capabilities` above is: this
-                  // build compares lineage on every inbound message before it hands one to
-                  // `PeerSession`. The server has no other way to tell this build from an older one
-                  // on the same protocol version, and without the claim it refuses to emit any
-                  // rewritten document toward this replica.
-                  capabilities: { lineageAware: true },
-                  documents: options.documents.map((entry) => ({
-                    documentType: entry.document.name,
-                    documentId: entry.documentId
-                  }))
-                }, { streamBufferSize: 1 }).pipe(
-                  Stream.mapError(mapError),
-                  Stream.peel(Sink.take<PeerRpc.OpenEvent>(1)),
-                  Effect.provideService(Scope.Scope, connectionScope),
-                  Effect.onExit((exit) => Deferred.succeed(openCompleted, exit).pipe(Effect.asVoid))
-                )
-                const openFiber = yield* stateLock.withPermit(
-                  Effect.suspend(() =>
-                    closing
-                      ? Effect.fail(unavailable())
-                      : Effect.forkIn(openRequest, connectionScope)
-                  )
-                )
-                const [first, remainder] = yield* Deferred.await(openCompleted).pipe(
-                  Effect.onInterrupt(() => Fiber.interrupt(openFiber)),
-                  Effect.flatten
-                )
-                const handshake = first[0]
-                if (handshake === undefined || handshake._tag !== "Opened") {
-                  return yield* protocolFailure(handshake?._tag ?? "Open stream ended before handshake")
-                }
-                if (handshake.peerId !== connectOptions.peerId) {
-                  return yield* new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.ProtocolMismatch({
-                      expected: connectOptions.peerId,
-                      observed: handshake.peerId
-                    })
-                  })
-                }
-                yield* stateLock.withPermit(
-                  Effect.suspend(() => closing ? Effect.fail(unavailable()) : Effect.void)
-                )
-                const sendLock = yield* Semaphore.make(1)
-                const send = (message: Uint8Array) =>
-                  PeerRpcObservability.observe({
-                    effect: Effect.uninterruptibleMask((restoreSend) =>
-                      stateLock.withPermit(Effect.gen(function*() {
-                        if (closing) return yield* unavailable()
-                        const completed = yield* Deferred.make<Exit.Exit<void, ReplicaError.ReplicaError>>()
-                        const fiber = yield* client.Push({ sessionId: handshake.sessionId, payload: message }).pipe(
-                          Effect.mapError(mapError),
-                          sendLock.withPermit,
-                          Effect.onExit((exit) => Deferred.succeed(completed, exit).pipe(Effect.asVoid)),
-                          Effect.forkIn(connectionScope, { startImmediately: true })
-                        )
-                        return [fiber, completed] as const
-                      })).pipe(
-                        Effect.flatMap(([fiber, completed]) =>
-                          Deferred.await(completed).pipe(
-                            restoreSend,
-                            Effect.flatten,
-                            Effect.onInterrupt(() => Fiber.interrupt(fiber))
-                          )
-                        )
-                      )
-                    ),
-                    operation: "AdapterPush",
-                    spanName: "effect_local_rpc.adapter.push",
-                    attributes: { "rpc.payload_bytes": message.byteLength },
-                    result: adapterResult
-                  })
-                return {
-                  peerId: handshake.peerId,
-                  capabilities: handshake.capabilities,
-                  receive: remainder.pipe(
-                    Stream.mapEffect((event) =>
-                      event._tag === "Message"
-                        ? Effect.succeed(event.payload)
-                        : Effect.fail(protocolFailure(event._tag))
-                    ),
-                    Stream.interruptWhen(interruptOnClose)
-                  ),
-                  send,
-                  close: closeWithExit(Exit.void)
-                }
-              })).pipe(Effect.onExitIf(Exit.isFailure, closeWithExit))
-            })
-          )
-        }),
-        operation: "AdapterOpen",
-        spanName: "effect_local_rpc.adapter.open",
-        attributes: { "rpc.selected_documents": options.documents.length },
-        result: adapterResult
-      })
-  })
-
-export const makeSession = (
-  client: PeerRpc.RpcClient,
-  options: {
-    readonly peerId: Identity.PeerId
-    readonly documents: ReadonlyArray<PeerSession.SelectedDocument>
-    readonly definition: ReplicaDefinition.Any
-  }
-) =>
-  PeerSession.makeLive(options).pipe(
-    Effect.provide(layer(client, { documents: options.documents, definition: options.definition }))
-  )
-
-export interface StoreAndForwardOptions {
+export interface Options {
   readonly expectedLocal: PeerSyncEnvelope.RelayPeerPrincipal
   readonly senderReplicaIncarnation: Identity.ReplicaIncarnation
   readonly expectedRelayPeerId: Identity.PeerId
@@ -301,7 +130,7 @@ const samePrincipal = (
   left.subjectId === right.subjectId &&
   left.peerId === right.peerId
 
-const validateRelayOptions = (options: StoreAndForwardOptions) =>
+const validateRelayOptions = (options: Options) =>
   Effect.suspend(() => {
     for (
       const [name, value] of [
@@ -312,7 +141,7 @@ const validateRelayOptions = (options: StoreAndForwardOptions) =>
       if (
         !Number.isSafeInteger(value) ||
         value <= 0 ||
-        value > PeerRelayRpc.maximumNegotiatedDurationMillis
+        value > PeerRpc.maximumNegotiatedDurationMillis
       ) {
         return Effect.fail(protocolFailure(`valid ${name}`))
       }
@@ -324,8 +153,8 @@ const validateRelayOptions = (options: StoreAndForwardOptions) =>
   })
 
 const validateStoredMessage = (
-  event: PeerRelayRpc.StoredMessage,
-  options: StoreAndForwardOptions,
+  event: PeerRpc.StoredMessage,
+  options: Options,
   crypto: Crypto.Crypto,
   limits: ReplicaLimits.Values
 ) =>
@@ -361,7 +190,7 @@ const validateStoredMessage = (
       remote: expectedRecipient,
       relayPeerId: event.relayPeerId,
       relayMessageId: event.relayMessageId,
-      protocolVersion: PeerRelayRpc.protocolVersion,
+      protocolVersion: PeerRpc.protocolVersion,
       payloadVersion: event.payloadVersion,
       senderReplicaIncarnation: event.sender.replicaIncarnation,
       senderConnectionEpoch: event.sender.connectionEpoch,
@@ -377,9 +206,9 @@ const validateStoredMessage = (
     }
   })
 
-export const layerStoreAndForward = (
-  client: PeerRelayRpc.RpcClient,
-  options: StoreAndForwardOptions
+export const layer = (
+  client: PeerRpc.RpcClient,
+  options: Options
 ) =>
   Layer.effect(
     PeerTransport.PeerTransport,
@@ -398,7 +227,7 @@ export const layerStoreAndForward = (
       } as const
 
       return {
-        capabilities: { storeAndForward: true },
+        capabilities: { lineageAware: true },
         connect: (connectOptions) =>
           PeerRpcObservability.observe({
             effect: Effect.gen(function*() {
@@ -500,17 +329,17 @@ export const layerStoreAndForward = (
                     const openCompleted = yield* Deferred.make<
                       Exit.Exit<
                         readonly [
-                          ReadonlyArray<PeerRelayRpc.OpenRelayEvent>,
+                          ReadonlyArray<PeerRpc.OpenEvent>,
                           Stream.Stream<
-                            PeerRelayRpc.OpenRelayEvent,
+                            PeerRpc.OpenEvent,
                             ReplicaError.ReplicaError
                           >
                         ],
                         ReplicaError.ReplicaError
                       >
                     >()
-                    const openRequest = client.OpenRelay({
-                      version: PeerRelayRpc.protocolVersion,
+                    const openRequest = client.Open({
+                      protocolVersion: PeerRpc.protocolVersion,
                       expectedRelayPeerId: options.expectedRelayPeerId,
                       expectedLocal: options.expectedLocal,
                       senderReplicaIncarnation: options.senderReplicaIncarnation,
@@ -523,7 +352,7 @@ export const layerStoreAndForward = (
                       senderRetryHorizonMillis: advertisedRetryHorizon
                     }, { streamBufferSize: 1 }).pipe(
                       Stream.mapError(mapError),
-                      Stream.peel(Sink.take<PeerRelayRpc.OpenRelayEvent>(1)),
+                      Stream.peel(Sink.take<PeerRpc.OpenEvent>(1)),
                       Effect.provideService(Scope.Scope, connectionScope),
                       Effect.onExit((exit) => Deferred.succeed(openCompleted, exit).pipe(Effect.asVoid))
                     )
@@ -544,10 +373,9 @@ export const layerStoreAndForward = (
                     const handshake = first[0]
                     if (
                       handshake === undefined ||
-                      handshake._tag !== "RelayOpened" ||
-                      handshake.version !== PeerRelayRpc.protocolVersion ||
+                      handshake._tag !== "Opened" ||
+                      handshake.protocolVersion !== PeerRpc.protocolVersion ||
                       handshake.remotePeerId !== options.remote.peerId ||
-                      handshake.capabilities.storeAndForward !== true ||
                       !samePrincipal(handshake.authenticatedLocal, options.expectedLocal)
                     ) {
                       return yield* protocolFailure("valid relay handshake")
@@ -596,7 +424,7 @@ export const layerStoreAndForward = (
                     const pushEntry = (
                       entry: Effect.Success<ReturnType<typeof runtime.admit>>
                     ) =>
-                      client.PushRelay({
+                      client.Push({
                         sessionId: handshake.sessionId,
                         relayMessageId: entry.relayMessageId,
                         payload: entry.payload
@@ -672,7 +500,7 @@ export const layerStoreAndForward = (
                                       receiptRetentionMillis: options.receiptRetentionMillis,
                                       acknowledge: terminalCall(
                                         PeerRpcObservability.observeRelay({
-                                          effect: client.AcknowledgeRelay({
+                                          effect: client.Acknowledge({
                                             sessionId: handshake.sessionId,
                                             relayMessageId: event.relayMessageId,
                                             claimToken: event.claimToken,
@@ -694,7 +522,7 @@ export const layerStoreAndForward = (
                                       reject: (reason: PeerTransport.PermanentRejectReason) =>
                                         terminalCall(
                                           PeerRpcObservability.observeRelay({
-                                            effect: client.RejectRelay({
+                                            effect: client.Reject({
                                               sessionId: handshake.sessionId,
                                               relayMessageId: event.relayMessageId,
                                               claimToken: event.claimToken,
@@ -741,11 +569,8 @@ export const layerStoreAndForward = (
                     return {
                       peerId: handshake.remotePeerId,
                       relayPeerId: options.expectedRelayPeerId,
-                      capabilities: handshake.capabilities,
-                      receive: acknowledged.pipe(
-                        Stream.map((delivery) => delivery.message)
-                      ),
-                      receiveWithAcknowledgement: acknowledged,
+                      capabilities: { lineageAware: true },
+                      receive: acknowledged,
                       send,
                       close: closeWithExit(Exit.void)
                     }
@@ -762,13 +587,13 @@ export const layerStoreAndForward = (
     })
   )
 
-export const makeStoreAndForwardSession = (
-  client: PeerRelayRpc.RpcClient,
-  options: StoreAndForwardOptions
+export const makeSession = (
+  client: PeerRpc.RpcClient,
+  options: Options
 ) =>
   PeerSession.makeLive({
     peerId: options.remote.peerId,
     documents: options.documents
   }).pipe(
-    Effect.provide(layerStoreAndForward(client, options))
+    Effect.provide(layer(client, options))
   )

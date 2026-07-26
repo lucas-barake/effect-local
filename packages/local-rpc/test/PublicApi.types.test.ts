@@ -3,46 +3,46 @@ import * as Schema from "effect/Schema"
 import * as PublicApi from "../src/index.js"
 
 describe("public API", () => {
-  it("exports the version 3 relay protocol without widening version 2", () => {
+  it("exports the durable protocol as version 1", () => {
     for (
       const name of [
         "PeerRelayAuthorization",
         "PeerRelayIngress",
         "PeerRelayLimits",
-        "PeerRelayRpc",
-        "PeerRelayStore"
+        "PeerRpc",
+        "PeerRelayStore",
+        "PeerRpcServer",
+        "SqlPeerRelayStore"
       ]
     ) {
       assert.property(PublicApi, name)
     }
 
-    const decoded = Schema.decodeUnknownSync(PublicApi.PeerRelayRpc.RelayOpened)({
-      _tag: "RelayOpened",
-      version: 3,
+    for (const name of ["PeerRelayRpc", "PeerAuthorization", "PeerRpcLimits"]) {
+      assert.notProperty(PublicApi, name)
+    }
+
+    const decoded = Schema.decodeUnknownSync(PublicApi.PeerRpc.Opened)({
+      _tag: "Opened",
+      protocolVersion: 1,
       sessionId: "ses_00000000-0000-4000-8000-000000000001",
       remotePeerId: "peer_00000000-0000-4000-8000-000000000002",
       authenticatedLocal: {
         tenantId: "tenant",
         subjectId: "subject",
         peerId: "peer_00000000-0000-4000-8000-000000000001"
-      },
-      capabilities: {
-        storeAndForward: true
       }
     })
 
     assert.deepStrictEqual(decoded, {
-      _tag: "RelayOpened",
-      version: 3,
+      _tag: "Opened",
+      protocolVersion: 1,
       sessionId: "ses_00000000-0000-4000-8000-000000000001",
       remotePeerId: "peer_00000000-0000-4000-8000-000000000002",
       authenticatedLocal: {
         tenantId: "tenant",
         subjectId: "subject",
         peerId: "peer_00000000-0000-4000-8000-000000000001"
-      },
-      capabilities: {
-        storeAndForward: true
       }
     })
   })

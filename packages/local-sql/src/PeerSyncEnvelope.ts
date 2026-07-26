@@ -10,7 +10,7 @@ import * as WriterProvenance from "./internal/writerProvenance.js"
 export const syncEnvelopeVersion = 1
 export const relayOuterEnvelopeVersion = 1
 export const relayOuterEnvelopeDomain = "effect-local/relay-outer-envelope"
-export const relayProtocolVersion = 3
+export const relayProtocolVersion = 1
 export const maximumWriterProvenanceEntries = 1_000
 export const maximumRelayPayloadBytes = 4 * 1_024 * 1_024
 

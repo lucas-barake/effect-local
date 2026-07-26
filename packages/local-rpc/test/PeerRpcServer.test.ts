@@ -1,18 +1,9 @@
-import { assert, describe, it } from "@effect/vitest"
-import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
-import type * as DocumentEntity from "@lucas-barake/effect-local-sql/DocumentEntity"
-import * as PeerSession from "@lucas-barake/effect-local-sql/PeerSession"
-import * as PeerSync from "@lucas-barake/effect-local-sql/PeerSync"
+import { assert, describe, it, vi } from "@effect/vitest"
 import * as PeerSyncEnvelope from "@lucas-barake/effect-local-sql/PeerSyncEnvelope"
-import * as ReplicaGate from "@lucas-barake/effect-local-sql/ReplicaGate"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Document from "@lucas-barake/effect-local/Document"
-import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
-import * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
-import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
-import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
@@ -25,2741 +16,33 @@ import * as Layer from "effect/Layer"
 import * as Metric from "effect/Metric"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
-import * as Redacted from "effect/Redacted"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
-import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
-import * as Tracer from "effect/Tracer"
-import * as Sharding from "effect/unstable/cluster/Sharding"
 import type * as Rpc from "effect/unstable/rpc/Rpc"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
-import * as RpcTest from "effect/unstable/rpc/RpcTest"
 import { createHash, randomBytes } from "node:crypto"
 import * as PeerRpcObservability from "../src/internal/peerRpcObservability.js"
 import * as PeerAuthentication from "../src/PeerAuthentication.js"
-import * as PeerAuthenticator from "../src/PeerAuthenticator.js"
-import * as PeerAuthorization from "../src/PeerAuthorization.js"
-import * as PeerCredentials from "../src/PeerCredentials.js"
 import * as PeerRelayAuthorization from "../src/PeerRelayAuthorization.js"
 import * as PeerRelayIngress from "../src/PeerRelayIngress.js"
 import * as PeerRelayLimits from "../src/PeerRelayLimits.js"
-import * as PeerRelayRpc from "../src/PeerRelayRpc.js"
 import * as PeerRelayStore from "../src/PeerRelayStore.js"
 import * as PeerRpc from "../src/PeerRpc.js"
 import * as PeerRpcError from "../src/PeerRpcError.js"
-import * as PeerRpcLimits from "../src/PeerRpcLimits.js"
 import * as PeerRpcServer from "../src/PeerRpcServer.js"
-import * as RpcPeerTransport from "../src/RpcPeerTransport.js"
 
 const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
 const Note = Document.make("Note", { schema: Schema.Struct({ body: Schema.String }), version: 1 })
 const taskId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
-const noteId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000002")
 const serverPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001")
-const definition = ReplicaDefinition.make({
-  name: "peer-rpc-server-test",
-  documents: DocumentSet.make(Task, Note),
-  mutations: [],
-  projections: [],
-  queries: []
-})
-const definitionHash = definition.hash
 const remotePeerA = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000002")
 const remotePeerB = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000003")
-const missingSessionId = Identity.SessionId.make("ses_00000000-0000-4000-8000-000000000001")
-const permit = {
-  replicaId: Identity.ReplicaId.make("rep_00000000-0000-4000-8000-000000000001"),
-  incarnation: Identity.ReplicaIncarnation.make(1),
-  writerGeneration: Identity.WriterGeneration.make(1)
-}
-const replicaLimits = ReplicaLimits.Values.make({
-  maxBackupBytes: 1_000_000,
-  maxChunkBytes: 64_000,
-  maxArchiveRecords: 1_000,
-  maxJsonDepth: 32,
-  maxSyncMessageBytes: 64_000,
-  maxPeerSendMillis: 1_000,
-  maxSyncChangesPerMessage: 100,
-  maxSyncDependencyEdgesPerMessage: 1_000,
-  maxSyncOperationsPerMessage: 1_000,
-  maxPendingBytesPerDocument: 1_000_000,
-  maxPendingBytesPerPeer: 1_000_000,
-  maxPendingBytesPerReplica: 2_000_000,
-  maxPendingAgeMillis: 60_000,
-  maxPendingChangesPerDocument: 1_000,
-  maxPendingChangesPerPeer: 1_000,
-  maxPendingChangesPerReplica: 2_000,
-  maxPendingDependencyEdgesPerDocument: 10_000,
-  maxPendingDependencyEdgesPerPeer: 10_000,
-  maxPendingDependencyEdgesPerReplica: 20_000,
-  maxSessions: 8,
-  maxStreamsPerSession: 4,
-  maxInFlightPerSession: 1,
-  maxQueuedRpc: 32,
-  maxQueuedPermits: 32,
-  maxActiveRestores: 32,
-  maxRestoresPerSession: 1,
-  maxRestoreMillis: 30_000,
-  maxRestorePullMillis: 10_000,
-  maxRestoreCoalesceMillis: 25,
-  maxRestoreErrorBytes: 4_096
-})
-const maximumWriterProvenance = Array.from(
-  { length: replicaLimits.maxSyncChangesPerMessage },
-  (_, index) => ({
-    changeHash: index.toString(16).padStart(64, "0"),
-    writerSchemaVersion: Number.MAX_SAFE_INTEGER,
-    writerDefinitionHash: "x".repeat(256)
-  })
-)
-const rpcLimits = PeerRpcLimits.Values.make({
-  ...PeerRpcLimits.defaults,
-  openRatePerSecond: 1_000,
-  openBurst: 1_000,
-  pushRatePerSecond: 1_000,
-  pushBurst: 1_000,
-  authenticationRatePerSecond: 1_000,
-  authenticationBurst: 1_000,
-  maximumReauthorizationInterval: 60_000
-})
 const crypto = Crypto.make({
   randomBytes: (size) => randomBytes(size),
   digest: (algorithm, bytes) =>
     Effect.sync(() => new Uint8Array(createHash(algorithm.replace("-", "").toLowerCase()).update(bytes).digest()))
-})
-const SyncEnvelopeJson = Schema.fromJsonString(Schema.toCodecJson(PeerSession.SyncEnvelope))
-const baseOptions = {
-  rpcLimits: {},
-  replicaLimits: {},
-  initialOutbound: null,
-  authorization: undefined,
-  authenticationValidUntil: Number.MAX_SAFE_INTEGER,
-  authorizationValidUntil: Number.MAX_SAFE_INTEGER,
-  blockInbound: false,
-  blockAuthorization: false,
-  failSessionOpen: false,
-  sessionOpenFailure: undefined,
-  manualClock: false
-}
-
-const makeFixture = (options: {
-  readonly rpcLimits: Partial<PeerRpcLimits.Values>
-  readonly replicaLimits: Partial<ReplicaLimits.Values>
-  readonly initialOutbound: PeerSync.Outbound | null
-  readonly authorization:
-    | ((request: {
-      readonly principal: PeerAuthentication.PeerPrincipal
-      readonly documents: ReadonlyArray<PeerRpc.RequestedDocument>
-    }) => Effect.Effect<{
-      readonly documents: ReadonlyArray<PeerSession.SelectedDocument>
-      readonly validUntil: number
-      readonly invalidated: Effect.Effect<void>
-    }, PeerRpcError.AccessDenied | PeerRpcError.ServerUnavailable>)
-    | undefined
-  readonly authenticationValidUntil: number
-  readonly authorizationValidUntil: number
-  readonly blockInbound: boolean
-  readonly blockAuthorization: boolean
-  readonly failSessionOpen: boolean
-  readonly sessionOpenFailure: ReplicaError.Reason | undefined
-  readonly manualClock: boolean
-}) =>
-  Effect.gen(function*() {
-    const configuredReplicaLimits = ReplicaLimits.Values.make({ ...replicaLimits, ...options.replicaLimits })
-    const configuredRpcLimits = PeerRpcLimits.Values.make({ ...rpcLimits, ...options.rpcLimits })
-    const commits = yield* Queue.unbounded<CommitPublisher.CommitEvent>()
-    const generated = yield* Queue.unbounded<Identity.DocumentId>()
-    const generatePeers = yield* Queue.unbounded<{ readonly lineageAware: boolean }>()
-    const received = yield* Queue.unbounded<number>()
-    const receivedPayloads = yield* Queue.unbounded<typeof DocumentEntity.ApplySync.payloadSchema.Type>()
-    const sent = yield* Queue.unbounded<number>()
-    const enqueued = yield* Queue.unbounded<Identity.DocumentId>()
-    const pendingStarted = yield* Queue.unbounded<Identity.PeerId>()
-    const inboundRelease = yield* Deferred.make<void>()
-    const inboundBlocked = yield* Deferred.make<void>()
-    const authenticationInvalidated = yield* Deferred.make<void>()
-    const commitProcessed = yield* Queue.unbounded<void>()
-    const commitFlushStarted = yield* Deferred.make<void>()
-    const commitFlushRelease = yield* Deferred.make<void>()
-    const authorizationInvalidated = yield* Deferred.make<void>()
-    const authorizationRelease = yield* Deferred.make<void>()
-    const authorizationStarted = yield* Queue.unbounded<string>()
-    const authorizationCalls = yield* Ref.make(0)
-    const sessionOpenCalls = yield* Ref.make(0)
-    const subscriptions = yield* Ref.make(0)
-    const publications = yield* Ref.make(0)
-    let activeFibers = 0
-    let credential = "owner"
-    let initialOutbound = options.initialOutbound
-    let failSessionOpen = options.failSessionOpen
-    let reply: PeerSync.Reply | null = null
-    let blockCommitFlush = false
-    let currentTime = 0
-    let currentTimeOnNextRandomBytes: number | undefined
-    const clock = {
-      currentTimeMillisUnsafe: () => currentTime,
-      currentTimeMillis: Effect.sync(() => currentTime),
-      currentTimeNanosUnsafe: () => BigInt(currentTime) * 1_000_000n,
-      currentTimeNanos: Effect.sync(() => BigInt(currentTime) * 1_000_000n),
-      sleep: () => Effect.never
-    } satisfies Clock.Clock
-    const fixtureCrypto = Crypto.make({
-      randomBytes: (size) => {
-        if (currentTimeOnNextRandomBytes !== undefined) {
-          currentTime = currentTimeOnNextRandomBytes
-          currentTimeOnNextRandomBytes = undefined
-        }
-        return randomBytes(size)
-      },
-      digest: crypto.digest
-    })
-    const nextOutbound = yield* Ref.make<PeerSync.Outbound | null>(null)
-    const enqueuedOutbounds = yield* Ref.make(new Map<Identity.PeerId, ReadonlyArray<PeerSync.Outbound>>())
-    const principals = new Map([
-      [
-        "owner",
-        PeerAuthentication.PeerPrincipal.make({ tenantId: "tenant", subjectId: "subject-a", peerId: remotePeerA })
-      ],
-      [
-        "same-subject",
-        PeerAuthentication.PeerPrincipal.make({
-          tenantId: "tenant",
-          subjectId: "subject-a",
-          peerId: remotePeerB
-        })
-      ],
-      [
-        "same-peer",
-        PeerAuthentication.PeerPrincipal.make({
-          tenantId: "tenant",
-          subjectId: "subject-b",
-          peerId: remotePeerA
-        })
-      ],
-      [
-        "foreign",
-        PeerAuthentication.PeerPrincipal.make({
-          tenantId: "tenant",
-          subjectId: "subject-b",
-          peerId: remotePeerB
-        })
-      ],
-      [
-        "other-tenant",
-        PeerAuthentication.PeerPrincipal.make({
-          tenantId: "other",
-          subjectId: "subject-c",
-          peerId: remotePeerB
-        })
-      ],
-      [
-        "third",
-        PeerAuthentication.PeerPrincipal.make({
-          tenantId: "tenant",
-          subjectId: "subject-c",
-          peerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000010")
-        })
-      ]
-    ])
-    const gate = ReplicaGate.ReplicaGate.of({
-      current: Effect.succeed(permit),
-      claiming: Effect.succeed(false),
-      shared: Effect.acquireRelease(Effect.succeed(permit), () => Effect.void),
-      admit: Effect.acquireRelease(Effect.succeed(permit), () => Effect.void),
-      claim: (use) => use(permit),
-      refresh: Effect.succeed(permit),
-      validate: () => Effect.void
-    })
-    const sync = PeerSync.PeerSync.of({
-      withDocumentInvalidation: (_documentId, effect) => effect,
-      invalidateDocument: () => Effect.void,
-      open: (peerId) =>
-        Ref.update(sessionOpenCalls, (count) => count + 1).pipe(
-          Effect.andThen(
-            failSessionOpen
-              ? Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: options.sessionOpenFailure ??
-                    new ReplicaError.StorageUnavailable({ cause: new Error("session startup failed") })
-                })
-              )
-              : Effect.succeed({ peerId, connectionEpoch: "local-epoch", replicaIncarnation: permit.incarnation })
-          )
-        ),
-      reset: () => Effect.void,
-      generate: (_document, documentId, _session, peer) =>
-        Queue.offer(generated, documentId).pipe(
-          // What the server side session read off its own transport connection. This is the value
-          // that decides whether a rewritten document may be emitted toward the connected peer.
-          Effect.andThen(Queue.offer(generatePeers, peer)),
-          Effect.andThen(
-            blockCommitFlush
-              ? Deferred.succeed(commitFlushStarted, undefined).pipe(
-                Effect.andThen(Deferred.await(commitFlushRelease))
-              )
-              : Effect.void
-          ),
-          Effect.andThen(Ref.getAndSet(nextOutbound, null)),
-          Effect.map((outbound) => ({ outbound, observedByPeer: false, dirty: false }))
-        ),
-      receive: () => Effect.die("unexpected direct PeerSync receive"),
-      enqueue: (session, reply) => {
-        const outbound = {
-          ...reply,
-          sendSequence: 0,
-          lineage: Identity.genesisLineage,
-          writerProvenance: maximumWriterProvenance
-        }
-        return Queue.offer(enqueued, reply.documentId).pipe(
-          Effect.andThen(Ref.update(enqueuedOutbounds, (pendingByPeer) => {
-            const next = new Map(pendingByPeer)
-            next.set(session.peerId, [...(next.get(session.peerId) ?? []), outbound])
-            return next
-          })),
-          Effect.as(outbound)
-        )
-      },
-      pending: (session) =>
-        Queue.offer(pendingStarted, session.peerId).pipe(
-          Effect.andThen(Ref.modify(enqueuedOutbounds, (pendingByPeer) => {
-            const next = new Map(pendingByPeer)
-            const pending = next.get(session.peerId) ?? []
-            next.delete(session.peerId)
-            const initial = initialOutbound === null ? [] : [initialOutbound]
-            initialOutbound = null
-            return [[...initial, ...pending], next]
-          }))
-        ),
-      markSent: (_session, sequence) => Queue.offer(sent, sequence).pipe(Effect.as(true))
-    })
-    const publisher = CommitPublisher.CommitPublisher.of({
-      publishPending: Ref.updateAndGet(publications, (count) => count + 1),
-      invalidate: () => Effect.void,
-      subscribe: Ref.update(subscriptions, (count) => count + 1).pipe(
-        Effect.as({
-          watermark: Identity.CommitSequence.make(0),
-          refreshGeneration: 0,
-          events: Stream.fromQueue(commits).pipe(
-            Stream.tap(() => Queue.offer(commitProcessed, undefined))
-          )
-        })
-      )
-    })
-    const applyResult = {
-      reply: null,
-      heads: [],
-      acceptedHeads: [],
-      commitSequence: Identity.CommitSequence.make(1),
-      observedByPeer: true,
-      durableConfirmation: false as const,
-      duplicate: false
-    }
-    const sharding = Sharding.Sharding.of({
-      ...({} as Sharding.Sharding["Service"]),
-      makeClient: () =>
-        Effect.succeed(() =>
-          ({
-            ApplySync: (payload: typeof DocumentEntity.ApplySync.payloadSchema.Type) =>
-              Queue.offer(receivedPayloads, payload).pipe(
-                Effect.andThen(Queue.offer(received, payload.receiveSequence)),
-                Effect.andThen(
-                  options.blockInbound
-                    ? Deferred.succeed(inboundBlocked, undefined).pipe(Effect.andThen(Deferred.await(inboundRelease)))
-                    : Effect.void
-                ),
-                Effect.as({ ...applyResult, reply })
-              )
-          }) as never
-        )
-    })
-    const authorization = PeerAuthorization.PeerAuthorization.of({
-      authorize: options.authorization ?? ((request) =>
-        Ref.update(authorizationCalls, (count) => count + 1).pipe(
-          Effect.andThen(Queue.offer(authorizationStarted, request.principal.subjectId)),
-          Effect.andThen(options.blockAuthorization ? Deferred.await(authorizationRelease) : Effect.void),
-          Effect.as({
-            documents: request.documents.map((requested) => ({
-              document: requested.documentType === Task.name ? Task : Note,
-              documentId: requested.documentId
-            })),
-            validUntil: options.authorizationValidUntil,
-            invalidated: Deferred.await(authorizationInvalidated)
-          })
-        ))
-    })
-    const services = Layer.mergeAll(
-      Layer.succeed(Crypto.Crypto, fixtureCrypto),
-      Layer.succeed(CommitPublisher.CommitPublisher, publisher),
-      Layer.succeed(PeerSync.PeerSync, sync),
-      Layer.succeed(ReplicaGate.ReplicaGate, gate),
-      Layer.succeed(ReplicaLimits.ReplicaLimits, configuredReplicaLimits),
-      Layer.succeed(Sharding.Sharding, sharding),
-      Layer.succeed(PeerRpcLimits.PeerRpcLimits, configuredRpcLimits),
-      Layer.succeed(PeerAuthorization.PeerAuthorization, authorization),
-      options.manualClock ? Layer.succeed(Clock.Clock, clock) : Layer.empty,
-      Layer.succeed(Metric.FiberRuntimeMetrics, {
-        recordFiberStart: () => void (activeFibers += 1),
-        recordFiberEnd: () => void (activeFibers -= 1)
-      })
-    )
-    const handlers = PeerRpcServer.layerHandlers({ tenantId: "tenant", peerId: serverPeerId, definition }).pipe(
-      Layer.provide(services)
-    )
-    const handlerScope = yield* Scope.make()
-    yield* Effect.addFinalizer(() => Scope.close(handlerScope, Exit.void))
-    const handlerContext = yield* Layer.build(handlers).pipe(Effect.provideService(Scope.Scope, handlerScope))
-    const openHandler = handlerContext.mapUnsafe.get(PeerRpc.OpenRpc.key) as Rpc.Handler<"Open">
-    const pushHandler = handlerContext.mapUnsafe.get(PeerRpc.PushRpc.key) as Rpc.Handler<"Push">
-    const directOpenAs = (
-      principal: PeerAuthentication.PeerPrincipal,
-      documents: ReadonlyArray<PeerRpc.RequestedDocument>
-    ) =>
-      (openHandler.handler({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents
-      }, {} as never) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>).pipe(
-        Stream.provideContext(Context.add(
-          openHandler.context,
-          PeerAuthentication.AuthenticatedPeer,
-          {
-            principal,
-            validUntil: options.authenticationValidUntil,
-            invalidated: Deferred.await(authenticationInvalidated)
-          }
-        ))
-      )
-    const directOpen = (documents: ReadonlyArray<PeerRpc.RequestedDocument>) =>
-      directOpenAs(principals.get("owner")!, documents)
-    const directPushAs = (
-      validUntil: number,
-      request: typeof PeerRpc.PushRpc.payloadSchema.Type
-    ) =>
-      (pushHandler.handler(request, {} as never) as Effect.Effect<void, PeerRpcError.PeerRpcError>).pipe(
-        Effect.provideContext(Context.add(
-          pushHandler.context,
-          PeerAuthentication.AuthenticatedPeer,
-          {
-            principal: principals.get("owner")!,
-            validUntil,
-            invalidated: Deferred.await(authenticationInvalidated)
-          }
-        ))
-      )
-    const directPush = (request: typeof PeerRpc.PushRpc.payloadSchema.Type) =>
-      directPushAs(options.authenticationValidUntil, request)
-    const client = yield* RpcTest.makeClient(PeerRpc.Rpcs).pipe(
-      Effect.provide(handlerContext),
-      Effect.provide(PeerAuthentication.layerServer),
-      Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
-        authenticate: (value) => {
-          const credential = Redacted.value(value)
-          const bulk = /^bulk-(\d+)$/.exec(credential)
-          const subject = /^subject-(\d+)$/.exec(credential)
-          const principal = principals.get(credential) ?? (bulk === null && subject === null
-            ? undefined
-            : PeerAuthentication.PeerPrincipal.make({
-              tenantId: "tenant",
-              subjectId: subject === null ? "bulk" : `subject-${subject[1]}`,
-              peerId: Identity.PeerId.make(
-                `peer_00000000-0000-4000-8000-${Number((bulk ?? subject)![1]).toString(16).padStart(12, "0")}`
-              )
-            }))
-          return principal === undefined
-            ? Effect.fail(new PeerRpcError.AuthenticationFailure())
-            : Effect.succeed({
-              principal,
-              validUntil: options.authenticationValidUntil,
-              invalidated: Deferred.await(authenticationInvalidated)
-            })
-        }
-      }),
-      Effect.provide(PeerAuthentication.layerClient),
-      Effect.provideService(PeerCredentials.PeerCredentials, {
-        get: Effect.sync(() => Redacted.make(credential))
-      }),
-      Effect.provideService(PeerRpcLimits.PeerRpcLimits, configuredRpcLimits)
-    )
-    // `capabilities` is omitted unless a test supplies one, which is exactly the payload a client
-    // built before lineage sends. It is spread rather than passed as `undefined` because the field
-    // is `Schema.optionalKey`: absent and explicitly undefined are not the same wire value.
-    const open = (
-      documents: ReadonlyArray<PeerRpc.RequestedDocument>,
-      capabilities?: { readonly lineageAware?: boolean }
-    ) =>
-      Effect.gen(function*() {
-        const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
-        const fiber = yield* Stream.runForEach(
-          client.Open({
-            protocolVersion: PeerRpc.protocolVersion,
-            expectedPeerId: serverPeerId,
-            definitionHash,
-            ...(capabilities === undefined ? {} : { capabilities }),
-            documents
-          }),
-          (event) => Queue.offer(events, event).pipe(Effect.asVoid)
-        ).pipe(Effect.forkChild)
-        const opened = yield* Effect.raceFirst(
-          Queue.take(events),
-          Fiber.join(fiber).pipe(Effect.andThen(Effect.die("Open stream ended before Opened")))
-        )
-        assert.strictEqual(opened._tag, "Opened")
-        return { opened: opened as PeerRpc.Opened, events, fiber }
-      })
-    const encodeMessage = (
-      sequence: number,
-      documentId: Identity.DocumentId,
-      documentType: string,
-      message: Uint8Array
-    ) =>
-      Effect.gen(function*() {
-        const value = yield* Schema.encodeEffect(SyncEnvelopeJson)({
-          connectionEpoch: "remote-epoch",
-          sequence,
-          documentId,
-          documentType,
-          messageHash: yield* Canonical.digest(message).pipe(Effect.provideService(Crypto.Crypto, crypto)),
-          message,
-          writerProvenance: [{
-            changeHash: "a".repeat(64),
-            writerSchemaVersion: 1,
-            writerDefinitionHash: "remote-definition-hash"
-          }]
-        })
-        return new TextEncoder().encode(value)
-      })
-    const encode = (sequence: number, documentId = taskId, documentType = Task.name) =>
-      encodeMessage(sequence, documentId, documentType, Uint8Array.of(sequence + 1))
-    return {
-      client,
-      commits,
-      generated,
-      generatePeers,
-      received,
-      receivedPayloads,
-      sent,
-      enqueued,
-      pendingStarted,
-      inboundRelease,
-      inboundBlocked,
-      authenticationInvalidated,
-      commitProcessed,
-      commitFlushStarted,
-      commitFlushRelease,
-      authorizationInvalidated,
-      authorizationRelease,
-      authorizationStarted,
-      authorizationCalls,
-      sessionOpenCalls,
-      subscriptions,
-      publications,
-      setCredential: (value: string) => Effect.sync(() => void (credential = value)),
-      allowSessionOpen: Effect.sync(() => void (failSessionOpen = false)),
-      setPendingOutbound: (outbound: PeerSync.Outbound) => Effect.sync(() => void (initialOutbound = outbound)),
-      setNextOutbound: (outbound: PeerSync.Outbound) => Ref.set(nextOutbound, outbound),
-      setReply: (value: PeerSync.Reply) => Effect.sync(() => void (reply = value)),
-      setCurrentTime: (value: number) => Effect.sync(() => void (currentTime = value)),
-      setCurrentTimeOnNextRandomBytes: (value: number) =>
-        Effect.sync(() => void (currentTimeOnNextRandomBytes = value)),
-      blockCommitGeneration: Effect.sync(() => void (blockCommitFlush = true)),
-      activeFiberCount: Effect.sync(() => activeFibers),
-      closeServer: Scope.close(handlerScope, Exit.void),
-      open,
-      directOpen,
-      directPush,
-      directPushAs,
-      directOpenAs: (credential: "owner" | "foreign" | "third", documents: ReadonlyArray<PeerRpc.RequestedDocument>) =>
-        directOpenAs(principals.get(credential)!, documents),
-      encode,
-      encodeMessage
-    }
-  })
-
-describe("PeerRpcServer", () => {
-  it.effect("emits Opened before any peer Message", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        initialOutbound: {
-          sendSequence: 0,
-          documentId: taskId,
-          message: Uint8Array.of(1, 2, 3),
-          messageHash: "hash",
-          heads: [],
-          lineage: Identity.genesisLineage,
-          writerProvenance: []
-        }
-      })
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      assert.strictEqual((yield* Queue.take(session.events))._tag, "Message")
-      yield* Fiber.interrupt(session.fiber)
-      assert.strictEqual(yield* Ref.get(fixture.subscriptions), 1)
-    })))
-
-  it.effect("advertises lineage awareness through a real Open handshake and into peer session generation", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture(baseOptions)
-      // Both halves of the handshake through the adapter a real peer actually uses: its `Open`
-      // carries the client's capability advertisement, and it decodes the server's out of `Opened`.
-      const context = yield* Layer.build(RpcPeerTransport.layer(fixture.client, {
-        documents: [{ document: Task, documentId: taskId }],
-        definition
-      }))
-      const connection = yield* Context.get(context, PeerTransport.PeerTransport).connect({
-        replicaId: permit.replicaId,
-        peerId: serverPeerId
-      })
-      // The wire frame, decoded by the real client through the real `Opened` schema. Absent here
-      // would mean every lineage aware peer refuses to emit a rewritten document to this server.
-      assert.deepStrictEqual(connection.capabilities, { storeAndForward: false, lineageAware: true })
-      // The server side session read the CLIENT's advertisement off its own transport connection, so
-      // a rewritten document may be generated toward this peer. `PeerSync.generate` is what turns a
-      // false here into a refusal, which its own suite covers.
-      assert.deepStrictEqual(yield* Queue.take(fixture.generatePeers), { lineageAware: true })
-      yield* connection.close
-    })))
-
-  it.effect("treats an Open that omits the client capability as not lineage aware", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture(baseOptions)
-      // Exactly what a client built before lineage sends. `PeerRpc.protocolVersion` was not bumped
-      // for lineage, so it passes the version check; inferring awareness from that version would
-      // hand it a rewritten document, which it would union and reply with the discarded history.
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      // The server's own claim is unconditional and independent of the client's.
-      assert.deepStrictEqual(session.opened.capabilities, { storeAndForward: false, lineageAware: true })
-      assert.deepStrictEqual(yield* Queue.take(fixture.generatePeers), { lineageAware: false })
-      yield* Fiber.interrupt(session.fiber)
-    })))
-
-  it.effect("reads the advertised flag rather than the presence of the capability object", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture(baseOptions)
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }], {})
-      assert.deepStrictEqual(yield* Queue.take(fixture.generatePeers), { lineageAware: false })
-      yield* Fiber.interrupt(session.fiber)
-    })))
-
-  it.effect("hosts the existing canonical replica through the real PeerSession", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture(baseOptions)
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* fixture.client.Push({ sessionId: session.opened.sessionId, payload: yield* fixture.encode(0) })
-      assert.strictEqual(yield* Queue.take(fixture.received), 0)
-      const payload = yield* Queue.take(fixture.receivedPayloads)
-      assert.strictEqual(payload.connectionEpoch, "remote-epoch")
-      assert.strictEqual(payload.localConnectionEpoch, "local-epoch")
-      assert.deepStrictEqual(payload.writerProvenance, [{
-        changeHash: "a".repeat(64),
-        writerSchemaVersion: 1,
-        writerDefinitionHash: "remote-definition-hash"
-      }])
-      assert.strictEqual(yield* Ref.get(fixture.publications), 1)
-      yield* Fiber.interrupt(session.fiber)
-    })))
-
-  it.effect("serially applies Push messages in accepted order", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture(baseOptions)
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* fixture.client.Push({ sessionId: session.opened.sessionId, payload: yield* fixture.encode(0) })
-      assert.strictEqual(yield* Queue.take(fixture.received), 0)
-      yield* fixture.client.Push({ sessionId: session.opened.sessionId, payload: yield* fixture.encode(1) })
-      assert.strictEqual(yield* Queue.take(fixture.received), 1)
-      yield* Fiber.interrupt(session.fiber)
-    })))
-
-  it.effect("replaces the prior session without letting stale cleanup remove the replacement", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture(baseOptions)
-      const first = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      const replacement = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      const oldExit = yield* Fiber.await(first.fiber)
-      assert.isTrue(Exit.isFailure(oldExit))
-      if (Exit.isFailure(oldExit)) {
-        const streamError = Cause.findErrorOption(oldExit.cause)
-        assert.strictEqual(streamError._tag, "Some")
-        if (streamError._tag === "Some") assert.strictEqual(streamError.value._tag, "SessionUnavailable")
-      }
-      const oldError = yield* fixture.client.Push({
-        sessionId: first.opened.sessionId,
-        payload: Uint8Array.of(1)
-      }).pipe(Effect.flip)
-      assert.instanceOf(oldError, PeerRpcError.SessionUnavailable)
-      yield* Fiber.interrupt(first.fiber)
-      yield* fixture.client.Push({
-        sessionId: replacement.opened.sessionId,
-        payload: yield* fixture.encode(0)
-      })
-      assert.strictEqual(yield* Queue.take(fixture.received), 0)
-      yield* Fiber.interrupt(replacement.fiber)
-    })))
-
-  it.effect("keeps the healthy session alive when a malformed replacement Open fails validation", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture(baseOptions)
-      const first = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      const authorizationCallsBeforeMalformedOpen = yield* Ref.get(fixture.authorizationCalls)
-      const malformedError = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [
-          { documentType: Task.name, documentId: taskId },
-          { documentType: Note.name, documentId: taskId }
-        ]
-      }).pipe(Stream.runDrain, Effect.flip)
-      yield* fixture.client.Push({
-        sessionId: first.opened.sessionId,
-        payload: yield* fixture.encode(0)
-      })
-      assert.strictEqual(yield* Queue.take(fixture.received), 0)
-      assert.instanceOf(malformedError, PeerRpcError.InvalidRequest)
-      assert.strictEqual(yield* Ref.get(fixture.authorizationCalls), authorizationCallsBeforeMalformedOpen)
-      yield* Fiber.interrupt(first.fiber)
-    })))
-
-  it.effect("does not consume Open admission for a cross type duplicate document id", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        manualClock: true,
-        rpcLimits: { openRatePerSecond: Number.MIN_VALUE, openBurst: 1 }
-      })
-      const malformedError = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [
-          { documentType: Task.name, documentId: taskId },
-          { documentType: Note.name, documentId: taskId }
-        ]
-      }).pipe(Stream.runDrain, Effect.flip)
-      assert.instanceOf(malformedError, PeerRpcError.InvalidRequest)
-
-      const valid = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      assert.strictEqual(yield* Ref.get(fixture.authorizationCalls), 1)
-      yield* Fiber.interrupt(valid.fiber)
-    })))
-
-  it.effect("enforces the global session limit", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({ ...baseOptions, replicaLimits: { maxSessions: 1 } })
-      const first = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* fixture.setCredential("foreign")
-      const error = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Note.name, documentId: noteId }]
-      }).pipe(Stream.runDrain, Effect.flip)
-      assert.instanceOf(error, PeerRpcError.SessionOverloaded)
-      yield* Fiber.interrupt(first.fiber)
-    })))
-
-  it.effect("enforces the per subject session limit", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({ ...baseOptions, rpcLimits: { maxSessionsPerSubject: 1 } })
-      const first = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* fixture.setCredential("same-subject")
-      const error = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Note.name, documentId: noteId }]
-      }).pipe(Stream.runDrain, Effect.flip)
-      assert.instanceOf(error, PeerRpcError.SessionOverloaded)
-      yield* Fiber.interrupt(first.fiber)
-    })))
-
-  it.effect("retains touched subjects while evicting the oldest inactive subject", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        rpcLimits: {
-          openRatePerSecond: 1,
-          openBurst: 1,
-          maxRetainedRateLimitedSubjects: 3
-        },
-        authorization: () => Effect.fail(new PeerRpcError.AccessDenied())
-      })
-      const attempt = (subject: number) =>
-        fixture.setCredential(`subject-${subject}`).pipe(
-          Effect.andThen(
-            fixture.client.Open({
-              protocolVersion: PeerRpc.protocolVersion,
-              expectedPeerId: serverPeerId,
-              definitionHash,
-              documents: [{ documentType: Task.name, documentId: taskId }]
-            }).pipe(Stream.runDrain, Effect.flip)
-          )
-        )
-      for (const subject of [1, 2, 3]) {
-        assert.instanceOf(yield* attempt(subject), PeerRpcError.AccessDenied)
-      }
-      assert.instanceOf(yield* attempt(2), PeerRpcError.RequestCapacityExceeded)
-      assert.instanceOf(yield* attempt(4), PeerRpcError.AccessDenied)
-      assert.instanceOf(yield* attempt(1), PeerRpcError.AccessDenied)
-      assert.instanceOf(yield* attempt(2), PeerRpcError.RequestCapacityExceeded)
-      assert.instanceOf(yield* attempt(3), PeerRpcError.AccessDenied)
-    })))
-
-  it.effect("retains an active subject when the subject state bound is full", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        rpcLimits: { maxRetainedRateLimitedSubjects: 1 }
-      })
-      const active = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* fixture.setCredential("foreign")
-      const full = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Note.name, documentId: noteId }]
-      }).pipe(Stream.runDrain, Effect.flip)
-      assert.instanceOf(full, PeerRpcError.RequestCapacityExceeded)
-      yield* Fiber.interrupt(active.fiber)
-      const replacement = yield* fixture.open([{ documentType: Note.name, documentId: noteId }])
-      yield* Fiber.interrupt(replacement.fiber)
-    })))
-
-  for (
-    const [description, elapsed, expected] of [
-      ["retains an exhausted inactive subject just before idle expiry", 999, "RequestCapacityExceeded"],
-      ["refreshes an exhausted inactive subject exactly at idle expiry", 1_000, "AccessDenied"]
-    ] as const
-  ) {
-    it.effect(description, () =>
-      Effect.scoped(Effect.gen(function*() {
-        const fixture = yield* makeFixture({
-          ...baseOptions,
-          rpcLimits: {
-            openRatePerSecond: Number.MIN_VALUE,
-            openBurst: 1,
-            rateLimitIdleRetention: 1_000,
-            maxRetainedRateLimitedSubjects: 8
-          },
-          authorization: () => Effect.fail(new PeerRpcError.AccessDenied())
-        })
-        const attempt = () =>
-          fixture.client.Open({
-            protocolVersion: PeerRpc.protocolVersion,
-            expectedPeerId: serverPeerId,
-            definitionHash,
-            documents: [{ documentType: Task.name, documentId: taskId }]
-          }).pipe(Stream.runDrain, Effect.flip)
-        assert.instanceOf(yield* attempt(), PeerRpcError.AccessDenied)
-        yield* TestClock.adjust(elapsed)
-        assert.strictEqual((yield* attempt())._tag, expected)
-      })))
-  }
-
-  it.effect("serves outbound byte waiters in FIFO order without bypassing a large head", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        rpcLimits: {
-          maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(
-            replicaLimits.maxSyncMessageBytes,
-            replicaLimits.maxSyncChangesPerMessage
-          )
-        },
-        initialOutbound: {
-          sendSequence: 0,
-          documentId: taskId,
-          message: new Uint8Array(48_000),
-          messageHash: "fifo-blocker",
-          heads: [],
-          lineage: Identity.genesisLineage,
-          writerProvenance: maximumWriterProvenance
-        }
-      })
-      const opened = yield* Queue.unbounded<string>()
-      const blockerReady = yield* Deferred.make<void>()
-      const blocker = yield* Effect.scoped(Effect.gen(function*() {
-        const pull = yield* Stream.toPull(fixture.directOpen([{ documentType: Task.name, documentId: taskId }]))
-        assert.strictEqual((yield* pull)[0]._tag, "Opened")
-        assert.strictEqual((yield* pull)[0]._tag, "Message")
-        yield* Deferred.succeed(blockerReady, undefined)
-        return yield* Effect.never
-      })).pipe(Effect.forkChild)
-      yield* Deferred.await(blockerReady)
-      assert.strictEqual(yield* Queue.take(fixture.pendingStarted), remotePeerA)
-      yield* fixture.setPendingOutbound({
-        sendSequence: 0,
-        documentId: noteId,
-        message: new Uint8Array(replicaLimits.maxSyncMessageBytes),
-        messageHash: "fifo-head",
-        heads: [],
-        lineage: Identity.genesisLineage,
-        writerProvenance: maximumWriterProvenance
-      })
-      yield* fixture.setCredential("foreign")
-      const head = yield* Stream.runForEach(
-        fixture.client.Open({
-          protocolVersion: PeerRpc.protocolVersion,
-          expectedPeerId: serverPeerId,
-          definitionHash,
-          documents: [{ documentType: Note.name, documentId: noteId }]
-        }),
-        (event) => event._tag === "Message" ? Queue.offer(opened, "head").pipe(Effect.asVoid) : Effect.void
-      ).pipe(
-        Effect.forkChild
-      )
-      assert.strictEqual(yield* Queue.take(fixture.pendingStarted), remotePeerB)
-      for (let index = 0; index < 5; index++) yield* Effect.yieldNow
-      yield* fixture.setPendingOutbound({
-        sendSequence: 0,
-        documentId: taskId,
-        message: new Uint8Array(48_000),
-        messageHash: "fifo-tail",
-        heads: [],
-        lineage: Identity.genesisLineage,
-        writerProvenance: []
-      })
-      yield* fixture.setCredential("subject-10")
-      const tail = yield* Stream.runForEach(
-        fixture.client.Open({
-          protocolVersion: PeerRpc.protocolVersion,
-          expectedPeerId: serverPeerId,
-          definitionHash,
-          documents: [{ documentType: Task.name, documentId: taskId }]
-        }),
-        (event) => event._tag === "Message" ? Queue.offer(opened, "tail").pipe(Effect.asVoid) : Effect.void
-      ).pipe(
-        Effect.forkChild
-      )
-      yield* Queue.take(fixture.pendingStarted)
-      for (let index = 0; index < 5; index++) yield* Effect.yieldNow
-      assert.strictEqual((yield* Queue.poll(opened))._tag, "None")
-      yield* Fiber.interrupt(blocker)
-      assert.strictEqual(yield* Queue.take(opened), "head")
-      assert.strictEqual(yield* Queue.take(opened), "tail")
-      yield* Fiber.interrupt(head)
-      yield* Fiber.interrupt(tail)
-    })))
-
-  it.effect("advances outbound byte waiters and restores capacity when the head is canceled", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        rpcLimits: {
-          maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(
-            replicaLimits.maxSyncMessageBytes,
-            replicaLimits.maxSyncChangesPerMessage
-          )
-        }
-      })
-      yield* fixture.setPendingOutbound({
-        sendSequence: 0,
-        documentId: taskId,
-        message: new Uint8Array(replicaLimits.maxSyncMessageBytes),
-        messageHash: "cancel-blocker",
-        heads: [],
-        lineage: Identity.genesisLineage,
-        writerProvenance: maximumWriterProvenance
-      })
-      const blockerReady = yield* Deferred.make<void>()
-      const blocker = yield* Effect.scoped(Effect.gen(function*() {
-        const pull = yield* Stream.toPull(fixture.directOpen([{ documentType: Task.name, documentId: taskId }]))
-        yield* pull
-        yield* pull
-        yield* Deferred.succeed(blockerReady, undefined)
-        return yield* Effect.never
-      })).pipe(Effect.forkChild)
-      yield* Deferred.await(blockerReady)
-      assert.strictEqual(yield* Queue.take(fixture.pendingStarted), remotePeerA)
-      yield* fixture.setPendingOutbound({
-        sendSequence: 0,
-        documentId: noteId,
-        message: new Uint8Array(replicaLimits.maxSyncMessageBytes),
-        messageHash: "cancel-head",
-        heads: [],
-        lineage: Identity.genesisLineage,
-        writerProvenance: []
-      })
-      const head = yield* fixture.directOpenAs(
-        "foreign",
-        [{ documentType: Note.name, documentId: noteId }]
-      ).pipe(Stream.runDrain, Effect.forkChild)
-      assert.strictEqual(yield* Queue.take(fixture.pendingStarted), remotePeerB)
-      for (let index = 0; index < 5; index++) yield* Effect.yieldNow
-      yield* fixture.setPendingOutbound({
-        sendSequence: 0,
-        documentId: taskId,
-        message: Uint8Array.of(1),
-        messageHash: "cancel-tail",
-        heads: [],
-        lineage: Identity.genesisLineage,
-        writerProvenance: []
-      })
-      const tailMessage = yield* Deferred.make<void>()
-      const tail = yield* fixture.directOpenAs(
-        "third",
-        [{ documentType: Task.name, documentId: taskId }]
-      ).pipe(
-        Stream.runForEach((event) =>
-          event._tag === "Message" ? Deferred.succeed(tailMessage, undefined).pipe(Effect.asVoid) : Effect.void
-        ),
-        Effect.forkChild
-      )
-      yield* Queue.take(fixture.pendingStarted)
-      for (let index = 0; index < 5; index++) yield* Effect.yieldNow
-      yield* Fiber.interrupt(head)
-      yield* Deferred.await(tailMessage)
-      yield* Fiber.interrupt(tail)
-      yield* Fiber.interrupt(blocker)
-      yield* fixture.setPendingOutbound({
-        sendSequence: 0,
-        documentId: taskId,
-        message: new Uint8Array(replicaLimits.maxSyncMessageBytes),
-        messageHash: "cancel-probe",
-        heads: [],
-        lineage: Identity.genesisLineage,
-        writerProvenance: []
-      })
-      const probeMessage = yield* Deferred.make<void>()
-      const probe = yield* fixture.directOpenAs(
-        "third",
-        [{ documentType: Task.name, documentId: taskId }]
-      ).pipe(
-        Stream.runForEach((event) =>
-          event._tag === "Message" ? Deferred.succeed(probeMessage, undefined).pipe(Effect.asVoid) : Effect.void
-        ),
-        Effect.forkChild
-      )
-      yield* Deferred.await(probeMessage)
-      yield* Fiber.interrupt(probe)
-    })))
-
-  it.effect("bounds outbound byte waiters by the active session limit", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        replicaLimits: { maxSessions: 8 },
-        rpcLimits: {
-          maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(
-            replicaLimits.maxSyncMessageBytes,
-            replicaLimits.maxSyncChangesPerMessage
-          )
-        }
-      })
-      const large = new Uint8Array(replicaLimits.maxSyncMessageBytes)
-      yield* fixture.setPendingOutbound({
-        sendSequence: 0,
-        documentId: taskId,
-        message: large,
-        messageHash: "bounded-blocker",
-        heads: [],
-        lineage: Identity.genesisLineage,
-        writerProvenance: maximumWriterProvenance
-      })
-      const blockerReady = yield* Deferred.make<void>()
-      const blocker = yield* Effect.scoped(Effect.gen(function*() {
-        const pull = yield* Stream.toPull(fixture.directOpen([{ documentType: Task.name, documentId: taskId }]))
-        yield* pull
-        yield* pull
-        yield* Deferred.succeed(blockerReady, undefined)
-        return yield* Effect.never
-      })).pipe(Effect.forkChild)
-      yield* Deferred.await(blockerReady)
-      yield* Queue.take(fixture.pendingStarted)
-      const waiters = []
-      for (let index = 0; index < 7; index++) {
-        yield* fixture.setPendingOutbound({
-          sendSequence: 0,
-          documentId: taskId,
-          message: large,
-          messageHash: `bounded-waiter-${index}`,
-          heads: [],
-          lineage: Identity.genesisLineage,
-          writerProvenance: []
-        })
-        yield* fixture.setCredential(`subject-${index + 10}`)
-        waiters.push(
-          yield* fixture.client.Open({
-            protocolVersion: PeerRpc.protocolVersion,
-            expectedPeerId: serverPeerId,
-            definitionHash,
-            documents: [{ documentType: Task.name, documentId: taskId }]
-          }).pipe(Stream.runDrain, Effect.forkChild)
-        )
-        yield* Queue.take(fixture.pendingStarted)
-        for (let turn = 0; turn < 5; turn++) yield* Effect.yieldNow
-      }
-      yield* fixture.setPendingOutbound({
-        sendSequence: 0,
-        documentId: taskId,
-        message: large,
-        messageHash: "bounded-rejected",
-        heads: [],
-        lineage: Identity.genesisLineage,
-        writerProvenance: []
-      })
-      yield* fixture.setCredential("subject-20")
-      const rejected = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Task.name, documentId: taskId }]
-      }).pipe(Stream.runDrain, Effect.flip)
-      assert.instanceOf(rejected, PeerRpcError.SessionOverloaded)
-      for (const waiter of waiters) {
-        assert.isUndefined(waiter.pollUnsafe())
-        yield* Fiber.interrupt(waiter)
-      }
-      yield* Fiber.interrupt(blocker)
-    })))
-
-  it.effect("bounds global Open setup while authorization is blocked", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        blockAuthorization: true,
-        rpcLimits: { maxInFlightOpen: 1, maxInFlightOpenPerSubject: 2 }
-      })
-      const first = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Task.name, documentId: taskId }]
-      }).pipe(Stream.runDrain, Effect.forkChild)
-      assert.strictEqual(yield* Queue.take(fixture.authorizationStarted), "subject-a")
-      yield* fixture.setCredential("foreign")
-      const error = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Note.name, documentId: noteId }]
-      }).pipe(Stream.runDrain, Effect.flip)
-      assert.instanceOf(error, PeerRpcError.RequestCapacityExceeded)
-      yield* Deferred.succeed(fixture.authorizationRelease, undefined)
-      yield* Fiber.interrupt(first)
-    })))
-
-  it.effect("bounds per subject Open setup while authorization is blocked", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        blockAuthorization: true,
-        rpcLimits: { maxInFlightOpen: 2, maxInFlightOpenPerSubject: 1 }
-      })
-      const first = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Task.name, documentId: taskId }]
-      }).pipe(Stream.runDrain, Effect.forkChild)
-      assert.strictEqual(yield* Queue.take(fixture.authorizationStarted), "subject-a")
-      yield* fixture.setCredential("same-subject")
-      const error = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Note.name, documentId: noteId }]
-      }).pipe(Stream.runDrain, Effect.flip)
-      assert.instanceOf(error, PeerRpcError.RequestCapacityExceeded)
-      yield* Deferred.succeed(fixture.authorizationRelease, undefined)
-      yield* Fiber.interrupt(first)
-    })))
-
-  it.effect("enforces the selected document limit before allocation", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({ ...baseOptions, replicaLimits: { maxStreamsPerSession: 1 } })
-      const error = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [
-          { documentType: Task.name, documentId: taskId },
-          { documentType: Note.name, documentId: noteId }
-        ]
-      }).pipe(Stream.runDrain, Effect.flip)
-      assert.instanceOf(error, PeerRpcError.RequestLimitExceeded)
-      assert.strictEqual(yield* Ref.get(fixture.authorizationCalls), 0)
-    })))
-
-  it.effect("validates Open identity protocol and selection before authorization", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture(baseOptions)
-      const cases = [
-        {
-          request: {
-            protocolVersion: PeerRpc.protocolVersion + 1,
-            expectedPeerId: serverPeerId,
-            definitionHash,
-            documents: [{ documentType: Task.name, documentId: taskId }]
-          },
-          tag: "UnsupportedVersion"
-        },
-        {
-          request: {
-            protocolVersion: PeerRpc.protocolVersion,
-            expectedPeerId: remotePeerA,
-            definitionHash,
-            documents: [{ documentType: Task.name, documentId: taskId }]
-          },
-          tag: "PeerMismatch"
-        },
-        {
-          request: {
-            protocolVersion: PeerRpc.protocolVersion,
-            expectedPeerId: serverPeerId,
-            definitionHash: "def_ffffffffffffffff",
-            documents: [{ documentType: Task.name, documentId: taskId }]
-          },
-          tag: "DefinitionMismatch"
-        },
-        {
-          request: {
-            protocolVersion: PeerRpc.protocolVersion,
-            expectedPeerId: serverPeerId,
-            definitionHash,
-            documents: []
-          },
-          tag: "InvalidRequest"
-        },
-        {
-          request: {
-            protocolVersion: PeerRpc.protocolVersion,
-            expectedPeerId: serverPeerId,
-            definitionHash,
-            documents: [
-              { documentType: Task.name, documentId: taskId },
-              { documentType: Task.name, documentId: taskId }
-            ]
-          },
-          tag: "InvalidRequest"
-        },
-        {
-          request: {
-            protocolVersion: PeerRpc.protocolVersion,
-            expectedPeerId: serverPeerId,
-            definitionHash,
-            documents: [
-              { documentType: Task.name, documentId: taskId },
-              { documentType: Note.name, documentId: taskId }
-            ]
-          },
-          tag: "InvalidRequest"
-        },
-        {
-          request: {
-            protocolVersion: PeerRpc.protocolVersion + 1,
-            expectedPeerId: remotePeerA,
-            definitionHash: "def_ffffffffffffffff",
-            documents: []
-          },
-          tag: "UnsupportedVersion"
-        },
-        {
-          request: {
-            protocolVersion: PeerRpc.protocolVersion,
-            expectedPeerId: remotePeerA,
-            definitionHash: "def_ffffffffffffffff",
-            documents: []
-          },
-          tag: "PeerMismatch"
-        },
-        {
-          request: {
-            protocolVersion: PeerRpc.protocolVersion,
-            expectedPeerId: serverPeerId,
-            definitionHash: "def_ffffffffffffffff",
-            documents: []
-          },
-          tag: "DefinitionMismatch"
-        }
-      ]
-      for (const testCase of cases) {
-        const error = yield* fixture.client.Open(testCase.request).pipe(Stream.runDrain, Effect.flip)
-        assert.strictEqual(error._tag, testCase.tag)
-      }
-      const legacyError = yield* fixture.client.Open({
-        protocolVersion: 1,
-        expectedPeerId: serverPeerId,
-        documents: [{ documentType: Task.name, documentId: taskId }]
-      }).pipe(Stream.runDrain, Effect.flip)
-      assert.instanceOf(legacyError, PeerRpcError.UnsupportedVersion)
-      yield* fixture.setCredential("other-tenant")
-      const tenantError = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Task.name, documentId: taskId }]
-      }).pipe(Stream.runDrain, Effect.flip)
-      assert.instanceOf(tenantError, PeerRpcError.AccessDenied)
-      assert.strictEqual(yield* Ref.get(fixture.authorizationCalls), 0)
-      assert.strictEqual(yield* Ref.get(fixture.sessionOpenCalls), 0)
-    })))
-
-  it.effect("rejects authorized documents that do not belong to the configured definition", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const TaskV2 = Document.make(Task.name, {
-        schema: Schema.Struct({ title: Schema.String }),
-        version: Task.version + 1
-      })
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        authorization: (request) =>
-          Effect.succeed({
-            documents: request.documents.map(({ documentId }) => ({ document: TaskV2, documentId })),
-            validUntil: Number.MAX_SAFE_INTEGER,
-            invalidated: Effect.never
-          })
-      })
-      const exit = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Task.name, documentId: taskId }]
-      }).pipe(Stream.take(1), Stream.runDrain, Effect.exit)
-      assert.isTrue(Exit.isFailure(exit))
-      if (Exit.isFailure(exit)) {
-        const error = Cause.findErrorOption(exit.cause)
-        assert.isTrue(Option.isSome(error) && error.value._tag === "AccessDenied")
-      }
-      assert.strictEqual(yield* Ref.get(fixture.sessionOpenCalls), 0)
-    })))
-
-  it.effect("mediates every direct authorization selection before session allocation", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const cases = [
-        [],
-        [{ document: Task, documentId: taskId }, { document: Note, documentId: noteId }],
-        [{ document: Task, documentId: taskId }, { document: Task, documentId: taskId }],
-        [{ document: Note, documentId: taskId }],
-        [{ document: Task, documentId: noteId }]
-      ]
-      for (const documents of cases) {
-        const fixture = yield* makeFixture({
-          ...baseOptions,
-          authorization: () =>
-            Effect.succeed({
-              documents,
-              validUntil: Number.MAX_SAFE_INTEGER,
-              invalidated: Effect.void
-            })
-        })
-        const error = yield* fixture.client.Open({
-          protocolVersion: PeerRpc.protocolVersion,
-          expectedPeerId: serverPeerId,
-          definitionHash,
-          documents: [{ documentType: Task.name, documentId: taskId }]
-        }).pipe(Stream.runDrain, Effect.flip)
-        assert.instanceOf(error, PeerRpcError.AccessDenied)
-        assert.strictEqual((yield* Queue.poll(fixture.pendingStarted))._tag, "None")
-      }
-    })))
-
-  it.effect("maps direct authorization defects and unexpected failures without exposing their contents", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const sentinel = "authorization-private-sentinel-836592"
-      for (
-        const authorization of [
-          () => Effect.die(new Error(sentinel)),
-          () => Effect.fail(new Error(sentinel) as never)
-        ]
-      ) {
-        const fixture = yield* makeFixture({ ...baseOptions, authorization })
-        const error = yield* fixture.client.Open({
-          protocolVersion: PeerRpc.protocolVersion,
-          expectedPeerId: serverPeerId,
-          definitionHash,
-          documents: [{ documentType: Task.name, documentId: taskId }]
-        }).pipe(Stream.runDrain, Effect.flip)
-        assert.instanceOf(error, PeerRpcError.ServerUnavailable)
-        assert.isFalse(JSON.stringify(error).includes(sentinel))
-      }
-    })))
-
-  it.effect("preserves declared direct authorization failures", () =>
-    Effect.scoped(Effect.gen(function*() {
-      for (const expected of [new PeerRpcError.AccessDenied(), new PeerRpcError.ServerUnavailable()]) {
-        const fixture = yield* makeFixture({
-          ...baseOptions,
-          authorization: () => Effect.fail(expected)
-        })
-        const actual = yield* fixture.client.Open({
-          protocolVersion: PeerRpc.protocolVersion,
-          expectedPeerId: serverPeerId,
-          definitionHash,
-          documents: [{ documentType: Task.name, documentId: taskId }]
-        }).pipe(Stream.runDrain, Effect.flip)
-        assert.strictEqual(actual._tag, expected._tag)
-      }
-    })))
-
-  it.effect("maps mixed authorization interruption and defects without exposing their contents", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const sentinel = "mixed-authorization-private-sentinel-361794"
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        authorization: () =>
-          Effect.failCause(Cause.fromReasons([
-            Cause.makeInterruptReason(1),
-            Cause.makeDieReason(new Error(sentinel))
-          ]))
-      })
-      const error = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Task.name, documentId: taskId }]
-      }).pipe(Stream.runDrain, Effect.flip)
-      assert.instanceOf(error, PeerRpcError.ServerUnavailable)
-      assert.isFalse(JSON.stringify(error).includes(sentinel))
-      assert.strictEqual((yield* Queue.poll(fixture.pendingStarted))._tag, "None")
-    })))
-
-  it.effect("preserves direct authorization interruption", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        authorization: () => Effect.interrupt
-      })
-      const exit = yield* fixture.directOpen([{ documentType: Task.name, documentId: taskId }]).pipe(
-        Stream.runDrain,
-        Effect.exit
-      )
-      assert.isTrue(Exit.isFailure(exit))
-      if (Exit.isFailure(exit)) assert.isTrue(Cause.hasInterruptsOnly(exit.cause))
-    })))
-
-  it.effect("rejects an expired direct authorization before session allocation", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        authorization: () =>
-          Effect.succeed({
-            documents: [{ document: Task, documentId: taskId }],
-            validUntil: 0,
-            invalidated: Effect.void
-          })
-      })
-      const error = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Task.name, documentId: taskId }]
-      }).pipe(Stream.runDrain, Effect.flip)
-      assert.instanceOf(error, PeerRpcError.AccessDenied)
-      assert.strictEqual((yield* Queue.poll(fixture.pendingStarted))._tag, "None")
-    })))
-
-  for (const validUntil of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
-    it.effect(`rejects nonfinite direct authorization lease ${String(validUntil)} before session allocation`, () =>
-      Effect.scoped(Effect.gen(function*() {
-        const fixture = yield* makeFixture({
-          ...baseOptions,
-          authorization: () =>
-            Effect.succeed({
-              documents: [{ document: Task, documentId: taskId }],
-              validUntil,
-              invalidated: Effect.void
-            })
-        })
-        const error = yield* fixture.client.Open({
-          protocolVersion: PeerRpc.protocolVersion,
-          expectedPeerId: serverPeerId,
-          definitionHash,
-          documents: [{ documentType: Task.name, documentId: taskId }]
-        }).pipe(Stream.runDrain, Effect.flip)
-        assert.instanceOf(error, PeerRpcError.AccessDenied)
-        assert.strictEqual((yield* Queue.poll(fixture.pendingStarted))._tag, "None")
-      })))
-  }
-
-  for (const validUntil of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
-    it.effect(`rejects nonfinite direct authentication lease ${String(validUntil)} before session allocation`, () =>
-      Effect.scoped(Effect.gen(function*() {
-        const fixture = yield* makeFixture({ ...baseOptions, authenticationValidUntil: validUntil })
-        const error = yield* fixture.directOpen([{ documentType: Task.name, documentId: taskId }]).pipe(
-          Stream.runDrain,
-          Effect.flip
-        )
-        assert.instanceOf(error, PeerRpcError.AuthenticationFailure)
-        assert.strictEqual((yield* Queue.poll(fixture.pendingStarted))._tag, "None")
-        assert.strictEqual(yield* Ref.get(fixture.authorizationCalls), 0)
-      })))
-  }
-
-  it.effect("closes the session instead of dropping an inbound message on overflow", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({ ...baseOptions, blockInbound: true })
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* fixture.client.Push({ sessionId: session.opened.sessionId, payload: yield* fixture.encode(0) })
-      yield* Deferred.await(fixture.inboundBlocked)
-      const error = yield* fixture.client.Push({
-        sessionId: session.opened.sessionId,
-        payload: yield* fixture.encode(1)
-      }).pipe(Effect.flip)
-      assert.instanceOf(error, PeerRpcError.SessionOverloaded)
-      const streamExit = yield* Fiber.await(session.fiber)
-      assert.isTrue(Exit.isFailure(streamExit))
-      if (Exit.isFailure(streamExit)) {
-        const streamError = Cause.findErrorOption(streamExit.cause)
-        assert.strictEqual(streamError._tag, "Some")
-        if (streamError._tag === "Some") assert.strictEqual(streamError.value._tag, "SessionOverloaded")
-      }
-      yield* Deferred.succeed(fixture.inboundRelease, undefined)
-      const unavailable = yield* fixture.client.Push({
-        sessionId: session.opened.sessionId,
-        payload: yield* fixture.encode(3)
-      }).pipe(Effect.flip)
-      assert.instanceOf(unavailable, PeerRpcError.SessionUnavailable)
-    })))
-
-  it.effect("does not expose sessions across the ownership matrix", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture(baseOptions)
-      const missing = yield* fixture.client.Push({ sessionId: missingSessionId, payload: Uint8Array.of(1) }).pipe(
-        Effect.flip
-      )
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      assert.instanceOf(missing, PeerRpcError.SessionUnavailable)
-      for (const credential of ["same-peer", "same-subject", "other-tenant"] as const) {
-        yield* fixture.setCredential(credential)
-        const foreign = yield* fixture.client.Push({
-          sessionId: session.opened.sessionId,
-          payload: Uint8Array.of(1)
-        }).pipe(Effect.flip)
-        assert.instanceOf(foreign, PeerRpcError.SessionUnavailable)
-        assert.strictEqual(missing._tag, foreign._tag)
-      }
-      yield* Fiber.interrupt(session.fiber)
-    })))
-
-  it.effect("rejects Push after the Open stream is interrupted", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture(baseOptions)
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* Fiber.interrupt(session.fiber)
-      const error = yield* fixture.client.Push({
-        sessionId: session.opened.sessionId,
-        payload: Uint8Array.of(1)
-      }).pipe(Effect.flip)
-      assert.instanceOf(error, PeerRpcError.SessionUnavailable)
-    })))
-
-  it.effect("stops admission before draining sessions on Layer close", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture(baseOptions)
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* fixture.closeServer
-      const streamExit = yield* Fiber.await(session.fiber)
-      assert.isTrue(Exit.isFailure(streamExit))
-      if (Exit.isFailure(streamExit)) {
-        const streamError = Cause.findErrorOption(streamExit.cause)
-        assert.strictEqual(streamError._tag, "Some")
-        if (streamError._tag === "Some") assert.strictEqual(streamError.value._tag, "ServerUnavailable")
-      }
-      const error = yield* fixture.client.Push({
-        sessionId: session.opened.sessionId,
-        payload: Uint8Array.of(1)
-      }).pipe(Effect.flip)
-      assert.instanceOf(error, PeerRpcError.ServerUnavailable)
-    })))
-
-  it.effect("interrupts a captured Open request while the server scope is closing", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        initialOutbound: {
-          sendSequence: 0,
-          documentId: taskId,
-          message: Uint8Array.of(1),
-          messageHash: "held",
-          heads: [],
-          lineage: Identity.genesisLineage,
-          writerProvenance: []
-        }
-      })
-      const messageHeld = yield* Deferred.make<void>()
-      const interrupted = yield* Deferred.make<void>()
-      const request = yield* Effect.scoped(Effect.gen(function*() {
-        const pull = yield* Stream.toPull(fixture.directOpen([{ documentType: Task.name, documentId: taskId }]))
-        assert.strictEqual((yield* pull)[0]._tag, "Opened")
-        assert.strictEqual((yield* pull)[0]._tag, "Message")
-        yield* Deferred.succeed(messageHeld, undefined)
-        return yield* Effect.never
-      })).pipe(
-        Effect.ensuring(Deferred.succeed(interrupted, undefined)),
-        Effect.forkChild
-      )
-      yield* Deferred.await(messageHeld)
-      yield* fixture.closeServer
-      yield* Deferred.await(interrupted)
-      assert.isTrue(Exit.isFailure(yield* Fiber.await(request)))
-    })))
-
-  it.effect("preserves overload when detachment follows an outbound take", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        blockInbound: true,
-        initialOutbound: {
-          sendSequence: 0,
-          documentId: taskId,
-          message: Uint8Array.of(1),
-          messageHash: "taken-before-overload",
-          heads: [],
-          lineage: Identity.genesisLineage,
-          writerProvenance: []
-        }
-      })
-      const opened = yield* Deferred.make<PeerRpc.Opened>()
-      const messageTaken = yield* Deferred.make<void>()
-      const request = yield* Effect.scoped(Effect.gen(function*() {
-        const pull = yield* Stream.toPull(fixture.directOpen([{ documentType: Task.name, documentId: taskId }]))
-        const first = yield* pull
-        assert.strictEqual(first[0]._tag, "Opened")
-        yield* Deferred.succeed(opened, first[0] as PeerRpc.Opened)
-        assert.strictEqual((yield* pull)[0]._tag, "Message")
-        yield* Deferred.succeed(messageTaken, undefined)
-        yield* pull
-      })).pipe(Effect.forkChild)
-      const session = yield* Deferred.await(opened)
-      yield* Deferred.await(messageTaken)
-      yield* fixture.client.Push({
-        sessionId: session.sessionId,
-        payload: yield* fixture.encode(0)
-      })
-      yield* Deferred.await(fixture.inboundBlocked)
-      const overload = yield* fixture.client.Push({
-        sessionId: session.sessionId,
-        payload: yield* fixture.encode(1)
-      }).pipe(Effect.flip)
-      assert.strictEqual(overload._tag, "SessionOverloaded")
-      yield* Deferred.succeed(fixture.inboundRelease, undefined)
-      const streamExit = yield* Fiber.await(request)
-      assert.isTrue(Exit.isFailure(streamExit))
-      if (Exit.isFailure(streamExit)) {
-        const streamError = Cause.findErrorOption(streamExit.cause)
-        assert.strictEqual(streamError._tag, "Some")
-        if (streamError._tag === "Some") assert.instanceOf(streamError.value, PeerRpcError.SessionOverloaded)
-      }
-    })))
-
-  it.effect("revokes the session when an authorization lease is invalidated", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture(baseOptions)
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* Deferred.succeed(fixture.authorizationInvalidated, undefined)
-      assert.isTrue(Exit.isFailure(yield* Fiber.await(session.fiber)))
-      const error = yield* fixture.client.Push({
-        sessionId: session.opened.sessionId,
-        payload: Uint8Array.of(1)
-      }).pipe(Effect.flip)
-      assert.instanceOf(error, PeerRpcError.SessionUnavailable)
-    })))
-
-  it.effect("revokes the session when the authorization invalidation monitor defects", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const invalidate = yield* Deferred.make<void>()
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        authorization: (request) =>
-          Effect.succeed({
-            documents: request.documents.map((document) => ({ document: Task, documentId: document.documentId })),
-            validUntil: Number.MAX_SAFE_INTEGER,
-            invalidated: Deferred.await(invalidate).pipe(
-              Effect.andThen(Effect.die("authorization invalidation monitor defect"))
-            )
-          })
-      })
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* Deferred.succeed(invalidate, undefined)
-      for (let index = 0; index < 5; index++) yield* Effect.yieldNow
-      const exit = session.fiber.pollUnsafe()
-      assert.isDefined(exit)
-      assert.isTrue(Exit.isFailure(exit!))
-      if (Exit.isFailure(exit!)) {
-        const error = Cause.findErrorOption(exit!.cause)
-        assert.strictEqual(error._tag, "Some")
-        if (error._tag === "Some") assert.instanceOf(error.value, PeerRpcError.SessionUnavailable)
-      }
-    })))
-
-  it.effect("revokes the active session when authentication is invalidated", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture(baseOptions)
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* Deferred.succeed(fixture.authenticationInvalidated, undefined)
-      assert.isTrue(Exit.isFailure(yield* Fiber.await(session.fiber)))
-      const error = yield* fixture.client.Push({
-        sessionId: session.opened.sessionId,
-        payload: Uint8Array.of(1)
-      }).pipe(Effect.flip)
-      assert.instanceOf(error, PeerRpcError.SessionUnavailable)
-    })))
-
-  it.effect(
-    "rejects a Push admitted while the losing lease monitor is still tearing down after authentication is invalidated",
-    () =>
-      Effect.scoped(Effect.gen(function*() {
-        const authorizationNeverInvalidates = yield* Deferred.make<void>()
-        const teardownStarted = yield* Deferred.make<void>()
-        const teardownRelease = yield* Deferred.make<void>()
-        const fixture = yield* makeFixture({
-          ...baseOptions,
-          authorization: (request) =>
-            Effect.succeed({
-              documents: request.documents.map((document) => ({ document: Task, documentId: document.documentId })),
-              validUntil: Number.MAX_SAFE_INTEGER,
-              invalidated: Deferred.await(authorizationNeverInvalidates).pipe(
-                Effect.onInterrupt(() =>
-                  Deferred.succeed(teardownStarted, undefined).pipe(Effect.andThen(Deferred.await(teardownRelease)))
-                )
-              )
-            })
-        })
-        const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-
-        yield* Deferred.succeed(fixture.authenticationInvalidated, undefined)
-        yield* Deferred.await(teardownStarted)
-
-        yield* Effect.gen(function*() {
-          const rejection = yield* fixture.directPush({
-            sessionId: session.opened.sessionId,
-            payload: Uint8Array.of(1)
-          }).pipe(Effect.exit)
-
-          assert.isTrue(Exit.isFailure(rejection))
-          if (Exit.isFailure(rejection)) {
-            const error = Cause.findErrorOption(rejection.cause)
-            assert.strictEqual(error._tag, "Some")
-            if (error._tag === "Some") assert.strictEqual(error.value._tag, "SessionUnavailable")
-          }
-        }).pipe(Effect.ensuring(Deferred.succeed(teardownRelease, undefined)))
-
-        assert.isTrue(Exit.isFailure(yield* Fiber.await(session.fiber)))
-      }))
-  )
-
-  for (const lease of ["authentication", "authorization"] as const) {
-    it.effect(`revokes the active session when ${lease} expires`, () =>
-      Effect.scoped(Effect.gen(function*() {
-        const fixture = yield* makeFixture({
-          ...baseOptions,
-          authenticationValidUntil: lease === "authentication" ? 1_000 : Number.MAX_SAFE_INTEGER,
-          authorizationValidUntil: lease === "authorization" ? 1_000 : Number.MAX_SAFE_INTEGER
-        })
-        const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-        yield* TestClock.adjust(1_000)
-        assert.isTrue(Exit.isFailure(yield* Fiber.await(session.fiber)))
-      })))
-  }
-
-  it.effect("rejects Push at its current authentication deadline", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        authenticationValidUntil: 10_000,
-        manualClock: true
-      })
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* fixture.setCurrentTime(1)
-
-      const error = yield* fixture.directPushAs(1, {
-        sessionId: session.opened.sessionId,
-        payload: yield* fixture.encode(0)
-      }).pipe(Effect.flip)
-
-      assert.instanceOf(error, PeerRpcError.AuthenticationFailure)
-      assert.strictEqual((yield* Queue.poll(fixture.received))._tag, "None")
-    })))
-
-  it.effect("rejects every Push racing the exact earliest lease boundary", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        authenticationValidUntil: 2_000,
-        authorizationValidUntil: 1_000,
-        manualClock: true
-      })
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* fixture.setCurrentTime(999)
-      yield* fixture.directPush({
-        sessionId: session.opened.sessionId,
-        payload: yield* fixture.encode(0)
-      })
-      assert.strictEqual(yield* Queue.take(fixture.received), 0)
-      yield* fixture.setCurrentTime(1_000)
-      const exits = yield* Effect.forEach(
-        Array.from({ length: 16 }, (_, sequence) => sequence + 1),
-        (sequence) =>
-          Effect.gen(function*() {
-            const payload = yield* fixture.encode(sequence)
-            return yield* fixture.directPush({
-              sessionId: session.opened.sessionId,
-              payload
-            })
-          }).pipe(Effect.exit),
-        { concurrency: "unbounded" }
-      )
-      assert.isTrue(exits.every(Exit.isFailure))
-      assert.isTrue(exits.every((exit) => {
-        if (Exit.isSuccess(exit)) return false
-        const error = Cause.findErrorOption(exit.cause)
-        return error._tag === "Some" && error.value instanceof PeerRpcError.SessionUnavailable
-      }))
-      assert.isTrue(Exit.isFailure(yield* Fiber.await(session.fiber)))
-    })))
-
-  it.effect("rejects a queued outbound Message at the exact earliest lease boundary", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        authenticationValidUntil: 2_000,
-        authorizationValidUntil: 1_000,
-        initialOutbound: {
-          sendSequence: 0,
-          documentId: taskId,
-          message: Uint8Array.of(1, 2, 3),
-          messageHash: "lease-boundary",
-          heads: [],
-          lineage: Identity.genesisLineage,
-          writerProvenance: []
-        },
-        manualClock: true
-      })
-      const pull = yield* Stream.toPull(fixture.directOpen([{ documentType: Task.name, documentId: taskId }]))
-      assert.strictEqual((yield* pull)[0]._tag, "Opened")
-      assert.strictEqual(yield* Queue.take(fixture.sent), 0)
-      yield* fixture.setCurrentTime(1_000)
-      const error = yield* pull.pipe(Effect.flip)
-      assert.instanceOf(error, PeerRpcError.SessionUnavailable)
-    })))
-
-  it.effect("rejects the first Opened event at the exact earliest lease boundary", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        authenticationValidUntil: 2_000,
-        authorizationValidUntil: 1_000,
-        manualClock: true
-      })
-      yield* fixture.setCurrentTimeOnNextRandomBytes(1_000)
-      const pull = yield* Stream.toPull(fixture.directOpen([{ documentType: Task.name, documentId: taskId }]))
-      const error = yield* pull.pipe(Effect.flip)
-      assert.instanceOf(error, PeerRpcError.SessionUnavailable)
-    })))
-
-  it.effect("rejects commit flush generation at the exact earliest lease boundary", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        authenticationValidUntil: 2_000,
-        authorizationValidUntil: 1_000,
-        manualClock: true
-      })
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      assert.strictEqual(yield* Queue.take(fixture.generated), taskId)
-      yield* fixture.setNextOutbound({
-        sendSequence: 0,
-        documentId: taskId,
-        message: Uint8Array.of(1, 2, 3),
-        messageHash: "lease-boundary",
-        heads: [],
-        lineage: Identity.genesisLineage,
-        writerProvenance: []
-      })
-      yield* fixture.setCurrentTime(1_000)
-      yield* Queue.offer(fixture.commits, {
-        _tag: "Commit",
-        commitSequence: Identity.CommitSequence.make(1),
-        documentId: taskId,
-        keys: [],
-        refreshGeneration: 0
-      })
-      yield* Queue.take(fixture.commitProcessed)
-      const error = yield* Fiber.join(session.fiber).pipe(Effect.flip)
-      assert.instanceOf(error, PeerRpcError.SessionUnavailable)
-      assert.strictEqual((yield* Queue.poll(fixture.generated))._tag, "None")
-    })))
-
-  it.effect("revokes the active session at the maximum reauthorization interval", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        rpcLimits: { maximumReauthorizationInterval: 1_000 }
-      })
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* TestClock.adjust(1_000)
-      assert.isTrue(Exit.isFailure(yield* Fiber.await(session.fiber)))
-    })))
-
-  it.effect("publishes no session when a lease is invalidated during setup", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture(baseOptions)
-      yield* Deferred.succeed(fixture.authenticationInvalidated, undefined)
-      const error = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Task.name, documentId: taskId }]
-      }).pipe(Stream.runDrain, Effect.flip)
-      assert.instanceOf(error, PeerRpcError.SessionUnavailable)
-    })))
-
-  it.effect("releases partial acquisition after session startup failure", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        failSessionOpen: true,
-        replicaLimits: { maxSessions: 1 }
-      })
-      const error = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Task.name, documentId: taskId }]
-      }).pipe(Stream.runDrain, Effect.flip)
-      assert.instanceOf(error, PeerRpcError.ServerUnavailable)
-      yield* fixture.allowSessionOpen
-      yield* fixture.setCredential("foreign")
-      const session = yield* fixture.open([{ documentType: Note.name, documentId: noteId }])
-      yield* Fiber.interrupt(session.fiber)
-    })))
-
-  it.effect("reports a lineage rewrite session failure as its own fieldless wire error", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        failSessionOpen: true,
-        sessionOpenFailure: new ReplicaError.DocumentLineageChanged({
-          documentId: taskId,
-          localLineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000004"),
-          remoteLineage: Identity.genesisLineage
-        })
-      })
-      const error = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Task.name, documentId: taskId }]
-      }).pipe(Stream.runDrain, Effect.flip)
-      assert.instanceOf(error, PeerRpcError.DocumentLineageChanged)
-      // The peer learns the lineage no longer matches and nothing else: no document id, no lineage.
-      assert.deepStrictEqual(
-        Schema.encodeSync(PeerRpcError.PeerRpcError)(error),
-        { _tag: "DocumentLineageChanged" }
-      )
-    })))
-
-  it.effect("maps initialization send capacity timeout to SessionOverloaded", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const message = new Uint8Array(replicaLimits.maxSyncMessageBytes)
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        blockInbound: true,
-        rpcLimits: {
-          maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(
-            replicaLimits.maxSyncMessageBytes,
-            replicaLimits.maxSyncChangesPerMessage
-          )
-        }
-      })
-      const blocker = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* Queue.take(fixture.generated)
-      yield* Queue.take(fixture.pendingStarted)
-      yield* fixture.client.Push({
-        sessionId: blocker.opened.sessionId,
-        payload: yield* fixture.encodeMessage(0, taskId, Task.name, message)
-      })
-      yield* Deferred.await(fixture.inboundBlocked)
-      yield* fixture.setPendingOutbound({
-        sendSequence: 0,
-        documentId: noteId,
-        message,
-        messageHash: "initial-capacity",
-        heads: [],
-        lineage: Identity.genesisLineage,
-        writerProvenance: maximumWriterProvenance
-      })
-      yield* fixture.setCredential("foreign")
-      const opening = yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Note.name, documentId: noteId }]
-      }).pipe(Stream.runDrain, Effect.forkChild)
-      assert.strictEqual(yield* Queue.take(fixture.pendingStarted), remotePeerB)
-      yield* TestClock.adjust(replicaLimits.maxPeerSendMillis + 1)
-      const error = yield* Fiber.join(opening).pipe(Effect.flip)
-      assert.strictEqual(error._tag, "SessionOverloaded")
-      yield* Deferred.succeed(fixture.inboundRelease, undefined)
-      yield* Fiber.interrupt(blocker.fiber)
-    })))
-
-  it.effect("maps a post ready Push reply capacity timeout to SessionOverloaded", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const message = new Uint8Array(replicaLimits.maxSyncMessageBytes)
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        rpcLimits: {
-          maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(
-            replicaLimits.maxSyncMessageBytes,
-            replicaLimits.maxSyncChangesPerMessage
-          )
-        },
-        initialOutbound: {
-          sendSequence: 0,
-          documentId: taskId,
-          message,
-          messageHash: "held-for-push-reply",
-          heads: [],
-          lineage: Identity.genesisLineage,
-          writerProvenance: maximumWriterProvenance
-        }
-      })
-      const messageHeld = yield* Deferred.make<void>()
-      const blocker = yield* Effect.scoped(Effect.gen(function*() {
-        const pull = yield* Stream.toPull(fixture.directOpen([{ documentType: Task.name, documentId: taskId }]))
-        assert.strictEqual((yield* pull)[0]._tag, "Opened")
-        assert.strictEqual((yield* pull)[0]._tag, "Message")
-        yield* Deferred.succeed(messageHeld, undefined)
-        return yield* Effect.never
-      })).pipe(Effect.forkChild)
-      yield* Deferred.await(messageHeld)
-      yield* Queue.take(fixture.generated)
-      assert.strictEqual(yield* Queue.take(fixture.pendingStarted), remotePeerA)
-      yield* fixture.setCredential("foreign")
-      const session = yield* fixture.open([{ documentType: Note.name, documentId: noteId }])
-      yield* Queue.take(fixture.generated)
-      assert.strictEqual(yield* Queue.take(fixture.pendingStarted), remotePeerB)
-      yield* fixture.setReply({
-        documentId: noteId,
-        message,
-        messageHash: "push-reply-capacity",
-        heads: []
-      })
-      yield* fixture.client.Push({
-        sessionId: session.opened.sessionId,
-        payload: yield* fixture.encodeMessage(0, noteId, Note.name, Uint8Array.of(1))
-      })
-      assert.strictEqual(yield* Queue.take(fixture.enqueued), noteId)
-      assert.strictEqual(yield* Queue.take(fixture.pendingStarted), remotePeerB)
-      yield* TestClock.adjust(replicaLimits.maxPeerSendMillis + 1)
-      const error = yield* Fiber.join(session.fiber).pipe(Effect.flip)
-      assert.strictEqual(error._tag, "SessionOverloaded")
-      yield* Fiber.interrupt(blocker)
-    })))
-
-  it.effect("does not retain disconnected watchers after repeated startup failure", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({ ...baseOptions, failSessionOpen: true })
-      const baseline = yield* fixture.activeFiberCount
-      assert.isAbove(baseline, 0)
-      for (let index = 0; index < 20; index++) {
-        const error = yield* fixture.client.Open({
-          protocolVersion: PeerRpc.protocolVersion,
-          expectedPeerId: serverPeerId,
-          definitionHash,
-          documents: [{ documentType: Task.name, documentId: taskId }]
-        }).pipe(Stream.runDrain, Effect.flip)
-        assert.instanceOf(error, PeerRpcError.ServerUnavailable)
-      }
-      for (let index = 0; index < 10; index++) yield* Effect.yieldNow
-      assert.strictEqual(yield* fixture.activeFiberCount, baseline)
-    })))
-
-  it.effect("interrupts an overloaded Open without draining an unacknowledged message", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const message = new Uint8Array(replicaLimits.maxSyncMessageBytes)
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        rpcLimits: {
-          maxOutboundBufferedBytesPerSession: PeerSession.maximumSyncEnvelopeBytes(
-            replicaLimits.maxSyncMessageBytes,
-            replicaLimits.maxSyncChangesPerMessage
-          ),
-          maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(
-            replicaLimits.maxSyncMessageBytes,
-            replicaLimits.maxSyncChangesPerMessage
-          )
-        },
-        initialOutbound: {
-          sendSequence: 0,
-          documentId: taskId,
-          message,
-          messageHash: "first",
-          heads: [],
-          lineage: Identity.genesisLineage,
-          writerProvenance: maximumWriterProvenance
-        }
-      })
-      const opened = yield* Deferred.make<PeerRpc.Opened>()
-      const messageHeld = yield* Deferred.make<void>()
-      const stream = yield* Effect.scoped(Effect.gen(function*() {
-        const pull = yield* Stream.toPull(fixture.directOpen([{ documentType: Task.name, documentId: taskId }]))
-        const first = yield* pull
-        assert.strictEqual(first[0]._tag, "Opened")
-        yield* Deferred.succeed(opened, first[0] as PeerRpc.Opened)
-        const second = yield* pull
-        assert.strictEqual(second[0]._tag, "Message")
-        yield* Deferred.succeed(messageHeld, undefined)
-        return yield* Effect.never
-      })).pipe(Effect.forkChild)
-      const session = yield* Deferred.await(opened)
-      yield* Deferred.await(messageHeld)
-      yield* Queue.take(fixture.generated)
-      assert.strictEqual(yield* Queue.take(fixture.sent), 0)
-      yield* fixture.setNextOutbound({
-        sendSequence: 1,
-        documentId: taskId,
-        message,
-        messageHash: "second",
-        heads: [],
-        lineage: Identity.genesisLineage,
-        writerProvenance: []
-      })
-      yield* Queue.offer(fixture.commits, {
-        _tag: "Commit",
-        commitSequence: Identity.CommitSequence.make(1),
-        documentId: taskId,
-        keys: [],
-        refreshGeneration: 0
-      })
-      yield* Queue.take(fixture.generated)
-      for (let index = 0; index < 5; index++) {
-        yield* Effect.yieldNow
-        yield* TestClock.adjust(replicaLimits.maxPeerSendMillis + 1)
-      }
-      yield* Effect.yieldNow
-      assert.isTrue(Exit.isFailure(yield* Fiber.await(stream)))
-      const error = yield* fixture.client.Push({ sessionId: session.sessionId, payload: Uint8Array.of(1) }).pipe(
-        Effect.flip
-      )
-      assert.instanceOf(error, PeerRpcError.SessionUnavailable)
-    })))
-
-  it.effect("maps commit flush send capacity timeout to SessionOverloaded", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const message = new Uint8Array(replicaLimits.maxSyncMessageBytes)
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        blockInbound: true,
-        rpcLimits: {
-          maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(
-            replicaLimits.maxSyncMessageBytes,
-            replicaLimits.maxSyncChangesPerMessage
-          )
-        }
-      })
-      const blocker = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* Queue.take(fixture.pendingStarted)
-      yield* Queue.take(fixture.generated)
-      yield* fixture.client.Push({
-        sessionId: blocker.opened.sessionId,
-        payload: yield* fixture.encodeMessage(0, taskId, Task.name, message)
-      })
-      yield* Deferred.await(fixture.inboundBlocked)
-      yield* fixture.setCredential("foreign")
-      const session = yield* fixture.open([{ documentType: Note.name, documentId: noteId }])
-      yield* Queue.take(fixture.pendingStarted)
-      yield* Queue.take(fixture.generated)
-      yield* fixture.setNextOutbound({
-        sendSequence: 0,
-        documentId: noteId,
-        message,
-        messageHash: "flush-capacity",
-        heads: [],
-        lineage: Identity.genesisLineage,
-        writerProvenance: maximumWriterProvenance
-      })
-      yield* Queue.offer(fixture.commits, {
-        _tag: "Commit",
-        commitSequence: Identity.CommitSequence.make(1),
-        documentId: noteId,
-        keys: [],
-        refreshGeneration: 0
-      })
-      assert.strictEqual(yield* Queue.take(fixture.generated), noteId)
-      yield* TestClock.adjust(replicaLimits.maxPeerSendMillis + 1)
-      const error = yield* Fiber.join(session.fiber).pipe(Effect.flip)
-      assert.strictEqual(error._tag, "SessionOverloaded")
-      yield* Deferred.succeed(fixture.inboundRelease, undefined)
-      yield* Fiber.interrupt(blocker.fiber)
-    })))
-
-  it.effect("returns inbound byte reservations after overload cleanup", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const message = new Uint8Array(replicaLimits.maxSyncMessageBytes)
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        blockInbound: true,
-        rpcLimits: {
-          maxBufferedBytes: PeerSession.maximumSyncEnvelopeBytes(
-            replicaLimits.maxSyncMessageBytes,
-            replicaLimits.maxSyncChangesPerMessage
-          )
-        }
-      })
-      const first = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      const payload = yield* fixture.encodeMessage(0, taskId, Task.name, message)
-      yield* fixture.client.Push({ sessionId: first.opened.sessionId, payload })
-      yield* Deferred.await(fixture.inboundBlocked)
-      const overload = yield* fixture.client.Push({
-        sessionId: first.opened.sessionId,
-        payload: yield* fixture.encode(1)
-      }).pipe(Effect.flip)
-      assert.strictEqual(overload._tag, "SessionOverloaded")
-      yield* Deferred.succeed(fixture.inboundRelease, undefined)
-      yield* fixture.setCredential("foreign")
-      const second = yield* fixture.open([{ documentType: Note.name, documentId: noteId }])
-      yield* fixture.client.Push({
-        sessionId: second.opened.sessionId,
-        payload: yield* fixture.encodeMessage(0, noteId, Note.name, message)
-      })
-      assert.strictEqual(yield* Queue.take(fixture.received), 0)
-      yield* Fiber.interrupt(second.fiber)
-    })))
-
-  it.effect("survives repeated replacement followed by server shutdown", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        replicaLimits: { maxSessions: 64 },
-        rpcLimits: { maxSessionsPerSubject: 64 }
-      })
-      let current = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      for (let index = 0; index < 20; index++) {
-        const replacement = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-        const exit = yield* Fiber.await(current.fiber)
-        assert.isTrue(Exit.isFailure(exit))
-        if (Exit.isFailure(exit)) {
-          const error = Cause.findErrorOption(exit.cause)
-          assert.strictEqual(error._tag, "Some")
-          if (error._tag === "Some") assert.strictEqual(error.value._tag, "SessionUnavailable")
-        }
-        current = replacement
-      }
-      yield* fixture.closeServer
-      const exit = yield* Fiber.await(current.fiber)
-      assert.isTrue(Exit.isFailure(exit))
-      if (Exit.isFailure(exit)) {
-        const error = Cause.findErrorOption(exit.cause)
-        assert.strictEqual(error._tag, "Some")
-        if (error._tag === "Some") assert.strictEqual(error.value._tag, "ServerUnavailable")
-      }
-    })))
-
-  it.effect("coalesces 256 commits while 64 sessions are active", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        replicaLimits: { maxSessions: 64 },
-        rpcLimits: { maxSessionsPerSubject: 64 }
-      })
-      const documentIds = Array.from({ length: 64 }, (_, index) =>
-        Identity.DocumentId.make(
-          `doc_00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`
-        ))
-      const sessions = yield* Effect.forEach(documentIds, (documentId, index) =>
-        fixture.setCredential(`bulk-${index}`).pipe(
-          Effect.andThen(fixture.open([{ documentType: Task.name, documentId }])),
-          Effect.tap(() =>
-            Queue.take(fixture.generated)
-          )
-        ))
-      yield* fixture.blockCommitGeneration
-      const commits = Array.from({ length: 256 }, (_, index) => ({
-        _tag: "Commit" as const,
-        commitSequence: Identity.CommitSequence.make(index + 1),
-        documentId: documentIds[0],
-        keys: [],
-        refreshGeneration: 0
-      }))
-      yield* Queue.offer(fixture.commits, commits[0])
-      yield* Queue.take(fixture.commitProcessed)
-      yield* Deferred.await(fixture.commitFlushStarted)
-      yield* Queue.offerAll(fixture.commits, commits.slice(1))
-      for (let index = 1; index < commits.length; index++) yield* Queue.take(fixture.commitProcessed)
-      yield* Deferred.succeed(fixture.commitFlushRelease, undefined)
-      assert.strictEqual(yield* Queue.take(fixture.generated), documentIds[0])
-      assert.strictEqual(yield* Queue.take(fixture.generated), documentIds[0])
-      for (let index = 0; index < 10; index++) yield* Effect.yieldNow
-      assert.strictEqual((yield* Queue.poll(fixture.generated))._tag, "None")
-      yield* Effect.forEach(sessions, (session) => Fiber.interrupt(session.fiber), {
-        concurrency: "unbounded",
-        discard: true
-      })
-    })))
-
-  it.effect("routes disjoint commits only to interested sessions", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture(baseOptions)
-      const task = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* Queue.take(fixture.generated)
-      yield* fixture.setCredential("foreign")
-      const note = yield* fixture.open([{ documentType: Note.name, documentId: noteId }])
-      yield* Queue.take(fixture.generated)
-      yield* Queue.offer(fixture.commits, {
-        _tag: "Commit",
-        commitSequence: Identity.CommitSequence.make(1),
-        documentId: taskId,
-        keys: [],
-        refreshGeneration: 0
-      })
-      assert.strictEqual(yield* Queue.take(fixture.generated), taskId)
-      yield* Fiber.interrupt(task.fiber)
-      yield* Fiber.interrupt(note.fiber)
-    })))
-
-  it.effect("records fixed cardinality metrics and safe finite spans at live boundaries", () => {
-    const spans: Array<Tracer.NativeSpan> = []
-    const tracer = Tracer.make({
-      span: (options) => {
-        const span = new Tracer.NativeSpan(options)
-        spans.push(span)
-        return span
-      }
-    })
-    return Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        initialOutbound: {
-          sendSequence: 0,
-          documentId: taskId,
-          message: Uint8Array.of(17, 18, 19),
-          messageHash: "hash",
-          heads: [],
-          lineage: Identity.genesisLineage,
-          writerProvenance: []
-        },
-        authorization: (request) =>
-          Effect.logDebug("authorization-log-forbidden-value").pipe(
-            Effect.andThen(
-              request.documents.some((document) => document.documentType === Note.name)
-                ? Effect.fail(new PeerRpcError.AccessDenied())
-                : Effect.succeed({
-                  documents: request.documents.map((document) => ({ document: Task, documentId: document.documentId })),
-                  validUntil: Number.MAX_SAFE_INTEGER,
-                  invalidated: Effect.never
-                })
-            )
-          )
-      })
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      assert.strictEqual((yield* Queue.take(session.events))._tag, "Message")
-      yield* fixture.client.Push({ sessionId: session.opened.sessionId, payload: yield* fixture.encode(0) })
-      yield* Queue.take(fixture.received)
-      yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Note.name, documentId: noteId }]
-      }).pipe(Stream.runDrain, Effect.flip)
-      yield* fixture.client.Open({
-        protocolVersion: PeerRpc.protocolVersion + 1,
-        expectedPeerId: serverPeerId,
-        definitionHash,
-        documents: [{ documentType: Task.name, documentId: taskId }]
-      }).pipe(Stream.runDrain, Effect.flip)
-
-      assert.strictEqual((yield* Metric.value(PeerRpcObservability.boundary("Open", "Attempt"))).count, 3)
-      assert.strictEqual((yield* Metric.value(PeerRpcObservability.boundary("Open", "Success"))).count, 1)
-      assert.strictEqual(
-        (yield* Metric.value(PeerRpcObservability.boundary("Open", "AuthorizationDenied"))).count,
-        1
-      )
-      assert.strictEqual(
-        (yield* Metric.value(PeerRpcObservability.boundary("Open", "ProtocolRejected"))).count,
-        1
-      )
-      assert.strictEqual((yield* Metric.value(PeerRpcObservability.boundary("Push", "Attempt"))).count, 1)
-      assert.strictEqual((yield* Metric.value(PeerRpcObservability.boundary("Push", "Success"))).count, 1)
-      assert.strictEqual((yield* Metric.value(PeerRpcObservability.activeSessions())).value, 1)
-      assert.deepInclude(yield* Metric.value(PeerRpcObservability.selectedDocuments()), { count: 3, sum: 3 })
-      assert.strictEqual((yield* Metric.value(PeerRpcObservability.bytes("Inbound"))).count, 1)
-      assert.strictEqual((yield* Metric.value(PeerRpcObservability.bytes("Outbound"))).count, 1)
-
-      yield* fixture.closeServer
-      yield* Fiber.await(session.fiber)
-      assert.strictEqual((yield* Metric.value(PeerRpcObservability.activeSessions())).value, 0)
-      assert.strictEqual((yield* Metric.value(PeerRpcObservability.queueItems("Inbound"))).value, 0)
-      assert.strictEqual((yield* Metric.value(PeerRpcObservability.queueItems("Outbound"))).value, 0)
-      assert.strictEqual(
-        (yield* Metric.value(PeerRpcObservability.boundary("Server", "ShutdownClosed"))).count,
-        1
-      )
-
-      const safeSpans = spans.filter((span) => span.name.startsWith("effect_local_rpc."))
-      assert.deepStrictEqual(
-        new Set(safeSpans.map((span) => span.name)),
-        new Set([
-          "effect_local_rpc.authentication",
-          "effect_local_rpc.server.open",
-          "effect_local_rpc.server.push"
-        ])
-      )
-      const allowedAttributes = new Set([
-        "rpc.operation",
-        "rpc.result",
-        "rpc.selected_documents",
-        "rpc.payload_bytes"
-      ])
-      for (const span of safeSpans) {
-        for (const [key, value] of span.attributes) {
-          assert.isTrue(allowedAttributes.has(key))
-          if (typeof value === "number") assert.isTrue(Number.isFinite(value))
-        }
-        assert.strictEqual(span.status._tag, "Ended")
-        if (span.status._tag === "Ended") assert.isTrue(Exit.isSuccess(span.status.exit))
-        assert.deepStrictEqual(span.events, [])
-      }
-      const telemetry = JSON.stringify(safeSpans.map((span) => ({
-        name: span.name,
-        attributes: [...span.attributes],
-        status: span.status._tag === "Ended" && Exit.isFailure(span.status.exit)
-          ? Cause.pretty(span.status.exit.cause)
-          : span.status._tag
-      }))) + (yield* Metric.dump)
-      for (
-        const forbidden of [
-          "owner",
-          "authorization-log-forbidden-value",
-          "tenant",
-          "subject-a",
-          taskId,
-          noteId,
-          remotePeerA,
-          session.opened.sessionId
-        ]
-      ) assert.notInclude(telemetry, forbidden)
-    })).pipe(
-      Effect.provideService(Metric.MetricRegistry, new Map()),
-      Effect.provideService(Tracer.Tracer, tracer)
-    )
-  })
-
-  it.effect("rejects Push beyond the per subject burst", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        rpcLimits: { pushBurst: 1, pushRatePerSecond: Number.MIN_VALUE }
-      })
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* fixture.client.Push({ sessionId: session.opened.sessionId, payload: yield* fixture.encode(0) })
-      assert.strictEqual(yield* Queue.take(fixture.received), 0)
-      const rejected = yield* fixture.client.Push({
-        sessionId: session.opened.sessionId,
-        payload: yield* fixture.encode(1)
-      }).pipe(Effect.flip)
-      assert.instanceOf(rejected, PeerRpcError.RequestCapacityExceeded)
-      assert.strictEqual((yield* Queue.poll(fixture.received))._tag, "None")
-      yield* Fiber.interrupt(session.fiber)
-    })))
-
-  it.effect("keeps the subject Push bucket monotonic when a stale update lands after a fresher one", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        rpcLimits: { pushBurst: 1, pushRatePerSecond: 1 }
-      })
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* TestClock.setTime(500)
-      yield* fixture.directPush({ sessionId: session.opened.sessionId, payload: yield* fixture.encode(0) })
-      assert.strictEqual(yield* Queue.take(fixture.received), 0)
-
-      yield* TestClock.setTime(0)
-      const stale = yield* fixture.directPush({
-        sessionId: session.opened.sessionId,
-        payload: yield* fixture.encode(1)
-      }).pipe(Effect.flip)
-      assert.strictEqual(stale._tag, "RequestCapacityExceeded")
-
-      yield* TestClock.setTime(1_000)
-      const laterExit = yield* fixture.directPush({
-        sessionId: session.opened.sessionId,
-        payload: yield* fixture.encode(1)
-      }).pipe(Effect.exit)
-      assert.isTrue(Exit.isFailure(laterExit), "expected the third push to stay capacity rejected")
-      if (Exit.isFailure(laterExit)) {
-        const failure = Cause.findErrorOption(laterExit.cause)
-        assert.isTrue(Option.isSome(failure) && failure.value._tag === "RequestCapacityExceeded")
-      }
-      assert.strictEqual((yield* Queue.poll(fixture.received))._tag, "None")
-
-      yield* Fiber.interrupt(session.fiber)
-    })))
-
-  it.effect("keeps the subject Open bucket monotonic when a stale update lands after a fresher one", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        rpcLimits: {
-          openBurst: 1,
-          openRatePerSecond: 1,
-          maxInFlightOpenPerSubject: 100,
-          maxSessionsPerSubject: 100
-        }
-      })
-      const documents = [{ documentType: Task.name, documentId: taskId }]
-      const attemptOpen = () =>
-        Effect.gen(function*() {
-          const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
-          const fiber = yield* Stream.runForEach(
-            fixture.directOpen(documents),
-            (event) => Queue.offer(events, event).pipe(Effect.asVoid)
-          ).pipe(Effect.forkChild)
-          return yield* Effect.raceFirst(
-            Queue.take(events).pipe(Effect.as({ _tag: "Admitted" as const, fiber })),
-            Fiber.await(fiber).pipe(Effect.map((exit) => ({ _tag: "Rejected" as const, exit })))
-          )
-        })
-
-      yield* TestClock.setTime(500)
-      const first = yield* attemptOpen()
-      assert.strictEqual(first._tag, "Admitted")
-
-      yield* TestClock.setTime(0)
-      const stale = yield* attemptOpen()
-      assert.strictEqual(stale._tag, "Rejected")
-      if (stale._tag === "Rejected") {
-        assert.isTrue(Exit.isFailure(stale.exit))
-        if (Exit.isFailure(stale.exit)) {
-          const failure = Cause.findErrorOption(stale.exit.cause)
-          assert.isTrue(Option.isSome(failure) && failure.value._tag === "RequestCapacityExceeded")
-        }
-      }
-
-      yield* TestClock.setTime(1_000)
-      const later = yield* attemptOpen()
-      assert.strictEqual(later._tag, "Rejected")
-      if (later._tag === "Rejected") {
-        assert.isTrue(Exit.isFailure(later.exit))
-        if (Exit.isFailure(later.exit)) {
-          const failure = Cause.findErrorOption(later.exit.cause)
-          assert.isTrue(Option.isSome(failure) && failure.value._tag === "RequestCapacityExceeded")
-        }
-      }
-
-      if (first._tag === "Admitted") yield* Fiber.interrupt(first.fiber)
-    })))
-
-  it.effect("does not let a stale Push rewind the shared subject clock advanced by an Open", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        rpcLimits: { pushBurst: 1, pushRatePerSecond: 1 }
-      })
-      const documents = [{ documentType: Task.name, documentId: taskId }]
-      const openDirect = () =>
-        Effect.gen(function*() {
-          const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
-          const fiber = yield* Stream.runForEach(
-            fixture.directOpen(documents),
-            (event) => Queue.offer(events, event).pipe(Effect.asVoid)
-          ).pipe(Effect.forkChild)
-          const opened = yield* Effect.raceFirst(
-            Queue.take(events),
-            Fiber.join(fiber).pipe(Effect.andThen(Effect.die("Open stream ended before Opened")))
-          )
-          assert.strictEqual(opened._tag, "Opened")
-          return { opened: opened as PeerRpc.Opened, fiber }
-        })
-
-      yield* TestClock.setTime(0)
-      const first = yield* openDirect()
-
-      yield* TestClock.setTime(2_000)
-      yield* fixture.directPush({ sessionId: first.opened.sessionId, payload: yield* fixture.encode(0) })
-      assert.strictEqual(yield* Queue.take(fixture.received), 0)
-
-      yield* TestClock.setTime(10_000)
-      const second = yield* openDirect()
-
-      yield* TestClock.setTime(3_000)
-      yield* fixture.directPush({ sessionId: second.opened.sessionId, payload: yield* fixture.encode(1) })
-      assert.strictEqual(yield* Queue.take(fixture.received), 1)
-
-      yield* TestClock.setTime(4_000)
-      const laterExit = yield* fixture.directPush({
-        sessionId: second.opened.sessionId,
-        payload: yield* fixture.encode(2)
-      }).pipe(Effect.exit)
-      assert.isTrue(Exit.isFailure(laterExit), "expected the fourth push to stay capacity rejected")
-      if (Exit.isFailure(laterExit)) {
-        const failure = Cause.findErrorOption(laterExit.cause)
-        assert.isTrue(Option.isSome(failure) && failure.value._tag === "RequestCapacityExceeded")
-      }
-      assert.strictEqual((yield* Queue.poll(fixture.received))._tag, "None")
-
-      yield* Fiber.interrupt(first.fiber)
-      yield* Fiber.interrupt(second.fiber)
-    })))
-
-  it.effect("does not let a stale Push rewind the shared clock advanced by a rejected Open", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        rpcLimits: {
-          openBurst: 1,
-          openRatePerSecond: Number.MIN_VALUE,
-          pushBurst: 1,
-          pushRatePerSecond: 1
-        }
-      })
-      const documents = [{ documentType: Task.name, documentId: taskId }]
-      const session = yield* fixture.open(documents)
-
-      yield* TestClock.setTime(2_000)
-      yield* fixture.directPush({ sessionId: session.opened.sessionId, payload: yield* fixture.encode(0) })
-      assert.strictEqual(yield* Queue.take(fixture.received), 0)
-
-      yield* TestClock.setTime(10_000)
-      const rejectedOpen = yield* fixture.directOpen(documents).pipe(Stream.runDrain, Effect.flip)
-      assert.strictEqual(rejectedOpen._tag, "RequestCapacityExceeded")
-
-      yield* TestClock.setTime(3_000)
-      yield* fixture.directPush({ sessionId: session.opened.sessionId, payload: yield* fixture.encode(1) })
-      assert.strictEqual(yield* Queue.take(fixture.received), 1)
-
-      yield* TestClock.setTime(4_000)
-      const laterExit = yield* fixture.directPush({
-        sessionId: session.opened.sessionId,
-        payload: yield* fixture.encode(2)
-      }).pipe(Effect.exit)
-      assert.isTrue(Exit.isFailure(laterExit), "expected the later Push to remain capacity rejected")
-      if (Exit.isFailure(laterExit)) {
-        const failure = Cause.findErrorOption(laterExit.cause)
-        assert.isTrue(Option.isSome(failure) && failure.value._tag === "RequestCapacityExceeded")
-      }
-      assert.strictEqual((yield* Queue.poll(fixture.received))._tag, "None")
-
-      yield* Fiber.interrupt(session.fiber)
-    })))
-
-  it.effect("does not let a stale Open ignore the shared subject clock advanced by a Push", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        rpcLimits: {
-          openBurst: 1,
-          openRatePerSecond: 1,
-          maxInFlightOpenPerSubject: 100,
-          maxSessionsPerSubject: 100
-        }
-      })
-      const documents = [{ documentType: Task.name, documentId: taskId }]
-      const openDirect = () =>
-        Effect.gen(function*() {
-          const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
-          const fiber = yield* Stream.runForEach(
-            fixture.directOpen(documents),
-            (event) => Queue.offer(events, event).pipe(Effect.asVoid)
-          ).pipe(Effect.forkChild)
-          const opened = yield* Effect.raceFirst(
-            Queue.take(events),
-            Fiber.join(fiber).pipe(Effect.andThen(Effect.die("Open stream ended before Opened")))
-          )
-          assert.strictEqual(opened._tag, "Opened")
-          return { opened: opened as PeerRpc.Opened, fiber }
-        })
-
-      yield* TestClock.setTime(0)
-      const first = yield* openDirect()
-      yield* TestClock.setTime(10_000)
-      yield* fixture.directPush({ sessionId: first.opened.sessionId, payload: yield* fixture.encode(0) })
-      assert.strictEqual(yield* Queue.take(fixture.received), 0)
-
-      yield* TestClock.setTime(500)
-      const second = yield* openDirect()
-      yield* fixture.directPush({ sessionId: second.opened.sessionId, payload: yield* fixture.encode(1) })
-      assert.strictEqual(yield* Queue.take(fixture.received), 1)
-
-      yield* Fiber.interrupt(first.fiber)
-      yield* Fiber.interrupt(second.fiber)
-    })))
-
-  it.effect("keeps inactive subject retention monotonic after a stale admitted Open", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        rpcLimits: {
-          openBurst: 2,
-          openRatePerSecond: 1,
-          rateLimitIdleRetention: 1_000
-        },
-        authorization: () => Effect.fail(new PeerRpcError.AccessDenied())
-      })
-      const documents = [{ documentType: Task.name, documentId: taskId }]
-      const attempt = () => fixture.directOpen(documents).pipe(Stream.runDrain, Effect.flip)
-
-      assert.strictEqual((yield* attempt())._tag, "AccessDenied")
-      yield* TestClock.setTime(10_000)
-      assert.strictEqual((yield* attempt())._tag, "AccessDenied")
-      yield* TestClock.setTime(500)
-      assert.strictEqual((yield* attempt())._tag, "AccessDenied")
-
-      yield* TestClock.setTime(1_500)
-      assert.strictEqual((yield* attempt())._tag, "RequestCapacityExceeded")
-    })))
-
-  it.effect("admits a Push exactly when fractional refill reaches one token", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture({
-        ...baseOptions,
-        rpcLimits: { pushBurst: 1, pushRatePerSecond: 1 }
-      })
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      yield* fixture.directPush({ sessionId: session.opened.sessionId, payload: yield* fixture.encode(0) })
-      assert.strictEqual(yield* Queue.take(fixture.received), 0)
-
-      yield* TestClock.setTime(999)
-      const fractional = yield* fixture.directPush({
-        sessionId: session.opened.sessionId,
-        payload: yield* fixture.encode(1)
-      }).pipe(Effect.flip)
-      assert.strictEqual(fractional._tag, "RequestCapacityExceeded")
-
-      yield* TestClock.setTime(1_000)
-      yield* fixture.directPush({ sessionId: session.opened.sessionId, payload: yield* fixture.encode(1) })
-      assert.strictEqual(yield* Queue.take(fixture.received), 1)
-      yield* Fiber.interrupt(session.fiber)
-    })))
-
-  it.effect("rejects a Push payload beyond the sync envelope limit", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture(baseOptions)
-      const session = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      const oversized = new Uint8Array(
-        PeerSession.maximumSyncEnvelopeBytes(
-          replicaLimits.maxSyncMessageBytes,
-          replicaLimits.maxSyncChangesPerMessage
-        ) + 1
-      )
-      const rejected = yield* fixture.client.Push({
-        sessionId: session.opened.sessionId,
-        payload: oversized
-      }).pipe(Effect.flip)
-      assert.instanceOf(rejected, PeerRpcError.RequestLimitExceeded)
-      assert.strictEqual((yield* Queue.poll(fixture.received))._tag, "None")
-      yield* Fiber.interrupt(session.fiber)
-    })))
-
-  it.effect("marks every session dirty on a full refresh commit", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const fixture = yield* makeFixture(baseOptions)
-      const task = yield* fixture.open([{ documentType: Task.name, documentId: taskId }])
-      assert.strictEqual(yield* Queue.take(fixture.generated), taskId)
-      yield* fixture.setCredential("foreign")
-      const note = yield* fixture.open([{ documentType: Note.name, documentId: noteId }])
-      assert.strictEqual(yield* Queue.take(fixture.generated), noteId)
-      yield* Queue.offer(fixture.commits, { _tag: "FullRefreshRequired", refreshGeneration: 1 })
-      yield* Queue.take(fixture.commitProcessed)
-      const refreshed = yield* Effect.all([Queue.take(fixture.generated), Queue.take(fixture.generated)])
-      assert.deepStrictEqual(new Set(refreshed), new Set([taskId, noteId]))
-      yield* Fiber.interrupt(task.fiber)
-      yield* Fiber.interrupt(note.fiber)
-    })))
 })
 
 const relayTransition: PeerRelayStore.TransitionResult = {
@@ -2838,7 +121,7 @@ const relayPrincipal: PeerAuthentication.PeerPrincipal = {
 }
 
 const relayOpenRequest = {
-  version: PeerRelayRpc.protocolVersion,
+  protocolVersion: PeerRpc.protocolVersion,
   expectedRelayPeerId: serverPeerId,
   expectedLocal: relayPrincipal,
   senderReplicaIncarnation: Identity.ReplicaIncarnation.make(1),
@@ -2849,7 +132,7 @@ const relayOpenRequest = {
   documents: [{ documentType: Task.name, documentId: taskId }],
   receiptRetentionMillis: PeerRelayLimits.defaults.maximumReceiptRetentionMillis,
   senderRetryHorizonMillis: PeerRelayLimits.defaults.maximumSenderRetryHorizonMillis
-} satisfies typeof PeerRelayRpc.OpenRelayRpc.payloadSchema.Type
+} satisfies typeof PeerRpc.OpenRpc.payloadSchema.Type
 
 const relayAuthenticated = {
   principal: relayPrincipal,
@@ -2916,9 +199,9 @@ const makeRelayPayload = Effect.gen(function*() {
 
 const makeRelayClaim = (
   relayMessageId: Identity.RelayMessageId,
-  claimToken: PeerRelayRpc.ClaimToken,
+  claimToken: PeerRpc.ClaimToken,
   messageHash: string,
-  outerEnvelopeDigest: PeerRelayRpc.RelayDigest,
+  outerEnvelopeDigest: PeerRpc.RelayDigest,
   payloadBytes: number,
   sessionGeneration: number
 ) =>
@@ -2962,7 +245,7 @@ const makeRelayOuterEnvelopeDigest = (
     },
     relayPeerId: serverPeerId,
     relayMessageId,
-    protocolVersion: PeerRelayRpc.protocolVersion,
+    protocolVersion: PeerRpc.protocolVersion,
     payloadVersion: 1,
     senderReplicaIncarnation: relayOpenRequest.senderReplicaIncarnation,
     senderConnectionEpoch: "epoch",
@@ -2993,7 +276,7 @@ const makeRelayHandlerContext = (
   }
 ) =>
   Layer.build(
-    PeerRpcServer.layerRelayHandlers({
+    PeerRpcServer.layerHandlers({
       tenantId: "tenant",
       peerId: serverPeerId
     }).pipe(
@@ -3021,7 +304,7 @@ const relayHandlerEffect = <A, E, R,>(
 
 const makeTerminalRelayContext = (
   relayMessageId: Identity.RelayMessageId,
-  claimToken: PeerRelayRpc.ClaimToken,
+  claimToken: PeerRpc.ClaimToken,
   authorization: Context.Service.Shape<typeof PeerRelayAuthorization.PeerRelayAuthorization>,
   acknowledge: PeerRelayStore.Service["acknowledge"]
 ) =>
@@ -3085,7 +368,7 @@ const makeTerminalRelayContext = (
     )
   })
 
-describe("PeerRpcServer relay", () => {
+describe("PeerRpcServer", () => {
   it.effect("denies operation admission after an absolute grant deadline", () =>
     Effect.scoped(Effect.gen(function*() {
       let now = 0
@@ -3130,11 +413,11 @@ describe("PeerRpcServer relay", () => {
       })
       const context = yield* makeRelayHandlerContext(authorization, store)
       const openHandler = context.mapUnsafe.get(
-        PeerRelayRpc.OpenRelayRpc.key
-      ) as Rpc.Handler<"OpenRelay">
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
       const pushHandler = context.mapUnsafe.get(
-        PeerRelayRpc.PushRelayRpc.key
-      ) as Rpc.Handler<"PushRelay">
+        PeerRpc.PushRpc.key
+      ) as Rpc.Handler<"Push">
       const provide = <A, E, R,>(
         handler: Rpc.Handler<any>,
         effect: Effect.Effect<A, E, R>
@@ -3152,23 +435,23 @@ describe("PeerRpcServer relay", () => {
             )
           )
         )
-      const events = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
       const openFiber = yield* Stream.runForEach(
         openHandler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>,
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>,
         (event) => Queue.offer(events, event)
       ).pipe(
         (effect) => provide(openHandler, effect),
         Effect.forkScoped
       )
       const opened = yield* Queue.take(events)
-      assert.strictEqual(opened._tag, "RelayOpened")
+      assert.strictEqual(opened._tag, "Opened")
       const { payload } = yield* makeRelayPayload
       const denied = yield* (
         pushHandler.handler({
-          sessionId: (opened as PeerRelayRpc.RelayOpened).sessionId,
+          sessionId: (opened as PeerRpc.Opened).sessionId,
           relayMessageId: Identity.RelayMessageId.make(
             "rly_00000000-0000-4000-8000-000000000052"
           ),
@@ -3206,14 +489,14 @@ describe("PeerRpcServer relay", () => {
         makeRelayStore()
       ).pipe(Effect.provideService(Clock.Clock, testClock))
       const handler = context.mapUnsafe.get(
-        PeerRelayRpc.OpenRelayRpc.key
-      ) as Rpc.Handler<"OpenRelay">
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
       const now = yield* Clock.currentTimeMillis
       const fiber = yield* Stream.runHead(
         handler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>
       ).pipe(
         Effect.provideContext(
           Context.add(
@@ -3282,25 +565,25 @@ describe("PeerRpcServer relay", () => {
       })
       const context = yield* makeRelayHandlerContext(authorization, store)
       const openHandler = context.mapUnsafe.get(
-        PeerRelayRpc.OpenRelayRpc.key
-      ) as Rpc.Handler<"OpenRelay">
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
       const pushHandler = context.mapUnsafe.get(
-        PeerRelayRpc.PushRelayRpc.key
-      ) as Rpc.Handler<"PushRelay">
-      const events = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+        PeerRpc.PushRpc.key
+      ) as Rpc.Handler<"Push">
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
       const openFiber = yield* Stream.runForEach(
         openHandler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>,
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>,
         (event) => Queue.offer(events, event)
       ).pipe(
         (effect) => relayHandlerEffect(openHandler, effect),
         Effect.forkScoped
       )
       const opened = yield* Queue.take(events)
-      assert.strictEqual(opened._tag, "RelayOpened")
-      const sessionId = (opened as PeerRelayRpc.RelayOpened).sessionId
+      assert.strictEqual(opened._tag, "Opened")
+      const sessionId = (opened as PeerRpc.Opened).sessionId
       const { payload } = yield* makeRelayPayload
       const push = (relayMessageId: Identity.RelayMessageId) =>
         pushHandler.handler({
@@ -3381,20 +664,20 @@ describe("PeerRpcServer relay", () => {
       })
       const context = yield* makeRelayHandlerContext(authorization, store)
       const openHandler = context.mapUnsafe.get(
-        PeerRelayRpc.OpenRelayRpc.key
-      ) as Rpc.Handler<"OpenRelay">
-      const events = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
       const openFiber = yield* Stream.runForEach(
         openHandler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>,
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>,
         (event) => Queue.offer(events, event)
       ).pipe(
         (effect) => relayHandlerEffect(openHandler, effect),
         Effect.forkScoped
       )
-      assert.strictEqual((yield* Queue.take(events))._tag, "RelayOpened")
+      assert.strictEqual((yield* Queue.take(events))._tag, "Opened")
       yield* Deferred.await(receiveDenied)
       yield* Effect.yieldNow
       assert.strictEqual(yield* Ref.get(claimCalls), 0)
@@ -3440,29 +723,29 @@ describe("PeerRpcServer relay", () => {
       })
       const context = yield* makeRelayHandlerContext(authorization, store)
       const openHandler = context.mapUnsafe.get(
-        PeerRelayRpc.OpenRelayRpc.key
-      ) as Rpc.Handler<"OpenRelay">
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
       const pushHandler = context.mapUnsafe.get(
-        PeerRelayRpc.PushRelayRpc.key
-      ) as Rpc.Handler<"PushRelay">
-      const events = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+        PeerRpc.PushRpc.key
+      ) as Rpc.Handler<"Push">
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
       const openFiber = yield* Stream.runForEach(
         openHandler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>,
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>,
         (event) => Queue.offer(events, event)
       ).pipe(
         (effect) => relayHandlerEffect(openHandler, effect),
         Effect.forkScoped
       )
       const opened = yield* Queue.take(events)
-      assert.strictEqual(opened._tag, "RelayOpened")
+      assert.strictEqual(opened._tag, "Opened")
       pushing = true
       const { payload } = yield* makeRelayPayload
       const pushFiber = yield* (
         pushHandler.handler({
-          sessionId: (opened as PeerRelayRpc.RelayOpened).sessionId,
+          sessionId: (opened as PeerRpc.Opened).sessionId,
           relayMessageId: Identity.RelayMessageId.make(
             "rly_00000000-0000-4000-8000-000000000043"
           ),
@@ -3482,7 +765,7 @@ describe("PeerRpcServer relay", () => {
       assert.strictEqual(yield* Ref.get(commits), 1)
       const later = yield* (
         pushHandler.handler({
-          sessionId: (opened as PeerRelayRpc.RelayOpened).sessionId,
+          sessionId: (opened as PeerRpc.Opened).sessionId,
           relayMessageId: Identity.RelayMessageId.make(
             "rly_00000000-0000-4000-8000-000000000046"
           ),
@@ -3518,7 +801,7 @@ describe("PeerRpcServer relay", () => {
       const acknowledgeCalls = yield* Ref.make(0)
       const context = yield* makeTerminalRelayContext(
         Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000050"),
-        PeerRelayRpc.ClaimToken.make("clm_00000000-0000-4000-8000-000000000050"),
+        PeerRpc.ClaimToken.make("clm_00000000-0000-4000-8000-000000000050"),
         authorization,
         () =>
           Ref.update(acknowledgeCalls, (count) => count + 1).pipe(
@@ -3526,17 +809,17 @@ describe("PeerRpcServer relay", () => {
           )
       )
       const openHandler = context.mapUnsafe.get(
-        PeerRelayRpc.OpenRelayRpc.key
-      ) as Rpc.Handler<"OpenRelay">
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
       const acknowledgeHandler = context.mapUnsafe.get(
-        PeerRelayRpc.AcknowledgeRelayRpc.key
-      ) as Rpc.Handler<"AcknowledgeRelay">
-      const events = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+        PeerRpc.AcknowledgeRpc.key
+      ) as Rpc.Handler<"Acknowledge">
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
       const openFiber = yield* Stream.runForEach(
         openHandler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>,
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>,
         (event) => Queue.offer(events, event)
       ).pipe(
         (effect) => relayHandlerEffect(openHandler, effect),
@@ -3544,7 +827,7 @@ describe("PeerRpcServer relay", () => {
       )
       const opened = yield* Queue.take(events)
       const stored = yield* Queue.take(events)
-      if (opened._tag !== "RelayOpened" || stored._tag !== "StoredMessage") {
+      if (opened._tag !== "Opened" || stored._tag !== "StoredMessage") {
         return assert.fail("Expected relay open and stored message events")
       }
       const denied = yield* (
@@ -3587,7 +870,7 @@ describe("PeerRpcServer relay", () => {
       const acknowledgeCalls = yield* Ref.make(0)
       const context = yield* makeTerminalRelayContext(
         Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000051"),
-        PeerRelayRpc.ClaimToken.make("clm_00000000-0000-4000-8000-000000000051"),
+        PeerRpc.ClaimToken.make("clm_00000000-0000-4000-8000-000000000051"),
         authorization,
         () =>
           Effect.uninterruptible(
@@ -3599,18 +882,18 @@ describe("PeerRpcServer relay", () => {
           )
       )
       const openHandler = context.mapUnsafe.get(
-        PeerRelayRpc.OpenRelayRpc.key
-      ) as Rpc.Handler<"OpenRelay">
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
       const acknowledgeHandler = context.mapUnsafe.get(
-        PeerRelayRpc.AcknowledgeRelayRpc.key
-      ) as Rpc.Handler<"AcknowledgeRelay">
-      const runtime = Context.get(context, PeerRpcServer.PeerRelayServerRuntime)
-      const events = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+        PeerRpc.AcknowledgeRpc.key
+      ) as Rpc.Handler<"Acknowledge">
+      const runtime = Context.get(context, PeerRpcServer.PeerRpcServerRuntime)
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
       const openFiber = yield* Stream.runForEach(
         openHandler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>,
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>,
         (event) => Queue.offer(events, event)
       ).pipe(
         (effect) => relayHandlerEffect(openHandler, effect),
@@ -3618,7 +901,7 @@ describe("PeerRpcServer relay", () => {
       )
       const opened = yield* Queue.take(events)
       const stored = yield* Queue.take(events)
-      if (opened._tag !== "RelayOpened" || stored._tag !== "StoredMessage") {
+      if (opened._tag !== "Opened" || stored._tag !== "StoredMessage") {
         return assert.fail("Expected relay open and stored message events")
       }
       const terminalFiber = yield* (
@@ -3648,7 +931,7 @@ describe("PeerRpcServer relay", () => {
       const relayMessageId = Identity.RelayMessageId.make(
         "rly_00000000-0000-4000-8000-000000000047"
       )
-      const claimToken = PeerRelayRpc.ClaimToken.make(
+      const claimToken = PeerRpc.ClaimToken.make(
         "clm_00000000-0000-4000-8000-000000000047"
       )
       const { messageHash, payload } = yield* makeRelayPayload
@@ -3736,21 +1019,21 @@ describe("PeerRpcServer relay", () => {
         ingress
       )
       const openHandler = context.mapUnsafe.get(
-        PeerRelayRpc.OpenRelayRpc.key
-      ) as Rpc.Handler<"OpenRelay">
-      const runtime = Context.get(context, PeerRpcServer.PeerRelayServerRuntime)
-      const events = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
+      const runtime = Context.get(context, PeerRpcServer.PeerRpcServerRuntime)
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
       const openFiber = yield* Stream.runForEach(
         openHandler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>,
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>,
         (event) => Queue.offer(events, event)
       ).pipe(
         (effect) => relayHandlerEffect(openHandler, effect),
         Effect.forkScoped
       )
-      assert.strictEqual((yield* Queue.take(events))._tag, "RelayOpened")
+      assert.strictEqual((yield* Queue.take(events))._tag, "Opened")
       yield* Deferred.await(claimStarted)
       yield* Deferred.succeed(receiveInvalidated, undefined)
       yield* Effect.yieldNow
@@ -3766,7 +1049,7 @@ describe("PeerRpcServer relay", () => {
       const relayMessageId = Identity.RelayMessageId.make(
         "rly_00000000-0000-4000-8000-000000000048"
       )
-      const claimToken = PeerRelayRpc.ClaimToken.make(
+      const claimToken = PeerRpc.ClaimToken.make(
         "clm_00000000-0000-4000-8000-000000000048"
       )
       const { messageHash, payload } = yield* makeRelayPayload
@@ -3848,22 +1131,22 @@ describe("PeerRpcServer relay", () => {
         ingress
       )
       const handler = context.mapUnsafe.get(
-        PeerRelayRpc.OpenRelayRpc.key
-      ) as Rpc.Handler<"OpenRelay">
-      const runtime = Context.get(context, PeerRpcServer.PeerRelayServerRuntime)
-      const events = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
+      const runtime = Context.get(context, PeerRpcServer.PeerRpcServerRuntime)
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
       const openFiber = yield* Stream.runForEach(
         handler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>,
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>,
         (event) => Queue.offer(events, event)
       ).pipe(
         (effect) => relayHandlerEffect(handler, effect),
         Effect.exit,
         Effect.forkScoped
       )
-      assert.strictEqual((yield* Queue.take(events))._tag, "RelayOpened")
+      assert.strictEqual((yield* Queue.take(events))._tag, "Opened")
       yield* Deferred.await(transferStarted)
       yield* Deferred.succeed(sessionInvalidated, undefined)
       for (let index = 0; index < 20; index++) yield* Effect.yieldNow
@@ -3879,7 +1162,7 @@ describe("PeerRpcServer relay", () => {
       const relayMessageId = Identity.RelayMessageId.make(
         "rly_00000000-0000-4000-8000-000000000044"
       )
-      const claimToken = PeerRelayRpc.ClaimToken.make(
+      const claimToken = PeerRpc.ClaimToken.make(
         "clm_00000000-0000-4000-8000-000000000044"
       )
       const { messageHash, payload } = yield* makeRelayPayload
@@ -3955,21 +1238,21 @@ describe("PeerRpcServer relay", () => {
         ingress
       )
       const openHandler = context.mapUnsafe.get(
-        PeerRelayRpc.OpenRelayRpc.key
-      ) as Rpc.Handler<"OpenRelay">
-      const runtime = Context.get(context, PeerRpcServer.PeerRelayServerRuntime)
-      const events = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
+      const runtime = Context.get(context, PeerRpcServer.PeerRpcServerRuntime)
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
       const openFiber = yield* Stream.runForEach(
         openHandler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>,
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>,
         (event) => Queue.offer(events, event)
       ).pipe(
         (effect) => relayHandlerEffect(openHandler, effect),
         Effect.forkScoped
       )
-      assert.strictEqual((yield* Queue.take(events))._tag, "RelayOpened")
+      assert.strictEqual((yield* Queue.take(events))._tag, "Opened")
       yield* Deferred.await(released)
       yield* Effect.yieldNow
       yield* Effect.yieldNow
@@ -3984,7 +1267,7 @@ describe("PeerRpcServer relay", () => {
       const relayMessageId = Identity.RelayMessageId.make(
         "rly_00000000-0000-4000-8000-000000000045"
       )
-      const claimToken = PeerRelayRpc.ClaimToken.make(
+      const claimToken = PeerRpc.ClaimToken.make(
         "clm_00000000-0000-4000-8000-000000000045"
       )
       const { messageHash, payload } = yield* makeRelayPayload
@@ -4054,28 +1337,28 @@ describe("PeerRpcServer relay", () => {
         ingress
       )
       const openHandler = context.mapUnsafe.get(
-        PeerRelayRpc.OpenRelayRpc.key
-      ) as Rpc.Handler<"OpenRelay">
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
       const acknowledgeHandler = context.mapUnsafe.get(
-        PeerRelayRpc.AcknowledgeRelayRpc.key
-      ) as Rpc.Handler<"AcknowledgeRelay">
-      const runtime = Context.get(context, PeerRpcServer.PeerRelayServerRuntime)
-      const events = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+        PeerRpc.AcknowledgeRpc.key
+      ) as Rpc.Handler<"Acknowledge">
+      const runtime = Context.get(context, PeerRpcServer.PeerRpcServerRuntime)
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
       const openFiber = yield* Stream.runForEach(
         openHandler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>,
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>,
         (event) => Queue.offer(events, event)
       ).pipe(
         (effect) => relayHandlerEffect(openHandler, effect),
         Effect.forkScoped
       )
       const opened = yield* Queue.take(events)
-      assert.strictEqual(opened._tag, "RelayOpened")
+      assert.strictEqual(opened._tag, "Opened")
       const stored = yield* Queue.take(events)
       assert.strictEqual(stored._tag, "StoredMessage")
-      if (opened._tag !== "RelayOpened" || stored._tag !== "StoredMessage") {
+      if (opened._tag !== "Opened" || stored._tag !== "StoredMessage") {
         return assert.fail("Expected relay open and stored message events")
       }
       const error = yield* (
@@ -4138,21 +1421,21 @@ describe("PeerRpcServer relay", () => {
       })
       const context = yield* makeRelayHandlerContext(authorization, store)
       const openHandler = context.mapUnsafe.get(
-        PeerRelayRpc.OpenRelayRpc.key
-      ) as Rpc.Handler<"OpenRelay">
-      const runtime = Context.get(context, PeerRpcServer.PeerRelayServerRuntime)
-      const events = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
+      const runtime = Context.get(context, PeerRpcServer.PeerRpcServerRuntime)
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
       const openFiber = yield* Stream.runForEach(
         openHandler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>,
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>,
         (event) => Queue.offer(events, event)
       ).pipe(
         (effect) => relayHandlerEffect(openHandler, effect),
         Effect.forkScoped
       )
-      assert.strictEqual((yield* Queue.take(events))._tag, "RelayOpened")
+      assert.strictEqual((yield* Queue.take(events))._tag, "Opened")
       yield* Deferred.await(claimStarted)
       yield* Deferred.succeed(sessionInvalidated, undefined)
       yield* Effect.yieldNow
@@ -4259,7 +1542,7 @@ describe("PeerRpcServer relay", () => {
         usage: Effect.succeed({ connections: 0, reservedBytes: 0, byteReservationWaiters: 0 }),
         await: Effect.never
       })
-      const handlers = PeerRpcServer.layerRelayHandlers({
+      const handlers = PeerRpcServer.layerHandlers({
         tenantId: "tenant",
         peerId: serverPeerId
       }).pipe(
@@ -4272,12 +1555,12 @@ describe("PeerRpcServer relay", () => {
         ))
       )
       const context = yield* Layer.build(handlers)
-      const openHandler = context.mapUnsafe.get(PeerRelayRpc.OpenRelayRpc.key) as Rpc.Handler<"OpenRelay">
-      const pushHandler = context.mapUnsafe.get(PeerRelayRpc.PushRelayRpc.key) as Rpc.Handler<"PushRelay">
+      const openHandler = context.mapUnsafe.get(PeerRpc.OpenRpc.key) as Rpc.Handler<"Open">
+      const pushHandler = context.mapUnsafe.get(PeerRpc.PushRpc.key) as Rpc.Handler<"Push">
       const acknowledgeHandler = context.mapUnsafe.get(
-        PeerRelayRpc.AcknowledgeRelayRpc.key
-      ) as Rpc.Handler<"AcknowledgeRelay">
-      const runtime = Context.get(context, PeerRpcServer.PeerRelayServerRuntime)
+        PeerRpc.AcknowledgeRpc.key
+      ) as Rpc.Handler<"Acknowledge">
+      const runtime = Context.get(context, PeerRpcServer.PeerRpcServerRuntime)
       const protocolStopped = yield* Deferred.make<void>()
       const ingressStopped = yield* Deferred.make<void>()
       const baseProtocol = yield* RpcServer.Protocol.make(() =>
@@ -4300,7 +1583,7 @@ describe("PeerRpcServer relay", () => {
           )
       }
       const openRequest = {
-        version: PeerRelayRpc.protocolVersion,
+        protocolVersion: PeerRpc.protocolVersion,
         expectedRelayPeerId: serverPeerId,
         expectedLocal: localPrincipal,
         senderReplicaIncarnation: Identity.ReplicaIncarnation.make(1),
@@ -4311,7 +1594,7 @@ describe("PeerRpcServer relay", () => {
         documents: [{ documentType: Task.name, documentId: taskId }],
         receiptRetentionMillis: PeerRelayLimits.defaults.maximumReceiptRetentionMillis,
         senderRetryHorizonMillis: PeerRelayLimits.defaults.maximumSenderRetryHorizonMillis
-      } satisfies typeof PeerRelayRpc.OpenRelayRpc.payloadSchema.Type
+      } satisfies typeof PeerRpc.OpenRpc.payloadSchema.Type
       const authenticated = {
         principal: localPrincipal,
         validUntil: Number.MAX_SAFE_INTEGER,
@@ -4320,8 +1603,8 @@ describe("PeerRpcServer relay", () => {
       const stream = openHandler.handler(
         openRequest,
         {} as never
-      ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>
-      const events = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+      ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
       const openFiber = yield* Stream.runForEach(
         stream.pipe(
           Stream.provideContext(Context.add(
@@ -4333,9 +1616,9 @@ describe("PeerRpcServer relay", () => {
         (event) => Queue.offer(events, event)
       ).pipe(Effect.forkScoped)
       const opened = yield* Queue.take(events)
-      assert.strictEqual(opened._tag, "RelayOpened")
+      assert.strictEqual(opened._tag, "Opened")
       assert.strictEqual(
-        (opened as PeerRelayRpc.RelayOpened).remotePeerId,
+        (opened as PeerRpc.Opened).remotePeerId,
         remotePeerB
       )
       const relayMessageId = Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000001")
@@ -4366,7 +1649,7 @@ describe("PeerRpcServer relay", () => {
         },
         relayPeerId: serverPeerId,
         relayMessageId,
-        protocolVersion: PeerRelayRpc.protocolVersion,
+        protocolVersion: PeerRpc.protocolVersion,
         payloadVersion: 1,
         senderReplicaIncarnation: Identity.ReplicaIncarnation.make(1),
         senderConnectionEpoch: "epoch",
@@ -4381,7 +1664,7 @@ describe("PeerRpcServer relay", () => {
         payload
       }).pipe(Effect.provideService(Crypto.Crypto, crypto))
       yield* (pushHandler.handler({
-        sessionId: (opened as PeerRelayRpc.RelayOpened).sessionId,
+        sessionId: (opened as PeerRpc.Opened).sessionId,
         relayMessageId,
         payload
       }, {} as never) as Effect.Effect<void, PeerRpcError.PeerRpcError>).pipe(
@@ -4398,7 +1681,7 @@ describe("PeerRpcServer relay", () => {
         (openHandler.handler(
           openRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>).pipe(
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>).pipe(
           Stream.provideContext(Context.add(
             openHandler.context,
             PeerAuthentication.AuthenticatedPeer,
@@ -4412,7 +1695,7 @@ describe("PeerRpcServer relay", () => {
       }
       authorizationDefect = undefined
       const ownerContext = yield* Layer.build(Layer.fresh(handlers))
-      const ownerRuntime = Context.get(ownerContext, PeerRpcServer.PeerRelayServerRuntime)
+      const ownerRuntime = Context.get(ownerContext, PeerRpcServer.PeerRpcServerRuntime)
       const serverContext = Context.add(
         Context.add(
           Context.add(
@@ -4438,7 +1721,7 @@ describe("PeerRpcServer relay", () => {
         )
       )
       yield* Layer.build(
-        PeerRpcServer.layerRelayServer.pipe(
+        PeerRpcServer.layerServer.pipe(
           Layer.provide(Layer.succeedContext(serverContext))
         )
       )
@@ -4457,9 +1740,9 @@ describe("PeerRpcServer relay", () => {
       yield* runtime.shutdown
       yield* runtime.shutdown
       const stale = yield* (acknowledgeHandler.handler({
-        sessionId: (opened as PeerRelayRpc.RelayOpened).sessionId,
+        sessionId: (opened as PeerRpc.Opened).sessionId,
         relayMessageId,
-        claimToken: PeerRelayRpc.ClaimToken.make("clm_00000000-0000-4000-8000-000000000001"),
+        claimToken: PeerRpc.ClaimToken.make("clm_00000000-0000-4000-8000-000000000001"),
         messageHash
       }, {} as never) as Effect.Effect<void, PeerRpcError.PeerRpcError>).pipe(
         Effect.provideContext(Context.add(
@@ -4486,7 +1769,7 @@ describe("PeerRpcServer relay", () => {
       const relayMessageId = Identity.RelayMessageId.make(
         "rly_00000000-0000-4000-8000-000000000021"
       )
-      const claimToken = PeerRelayRpc.ClaimToken.make(
+      const claimToken = PeerRpc.ClaimToken.make(
         "clm_00000000-0000-4000-8000-000000000021"
       )
       const { messageHash, payload } = yield* makeRelayPayload
@@ -4501,7 +1784,7 @@ describe("PeerRpcServer relay", () => {
         },
         relayPeerId: serverPeerId,
         relayMessageId,
-        protocolVersion: PeerRelayRpc.protocolVersion,
+        protocolVersion: PeerRpc.protocolVersion,
         payloadVersion: 1,
         senderReplicaIncarnation: relayOpenRequest.senderReplicaIncarnation,
         senderConnectionEpoch: "epoch",
@@ -4619,21 +1902,21 @@ describe("PeerRpcServer relay", () => {
         ingress
       )
       const handler = context.mapUnsafe.get(
-        PeerRelayRpc.OpenRelayRpc.key
-      ) as Rpc.Handler<"OpenRelay">
-      const events = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
       const openFiber = yield* Stream.runForEach(
         handler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>,
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>,
         (event) => Queue.offer(events, event)
       ).pipe(
         (effect) => relayHandlerEffect(handler, effect),
         Effect.forkScoped
       )
       const opened = yield* Queue.take(events)
-      assert.strictEqual(opened._tag, "RelayOpened")
+      assert.strictEqual(opened._tag, "Opened")
       assert.strictEqual(yield* Deferred.await(deliverySettled), "Released")
       assert.strictEqual(yield* Ref.get(storeReleaseCalls), 1)
       assert.strictEqual(yield* Ref.get(reservationReleaseCalls), 1)
@@ -4684,13 +1967,13 @@ describe("PeerRpcServer relay", () => {
         })
       )
       const handler = context.mapUnsafe.get(
-        PeerRelayRpc.OpenRelayRpc.key
-      ) as Rpc.Handler<"OpenRelay">
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
       const invoke = Stream.runHead(
         handler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>
       ).pipe(
         (effect) => relayHandlerEffect(handler, effect),
         Effect.asVoid
@@ -4704,6 +1987,94 @@ describe("PeerRpcServer relay", () => {
       assert.strictEqual(yield* Ref.get(authorizationCalls), 1)
       yield* Deferred.succeed(releaseAuthorization, undefined)
       yield* Fiber.join(first)
+    })))
+
+  it.effect("detaches the incumbent when an interrupted replacement acquires the registry lock", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const replacementAuthorized = yield* Deferred.make<void>()
+      let trackReplacement = false
+      let replacementAuthorizationCalls = 0
+      const authorization = PeerRelayAuthorization.PeerRelayAuthorization.of({
+        authorize: (request) => {
+          if (trackReplacement) {
+            replacementAuthorizationCalls += 1
+            if (replacementAuthorizationCalls === 2) {
+              Deferred.doneUnsafe(replacementAuthorized, Effect.void)
+            }
+          }
+          return authorizeRelay(request)
+        },
+        authorizeUnsafeUnboundedAutomerge3Decode: authorizeUnsafeRelayDecode
+      })
+      const context = yield* makeRelayHandlerContext(authorization, makeRelayStore())
+      const handler = context.mapUnsafe.get(
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
+      const runtime = Context.get(context, PeerRpcServer.PeerRpcServerRuntime)
+      const invoke = (request: typeof PeerRpc.OpenRpc.payloadSchema.Type) =>
+        Stream.runForEach(
+          handler.handler(
+            request,
+            {} as never
+          ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>,
+          () => Effect.void
+        ).pipe((effect) => relayHandlerEffect(handler, effect))
+      const incumbent = yield* invoke(relayOpenRequest).pipe(Effect.forkScoped)
+      const blockerRequest = {
+        ...relayOpenRequest,
+        remote: {
+          subjectId: "registry-blocker",
+          peerId: remotePeerB
+        }
+      }
+      const blocker = yield* invoke(blockerRequest).pipe(Effect.forkScoped)
+      while ((yield* runtime.usage).sessions !== 2) {
+        yield* Effect.yieldNow
+      }
+
+      const registryLocked = yield* Deferred.make<void>()
+      const releaseRegistry = yield* Deferred.make<void>()
+      const setRelayActiveClaims = PeerRpcObservability.setRelayActiveClaims
+      const metricSpy = vi.spyOn(PeerRpcObservability, "setRelayActiveClaims")
+        .mockImplementation((amount) =>
+          Deferred.succeed(registryLocked, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseRegistry)),
+            Effect.andThen(setRelayActiveClaims(amount))
+          )
+        )
+
+      yield* Effect.gen(function*() {
+        const interruptBlocker = yield* Fiber.interrupt(blocker).pipe(Effect.forkScoped)
+        yield* Deferred.await(registryLocked)
+
+        trackReplacement = true
+        const replacement = yield* invoke(relayOpenRequest).pipe(Effect.forkScoped)
+        yield* Deferred.await(replacementAuthorized)
+        yield* Effect.forEach(
+          Array.from({ length: 10 }),
+          () => Effect.yieldNow,
+          { discard: true }
+        )
+        const interruptReplacement = yield* Fiber.interrupt(replacement).pipe(Effect.forkScoped)
+        yield* Effect.forEach(
+          Array.from({ length: 10 }),
+          () => Effect.yieldNow,
+          { discard: true }
+        )
+        assert.isUndefined(interruptReplacement.pollUnsafe())
+
+        yield* Deferred.succeed(releaseRegistry, undefined)
+        yield* Fiber.join(interruptBlocker)
+        yield* Fiber.join(interruptReplacement)
+        assert.strictEqual((yield* runtime.usage).sessions, 0)
+        yield* Fiber.interrupt(incumbent)
+      }).pipe(
+        Effect.ensuring(
+          Deferred.succeed(releaseRegistry, undefined).pipe(
+            Effect.andThen(Effect.sync(() => metricSpy.mockRestore()))
+          )
+        )
+      )
     })))
 
   it.effect("removes a newly registered Open when replacement cleanup is interrupted", () =>
@@ -4739,7 +2110,7 @@ describe("PeerRpcServer relay", () => {
       const relayMessageId = Identity.RelayMessageId.make(
         "rly_00000000-0000-4000-8000-000000000031"
       )
-      const claimToken = PeerRelayRpc.ClaimToken.make(
+      const claimToken = PeerRpc.ClaimToken.make(
         "clm_00000000-0000-4000-8000-000000000031"
       )
       const { messageHash, payload } = yield* makeRelayPayload
@@ -4754,7 +2125,7 @@ describe("PeerRpcServer relay", () => {
         },
         relayPeerId: serverPeerId,
         relayMessageId,
-        protocolVersion: PeerRelayRpc.protocolVersion,
+        protocolVersion: PeerRpc.protocolVersion,
         payloadVersion: 1,
         senderReplicaIncarnation: relayOpenRequest.senderReplicaIncarnation,
         senderConnectionEpoch: "epoch",
@@ -4841,21 +2212,21 @@ describe("PeerRpcServer relay", () => {
         ingress
       )
       const handler = context.mapUnsafe.get(
-        PeerRelayRpc.OpenRelayRpc.key
-      ) as Rpc.Handler<"OpenRelay">
-      const runtime = Context.get(context, PeerRpcServer.PeerRelayServerRuntime)
-      const events = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
+      const runtime = Context.get(context, PeerRpcServer.PeerRpcServerRuntime)
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
       const first = yield* Stream.runForEach(
         handler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>,
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>,
         (event) => Queue.offer(events, event)
       ).pipe(
         (effect) => relayHandlerEffect(handler, effect),
         Effect.forkScoped
       )
-      assert.strictEqual((yield* Queue.take(events))._tag, "RelayOpened")
+      assert.strictEqual((yield* Queue.take(events))._tag, "Opened")
       assert.strictEqual((yield* Queue.take(events))._tag, "StoredMessage")
       assert.strictEqual((yield* runtime.usage).activeClaims, 1)
       assert.strictEqual((yield* Metric.value(PeerRpcObservability.relayActiveClaims())).value, 1)
@@ -4881,7 +2252,7 @@ describe("PeerRpcServer relay", () => {
         handler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>
       ).pipe(
         (effect) => relayHandlerEffect(handler, effect),
         Effect.forkScoped
@@ -4904,25 +2275,25 @@ describe("PeerRpcServer relay", () => {
       claimed = false
       releaseStarted = yield* Deferred.make<void>()
       releaseGate = yield* Deferred.make<void>()
-      const nextEvents = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+      const nextEvents = yield* Queue.unbounded<PeerRpc.OpenEvent>()
       const nextIncumbent = yield* Stream.runForEach(
         handler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>,
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>,
         (event) => Queue.offer(nextEvents, event)
       ).pipe(
         (effect) => relayHandlerEffect(handler, effect),
         Effect.forkScoped
       )
-      assert.strictEqual((yield* Queue.take(nextEvents))._tag, "RelayOpened")
+      assert.strictEqual((yield* Queue.take(nextEvents))._tag, "Opened")
       assert.strictEqual((yield* Queue.take(nextEvents))._tag, "StoredMessage")
       trackLateMonitors = true
       const staleOpen = yield* Stream.runHead(
         handler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>
       ).pipe(
         (effect) => relayHandlerEffect(handler, effect),
         Effect.forkScoped
@@ -4934,7 +2305,7 @@ describe("PeerRpcServer relay", () => {
         handler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>
       ).pipe((effect) => relayHandlerEffect(handler, effect))
       yield* Deferred.succeed(releaseGate, undefined)
       yield* Fiber.join(staleOpen)
@@ -5010,29 +2381,29 @@ describe("PeerRpcServer relay", () => {
       })
       const context = yield* makeRelayHandlerContext(authorization, store)
       const openHandler = context.mapUnsafe.get(
-        PeerRelayRpc.OpenRelayRpc.key
-      ) as Rpc.Handler<"OpenRelay">
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
       const pushHandler = context.mapUnsafe.get(
-        PeerRelayRpc.PushRelayRpc.key
-      ) as Rpc.Handler<"PushRelay">
-      const runtime = Context.get(context, PeerRpcServer.PeerRelayServerRuntime)
-      const events = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+        PeerRpc.PushRpc.key
+      ) as Rpc.Handler<"Push">
+      const runtime = Context.get(context, PeerRpcServer.PeerRpcServerRuntime)
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
       const openFiber = yield* Stream.runForEach(
         openHandler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>,
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>,
         (event) => Queue.offer(events, event)
       ).pipe(
         (effect) => relayHandlerEffect(openHandler, effect),
         Effect.forkScoped
       )
       const opened = yield* Queue.take(events)
-      assert.strictEqual(opened._tag, "RelayOpened")
+      assert.strictEqual(opened._tag, "Opened")
       const { payload } = yield* makeRelayPayload
       const pushFiber = yield* (
         pushHandler.handler({
-          sessionId: (opened as PeerRelayRpc.RelayOpened).sessionId,
+          sessionId: (opened as PeerRpc.Opened).sessionId,
           relayMessageId: Identity.RelayMessageId.make(
             "rly_00000000-0000-4000-8000-000000000041"
           ),
@@ -5054,7 +2425,7 @@ describe("PeerRpcServer relay", () => {
       assert.strictEqual(yield* Ref.get(admitCalls), 1)
       const later = yield* (
         pushHandler.handler({
-          sessionId: (opened as PeerRelayRpc.RelayOpened).sessionId,
+          sessionId: (opened as PeerRpc.Opened).sessionId,
           relayMessageId: Identity.RelayMessageId.make(
             "rly_00000000-0000-4000-8000-000000000049"
           ),
@@ -5128,26 +2499,26 @@ describe("PeerRpcServer relay", () => {
         })
       )
       const openHandler = context.mapUnsafe.get(
-        PeerRelayRpc.OpenRelayRpc.key
-      ) as Rpc.Handler<"OpenRelay">
+        PeerRpc.OpenRpc.key
+      ) as Rpc.Handler<"Open">
       const pushHandler = context.mapUnsafe.get(
-        PeerRelayRpc.PushRelayRpc.key
-      ) as Rpc.Handler<"PushRelay">
-      const runtime = Context.get(context, PeerRpcServer.PeerRelayServerRuntime)
-      const events = yield* Queue.unbounded<PeerRelayRpc.OpenRelayEvent>()
+        PeerRpc.PushRpc.key
+      ) as Rpc.Handler<"Push">
+      const runtime = Context.get(context, PeerRpcServer.PeerRpcServerRuntime)
+      const events = yield* Queue.unbounded<PeerRpc.OpenEvent>()
       const openFiber = yield* Stream.runForEach(
         openHandler.handler(
           relayOpenRequest,
           {} as never
-        ) as Stream.Stream<PeerRelayRpc.OpenRelayEvent, PeerRpcError.PeerRpcError>,
+        ) as Stream.Stream<PeerRpc.OpenEvent, PeerRpcError.PeerRpcError>,
         (event) => Queue.offer(events, event)
       ).pipe(
         (effect) => relayHandlerEffect(openHandler, effect),
         Effect.forkScoped
       )
       const opened = yield* Queue.take(events)
-      assert.strictEqual(opened._tag, "RelayOpened")
-      const sessionId = (opened as PeerRelayRpc.RelayOpened).sessionId
+      assert.strictEqual(opened._tag, "Opened")
+      const sessionId = (opened as PeerRpc.Opened).sessionId
       const { payload } = yield* makeRelayPayload
       const invoke = (relayMessageId: Identity.RelayMessageId) =>
         pushHandler.handler({

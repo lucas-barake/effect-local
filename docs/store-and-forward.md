@@ -2,12 +2,11 @@
 
 ## Contract
 
-Store and forward is an optional relay mode for SQL replicas. It adds durable sender admission, durable relay
-custody, reconnect delivery, and durable recipient receipts. Direct RPC remains protocol version `2` with
-`capabilities: { storeAndForward: false }`. Relay RPC uses protocol version `3` on a distinct listener and reports
-`capabilities: { storeAndForward: true }`.
+Store and forward is the RPC synchronization topology for SQL replicas. Protocol version `1` adds durable sender
+admission, durable relay custody, reconnect delivery, and durable recipient receipts. There is no separate direct
+protocol or topology.
 
-The delivery guarantee is at least once. A successful relay `PushRelay` means the relay SQLite authority committed
+The delivery guarantee is at least once. A successful `Push` means the relay SQL authority committed
 the complete envelope before replying. A recipient can therefore see a duplicate after a lost response, expired
 claim, interrupted acknowledgement, or reconnect. The recipient SQL path makes that duplicate safe within the
 negotiated receipt retention window. Effect Local does not claim exactly once delivery.
@@ -15,28 +14,25 @@ negotiated receipt retention window. Effect Local does not claim exactly once de
 Store and forward does not make the relay authoritative for document contents. Each replica remains authoritative for
 its local writes. Automerge remains responsible for convergence after valid changes reach a replica.
 
-## Opt in composition
+## Composition
 
-The application must opt in on both sides. It must also keep the direct and relay transports separate.
-
-On the server, `PeerRpcServer.layerHandlers` remains the direct version `2` handler Layer. The application continues
-to own its direct `RpcServer.Protocol`, serializer, socket, and listener. The optional
-`PeerRpcServer.layerStoreAndForwardDeployment` merges that unchanged direct deployment with a relay deployment built
-from `PeerRelayRpc.Rpcs`, `PeerRelayIngress`, and a different `SocketServer` Layer.
+The application supplies relay policy, custody, limits, authentication, SQL, and a socket. The server uses
+`PeerRpcServer.layerHandlers` with `PeerRpc.Rpcs`, plus `PeerRpcServer.layerServer` and `PeerRelayIngress` for the
+bounded listener.
 
 On the client, `SqlReplica.layerRelay` installs relay receipt support. `PeerRelayOutbox.layerSql` stores stable sender
 admissions. `PeerRelayClientRuntime.layer` supervises sender outbox and receipt maintenance.
-`RpcPeerTransport.makeStoreAndForwardSession` binds the generated relay client to the ordinary `PeerSession`.
+`RpcPeerTransport.makeSession` binds the generated relay client to the ordinary `PeerSession`.
 
-This example shows the relay specific composition. The named application values provide the existing SQL, Crypto,
-authentication, direct RPC, socket, definition, projection, and mutation or query Layers.
+This example shows the server and client composition. The named application values provide SQL, Crypto,
+authentication, socket, definition, projection, and mutation or query Layers.
 
 ```ts
 import * as PeerRelayAuthorization from "@lucas-barake/effect-local-rpc/PeerRelayAuthorization"
 import * as PeerRelayLimits from "@lucas-barake/effect-local-rpc/PeerRelayLimits"
-import * as PeerRelayStore from "@lucas-barake/effect-local-rpc/PeerRelayStore"
 import * as PeerRpcServer from "@lucas-barake/effect-local-rpc/PeerRpcServer"
 import * as RpcPeerTransport from "@lucas-barake/effect-local-rpc/RpcPeerTransport"
+import * as SqlPeerRelayStore from "@lucas-barake/effect-local-rpc/SqlPeerRelayStore"
 import * as PeerRelayClientRuntime from "@lucas-barake/effect-local-sql/PeerRelayClientRuntime"
 import * as PeerRelayOutbox from "@lucas-barake/effect-local-sql/PeerRelayOutbox"
 import * as PeerRelayOutboxLimits from "@lucas-barake/effect-local-sql/PeerRelayOutboxLimits"
@@ -45,17 +41,16 @@ import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import { Effect, Layer } from "effect"
 
 const RelayLimitsLive = PeerRelayLimits.layer(relayLimits)
-const RelayStoreLive = PeerRelayStore.layerSqlite.pipe(
+const RelayStoreLive = SqlPeerRelayStore.layer.pipe(
   Layer.provideMerge(RelayLimitsLive)
 )
 const RelayAuthorizationLive = PeerRelayAuthorization.layer(
   authorizeRelay,
   PeerRelayAuthorization.denyUnsafeUnboundedAutomerge3Decode
 )
-const RelayServerLive = PeerRpcServer.layerStoreAndForwardDeployment({
-  directDeployment,
-  relaySocketLayer,
-  relay: { tenantId, peerId: relayPeerId }
+const RelayHandlersLive = PeerRpcServer.layerHandlers({
+  tenantId,
+  peerId: relayPeerId
 }).pipe(
   Layer.provideMerge(RelayLimitsLive),
   Layer.provideMerge(RelayStoreLive),
@@ -74,7 +69,7 @@ const RelayClientLive = PeerRelayClientRuntime.layer.pipe(
   Layer.provideMerge(RelayOutboxLive)
 )
 
-const session = RpcPeerTransport.makeStoreAndForwardSession(relayRpcClient, {
+const session = RpcPeerTransport.makeSession(relayRpcClient, {
   expectedLocal,
   senderReplicaIncarnation,
   expectedRelayPeerId: relayPeerId,
@@ -87,8 +82,8 @@ const session = RpcPeerTransport.makeStoreAndForwardSession(relayRpcClient, {
 }).pipe(Effect.provide(RelayClientLive))
 ```
 
-`relayRpcClient` must be a `PeerRelayRpc.RpcClient` created with `PeerRelayRpc.makeRpcClient` over
-`PeerRelayIngress.layerProtocolSocket`. It must not use the direct WebSocket MessagePack protocol. The server
+`relayRpcClient` must be a `PeerRpc.RpcClient` created with `PeerRpc.makeRpcClient` over
+`PeerRelayIngress.layerProtocolSocket`. The server
 composition still requires the application SQL and Crypto Layers, `PeerAuthentication.layerServer`, the relay
 authorization Layer, and a `PeerRelayLimits` Layer. The client composition still requires the application SQL,
 Crypto, core replica limits, generated client authentication middleware, and a scoped relay socket.
@@ -97,12 +92,12 @@ The example denies the separate unsafe Automerge decode grant. That is the requi
 and `authorizeRelay` document authorization do not promote a caller into resource trust.
 
 The `expectedRelayPeerId`, `expectedLocal`, exact remote subject and peer, replica incarnation, selected documents,
-receipt retention, and sender retry horizon are part of the version `3` handshake. A mismatch fails the connection.
+receipt retention, and sender retry horizon are part of the version `1` handshake. A mismatch fails the connection.
 
 ## Protocol and durable identity
 
-`PeerRelayRpc.Rpcs` contains `OpenRelay`, `PushRelay`, `AcknowledgeRelay`, and `RejectRelay`. Every request uses the
-same required authentication middleware as direct RPC. The first `OpenRelay` stream value is `RelayOpened`. Later
+`PeerRpc.Rpcs` contains `Open`, `Push`, `Acknowledge`, and `Reject`. Every request uses the
+same required authentication middleware. The first `Open` stream value is `Opened`. Later
 values are `StoredMessage` deliveries.
 
 Each sender admission has one stable `RelayMessageId`. The sender outbox persists that identity, the exact relay and
@@ -119,7 +114,7 @@ and digest is safe. Conflicting reuse is rejected.
 A relay claim carries an opaque claim token and a finite deadline. A recipient acknowledgement can terminalize only
 the exact message, recipient principal, live session generation, token, and message hash.
 
-`PeerSession` sends `AcknowledgeRelay` only after all of these operations succeed:
+`PeerSession` sends `Acknowledge` only after all of these operations succeed:
 
 1. The relay outer envelope and inner sync envelope are validated.
 2. The Automerge message is applied through the production `DocumentEntity.ApplySync` path.
@@ -131,7 +126,7 @@ This boundary proves durable recipient processing for replay suppression. It doe
 `PeerSession.durableConfirmation()`, which remains `false`. It also does not prove that another peer observed the
 change.
 
-A stable protocol violation uses `RejectRelay` with `ProtocolInvalid`. Application code can use
+A stable protocol violation uses `Reject` with `ProtocolInvalid`. Application code can use
 `ApplicationRejected` through the acknowledged delivery contract. A permanent rejection becomes a retained dead
 letter row. Infrastructure failure, interruption, timeout, disconnect, and claim expiry release or recover the
 message for retry.
@@ -256,10 +251,9 @@ writer provenance shape. It does not interpret Automerge changes, dependency gra
 `PeerSync` receive path performs the one semantic Automerge decode and applies the existing change, dependency, and
 operation limits.
 
-Direct protocol version `2` retains its preexisting authorized peer allocation risk because it has no separate unsafe
-resource trust callback. Only connect direct peers whose produced Automerge bytes the application resource trusts.
-When Automerge exposes an allocation bounded decode API, Effect Local should use it and remove this unsafe grant
-instead of normalizing the exception as permanent policy.
+The durable protocol always requires the separate unsafe resource trust callback. When Automerge exposes an
+allocation bounded decode API, Effect Local should use it and remove this unsafe grant instead of normalizing the
+exception as permanent policy.
 
 The relay outer digest binds the complete versioned envelope. It provides integrity and conflict detection. It is not
 encryption or a signature. The relay stores and can read the payload supplied by the client. Applications that need
@@ -272,13 +266,13 @@ existence.
 
 ## Deployment boundary and limitations
 
-One SQLite database is the custody authority for one relay shard. The application must route every write and claim
-for that shard to one process and one durable volume. A second process must not open the same database through a
-network file system. There is no built in leader election, quorum, replicated log, automatic failover, shard
-rebalance, cross region routing, or split brain recovery.
+One logical SQL database is the custody authority for one relay shard. The application must route every write and
+claim for that shard to it. `SqlPeerRelayStore.layer` supports SQLite, PostgreSQL, and MySQL. Replication and failover
+are properties of the selected database deployment. The relay does not add leader election, shard rebalance, cross
+region routing, or split brain recovery.
 
-When that SQLite authority is unavailable, new custody stops and delivery pauses. Durable pending rows remain
-discoverable after restart on the same volume. Claims recover after their deadlines. The server also runs bounded
+When that SQL authority is unavailable, new custody stops and delivery pauses. Durable pending rows remain
+discoverable after recovery. Claims recover after their deadlines. The server also runs bounded
 compensation and maintenance so a missed process notification does not permanently strand committed work.
 
 This package supplies a bounded single authority relay building block. It does not claim WhatsApp scale, global
@@ -288,12 +282,12 @@ availability, managed operations, peer discovery, end to end encryption, account
 
 The relay exposes Effect services and spans. It does not install a metrics exporter.
 
-| Source                         | Exposed values                                                                      |
-| ------------------------------ | ----------------------------------------------------------------------------------- |
-| `PeerRelayServerRuntime.usage` | `accepting`, `sessions`, `subjects`, `activeClaims`, `queuedChannels`               |
-| `PeerRelayIngress.usage`       | `connections`, `reservedBytes`, `byteReservationWaiters`                            |
-| `PeerRelayStore.usage`         | `activeCount`, `activeBytes`, `retainedCount`, `retainedBytes` for a selected scope |
-| `PeerRelayOutbox.usage`        | Remote and replica `messageCount` and `encodedBytes`                                |
+| Source                       | Exposed values                                                                      |
+| ---------------------------- | ----------------------------------------------------------------------------------- |
+| `PeerRpcServerRuntime.usage` | `accepting`, `sessions`, `subjects`, `activeClaims`, `queuedChannels`               |
+| `PeerRelayIngress.usage`     | `connections`, `reservedBytes`, `byteReservationWaiters`                            |
+| `PeerRelayStore.usage`       | `activeCount`, `activeBytes`, `retainedCount`, `retainedBytes` for a selected scope |
+| `PeerRelayOutbox.usage`      | Remote and replica `messageCount` and `encodedBytes`                                |
 
 Store operations use spans named `PeerRelayStore.admit`, `claim`, `loadClaimedPayload`, `acknowledge`, `reject`,
 `release`, `recover`, `expire`, `repair`, `reconcile`, `collect`, and `usage`. Client relay spans are
