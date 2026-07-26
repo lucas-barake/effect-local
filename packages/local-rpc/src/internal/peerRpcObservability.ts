@@ -274,7 +274,7 @@ export const recordSelectedDocuments = (amount: number) =>
 const withoutMetricAttributes = <A, E, R,>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.provideService(Metric.CurrentMetricAttributes, {}))
 
-const bestEffort = <A, E, R,>(effect: Effect.Effect<A, E, R>) => effect.pipe(Effect.catchCause(() => Effect.void))
+const bestEffort = <A, E, R,>(effect: Effect.Effect<A, E, R>) => effect.pipe(Effect.ignoreCause)
 
 const safeSpan = (span: Tracer.Span): Tracer.Span => {
   let status = span.status

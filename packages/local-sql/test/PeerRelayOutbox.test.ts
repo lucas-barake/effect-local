@@ -12,6 +12,7 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import { TestClock } from "effect/testing"
+import * as Tracer from "effect/Tracer"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -285,6 +286,37 @@ describe("PeerRelayOutbox", () => {
         replica: { messageCount: 1, encodedBytes: payload.byteLength }
       })
     }).pipe(Effect.provide(layer(":memory:"))))
+
+  it.effect("loads replay rows in bounded batches instead of one query per row", () =>
+    Effect.gen(function*() {
+      yield* insertDocument
+      const outbox = yield* PeerRelayOutbox.PeerRelayOutbox
+      for (let sequence = 1; sequence <= 8; sequence++) {
+        yield* outbox.admit({
+          ...endpoint,
+          payload: yield* makePayload(sequence),
+          retryHorizonMillis: 30_000
+        })
+      }
+
+      let queryCount = 0
+      const tracer = Tracer.make({
+        span: (options) => {
+          if (options.name === "sql.execute") queryCount++
+          return new Tracer.NativeSpan(options)
+        }
+      })
+      const entries = yield* outbox.dueForEndpoint({ ...endpoint, maximum: 8 }).pipe(
+        Effect.provideService(Tracer.Tracer, tracer)
+      )
+
+      assert.strictEqual(entries.length, 8)
+      assert.isAtMost(queryCount, 2)
+    }).pipe(Effect.provide(layer(":memory:", {
+      ...outboxLimits,
+      maxMessagesPerRemote: 8,
+      maxMessagesPerReplica: 8
+    }))))
 
   it.effect("fences every replay operation after the replica incarnation changes", () =>
     Effect.gen(function*() {

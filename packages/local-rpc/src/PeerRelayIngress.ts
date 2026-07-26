@@ -611,7 +611,7 @@ const makeServerProtocol = (
               yield* socket.runRaw(
                 () => Effect.void,
                 { onOpen: write(new Socket.CloseEvent(1013)).pipe(Effect.ignore) }
-              ).pipe(Effect.catch(() => Effect.void))
+              ).pipe(Effect.ignore)
             })
           }
           connections++
@@ -676,7 +676,7 @@ const makeServerProtocol = (
                   })
                 )
               }
-            ).pipe(Effect.catch(() => Effect.void))
+            ).pipe(Effect.ignore)
           }).pipe(
             Effect.ensuring(
               Effect.gen(function*() {

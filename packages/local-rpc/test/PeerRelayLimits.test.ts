@@ -167,4 +167,36 @@ describe("PeerRelayLimits", () => {
         })
       )
     ))
+
+  it.effect("rejects a maintenance interval that exceeds the declared row rate", () =>
+    Effect.gen(function*() {
+      const exit = yield* Effect.exit(PeerRelayLimits.make({
+        ...PeerRelayLimits.defaults,
+        maintenanceIntervalMillis: 1
+      }))
+      assert.strictEqual(exit._tag, "Failure")
+      if (exit._tag === "Failure") {
+        const error = yield* Effect.failCause(exit.cause).pipe(Effect.flip)
+        assert.strictEqual(error._tag, "InvalidPeerRelayLimits")
+        if (error._tag === "InvalidPeerRelayLimits") {
+          assert.strictEqual(error.field, "claimRecoveryRowsPerSecond")
+        }
+      }
+    }))
+
+  it.effect("rejects a maintenance interval that cannot keep up with admission", () =>
+    Effect.gen(function*() {
+      const exit = yield* Effect.exit(PeerRelayLimits.make({
+        ...PeerRelayLimits.defaults,
+        maintenanceIntervalMillis: 2_000
+      }))
+      assert.strictEqual(exit._tag, "Failure")
+      if (exit._tag === "Failure") {
+        const error = yield* Effect.failCause(exit.cause).pipe(Effect.flip)
+        assert.strictEqual(error._tag, "InvalidPeerRelayLimits")
+        if (error._tag === "InvalidPeerRelayLimits") {
+          assert.strictEqual(error.field, "maintenanceIntervalMillis")
+        }
+      }
+    }))
 })

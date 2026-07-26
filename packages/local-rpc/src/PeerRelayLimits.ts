@@ -365,11 +365,46 @@ const validate = (values: Values) => {
           values.maxInFlightSqlMaintenance <=
         values.maxInFlightSqlTransactions
     ],
+    [
+      "maintenanceIntervalMillis",
+      [
+        values.claimRecoveryBatchSize,
+        values.expiryBatchSize,
+        values.integrityBatchSize,
+        values.reconciliationBatchSize,
+        values.terminalCollectionBatchSize
+      ].every((batchSize) => batchSize * 1_000 / values.maintenanceIntervalMillis >= values.admissionRatePerSecond)
+    ],
     ["claimRecoveryRowsPerSecond", values.claimRecoveryRowsPerSecond >= values.admissionRatePerSecond],
+    [
+      "claimRecoveryRowsPerSecond",
+      values.claimRecoveryRowsPerSecond >=
+        values.claimRecoveryBatchSize * 1_000 / values.maintenanceIntervalMillis
+    ],
     ["expiryRowsPerSecond", values.expiryRowsPerSecond >= values.admissionRatePerSecond],
+    [
+      "expiryRowsPerSecond",
+      values.expiryRowsPerSecond >=
+        values.expiryBatchSize * 1_000 / values.maintenanceIntervalMillis
+    ],
     ["integrityRowsPerSecond", values.integrityRowsPerSecond >= values.admissionRatePerSecond],
+    [
+      "integrityRowsPerSecond",
+      values.integrityRowsPerSecond >=
+        values.integrityBatchSize * 1_000 / values.maintenanceIntervalMillis
+    ],
     ["reconciliationRowsPerSecond", values.reconciliationRowsPerSecond >= values.admissionRatePerSecond],
+    [
+      "reconciliationRowsPerSecond",
+      values.reconciliationRowsPerSecond >=
+        values.reconciliationBatchSize * 1_000 / values.maintenanceIntervalMillis
+    ],
     ["terminalCollectionRowsPerSecond", values.terminalCollectionRowsPerSecond >= values.admissionRatePerSecond],
+    [
+      "terminalCollectionRowsPerSecond",
+      values.terminalCollectionRowsPerSecond >=
+        values.terminalCollectionBatchSize * 1_000 / values.maintenanceIntervalMillis
+    ],
     ["orphanChannelCleanupRowsPerSecond", values.orphanChannelCleanupRowsPerSecond >= values.admissionRatePerSecond],
     ["shutdownReleaseConcurrency", values.shutdownReleaseConcurrency <= values.maxInFlightSqlTransactions],
     ["shutdownReleaseTimeoutMillis", values.shutdownReleaseTimeoutMillis < values.claimLeaseMillis]

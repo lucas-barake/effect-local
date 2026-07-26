@@ -111,10 +111,7 @@ const relayQuotaDomain = (
 const recordQuotaRejection = (error: StoreError) =>
   Option.match(relayQuotaDomain(error), {
     onNone: () => Effect.void,
-    onSome: (domain) =>
-      PeerRpcObservability.recordRelayQuotaRejection(domain).pipe(
-        Effect.catchCause(() => Effect.void)
-      )
+    onSome: (domain) => PeerRpcObservability.recordRelayQuotaRejection(domain).pipe(Effect.ignoreCause)
   })
 
 const encodeKey = (...parts: ReadonlyArray<string | number>) => JSON.stringify(parts)
@@ -296,7 +293,7 @@ const UsageRow = Schema.Struct({
 
 const KeyRow = Schema.Struct({ messageId: PositiveInt })
 
-const makeService = Effect.gen(function*() {
+export const make = Effect.gen(function*() {
   const sql = (yield* SqlClient.SqlClient).withoutTransforms()
   const crypto = yield* Crypto.Crypto
   const limits = yield* PeerRelayLimits.PeerRelayLimits
@@ -1864,7 +1861,7 @@ const makeService = Effect.gen(function*() {
           ? PeerRpcObservability.setRelayPending(
             value.activeCount,
             value.activeBytes
-          ).pipe(Effect.catchCause(() => Effect.void))
+          ).pipe(Effect.ignoreCause)
           : Effect.void
       )
     )
@@ -1886,8 +1883,6 @@ const makeService = Effect.gen(function*() {
   })
 })
 
-export const make = makeService
-
 export const layer: Layer.Layer<
   PeerRelayStore,
   | Migrator.MigrationError
@@ -1895,4 +1890,4 @@ export const layer: Layer.Layer<
   | Schema.SchemaError
   | ReplicaError.ReplicaError,
   SqlClient.SqlClient | Crypto.Crypto | PeerRelayLimits.PeerRelayLimits
-> = Layer.effect(PeerRelayStore, makeService)
+> = Layer.effect(PeerRelayStore, make)

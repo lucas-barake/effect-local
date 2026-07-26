@@ -124,6 +124,7 @@ const UsageRow = Schema.Struct({
   encoded_bytes: NonNegativeInt
 })
 const HorizonRow = Schema.Struct({ horizon_millis: Schema.NullOr(Schema.Number) })
+const replayRowBatchSize = 500
 
 const replicaFailure = (reason: ReplicaError.Reason): ReplicaError.ReplicaError =>
   new ReplicaError.ReplicaError({ reason })
@@ -253,11 +254,11 @@ const make = Effect.gen(function*() {
         LIMIT ${request.maximum}`
   })
 
-  const findByRowId = SqlSchema.findAll({
+  const findByRowIds = SqlSchema.findAll({
     Request: Schema.Struct({
       replicaId: Identity.ReplicaId,
       replicaIncarnation: Identity.ReplicaIncarnation,
-      rowId: PositiveInt
+      rowIds: Schema.Array(PositiveInt).check(Schema.isMinLength(1))
     }),
     Result: Row,
     execute: (request) =>
@@ -265,7 +266,7 @@ const make = Effect.gen(function*() {
         FROM effect_local_peer_relay_outbox
         WHERE replica_id = ${request.replicaId}
           AND replica_incarnation = ${request.replicaIncarnation}
-          AND row_id = ${request.rowId}`
+          AND ${sql.in("row_id", request.rowIds)}`
   })
 
   const insertRow = SqlSchema.findAll({
@@ -751,6 +752,18 @@ const make = Effect.gen(function*() {
           now,
           maximum: input.maximum
         })
+        if (metadata.length === 0) return []
+        const rows: Array<typeof Row.Type> = []
+        for (let offset = 0; offset < metadata.length; offset += replayRowBatchSize) {
+          rows.push(
+            ...yield* findByRowIds({
+              replicaId: permit.replicaId,
+              replicaIncarnation: permit.incarnation,
+              rowIds: metadata.slice(offset, offset + replayRowBatchSize).map((item) => item.row_id)
+            })
+          )
+        }
+        const rowsById = new Map(rows.map((row) => [row.row_id, row]))
         const entries: Array<Entry> = []
         for (const item of metadata) {
           if (
@@ -762,15 +775,11 @@ const make = Effect.gen(function*() {
           ) {
             return yield* storageCorrupt(new Error("Relay outbox payload length mismatch"))
           }
-          const rows = yield* findByRowId({
-            replicaId: permit.replicaId,
-            replicaIncarnation: permit.incarnation,
-            rowId: item.row_id
-          })
-          if (rows.length !== 1) {
+          const row = rowsById.get(item.row_id)
+          if (row === undefined) {
             return yield* storageCorrupt(new Error("Relay outbox row disappeared during replay"))
           }
-          const entry = yield* validateRow(rows[0]!, permit)
+          const entry = yield* validateRow(row, permit)
           if (
             entry.expectedLocal.tenantId !== endpoint.expectedLocal.tenantId ||
             entry.expectedLocal.subjectId !== endpoint.expectedLocal.subjectId ||

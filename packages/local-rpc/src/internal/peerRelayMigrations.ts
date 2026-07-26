@@ -1,9 +1,7 @@
 import * as Effect from "effect/Effect"
-import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as Migrator from "effect/unstable/sql/Migrator"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
-import type * as SqlError from "effect/unstable/sql/SqlError"
 
 const executeStatements = (
   sql: SqlClient.SqlClient,
@@ -872,9 +870,3 @@ export const run = Effect.gen(function*() {
     orElse: () => genericRun
   })
 })
-
-export const layer: Layer.Layer<
-  never,
-  Migrator.MigrationError | SqlError.SqlError,
-  SqlClient.SqlClient
-> = Layer.effectDiscard(run)
