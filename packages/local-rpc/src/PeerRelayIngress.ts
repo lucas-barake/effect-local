@@ -724,11 +724,6 @@ export const layerProtocolSocketServer = <E, R,>(
     })
   ) as Layer.Layer<PeerRelayIngress | RpcServer.Protocol, E, R | PeerRelayLimits>
 
-const toClientError = (message: string, cause: unknown) =>
-  new RpcClientError.RpcClientError({
-    reason: new RpcClientError.RpcClientDefect({ message, cause })
-  })
-
 export const makeProtocolSocket = Effect.gen(function*() {
   const socket = yield* Socket.Socket
   const limits = yield* PeerRelayLimits
@@ -784,7 +779,12 @@ export const makeProtocolSocket = Effect.gen(function*() {
         ),
         Effect.tapCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return Effect.void
-          currentError = toClientError("Relay socket protocol failed", Cause.squash(cause))
+          currentError = new RpcClientError.RpcClientError({
+            reason: new RpcClientError.RpcClientDefect({
+              message: "Relay socket protocol failed",
+              cause: Cause.squash(cause)
+            })
+          })
           return Effect.forEach(
             clientIds,
             (clientId) =>
@@ -812,20 +812,47 @@ export const makeProtocolSocket = Effect.gen(function*() {
                   try {
                     encoded = encodeFrame(request, limits.maximumDeclaredFrameBytes)
                   } catch (cause) {
-                    return yield* Effect.fail(toClientError("Relay request frame is invalid", cause))
+                    return yield* new RpcClientError.RpcClientError({
+                      reason: new RpcClientError.RpcClientDefect({
+                        message: "Relay request frame is invalid",
+                        cause
+                      })
+                    })
                   }
                   yield* reservation.shrinkTo(encoded.bodyBytes)
                   if (request._tag === "Request") requestClients.set(request.id, clientId)
                   yield* write(encoded.frame).pipe(
-                    Effect.mapError((cause) => toClientError("Relay socket write failed", cause))
+                    Effect.catchTag("SocketError", (cause) =>
+                      Effect.fail(
+                        new RpcClientError.RpcClientError({
+                          reason: new RpcClientError.RpcClientDefect({
+                            message: "Relay socket write failed",
+                            cause
+                          })
+                        })
+                      ))
                   )
                 })
             ).pipe(
               Effect.catchTags({
                 RequestLimitExceeded: (cause) =>
-                  Effect.fail(toClientError("Relay request capacity is exhausted", cause)),
+                  Effect.fail(
+                    new RpcClientError.RpcClientError({
+                      reason: new RpcClientError.RpcClientDefect({
+                        message: "Relay request capacity is exhausted",
+                        cause
+                      })
+                    })
+                  ),
                 RequestCapacityExceeded: (cause) =>
-                  Effect.fail(toClientError("Relay request capacity is exhausted", cause))
+                  Effect.fail(
+                    new RpcClientError.RpcClientError({
+                      reason: new RpcClientError.RpcClientDefect({
+                        message: "Relay request capacity is exhausted",
+                        cause
+                      })
+                    })
+                  )
               })
             )
           }),

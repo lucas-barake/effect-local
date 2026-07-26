@@ -245,20 +245,6 @@ const decodeSyncChanges = (
   return [...changes.values()]
 }
 
-const failStorageUnavailable = (cause: unknown) =>
-  Effect.fail(
-    new ReplicaError.ReplicaError({
-      reason: new ReplicaError.StorageUnavailable({ cause })
-    })
-  )
-
-const failStorageCorrupt = (cause: unknown) =>
-  Effect.fail(
-    new ReplicaError.ReplicaError({
-      reason: new ReplicaError.StorageCorrupt({ cause })
-    })
-  )
-
 export class PeerSync extends Context.Service<PeerSync, {
   readonly open: (peerId: Identity.PeerId) => Effect.Effect<Session, ReplicaError.ReplicaError>
   readonly reset: (session: Session) => Effect.Effect<void, ReplicaError.ReplicaError>
@@ -530,8 +516,18 @@ const make = (
           // A document this replica does not hold has no history for a rewrite to have discarded,
           // so it is on the genesis lineage exactly as a never rewritten document is.
           NoSuchElementError: () => Effect.succeed(Identity.genesisLineage),
-          SqlError: failStorageUnavailable,
-          SchemaError: failStorageCorrupt
+          SqlError: (cause) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({ cause })
+              })
+            ),
+          SchemaError: (cause) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause })
+              })
+            )
         })
       )
     const findPendingOutbox = SqlSchema.findAll({
@@ -839,7 +835,11 @@ const make = (
               replicaIncarnation
             })
             if (updated.length !== 1) {
-              return yield* failStorageCorrupt(new Error("Relay receipt usage is inconsistent"))
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({
+                  cause: new Error("Relay receipt usage is inconsistent")
+                })
+              })
             }
           }
           for (const row of rows) {
@@ -847,7 +847,11 @@ const make = (
               VALUES (${row.row_id})`
             const deleted = yield* deleteRelayReceipt({ rowId: row.row_id })
             if (deleted.length !== 1) {
-              return yield* failStorageCorrupt(new Error("Relay receipt disappeared during pruning"))
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({
+                  cause: new Error("Relay receipt disappeared during pruning")
+                })
+              })
             }
           }
           yield* sql`DELETE FROM effect_local_peer_relay_receipt_usage
@@ -886,8 +890,18 @@ const make = (
       }
     })).pipe(
       Effect.catchTags({
-        SchemaError: failStorageCorrupt,
-        SqlError: failStorageUnavailable
+        SchemaError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+          ),
+        SqlError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause })
+            })
+          )
       })
     )
 
@@ -1040,8 +1054,18 @@ const make = (
           findCheckpointProvenance(documentId)
         ]).pipe(
           Effect.catchTags({
-            SqlError: failStorageUnavailable,
-            SchemaError: failStorageCorrupt
+            SqlError: (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({ cause })
+                })
+              ),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageCorrupt({ cause })
+                })
+              )
           })
         )
         return yield* Effect.try({
@@ -1139,8 +1163,18 @@ const make = (
             messageHash: reply.messageHash
           }).pipe(
             Effect.catchTags({
-              SqlError: failStorageUnavailable,
-              SchemaError: failStorageCorrupt
+              SqlError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageUnavailable({ cause })
+                  })
+                ),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageCorrupt({ cause })
+                  })
+                )
             })
           )
           const existing = rows[0]
@@ -1159,8 +1193,18 @@ const make = (
             persistOutbound(session, reply.documentId, reply.message, reply.heads)
           ).pipe(
             Effect.catchTags({
-              SqlError: failStorageUnavailable,
-              SchemaError: failStorageCorrupt
+              SqlError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageUnavailable({ cause })
+                  })
+                ),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageCorrupt({ cause })
+                  })
+                )
             })
           )
         }))
@@ -1204,8 +1248,18 @@ const make = (
                 documentId
               }).pipe(
                 Effect.catchTags({
-                  SqlError: failStorageUnavailable,
-                  SchemaError: failStorageCorrupt
+                  SqlError: (cause) =>
+                    Effect.fail(
+                      new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.StorageUnavailable({ cause })
+                      })
+                    ),
+                  SchemaError: (cause) =>
+                    Effect.fail(
+                      new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.StorageCorrupt({ cause })
+                      })
+                    )
                 })
               )
               if ((existing[0]?.count ?? 0) > 0) {
@@ -1259,8 +1313,18 @@ const make = (
                       return outbound
                     })).pipe(
                       Effect.catchTags({
-                        SqlError: failStorageUnavailable,
-                        SchemaError: failStorageCorrupt
+                        SqlError: (cause) =>
+                          Effect.fail(
+                            new ReplicaError.ReplicaError({
+                              reason: new ReplicaError.StorageUnavailable({ cause })
+                            })
+                          ),
+                        SchemaError: (cause) =>
+                          Effect.fail(
+                            new ReplicaError.ReplicaError({
+                              reason: new ReplicaError.StorageCorrupt({ cause })
+                            })
+                          )
                       })
                     )
                     return outbound === null
@@ -1425,15 +1489,30 @@ const make = (
                     documentId,
                     acceptedAt,
                     new Date(nowMillis - limits.maxPendingAgeMillis).toISOString()
-                  ).pipe(Effect.catchTag("SqlError", failStorageUnavailable))
+                  ).pipe(Effect.catchTag("SqlError", (cause) =>
+                    Effect.fail(
+                      new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.StorageUnavailable({ cause })
+                      })
+                    )))
                   if (relayReceiptLimits !== null) {
                     yield* sql.withTransaction(Effect.gen(function*() {
                       yield* pruneRelayReceiptsInTransaction(permit.incarnation, acceptedAt)
                       yield* gate.validate(permit)
                     })).pipe(
                       Effect.catchTags({
-                        SqlError: failStorageUnavailable,
-                        SchemaError: failStorageCorrupt
+                        SqlError: (cause) =>
+                          Effect.fail(
+                            new ReplicaError.ReplicaError({
+                              reason: new ReplicaError.StorageUnavailable({ cause })
+                            })
+                          ),
+                        SchemaError: (cause) =>
+                          Effect.fail(
+                            new ReplicaError.ReplicaError({
+                              reason: new ReplicaError.StorageCorrupt({ cause })
+                            })
+                          )
                       })
                     )
                   }
@@ -1511,8 +1590,18 @@ const make = (
                   })
                 const receiptRows = yield* loadReceipt().pipe(
                   Effect.catchTags({
-                    SqlError: failStorageUnavailable,
-                    SchemaError: failStorageCorrupt
+                    SqlError: (cause) =>
+                      Effect.fail(
+                        new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.StorageUnavailable({ cause })
+                        })
+                      ),
+                    SchemaError: (cause) =>
+                      Effect.fail(
+                        new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.StorageCorrupt({ cause })
+                        })
+                      )
                   })
                 )
                 const receipt = receiptRows[0]
@@ -1528,8 +1617,18 @@ const make = (
                     documentId
                   }).pipe(
                     Effect.catchTags({
-                      SqlError: failStorageUnavailable,
-                      SchemaError: failStorageCorrupt
+                      SqlError: (cause) =>
+                        Effect.fail(
+                          new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.StorageUnavailable({ cause })
+                          })
+                        ),
+                      SchemaError: (cause) =>
+                        Effect.fail(
+                          new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.StorageCorrupt({ cause })
+                          })
+                        )
                     })
                   )
                   const receiptTotal = receiptTotals[0]
@@ -1771,16 +1870,36 @@ const make = (
                         }))
                       }).pipe(
                         Effect.catchTags({
-                          SqlError: failStorageUnavailable,
-                          SchemaError: failStorageCorrupt
+                          SqlError: (cause) =>
+                            Effect.fail(
+                              new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.StorageUnavailable({ cause })
+                              })
+                            ),
+                          SchemaError: (cause) =>
+                            Effect.fail(
+                              new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.StorageCorrupt({ cause })
+                              })
+                            )
                         })
                       )
                       yield* validateExistingChanges(existingChanges)
                       const validatePendingQuota = Effect.gen(function*() {
                         const pendingTotals = yield* findDocumentPendingChangeTotals(documentId).pipe(
                           Effect.catchTags({
-                            SqlError: failStorageUnavailable,
-                            SchemaError: failStorageCorrupt
+                            SqlError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageUnavailable({ cause })
+                                })
+                              ),
+                            SchemaError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageCorrupt({ cause })
+                                })
+                              )
                           })
                         )
                         const receiptPending = yield* findDocumentPendingReceiptTotals({
@@ -1788,8 +1907,18 @@ const make = (
                           documentId
                         }).pipe(
                           Effect.catchTags({
-                            SqlError: failStorageUnavailable,
-                            SchemaError: failStorageCorrupt
+                            SqlError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageUnavailable({ cause })
+                                })
+                              ),
+                            SchemaError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageCorrupt({ cause })
+                                })
+                              )
                           })
                         )
                         if (
@@ -1826,8 +1955,18 @@ const make = (
                         }
                         const peerTotals = yield* findPeerPendingChangeTotals(receiptSession.peerId).pipe(
                           Effect.catchTags({
-                            SqlError: failStorageUnavailable,
-                            SchemaError: failStorageCorrupt
+                            SqlError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageUnavailable({ cause })
+                                })
+                              ),
+                            SchemaError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageCorrupt({ cause })
+                                })
+                              )
                           })
                         )
                         const peerReceiptPending = yield* findPeerPendingReceiptTotals({
@@ -1835,8 +1974,18 @@ const make = (
                           peerId: receiptSession.peerId
                         }).pipe(
                           Effect.catchTags({
-                            SqlError: failStorageUnavailable,
-                            SchemaError: failStorageCorrupt
+                            SqlError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageUnavailable({ cause })
+                                })
+                              ),
+                            SchemaError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageCorrupt({ cause })
+                                })
+                              )
                           })
                         )
                         if (
@@ -1873,16 +2022,36 @@ const make = (
                         }
                         const replicaTotals = yield* findReplicaPendingChangeTotals(undefined).pipe(
                           Effect.catchTags({
-                            SqlError: failStorageUnavailable,
-                            SchemaError: failStorageCorrupt
+                            SqlError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageUnavailable({ cause })
+                                })
+                              ),
+                            SchemaError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageCorrupt({ cause })
+                                })
+                              )
                           })
                         )
                         const replicaReceiptPending = yield* findReplicaPendingReceiptTotals(
                           receiptSession.replicaIncarnation
                         ).pipe(
                           Effect.catchTags({
-                            SqlError: failStorageUnavailable,
-                            SchemaError: failStorageCorrupt
+                            SqlError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageUnavailable({ cause })
+                                })
+                              ),
+                            SchemaError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageCorrupt({ cause })
+                                })
+                              )
                           })
                         )
                         if (
@@ -1931,8 +2100,18 @@ const make = (
                       })
                       const pendingRows = yield* findPendingChanges(documentId).pipe(
                         Effect.catchTags({
-                          SqlError: failStorageUnavailable,
-                          SchemaError: failStorageCorrupt
+                          SqlError: (cause) =>
+                            Effect.fail(
+                              new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.StorageUnavailable({ cause })
+                              })
+                            ),
+                          SchemaError: (cause) =>
+                            Effect.fail(
+                              new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.StorageCorrupt({ cause })
+                              })
+                            )
                         })
                       )
                       const pendingReceiptRows = yield* findPendingReceipts({
@@ -1940,14 +2119,34 @@ const make = (
                         documentId
                       }).pipe(
                         Effect.catchTags({
-                          SqlError: failStorageUnavailable,
-                          SchemaError: failStorageCorrupt
+                          SqlError: (cause) =>
+                            Effect.fail(
+                              new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.StorageUnavailable({ cause })
+                              })
+                            ),
+                          SchemaError: (cause) =>
+                            Effect.fail(
+                              new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.StorageCorrupt({ cause })
+                              })
+                            )
                         })
                       )
                       const checkpointProvenanceRows = yield* findCheckpointProvenance(documentId).pipe(
                         Effect.catchTags({
-                          SqlError: failStorageUnavailable,
-                          SchemaError: failStorageCorrupt
+                          SqlError: (cause) =>
+                            Effect.fail(
+                              new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.StorageUnavailable({ cause })
+                              })
+                            ),
+                          SchemaError: (cause) =>
+                            Effect.fail(
+                              new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.StorageCorrupt({ cause })
+                              })
+                            )
                         })
                       )
                       const checkpointProvenanceByHash = new Map<
@@ -1963,9 +2162,13 @@ const make = (
                             existing.writerDefinitionHash !== entry.writerDefinitionHash
                           )
                         ) {
-                          return yield* failStorageCorrupt(
-                            new Error(`Conflicting checkpoint writer provenance for change ${entry.changeHash}`)
-                          )
+                          return yield* new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.StorageCorrupt({
+                              cause: new Error(
+                                `Conflicting checkpoint writer provenance for change ${entry.changeHash}`
+                              )
+                            })
+                          })
                         }
                         checkpointProvenanceByHash.set(entry.changeHash, entry)
                       }
@@ -2005,9 +2208,13 @@ const make = (
                             existing.writerDefinitionHash !== entry.writerDefinitionHash
                           )
                         ) {
-                          return yield* failStorageCorrupt(
-                            new Error(`Conflicting pending writer provenance for change ${entry.changeHash}`)
-                          )
+                          return yield* new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.StorageCorrupt({
+                              cause: new Error(
+                                `Conflicting pending writer provenance for change ${entry.changeHash}`
+                              )
+                            })
+                          })
                         }
                         pendingProvenanceByHash.set(entry.changeHash, entry)
                       }
@@ -2086,8 +2293,18 @@ const make = (
                           const bytes = InternalAutomerge.save(staged)
                           const durableRows = yield* findDocumentChangeProvenance(documentId).pipe(
                             Effect.catchTags({
-                              SqlError: failStorageUnavailable,
-                              SchemaError: failStorageCorrupt
+                              SqlError: (cause) =>
+                                Effect.fail(
+                                  new ReplicaError.ReplicaError({
+                                    reason: new ReplicaError.StorageUnavailable({ cause })
+                                  })
+                                ),
+                              SchemaError: (cause) =>
+                                Effect.fail(
+                                  new ReplicaError.ReplicaError({
+                                    reason: new ReplicaError.StorageCorrupt({ cause })
+                                  })
+                                )
                             })
                           )
                           const checkpointWriterProvenance = yield* Effect.try({
@@ -2216,7 +2433,11 @@ const make = (
                               writerProvenance: checkpoint.writerProvenance
                             })
                             if (installed.length !== 1) {
-                              return yield* failStorageCorrupt(new Error("Checkpoint identity collision"))
+                              return yield* new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.StorageCorrupt({
+                                  cause: new Error("Checkpoint identity collision")
+                                })
+                              })
                             }
                             yield* sql`DELETE FROM effect_local_checkpoints
                 WHERE document_id = ${documentId}
@@ -2301,8 +2522,18 @@ const make = (
                           return { _tag: "Committed" as const, commitSequence, reply }
                         })).pipe(
                           Effect.catchTags({
-                            SqlError: failStorageUnavailable,
-                            SchemaError: failStorageCorrupt
+                            SqlError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageUnavailable({ cause })
+                                })
+                              ),
+                            SchemaError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageCorrupt({ cause })
+                                })
+                              )
                           })
                         )
                         if (result._tag === "Committed") {
@@ -2354,8 +2585,18 @@ const make = (
               return pruned
             })).pipe(
               Effect.catchTags({
-                SqlError: failStorageUnavailable,
-                SchemaError: failStorageCorrupt
+                SqlError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageUnavailable({ cause })
+                    })
+                  ),
+                SchemaError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageCorrupt({ cause })
+                    })
+                  )
               })
             )
           )
@@ -2391,7 +2632,12 @@ const make = (
                 AND peer_id = ${session.peerId}
                 AND connection_epoch = ${session.connectionEpoch}
                 AND relay_message_id IS NULL`
-              })).pipe(Effect.catchTag("SqlError", failStorageUnavailable))
+              })).pipe(Effect.catchTag("SqlError", (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageUnavailable({ cause })
+                  })
+                )))
               yield* Ref.update(generation, (current) => current + 1)
               yield* removeState(session)
             }))
@@ -2432,8 +2678,18 @@ const make = (
               }))
             ),
             Effect.catchTags({
-              SqlError: failStorageUnavailable,
-              SchemaError: failStorageCorrupt
+              SqlError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageUnavailable({ cause })
+                  })
+                ),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageCorrupt({ cause })
+                  })
+                )
             })
           )
         })),
@@ -2461,8 +2717,18 @@ const make = (
               return true
             })).pipe(
               Effect.catchTags({
-                SqlError: failStorageUnavailable,
-                SchemaError: failStorageCorrupt
+                SqlError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageUnavailable({ cause })
+                    })
+                  ),
+                SchemaError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageCorrupt({ cause })
+                    })
+                  )
               })
             )
           )

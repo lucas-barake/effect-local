@@ -7,9 +7,7 @@ import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
-import type * as SchemaError from "effect/SchemaError"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
-import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as PeerRelayOutboxLimits from "./PeerRelayOutboxLimits.js"
@@ -126,19 +124,15 @@ const UsageRow = Schema.Struct({
 const HorizonRow = Schema.Struct({ horizon_millis: Schema.NullOr(Schema.Number) })
 const replayRowBatchSize = 500
 
-const replicaFailure = (reason: ReplicaError.Reason): ReplicaError.ReplicaError =>
-  new ReplicaError.ReplicaError({ reason })
-
-const storageUnavailable = (cause: unknown) =>
-  Effect.fail(replicaFailure(new ReplicaError.StorageUnavailable({ cause })))
-
-const storageCorrupt = (cause: unknown) => Effect.fail(replicaFailure(new ReplicaError.StorageCorrupt({ cause })))
-
 const protocolMismatch = (expected: string, observed: string) =>
-  replicaFailure(new ReplicaError.ProtocolMismatch({ expected, observed }))
+  new ReplicaError.ReplicaError({
+    reason: new ReplicaError.ProtocolMismatch({ expected, observed })
+  })
 
 const quotaExceeded = (resource: string, limit: number) =>
-  replicaFailure(new ReplicaError.QuotaExceeded({ resource, limit }))
+  new ReplicaError.ReplicaError({
+    reason: new ReplicaError.QuotaExceeded({ resource, limit })
+  })
 
 const parseIso = (value: string): number | null => {
   const millis = Date.parse(value)
@@ -419,7 +413,11 @@ const make = Effect.gen(function*() {
         encodedSize: row.encoded_size
       })
       if (remote.length !== 1 || replica.length !== 1) {
-        return yield* storageCorrupt(new Error("Relay outbox usage reservation mismatch"))
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.StorageCorrupt({
+            cause: new Error("Relay outbox usage reservation mismatch")
+          })
+        })
       }
       yield* sql`DELETE FROM effect_local_peer_relay_outbox_remote_usage
         WHERE replica_incarnation = ${row.replica_incarnation}
@@ -444,7 +442,11 @@ const make = Effect.gen(function*() {
         row.replica_id !== permit.replicaId ||
         row.encoded_size !== row.payload.byteLength
       ) {
-        return yield* storageCorrupt(new Error("Relay outbox metadata mismatch"))
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.StorageCorrupt({
+            cause: new Error("Relay outbox metadata mismatch")
+          })
+        })
       }
       const createdAt = parseIso(row.created_at)
       const retryDeadline = parseIso(row.retry_deadline)
@@ -458,7 +460,11 @@ const make = Effect.gen(function*() {
         nextAttemptAt < createdAt ||
         nextAttemptAt >= retryDeadline
       ) {
-        return yield* storageCorrupt(new Error("Relay outbox deadline mismatch"))
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.StorageCorrupt({
+            cause: new Error("Relay outbox deadline mismatch")
+          })
+        })
       }
       const syncEnvelope = yield* PeerSyncEnvelope.decodeSyncEnvelope(row.payload, replicaLimits).pipe(
         Effect.provideService(Crypto.Crypto, crypto)
@@ -470,7 +476,11 @@ const make = Effect.gen(function*() {
         syncEnvelope.documentType !== row.document_type ||
         syncEnvelope.messageHash !== row.message_hash
       ) {
-        return yield* storageCorrupt(new Error("Relay outbox payload metadata mismatch"))
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.StorageCorrupt({
+            cause: new Error("Relay outbox payload metadata mismatch")
+          })
+        })
       }
       const outerEnvelope: PeerSyncEnvelope.RelayOuterEnvelope = {
         domain: PeerSyncEnvelope.relayOuterEnvelopeDomain,
@@ -505,7 +515,11 @@ const make = Effect.gen(function*() {
         Effect.provideService(Crypto.Crypto, crypto)
       )
       if (digest !== row.outer_envelope_digest) {
-        return yield* storageCorrupt(new Error("Relay outbox digest mismatch"))
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.StorageCorrupt({
+            cause: new Error("Relay outbox digest mismatch")
+          })
+        })
       }
       return {
         rowId: row.row_id,
@@ -531,20 +545,6 @@ const make = Effect.gen(function*() {
         nextAttemptAt: row.next_attempt_at
       }
     })
-
-  const mapStorageFailures = <A, R,>(
-    effect: Effect.Effect<
-      A,
-      ReplicaError.ReplicaError | SchemaError.SchemaError | SqlError.SqlError,
-      R
-    >
-  ): Effect.Effect<A, ReplicaError.ReplicaError, R> =>
-    effect.pipe(
-      Effect.catchTags({
-        SqlError: storageUnavailable,
-        SchemaError: storageCorrupt
-      })
-    )
 
   const validateReplicaIncarnation = (expected: Identity.ReplicaIncarnation) =>
     gate.current.pipe(
@@ -576,7 +576,12 @@ const make = Effect.gen(function*() {
       )
       const relayMessageId = yield* Identity.makeRelayMessageId.pipe(
         Effect.provideService(Crypto.Crypto, crypto),
-        Effect.mapError((cause) => replicaFailure(new ReplicaError.StorageUnavailable({ cause })))
+        Effect.catchTag("PlatformError", (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause })
+            })
+          ))
       )
       const outerEnvelope: PeerSyncEnvelope.RelayOuterEnvelope = {
         domain: PeerSyncEnvelope.relayOuterEnvelopeDomain,
@@ -612,10 +617,14 @@ const make = Effect.gen(function*() {
         senderConnectionEpoch: syncEnvelope.connectionEpoch,
         senderSequence: syncEnvelope.sequence
       }
-      return yield* mapStorageFailures(sql.withTransaction(Effect.gen(function*() {
+      return yield* sql.withTransaction(Effect.gen(function*() {
         const existing = yield* findSource(request)
         if (existing.length > 1) {
-          return yield* storageCorrupt(new Error("Duplicate relay source operation"))
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({
+              cause: new Error("Duplicate relay source operation")
+            })
+          })
         }
         if (existing.length === 1) {
           const entry = yield* validateRow(existing[0]!, permit)
@@ -692,7 +701,11 @@ const make = Effect.gen(function*() {
           nextAttemptAt: createdAt
         })
         if (inserted.length !== 1) {
-          return yield* storageCorrupt(new Error("Relay outbox insert did not return one row"))
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({
+              cause: new Error("Relay outbox insert did not return one row")
+            })
+          })
         }
         yield* gate.validate(permit)
         return {
@@ -718,7 +731,20 @@ const make = Effect.gen(function*() {
           retryDeadline,
           nextAttemptAt: createdAt
         }
-      })))
+      })).pipe(Effect.catchTags({
+        SqlError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause })
+            })
+          ),
+        SchemaError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+          )
+      }))
     }))
 
   const dueForEndpoint = (input: ReplayInput) =>
@@ -738,7 +764,7 @@ const make = Effect.gen(function*() {
       }
       const permit = yield* gate.shared
       const now = new Date(yield* Clock.currentTimeMillis).toISOString()
-      return yield* mapStorageFailures(sql.withTransaction(Effect.gen(function*() {
+      return yield* sql.withTransaction(Effect.gen(function*() {
         const metadata = yield* findDueMetadata({
           replicaId: permit.replicaId,
           replicaIncarnation: permit.incarnation,
@@ -773,11 +799,19 @@ const make = Effect.gen(function*() {
                 replicaLimits.maxSyncChangesPerMessage
               )
           ) {
-            return yield* storageCorrupt(new Error("Relay outbox payload length mismatch"))
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({
+                cause: new Error("Relay outbox payload length mismatch")
+              })
+            })
           }
           const row = rowsById.get(item.row_id)
           if (row === undefined) {
-            return yield* storageCorrupt(new Error("Relay outbox row disappeared during replay"))
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({
+                cause: new Error("Relay outbox row disappeared during replay")
+              })
+            })
           }
           const entry = yield* validateRow(row, permit)
           if (
@@ -785,12 +819,29 @@ const make = Effect.gen(function*() {
             entry.expectedLocal.subjectId !== endpoint.expectedLocal.subjectId ||
             entry.expectedLocal.peerId !== endpoint.expectedLocal.peerId
           ) {
-            return yield* storageCorrupt(new Error("Relay outbox local endpoint mismatch"))
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({
+                cause: new Error("Relay outbox local endpoint mismatch")
+              })
+            })
           }
           entries.push(entry)
         }
         return entries
-      })))
+      })).pipe(Effect.catchTags({
+        SqlError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause })
+            })
+          ),
+        SchemaError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+          )
+      }))
     }))
 
   const maximumPendingHorizon = (input: Endpoint) =>
@@ -815,12 +866,29 @@ const make = Effect.gen(function*() {
             AND remote_subject_id = ${endpoint.remote.subjectId}
             AND remote_peer_id = ${endpoint.remote.peerId}`
       })
-      const rows = yield* mapStorageFailures(query(undefined))
+      const rows = yield* query(undefined).pipe(Effect.catchTags({
+        SqlError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause })
+            })
+          ),
+        SchemaError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+          )
+      }))
       const horizon = rows[0]?.horizon_millis ?? null
       if (horizon === null) return null
       const rounded = Math.round(horizon)
       if (rounded <= 0 || rounded > limits.maxRetryHorizonMillis) {
-        return yield* storageCorrupt(new Error("Relay outbox horizon mismatch"))
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.StorageCorrupt({
+            cause: new Error("Relay outbox horizon mismatch")
+          })
+        })
       }
       return rounded
     }))
@@ -828,7 +896,7 @@ const make = Effect.gen(function*() {
   const markCustody = (input: CustodyInput) =>
     Effect.scoped(Effect.gen(function*() {
       const permit = yield* gate.shared
-      yield* mapStorageFailures(sql.withTransaction(Effect.gen(function*() {
+      yield* sql.withTransaction(Effect.gen(function*() {
         const rows = yield* findRow({
           replicaId: permit.replicaId,
           replicaIncarnation: permit.incarnation,
@@ -839,7 +907,11 @@ const make = Effect.gen(function*() {
           return
         }
         if (rows.length !== 1) {
-          return yield* storageCorrupt(new Error("Duplicate relay message identity"))
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({
+              cause: new Error("Duplicate relay message identity")
+            })
+          })
         }
         const row = rows[0]!
         yield* validateRow(row, permit)
@@ -856,13 +928,26 @@ const make = Effect.gen(function*() {
             AND relay_message_id = ${input.relayMessageId}
             AND outer_envelope_digest = ${input.outerEnvelopeDigest}`
         yield* gate.validate(permit)
-      })))
+      })).pipe(Effect.catchTags({
+        SqlError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause })
+            })
+          ),
+        SchemaError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+          )
+      }))
     }))
 
   const pruneExpired = Effect.scoped(Effect.gen(function*() {
     const permit = yield* gate.shared
     const now = new Date(yield* Clock.currentTimeMillis).toISOString()
-    return yield* mapStorageFailures(sql.withTransaction(Effect.gen(function*() {
+    return yield* sql.withTransaction(Effect.gen(function*() {
       const query = SqlSchema.findAll({
         Request: Schema.Void,
         Result: Row,
@@ -886,7 +971,20 @@ const make = Effect.gen(function*() {
       }
       yield* gate.validate(permit)
       return rows.length
-    })))
+    })).pipe(Effect.catchTags({
+      SqlError: (cause) =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageUnavailable({ cause })
+          })
+        ),
+      SchemaError: (cause) =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({ cause })
+          })
+        )
+    }))
   }))
 
   const usage = (input: Endpoint) =>
@@ -912,9 +1010,22 @@ const make = Effect.gen(function*() {
             FROM effect_local_peer_relay_outbox_replica_usage
             WHERE replica_incarnation = ${permit.incarnation}`
       })
-      const [remoteRows, replicaRows] = yield* mapStorageFailures(
-        sql.withTransaction(Effect.all([remoteQuery(undefined), replicaQuery(undefined)]))
-      )
+      const [remoteRows, replicaRows] = yield* sql.withTransaction(
+        Effect.all([remoteQuery(undefined), replicaQuery(undefined)])
+      ).pipe(Effect.catchTags({
+        SqlError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause })
+            })
+          ),
+        SchemaError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+          )
+      }))
       const remote = remoteRows[0] ?? { message_count: 0, encoded_bytes: 0 }
       const replica = replicaRows[0] ?? { message_count: 0, encoded_bytes: 0 }
       return {

@@ -204,20 +204,6 @@ export class Compaction extends Context.Service<Compaction, {
  */
 const receiptPruneBatchSize = 512
 
-const failStorageUnavailable = (cause: unknown) =>
-  Effect.fail(
-    new ReplicaError.ReplicaError({
-      reason: new ReplicaError.StorageUnavailable({ cause })
-    })
-  )
-
-const failStorageCorrupt = (cause: unknown) =>
-  Effect.fail(
-    new ReplicaError.ReplicaError({
-      reason: new ReplicaError.StorageCorrupt({ cause })
-    })
-  )
-
 export const layer: Layer.Layer<
   Compaction,
   never,
@@ -356,7 +342,12 @@ export const layer: Layer.Layer<
     // durable is wrong, the operation simply could not start.
     const makeLineage = Identity.makeDocumentLineage.pipe(
       Effect.provideService(Crypto.Crypto, crypto),
-      Effect.catchTag("PlatformError", failStorageUnavailable)
+      Effect.catchTag("PlatformError", (cause) =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageUnavailable({ cause })
+          })
+        ))
     )
     const findDefinitionHash = SqlSchema.findOne({
       Request: Schema.Void,
@@ -885,7 +876,20 @@ export const layer: Layer.Layer<
         if (removed < receiptPruneBatchSize) return deleted
       }
     }).pipe(
-      Effect.catchTags({ SqlError: failStorageUnavailable, SchemaError: failStorageCorrupt }),
+      Effect.catchTags({
+        SqlError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause })
+            })
+          ),
+        SchemaError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+          )
+      }),
       Effect.tap((deleted) => Effect.annotateCurrentSpan({ "receipts.pruned": deleted })),
       Effect.withSpan("Compaction.pruneCommandReceipts", {
         attributes: { "receipts.batch_size": receiptPruneBatchSize }
@@ -1170,9 +1174,11 @@ export const layer: Layer.Layer<
         const rootChanges = InternalAutomerge.changesSince(rebuilt, [])
         const rootChange = rootChanges[0]
         if (rootChanges.length !== 1 || rootChange === undefined) {
-          return yield* failStorageCorrupt(
-            new Error(`Re-rooted document produced ${rootChanges.length} changes instead of one`)
-          )
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({
+              cause: new Error(`Re-rooted document produced ${rootChanges.length} changes instead of one`)
+            })
+          })
         }
         const definitionHash = yield* findDefinitionHash(undefined).pipe(
           Effect.map((row) => row.definition_hash),
@@ -1334,7 +1340,11 @@ export const layer: Layer.Layer<
           for (const entry of usage.values()) {
             const updated = yield* decrementRelayReceiptUsage(entry)
             if (updated.length !== 1) {
-              return yield* failStorageCorrupt(new Error("Relay receipt usage is inconsistent"))
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({
+                  cause: new Error("Relay receipt usage is inconsistent")
+                })
+              })
             }
             if (updated[0]!.receipt_count === 0) {
               zeroUsage.push(entry)
@@ -1345,13 +1355,21 @@ export const layer: Layer.Layer<
           for (const entry of zeroUsage) {
             const deleted = yield* deleteZeroRelayReceiptUsage(entry)
             if (deleted.length !== 1) {
-              return yield* failStorageCorrupt(new Error("Zero relay receipt usage disappeared"))
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({
+                  cause: new Error("Zero relay receipt usage disappeared")
+                })
+              })
             }
           }
           for (const receipt of settledRelayReceipts) {
             const authorized = yield* authorizeRelayReceiptDelete(receipt.row_id)
             if (authorized.length !== 1) {
-              return yield* failStorageCorrupt(new Error("Relay receipt deletion was not authorized"))
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({
+                  cause: new Error("Relay receipt deletion was not authorized")
+                })
+              })
             }
             const deleted = yield* deleteExpiredRelayReceipt({
               documentId,
@@ -1359,7 +1377,11 @@ export const layer: Layer.Layer<
               rowId: receipt.row_id
             })
             if (deleted.length !== 1) {
-              return yield* failStorageCorrupt(new Error("Relay receipt disappeared during history rewrite"))
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({
+                  cause: new Error("Relay receipt disappeared during history rewrite")
+                })
+              })
             }
           }
           yield* sql`DELETE FROM effect_local_peer_receipts
@@ -1480,7 +1502,20 @@ export const layer: Layer.Layer<
           return lineage
         }))
       })).pipe(
-        Effect.catchTags({ SqlError: failStorageUnavailable, SchemaError: failStorageCorrupt }),
+        Effect.catchTags({
+          SqlError: (cause) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({ cause })
+              })
+            ),
+          SchemaError: (cause) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause })
+              })
+            )
+        }),
         // Byte and row counts only, annotated from inside. The document's value, its heads and the
         // lineage itself never reach the span.
         Effect.withSpan("Compaction.rewriteHistory")

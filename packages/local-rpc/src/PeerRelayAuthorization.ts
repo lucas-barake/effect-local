@@ -87,23 +87,13 @@ export class PeerRelayAuthorization extends Context.Service<PeerRelayAuthorizati
   readonly authorizeUnsafeUnboundedAutomerge3Decode: AuthorizeUnsafeUnboundedAutomerge3Decode
 }>()("@lucas-barake/effect-local-rpc/PeerRelayAuthorization") {}
 
-const accessDeniedOnSchemaError = <A, E, R,>(effect: Effect.Effect<A, E, R>) =>
-  effect.pipe(
-    Effect.catchIf(
-      (error): error is E & { readonly _tag: "SchemaError" } =>
-        typeof error === "object" && error !== null && "_tag" in error && error._tag === "SchemaError",
-      () => new PeerRpcError.AccessDenied()
-    )
-  )
-
 const validateRequestShape = (request: Request) =>
-  accessDeniedOnSchemaError(
-    Effect.all([
-      Direction.makeEffect(request.direction),
-      PeerAuthentication.PeerPrincipal.makeEffect(request.principal),
-      RemotePeer.makeEffect(request.remote)
-    ])
-  ).pipe(
+  Effect.all([
+    Direction.makeEffect(request.direction),
+    PeerAuthentication.PeerPrincipal.makeEffect(request.principal),
+    RemotePeer.makeEffect(request.remote)
+  ]).pipe(
+    Effect.catchTag("SchemaError", () => new PeerRpcError.AccessDenied()),
     Effect.flatMap(() => validateRequest(request.documents)),
     Effect.flatMap((requested) =>
       new Set(request.documents.map((document) => document.documentId)).size ===
@@ -114,7 +104,8 @@ const validateRequestShape = (request: Request) =>
   )
 
 const validateResult = (request: Request, result: Result) =>
-  accessDeniedOnSchemaError(PeerAuthentication.PeerPrincipal.makeEffect(result.remote)).pipe(
+  PeerAuthentication.PeerPrincipal.makeEffect(result.remote).pipe(
+    Effect.catchTag("SchemaError", () => new PeerRpcError.AccessDenied()),
     Effect.flatMap((remote) =>
       remote.tenantId === request.principal.tenantId &&
         remote.subjectId === request.remote.subjectId &&
@@ -149,7 +140,8 @@ const canonicalDocuments = (
   })
 
 const validateUnsafeRequest = (request: UnsafeUnboundedAutomerge3DecodeRequest) =>
-  accessDeniedOnSchemaError(UnsafeUnboundedAutomerge3DecodeRequest.makeEffect(request)).pipe(
+  UnsafeUnboundedAutomerge3DecodeRequest.makeEffect(request).pipe(
+    Effect.catchTag("SchemaError", () => new PeerRpcError.AccessDenied()),
     Effect.flatMap((validated) => validateUnsafeDocuments(validated.documents).pipe(Effect.as(validated)))
   )
 
@@ -157,9 +149,8 @@ const validateUnsafeGrant = (
   request: UnsafeUnboundedAutomerge3DecodeRequest,
   result: UnsafeUnboundedAutomerge3DecodeGrant
 ) =>
-  accessDeniedOnSchemaError(
-    Schema.decodeUnknownEffect(UnsafeUnboundedAutomerge3DecodeGrant)(result)
-  ).pipe(
+  Schema.decodeUnknownEffect(UnsafeUnboundedAutomerge3DecodeGrant)(result).pipe(
+    Effect.catchTag("SchemaError", () => new PeerRpcError.AccessDenied()),
     Effect.flatMap((grant) =>
       Effect.gen(function*() {
         const requested = yield* validateUnsafeDocuments(request.documents)

@@ -1,5 +1,6 @@
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -13,7 +14,6 @@ import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as PeerRelayMigrations from "./internal/peerRelayMigrations.js"
 import { make as makeWriteTransaction } from "./internal/peerRelaySqlTransaction.js"
-import { mapStoreErrors } from "./internal/peerRelayStoreErrors.js"
 import * as PeerRpcObservability from "./internal/peerRpcObservability.js"
 import * as PeerRelayLimits from "./PeerRelayLimits.js"
 import {
@@ -55,11 +55,6 @@ interface UsageScope {
   readonly retainedCountLimit: number
   readonly retainedBytesLimit: number
 }
-
-const storageCorrupt = (cause: unknown) =>
-  new ReplicaError.ReplicaError({
-    reason: new ReplicaError.StorageCorrupt({ cause })
-  })
 
 const protocolMismatch = (expected: string, observed: string) =>
   new ReplicaError.ReplicaError({
@@ -183,7 +178,12 @@ const decodeDocuments = Schema.decodeUnknownEffect(
 
 const parseDocuments = (value: string) =>
   decodeDocuments(value).pipe(
-    Effect.mapError((cause) => storageCorrupt(cause))
+    Effect.catchTag("SchemaError", (cause) =>
+      Effect.fail(
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.StorageCorrupt({ cause })
+        })
+      ))
   )
 
 const validateInput = <S extends Schema.Top,>(schema: S, input: unknown) =>
@@ -211,17 +211,35 @@ const checkDurability = (
           execute: () => sql`PRAGMA synchronous`
         })
         const mode = yield* journal(undefined).pipe(
-          Effect.catchTag("NoSuchElementError", (cause) => Effect.fail(storageCorrupt(cause)))
+          Effect.catchTag("NoSuchElementError", (cause) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause })
+              })
+            ))
         )
         if (mode.journal_mode.toLowerCase() !== "wal") {
-          return yield* storageCorrupt(new Error("Relay custody requires SQLite WAL mode"))
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({
+              cause: new Error("Relay custody requires SQLite WAL mode")
+            })
+          })
         }
         yield* sql`PRAGMA synchronous = FULL`
         const setting = yield* synchronous(undefined).pipe(
-          Effect.catchTag("NoSuchElementError", (cause) => Effect.fail(storageCorrupt(cause)))
+          Effect.catchTag("NoSuchElementError", (cause) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause })
+              })
+            ))
         )
         if (setting.synchronous !== 2) {
-          return yield* storageCorrupt(new Error("Relay custody requires SQLite FULL synchronous mode"))
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({
+              cause: new Error("Relay custody requires SQLite FULL synchronous mode")
+            })
+          })
         }
       }),
     orElse: () => Effect.void
@@ -470,7 +488,11 @@ export const make = Effect.gen(function*() {
     Effect.gen(function*() {
       const reservationOption = yield* findReservation(messageId)
       if (Option.isNone(reservationOption)) {
-        return yield* storageCorrupt(new Error("Missing relay quota reservation"))
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.StorageCorrupt({
+            cause: new Error("Missing relay quota reservation")
+          })
+        })
       }
       const reservation = reservationOption.value
       if (reservation.activeConsumed === 1) {
@@ -500,7 +522,11 @@ export const make = Effect.gen(function*() {
           })(undefined)
         )
         if (changed !== 1) {
-          return yield* storageCorrupt(new Error("Invalid active relay quota reservation"))
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({
+              cause: new Error("Invalid active relay quota reservation")
+            })
+          })
         }
         yield* sql`DELETE FROM effect_local_relay_usage
           WHERE scope_kind = ${kind}
@@ -521,7 +547,11 @@ export const make = Effect.gen(function*() {
     Effect.gen(function*() {
       const reservationOption = yield* findReservation(messageId)
       if (Option.isNone(reservationOption)) {
-        return yield* storageCorrupt(new Error("Missing relay quota reservation"))
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.StorageCorrupt({
+            cause: new Error("Missing relay quota reservation")
+          })
+        })
       }
       const reservation = reservationOption.value
       if (reservation.retainedConsumed === 1) {
@@ -551,7 +581,11 @@ export const make = Effect.gen(function*() {
           })(undefined)
         )
         if (changed !== 1) {
-          return yield* storageCorrupt(new Error("Invalid retained relay quota reservation"))
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({
+              cause: new Error("Invalid retained relay quota reservation")
+            })
+          })
         }
         yield* sql`DELETE FROM effect_local_relay_usage
           WHERE scope_kind = ${kind}
@@ -654,7 +688,7 @@ export const make = Effect.gen(function*() {
   const admit: Service["admit"] = (unsafeInput) => {
     let observedBytes: number | undefined
     let observedVersion: number | undefined
-    const effect = mapStoreErrors(Effect.gen(function*() {
+    const effect = Effect.gen(function*() {
       const input = yield* validateInput(Admission, unsafeInput)
       const payloadBytes = input.payload.byteLength
       observedBytes = payloadBytes
@@ -814,7 +848,27 @@ export const make = Effect.gen(function*() {
           lane: "New"
         })
       }))
-    })).pipe(Effect.tapError(recordQuotaRejection))
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.failCause(Cause.map(cause, (error) => {
+          switch (error._tag) {
+            case "SqlError":
+            case "NestedPeerRelayTransactionError":
+              return new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({ cause: error })
+              })
+            case "SchemaError":
+            case "NoSuchElementError":
+              return new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause: error })
+              })
+            default:
+              return error
+          }
+        }))
+      ),
+      Effect.tapError(recordQuotaRejection)
+    )
     return PeerRpcObservability.observeRelay({
       effect,
       operation: "RelayAdmit",
@@ -941,7 +995,7 @@ export const make = Effect.gen(function*() {
 
   const claim: Service["claim"] = (unsafeInput) => {
     let observedAttempt: number | undefined
-    const effect = mapStoreErrors(Effect.gen(function*() {
+    const effect = Effect.gen(function*() {
       const input = yield* validateInput(ClaimRequest, unsafeInput)
       return yield* write(Effect.gen(function*() {
         const now = (yield* nowQuery(sql)).now
@@ -991,7 +1045,11 @@ export const make = Effect.gen(function*() {
           })(undefined)
         )
         if (claimed !== 1) {
-          return yield* storageCorrupt(new Error("Relay claim compare and swap failed"))
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({
+              cause: new Error("Relay claim compare and swap failed")
+            })
+          })
         }
         const channelClaimed = yield* mutationCount(
           sql`UPDATE effect_local_relay_channels
@@ -1016,7 +1074,11 @@ export const make = Effect.gen(function*() {
           })(undefined)
         )
         if (channelClaimed !== 1) {
-          return yield* storageCorrupt(new Error("Relay channel claim compare and swap failed"))
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({
+              cause: new Error("Relay channel claim compare and swap failed")
+            })
+          })
         }
         return {
           message: Option.some(ClaimedMessage.make({
@@ -1047,7 +1109,25 @@ export const make = Effect.gen(function*() {
           lane: candidate.retryCount === 0 ? "New" as const : "Retry" as const
         }
       }))
-    }))
+    }).pipe(Effect.catchCause((cause) =>
+      Effect.failCause(Cause.map(cause, (error) => {
+        switch (error._tag) {
+          case "SqlError":
+          case "PlatformError":
+          case "NestedPeerRelayTransactionError":
+            return new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause: error })
+            })
+          case "SchemaError":
+          case "NoSuchElementError":
+            return new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause: error })
+            })
+          default:
+            return error
+        }
+      }))
+    ))
     return PeerRpcObservability.observeRelay({
       effect,
       operation: "RelayClaim",
@@ -1072,7 +1152,7 @@ export const make = Effect.gen(function*() {
   }
 
   const loadClaimedPayload: Service["loadClaimedPayload"] = (unsafeInput) =>
-    mapStoreErrors(Effect.gen(function*() {
+    Effect.gen(function*() {
       const input = yield* validateInput(LoadClaimedPayloadRequest, unsafeInput)
       const now = (yield* nowQuery(sql)).now
       const rows = yield* SqlSchema.findAll({
@@ -1111,6 +1191,25 @@ export const make = Effect.gen(function*() {
         return yield* protocolMismatch("active relay claim", "stale relay claim")
       }
       return rows[0]!.payload
+    }).pipe(Effect.catchTags({
+      SqlError: (cause) =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageUnavailable({ cause })
+          })
+        ),
+      SchemaError: (cause) =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({ cause })
+          })
+        ),
+      NoSuchElementError: (cause) =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({ cause })
+          })
+        )
     }))
 
   const TerminalRow = Schema.Struct({
@@ -1227,7 +1326,7 @@ export const make = Effect.gen(function*() {
     reason: string,
     onChanged?: (latencyMillis: number) => void
   ): Effect.Effect<TransitionResult, StoreError> =>
-    mapStoreErrors(Effect.gen(function*() {
+    Effect.gen(function*() {
       const input = yield* validateInput(TerminalRequest, unsafeInput)
       if (
         input.recipient.tenantId !== input.channel.tenantId ||
@@ -1295,7 +1394,24 @@ export const make = Effect.gen(function*() {
           lane: "New"
         } as const
       }))
-    }))
+    }).pipe(Effect.catchCause((cause) =>
+      Effect.failCause(Cause.map(cause, (error) => {
+        switch (error._tag) {
+          case "SqlError":
+          case "NestedPeerRelayTransactionError":
+            return new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause: error })
+            })
+          case "SchemaError":
+          case "NoSuchElementError":
+            return new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause: error })
+            })
+          default:
+            return error
+        }
+      }))
+    ))
 
   const acknowledge: Service["acknowledge"] = (input) => {
     let latencyMillis: number | undefined
@@ -1329,7 +1445,7 @@ export const make = Effect.gen(function*() {
   }
 
   const reject: Service["reject"] = (unsafeInput) => {
-    const effect = mapStoreErrors(Effect.gen(function*() {
+    const effect = Effect.gen(function*() {
       const input = yield* validateInput(RejectRequest, unsafeInput)
       return yield* terminalTransition(
         TerminalRequest.make({
@@ -1343,7 +1459,7 @@ export const make = Effect.gen(function*() {
         "DeadLettered",
         input.reason
       )
-    }))
+    })
     return PeerRpcObservability.observeRelay({
       effect,
       operation: "RelayAcknowledge",
@@ -1361,7 +1477,7 @@ export const make = Effect.gen(function*() {
   }
 
   const release: Service["release"] = (unsafeInput) => {
-    const effect = mapStoreErrors(Effect.gen(function*() {
+    const effect = Effect.gen(function*() {
       const input = yield* validateInput(ReleaseRequest, unsafeInput)
       return yield* write(Effect.gen(function*() {
         const now = (yield* nowQuery(sql)).now
@@ -1449,7 +1565,24 @@ export const make = Effect.gen(function*() {
           lane: "Retry"
         } as const
       }))
-    }))
+    }).pipe(Effect.catchCause((cause) =>
+      Effect.failCause(Cause.map(cause, (error) => {
+        switch (error._tag) {
+          case "SqlError":
+          case "NestedPeerRelayTransactionError":
+            return new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause: error })
+            })
+          case "SchemaError":
+          case "NoSuchElementError":
+            return new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause: error })
+            })
+          default:
+            return error
+        }
+      }))
+    ))
     return PeerRpcObservability.observeRelay({
       effect,
       operation: "RelayRelease",
@@ -1482,7 +1615,7 @@ export const make = Effect.gen(function*() {
   const recover: Service["recover"] = (unsafeInput) =>
     Effect.suspend(() => {
       let deadLettered = 0
-      const effect = mapStoreErrors(Effect.gen(function*() {
+      const effect = Effect.gen(function*() {
         const input = yield* validateInput(MaintenanceRequest, unsafeInput)
         const effectiveBatch = Math.min(input.batchSize, limits.claimRecoveryBatchSize)
         return yield* write(Effect.gen(function*() {
@@ -1543,7 +1676,24 @@ export const make = Effect.gen(function*() {
           }
           return maintenanceResult(rows.map((row) => row.messageId), effectiveBatch)
         }))
-      }))
+      }).pipe(Effect.catchCause((cause) =>
+        Effect.failCause(Cause.map(cause, (error) => {
+          switch (error._tag) {
+            case "SqlError":
+            case "NestedPeerRelayTransactionError":
+              return new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({ cause: error })
+              })
+            case "SchemaError":
+            case "NoSuchElementError":
+              return new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause: error })
+              })
+            default:
+              return error
+          }
+        }))
+      ))
       return PeerRpcObservability.observeRelay({
         effect,
         operation: "RelayMaintenance",
@@ -1560,7 +1710,7 @@ export const make = Effect.gen(function*() {
     })
 
   const expire: Service["expire"] = (unsafeInput) => {
-    const effect = mapStoreErrors(Effect.gen(function*() {
+    const effect = Effect.gen(function*() {
       const input = yield* validateInput(MaintenanceRequest, unsafeInput)
       const effectiveBatch = Math.min(input.batchSize, limits.expiryBatchSize)
       return yield* write(Effect.gen(function*() {
@@ -1581,7 +1731,24 @@ export const make = Effect.gen(function*() {
         }
         return maintenanceResult(rows.map((row) => row.messageId), effectiveBatch)
       }))
-    }))
+    }).pipe(Effect.catchCause((cause) =>
+      Effect.failCause(Cause.map(cause, (error) => {
+        switch (error._tag) {
+          case "SqlError":
+          case "NestedPeerRelayTransactionError":
+            return new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause: error })
+            })
+          case "SchemaError":
+          case "NoSuchElementError":
+            return new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause: error })
+            })
+          default:
+            return error
+        }
+      }))
+    ))
     return PeerRpcObservability.observeRelay({
       effect,
       operation: "RelayMaintenance",
@@ -1615,7 +1782,7 @@ export const make = Effect.gen(function*() {
   })
 
   const repair: Service["repair"] = (unsafeInput) => {
-    const effect = mapStoreErrors(Effect.gen(function*() {
+    const effect = Effect.gen(function*() {
       const input = yield* validateInput(MaintenanceRequest, unsafeInput)
       const effectiveBatch = Math.min(input.batchSize, limits.integrityBatchSize)
       return yield* write(Effect.gen(function*() {
@@ -1655,7 +1822,11 @@ export const make = Effect.gen(function*() {
             row.activeConsumed === null ||
             row.retainedConsumed === null
           ) {
-            return yield* storageCorrupt(new Error("Relay reservation reconciliation required"))
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({
+                cause: new Error("Relay reservation reconciliation required")
+              })
+            })
           }
           const active = row.state === "Pending" || row.state === "Claimed"
           const terminal = row.state === "Acknowledged" ||
@@ -1665,7 +1836,11 @@ export const make = Effect.gen(function*() {
             (active && row.activeConsumed !== 0) ||
             (terminal && row.activeConsumed !== 1)
           ) {
-            return yield* storageCorrupt(new Error("Corrupt relay reservation entitlement"))
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({
+                cause: new Error("Corrupt relay reservation entitlement")
+              })
+            })
           }
           const corrupt = (!active && !terminal) ||
             row.messageTenantId !== row.channelTenantId ||
@@ -1684,12 +1859,33 @@ export const make = Effect.gen(function*() {
           if (corrupt && active) {
             yield* terminalize(row.messageId, "DeadLettered", now, { reason: "Corrupt" })
           } else if (corrupt) {
-            return yield* storageCorrupt(new Error("Corrupt terminal relay row"))
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({
+                cause: new Error("Corrupt terminal relay row")
+              })
+            })
           }
         }
         return maintenanceResult(rows.map((row) => row.messageId), effectiveBatch)
       }))
-    }))
+    }).pipe(Effect.catchCause((cause) =>
+      Effect.failCause(Cause.map(cause, (error) => {
+        switch (error._tag) {
+          case "SqlError":
+          case "NestedPeerRelayTransactionError":
+            return new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause: error })
+            })
+          case "SchemaError":
+          case "NoSuchElementError":
+            return new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause: error })
+            })
+          default:
+            return error
+        }
+      }))
+    ))
     return PeerRpcObservability.observeRelay({
       effect,
       operation: "RelayMaintenance",
@@ -1703,7 +1899,7 @@ export const make = Effect.gen(function*() {
   }
 
   const reconcile: Service["reconcile"] = (unsafeInput) => {
-    const effect = mapStoreErrors(Effect.gen(function*() {
+    const effect = Effect.gen(function*() {
       const input = yield* validateInput(MaintenanceRequest, unsafeInput)
       const effectiveBatch = Math.min(input.batchSize, limits.reconciliationBatchSize)
       return yield* write(Effect.gen(function*() {
@@ -1731,11 +1927,31 @@ export const make = Effect.gen(function*() {
           messageRows.length !== reservationRows.length ||
           messageRows.some((row, index) => row.messageId !== reservationRows[index]?.messageId)
         ) {
-          return yield* storageCorrupt(new Error("Relay reservation bijection is corrupt"))
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({
+              cause: new Error("Relay reservation bijection is corrupt")
+            })
+          })
         }
         return maintenanceResult(messageRows.map((row) => row.messageId), effectiveBatch)
       }))
-    }))
+    }).pipe(Effect.catchCause((cause) =>
+      Effect.failCause(Cause.map(cause, (error) => {
+        switch (error._tag) {
+          case "SqlError":
+          case "NestedPeerRelayTransactionError":
+            return new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause: error })
+            })
+          case "SchemaError":
+            return new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause: error })
+            })
+          default:
+            return error
+        }
+      }))
+    ))
     return PeerRpcObservability.observeRelay({
       effect,
       operation: "RelayMaintenance",
@@ -1749,7 +1965,7 @@ export const make = Effect.gen(function*() {
   }
 
   const collect: Service["collect"] = (unsafeInput) => {
-    const effect = mapStoreErrors(Effect.gen(function*() {
+    const effect = Effect.gen(function*() {
       const input = yield* validateInput(MaintenanceRequest, unsafeInput)
       const effectiveBatch = Math.min(input.batchSize, limits.terminalCollectionBatchSize)
       return yield* write(Effect.gen(function*() {
@@ -1789,7 +2005,11 @@ export const make = Effect.gen(function*() {
             })(undefined)
           )
           if (reservationDeleted !== 1) {
-            return yield* storageCorrupt(new Error("Invalid collected relay quota reservation"))
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({
+                cause: new Error("Invalid collected relay quota reservation")
+              })
+            })
           }
           yield* sql`DELETE FROM effect_local_relay_messages
             WHERE message_id = ${row.messageId}
@@ -1806,7 +2026,24 @@ export const make = Effect.gen(function*() {
         }
         return maintenanceResult(rows.map((row) => row.messageId), effectiveBatch)
       }))
-    }))
+    }).pipe(Effect.catchCause((cause) =>
+      Effect.failCause(Cause.map(cause, (error) => {
+        switch (error._tag) {
+          case "SqlError":
+          case "NestedPeerRelayTransactionError":
+            return new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause: error })
+            })
+          case "SchemaError":
+          case "NoSuchElementError":
+            return new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause: error })
+            })
+          default:
+            return error
+        }
+      }))
+    ))
     return PeerRpcObservability.observeRelay({
       effect,
       operation: "RelayMaintenance",
@@ -1821,7 +2058,7 @@ export const make = Effect.gen(function*() {
 
   const usage: Service["usage"] = (unsafeInput) => {
     const exactShard = unsafeInput === undefined
-    const effect = mapStoreErrors(Effect.gen(function*() {
+    const effect = Effect.gen(function*() {
       const input = unsafeInput === undefined
         ? UsageRequest.make({ scopeKind: "Shard", scopeKey: encodeKey("local") })
         : yield* validateInput(UsageRequest, unsafeInput)
@@ -1844,6 +2081,19 @@ export const make = Effect.gen(function*() {
         retainedCount: 0,
         retainedBytes: 0
       }))
+    }).pipe(Effect.catchTags({
+      SqlError: (cause) =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageUnavailable({ cause })
+          })
+        ),
+      SchemaError: (cause) =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({ cause })
+          })
+        )
     }))
     return PeerRpcObservability.observeRelay({
       effect,
