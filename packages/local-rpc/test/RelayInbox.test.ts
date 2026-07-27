@@ -83,7 +83,9 @@ const relay = (
     Layer.provide(TestShardingConfig),
     // Merged rather than provided so a test can assert against the same durable rows the entity
     // wrote. Delivery budgets and terminal states are durable guarantees, not internals.
-    Layer.provideMerge(options?.store ?? sqliteStore)
+    Layer.provideMerge(options?.store ?? sqliteStore),
+    // The entity mints claim tokens from the deployment's own randomness, not the ambient global.
+    Layer.provide(NodeCrypto.layer)
   )
 
 const layer = relay()

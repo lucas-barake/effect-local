@@ -452,7 +452,16 @@ export const observe = <A, E, R,>(options: {
               ),
               Effect.tap((exit) =>
                 Effect.sync(() => options.result(exit)).pipe(
-                  Effect.catchCause(() => Effect.succeed("Failure" as const)),
+                  // Only a defect thrown by the caller's own classifier is recovered — the wrapped
+                  // effect is `Effect.sync`, so nothing else can arrive here — and it is logged
+                  // rather than swallowed. Recovering the whole `Cause` would relabel every
+                  // observed operation as a failure with nothing anywhere saying why, and would
+                  // silently absorb interruption alongside it.
+                  Effect.catchDefect((defect) =>
+                    Effect.logWarning("Peer rpc observability classifier died", defect).pipe(
+                      Effect.as("Failure" as const)
+                    )
+                  ),
                   Effect.flatMap((result) =>
                     Effect.sync(() => span.attribute("rpc.result", result)).pipe(
                       Effect.andThen(record(options.operation, result, 1))
@@ -518,11 +527,21 @@ export const observeRelay = <A, E, R,>(options: {
               Effect.tap(([duration, exit]) => {
                 const durationMillis = Duration.toMillis(duration)
                 return Effect.gen(function*() {
+                  // As above: a defect in the caller's classifier is recovered and reported;
+                  // interruption is left alone.
                   const result = yield* Effect.sync(() => options.result(exit)).pipe(
-                    Effect.catchCause(() => Effect.succeed("Failure" as const))
+                    Effect.catchDefect((defect) =>
+                      Effect.logWarning("Relay observability classifier died", defect).pipe(
+                        Effect.as("Failure" as const)
+                      )
+                    )
                   )
                   const facts = yield* Effect.sync(() => options.facts(exit)).pipe(
-                    Effect.catchCause(() => Effect.succeed<RelayFacts>({}))
+                    Effect.catchDefect((defect) =>
+                      Effect.logWarning("Relay observability facts died", defect).pipe(
+                        Effect.as<RelayFacts>({})
+                      )
+                    )
                   )
                   yield* Effect.sync(() => {
                     span.attribute("rpc.result", result)

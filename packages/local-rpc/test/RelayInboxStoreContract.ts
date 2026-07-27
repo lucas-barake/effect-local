@@ -373,6 +373,30 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
     })
   },
   {
+    name: "charges a revived message against the inbox byte quota",
+    run: Effect.gen(function*() {
+      const store = yield* RelayInboxStore.RelayInboxStore
+      yield* store.admit(
+        admission({ inboxKey: "revive-bytes", id: "000000000001", sequence: 0, now: 3_100_000, ttl: 1_000 })
+      )
+      yield* store.expire({ now: 3_105_000, limit: 1_000, terminalRetentionMillis: 1_000 })
+
+      // The message cap alone is generous, so only the byte cap can refuse this. A revive restores
+      // the row's stored bytes to pending, so a sender replaying identities the inbox already gave
+      // up on would otherwise be bounded only by the message count times the maximum payload —
+      // which is the number the byte cap exists to be lower than.
+      const revived = yield* store.admit(admission({
+        inboxKey: "revive-bytes",
+        id: "000000000001",
+        sequence: 0,
+        now: 3_106_000,
+        ttl: 1_000,
+        quota: { maxPendingMessages: 100, maxPendingBytes: 1 }
+      }))
+      assert.strictEqual(revived._tag, "QuotaExceeded")
+    })
+  },
+  {
     name: "keeps a revived message deduplicated for the sender's replay window",
     run: Effect.gen(function*() {
       const store = yield* RelayInboxStore.RelayInboxStore

@@ -1,6 +1,7 @@
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
+import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
@@ -224,8 +225,6 @@ interface Session {
   readonly deadlineAt: Ref.Ref<number>
 }
 
-const makeClaimToken = Effect.sync(() => `clm_${crypto.randomUUID()}` as PeerRpc.ClaimToken)
-
 /**
  * The in-flight key for a channel.
  *
@@ -249,6 +248,14 @@ export const layer = (options: Options) =>
       const address = yield* Entity.CurrentAddress
       const inboxKey = address.entityId
       const store = yield* RelayInboxStore.RelayInboxStore
+      // Resolved once here so the handlers carry no requirement of their own. A claim token is the
+      // anti-replay binding between one delivery attempt and its settlement, so it is minted from
+      // the deployment's own `Crypto` like every other identity in this package rather than from
+      // the ambient global, which no deployment can substitute and no test can make deterministic.
+      const crypto = yield* Crypto.Crypto
+      const makeClaimToken = Crypto.Crypto.use((platform) =>
+        platform.randomUUIDv4.pipe(Effect.map((uuid) => PeerRpc.ClaimToken.make(`clm_${uuid}`)))
+      ).pipe(Effect.provideService(Crypto.Crypto, crypto))
 
       // Converted once at construction. Everything downstream of these is arithmetic against
       // `Clock.currentTimeMillis` or a millisecond column, so the durations are resolved here

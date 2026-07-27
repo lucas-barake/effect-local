@@ -63,6 +63,20 @@ const recipient = PeerAuthentication.PeerPrincipal.make({
   peerId: recipientPeerId
 })
 
+/**
+ * A third device in the same tenant.
+ *
+ * The recipient's inbox is keyed by the recipient alone, so every peer holding a Send grant to it
+ * writes into that one inbox. A session opened against one counterparty therefore drains messages
+ * from all of them, which is what makes "who sent this" a question the front door has to ask per
+ * message rather than once at the handshake.
+ */
+const intruder = PeerAuthentication.PeerPrincipal.make({
+  tenantId: "tenant",
+  subjectId: "intruder",
+  peerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000005")
+})
+
 /** A real, authenticated peer that simply belongs to a tenant this relay does not serve. */
 const outsider = PeerAuthentication.PeerPrincipal.make({
   tenantId: "other",
@@ -274,7 +288,12 @@ const harness = (options?: {
     )
 
     const credential = yield* Ref.make("sender")
-    const principals = new Map([["sender", sender], ["recipient", recipient], ["outsider", outsider]])
+    const principals = new Map([
+      ["sender", sender],
+      ["recipient", recipient],
+      ["outsider", outsider],
+      ["intruder", intruder]
+    ])
     const authentication = yield* PeerAuthentication.PeerAuthentication.pipe(
       Effect.provide(PeerAuthentication.layerServer),
       Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
@@ -1017,6 +1036,101 @@ describe("RelayServer", () => {
         pending.some((message) => message.relayMessageId === relayId("000000000001")),
         "the withheld document stays durable"
       )
+    })))
+
+  it.effect("re-authorizes each delivery against the peer that actually sent it", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const peer = yield* harness()
+
+      // A third device writes into the recipient's inbox while it is fully entitled to. The inbox
+      // is keyed by the recipient alone, so this message now sits alongside every other sender's.
+      const intruderSession = yield* open(peer, intruder, recipient)
+      yield* Ref.set(peer.credential, "intruder")
+      yield* peer.client.Push({
+        sessionId: intruderSession.opened.sessionId,
+        relayMessageId: relayId("000000000001"),
+        payload: yield* encodePayload(peer, { epoch: "intruder" })
+      })
+      yield* TestClock.adjust(10)
+
+      // Every grant naming the intruder is withdrawn, both directions and both ports. The recipient
+      // is no longer entitled to anything at all from that device.
+      const withoutIntruder = (subject: string, remote: string) => subject !== "intruder" && remote !== "intruder"
+      peer.knobs.allow = (request) => withoutIntruder(request.principal.subjectId, request.remote.subjectId)
+      peer.knobs.allowRisk = (request) => withoutIntruder(request.principal.subjectId, request.remote.subjectId)
+
+      // The recipient reconnects to a different, still-authorized counterparty, and a message from
+      // that counterparty arrives. Taking it proves the stream is live and has been dispatched
+      // past the intruder's older message, so the intruder's absence below is observed rather than
+      // merely not-yet-delivered.
+      const recipientSession = yield* open(peer, recipient, sender)
+      const senderSession = yield* open(peer, sender, recipient)
+      yield* push(
+        peer,
+        senderSession.opened.sessionId,
+        yield* encodePayload(peer, { epoch: "sender" }),
+        "000000000002"
+      )
+      const delivered = yield* Queue.take(recipientSession.events)
+      assert.strictEqual(delivered._tag, "StoredMessage")
+      if (delivered._tag !== "StoredMessage") return
+      assert.strictEqual(
+        delivered.relayMessageId,
+        relayId("000000000002"),
+        "the authorized counterparty's message, not the intruder's older one"
+      )
+
+      const pending = yield* peer.store.pendingHeads(
+        yield* inboxKeyOf(peer, recipient),
+        { limit: 10 }
+      )
+      assert.isTrue(
+        pending.some((message) => message.relayMessageId === relayId("000000000001")),
+        "the intruder's message stays durable rather than being handed over"
+      )
+    })))
+
+  it.effect("re-authorizes a settlement against the peer whose message it settles", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const peer = yield* harness()
+
+      // Delivered while the intruder was authorized, over a session whose counterparty is somebody
+      // else entirely. That is the ordinary shape of a busy device, not a contrived one.
+      const intruderSession = yield* open(peer, intruder, recipient)
+      yield* Ref.set(peer.credential, "intruder")
+      yield* peer.client.Push({
+        sessionId: intruderSession.opened.sessionId,
+        relayMessageId: relayId("000000000001"),
+        payload: yield* encodePayload(peer, { epoch: "intruder" })
+      })
+
+      const recipientSession = yield* open(peer, recipient, sender)
+      const stored = yield* Queue.take(recipientSession.events)
+      if (stored._tag !== "StoredMessage") return assert.fail("expected a delivery")
+      assert.strictEqual(stored.sender.peerId, intruder.peerId)
+
+      // Settling is a durable mutation performed on the authority of a Receive grant. The recipient
+      // now holds none for this message's sender — only for the unrelated counterparty this socket
+      // was opened against, which must not stand in for it.
+      peer.knobs.allow = (request) =>
+        request.principal.subjectId !== "intruder" && request.remote.subjectId !== "intruder"
+      peer.knobs.allowRisk = (request) =>
+        request.principal.subjectId !== "intruder" && request.remote.subjectId !== "intruder"
+
+      yield* Ref.set(peer.credential, "recipient")
+      const denied = yield* peer.client.Acknowledge({
+        sessionId: recipientSession.opened.sessionId,
+        relayMessageId: stored.relayMessageId,
+        claimToken: stored.claimToken,
+        messageHash: stored.messageHash
+      }).pipe(Effect.flip)
+      assert.strictEqual(denied._tag, "AccessDenied")
+
+      const pending = yield* peer.store.pendingHeads(
+        yield* inboxKeyOf(peer, recipient),
+        { limit: 10 }
+      )
+      assert.strictEqual(pending.length, 1, "the terminal transition never ran")
     })))
 
   it.effect("withholds a delivery whose unbounded decode risk is not acknowledged", () =>

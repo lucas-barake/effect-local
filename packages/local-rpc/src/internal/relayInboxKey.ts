@@ -14,8 +14,9 @@ import type { PeerPrincipal } from "./peerPrincipal.js"
  * device's inbox and merges their deduplication namespaces, so it is a confidentiality boundary
  * rather than a routing convenience.
  *
- * Bounded length. The backing `PersistedQueue` stores its queue name in a `VARCHAR(100)` column,
- * and a principal alone can exceed that, so the encoding must be fixed width.
+ * Bounded length. This value is both the cluster `EntityId` and the `inbox_key` column, which is a
+ * fixed 64 character identity column across all three dialects, so the encoding must be fixed
+ * width regardless of how long a principal is.
  *
  * Canonical digesting satisfies both. The principal is serialized as a structured value, which
  * removes delimiter ambiguity entirely, and the digest is a fixed 64 character hex string.
@@ -35,14 +36,3 @@ export const encodeInboxKey = (
  * happens to cover the same fields.
  */
 export const inboxKeyDomain = "effect-local/relay-inbox-key"
-
-/**
- * Deduplication identity for one message inside one inbox.
- *
- * `PersistedQueue` enforces uniqueness on the element id alone, not on `(queue_name, id)`, so ids
- * from different inboxes share one namespace. Without the inbox key prefix, the same
- * `relayMessageId` addressed to two devices would be treated as a duplicate and the second device
- * would silently never receive its copy.
- */
-export const encodeInboxElementId = (inboxKey: string, relayMessageId: string): string =>
-  `${inboxKey}:${relayMessageId}`

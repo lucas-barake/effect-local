@@ -1,4 +1,5 @@
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
+import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
@@ -47,7 +48,9 @@ const ExistingRow = Schema.Struct({
   state: Schema.String,
   terminal_at: Schema.NullOr(DatabaseInt),
   outer_envelope_digest: Schema.String,
-  message_hash: Schema.String
+  message_hash: Schema.String,
+  // Read so a revive can be charged the bytes it restores to pending, not just the row count.
+  byte_size: DatabaseInt
 })
 
 const CountRow = Schema.Struct({
@@ -58,7 +61,9 @@ const CountRow = Schema.Struct({
 const RetainedRow = Schema.Struct({ retained_count: DatabaseInt })
 
 const AbandonedRow = Schema.Struct({
-  relay_message_id: Schema.String,
+  // Decoded with its domain schema rather than asserted: the database is an external boundary, and
+  // a branded id that never passed its own pattern check is not the identity it claims to be.
+  relay_message_id: Identity.RelayMessageId,
   state: Schema.String,
   deliveries: DatabaseInt,
   terminal_at: Schema.NullOr(DatabaseInt)
@@ -92,9 +97,19 @@ export const make = Effect.gen(function*() {
   const crypto = yield* Crypto.Crypto
 
   yield* Migrations.run.pipe(
-    Effect.mapError((cause) =>
-      new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) })
-    )
+    // Discriminated rather than collapsed. A `MigrationError` is a permanent lineage fault — a
+    // duplicate id, an unloadable module — and reporting it as unavailability would have every
+    // caller above retry a schema that will never build.
+    Effect.catchTag(
+      "SqlError",
+      (cause) => Effect.fail(new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) }))
+    ),
+    Effect.catchTag("MigrationError", (cause) =>
+      Effect.fail(
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.MigrationFailed({ migration: Migrations.tableName, cause })
+        })
+      ))
   )
 
   const decodeEnvelope = Schema.decodeUnknownEffect(EnvelopeJson)
@@ -105,7 +120,7 @@ export const make = Effect.gen(function*() {
     Result: ExistingRow,
     execute: (request) =>
       sql`
-        SELECT state, terminal_at, outer_envelope_digest, message_hash FROM ${sql(table)}
+        SELECT state, terminal_at, outer_envelope_digest, message_hash, byte_size FROM ${sql(table)}
         WHERE inbox_key = ${request.inboxKey} AND relay_message_id = ${request.relayMessageId}
       `
   })
@@ -173,7 +188,10 @@ export const make = Effect.gen(function*() {
         // A revive creates a `Pending` row, so it is charged against the same caps as a first
         // admission; otherwise replaying abandoned identities would restore unbounded pending work.
         const revivedUsage = yield* findUsage(request.inboxKey)
-        if (revivedUsage.pending_count + 1 > request.quota.maxPendingMessages) {
+        if (
+          revivedUsage.pending_count + 1 > request.quota.maxPendingMessages ||
+          revivedUsage.pending_bytes + row.byte_size > request.quota.maxPendingBytes
+        ) {
           return { _tag: "QuotaExceeded" } as const
         }
         yield* sql`
@@ -270,8 +288,16 @@ export const make = Effect.gen(function*() {
 
   const pendingHeads = (inboxKey: string, options: { readonly limit: number }) =>
     findHeads({ inboxKey, limit: options.limit }).pipe(
-      Effect.mapError((cause) =>
-        new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) })
+      // A `SchemaError` here is a row this store cannot decode, which is corruption rather than
+      // downtime. Collapsing the two would have callers retry a row that will never decode.
+      Effect.catchTag(
+        "SqlError",
+        (cause) =>
+          Effect.fail(new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) }))
+      ),
+      Effect.catchTag(
+        "SchemaError",
+        (cause) => Effect.fail(new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageCorrupt({ cause }) }))
       ),
       Effect.flatMap(Effect.forEach((row) =>
         Effect.gen(function*() {
@@ -321,6 +347,25 @@ export const make = Effect.gen(function*() {
               })
             )
           )
+          // The five channel columns are redundant metadata exactly like the four above, and they
+          // are what everything downstream orders and routes by: the SQL head-selection key, the
+          // entity's `channelId`, and its busy and withheld channel bookkeeping. A row whose
+          // columns disagree with its own envelope would be replayed under an ordering stream that
+          // contradicts its content. `admit` enforces this at write time; a row that reaches here
+          // violating it did not come from `admit`.
+          if (
+            channel.tenantId !== envelope.sender.tenantId ||
+            channel.senderSubjectId !== envelope.sender.subjectId ||
+            channel.senderPeerId !== envelope.sender.peerId ||
+            channel.senderReplicaIncarnation !== envelope.sender.replicaIncarnation ||
+            channel.senderConnectionEpoch !== envelope.sender.connectionEpoch
+          ) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({
+                cause: `channel columns disagree with the envelope sender for ${row.relay_message_id}`
+              })
+            })
+          }
           return {
             relayMessageId: envelope.relayMessageId,
             channel,
@@ -444,9 +489,15 @@ export const make = Effect.gen(function*() {
 
   const usage = (inboxKey: string) =>
     Effect.all([findUsage(inboxKey), findRetained(inboxKey)]).pipe(
-      Effect.mapError((cause) =>
-        new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) })
-      ),
+      // A `SchemaError` here is a row this store cannot decode, which is corruption rather than
+      // downtime. Collapsing the two would have callers retry a row that will never decode. An
+      // aggregate returning no row at all is likewise not something a retry fixes.
+      Effect.catchTag("SqlError", (cause) =>
+        Effect.fail(new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) }))),
+      Effect.catchTag("SchemaError", (cause) =>
+        Effect.fail(new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageCorrupt({ cause }) }))),
+      Effect.catchTag("NoSuchElementError", (cause) =>
+        Effect.fail(new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageCorrupt({ cause }) }))),
       Effect.map(([pending, retained]) => ({
         pendingCount: pending.pending_count,
         pendingBytes: pending.pending_bytes,
@@ -468,8 +519,16 @@ export const make = Effect.gen(function*() {
 
   const abandoned = (inboxKey: string, options: { readonly limit: number }) =>
     findAbandoned({ inboxKey, limit: options.limit }).pipe(
-      Effect.mapError((cause) =>
-        new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) })
+      // A `SchemaError` here is a row this store cannot decode, which is corruption rather than
+      // downtime. Collapsing the two would have callers retry a row that will never decode.
+      Effect.catchTag(
+        "SqlError",
+        (cause) =>
+          Effect.fail(new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) }))
+      ),
+      Effect.catchTag(
+        "SchemaError",
+        (cause) => Effect.fail(new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageCorrupt({ cause }) }))
       ),
       Effect.flatMap(Effect.forEach((row) =>
         Schema.decodeUnknownEffect(RelayInboxStore.InboxState)(row.state).pipe(
@@ -479,7 +538,7 @@ export const make = Effect.gen(function*() {
             })
           ),
           Effect.map((state) => ({
-            relayMessageId: row.relay_message_id as RelayInboxStore.AbandonedMessage["relayMessageId"],
+            relayMessageId: row.relay_message_id,
             state,
             deliveries: row.deliveries,
             terminalAt: row.terminal_at ?? 0
@@ -509,11 +568,14 @@ export const make = Effect.gen(function*() {
   ) =>
     Effect.gen(function*() {
       const rows = yield* selectExpired({ now: options.now, limit: options.limit }).pipe(
-        Effect.mapError((cause) =>
-          new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) })
-        )
+        Effect.catchTag("SqlError", (cause) =>
+          Effect.fail(new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) }))),
+        Effect.catchTag("SchemaError", (cause) =>
+          Effect.fail(new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageCorrupt({ cause }) })))
       )
-      if (rows.length === 0) return 0
+      if (rows.length === 0) {
+        return 0
+      }
       // Re-applies every predicate from the selection. Filtering on `relay_message_id` alone would
       // reach rows in other inboxes, because the key is `(inbox_key, relay_message_id)` and the
       // same identity can legitimately be addressed to more than one device.
@@ -525,11 +587,14 @@ export const make = Effect.gen(function*() {
             )
         WHERE state = 'Pending' AND expires_at <= ${options.now}
           AND ${
-        sql.or(rows.map((row) => sql`(inbox_key = ${row.inbox_key} AND relay_message_id = ${row.relay_message_id})`))
+        sql.or(rows.map((row) =>
+          sql`(inbox_key = ${row.inbox_key} AND relay_message_id = ${row.relay_message_id})`
+        ))
       }
-      `.pipe(Effect.mapError((cause) =>
-        new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) })
-      ))
+      `.pipe(
+        Effect.catchTag("SqlError", (cause) =>
+          Effect.fail(new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) })))
+      )
       yield* Effect.logWarning("Relay inbox expired undelivered messages").pipe(
         Effect.annotateLogs({ expired: rows.length })
       )
@@ -550,20 +615,26 @@ export const make = Effect.gen(function*() {
   const collect = (options: { readonly now: number; readonly limit: number }) =>
     Effect.gen(function*() {
       const rows = yield* selectCollectable({ now: options.now, limit: options.limit }).pipe(
-        Effect.mapError((cause) =>
-          new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) })
-        )
+        Effect.catchTag("SqlError", (cause) =>
+          Effect.fail(new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) }))),
+        Effect.catchTag("SchemaError", (cause) =>
+          Effect.fail(new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageCorrupt({ cause }) })))
       )
-      if (rows.length === 0) return 0
+      if (rows.length === 0) {
+        return 0
+      }
       yield* sql`
         DELETE FROM ${sql(table)}
         WHERE state <> 'Pending' AND deduplicate_until <= ${options.now}
           AND ${
-        sql.or(rows.map((row) => sql`(inbox_key = ${row.inbox_key} AND relay_message_id = ${row.relay_message_id})`))
+        sql.or(rows.map((row) =>
+          sql`(inbox_key = ${row.inbox_key} AND relay_message_id = ${row.relay_message_id})`
+        ))
       }
-      `.pipe(Effect.mapError((cause) =>
-        new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) })
-      ))
+      `.pipe(
+        Effect.catchTag("SqlError", (cause) =>
+          Effect.fail(new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) })))
+      )
       return rows.length
     })
 

@@ -54,6 +54,31 @@ export interface Options {
   readonly entityCallTimeout: Duration.Input
 }
 
+/**
+ * What the front door handed over, and on whose authority.
+ *
+ * `Acknowledge` and `Reject` carry only identifiers, so without this the settlement would have to
+ * be authorized against the handshake's counterparty — which is not who sent the message. A device's
+ * inbox is keyed by that device alone, so one session drains messages from every peer that holds a
+ * Send grant to it.
+ */
+interface Delivered {
+  readonly remote: PeerRelayAuthorization.RemotePeer
+  readonly document: PeerRpc.RequestedDocument
+}
+
+/**
+ * Safety valve on the provenance map, not a tuning knob.
+ *
+ * Delivery is stop and wait per channel, so the number of delivered-but-unsettled messages is
+ * already bounded by the entity's concurrent channel limit; an entry is dropped as soon as its
+ * settlement is durable. This cap exists only so a mistake in that reasoning cannot grow a map for
+ * the life of a connection. Eviction is safe in the direction that matters: a settlement for an
+ * evicted message is refused, and the row stays `Pending` for a later session rather than being
+ * discarded.
+ */
+const maxRememberedDeliveries = 1_024
+
 /** Everything the handshake established, held for the life of one client connection. */
 interface Session {
   readonly sessionId: Identity.SessionId
@@ -64,6 +89,7 @@ interface Session {
   readonly senderRetryHorizonMillis: number
   readonly inboxKeySelf: string
   readonly inboxKeyRemote: string
+  readonly delivered: Map<Identity.RelayMessageId, Delivered>
 }
 
 const RelayEnvelopeJson = Schema.fromJsonString(
@@ -157,16 +183,26 @@ export const layerHandlers = (options: Options) =>
         const authenticated = yield* PeerAuthentication.AuthenticatedPeer
         const session = yield* sessionFor(payload.sessionId, authenticated.principal)
 
-        // Re-authorized here, not merely at the handshake. Settling is a durable mutation of the
-        // relay's state, and a principal whose Receive authority has been withdrawn must not be
-        // able to perform one. The session monitor also ends a session whose grants lapse, but that
-        // is asynchronous, so on its own it leaves a window in which a revoked peer can still
-        // settle — and it reports the wrong thing, `SessionUnavailable` rather than `AccessDenied`.
+        // Authorized against what this session was actually handed, not against the handshake. The
+        // request carries only identifiers, and the handshake's counterparty is not necessarily the
+        // peer whose message is being settled — one session drains every sender that writes into
+        // this device's inbox — so settling on the handshake's grant would let a recipient
+        // terminally discard a message it holds no current authority over.
+        const delivered = session.delivered.get(payload.relayMessageId)
+        if (delivered === undefined) {
+          return yield* new PeerRpcError.SessionUnavailable()
+        }
+
+        // Re-authorized here, not merely at delivery. Settling is a durable mutation of the relay's
+        // state, and a principal whose Receive authority has been withdrawn since must not be able
+        // to perform one. The session monitor also ends a session whose grants lapse, but that is
+        // asynchronous, so on its own it leaves a window in which a revoked peer can still settle —
+        // and it reports the wrong thing, `SessionUnavailable` rather than `AccessDenied`.
         const receive = yield* authorization.authorize({
           direction: "Receive",
           principal: session.principal,
-          remote: session.remote,
-          documents: session.documents
+          remote: delivered.remote,
+          documents: [delivered.document]
         })
         if (receive.documents.length === 0) {
           return yield* new PeerRpcError.AccessDenied()
@@ -175,8 +211,8 @@ export const layerHandlers = (options: Options) =>
           risk: PeerRelayAuthorization.unsafeUnboundedAutomerge3DecodeRisk,
           direction: "Receive",
           principal: session.principal,
-          remote: session.remote,
-          documents: session.documents
+          remote: delivered.remote,
+          documents: [delivered.document]
         })
 
         // Keyed by the caller's own inbox, so settling another device's message is not expressible.
@@ -193,6 +229,12 @@ export const layerHandlers = (options: Options) =>
           Effect.catchTag("AlreadyProcessingMessage", () => new PeerRpcError.SessionOverloaded()),
           Effect.catchTag("PersistenceError", () => new PeerRpcError.ServerUnavailable())
         )
+
+        // Dropped only once the transition is durable, so a settlement that failed transiently can
+        // still be retried on this session.
+        yield* Effect.sync(() => {
+          session.delivered.delete(payload.relayMessageId)
+        })
       }).pipe(
         // Identifiers only. The session id is unguessable but not secret, and the message hash is
         // already a digest; the payload is never an attribute.
@@ -201,6 +243,10 @@ export const layerHandlers = (options: Options) =>
         })
       )
 
+    // The handlers below carry `AuthenticatedPeer` and, at `Open`, the request `Scope` in their
+    // requirement channels. Both are genuinely per call — the middleware provides the first per
+    // request, and the second is the rpc request scope the caller owns — so they are the only
+    // requirements a handler here is allowed to leak. Everything else is resolved above.
     return PeerRpc.Rpcs.of({
       Open: (payload) =>
         // Spans the handshake, not the session: the stream it returns outlives this effect.
@@ -304,7 +350,8 @@ export const layerHandlers = (options: Options) =>
               senderReplicaIncarnation: payload.senderReplicaIncarnation,
               senderRetryHorizonMillis: payload.senderRetryHorizonMillis,
               inboxKeySelf,
-              inboxKeyRemote
+              inboxKeyRemote,
+              delivered: new Map()
             }
 
             sessions.set(sessionId, session)
@@ -375,16 +422,33 @@ export const layerHandlers = (options: Options) =>
                 // into its inbox, so the handshake's Receive decision cannot stand in for the
                 // recipient's right to see a particular document. A message that fails here is left
                 // unsettled and simply not emitted, so it stays durable for a later session.
-                Stream.filterEffect((message) =>
-                  authorization.authorize({
-                    direction: "Receive",
-                    principal: session.principal,
-                    remote: session.remote,
-                    documents: [{
-                      documentType: message.document.documentType,
-                      documentId: message.document.documentId
-                    }]
-                  }).pipe(
+                Stream.filterEffect((message) => {
+                  // The counterparty is taken from the message, never from the handshake. This
+                  // inbox is keyed by its owner alone, so every peer holding a Send grant to this
+                  // device writes into it and one session drains all of them. Asking whether the
+                  // handshake's counterparty may send this document answers a question about a
+                  // different peer, and would release one sender's message on another sender's
+                  // grant.
+                  const remote = {
+                    subjectId: message.sender.subjectId,
+                    peerId: message.sender.peerId
+                  }
+                  const documents = [{
+                    documentType: message.document.documentType,
+                    documentId: message.document.documentId
+                  }]
+                  return Effect.suspend(() =>
+                    // A grant can only ever name a remote inside the caller's own tenant, so a row
+                    // claiming a foreign one is refused outright rather than put to the policy port.
+                    message.sender.tenantId !== session.principal.tenantId
+                      ? Effect.fail(new PeerRpcError.AccessDenied())
+                      : authorization.authorize({
+                        direction: "Receive",
+                        principal: session.principal,
+                        remote,
+                        documents
+                      })
+                  ).pipe(
                     // Delivering commits this peer to decoding the document, so the same risk
                     // acknowledgement the sender needed is required again on the receiving side, per
                     // message rather than once at the handshake.
@@ -392,11 +456,19 @@ export const layerHandlers = (options: Options) =>
                       risk: PeerRelayAuthorization.unsafeUnboundedAutomerge3DecodeRisk,
                       direction: "Receive",
                       principal: session.principal,
-                      remote: session.remote,
-                      documents: [{
-                        documentType: message.document.documentType,
-                        documentId: message.document.documentId
-                      }]
+                      remote,
+                      documents
+                    })),
+                    // Recorded before the message reaches the wire, because the recipient settles on
+                    // a different fiber and can do so the instant it reads. `Settle` carries only
+                    // identifiers, so this is the only place the settlement's authority can be
+                    // pinned to the peer and document that were actually authorized here.
+                    Effect.andThen(Effect.sync(() => {
+                      if (session.delivered.size >= maxRememberedDeliveries) {
+                        const oldest = session.delivered.keys().next()
+                        if (!oldest.done) session.delivered.delete(oldest.value)
+                      }
+                      session.delivered.set(message.relayMessageId, { remote, document: documents[0]! })
                     })),
                     Effect.as(true),
                     Effect.catchTag("AccessDenied", () =>
@@ -415,10 +487,12 @@ export const layerHandlers = (options: Options) =>
                         Effect.andThen(release(inboxKeySelf, sessionId, message)),
                         Effect.as(false)
                       )),
-                    Effect.catchTag("ServerUnavailable", () =>
-                      release(inboxKeySelf, sessionId, message).pipe(Effect.as(false)))
+                    Effect.catchTag(
+                      "ServerUnavailable",
+                      () => release(inboxKeySelf, sessionId, message).pipe(Effect.as(false))
+                    )
                   )
-                ),
+                }),
                 // Cluster level failures are not part of the public contract, so each is reported as
                 // the wire error that tells the client what to do about it.
                 Stream.catchTag("MailboxFull", () =>
@@ -595,7 +669,10 @@ export const layer = (
     // cycle and no client can hold a delivery stream — a total outage that only appears under a
     // particular configuration, so it is refused at construction rather than discovered in
     // production. The factor of two leaves room for one lost heartbeat.
-    Layer.provide(Layer.effectDiscard(
+    Layer.provide(Layer.effectDiscard(Effect.suspend(() =>
+      // Suspended, because `Duration.toMillis` throws on an input that is not a duration at all.
+      // Evaluated eagerly it would throw out of `RelayServer.layer(...)` itself, before there is a
+      // layer to fail, which is not where a consumer looks for a configuration error.
       Duration.toMillis(options.heartbeatInterval) * 2 <
           Duration.toMillis(options.inbox.sessionDeadline) &&
         Duration.toMillis(options.entityCallTimeout) > 0
@@ -606,5 +683,5 @@ export const layer = (
               "inbox.sessionDeadline, and entityCallTimeout must be positive"
           )
         )
-    ))
+    )))
   )
