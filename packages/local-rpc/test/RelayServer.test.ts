@@ -61,6 +61,13 @@ const recipient = PeerAuthentication.PeerPrincipal.make({
   peerId: recipientPeerId
 })
 
+/** A real, authenticated peer that simply belongs to a tenant this relay does not serve. */
+const outsider = PeerAuthentication.PeerPrincipal.make({
+  tenantId: "other",
+  subjectId: "outsider",
+  peerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000004")
+})
+
 const serverOptions: RelayServer.Options = {
   tenantId: "tenant",
   peerId: relayPeerId,
@@ -210,7 +217,7 @@ const harness = (options?: {
     )
 
     const credential = yield* Ref.make("sender")
-    const principals = new Map([["sender", sender], ["recipient", recipient]])
+    const principals = new Map([["sender", sender], ["recipient", recipient], ["outsider", outsider]])
     const authentication = yield* PeerAuthentication.PeerAuthentication.pipe(
       Effect.provide(PeerAuthentication.layerServer),
       Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
@@ -692,6 +699,72 @@ describe("RelayServer", () => {
         pending.some((message) => message.relayMessageId === relayId("000000000001")),
         "the withheld message stays durable rather than being settled away"
       )
+    })))
+
+  it.effect("refuses a session id presented under another principal's credential", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const peer = yield* harness()
+      const senderSession = yield* open(peer, sender, recipient)
+      yield* open(peer, recipient, sender)
+
+      // A session id is unguessable, but unguessable is not the same as authenticated. The recipient
+      // holds a perfectly valid credential; it is simply not the credential this session was opened
+      // with, and nothing else in the handler re-derives the caller from the session.
+      const payload = yield* encodePayload(peer)
+      yield* Ref.set(peer.credential, "recipient")
+      const stolen = yield* peer.client.Push({
+        sessionId: senderSession.opened.sessionId,
+        relayMessageId: relayId("000000000001"),
+        payload
+      }).pipe(Effect.flip)
+      assert.strictEqual(stolen._tag, "SessionUnavailable")
+
+      const stolenAck = yield* peer.client.Acknowledge({
+        sessionId: senderSession.opened.sessionId,
+        relayMessageId: relayId("000000000001"),
+        claimToken: PeerRpc.ClaimToken.make("clm_00000000-0000-4000-8000-000000000000"),
+        messageHash: "a".repeat(64)
+      }).pipe(Effect.flip)
+      assert.strictEqual(stolenAck._tag, "SessionUnavailable")
+
+      const pending = yield* peer.store.pendingHeads(
+        yield* inboxKeyOf(peer, recipient),
+        { limit: 10 }
+      )
+      assert.strictEqual(pending.length, 0, "a borrowed session admits nothing")
+    })))
+
+  it.effect("refuses a principal authenticated into another tenant", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const peer = yield* harness()
+      // Authentication succeeded — this is a real peer with a real credential. It simply belongs to
+      // a tenant this relay does not serve, which is an authorization decision, not a mismatch.
+      yield* Ref.set(peer.credential, "outsider")
+      const failure = yield* peer.client.Open(openRequest(outsider, recipient)).pipe(
+        Stream.runDrain,
+        Effect.flip
+      )
+      assert.strictEqual(failure._tag, "AccessDenied")
+    })))
+
+  it.effect("checks every field of the claimed local identity independently", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const peer = yield* harness()
+      // One field at a time, so no clause can be masked by another failing alongside it. A
+      // credential reused for a sibling device of the same subject differs only in peerId.
+      for (
+        const claimed of [
+          { ...sender, subjectId: "recipient" },
+          { ...sender, peerId: recipientPeerId },
+          { ...sender, tenantId: "other" }
+        ]
+      ) {
+        const failure = yield* peer.client.Open({
+          ...openRequest(sender, recipient),
+          expectedLocal: PeerAuthentication.PeerPrincipal.make(claimed)
+        }).pipe(Stream.runDrain, Effect.flip)
+        assert.strictEqual(failure._tag, "PeerMismatch", `expectedLocal ${JSON.stringify(claimed)}`)
+      }
     })))
 
   it.effect("refuses a push when the unbounded decode risk is not acknowledged", () =>
