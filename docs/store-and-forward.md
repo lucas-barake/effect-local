@@ -16,45 +16,77 @@ its local writes. Automerge remains responsible for convergence after valid chan
 
 ## Composition
 
-The application supplies relay policy, custody, limits, authentication, SQL, and a socket. The server uses
-`PeerRpcServer.layerHandlers` with `PeerRpc.Rpcs`, plus `PeerRpcServer.layerServer` and `PeerRelayIngress` for the
-bounded listener.
+The application supplies relay policy, custody, limits, authentication, SQL, a socket, and a cluster. The server
+composes `RelayServer.layer`, which is the front door handlers plus the `RelayInbox` entity behaviour plus the
+retention singleton. The relay requires a `Sharding` and never builds one, so the deployment shape — single process
+in memory, one runner over SQL, or many sharded runners — stays the application's choice.
 
 On the client, `SqlReplica.layerRelay` installs relay receipt support. `PeerRelayOutbox.layerSql` stores stable sender
 admissions. `PeerRelayClientRuntime.layer` supervises sender outbox and receipt maintenance.
 `RpcPeerTransport.makeSession` binds the generated relay client to the ordinary `PeerSession`.
 
 This example shows the server and client composition. The named application values provide SQL, Crypto,
-authentication, socket, definition, projection, and mutation or query Layers.
+authentication, socket, cluster, definition, projection, and mutation or query Layers.
 
 ```ts
+import * as PeerAuthentication from "@lucas-barake/effect-local-rpc/PeerAuthentication"
 import * as PeerRelayAuthorization from "@lucas-barake/effect-local-rpc/PeerRelayAuthorization"
 import * as PeerRelayLimits from "@lucas-barake/effect-local-rpc/PeerRelayLimits"
-import * as PeerRpcServer from "@lucas-barake/effect-local-rpc/PeerRpcServer"
+import * as PeerRpc from "@lucas-barake/effect-local-rpc/PeerRpc"
+import * as RelayServer from "@lucas-barake/effect-local-rpc/RelayServer"
 import * as RpcPeerTransport from "@lucas-barake/effect-local-rpc/RpcPeerTransport"
-import * as SqlPeerRelayStore from "@lucas-barake/effect-local-rpc/SqlPeerRelayStore"
+import * as SqlRelayInboxStore from "@lucas-barake/effect-local-rpc/SqlRelayInboxStore"
 import * as PeerRelayClientRuntime from "@lucas-barake/effect-local-sql/PeerRelayClientRuntime"
 import * as PeerRelayOutbox from "@lucas-barake/effect-local-sql/PeerRelayOutbox"
 import * as PeerRelayOutboxLimits from "@lucas-barake/effect-local-sql/PeerRelayOutboxLimits"
 import * as PeerRelayReceiptLimits from "@lucas-barake/effect-local-sql/PeerRelayReceiptLimits"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
-import { Effect, Layer } from "effect"
+import { Duration, Effect, Layer } from "effect"
+import { RpcSerialization, RpcServer } from "effect/unstable/rpc"
 
-const RelayLimitsLive = PeerRelayLimits.layer(relayLimits)
-const RelayStoreLive = SqlPeerRelayStore.layer.pipe(
-  Layer.provideMerge(RelayLimitsLive)
-)
-const RelayAuthorizationLive = PeerRelayAuthorization.layer(
-  authorizeRelay,
-  PeerRelayAuthorization.denyUnsafeUnboundedAutomerge3Decode
-)
-const RelayHandlersLive = PeerRpcServer.layerHandlers({
+const RelayLive = RelayServer.layer({
   tenantId,
-  peerId: relayPeerId
+  peerId: relayPeerId,
+  heartbeatInterval: Duration.seconds(30),
+  entityCallTimeout: Duration.seconds(30),
+  inbox: {
+    maxDeliveries: 16,
+    messageTtl: Duration.days(7),
+    terminalRetention: Duration.days(8),
+    sessionDeadline: Duration.seconds(90),
+    sessionSweep: Duration.seconds(5),
+    maxConcurrentChannels: 8,
+    storeRetry: Duration.seconds(1),
+    maxPendingMessages: 10_000,
+    maxPendingBytes: 256 * 1_024 * 1_024,
+    mailboxCapacity: 64,
+    maxIdleTime: Duration.minutes(30)
+  },
+  // Required, not optional. Without it messageTtl and terminalRetention are inert: nothing expires,
+  // nothing is collected, and the retained row count climbs until admission is refused.
+  maintenance: {
+    interval: Duration.minutes(1),
+    batchLimit: 500,
+    terminalRetention: Duration.days(8),
+    enabled: true
+  }
 }).pipe(
-  Layer.provideMerge(RelayLimitsLive),
-  Layer.provideMerge(RelayStoreLive),
-  Layer.provideMerge(RelayAuthorizationLive)
+  Layer.provide(SqlRelayInboxStore.layer),
+  Layer.provide(PeerRelayLimits.layer(relayLimits)),
+  Layer.provide(PeerRelayAuthorization.layer(
+    authorizeRelay,
+    PeerRelayAuthorization.denyUnsafeUnboundedAutomerge3Decode
+  )),
+  // Supplied by the application: SingleRunner for one node, SocketRunner for many.
+  Layer.provide(shardingLive)
+)
+
+const ServerLive = RpcServer.layer(PeerRpc.Rpcs).pipe(
+  Layer.provide(RelayLive),
+  Layer.provide(PeerAuthentication.layerServer),
+  Layer.provide(RpcServer.layerProtocolSocketServer),
+  Layer.provide(RpcSerialization.layerJson),
+  Layer.provide(socketServerLive)
 )
 
 const ReceiptLimitsLive = PeerRelayReceiptLimits.layer(receiptLimits)
@@ -83,10 +115,19 @@ const session = RpcPeerTransport.makeSession(relayRpcClient, {
 ```
 
 `relayRpcClient` must be a `PeerRpc.RpcClient` created with `PeerRpc.makeRpcClient` over
-`PeerRelayIngress.layerProtocolSocket`. The server
+`RpcClient.layerProtocolSocket()` with a matching `RpcSerialization` — the same codec the server uses. The server
 composition still requires the application SQL and Crypto Layers, `PeerAuthentication.layerServer`, the relay
-authorization Layer, and a `PeerRelayLimits` Layer. The client composition still requires the application SQL,
-Crypto, core replica limits, generated client authentication middleware, and a scoped relay socket.
+authorization Layer, a `PeerRelayLimits` Layer, and a `Sharding`. The client composition still requires the
+application SQL, Crypto, core replica limits, generated client authentication middleware, and a scoped relay socket.
+
+`RelayServer.layer` refuses to build when `heartbeatInterval * 2` is not less than `inbox.sessionDeadline`, or when
+`entityCallTimeout` is not positive. Those two values have to agree or every session is reaped on a fixed cycle and
+no client can hold a delivery stream, so the mistake is refused where it is written rather than discovered in
+production.
+
+Every configured duration takes `Duration.Input`, so `"30 seconds"`, `Duration.seconds(30)` and `30_000` are
+equivalent. Values that cross the wire contract, such as `receiptRetentionMillis` above, keep the unit in the name
+because `Duration` has no stable serialized encoding.
 
 The example denies the separate unsafe Automerge decode grant. That is the required default. Ordinary authentication
 and `authorizeRelay` document authorization do not promote a caller into resource trust.
@@ -111,8 +152,10 @@ and digest is safe. Conflicting reuse is rejected.
 
 ## Acknowledgement boundary
 
-A relay claim carries an opaque claim token and a finite deadline. A recipient acknowledgement can terminalize only
-the exact message, recipient principal, live session generation, token, and message hash.
+Each delivery attempt mints an opaque claim token. A recipient acknowledgement can terminalize only the exact
+message, under the caller's own inbox key, the live session, that attempt's token, and the matching message hash. A
+token from an earlier attempt of the same message cannot settle a later one. There is no lease deadline to expire:
+what is in flight lives only in memory, so an abandoned attempt simply leaves the row `Pending`.
 
 `PeerSession` sends `Acknowledge` only after all of these operations succeed:
 
@@ -133,24 +176,33 @@ message for retry.
 
 ## Ordering, retry, expiry, and retention
 
-Ordering is FIFO only within one exact directed channel. The channel key is the tenant, sender subject, sender peer,
-sender replica incarnation, recipient subject, and recipient peer. The relay permits one claimed head for that
-channel. Earlier pending or claimed rows block later rows in the same channel. Different channels can progress
-independently.
+Ordering is FIFO only within one exact directed channel. The recipient is the inbox itself, so the channel key is
+the tenant, sender subject, sender peer, sender replica incarnation, and sender connection epoch. The epoch is part
+of the key because `sender_sequence` restarts at zero on every sender reconnect; without it one channel would hold
+sequences `{0,1,2,0,1}` and head selection would be arbitrary. Delivery is stop and wait within a channel: one head
+is in flight at a time and later rows wait behind it. Different channels progress concurrently, bounded by
+`maxConcurrentChannels`.
 
-Claims are finite fences. A stale worker can duplicate delivery after its claim expires, but its old token cannot
-acknowledge or reject the new claim. Retry uses bounded exponential delay with jitter. The sender outbox keeps pending
-admissions until custody succeeds or their configured retry horizon expires.
+A message the front door may not hand over — because receive authorization narrowed since it was admitted — is
+`Release`d rather than settled. The row stays `Pending` for a later session, and the channel is skipped for the rest
+of this session only, so withheld messages cannot occupy every delivery slot and starve channels the recipient is
+entitled to. The sender outbox keeps pending admissions until custody succeeds or their configured retry horizon
+expires.
 
-`RelayInbox.Options.maxDeliveries` caps recipient delivery. It is required per deployment. A failed, interrupted,
-disconnected, or expired claim durably advances the attempt count. When that count reaches the configured cap, the
-relay moves the message to `DeadLettered`, erases its payload, and retains only bounded terminal deduplication
-evidence. Process restart does not reset the count. Message expiry can terminalize the row before the attempt cap.
+`RelayInbox.Options.maxDeliveries` caps recipient delivery. It is required per deployment. An attempt is charged
+only once the message has provably reached the transport, so a delivery prepared for a channel and then abandoned
+when the recipient disconnected — ordinary behaviour on a flaky connection — costs nothing. A withheld attempt does
+spend one, which is what bounds how long an unauthorized message lingers. When the count reaches the cap the relay
+moves the message to `DeadLettered` so it stops blocking its channel. Process restart does not reset the count.
+Message expiry can terminalize the row before the attempt cap.
 
-The relay message time to live is configured by `PeerRelayLimits.messageTtlMillis`. Expired active rows erase their
-payload and become terminal. Acknowledged, rejected, and expired rows retain only bounded deduplication evidence until
-their retention deadline. `PeerRelayLimits.maximumReceiptRetentionMillis` must cover the message time to live, the
-maximum sender retry horizon, and minimum terminal retention.
+The relay message time to live is `RelayInbox.Options.messageTtl`. A terminal row — acknowledged, rejected, dead
+lettered, or expired — keeps its stored envelope until `RelayInboxMaintenance` collects it past its deduplication
+horizon, at which point the whole row is deleted. The envelope is retained rather than erased at the terminal
+transition because re-admitting a dead lettered or expired identity revives that row in place, which is what lets a
+sender that still holds custody recover a message the relay gave up on. `PeerRelayLimits.maximumReceiptRetention`
+must cover the message time to live, the maximum sender retry horizon, and the minimum terminal retention, and
+`RelayServer` refuses a handshake that would breach it.
 
 The recipient keeps sender scoped receipts under its current replica incarnation. Receipt identity includes sender
 tenant, sender subject, sender peer, and relay message ID. `PeerRelayReceiptLimits` bounds their count, encoded bytes,
@@ -161,14 +213,19 @@ Relay custody rows and client relay outbox or receipt rows are not part of the c
 
 ## Capacity and overload
 
-`PeerRelayLimits` validates active and retained count and byte quotas for sender peers, recipient peers, recipient
-subjects, tenants, and the shard. Admission reserves immutable quota entitlements in the same SQLite transaction as
-the message. Accepted work is not evicted to admit new work.
+Admission is bounded **per inbox** by `RelayInbox.Options.maxPendingMessages` and `maxPendingBytes`, and the cap is
+re-checked inside the same transaction that performs the write. Accepted work is not evicted to admit new work.
 
-The same limits bound relay connections, raw chunks, declared frames, incomplete frames, shared payload bytes, byte
-reservation waiters, per subject sessions, Open and Push concurrency and rates, terminal response work, channel
-queues, relay workers, maximum delivery attempts, SQL work classes, maintenance batches and rates, and shutdown claim
-release.
+Cross inbox quotas — per sender peer, per recipient subject, per tenant, per shard — are not enforced. Those counters
+span many inboxes, so no entity is their sole writer, and enforcing them would reintroduce the cross process
+arbitration this topology exists to remove. A deployment that needs tenant wide caps needs a mechanism with its own
+single writer story.
+
+Connection and frame accounting is likewise not enforced here. It bounded the bespoke length prefixed framing that
+standard Effect RPC over a socket replaces. A single relayed payload is still bounded, by `PeerRpc`'s schema check
+against `maximumRelayPayloadBytes`; concurrent connections and in flight bytes are the deployment's socket server to
+bound. `PeerRelayLimits` retains the negotiation windows, the authentication rate limits, and
+`maxSessionsPerSubject`.
 
 `PeerRelayOutboxLimits` independently bounds pending sender rows and encoded bytes per remote and per replica. It also
 bounds retry horizon, pruning batch, pruning rate, and maintenance interval.
@@ -266,30 +323,43 @@ existence.
 
 ## Deployment boundary and limitations
 
-One logical SQL database is the custody authority for one relay shard. The application must route every write and
-claim for that shard to it. `SqlPeerRelayStore.layer` supports SQLite, PostgreSQL, and MySQL. Replication and failover
-are properties of the selected database deployment. The relay does not add leader election, shard rebalance, cross
-region routing, or split brain recovery.
+Several relay nodes may run against one logical SQL database as active active. Single owner per recipient is
+enforced by cluster sharding rather than by deployment convention: exactly one runner owns a device's entity at a
+time, and ownership moves with the shard. `SqlRelayInboxStore.layer` supports SQLite, PostgreSQL, and MySQL.
+Replication and failover remain properties of the selected database deployment.
 
-When that SQL authority is unavailable, new custody stops and delivery pauses. Durable pending rows remain
-discoverable after recovery. Claims recover after their deadlines. The server also runs bounded
-compensation and maintenance so a missed process notification does not permanently strand committed work.
+Because the owning entity is the sole writer for its inbox, there is no claim ledger, lease deadline, or session
+generation to recover. Nothing in flight is persisted: a lost runner loses only memory, and the next owner finds the
+same `Pending` rows.
 
-This package supplies a bounded single authority relay building block. It does not claim WhatsApp scale, global
-availability, managed operations, peer discovery, end to end encryption, account management, or tenant routing.
+When the SQL authority is unavailable, new custody stops and delivery pauses. Durable pending rows remain
+discoverable after recovery. Retention runs as a cluster singleton so expiry and collection have exactly one owner
+deployment wide.
+
+On a rebalance, an entity's termination handshake waits up to the cluster's `entityTerminationTimeout` for its forked
+subscription before the session is closed, and rejects `Deliver` and `Settle` for that device during the window. Size
+that value accordingly.
+
+Single owner per key across multiple runners is not verified by this package's test suite, which is single process.
+This package supplies a relay building block. It does not claim global availability, managed operations, peer
+discovery, end to end encryption, account management, or tenant routing.
 
 ## Observability
 
 The relay exposes Effect services and spans. It does not install a metrics exporter.
 
-| Source                       | Exposed values                                                                      |
-| ---------------------------- | ----------------------------------------------------------------------------------- |
-| `PeerRpcServerRuntime.usage` | `accepting`, `sessions`, `subjects`, `activeClaims`, `queuedChannels`               |
-| `PeerRelayIngress.usage`     | `connections`, `reservedBytes`, `byteReservationWaiters`                            |
-| `PeerRelayStore.usage`       | `activeCount`, `activeBytes`, `retainedCount`, `retainedBytes` for a selected scope |
-| `PeerRelayOutbox.usage`      | Remote and replica `messageCount` and `encodedBytes`                                |
+| Source                      | Exposed values                                                    |
+| --------------------------- | ----------------------------------------------------------------- |
+| `RelayInboxStore.usage`     | `pendingCount`, `pendingBytes`, `retainedCount` for one inbox     |
+| `RelayInboxStore.abandoned` | Dead lettered and expired rows for one inbox, with attempt counts |
+| `PeerRelayOutbox.usage`     | Remote and replica `messageCount` and `encodedBytes`              |
 
-Store operations use spans named `PeerRelayStore.admit`, `claim`, `loadClaimedPayload`, `acknowledge`, `reject`,
-`release`, `recover`, `expire`, `repair`, `reconcile`, `collect`, and `usage`. Client relay spans are
+Store operations use spans named `SqlRelayInboxStore.admit`, `pendingHeads`, `recordDelivery`, `settle`, `usage`,
+`abandoned`, `expire`, and `collect`. Entity spans are `RelayInbox.Deliver`, `Subscribe`, `Settle`, `Release`,
+`Heartbeat`, and `EndSession`. Front door spans are `RelayServer.Open`, `RelayServer.Push`, and `RelayServer.Settle`.
+Retention sweeps use `RelayInboxMaintenance.sweep`. Client relay spans are
 `effect_local_rpc.adapter.relay_open` with `rpc.selected_documents` and
 `effect_local_rpc.adapter.relay_push` with `rpc.payload_bytes`.
+
+Attributes are identifiers only. The inbox key is a digest and the message and relay identifiers are opaque; the
+payload, the credential, and full principals are never span attributes.

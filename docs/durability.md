@@ -154,20 +154,20 @@ share an atomic transaction. The extra grant exists because Automerge `3.3.2` do
 semantic decode. Authentication and document access alone do not satisfy it.
 
 These boundaries provide at least once transfer. They do not provide exactly once delivery. A response can be lost
-after any commit. A claim can expire while an old recipient worker still runs. The durable identities and claim
-tokens make retries and stale acknowledgements safe, while retained recipient receipts make duplicate application
-idempotent during the negotiated window.
+after any commit. A delivery attempt can be abandoned while its message is still `Pending`. The durable identities
+and per attempt claim tokens make retries and stale acknowledgements safe, while retained recipient receipts make
+duplicate application idempotent during the negotiated window.
 
-Relay FIFO ordering is scoped to one exact directed peer channel. One claimed head blocks later rows in that channel.
-Unrelated channels do not share that ordering fence.
+Relay FIFO ordering is scoped to one exact directed peer channel, which includes the sender's connection epoch. One
+in flight head blocks later rows in that channel. Unrelated channels do not share that ordering fence.
 
-Recipient delivery attempts are durable and bounded by `RelayInbox.Options.maxDeliveries`, which is set to
-`16`. Failed, interrupted, disconnected, and expired claims advance the count. Reaching the cap changes the message
-to `DeadLettered` and erases the payload. Restart cannot reset this poison bound.
+Recipient delivery attempts are durable and bounded by `RelayInbox.Options.maxDeliveries`. An attempt is charged only
+once the message has reached the transport, so a delivery abandoned by a disconnect costs nothing. Reaching the cap
+changes the message to `DeadLettered` so it stops blocking its channel. Restart cannot reset this poison bound.
 
-Active payloads expire at `PeerRelayLimits.messageTtlMillis`. Acknowledged, rejected, and expired rows erase their
-payload and retain bounded deduplication evidence until their retention deadline. Sender outbox rows expire at their
-configured retry horizon. Recipient receipts expire according to `PeerRelayReceiptLimits`.
+Undelivered messages expire at `RelayInbox.Options.messageTtl`. A terminal row keeps its stored envelope until
+retention collects the whole row past its deduplication horizon, which is what lets a sender that still holds custody
+revive a dead lettered or expired identity. Sender outbox rows expire at their configured retry horizon. Recipient receipts expire according to `PeerRelayReceiptLimits`.
 
 Relay custody rows and client relay outbox or receipt rows are not canonical document history and are not included in
 canonical backup archives. Restore fences the previous incarnation, removes stale relay client state, and reconciles

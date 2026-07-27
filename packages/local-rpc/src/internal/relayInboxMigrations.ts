@@ -183,7 +183,7 @@ const createTable = Effect.gen(function*() {
   })
 })
 
-export const loader = Migrator.fromRecord({
+const loader = Migrator.fromRecord({
   "1_create_relay_inbox": createTable
 })
 

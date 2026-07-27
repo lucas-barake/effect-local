@@ -42,10 +42,10 @@ Effect RPC uses one durable protocol at version `1`. The sender first writes a s
 outbox. Relay acceptance means that the configured backend SQL store committed custody.
 The relay then delivers the oldest eligible message for one exact directed channel when the recipient reconnects.
 The recipient acknowledges only after its production sync workflow and sender scoped receipt commit. Lost
-acknowledgements and expired claims can duplicate delivery, so the guarantee is at least once.
+acknowledgements and abandoned delivery attempts can duplicate delivery, so the guarantee is at least once.
 
-Ordering is FIFO within the tenant, sender subject, sender peer, sender replica incarnation, recipient subject, and
-recipient peer channel. Other channels can progress independently. Message expiry, terminal retention, receipt
+Ordering is FIFO within the tenant, sender subject, sender peer, sender replica incarnation, and sender connection
+epoch channel; the recipient is the inbox itself. Other channels can progress independently. Message expiry, terminal retention, receipt
 retention, sender retry horizon, storage quotas, connection bounds, worker bounds, maximum delivery attempts, and
 maintenance rates are explicit configuration. The default maximum is `16` delivery attempts. Reaching it durably
 dead letters the message and erases its payload.
@@ -67,8 +67,9 @@ policy authority do not share an atomic transaction.
 The durable protocol requires the separate unsafe grant. A future allocation bounded Automerge decode API should
 remove that grant.
 
-Relay custody uses the injected `PeerRelayStore`. `SqlPeerRelayStore.layer` supports SQLite, PostgreSQL, and MySQL
-through a generic `SqlClient`. It does not add cross region routing or peer discovery. See
+Relay custody uses the injected `RelayInboxStore`, owned by one cluster entity per recipient device.
+`SqlRelayInboxStore.layer` supports SQLite, PostgreSQL, and MySQL through a generic `SqlClient`. Several relay nodes
+may serve one database, but the relay does not add cross region routing or peer discovery. See
 [Store and forward](store-and-forward.md) for the exact contract and composition.
 
 Automerge provides merge infrastructure, not collaboration UX. The public snapshot exposes the decoded value and head

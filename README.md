@@ -181,8 +181,8 @@ remote storage durability. Effect Local therefore keeps durable confirmation sep
 false.
 
 Effect RPC response acknowledgements bound streamed response chunks. They are not byte credits, durable receipts, or
-proof that Automerge applied a message. `PeerRpcServer` adds item limits, byte reservations, quotas, rate limits, and
-admission concurrency above the RPC stream. WebSocket ordering applies only within one live connection.
+proof that Automerge applied a message. `RelayServer` adds per inbox admission quotas, authentication rate limits,
+and a per subject session cap above the RPC stream. WebSocket ordering applies only within one live connection.
 
 The browser topology also assigns distinct roles:
 
@@ -232,7 +232,7 @@ always recover by reading the replica again because Atom is not part of the pers
 | Retry a command after losing the response | The same command ID, then the matching lookup method                  |
 | Coordinate several durable steps          | Effect Workflow                                                       |
 | Exchange changes with another replica     | `PeerSession` and an application supplied transport                   |
-| Host a live authenticated replica peer    | `PeerRpcServer` plus application owned Effect RPC                     |
+| Host a live authenticated replica peer    | `RelayServer` plus a cluster and application owned Effect RPC         |
 | Connect through the generated RPC client  | `RpcPeerTransport.makeSession`                                        |
 | Bound a high churn document's checkpoint  | `ReplicaWorkflow.HistoryRewriteWorkflow`                              |
 | Add asynchronous relay custody            | The opt in [store and forward](docs/store-and-forward.md) composition |
@@ -344,10 +344,12 @@ The RPC package itself is platform neutral. A network deployment requires an Eff
 `RpcClient.Protocol`, the same `RpcSerialization` on both ends, a platform `Socket`, an HTTP server, TLS, WebSocket
 upgrade routing, Origin policy, ingress byte and connection limits, credential issuance, secret rotation, tenant
 routing, process supervision, and graceful shutdown. None of those responsibilities are inferred from
-`PeerRpcServer.layerHandlers`.
+`RelayServer.layerHandlers`.
 
-The durable relay uses the bounded `PeerRelayIngress` protocol. The application owns TLS, routing, identity, policy,
-process supervision, and the SQLite, PostgreSQL, or MySQL deployment that holds one relay shard.
+The durable relay speaks standard Effect RPC over a socket with `RpcSerialization`. The application also owns the
+cluster: `RelayServer` requires a `Sharding` and never builds one, so single process, one runner over SQL, and many
+sharded runners are all its choice. The application owns TLS, routing, identity, policy, process supervision, and the
+SQLite, PostgreSQL, or MySQL deployment behind the relay.
 
 ## Composition recipes
 
@@ -994,13 +996,17 @@ reclaims expired entries.
 The RPC package exposes one protocol, `PeerRpc` version `1`. Its procedures are `Open`, `Push`,
 `Acknowledge`, and `Reject`. Every connection uses durable custody. There is no direct in memory RPC topology.
 
-Applications provide `PeerAuthenticator`, `PeerRelayAuthorization`, `PeerRelayLimits`,
-`PeerRelayIngress`, and `PeerRelayStore`. The semantic store is injectable. The built in
-`SqlPeerRelayStore.layer` requires a generic `SqlClient` and supports SQLite, PostgreSQL, and MySQL. The frontend
-replica, sender outbox, and recipient receipts remain SQLite.
+Applications provide `PeerAuthenticator`, `PeerRelayAuthorization`, `PeerRelayLimits`, a socket, and a `Sharding`.
+The semantic store is injectable through `RelayInboxStore`; the built in `SqlRelayInboxStore.layer` requires a
+generic `SqlClient` and supports SQLite, PostgreSQL, and MySQL. The frontend replica, sender outbox, and recipient
+receipts remain SQLite.
 
-`PeerRpcServer.layerHandlers({ tenantId, peerId })` builds the handlers. `PeerRpcServer.layerServer` supervises the
-RPC server and bounded ingress. A successful `Push` means the backend store committed custody before replying.
+The relay is a cluster of `RelayInbox` entities, one per recipient device, each the sole writer for its device's
+inbox. `RelayServer.layerHandlers(options)` builds the front door alone, which is what composes into an existing RPC
+server. `RelayServer.layer(options)` is the whole thing: front door, entity behaviour, and the retention singleton
+that makes `messageTtl` and `terminalRetention` actually run. Because ownership comes from sharding rather than from
+process local state, several relay nodes can serve one database. A successful `Push` means the owning entity
+committed custody before replying.
 
 ### 13. Connect an RPC peer
 
@@ -1460,12 +1466,6 @@ Run commands from the repository root.
 | `pnpm docgen`           | Compile documentation through the root TypeScript graph           |
 | `pnpm clean`            | Remove generated build artifacts                                  |
 
-`pnpm bench` excludes `PeerRpcServerPerformance.bench.ts`. That harness imports an instrumentation module created only
-by `base-admission-instrumentation.patch` or `candidate-admission-instrumentation.patch` inside detached benchmark
-worktrees. It must never run against or add hooks to the shipped source. After applying the matching patch, run it with
-`pnpm exec vitest bench --run --config packages/local-rpc/bench/vitest.admission.config.ts`. Base and candidate must use
-the same harness, dependency lock, sample count, and machine.
-
 ## Public API inventory
 
 Every root package exports module namespaces. Every module is also available through its public subpath, such as
@@ -1474,15 +1474,15 @@ Every root package exports module namespaces. Every module is also available thr
 The export surface supports several assembly levels. Most applications start with everyday domain and composition
 modules. Feature and advanced services remain public for products that need direct control.
 
-| Level                       | Modules                                                                                                                                                                                               |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Everyday domain             | `Document`, `DocumentSet`, `Mutation`, `Projection`, `Query`, `ReplicaDefinition`, `Replica`, `CommandOutcome`, `Snapshot`, `Identity`, `ReplicaStatus`, `Backup`                                     |
-| Durable runtime             | `SqlProjection`, `SqlReplica`, `BrowserReplica`, `BrowserSqlite`                                                                                                                                      |
-| Reactive and test adapters  | `ReplicaAtom`, `TestReplica`                                                                                                                                                                          |
-| Optional features           | `PeerTransport`, `PeerSession`, `Presence`, `ReplicaWorkflow`, `TestPeer`, `FaultInjection`, `PeerRpc`, `RpcPeerTransport`                                                                            |
-| RPC policy and server       | `PeerCredentials`, `PeerAuthenticator`, `PeerAuthentication`, `PeerRelayAuthorization`, `PeerRelayLimits`, `PeerRelayIngress`, `PeerRelayStore`, `SqlPeerRelayStore`, `PeerRpcServer`, `PeerRpcError` |
-| Advanced assembly           | `CommitPublisher`, `Compaction`, `Recovery`, `PeerSync`, `DurableRuntime`, `ReplicaClient`, `ReplicaOwner`, `SessionManager`                                                                          |
-| Advanced framework assembly | `CommandExecutor`, `DocumentEntity`, `DocumentStore`, `EntityReplica`, `Migrations`, `ProjectionStore`, `QueryExecutor`, `ReplicaBootstrap`, `ReplicaGate`, `ReplicaRpc`                              |
+| Level                       | Modules                                                                                                                                                                                                                  |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Everyday domain             | `Document`, `DocumentSet`, `Mutation`, `Projection`, `Query`, `ReplicaDefinition`, `Replica`, `CommandOutcome`, `Snapshot`, `Identity`, `ReplicaStatus`, `Backup`                                                        |
+| Durable runtime             | `SqlProjection`, `SqlReplica`, `BrowserReplica`, `BrowserSqlite`                                                                                                                                                         |
+| Reactive and test adapters  | `ReplicaAtom`, `TestReplica`                                                                                                                                                                                             |
+| Optional features           | `PeerTransport`, `PeerSession`, `Presence`, `ReplicaWorkflow`, `TestPeer`, `FaultInjection`, `PeerRpc`, `RpcPeerTransport`                                                                                               |
+| RPC policy and server       | `PeerCredentials`, `PeerAuthenticator`, `PeerAuthentication`, `PeerRelayAuthorization`, `PeerRelayLimits`, `RelayInboxStore`, `SqlRelayInboxStore`, `RelayInbox`, `RelayInboxMaintenance`, `RelayServer`, `PeerRpcError` |
+| Advanced assembly           | `CommitPublisher`, `Compaction`, `Recovery`, `PeerSync`, `DurableRuntime`, `ReplicaClient`, `ReplicaOwner`, `SessionManager`                                                                                             |
+| Advanced framework assembly | `CommandExecutor`, `DocumentEntity`, `DocumentStore`, `EntityReplica`, `Migrations`, `ProjectionStore`, `QueryExecutor`, `ReplicaBootstrap`, `ReplicaGate`, `ReplicaRpc`                                                 |
 
 These public framework assembly modules support custom runtimes and diagnostics. Paths under `internal/*` remain
 private and unsupported. The public assembly modules are not required for the normal application path shown in the
@@ -1786,23 +1786,25 @@ planning:
 | `PeerAuthenticator`      | Application credential verification service                                                                |
 | `PeerCredentials`        | Client credential provider                                                                                 |
 | `PeerRelayAuthorization` | Exact send and receive authorization plus the explicit Automerge resource trust grant                      |
-| `PeerRelayIngress`       | Bounded server and client socket protocol                                                                  |
-| `PeerRelayLimits`        | Authentication, ingress, custody, session, worker, quota, retry, and maintenance limits                    |
+| `PeerRelayLimits`        | Negotiation windows, authentication rate limits, and the per subject session cap                           |
 | `PeerRpc`                | Durable protocol version `1`, `Open`, `Push`, `Acknowledge`, `Reject`, events, group, and generated client |
-| `PeerRelayStore`         | Injectable semantic custody contract                                                                       |
-| `SqlPeerRelayStore`      | Generic `SqlClient` implementation with `make` and `layer` for SQLite, PostgreSQL, and MySQL               |
-| `PeerRpcServer`          | `layerHandlers`, `layerServer`, and `PeerRpcServerRuntime`                                                 |
+| `RelayInboxStore`        | Injectable semantic custody contract for one device's inbox                                                |
+| `SqlRelayInboxStore`     | Generic `SqlClient` implementation with `make` and `layer` for SQLite, PostgreSQL, and MySQL               |
+| `RelayInbox`             | The cluster entity that owns one device's inbox, with `layer` and `Options`                                |
+| `RelayInboxMaintenance`  | Deployment wide expiry and collection, as a cluster singleton                                              |
+| `RelayServer`            | `layerHandlers` for the front door alone, `layer` for the front door plus entity plus retention            |
 | `RpcPeerTransport`       | Durable `Options`, `layer`, `makeSession`, and `isRetryable`                                               |
 
 The `Open` stream starts with `Opened` and then emits `StoredMessage` values. `Push` succeeds only after durable
-custody. `Acknowledge` and `Reject` use the exact claim token and message hash. Every procedure can fail with a
-fieldless `PeerRpcError`.
+custody. `Acknowledge` and `Reject` use the claim token minted for that delivery attempt plus the message hash. Every
+procedure can fail with a fieldless `PeerRpcError`.
 
 `PeerAuthentication.layerClient` requires `PeerCredentials`.
 `PeerAuthentication.layerServer` requires `PeerAuthenticator` and `PeerRelayLimits`.
-`PeerRpcServer.layerHandlers` requires `Crypto`, `PeerRelayAuthorization`, `PeerRelayIngress`,
-`PeerRelayLimits`, and `PeerRelayStore`. `SqlPeerRelayStore.layer` requires `SqlClient`, `Crypto`, and
-`PeerRelayLimits`. `RpcPeerTransport.layer` additionally uses `PeerRelayClientRuntime`.
+`RelayServer.layerHandlers` requires `Crypto`, `PeerRelayAuthorization`, `PeerRelayLimits`, and `Sharding`.
+`RelayServer.layer` additionally registers the entity behaviour and the retention singleton, so it also requires
+`RelayInboxStore`. `SqlRelayInboxStore.layer` requires `SqlClient` and `Crypto`. `RpcPeerTransport.layer`
+additionally uses `PeerRelayClientRuntime`.
 
 ### Research basis
 

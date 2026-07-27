@@ -47,31 +47,36 @@ operations after process loss. Automerge remains responsible for causal history,
 
 ## Relay topology
 
-Effect RPC uses one durable protocol. Version `1` uses `PeerRpc.Rpcs`, the bounded `PeerRelayIngress` socket
-protocol, `PeerRpcServer.layerHandlers`, and `PeerRpcServer.layerServer`.
+Effect RPC uses one durable protocol. Version `1` uses `PeerRpc.Rpcs` over a standard Effect RPC socket with
+`RpcSerialization`, `RelayServer.layerHandlers` for the front door, and `RelayServer.layer` to compose the front door
+with the entity behaviour and its retention singleton.
 
 ```mermaid
 flowchart LR
   Sender["Sender SQL replica"] --> Outbox["Stable sender relay outbox"]
-  Outbox --> RelayListener["Relay protocol v1 listener"]
-  RelayListener --> Custody["Injected backend SQL custody"]
-  Custody --> RecipientListener["Recipient relay session"]
-  RecipientListener --> Receipt["Recipient SQL sync and receipt"]
-  Receipt --> Ack["Fenced relay acknowledgement"]
-  Ack --> Custody
+  Outbox --> FrontDoor["RelayServer front door (any node)"]
+  FrontDoor --> Entity["RelayInbox entity (single owner per device)"]
+  Entity --> Custody["Injected backend SQL custody"]
+  Entity --> RecipientSession["Recipient delivery session"]
+  RecipientSession --> Receipt["Recipient SQL sync and receipt"]
+  Receipt --> Ack["Relay acknowledgement"]
+  Ack --> Entity
 ```
 
-The application must route every custody write and claim for one shard to the same logical SQL database. The supplied
-`SqlClient` may target SQLite, PostgreSQL, or MySQL. This topology does not itself add leader election, quorum
-replication, automatic failover, shard rebalance, or split brain recovery beyond the selected database.
+Endpoint ownership, routing, and cross node wakeups come from cluster sharding rather than from process local state,
+so several relay nodes may serve one database as active active. The entity that owns a device is the sole writer for
+that device's inbox, which is what makes custody need no distributed protocol of its own. The supplied `SqlClient` may
+target SQLite, PostgreSQL, or MySQL. The relay requires a `Sharding` and never builds one: single process in memory,
+one runner over SQL, and many sharded runners are all the application's choice.
 
-Relay ordering is FIFO within one exact directed peer channel. Distinct channels can progress concurrently. Claims
-are finite fences. A stale claim may duplicate delivery, but its old token cannot retire a newer claim. See
+Relay ordering is FIFO within one exact directed peer channel, where a channel includes the sender's connection
+epoch. Distinct channels progress concurrently, so one stalled sender cannot block another. Delivery is stop and wait
+within a channel: nothing is offered behind an unsettled message. See
 [Store and forward](store-and-forward.md) for delivery, capacity, security, and lifecycle details.
 
-Relay infrastructure treats the Automerge message as opaque. It validates bounded framing, envelope Schema, endpoint
-and document routing, hashes, outer digest, and writer provenance shape. Relay enabled `PeerSync` performs the one
-semantic Automerge decode.
+Relay infrastructure treats the Automerge message as opaque. It validates the envelope Schema, endpoint and document
+routing, hashes, outer digest, and writer provenance shape. Relay enabled `PeerSync` performs the one semantic
+Automerge decode.
 
 That boundary is explicit because Automerge `3.3.2` has no allocation bounded decode API. Ordinary authentication and
 document authorization do not imply resource trust. `PeerRelayAuthorization` requires a second exact
