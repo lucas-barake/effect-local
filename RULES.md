@@ -4,13 +4,10 @@ Read this file before any work. Treat these rules as required for every package.
 
 ## Coordination
 
-- Read `AGENTS.local.md` before editing.
-- Only the main task owner edits or replaces `AGENTS.local.md`, and only when the repository level task changes to unrelated work.
-- The main task owner records the task, branch, PR, ownership, checkpoints, commands, results, decisions, and next actions.
-- The main task owner checks `git status` and the remote branch before mutation, rebases before every push, and pushes each independently verified fix.
+- Check `git status` and the remote branch before mutation, rebase before every push, and push each independently verified fix.
 - Never overwrite, revert, or reformat another contributor's work.
 - Keep commits narrow.
-- Use one production owner for overlapping files. Review agents must not edit production code, tests, shared ledgers, commits, branches, or PR state.
+- Use one production owner for overlapping files. Review agents must not edit production code, tests, commits, branches, or PR state.
 
 ## Effect Source Of Truth
 
@@ -41,7 +38,10 @@ Read this file before any work. Treat these rules as required for every package.
 - For a service that requires cleanup, acquire it with `Effect.acquireRelease` or another scoped `Effect`, and provide it with `Layer.effect`.
 - Keep Layer construction configurable. Do not hide lifecycle, persistence, concurrency, or security choices behind defaults.
 - Do not capture consumer specific runtime values in module global state. Pass them through service implementations, Layer constructors, or operation arguments.
-- A Layer must capture every service used later by its methods or expose that service as a Layer requirement.
+- Resolve dependencies once while the Layer is being built and close over them. A service method must not leave a service in its own requirement channel.
+- A service's methods should be `Effect<A, E, never>`. Leak a requirement only when the dependency is genuinely per call, such as a request scoped context or an ambient `Scope` the caller owns, and say why at the definition.
+- A leaked requirement is a real cost: it spreads to every transitive caller, it lets a method be invoked under a context the Layer never validated, and it hides which services an implementation actually needs behind the call sites instead of stating it once at construction.
+- A Layer must capture every service used later by its methods.
 - Export a constructor or use `Layer.fresh` when a context sensitive Layer must build independently more than once under one memo map.
 
 ## Composition And Effects
