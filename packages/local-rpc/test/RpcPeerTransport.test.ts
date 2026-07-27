@@ -129,9 +129,23 @@ const relayEntry = (payload: Uint8Array): PeerRelayOutbox.Entry => ({
   nextAttemptAt: "2026-07-25T00:00:00.000Z"
 })
 
+/**
+ * `overrides` re-derives the outer digest from the tampered envelope rather than tampering the
+ * stored message afterwards.
+ *
+ * That distinction is the whole point: a message edited after the fact fails the digest check, so
+ * it proves nothing about the endpoint and selected-document checks that run alongside it. What has
+ * to be modelled is a message that is internally consistent and still addressed to the wrong place
+ * — a relay handing this peer somebody else's traffic.
+ */
 const makeStoredMessage = (
   payloadSeed: Uint8Array,
-  lineage: Identity.DocumentLineage = Identity.genesisLineage
+  lineage: Identity.DocumentLineage = Identity.genesisLineage,
+  overrides?: {
+    readonly sender?: PeerSyncEnvelope.RelayPeerPrincipal
+    readonly recipient?: PeerSyncEnvelope.RelayPeerPrincipal
+    readonly document?: { readonly documentType: string; readonly documentId: Identity.DocumentId }
+  }
 ) =>
   Effect.gen(function*() {
     let source = Automerge.from(
@@ -174,12 +188,12 @@ const makeStoredMessage = (
     const envelope: PeerSyncEnvelope.RelayOuterEnvelope = {
       domain: PeerSyncEnvelope.relayOuterEnvelopeDomain,
       version: PeerSyncEnvelope.relayOuterEnvelopeVersion,
-      expectedLocal: {
+      expectedLocal: overrides?.sender ?? {
         tenantId: relayOptions.expectedLocal.tenantId,
         subjectId: relayOptions.remote.subjectId,
         peerId: relayOptions.remote.peerId
       },
-      remote: relayOptions.expectedLocal,
+      remote: overrides?.recipient ?? relayOptions.expectedLocal,
       relayPeerId,
       relayMessageId,
       protocolVersion: PeerRpc.protocolVersion,
@@ -187,7 +201,7 @@ const makeStoredMessage = (
       senderReplicaIncarnation,
       senderConnectionEpoch: "remote-epoch",
       senderSequence: 3,
-      document: { documentType: Task.name, documentId },
+      document: overrides?.document ?? { documentType: Task.name, documentId },
       lineage,
       writerProvenance,
       messageHash,
@@ -462,6 +476,73 @@ describe("RpcPeerTransport", () => {
         yield* connection.close
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
+
+  // A correct digest is not an address.
+  //
+  // The three cases are not equivalent, and the difference is worth stating because it decides
+  // which production guard each one actually pins. `digestRelayOuterEnvelope` is recomputed from
+  // the *configured* `expectedSender` and `expectedRecipient`, so a message addressed to or from
+  // the wrong principal fails the digest no matter what: the `samePrincipal` checks above it are an
+  // earlier and clearer rejection of the same thing, not a separate guard, and removing them keeps
+  // this suite green. The document is the exception - the digest takes `document` from the event
+  // itself, so a misdirected document produces a perfectly valid digest and only the
+  // selected-document check stands between it and the replica. That check was pinned by nothing in
+  // the repository: removing it left all 1019 tests green.
+  for (
+    const wrong of [
+      {
+        name: "a sender that is not the configured remote peer",
+        overrides: {
+          sender: {
+            tenantId: "tenant",
+            subjectId: "remote-subject",
+            peerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-0000000000ff")
+          }
+        }
+      },
+      {
+        name: "a recipient that is not this peer",
+        overrides: {
+          recipient: {
+            tenantId: "tenant",
+            subjectId: "local-subject",
+            peerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-0000000000fe")
+          }
+        }
+      },
+      {
+        name: "a document this session did not select",
+        overrides: {
+          document: {
+            documentType: Task.name,
+            documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-0000000000ff")
+          }
+        }
+      }
+    ]
+  ) {
+    it.effect(`refuses a stored message carrying ${wrong.name}`, () =>
+      Effect.scoped(
+        Effect.gen(function*() {
+          // Built through the envelope, so its digest is correct for what it claims to be. The
+          // digest check therefore cannot be what rejects it.
+          const misaddressed = yield* makeStoredMessage(Uint8Array.of(1, 2, 3), undefined, wrong.overrides)
+          const acknowledgements = yield* Ref.make(0)
+          const client = makeRelayClient(
+            () => Stream.fromIterable([relayOpened, misaddressed]).pipe(Stream.rechunk(1)),
+            undefined,
+            () => Ref.update(acknowledgements, (count) => count + 1)
+          )
+          const connection = yield* connectRelay(client, makeRuntime())
+          const error = yield* Stream.runHead(connection.receive).pipe(Effect.flip)
+          assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+          // Never acknowledged: settling a message this peer refused would tell the relay to drop
+          // it on behalf of whoever it was actually addressed to.
+          assert.strictEqual(yield* Ref.get(acknowledgements), 0)
+          yield* connection.close
+        }).pipe(Effect.provide(NodeCrypto.layer))
+      ))
+  }
 
   it.effect("reconstructs a non-genesis lineage when verifying the outer digest", () =>
     Effect.scoped(

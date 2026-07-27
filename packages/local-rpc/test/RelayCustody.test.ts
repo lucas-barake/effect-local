@@ -449,17 +449,33 @@ describe("relay custody against a real relay", () => {
         const recipientClient = yield* backend.clientFor("remote")
         const { documentId, recipient, sender } = yield* seedPair
 
-        // The label exists only on the sender. The relay is the only path to the recipient.
-        const labelled = yield* sender.replica.mutate(AddLabel, {
-          commandId: yield* Identity.makeCommandId,
-          documentId,
-          payload: "from-sender"
-        })
-        assert.strictEqual(labelled._tag, "DurablyCommittedLocal")
+        // One label on each side, neither of which the other has seen. Both peers therefore have
+        // something the exchange has to carry, which is what makes convergence below evidence of
+        // both directions: if only the sender had a change, the recipient's head set would collapse
+        // onto the sender's the moment it merged, and agreement would follow from the forward
+        // direction alone.
+        for (
+          const [side, label] of [
+            [sender, "from-sender"],
+            [recipient, "from-recipient"]
+          ] as const
+        ) {
+          const committed = yield* side.replica.mutate(AddLabel, {
+            commandId: yield* Identity.makeCommandId,
+            documentId,
+            payload: label
+          })
+          assert.strictEqual(committed._tag, "DurablyCommittedLocal")
+        }
         assert.deepStrictEqual(
           [...(yield* recipient.store.load(Task, documentId).pipe(Effect.orDie)).encoded.labels],
-          [],
-          "the recipient has not seen the label before the exchange"
+          ["from-recipient"],
+          "the recipient has only its own label before the exchange"
+        )
+        assert.deepStrictEqual(
+          [...(yield* sender.store.load(Task, documentId).pipe(Effect.orDie)).encoded.labels],
+          ["from-sender"],
+          "the sender has only its own label before the exchange"
         )
         yield* TestClock.adjust(5000)
 
@@ -478,16 +494,22 @@ describe("relay custody against a real relay", () => {
           yield* senderSession.flush
           yield* TestClock.adjust(5000)
 
-          // The whole point. The recipient's own replica holds the sender's label, which means the
-          // stored message survived `validateStoredMessage` - endpoint, selected document and a
-          // recomputed outer envelope digest - and was applied through the real `DocumentEntity`.
+          // The whole point, and it is symmetric. Each replica holds the other's label, which means
+          // a stored message travelled each way and survived `validateStoredMessage` - endpoint,
+          // selected document and a recomputed outer envelope digest - before being applied through
+          // the real `DocumentEntity`. Sorted because the merge order of two concurrent list
+          // insertions is Automerge's to choose, not this test's.
           const recipientLoaded = yield* recipient.store.load(Task, documentId).pipe(Effect.orDie)
           const senderLoaded = yield* sender.store.load(Task, documentId).pipe(Effect.orDie)
-          assert.deepStrictEqual([...recipientLoaded.encoded.labels], ["from-sender"])
+          assert.deepStrictEqual(
+            [...recipientLoaded.encoded.labels].toSorted(),
+            ["from-recipient", "from-sender"]
+          )
+          assert.deepStrictEqual(
+            [...senderLoaded.encoded.labels].toSorted(),
+            ["from-recipient", "from-sender"]
+          )
 
-          // Both directions completed, not just the push: the recipient's replies travelled back
-          // through its own inbox, so the two replicas agree on the document rather than the
-          // recipient merely having received something.
           assert.deepStrictEqual(
             [...recipientLoaded.materializedHeads].toSorted(),
             [...senderLoaded.materializedHeads].toSorted(),
