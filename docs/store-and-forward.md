@@ -21,9 +21,10 @@ composes `RelayServer.layer`, which is the front door handlers plus the `RelayIn
 retention singleton. The relay requires a `Sharding` and never builds one, so the deployment shape — single process
 in memory, one runner over SQL, or many sharded runners — stays the application's choice.
 
-On the client, `SqlReplica.layerRelay` installs relay receipt support. `PeerRelayOutbox.layerSql` stores stable sender
-admissions. `PeerRelayClientRuntime.layer` supervises sender outbox and receipt maintenance.
-`RpcPeerTransport.makeSession` binds the generated relay client to the ordinary `PeerSession`.
+On the client, `SqlReplica.layerRelay` (or `layerRelayWithBindings` when there are projections) installs relay receipt
+support. `PeerRelayClientRuntime.layerSql` stores stable sender admissions in the SQL outbox and supervises sender
+outbox and receipt maintenance. `RpcPeerTransport.makeSession` binds the generated relay client to the ordinary
+`PeerSession`.
 
 This example shows the server and client composition. The named application values provide SQL, Crypto,
 authentication, socket, cluster, definition, projection, and mutation or query Layers.
@@ -37,7 +38,6 @@ import * as RelayServer from "@lucas-barake/effect-local-rpc/RelayServer"
 import * as RpcPeerTransport from "@lucas-barake/effect-local-rpc/RpcPeerTransport"
 import * as SqlRelayInboxStore from "@lucas-barake/effect-local-rpc/SqlRelayInboxStore"
 import * as PeerRelayClientRuntime from "@lucas-barake/effect-local-sql/PeerRelayClientRuntime"
-import * as PeerRelayOutbox from "@lucas-barake/effect-local-sql/PeerRelayOutbox"
 import * as PeerRelayOutboxLimits from "@lucas-barake/effect-local-sql/PeerRelayOutboxLimits"
 import * as PeerRelayReceiptLimits from "@lucas-barake/effect-local-sql/PeerRelayReceiptLimits"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
@@ -90,15 +90,16 @@ const ServerLive = RpcServer.layer(PeerRpc.Rpcs).pipe(
 )
 
 const ReceiptLimitsLive = PeerRelayReceiptLimits.layer(receiptLimits)
-const RelayReplicaLive = SqlReplica.layerRelay(definition, { projections }).pipe(
+// `layerRelayWithBindings` rather than `layerRelay` whenever there are projections: it provides the
+// binding Layers, exactly as `layerWithBindings` does for the direct topology. Reaching for
+// `layerWithBindings` here instead is the easy mistake, and it builds a direct PeerSync that
+// PeerRelayClientRuntime then refuses.
+const RelayReplicaLive = SqlReplica.layerRelayWithBindings(definition, { projections }).pipe(
   Layer.provideMerge(ReceiptLimitsLive)
 )
-const RelayOutboxLive = PeerRelayOutbox.layerSql.pipe(
+const RelayClientLive = PeerRelayClientRuntime.layerSql.pipe(
   Layer.provideMerge(RelayReplicaLive),
   Layer.provideMerge(PeerRelayOutboxLimits.layer(outboxLimits))
-)
-const RelayClientLive = PeerRelayClientRuntime.layer.pipe(
-  Layer.provideMerge(RelayOutboxLive)
 )
 
 const session = RpcPeerTransport.makeSession(relayRpcClient, {
@@ -134,6 +135,52 @@ and `authorizeRelay` document authorization do not promote a caller into resourc
 
 The `expectedRelayPeerId`, `expectedLocal`, exact remote subject and peer, replica incarnation, selected documents,
 receipt retention, and sender retry horizon are part of the version `1` handshake. A mismatch fails the connection.
+
+### In the browser
+
+Nothing above is node specific. No `packages/*/src` module imports `node:` anything, and the client custody tables are
+part of the shared migration set the browser already applies, so `PeerRelayOutbox` and `PeerRelayClientRuntime` run in
+a browser over `BrowserSqlite` and `BrowserCrypto` exactly as they do on a server.
+
+Two placement rules matter more than the wiring.
+
+The relay session belongs to the **owner**, not to a tab. `BrowserReplica` and `ReplicaOwner` are the two halves of a
+tab to SharedWorker RPC, not a network transport; the owner's runtime is the only place that holds `SqlClient`,
+`ReplicaGate`, `PeerSync`, `CommitPublisher` and a `Sharding`, which is exactly what `RpcPeerTransport.makeSession`
+requires. Opening a session per attached tab would make one device several senders.
+
+The owner's replica has to be built relay flavoured. A browser app almost always has projections, so that means
+`SqlReplica.layerRelayWithBindings`. `PeerRelayClientRuntime` fails at construction on a direct `PeerSync` rather than
+degrading, so this is caught immediately, but it is caught in a service the consumer did not think it was choosing.
+
+The socket is the platform's, per the responsibility table in the README: this package does not ship a WebSocket
+client. `@effect/platform-browser` already provides one.
+
+```ts
+import * as BrowserSocket from "@effect/platform-browser/BrowserSocket"
+import * as PeerRpc from "@lucas-barake/effect-local-rpc/PeerRpc"
+import { RpcClient, RpcSerialization } from "effect/unstable/rpc"
+
+const relayRpcClient = PeerRpc.makeRpcClient.pipe(
+  Effect.provide(RpcClient.layerProtocolSocket()),
+  Effect.provide(BrowserSocket.layerWebSocket(relayUrl)),
+  Effect.provide(RpcSerialization.layerJson),
+  Effect.provide(PeerAuthentication.layerClient),
+  Effect.provideService(PeerCredentials.PeerCredentials, credentials)
+)
+```
+
+`credentials` is the application's. `PeerAuthentication.layerClient` calls `PeerCredentials.get` once per request, so a
+`Ref` or `Deferred` backed implementation that the page refreshes is a valid shape. Supplying it inside a SharedWorker
+is the part with no answer in this package: `SharedWorkerGlobalScope` has no `localStorage` and no cookie jar, so the
+token has to travel from the page across the existing `MessagePort`, and `ReplicaRpc` has no slot for it today.
+
+Reconnect is likewise the application's. `SupervisedPeerSession.awaitDisconnect` reports the disconnect and
+`RpcPeerTransport.isRetryable` classifies whether the failure is worth retrying, but the schedule is a deployment
+policy, not a library default. One detail is easy to get wrong: `senderReplicaIncarnation` is captured in
+`RpcPeerTransport.Options` and validated against the live `ReplicaGate`, and a restore bumps the incarnation. A
+supervisor that holds one options value across attempts works until the first restore and then fails every reconnect,
+so rebuild the options from `gate.current` on each attempt.
 
 ## Protocol and durable identity
 

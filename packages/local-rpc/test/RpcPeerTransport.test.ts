@@ -790,4 +790,28 @@ describe("RpcPeerTransport", () => {
       Effect.provideService(Tracer.Tracer, tracer)
     )
   })
+
+  // `isRetryable` is the classifier a reconnect supervisor uses to tell "the relay is down, come
+  // back" apart from "this exchange will never be accepted". Reconnect policy is the application's
+  // per the responsibility table, so nothing in this package calls it - which is exactly why the
+  // classification needs pinning here rather than being discovered wrong by a consumer.
+  describe("isRetryable", () => {
+    it("treats unavailability as retryable and every permanent rejection as not", () => {
+      assert.isTrue(
+        RpcPeerTransport.isRetryable(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageUnavailable({ cause: new Error("relay down") })
+          })
+        )
+      )
+      for (
+        const reason of [
+          new ReplicaError.ProtocolMismatch({ expected: "valid relay handshake", observed: "AccessDenied" }),
+          new ReplicaError.QuotaExceeded({ resource: "relay outbox", limit: 0 })
+        ]
+      ) {
+        assert.isFalse(RpcPeerTransport.isRetryable(new ReplicaError.ReplicaError({ reason })))
+      }
+    })
+  })
 })

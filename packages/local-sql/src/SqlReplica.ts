@@ -277,3 +277,23 @@ export const layerWithBindings = <
   layer(definition, options).pipe(
     Layer.provide(Layer.mergeAll(Layer.empty, ...options.projections.map((binding) => binding.layer)))
   )
+
+/**
+ * `layerRelay` with the projection bindings provided, mirroring `layerWithBindings`.
+ *
+ * Without this a consumer that has projections cannot reach the relay stack at all through the
+ * documented constructors: `layerWithBindings` wraps `layer`, so every binding-shaped deployment is
+ * silently a direct-topology deployment. That matters beyond ergonomics, because
+ * `PeerRelayClientRuntime` refuses to build on a direct `PeerSync` — the failure arrives at
+ * construction of a service the consumer did not think it was choosing.
+ */
+export const layerRelayWithBindings = <
+  D extends ReplicaDefinition.Any,
+  const Bindings extends ReadonlyArray<SqlProjection.Any>,
+>(
+  definition: D,
+  options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
+) =>
+  layerRelay(definition, options).pipe(
+    Layer.provide(Layer.mergeAll(Layer.empty, ...options.projections.map((binding) => binding.layer)))
+  )

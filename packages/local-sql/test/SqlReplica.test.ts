@@ -11,8 +11,10 @@ import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import * as Cause from "effect/Cause"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Latch from "effect/Latch"
 import * as Layer from "effect/Layer"
@@ -28,6 +30,9 @@ import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as CommitPublisher from "../src/CommitPublisher.js"
 import * as DocumentStore from "../src/DocumentStore.js"
 import * as ClusterStorage from "../src/internal/clusterStorage.js"
+import * as PeerRelayClientRuntime from "../src/PeerRelayClientRuntime.js"
+import * as PeerRelayOutboxLimits from "../src/PeerRelayOutboxLimits.js"
+import * as PeerRelayReceiptLimits from "../src/PeerRelayReceiptLimits.js"
 import * as ProjectionStore from "../src/ProjectionStore.js"
 import * as QueryExecutor from "../src/QueryExecutor.js"
 import * as Recovery from "../src/Recovery.js"
@@ -149,6 +154,63 @@ describe("SqlReplica", () => {
       /exactly one SQL binding/
     )
   })
+
+  it("rejects duplicate bindings for one projection through the relay constructor too", () => {
+    assert.throws(
+      () => SqlReplica.layerRelayWithBindings(projectedDefinition, { projections: [TaskTitleSql, TaskTitleSql] }),
+      /exactly one SQL binding/
+    )
+  })
+
+  // The reason `layerRelayWithBindings` exists. A deployment with projections that reaches for the
+  // only bindings constructor there was got a direct `PeerSync`, and found out at the point it
+  // built a service it did not think it was choosing.
+  for (
+    const flavour of [
+      {
+        name: "direct",
+        build: () => SqlReplica.layerWithBindings(projectedDefinition, { projections: [TaskTitleSql] }),
+        relayRuntimeBuilds: false
+      },
+      {
+        name: "relay",
+        build: () => SqlReplica.layerRelayWithBindings(projectedDefinition, { projections: [TaskTitleSql] }),
+        relayRuntimeBuilds: true
+      }
+    ]
+  ) {
+    it.effect(`${flavour.name} bindings constructor: relay client runtime builds = ${flavour.relayRuntimeBuilds}`, () =>
+      Effect.gen(function*() {
+        const exit = yield* Effect.exit(Effect.scoped(Layer.build(
+          PeerRelayClientRuntime.layerSql.pipe(
+            Layer.provide(flavour.build()),
+            Layer.provide(Layer.mergeAll(
+              Database,
+              Handler,
+              Limits,
+              PeerRelayReceiptLimits.layer(PeerRelayReceiptLimits.defaults),
+              PeerRelayOutboxLimits.layer(PeerRelayOutboxLimits.defaults)
+            ))
+          )
+        )))
+        if (flavour.relayRuntimeBuilds) {
+          assert.strictEqual(exit._tag, "Success")
+          return
+        }
+        // Named rather than merely "it failed": the direct stack has to be rejected for being the
+        // wrong `PeerSync`, not for some unrelated wiring fault that would mask a real regression.
+        if (!Exit.isFailure(exit)) return assert.fail("the direct stack must not build a relay runtime")
+        const failure = Cause.findErrorOption(exit.cause)
+        if (Option.isNone(failure)) return assert.fail("expected a typed failure")
+        const error = failure.value
+        if (error._tag !== "ReplicaError") return assert.fail(`expected a ReplicaError, got ${error._tag}`)
+        const reason = error.reason
+        if (reason._tag !== "ProtocolMismatch") {
+          return assert.fail(`expected a ProtocolMismatch, got ${reason._tag}`)
+        }
+        assert.strictEqual(reason.expected, "relay enabled PeerSync")
+      }))
+  }
 
   it.effect("forwards the configured health sampling interval", () =>
     Effect.gen(function*() {

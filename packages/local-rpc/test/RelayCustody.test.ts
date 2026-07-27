@@ -3,7 +3,6 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as DocumentStore from "@lucas-barake/effect-local-sql/DocumentStore"
 import * as PeerRelayClientRuntime from "@lucas-barake/effect-local-sql/PeerRelayClientRuntime"
-import * as PeerRelayOutbox from "@lucas-barake/effect-local-sql/PeerRelayOutbox"
 import * as PeerRelayOutboxLimits from "@lucas-barake/effect-local-sql/PeerRelayOutboxLimits"
 import * as PeerRelayReceiptLimits from "@lucas-barake/effect-local-sql/PeerRelayReceiptLimits"
 import * as ReplicaGate from "@lucas-barake/effect-local-sql/ReplicaGate"
@@ -310,12 +309,8 @@ const clientStack = () => {
     Layer.orDie
   )
   const Store = DocumentStore.layer.pipe(Layer.provide(ReplicaLayer))
-  const Outbox = PeerRelayOutbox.layerSql.pipe(Layer.provide(ReplicaLayer))
-  const Runtime = PeerRelayClientRuntime.layer.pipe(
-    Layer.provide(Layer.merge(ReplicaLayer, Outbox)),
-    Layer.orDie
-  )
-  return Layer.mergeAll(ReplicaLayer, Store, Outbox, Runtime)
+  const Runtime = PeerRelayClientRuntime.layerSql.pipe(Layer.provide(ReplicaLayer), Layer.orDie)
+  return Layer.mergeAll(ReplicaLayer, Store, Runtime)
 }
 
 /**
