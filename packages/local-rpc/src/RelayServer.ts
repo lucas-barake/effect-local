@@ -204,6 +204,21 @@ export const layerHandlers = (options: Options) =>
             return yield* new PeerRpcError.AccessDenied()
           }
 
+          // Sessions are the front door's only unbounded resource, and an authenticated client can
+          // open them in a loop. Checked before minting an id so a refusal costs nothing.
+          let heldBySubject = 0
+          for (const held of sessions.values()) {
+            if (
+              held.principal.tenantId === principal.tenantId &&
+              held.principal.subjectId === principal.subjectId
+            ) {
+              heldBySubject += 1
+            }
+          }
+          if (heldBySubject >= limits.maxSessionsPerSubject) {
+            return yield* new PeerRpcError.RequestCapacityExceeded()
+          }
+
           const sessionId = yield* Identity.makeSessionId.pipe(
             Effect.provideService(Crypto.Crypto, crypto),
             // The platform's randomness failing is an environment fault, not something the client
@@ -241,6 +256,31 @@ export const layerHandlers = (options: Options) =>
             )
           )
 
+          // A session must not outlive what authorized it. The credential and both grants each
+          // expose an `invalidated` signal and a deadline, and none of them is observed by the
+          // client, so the relay is the only place that can end the session when authority is
+          // withdrawn. Without this the heartbeat below would keep an unauthorized session alive
+          // for as long as the socket stays open.
+          const authorityLapsesAt = Math.min(
+            authenticated.validUntil,
+            send.validUntil,
+            receive.validUntil
+          )
+          yield* Effect.raceAll([
+            authenticated.invalidated,
+            send.invalidated,
+            receive.invalidated,
+            Effect.sleep(Math.max(0, authorityLapsesAt - authorizedAt))
+          ]).pipe(
+            Effect.andThen(
+              Effect.logInfo("Relay session authority withdrawn; ending session").pipe(
+                Effect.annotateLogs({ sessionId })
+              )
+            ),
+            Effect.andThen(Effect.ignore(inboxClient(inboxKeySelf).EndSession({ sessionId }))),
+            Effect.forkScoped
+          )
+
           // Proves this node and its socket are still alive. Stopping is the signal.
           yield* Effect.ignore(inboxClient(inboxKeySelf).Heartbeat({ sessionId })).pipe(
             Effect.repeat(Schedule.spaced(options.heartbeatIntervalMillis)),
@@ -255,11 +295,39 @@ export const layerHandlers = (options: Options) =>
             authenticatedLocal: principal
           }
 
-          // Emitted only once the subscription exists, so a client that sees `Opened` has a session
-          // that is genuinely receiving rather than one that failed to attach.
+          // `Stream.concat` builds the second stream only after the first completes, so the
+          // subscription attaches after `Opened` reaches the wire. A client that sees `Opened` has
+          // a session the relay accepted, not yet one the owning entity has attached.
           return Stream.concat(
             Stream.succeed(opened),
             inboxClient(inboxKeySelf).Subscribe({ sessionId }).pipe(
+              // Re-authorized per message rather than once at handshake. A grant can be narrowed
+              // or revoked mid session, and anything with a Send grant to this device can write
+              // into its inbox, so the handshake's Receive decision cannot stand in for the
+              // recipient's right to see a particular document. A message that fails here is left
+              // unsettled and simply not emitted, so it stays durable for a later session.
+              Stream.filterEffect((message) =>
+                authorization.authorize({
+                  direction: "Receive",
+                  principal: session.principal,
+                  remote: session.remote,
+                  documents: [{
+                    documentType: message.document.documentType,
+                    documentId: message.document.documentId
+                  }]
+                }).pipe(
+                  Effect.as(true),
+                  Effect.catchTag("AccessDenied", () =>
+                    Effect.logInfo("Withheld a delivery the recipient may no longer receive").pipe(
+                      Effect.annotateLogs({
+                        sessionId,
+                        documentId: message.document.documentId
+                      }),
+                      Effect.as(false)
+                    )),
+                  Effect.catchTag("ServerUnavailable", () => Effect.succeed(false))
+                )
+              ),
               // Cluster level failures are not part of the public contract, so each is reported as
               // the wire error that tells the client what to do about it.
               Stream.catchTag("MailboxFull", () => Stream.fail(new PeerRpcError.SessionOverloaded())),
@@ -334,6 +402,10 @@ export const layerHandlers = (options: Options) =>
             payload: payload.payload
           }).pipe(
             Effect.provideService(Crypto.Crypto, crypto),
+            // A client can produce an envelope that decodes yet fails to canonicalize, so this is
+            // a permanent rejection. Reporting it as unavailability would have the sender's outbox
+            // retry it forever, paying a full canonical encode on the relay each time.
+            Effect.catchReason("ReplicaError", "ProtocolMismatch", () => new PeerRpcError.InvalidRequest()),
             Effect.catchTag("ReplicaError", () => new PeerRpcError.ServerUnavailable())
           )
 
@@ -393,4 +465,20 @@ export const layerHandlers = (options: Options) =>
  * machines — without the relay changing.
  */
 export const layer = (options: Options & { readonly inbox: RelayInbox.Options }) =>
-  Layer.merge(layerHandlers(options), RelayInbox.layer(options.inbox))
+  Layer.merge(layerHandlers(options), RelayInbox.layer(options.inbox)).pipe(
+    // Two independently configured values have to agree or every session is reaped on a fixed
+    // cycle and no client can hold a delivery stream — a total outage that only appears under a
+    // particular configuration, so it is refused at construction rather than discovered in
+    // production. The factor of two leaves room for one lost heartbeat.
+    Layer.provide(Layer.effectDiscard(
+      options.heartbeatIntervalMillis * 2 < options.inbox.sessionDeadlineMillis &&
+        options.entityCallTimeoutMillis > 0
+        ? Effect.void
+        : Effect.die(
+          new Error(
+            "RelayServer: heartbeatIntervalMillis * 2 must be less than " +
+              "inbox.sessionDeadlineMillis, and entityCallTimeoutMillis must be positive"
+          )
+        )
+    ))
+  )
