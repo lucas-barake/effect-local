@@ -403,7 +403,7 @@ describe("PeerAuthentication", () => {
             ...PeerRelayLimits.defaults,
             authenticationRatePerSecond: Number.MIN_VALUE,
             authenticationBurst: 1,
-            rateLimitIdleRetentionMillis: 1_000,
+            rateLimitIdleRetention: 1_000,
             maxRetainedRateLimitedConnections: 8
           })
         )

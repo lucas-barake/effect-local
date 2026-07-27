@@ -1,4 +1,5 @@
 import * as Clock from "effect/Clock"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schedule from "effect/Schedule"
@@ -15,14 +16,14 @@ import * as RelayInboxStore from "./RelayInboxStore.js"
  * a cluster singleton — one runner owns it at a time, and ownership moves with the shard rather than
  * being pinned to a particular process.
  *
- * Without it `messageTtlMillis` and `terminalRetentionMillis` are inert: undelivered messages are
+ * Without it `messageTtl` and `terminalRetention` are inert: undelivered messages are
  * never expired, terminal rows are never collected, the table grows without bound, and the retained
  * row count climbs until admission is permanently refused.
  */
 
 export interface Options {
   /** How often the sweep runs. */
-  readonly intervalMillis: number
+  readonly interval: Duration.Input
   /**
    * Rows touched per sweep, per operation.
    *
@@ -36,7 +37,7 @@ export interface Options {
    * Expiry is a terminal transition like settlement, so the identity has to outlive the window in
    * which its sender may still replay it. The store only ever grows this horizon, never shrinks it.
    */
-  readonly terminalRetentionMillis: number
+  readonly terminalRetention: Duration.Input
   /**
    * Whether this deployment runs retention at all.
    *
@@ -48,14 +49,15 @@ export interface Options {
 
 const sweep = (
   store: RelayInboxStore.RelayInboxStore["Service"],
-  options: Options
+  options: Options,
+  terminalRetentionMillis: number
 ) =>
   Effect.gen(function*() {
     const now = yield* Clock.currentTimeMillis
     const expired = yield* store.expire({
       now,
       limit: options.batchLimit,
-      terminalRetentionMillis: options.terminalRetentionMillis
+      terminalRetentionMillis
     })
     const collected = yield* store.collect({ now, limit: options.batchLimit })
     if (expired > 0 || collected > 0) {
@@ -90,8 +92,10 @@ export const layer = (
       Effect.gen(function*() {
         // Resolved once here rather than per sweep, so the loop carries no requirement of its own.
         const store = yield* RelayInboxStore.RelayInboxStore
-        yield* sweep(store, options).pipe(
-          Effect.repeat(Schedule.spaced(options.intervalMillis))
+        // Converted once, alongside the store: the column it feeds is a millisecond timestamp.
+        const terminalRetentionMillis = Duration.toMillis(options.terminalRetention)
+        yield* sweep(store, options, terminalRetentionMillis).pipe(
+          Effect.repeat(Schedule.spaced(options.interval))
         )
       })
     )

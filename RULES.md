@@ -71,6 +71,9 @@ Read this file before any work. Treat these rules as required for every package.
 
 - Optimize public APIs for low setup friction and explicit consumer control.
 - For pipeable public combinators, use `Function.dual` when data first and data last forms materially improve use.
+- Express a configurable duration as `Duration.Input`, never as a bare number named with a unit suffix such as `Millis`. `Duration.Input` lets a consumer write `"30 seconds"`, `Duration.minutes(5)`, or a raw number, and it states the unit in the type instead of in the identifier.
+- Convert a configured duration once, with `Duration.toMillis`, at the point the Layer or service is constructed, and close over the result. Do not convert per call and do not thread `Duration.Input` into arithmetic.
+- A duration that crosses a wire protocol or is persisted stays a plain number with its unit in the name. `Duration` has no stable serialized encoding, so a protocol or column must name its unit.
 - Use `camelCase` for values and functions. Use `PascalCase` for types, services, schemas, and error classes.
 - Add an `Error` suffix when it improves clarity. Preserve established class names and serialized `_tag` values for public or protocol errors.
 - Name Layer values and constructors so their implementation, configuration, or lifecycle is clear.

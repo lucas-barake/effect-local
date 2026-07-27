@@ -3,6 +3,7 @@ import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Clock from "effect/Clock"
 import * as Crypto from "effect/Crypto"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schedule from "effect/Schedule"
@@ -43,14 +44,14 @@ export interface Options {
    * Driven from here rather than by the client, because what has to be proven alive is this node
    * and its socket, not the peer at the other end.
    */
-  readonly heartbeatIntervalMillis: number
+  readonly heartbeatInterval: Duration.Input
   /**
    * How long to wait on an entity call before giving up.
    *
    * Sharding retries `EntityNotAssignedToRunner` and `RunnerUnavailable` indefinitely, so without a
    * bound a request during a rebalance would hang forever and leak a fiber per in-flight call.
    */
-  readonly entityCallTimeoutMillis: number
+  readonly entityCallTimeout: Duration.Input
 }
 
 /** Everything the handshake established, held for the life of one client connection. */
@@ -80,6 +81,13 @@ export const layerHandlers = (options: Options) =>
     const sessions = new Map<Identity.SessionId, Session>()
     const decodeEnvelope = Schema.decodeUnknownEffect(RelayEnvelopeJson)
 
+    // The wire negotiates its windows in milliseconds, so the configured durations are converted
+    // once here rather than on every handshake.
+    const maximumSenderRetryHorizonMillis = Duration.toMillis(limits.maximumSenderRetryHorizon)
+    const maximumReceiptRetentionMillis = Duration.toMillis(limits.maximumReceiptRetention)
+    const messageTtlMillis = Duration.toMillis(limits.messageTtl)
+    const minimumTerminalRetentionMillis = Duration.toMillis(limits.minimumTerminalRetention)
+
     /**
      * Bounds an entity call and reports exhaustion as unavailability.
      *
@@ -89,7 +97,7 @@ export const layerHandlers = (options: Options) =>
     const bounded = <A, E, R,>(effect: Effect.Effect<A, E, R>) =>
       effect.pipe(
         Effect.timeoutOrElse({
-          duration: options.entityCallTimeoutMillis,
+          duration: options.entityCallTimeout,
           orElse: () => Effect.fail(new PeerRpcError.ServerUnavailable())
         })
       )
@@ -227,11 +235,11 @@ export const layerHandlers = (options: Options) =>
             // The negotiated windows have to nest: a receipt must outlive both the message and the
             // window in which its sender may replay it, or a redelivery could be applied twice.
             if (
-              payload.senderRetryHorizonMillis > limits.maximumSenderRetryHorizonMillis ||
-              payload.receiptRetentionMillis > limits.maximumReceiptRetentionMillis ||
+              payload.senderRetryHorizonMillis > maximumSenderRetryHorizonMillis ||
+              payload.receiptRetentionMillis > maximumReceiptRetentionMillis ||
               payload.receiptRetentionMillis <
-                Math.max(limits.messageTtlMillis, payload.senderRetryHorizonMillis) +
-                  limits.minimumTerminalRetentionMillis
+                Math.max(messageTtlMillis, payload.senderRetryHorizonMillis) +
+                  minimumTerminalRetentionMillis
             ) {
               return yield* new PeerRpcError.InvalidRequest()
             }
@@ -344,7 +352,7 @@ export const layerHandlers = (options: Options) =>
             // Bounded per beat rather than per session: a heartbeat that hung would stall the
             // repeat itself, and the session it exists to keep alive would then lapse.
             yield* Effect.ignore(bounded(inboxClient(inboxKeySelf).Heartbeat({ sessionId }))).pipe(
-              Effect.repeat(Schedule.spaced(options.heartbeatIntervalMillis)),
+              Effect.repeat(Schedule.spaced(options.heartbeatInterval)),
               Effect.forkScoped
             )
 
@@ -571,7 +579,7 @@ export const layer = (
      * Retention for every inbox in the deployment.
      *
      * Required rather than optional, and composed here rather than left to the consumer, because
-     * `messageTtlMillis` and `terminalRetentionMillis` are inert without it: a deployment that
+     * `messageTtl` and `terminalRetention` are inert without it: a deployment that
      * forgot to add the singleton separately would expire nothing and collect nothing, and would
      * only find out when the table had grown past the point where admission still succeeded.
      */
@@ -588,13 +596,14 @@ export const layer = (
     // particular configuration, so it is refused at construction rather than discovered in
     // production. The factor of two leaves room for one lost heartbeat.
     Layer.provide(Layer.effectDiscard(
-      options.heartbeatIntervalMillis * 2 < options.inbox.sessionDeadlineMillis &&
-        options.entityCallTimeoutMillis > 0
+      Duration.toMillis(options.heartbeatInterval) * 2 <
+          Duration.toMillis(options.inbox.sessionDeadline) &&
+        Duration.toMillis(options.entityCallTimeout) > 0
         ? Effect.void
         : Effect.die(
           new Error(
-            "RelayServer: heartbeatIntervalMillis * 2 must be less than " +
-              "inbox.sessionDeadlineMillis, and entityCallTimeoutMillis must be positive"
+            "RelayServer: heartbeatInterval * 2 must be less than " +
+              "inbox.sessionDeadline, and entityCallTimeout must be positive"
           )
         )
     ))

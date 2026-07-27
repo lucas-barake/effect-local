@@ -7,6 +7,7 @@ import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
@@ -70,16 +71,16 @@ const recipient = PeerAuthentication.PeerPrincipal.make({
 
 const inboxOptions: RelayInbox.Options = {
   maxDeliveries: 10,
-  messageTtlMillis: 600_000,
-  terminalRetentionMillis: 600_000,
-  sessionDeadlineMillis: 90_000,
-  sessionSweepMillis: 1_000,
+  messageTtl: Duration.minutes(10),
+  terminalRetention: Duration.minutes(10),
+  sessionDeadline: Duration.seconds(90),
+  sessionSweep: Duration.seconds(1),
   maxConcurrentChannels: 4,
-  storeRetryMillis: 0,
+  storeRetry: Duration.zero,
   maxPendingMessages: 100,
   maxPendingBytes: 10_000_000,
   mailboxCapacity: 16,
-  maxIdleTimeMillis: 3_600_000
+  maxIdleTime: Duration.hours(1)
 }
 
 const openRequest = (
@@ -93,8 +94,8 @@ const openRequest = (
     senderReplicaIncarnation: Identity.ReplicaIncarnation.make(1),
     remote: { subjectId: remote.subjectId, peerId: remote.peerId },
     documents: [{ documentType: Task.name, documentId }],
-    receiptRetentionMillis: PeerRelayLimits.defaults.maximumReceiptRetentionMillis,
-    senderRetryHorizonMillis: PeerRelayLimits.defaults.maximumSenderRetryHorizonMillis
+    receiptRetentionMillis: Duration.toMillis(PeerRelayLimits.defaults.maximumReceiptRetention),
+    senderRetryHorizonMillis: Duration.toMillis(PeerRelayLimits.defaults.maximumSenderRetryHorizon)
   })
 
 const RelaySyncEnvelopeJson = Schema.fromJsonString(
@@ -189,8 +190,8 @@ describe("relay wire format", () => {
             Layer.provide(RelayServer.layerHandlers({
               tenantId: "tenant",
               peerId: relayPeerId,
-              heartbeatIntervalMillis: 30_000,
-              entityCallTimeoutMillis: 30_000
+              heartbeatInterval: Duration.seconds(30),
+              entityCallTimeout: Duration.seconds(30)
             })),
             Layer.provide(PeerAuthentication.layerServer),
             Layer.provide(RpcServer.layerProtocolSocketServer),

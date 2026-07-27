@@ -3,6 +3,7 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Clock from "effect/Clock"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import { TestClock } from "effect/testing"
@@ -23,9 +24,9 @@ const documentId = (value: string) => Identity.DocumentId.make(`doc_00000000-000
 const inboxKey = "inbox-a"
 
 const options: RelayInboxMaintenance.Options = {
-  intervalMillis: 1_000,
+  interval: Duration.seconds(1),
   batchLimit: 100,
-  terminalRetentionMillis: 10_000,
+  terminalRetention: Duration.seconds(10),
   enabled: true
 }
 

@@ -1,6 +1,8 @@
 import * as Context from "effect/Context"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import type * as SchemaIssue from "effect/SchemaIssue"
 import * as PeerRpcProtocol from "./internal/peerRpcProtocol.js"
@@ -29,19 +31,51 @@ import * as PeerRpcProtocol from "./internal/peerRpcProtocol.js"
 
 const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0))
 const PositiveNumber = Schema.Number.check(Schema.isFinite(), Schema.isGreaterThan(0))
-const NegotiatedDuration = PositiveInt.check(
-  Schema.isLessThanOrEqualTo(PeerRpcProtocol.maximumNegotiatedDurationMillis)
+
+/** Milliseconds for a finite, positive duration input, or `undefined` if it is neither. */
+const finiteMillis = (input: unknown): number | undefined =>
+  Option.match(Duration.fromInput(input as Duration.Input), {
+    onNone: () => undefined,
+    onSome: (duration) => Duration.isFinite(duration) ? Duration.toMillis(duration) : undefined
+  })
+
+/**
+ * A configured duration.
+ *
+ * `Duration.Input` rather than a number of milliseconds, so the unit lives in the type instead of
+ * in the field name and a deployment can write whichever form reads best: `"7 days"`,
+ * `Duration.hours(1)`, or a plain number.
+ */
+const PositiveDuration = Schema.declare<Duration.Input>(
+  (input): input is Duration.Input => {
+    const millis = finiteMillis(input)
+    return millis !== undefined && millis > 0
+  },
+  { expected: "a finite positive duration" }
+)
+
+/** A duration the wire contract also has to be able to carry, so it is bounded by the protocol. */
+const NegotiatedDuration = Schema.declare<Duration.Input>(
+  (input): input is Duration.Input => {
+    const millis = finiteMillis(input)
+    return millis !== undefined && millis > 0 &&
+      millis <= PeerRpcProtocol.maximumNegotiatedDurationMillis
+  },
+  {
+    expected: "a finite positive duration no longer than " +
+      `${PeerRpcProtocol.maximumNegotiatedDurationMillis}ms`
+  }
 )
 
 export const Values = Schema.Struct({
   /** How long an undelivered message survives in an inbox before it is expired. */
-  messageTtlMillis: NegotiatedDuration,
+  messageTtl: NegotiatedDuration,
   /** The longest replay window a client may negotiate at `Open`. */
-  maximumSenderRetryHorizonMillis: NegotiatedDuration,
+  maximumSenderRetryHorizon: NegotiatedDuration,
   /** The slack a receipt must outlive its message and that message's replay window by. */
-  minimumTerminalRetentionMillis: NegotiatedDuration,
+  minimumTerminalRetention: NegotiatedDuration,
   /** The longest receipt retention a client may negotiate at `Open`. */
-  maximumReceiptRetentionMillis: NegotiatedDuration,
+  maximumReceiptRetention: NegotiatedDuration,
 
   /** Credentials verified concurrently. Beyond this a caller is told to come back. */
   maxInFlightAuthentication: PositiveInt,
@@ -52,7 +86,7 @@ export const Values = Schema.Struct({
   /** Rate-limiter state retained for idle clients, so the table cannot grow without bound. */
   maxRetainedRateLimitedConnections: PositiveInt,
   /** How long a client's rate-limiter state is kept after its last request. */
-  rateLimitIdleRetentionMillis: PositiveInt,
+  rateLimitIdleRetention: PositiveDuration,
 
   /**
    * Live relay sessions one subject may hold.
@@ -64,19 +98,17 @@ export const Values = Schema.Struct({
 })
 export type Values = typeof Values.Type
 
-const day = 24 * 60 * 60 * 1_000
-
 export const defaults: Values = Values.make({
-  messageTtlMillis: 7 * day,
-  maximumSenderRetryHorizonMillis: 7 * day,
-  minimumTerminalRetentionMillis: day,
-  maximumReceiptRetentionMillis: 8 * day,
+  messageTtl: Duration.days(7),
+  maximumSenderRetryHorizon: Duration.days(7),
+  minimumTerminalRetention: Duration.days(1),
+  maximumReceiptRetention: Duration.days(8),
 
   maxInFlightAuthentication: 64,
   authenticationRatePerSecond: 16,
   authenticationBurst: 64,
   maxRetainedRateLimitedConnections: 10_000,
-  rateLimitIdleRetentionMillis: 10 * 60_000,
+  rateLimitIdleRetention: Duration.minutes(10),
 
   maxSessionsPerSubject: 4
 })
@@ -112,10 +144,12 @@ const validate = (values: Values) => {
       // message lets that replay land after the deduplication record is gone, and the recipient
       // applies it a second time. The front door refuses a handshake that would breach this, so the
       // two checks have to agree — this is the one that makes the deployment's own numbers legal.
-      "maximumReceiptRetentionMillis",
-      values.maximumReceiptRetentionMillis >=
-        Math.max(values.messageTtlMillis, values.maximumSenderRetryHorizonMillis) +
-          values.minimumTerminalRetentionMillis
+      "maximumReceiptRetention",
+      Duration.toMillis(values.maximumReceiptRetention) >=
+        Math.max(
+            Duration.toMillis(values.messageTtl),
+            Duration.toMillis(values.maximumSenderRetryHorizon)
+          ) + Duration.toMillis(values.minimumTerminalRetention)
     ],
     [
       // A burst smaller than the concurrency cap would refuse callers the concurrency limit was

@@ -4,6 +4,7 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
@@ -31,16 +32,16 @@ const inboxKey = "inbox-a"
 
 const baseOptions: RelayInbox.Options = {
   maxDeliveries: 10,
-  messageTtlMillis: 600_000,
-  terminalRetentionMillis: 600_000,
-  sessionDeadlineMillis: 90_000,
-  sessionSweepMillis: 1_000,
+  messageTtl: Duration.minutes(10),
+  terminalRetention: Duration.minutes(10),
+  sessionDeadline: Duration.seconds(90),
+  sessionSweep: Duration.seconds(1),
   maxConcurrentChannels: 4,
-  storeRetryMillis: 0,
+  storeRetry: Duration.zero,
   maxPendingMessages: 100,
   maxPendingBytes: 10_000_000,
   mailboxCapacity: 16,
-  maxIdleTimeMillis: 3_600_000
+  maxIdleTime: Duration.hours(1)
 }
 
 /**
@@ -86,6 +87,10 @@ const relay = (
   )
 
 const layer = relay()
+
+// The sweeper's own arithmetic is in milliseconds; the options state durations.
+const sessionDeadlineMillis = Duration.toMillis(baseOptions.sessionDeadline)
+const sessionSweepMillis = Duration.toMillis(baseOptions.sessionSweep)
 
 /**
  * Replaces one store operation with a failure, leaving the rest of the real store intact.
@@ -317,7 +322,7 @@ describe("RelayInbox", () => {
         }).pipe(Effect.catch(() => Effect.void), Effect.exit)
       )
       yield* TestClock.adjust(10)
-      yield* TestClock.adjust(baseOptions.sessionDeadlineMillis + baseOptions.sessionSweepMillis * 3)
+      yield* TestClock.adjust(sessionDeadlineMillis + sessionSweepMillis * 3)
 
       const outcome = yield* Fiber.join(settling)
       assert.strictEqual(
@@ -454,7 +459,7 @@ describe("RelayInbox", () => {
 
       // Nothing heartbeats it, so the entity's own deadline is what bounds it. A cluster cannot
       // rely on disconnects announcing themselves.
-      yield* TestClock.adjust(baseOptions.sessionDeadlineMillis + baseOptions.sessionSweepMillis * 2)
+      yield* TestClock.adjust(sessionDeadlineMillis + sessionSweepMillis * 2)
 
       const collected = yield* Fiber.join(subscriber)
       assert.strictEqual(collected.length, 0, "the released session's stream ends")
@@ -671,7 +676,7 @@ describe("RelayInbox", () => {
         outcome: "Acknowledged",
         messageHash: "000000000001".padStart(64, "a"),
         now: 1_000,
-        terminalRetentionMillis: baseOptions.terminalRetentionMillis
+        terminalRetentionMillis: Duration.toMillis(baseOptions.terminalRetention)
       })
       const promoted = (yield* store.pendingHeads(inboxKey, { limit: 10 }))
         .find((message) => message.relayMessageId === relayId("000000000002"))

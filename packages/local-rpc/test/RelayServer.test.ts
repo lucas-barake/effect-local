@@ -9,6 +9,7 @@ import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Latch from "effect/Latch"
@@ -72,22 +73,22 @@ const outsider = PeerAuthentication.PeerPrincipal.make({
 const serverOptions: RelayServer.Options = {
   tenantId: "tenant",
   peerId: relayPeerId,
-  heartbeatIntervalMillis: 30_000,
-  entityCallTimeoutMillis: 30_000
+  heartbeatInterval: Duration.seconds(30),
+  entityCallTimeout: Duration.seconds(30)
 }
 
 const inboxOptions: RelayInbox.Options = {
   maxDeliveries: 10,
-  messageTtlMillis: 600_000,
-  terminalRetentionMillis: 600_000,
-  sessionDeadlineMillis: 90_000,
-  sessionSweepMillis: 1_000,
+  messageTtl: Duration.minutes(10),
+  terminalRetention: Duration.minutes(10),
+  sessionDeadline: Duration.seconds(90),
+  sessionSweep: Duration.seconds(1),
   maxConcurrentChannels: 4,
-  storeRetryMillis: 0,
+  storeRetry: Duration.zero,
   maxPendingMessages: 100,
   maxPendingBytes: 10_000_000,
   mailboxCapacity: 16,
-  maxIdleTimeMillis: 3_600_000
+  maxIdleTime: Duration.hours(1)
 }
 
 const TestShardingConfig = ShardingConfig.layer({
@@ -112,8 +113,8 @@ const openRequest = (
     senderReplicaIncarnation: Identity.ReplicaIncarnation.make(1),
     remote: { subjectId: remote.subjectId, peerId: remote.peerId },
     documents,
-    receiptRetentionMillis: PeerRelayLimits.defaults.maximumReceiptRetentionMillis,
-    senderRetryHorizonMillis: PeerRelayLimits.defaults.maximumSenderRetryHorizonMillis
+    receiptRetentionMillis: Duration.toMillis(PeerRelayLimits.defaults.maximumReceiptRetention),
+    senderRetryHorizonMillis: Duration.toMillis(PeerRelayLimits.defaults.maximumSenderRetryHorizon)
   })
 
 /**
@@ -254,9 +255,9 @@ const harness = (options?: {
         ...options.composed,
         inbox: inboxOptions,
         maintenance: {
-          intervalMillis: 60_000,
+          interval: Duration.minutes(1),
           batchLimit: 100,
-          terminalRetentionMillis: inboxOptions.terminalRetentionMillis,
+          terminalRetention: inboxOptions.terminalRetention,
           enabled: true
         }
       })
@@ -1120,7 +1121,7 @@ describe("RelayServer", () => {
       // that stops proving it is alive. Nothing on the wire refreshes it — the client does not know
       // the session exists — so the relay drives the heartbeat itself, and without it every session
       // would go dark one deadline after opening no matter how healthy the connection is.
-      yield* TestClock.adjust(inboxOptions.sessionDeadlineMillis * 4)
+      yield* TestClock.adjust(Duration.toMillis(inboxOptions.sessionDeadline) * 4)
 
       yield* push(peer, senderSession.opened.sessionId, yield* encodePayload(peer))
       const delivered = yield* Queue.take(recipientSession.events)
@@ -1140,7 +1141,7 @@ describe("RelayServer", () => {
 
       const pushing = yield* push(peer, senderSession.opened.sessionId, yield* encodePayload(peer))
         .pipe(Effect.flip, Effect.forkScoped)
-      yield* TestClock.adjust(serverOptions.entityCallTimeoutMillis)
+      yield* TestClock.adjust(serverOptions.entityCallTimeout)
 
       const failure = yield* Fiber.join(pushing)
       // Retryable: the write may or may not have landed, and the sender still holds its outbox copy.
@@ -1169,8 +1170,8 @@ describe("RelayServer", () => {
       // only under one particular configuration, so it is refused where it is written down.
       for (
         const broken of [
-          { heartbeatIntervalMillis: inboxOptions.sessionDeadlineMillis },
-          { entityCallTimeoutMillis: 0 }
+          { heartbeatInterval: inboxOptions.sessionDeadline },
+          { entityCallTimeout: 0 }
         ]
       ) {
         const exit = yield* Effect.scoped(composed(broken)).pipe(Effect.exit)

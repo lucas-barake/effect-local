@@ -2,6 +2,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Deferred from "effect/Deferred"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Latch from "effect/Latch"
@@ -147,20 +148,20 @@ export interface Options {
    */
   readonly maxDeliveries: number
   /** How long an undelivered message survives before it is expired. */
-  readonly messageTtlMillis: number
+  readonly messageTtl: Duration.Input
   /**
    * How long a settled message's identity is retained. Must cover the sender's retry horizon, or a
    * replay could outlive the deduplication record and be applied twice.
    */
-  readonly terminalRetentionMillis: number
+  readonly terminalRetention: Duration.Input
   /** How long a session survives without a heartbeat. */
-  readonly sessionDeadlineMillis: number
+  readonly sessionDeadline: Duration.Input
   /** How often the entity checks for a lapsed session deadline. */
-  readonly sessionSweepMillis: number
+  readonly sessionSweep: Duration.Input
   /** Maximum channels delivered concurrently to one session. */
   readonly maxConcurrentChannels: number
   /** Backoff after a store failure, so a failing database cannot spin the dispatcher. */
-  readonly storeRetryMillis: number
+  readonly storeRetry: Duration.Input
   /** Per-inbox admission caps, enforced inside the admission transaction. */
   readonly maxPendingMessages: number
   readonly maxPendingBytes: number
@@ -172,7 +173,7 @@ export interface Options {
    */
   readonly mailboxCapacity: number
   /** How long an idle entity survives before the cluster passivates it. */
-  readonly maxIdleTimeMillis: number
+  readonly maxIdleTime: Duration.Input
 }
 
 /**
@@ -248,6 +249,13 @@ export const layer = (options: Options) =>
       const address = yield* Entity.CurrentAddress
       const inboxKey = address.entityId
       const store = yield* RelayInboxStore.RelayInboxStore
+
+      // Converted once at construction. Everything downstream of these is arithmetic against
+      // `Clock.currentTimeMillis` or a millisecond column, so the durations are resolved here
+      // rather than threaded through as inputs.
+      const messageTtlMillis = Duration.toMillis(options.messageTtl)
+      const terminalRetentionMillis = Duration.toMillis(options.terminalRetention)
+      const sessionDeadlineMillis = Duration.toMillis(options.sessionDeadline)
 
       const sessionRef = yield* Ref.make(Option.none<Session>())
       // Serializes session installation so two concurrent reconnects cannot both install
@@ -360,7 +368,7 @@ export const layer = (options: Options) =>
             outcome,
             messageHash: head.envelope.messageHash,
             now: settledAt,
-            terminalRetentionMillis: options.terminalRetentionMillis
+            terminalRetentionMillis
           })
           if (settled !== "Settled") {
             yield* Effect.logWarning("Relay inbox settlement did not apply").pipe(
@@ -381,7 +389,7 @@ export const layer = (options: Options) =>
                 relayMessageId: head.relayMessageId,
                 reason: error.reason._tag
               }),
-              Effect.andThen(Effect.sleep(options.storeRetryMillis))
+              Effect.andThen(Effect.sleep(options.storeRetry))
             )),
           // Fails any settle still waiting on this delivery so the recipient retries rather than
           // believing an acknowledgement landed.
@@ -437,7 +445,7 @@ export const layer = (options: Options) =>
           Effect.catchTag("ReplicaError", (error) =>
             Effect.logWarning("Relay inbox dispatch failed; retrying").pipe(
               Effect.annotateLogs({ inboxKey, reason: error.reason._tag }),
-              Effect.andThen(Effect.sleep(options.storeRetryMillis)),
+              Effect.andThen(Effect.sleep(options.storeRetry)),
               Effect.andThen(dispatch(session))
             ))
         ) as Effect.Effect<never>
@@ -461,7 +469,7 @@ export const layer = (options: Options) =>
           })
         )
       }).pipe(
-        Effect.repeat(Schedule.spaced(options.sessionSweepMillis)),
+        Effect.repeat(Schedule.spaced(options.sessionSweep)),
         Effect.forkScoped
       )
 
@@ -492,7 +500,7 @@ export const layer = (options: Options) =>
 
       const extendDeadline = (session: Session) =>
         Clock.currentTimeMillis.pipe(
-          Effect.flatMap((now) => Ref.set(session.deadlineAt, now + options.sessionDeadlineMillis))
+          Effect.flatMap((now) => Ref.set(session.deadlineAt, now + sessionDeadlineMillis))
         )
 
       return RelayInbox.of({
@@ -504,7 +512,7 @@ export const layer = (options: Options) =>
               channel: payload.channel,
               envelope: payload.envelope,
               now,
-              messageTtlMillis: options.messageTtlMillis,
+              messageTtlMillis,
               senderRetryHorizonMillis: payload.senderRetryHorizonMillis,
               quota: {
                 maxPendingMessages: options.maxPendingMessages,
@@ -583,7 +591,7 @@ export const layer = (options: Options) =>
                         PeerRpcError.ServerUnavailable | Cause.Done
                       >(0)
                       const now = yield* Clock.currentTimeMillis
-                      const deadlineAt = yield* Ref.make(now + options.sessionDeadlineMillis)
+                      const deadlineAt = yield* Ref.make(now + sessionDeadlineMillis)
                       const session: Session = {
                         sessionId: payload.sessionId,
                         outbound,
@@ -708,6 +716,6 @@ export const layer = (options: Options) =>
       // framework default that could change underneath these invariants.
       concurrency: 1,
       mailboxCapacity: options.mailboxCapacity,
-      maxIdleTime: options.maxIdleTimeMillis
+      maxIdleTime: options.maxIdleTime
     }
   )
