@@ -102,6 +102,27 @@ export class HeartbeatRpc extends Rpc.make("Heartbeat", {
   error: InboxError
 }) {}
 
+/**
+ * Ends a delivery attempt without settling it.
+ *
+ * The front door re-authorizes every message it takes off this entity's stream, and a message it
+ * may not hand over has already left the queue by then: the delivering fiber is waiting for a
+ * settlement that can never arrive, and it holds its channel while it waits. Releasing ends that
+ * attempt, leaves the row `Pending` for a later session, and frees the channel so the rest of the
+ * inbox keeps moving — without this, one withheld message stops every channel sharing the
+ * session's delivery slots, including channels the recipient is fully entitled to.
+ *
+ * Off the public wire contract, like `Heartbeat`: it is the front door's own bookkeeping.
+ */
+export class ReleaseRpc extends Rpc.make("Release", {
+  payload: {
+    sessionId: Identity.SessionId,
+    relayMessageId: Identity.RelayMessageId,
+    claimToken: PeerRpc.ClaimToken
+  },
+  error: InboxError
+}) {}
+
 export class EndSessionRpc extends Rpc.make("EndSession", {
   payload: { sessionId: Identity.SessionId },
   error: InboxError
@@ -111,6 +132,7 @@ export const RelayInbox = Entity.make("EffectLocalRelayInbox", [
   DeliverRpc,
   SubscribeRpc,
   SettleRpc,
+  ReleaseRpc,
   HeartbeatRpc,
   EndSessionRpc
 ])
@@ -153,11 +175,23 @@ export interface Options {
   readonly maxIdleTimeMillis: number
 }
 
+/**
+ * How a delivery attempt ended.
+ *
+ * `Released` is not a terminal state: the front door took the message off the queue and then
+ * decided the recipient may not have it, so the row stays `Pending` for a later session. It has to
+ * be distinguishable from a settlement, because the attempt still has to end — otherwise the
+ * delivering fiber waits forever for a settlement that can never come, holding its channel.
+ */
+type AttemptOutcome = RelayInboxStore.TerminalOutcome | "Released"
+
 interface Settlement {
   readonly claimToken: PeerRpc.ClaimToken
   readonly messageHash: string
-  /** Completed by the recipient's `Settle` call. */
-  readonly requested: Deferred.Deferred<RelayInboxStore.TerminalOutcome>
+  /** The channel this attempt belongs to, so releasing it can free exactly that channel. */
+  readonly channelId: string
+  /** Completed by the recipient's `Settle` or `Release` call. */
+  readonly requested: Deferred.Deferred<AttemptOutcome>
   /**
    * Completed by the delivering fiber once the terminal transition is durable.
    *
@@ -174,6 +208,15 @@ interface Session {
   readonly settlements: Map<Identity.RelayMessageId, Settlement>
   /** Channels with a delivery in flight. One message per channel at a time preserves order. */
   readonly busyChannels: Set<string>
+  /**
+   * Channels whose head this session may not receive.
+   *
+   * Held for the life of the session only. Without it the dispatcher would immediately re-offer the
+   * head the front door just withheld and spin on it; skipping the whole channel rather than the
+   * message keeps per-channel ordering intact, since the head cannot be passed over. A reconnect
+   * starts with an empty set, so a grant that comes back is picked up.
+   */
+  readonly withheldChannels: Set<string>
   /** Opened whenever there may be new work: a fresh admission, or a channel falling idle. */
   readonly wake: Latch.Latch
   readonly scope: Scope.Closeable
@@ -255,7 +298,7 @@ export const layer = (options: Options) =>
       const deliverHead = (session: Session, head: RelayInboxStore.PendingMessage) =>
         Effect.gen(function*() {
           const claimToken = yield* makeClaimToken
-          const requested = yield* Deferred.make<RelayInboxStore.TerminalOutcome>()
+          const requested = yield* Deferred.make<AttemptOutcome>()
           const durable = yield* Deferred.make<void, PeerRpcError.ServerUnavailable>()
           // Registered before the message is offered. The recipient can settle as soon as it reads
           // the message, and it does so on a different fiber, so the settlement must already be
@@ -263,6 +306,7 @@ export const layer = (options: Options) =>
           session.settlements.set(head.relayMessageId, {
             claimToken,
             messageHash: head.envelope.messageHash,
+            channelId: channelId(head.channel),
             requested,
             durable
           })
@@ -298,6 +342,19 @@ export const layer = (options: Options) =>
           }
 
           const outcome = yield* Deferred.await(requested)
+          if (outcome === "Released") {
+            // The front door took the message and then found the recipient may not have it. Nothing
+            // is written: the row stays `Pending` for a later session. Returning here is what frees
+            // the channel, which is the whole point — a released attempt that kept waiting for a
+            // settlement would hold its channel, and enough of them would hold every delivery slot
+            // and starve channels the recipient is perfectly entitled to.
+            yield* Effect.sync(() => session.withheldChannels.add(channelId(head.channel)))
+            yield* Effect.logDebug("Relay inbox delivery released without settling").pipe(
+              Effect.annotateLogs({ inboxKey, relayMessageId: head.relayMessageId })
+            )
+            return
+          }
+
           const settledAt = yield* Clock.currentTimeMillis
           const settled = yield* store.settle(inboxKey, head.relayMessageId, {
             outcome,
@@ -354,12 +411,20 @@ export const layer = (options: Options) =>
             // Closed before polling so an admission that arrives mid poll is not lost: it reopens
             // the latch and the following await returns immediately.
             yield* session.wake.close
+            // Widened by the channels this session has already been told it may not receive.
+            // Heads come back oldest first, so asking only for as many as can be delivered would
+            // return nothing but withheld ones once enough of them accumulate, and the channels
+            // behind them — which the recipient is entitled to — would never even be looked at.
             const heads = yield* store.pendingHeads(inboxKey, {
-              limit: options.maxConcurrentChannels
+              limit: options.maxConcurrentChannels + session.withheldChannels.size
             })
             for (const head of heads) {
               const channel = channelId(head.channel)
               if (session.busyChannels.has(channel)) continue
+              // Skipped for this session only. Re-offering a head the front door just withheld
+              // would spin, and passing over it to reach the next message in the same channel
+              // would break the ordering the channel exists to preserve.
+              if (session.withheldChannels.has(channel)) continue
               if (session.busyChannels.size >= options.maxConcurrentChannels) break
               session.busyChannels.add(channel)
               yield* Effect.forkIn(deliverHead(session, head), session.scope)
@@ -512,6 +577,7 @@ export const layer = (options: Options) =>
                         outbound,
                         settlements: new Map(),
                         busyChannels: new Set(),
+                        withheldChannels: new Set(),
                         wake: yield* Latch.make(true),
                         scope,
                         deadlineAt
@@ -560,6 +626,26 @@ export const layer = (options: Options) =>
                 relay_message_id: payload.relayMessageId,
                 outcome: payload.outcome
               }
+            })
+          ),
+
+        Release: ({ payload }) =>
+          Effect.gen(function*() {
+            const session = yield* currentSession(payload.sessionId)
+            const settlement = session.settlements.get(payload.relayMessageId)
+            if (settlement === undefined || settlement.claimToken !== payload.claimToken) {
+              // Nothing to release: the attempt already ended, or this token belongs to an earlier
+              // one. Either way the channel is not held by it, so there is nothing to undo.
+              return
+            }
+            yield* extendDeadline(session)
+            // Marked here as well as on the delivering fiber, so the channel is skipped from the
+            // moment the release is accepted rather than whenever that fiber next runs.
+            yield* Effect.sync(() => session.withheldChannels.add(settlement.channelId))
+            yield* Deferred.succeed(settlement.requested, "Released")
+          }).pipe(
+            Effect.withSpan("RelayInbox.Release", {
+              attributes: { inbox_key: inboxKey, relay_message_id: payload.relayMessageId }
             })
           ),
 

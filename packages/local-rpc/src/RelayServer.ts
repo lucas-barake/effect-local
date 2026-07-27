@@ -116,6 +116,26 @@ export const layerHandlers = (options: Options) =>
         return Effect.succeed(session)
       })
 
+    /**
+     * Hands a withheld delivery back to the entity.
+     *
+     * Best effort: if it does not land, the channel stays held until the session ends, which is the
+     * behaviour this call exists to avoid but is not itself a reason to fail the recipient's whole
+     * stream over a message it was never going to see.
+     */
+    const release = (
+      inboxKey: string,
+      sessionId: Identity.SessionId,
+      message: PeerRpc.StoredMessage
+    ) =>
+      Effect.ignore(bounded(
+        inboxClient(inboxKey).Release({
+          sessionId,
+          relayMessageId: message.relayMessageId,
+          claimToken: message.claimToken
+        })
+      ))
+
     const settle = (
       payload: {
         readonly sessionId: Identity.SessionId
@@ -370,14 +390,24 @@ export const layerHandlers = (options: Options) =>
                           sessionId,
                           documentId: message.document.documentId
                         }),
+                        // The message has already left the entity's queue, so its delivering fiber
+                        // is waiting for a settlement that can never arrive and is holding its
+                        // channel while it waits. Releasing ends that attempt without settling: the
+                        // row stays durable for a later session, and the channel stops occupying
+                        // one of this session's delivery slots. Without this one withheld message
+                        // stalls its channel for the whole session, and enough of them starve
+                        // channels the recipient is perfectly entitled to receive.
+                        Effect.andThen(release(inboxKeySelf, sessionId, message)),
                         Effect.as(false)
                       )),
-                    Effect.catchTag("ServerUnavailable", () => Effect.succeed(false))
+                    Effect.catchTag("ServerUnavailable", () =>
+                      release(inboxKeySelf, sessionId, message).pipe(Effect.as(false)))
                   )
                 ),
                 // Cluster level failures are not part of the public contract, so each is reported as
                 // the wire error that tells the client what to do about it.
-                Stream.catchTag("MailboxFull", () => Stream.fail(new PeerRpcError.SessionOverloaded())),
+                Stream.catchTag("MailboxFull", () =>
+                  Stream.fail(new PeerRpcError.SessionOverloaded())),
                 Stream.catchTag(
                   "AlreadyProcessingMessage",
                   () => Stream.fail(new PeerRpcError.SessionOverloaded())

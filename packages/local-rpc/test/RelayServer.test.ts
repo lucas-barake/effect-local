@@ -120,7 +120,7 @@ interface Knobs {
    * The separate acknowledgement that relaying a document commits its recipient to an
    * allocation-unbounded decode. It denies by default in production, so it is its own knob.
    */
-  allowRisk: boolean
+  allowRisk: (request: PeerRelayAuthorization.UnsafeUnboundedAutomerge3DecodeRequest) => boolean
   authority: { validUntil: number; invalidated: Effect.Effect<void> }
 }
 
@@ -131,7 +131,7 @@ const harness = (options?: {
   Effect.gen(function*() {
     const knobs: Knobs = {
       allow: options?.knobs?.allow ?? (() => true),
-      allowRisk: options?.knobs?.allowRisk ?? true,
+      allowRisk: options?.knobs?.allowRisk ?? (() => true),
       authority: options?.knobs?.authority ?? {
         validUntil: Number.MAX_SAFE_INTEGER,
         invalidated: Effect.never
@@ -158,13 +158,10 @@ const harness = (options?: {
               invalidated: Effect.never
             })
             : Effect.fail(new PeerRpcError.AccessDenied()),
+        // Deliberately independent of `allow`. Tying the two together would make removing either
+        // port from production invisible, since revoking one knob would revoke both gates at once.
         (request) =>
-          knobs.allowRisk && knobs.allow({
-              direction: request.direction,
-              principal: request.principal,
-              remote: request.remote,
-              documents: request.documents
-            })
+          knobs.allowRisk(request)
             ? Effect.succeed({
               _tag: "UnsafeUnboundedAutomerge3DecodeGrant" as const,
               risk: PeerRelayAuthorization.unsafeUnboundedAutomerge3DecodeRisk,
@@ -276,6 +273,8 @@ const encodePayload = (peer: Harness, options?: {
   readonly hash?: string
   readonly documentId?: Identity.DocumentId
   readonly sequence?: number
+  /** Part of the channel identity, so two epochs from one sender are two ordered streams. */
+  readonly epoch?: string
 }) =>
   Effect.gen(function*() {
     const message = options?.message ?? Uint8Array.of(1, 2, 3)
@@ -284,7 +283,7 @@ const encodePayload = (peer: Harness, options?: {
     ))
     return new TextEncoder().encode(
       yield* Schema.encodeEffect(RelaySyncEnvelopeJson)({
-        connectionEpoch: "epoch",
+        connectionEpoch: options?.epoch ?? "epoch",
         sequence: options?.sequence ?? 0,
         documentId: options?.documentId ?? documentId,
         documentType: Task.name,
@@ -634,12 +633,73 @@ describe("RelayServer", () => {
       assert.strictEqual(failure._tag, "RequestCapacityExceeded")
     })))
 
+  it.effect("keeps delivering other channels when one channel's head is withheld", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const peer = yield* harness()
+      const documents = [
+        { documentType: Task.name, documentId },
+        { documentType: Task.name, documentId: otherDocumentId }
+      ]
+      const senderSession = yield* open(peer, sender, recipient, documents)
+      const recipientSession = yield* open(peer, recipient, sender, documents)
+
+      // Denies only the per-delivery Receive check for one document. Both handshakes ask for both
+      // documents at once and every Send check is untouched, so nothing else is affected.
+      peer.knobs.allow = (request) =>
+        !(
+          request.direction === "Receive" &&
+          request.documents.length === 1 &&
+          request.documents[0]!.documentId === documentId
+        )
+
+      // One withheld channel per concurrent delivery slot, admitted first so they are the older
+      // heads, then one channel the recipient is plainly entitled to. A withheld head that keeps
+      // waiting for a settlement it can never get holds its slot, and enough of them hold every
+      // slot — at which point the authorized channel is never even looked at.
+      // (Within a single channel a withheld head does correctly block what follows it: passing over
+      // it would break the ordering the channel exists to preserve.)
+      for (let index = 0; index < inboxOptions.maxConcurrentChannels; index++) {
+        yield* push(
+          peer,
+          senderSession.opened.sessionId,
+          yield* encodePayload(peer, { epoch: `withheld-${index}` }),
+          `00000000000${index + 1}`
+        )
+        // Heads are ordered by admission time, and under virtual time these would otherwise all
+        // share one timestamp and fall back to an arbitrary tiebreak — which would sometimes float
+        // the authorized channel into the first batch and hide the starvation.
+        yield* TestClock.adjust(10)
+      }
+      yield* push(
+        peer,
+        senderSession.opened.sessionId,
+        yield* encodePayload(peer, { documentId: otherDocumentId, epoch: "clean" }),
+        "000000000009"
+      )
+
+      // Blocks until the authorized message arrives. If the withheld head still held its channel
+      // and its delivery slot, this would wait forever.
+      const delivered = yield* Queue.take(recipientSession.events)
+      assert.strictEqual(delivered._tag, "StoredMessage")
+      if (delivered._tag !== "StoredMessage") return
+      assert.strictEqual(delivered.relayMessageId, relayId("000000000009"))
+
+      const pending = yield* peer.store.pendingHeads(
+        yield* inboxKeyOf(peer, recipient),
+        { limit: 10 }
+      )
+      assert.isTrue(
+        pending.some((message) => message.relayMessageId === relayId("000000000001")),
+        "the withheld message stays durable rather than being settled away"
+      )
+    })))
+
   it.effect("refuses a push when the unbounded decode risk is not acknowledged", () =>
     Effect.scoped(Effect.gen(function*() {
       // Ordinary Send authorization is granted; only the separate risk acknowledgement is withheld.
       // Relaying commits the recipient to an allocation-unbounded decode, so it is gated on its own
       // port that denies by default, and an ordinary grant must not be able to stand in for it.
-      const peer = yield* harness({ knobs: { allowRisk: false } })
+      const peer = yield* harness({ knobs: { allowRisk: () => false } })
       const senderSession = yield* open(peer, sender, recipient)
 
       const payload = yield* encodePayload(peer)
