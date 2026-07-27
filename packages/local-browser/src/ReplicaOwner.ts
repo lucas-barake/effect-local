@@ -77,7 +77,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.ProtocolMismatch({
                 expected: `${ReplicaRpc.protocolVersion}:${definition.hash}`,
-                observed: `${protocolVersion ?? "missing"}:${definitionHash}`
+                observed: `${protocolVersion}:${definitionHash}`
               })
             })
           ),
@@ -248,13 +248,13 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           Effect.fail(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.ProtocolMismatch({
-                expected: "BeginRestoreBackupV4",
+                expected: "BeginRestoreBackup",
                 observed: "RestoreBackup"
               })
             })
           )
         ),
-      BeginRestoreBackupV4: (
+      BeginRestoreBackup: (
         { expectedDefinitionHash, installationId, maxBytes, mode, sessionId },
         { client }
       ) =>
@@ -270,7 +270,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
             })
           )
         ),
-      FinishRestoreBackupV4: ({ nonce, sessionId }, { client }) =>
+      FinishRestoreBackup: ({ nonce, sessionId }, { client }) =>
         restoreTransport.finish({
           sessionId,
           clientId: client.id,

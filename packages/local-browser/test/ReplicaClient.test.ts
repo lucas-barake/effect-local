@@ -100,19 +100,19 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     typeof ReplicaRpc.group,
     RpcClientError.RpcClientError
   >
-  type FinishRestore = TestReplicaRpcClient["FinishRestoreBackupV4"]
+  type FinishRestore = TestReplicaRpcClient["FinishRestoreBackup"]
   const dropTerminalReady = (
     rpc: TestReplicaRpcClient,
     terminalDropped: Deferred.Deferred<void>,
-    finish: FinishRestore = rpc.FinishRestoreBackupV4
+    finish: FinishRestore = rpc.FinishRestoreBackup
   ): TestReplicaRpcClient =>
     new Proxy(rpc, {
       get(target, property, receiver) {
         const value = Reflect.get(target, property, receiver)
-        if (property === "FinishRestoreBackupV4") return finish
-        if (property !== "BeginRestoreBackupV4") return value
-        return (payload: Parameters<typeof target.BeginRestoreBackupV4>[0]) =>
-          target.BeginRestoreBackupV4(payload).pipe(
+        if (property === "FinishRestoreBackup") return finish
+        if (property !== "BeginRestoreBackup") return value
+        return (payload: Parameters<typeof target.BeginRestoreBackup>[0]) =>
+          target.BeginRestoreBackup(payload).pipe(
             Effect.flatMap(({ nonce, port: ownerPort }) =>
               Effect.gen(function*() {
                 const channel = new MessageChannel()
@@ -865,15 +865,6 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         Effect.flatMap(effect, (value) =>
           Deferred.isDeferred<A, E>(value) ? Deferred.await(value) : Effect.succeed(value))
 
-      const legacySessionId = yield* Identity.makeSessionId
-      assert.strictEqual(
-        (yield* Effect.flip(unary(open({
-          sessionId: legacySessionId,
-          definitionHash: definition.hash
-        }, options(owner, "open-legacy"))))).reason._tag,
-        "ProtocolMismatch"
-      )
-
       yield* unary(open({
         sessionId,
         protocolVersion: ReplicaRpc.protocolVersion,
@@ -1058,7 +1049,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         rpc,
         terminalDropped,
         ((payload) =>
-          rpc.FinishRestoreBackupV4(payload).pipe(
+          rpc.FinishRestoreBackup(payload).pipe(
             Effect.tap(() => Deferred.succeed(finishDelivered, undefined))
           )) as FinishRestore
       )
@@ -1195,7 +1186,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           rpc,
           terminalDropped,
           (payload) =>
-            rpc.FinishRestoreBackupV4(payload).pipe(
+            rpc.FinishRestoreBackup(payload).pipe(
               Effect.forkIn(finishScope, { startImmediately: true }),
               Effect.andThen(Effect.fail(disconnected()))
             )
@@ -1436,7 +1427,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         const observedRpc = new Proxy(rpc, {
           get(target, property, receiver) {
             const value = Reflect.get(target, property, receiver)
-            if (property !== "RestoreBackup" && property !== "BeginRestoreBackupV4") return value
+            if (property !== "RestoreBackup" && property !== "BeginRestoreBackup") return value
             return (payload: never) =>
               Deferred.succeed(outerDispatched, undefined).pipe(
                 Effect.andThen(value(payload))
@@ -1535,9 +1526,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
               return (payload: { readonly sessionId: Identity.SessionId }) =>
                 Deferred.succeed(opened, payload.sessionId).pipe(Effect.andThen(value(payload)))
             }
-            if (property === "BeginRestoreBackupV4") {
-              return (payload: Parameters<typeof target.BeginRestoreBackupV4>[0]) =>
-                target.BeginRestoreBackupV4(payload).pipe(
+            if (property === "BeginRestoreBackup") {
+              return (payload: Parameters<typeof target.BeginRestoreBackup>[0]) =>
+                target.BeginRestoreBackup(payload).pipe(
                   Effect.tap(({ port }) =>
                     Effect.sync(() => {
                       port.addEventListener("message", (event: MessageEvent<unknown>) => {
@@ -1779,7 +1770,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 : value(payload)
             }
           }
-          if (property === "BeginRestoreBackupV4") {
+          if (property === "BeginRestoreBackup") {
             return (payload: never) => {
               restoreCalls++
               return restoreCalls === 1
@@ -1832,7 +1823,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 )
             }
           }
-          if (property === "BeginRestoreBackupV4") {
+          if (property === "BeginRestoreBackup") {
             return () => {
               beginCalls++
               return Effect.fail(protocolMismatch("restore"))
@@ -1906,7 +1897,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 : value(payload)
             }
           }
-          if (property === "BeginRestoreBackupV4") {
+          if (property === "BeginRestoreBackup") {
             return (payload: never) => {
               restoreCalls++
               return Effect.fail(protocolMismatch("restore"))
@@ -1960,7 +1951,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 : value(payload)
             }
           }
-          if (property === "BeginRestoreBackupV4") {
+          if (property === "BeginRestoreBackup") {
             return (payload: never) => {
               restoreCalls++
               return Effect.fail(protocolMismatch("restore"))
@@ -2015,7 +2006,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
               return value(payload)
             }
           }
-          if (property === "BeginRestoreBackupV4") {
+          if (property === "BeginRestoreBackup") {
             return (payload: never) => {
               restoreCalls++
               return Deferred.succeed(restoreApplied, undefined).pipe(
@@ -2150,12 +2141,12 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 )
             }
             if (property === "RenewSession") return () => Effect.never
-            if (property === "BeginRestoreBackupV4") {
-              return (payload: Parameters<typeof target.BeginRestoreBackupV4>[0]) =>
+            if (property === "BeginRestoreBackup") {
+              return (payload: Parameters<typeof target.BeginRestoreBackup>[0]) =>
                 Effect.sync(() => {
                   beginCalls += 1
                 }).pipe(
-                  Effect.andThen(target.BeginRestoreBackupV4(payload)),
+                  Effect.andThen(target.BeginRestoreBackup(payload)),
                   Effect.map(({ nonce, port }) => {
                     const add = port.addEventListener.bind(port)
                     const remove = port.removeEventListener.bind(port)

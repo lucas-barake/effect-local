@@ -44,8 +44,8 @@ const rpcClient = (
       }),
     RenewSession: () => Effect.succeed({ leaseMillis: 10_000 }),
     CloseSession: () => Effect.void,
-    BeginRestoreBackupV4: begin,
-    FinishRestoreBackupV4: finish
+    BeginRestoreBackup: begin,
+    FinishRestoreBackup: finish
   }) as unknown as RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>
 
 it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
@@ -1599,7 +1599,7 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
               maxRestoreErrorBytes: 4_096
             }),
           CloseSession: () => Effect.sync(() => closeCalls++),
-          BeginRestoreBackupV4: () =>
+          BeginRestoreBackup: () =>
             Effect.sync(() => {
               beginCalls++
               return { nonce, port: new MessageChannel().port1 }
@@ -1665,23 +1665,27 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       }
     }))
 
-  it.effect("rejects a version 3 handshake before opening the source transport", () =>
+  // Expressed as "not ours" rather than as a specific older number. There is only one protocol
+  // version, so naming a predecessor would invent a history that cannot exist; what this pins is
+  // that an owner from a different build is refused before any transport is opened.
+  it.effect("rejects a handshake from an owner speaking another protocol version", () =>
     Effect.scoped(Effect.gen(function*() {
-      const oldRpc = {
+      const otherVersion = ReplicaRpc.protocolVersion + 1
+      const otherRpc = {
         OpenSession: () =>
           Effect.succeed({
             leaseMillis: 10_000,
-            protocolVersion: 3,
+            protocolVersion: otherVersion,
             definitionHash: definition.hash,
             ownerEpoch: "owner"
           }),
         CloseSession: () => Effect.void
       } as unknown as RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>
-      const error = yield* ReplicaClient.fromRpcClient(definition, oldRpc).pipe(Effect.flip)
+      const error = yield* ReplicaClient.fromRpcClient(definition, otherRpc).pipe(Effect.flip)
       assert.strictEqual(error.reason._tag, "ProtocolMismatch")
       if (error.reason._tag === "ProtocolMismatch") {
-        assert.strictEqual(error.reason.expected, "protocol version 4")
-        assert.strictEqual(error.reason.observed, "protocol version 3")
+        assert.strictEqual(error.reason.expected, `protocol version ${ReplicaRpc.protocolVersion}`)
+        assert.strictEqual(error.reason.observed, `protocol version ${otherVersion}`)
       }
     })))
 })

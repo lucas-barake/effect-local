@@ -392,7 +392,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
           if (property === "OpenSession") {
             return (payload: never) => Effect.sync(() => ++opens).pipe(Effect.andThen(value(payload)))
           }
-          if (property === "BeginRestoreBackupV4") {
+          if (property === "BeginRestoreBackup") {
             return () => {
               restores++
               return Effect.never

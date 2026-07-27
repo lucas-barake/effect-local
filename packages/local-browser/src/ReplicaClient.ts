@@ -1334,7 +1334,7 @@ export const fromRpcClient = (
           const operation = withSession(
             "RestoreBackup",
             (session) =>
-              rpc.BeginRestoreBackupV4({
+              rpc.BeginRestoreBackup({
                 sessionId: session.sessionId,
                 mode: options.mode,
                 maxBytes,
@@ -1378,7 +1378,7 @@ export const fromRpcClient = (
                     }),
                     ({ close, nonce, port }) =>
                       Effect.gen(function*() {
-                        const result = rpc.FinishRestoreBackupV4({
+                        const result = rpc.FinishRestoreBackup({
                           sessionId: session.sessionId,
                           nonce
                         }).pipe(
