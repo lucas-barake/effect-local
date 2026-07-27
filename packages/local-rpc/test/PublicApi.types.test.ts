@@ -7,18 +7,31 @@ describe("public API", () => {
     for (
       const name of [
         "PeerRelayAuthorization",
-        "PeerRelayIngress",
         "PeerRelayLimits",
         "PeerRpc",
-        "PeerRelayStore",
-        "PeerRpcServer",
-        "SqlPeerRelayStore"
+        "RelayInbox",
+        "RelayInboxMaintenance",
+        "RelayInboxStore",
+        "RelayServer",
+        "SqlRelayInboxStore"
       ]
     ) {
       assert.property(PublicApi, name)
     }
 
-    for (const name of ["PeerRelayRpc", "PeerAuthorization", "PeerRpcLimits"]) {
+    // The single-process relay is gone, replaced by the cluster entity above. Asserting their
+    // absence keeps a stray re-export from quietly restoring an API with the old custody semantics.
+    for (
+      const name of [
+        "PeerRelayRpc",
+        "PeerAuthorization",
+        "PeerRpcLimits",
+        "PeerRelayIngress",
+        "PeerRelayStore",
+        "PeerRpcServer",
+        "SqlPeerRelayStore"
+      ]
+    ) {
       assert.notProperty(PublicApi, name)
     }
 

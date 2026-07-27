@@ -1,397 +1,104 @@
-import { NodeCrypto } from "@effect/platform-node"
+import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
+import { MysqlClient } from "@effect/sql-mysql2"
+import { PgClient } from "@effect/sql-pg"
 import { SqliteClient } from "@effect/sql-sqlite-node"
-import { assert, describe, it } from "@effect/vitest"
-import * as Identity from "@lucas-barake/effect-local/Identity"
+import { describe, it } from "@effect/vitest"
+import { MySqlContainer, type StartedMySqlContainer } from "@testcontainers/mysql"
+import { PostgreSqlContainer } from "@testcontainers/postgresql"
+import * as Context from "effect/Context"
+import * as Data from "effect/Data"
 import * as Effect from "effect/Effect"
+import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
-import * as RelayInboxStore from "../src/RelayInboxStore.js"
+import * as Redacted from "effect/Redacted"
+import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlRelayInboxStore from "../src/SqlRelayInboxStore.js"
+import { relayInboxStoreContract } from "./RelayInboxStoreContract.js"
 
-const peer = (value: string) => Identity.PeerId.make(`peer_00000000-0000-4000-8000-${value}`)
-const relayId = (value: string) => Identity.RelayMessageId.make(`rly_00000000-0000-4000-8000-${value}`)
-const documentId = (value: string) => Identity.DocumentId.make(`doc_00000000-0000-4000-8000-${value}`)
+/**
+ * The store contract against every dialect the relay claims to support.
+ *
+ * Multi-dialect parity is a decision, not an accident: the previous relay store supported all three
+ * and dropping one here would be a silent regression. It is also the only way this suite can see a
+ * whole class of defect — the PostgreSQL driver hands back `BIGINT`, `COUNT` and `SUM` as strings,
+ * and MySQL compares identity columns case-insensitively without a binary collation. Both were real
+ * bugs in this store, and both are invisible to SQLite.
+ */
 
-const layer = SqlRelayInboxStore.layer.pipe(
-  Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
-  Layer.provide(NodeCrypto.layer),
-  Layer.orDie
-)
+class ContainerError extends Data.TaggedError("ContainerError")<{
+  readonly cause: unknown
+}> {}
 
-const quota = { maxPendingMessages: 100, maxPendingBytes: 10_000_000 }
-
-const channel = (
-  options?: { readonly epoch?: string | undefined; readonly subject?: string | undefined }
-) => ({
-  tenantId: "tenant-a",
-  senderSubjectId: options?.subject ?? "sender-a",
-  senderPeerId: peer("00000000aaa1"),
-  senderReplicaIncarnation: Identity.ReplicaIncarnation.make(1),
-  senderConnectionEpoch: options?.epoch ?? "epoch-1"
-})
-
-const envelope = (options: {
-  readonly id: string
-  readonly sequence: number
-  readonly digest?: string
-  readonly epoch?: string
-  readonly subject?: string
-}) => {
-  const source = channel({ epoch: options.epoch, subject: options.subject })
-  return {
-    relayMessageId: relayId(options.id),
-    relayPeerId: peer("00000000ffff"),
-    sender: {
-      tenantId: source.tenantId,
-      subjectId: source.senderSubjectId,
-      peerId: source.senderPeerId,
-      replicaIncarnation: source.senderReplicaIncarnation,
-      connectionEpoch: source.senderConnectionEpoch,
-      sequence: options.sequence
-    },
-    recipient: {
-      tenantId: "tenant-a",
-      subjectId: "recipient-a",
-      peerId: peer("00000000bbb1")
-    },
-    payloadVersion: 1 as const,
-    document: { documentId: documentId("00000000dddd"), documentType: "note" },
-    writerProvenance: [],
-    messageHash: "a".repeat(64),
-    outerEnvelopeDigest: (options.digest ?? "b").repeat(64).slice(0, 64),
-    payload: new Uint8Array([1, 2, 3])
+class PgContainer extends Context.Service<PgContainer>()(
+  "@lucas-barake/effect-local-rpc/test/PgContainer",
+  {
+    make: Effect.acquireRelease(
+      Effect.tryPromise({
+        try: () => new PostgreSqlContainer("postgres:alpine").start(),
+        catch: (cause) => new ContainerError({ cause })
+      }),
+      (container) => Effect.promise(() => container.stop())
+    )
   }
+) {
+  static readonly layerClient = Layer.unwrap(
+    Effect.gen(function*() {
+      const container = yield* PgContainer
+      return PgClient.layer({ url: Redacted.make(container.getConnectionUri()) })
+    })
+  ).pipe(Layer.provide(Layer.effect(this)(this.make)))
 }
 
-const admission = (options: {
-  readonly inboxKey: string
-  readonly id: string
-  readonly sequence: number
-  readonly now: number
-  readonly ttl?: number
-  readonly horizon?: number
-  readonly digest?: string
-  readonly epoch?: string
-  readonly subject?: string
-  readonly quota?: RelayInboxStore.AdmissionQuota
-}) => ({
-  inboxKey: options.inboxKey,
-  channel: channel({ epoch: options.epoch, subject: options.subject }),
-  envelope: envelope(options),
-  now: options.now,
-  messageTtlMillis: options.ttl ?? 1_000,
-  senderRetryHorizonMillis: options.horizon ?? 1_000,
-  quota: options.quota ?? quota
-})
+class MysqlContainer extends Context.Service<MysqlContainer, StartedMySqlContainer>()(
+  "@lucas-barake/effect-local-rpc/test/MysqlContainer"
+) {
+  static readonly layer = Layer.effect(this)(
+    Effect.acquireRelease(
+      Effect.tryPromise({
+        try: () => new MySqlContainer("mysql:lts").start(),
+        catch: (cause) => new ContainerError({ cause })
+      }),
+      (container) => Effect.promise(() => container.stop())
+    )
+  )
+
+  static readonly layerClient = Layer.unwrap(
+    Effect.gen(function*() {
+      const container = yield* MysqlContainer
+      return MysqlClient.layer({ url: Redacted.make(container.getConnectionUri()) })
+    })
+  ).pipe(Layer.provide(this.layer))
+}
+
+// A file rather than `:memory:`, so the store is exercised against a real page cache and a real
+// journal instead of the in-process shortcut.
+const SqliteLayer = Effect.gen(function*() {
+  const fs = yield* FileSystem.FileSystem
+  const directory = yield* fs.makeTempDirectoryScoped()
+  return SqliteClient.layer({ filename: `${directory}/relay-inbox.sqlite` })
+}).pipe(Layer.unwrap, Layer.provide(NodeFileSystem.layer))
+
+const storeFor = (client: Layer.Layer<SqlClient.SqlClient, unknown, never>) =>
+  SqlRelayInboxStore.layer.pipe(
+    Layer.provide(client),
+    Layer.provide(NodeCrypto.layer),
+    Layer.orDie
+  )
 
 describe("RelayInboxStore", () => {
-  it.effect("admits a message and reports it as the pending head", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      const result = yield* store.admit(admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0 }))
-      assert.strictEqual(result._tag, "Admitted")
-
-      const heads = yield* store.pendingHeads("a", { limit: 10 })
-      assert.strictEqual(heads.length, 1)
-      assert.strictEqual(heads[0]!.relayMessageId, relayId("000000000001"))
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("reports a replay of the same identity and digest as a duplicate", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      yield* store.admit(admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0 }))
-      const replay = yield* store.admit(admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 1 }))
-
-      assert.strictEqual(replay._tag, "Duplicate")
-      assert.strictEqual(replay._tag === "Duplicate" ? replay.state : "", "Pending")
-      const heads = yield* store.pendingHeads("a", { limit: 10 })
-      assert.strictEqual(heads.length, 1, "a replay must not create a second row")
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("rejects the same identity carrying a different envelope digest", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      yield* store.admit(admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0 }))
-      const conflict = yield* store.admit(
-        admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 1, digest: "c" })
-      )
-      assert.strictEqual(conflict._tag, "Conflict")
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("refuses a message whose channel disagrees with its envelope", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      const request = admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0 })
-      const forged = {
-        ...request,
-        channel: { ...request.channel, senderConnectionEpoch: "another-epoch" }
+  for (
+    const dialect of [
+      { name: "sqlite", client: SqliteLayer, timeout: 60_000 },
+      { name: "postgres", client: PgContainer.layerClient, timeout: 180_000 },
+      { name: "mysql", client: MysqlContainer.layerClient, timeout: 240_000 }
+    ]
+  ) {
+    it.layer(storeFor(dialect.client), {
+      timeout: dialect.timeout
+    })(dialect.name, (it) => {
+      for (const check of relayInboxStoreContract) {
+        it.effect(check.name, () => check.run)
       }
-      const result = yield* store.admit(forged)
-      assert.strictEqual(
-        result._tag,
-        "Conflict",
-        "a fabricated channel would file the message under an ordering stream it does not belong to"
-      )
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("expiring one inbox leaves another inbox's copy of the same identity untouched", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      // The same relay message id addressed to two devices. The key is (inbox, id), so a sweep
-      // that filters on the id alone would reach across inboxes.
-      yield* store.admit(admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0, ttl: 1_000 }))
-      yield* store.admit(
-        admission({ inboxKey: "b", id: "000000000001", sequence: 0, now: 100_000, ttl: 1_000_000 })
-      )
-
-      const expired = yield* store.expire({ now: 5_000, limit: 10, terminalRetentionMillis: 1_000 })
-      assert.strictEqual(expired, 1)
-
-      const stale = yield* store.pendingHeads("a", { limit: 10 })
-      assert.strictEqual(stale.length, 0, "the overdue message is expired")
-      const live = yield* store.pendingHeads("b", { limit: 10 })
-      assert.strictEqual(live.length, 1, "the other inbox still holds a message with time left")
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("delivers one head per channel and does not starve a channel with high sequences", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      // `senderSequence` restarts per connection epoch, so it cannot order heads across channels.
-      yield* store.admit(
-        admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0, subject: "sender-a" })
-      )
-      yield* store.admit(
-        admission({ inboxKey: "a", id: "000000000002", sequence: 1, now: 1, subject: "sender-b" })
-      )
-      yield* store.admit(
-        admission({ inboxKey: "a", id: "000000000003", sequence: 500, now: 2, subject: "sender-c" })
-      )
-
-      const heads = yield* store.pendingHeads("a", { limit: 2 })
-      assert.strictEqual(heads.length, 2)
-
-      // Oldest waiting head first, so every channel is reachable regardless of its own numbering.
-      const all = yield* store.pendingHeads("a", { limit: 10 })
-      assert.deepStrictEqual(
-        all.map((head) => head.channel.senderSubjectId).toSorted(),
-        ["sender-a", "sender-b", "sender-c"]
-      )
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("orders within a channel by sender sequence", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      yield* store.admit(admission({ inboxKey: "a", id: "000000000002", sequence: 5, now: 0 }))
-      yield* store.admit(admission({ inboxKey: "a", id: "000000000001", sequence: 1, now: 1 }))
-
-      const heads = yield* store.pendingHeads("a", { limit: 10 })
-      assert.strictEqual(heads.length, 1, "one head per channel")
-      assert.strictEqual(heads[0]!.relayMessageId, relayId("000000000001"))
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("spends the full delivery budget before dead lettering", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      yield* store.admit(admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0 }))
-
-      const first = yield* store.recordDelivery("a", relayId("000000000001"), {
-        maxDeliveries: 1,
-        now: 1
-      })
-      assert.strictEqual(
-        first._tag,
-        "Recorded",
-        "the first delivery of a budget of one must be allowed to be settled"
-      )
-
-      const second = yield* store.recordDelivery("a", relayId("000000000001"), {
-        maxDeliveries: 1,
-        now: 2
-      })
-      assert.strictEqual(second._tag, "DeadLettered")
-
-      const heads = yield* store.pendingHeads("a", { limit: 10 })
-      assert.strictEqual(heads.length, 0, "a dead lettered message stops blocking its channel")
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("makes an abandoned message answerable after the fact", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      yield* store.admit(admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0 }))
-      yield* store.recordDelivery("a", relayId("000000000001"), { maxDeliveries: 1, now: 1 })
-      yield* store.recordDelivery("a", relayId("000000000001"), { maxDeliveries: 1, now: 2 })
-
-      const abandoned = yield* store.abandoned("a", { limit: 10 })
-      assert.strictEqual(abandoned.length, 1)
-      assert.strictEqual(abandoned[0]!.state, "DeadLettered")
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("settles on acknowledgement and does not redeliver", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      yield* store.admit(admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0 }))
-
-      const settled = yield* store.settle("a", relayId("000000000001"), {
-        outcome: "Acknowledged",
-        messageHash: "a".repeat(64),
-        now: 10,
-        terminalRetentionMillis: 1_000
-      })
-      assert.strictEqual(settled, "Settled")
-
-      const heads = yield* store.pendingHeads("a", { limit: 10 })
-      assert.strictEqual(heads.length, 0)
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("refuses a settlement whose content does not match", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      yield* store.admit(admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0 }))
-
-      const settled = yield* store.settle("a", relayId("000000000001"), {
-        outcome: "Acknowledged",
-        messageHash: "f".repeat(64),
-        now: 10,
-        terminalRetentionMillis: 1_000
-      })
-      assert.strictEqual(settled, "HashMismatch")
-
-      const heads = yield* store.pendingHeads("a", { limit: 10 })
-      assert.strictEqual(heads.length, 1, "the message stays deliverable")
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("reports a settlement that no longer applies", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      yield* store.admit(admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0 }))
-      const options = {
-        outcome: "Acknowledged" as const,
-        messageHash: "a".repeat(64),
-        now: 10,
-        terminalRetentionMillis: 1_000
-      }
-      yield* store.settle("a", relayId("000000000001"), options)
-      const again = yield* store.settle("a", relayId("000000000001"), options)
-      assert.strictEqual(again, "NotPending")
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("still deduplicates a replay that arrives after settlement", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      yield* store.admit(
-        admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0, horizon: 100_000 })
-      )
-      yield* store.settle("a", relayId("000000000001"), {
-        outcome: "Acknowledged",
-        messageHash: "a".repeat(64),
-        now: 10,
-        terminalRetentionMillis: 1_000
-      })
-
-      const replay = yield* store.admit(
-        admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 20, horizon: 100_000 })
-      )
-      assert.strictEqual(replay._tag, "Duplicate")
-      const heads = yield* store.pendingHeads("a", { limit: 10 })
-      assert.strictEqual(heads.length, 0, "an acknowledged message must not become deliverable again")
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("revives a message the inbox had given up on rather than telling the sender it landed", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      yield* store.admit(admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0, ttl: 1_000 }))
-      yield* store.expire({ now: 5_000, limit: 10, terminalRetentionMillis: 1_000 })
-
-      // The sender still holds custody and is replaying. Reporting a duplicate would make it drop
-      // the last copy of a message this inbox can no longer deliver.
-      const replay = yield* store.admit(
-        admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 6_000, ttl: 1_000 })
-      )
-      assert.strictEqual(replay._tag, "Admitted")
-
-      const heads = yield* store.pendingHeads("a", { limit: 10 })
-      assert.strictEqual(heads.length, 1, "the revived message is deliverable again")
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("charges a revived message against the inbox quota", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      yield* store.admit(admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0, ttl: 1_000 }))
-      yield* store.expire({ now: 5_000, limit: 10, terminalRetentionMillis: 1_000 })
-
-      const revived = yield* store.admit(admission({
-        inboxKey: "a",
-        id: "000000000001",
-        sequence: 0,
-        now: 6_000,
-        ttl: 1_000,
-        quota: { maxPendingMessages: 0, maxPendingBytes: 0 }
-      }))
-      assert.strictEqual(
-        revived._tag,
-        "QuotaExceeded",
-        "reviving creates pending work, so it cannot bypass the cap a first admission obeys"
-      )
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("keeps a revived message deduplicated for the sender's replay window", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      yield* store.admit(
-        admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0, ttl: 1_000, horizon: 1_000 })
-      )
-      yield* store.expire({ now: 2_000, limit: 10, terminalRetentionMillis: 1_000 })
-      yield* store.admit(
-        admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 2_000, ttl: 1_000, horizon: 10_000 })
-      )
-      yield* store.expire({ now: 3_100, limit: 10, terminalRetentionMillis: 1_000 })
-
-      // The horizon was extended by the revive, so collection at this point must not remove it.
-      const collected = yield* store.collect({ now: 3_200, limit: 10 })
-      assert.strictEqual(
-        collected,
-        0,
-        "collecting inside the sender's retry window would let a replay be applied twice"
-      )
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("removes terminal rows only once their deduplication horizon lapses", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      yield* store.admit(
-        admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0, horizon: 1_000 })
-      )
-      yield* store.settle("a", relayId("000000000001"), {
-        outcome: "Acknowledged",
-        messageHash: "a".repeat(64),
-        now: 10,
-        terminalRetentionMillis: 100
-      })
-
-      assert.strictEqual(yield* store.collect({ now: 500, limit: 10 }), 0)
-      assert.strictEqual(yield* store.collect({ now: 5_000, limit: 10 }), 1)
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("refuses admission beyond the inbox quota", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      yield* store.admit(admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0 }))
-      const refused = yield* store.admit(admission({
-        inboxKey: "a",
-        id: "000000000002",
-        sequence: 1,
-        now: 1,
-        quota: { maxPendingMessages: 1, maxPendingBytes: 10_000_000 }
-      }))
-      assert.strictEqual(refused._tag, "QuotaExceeded")
-    }).pipe(Effect.provide(layer)))
-
-  it.effect("counts a replay once against usage", () =>
-    Effect.gen(function*() {
-      const store = yield* RelayInboxStore.RelayInboxStore
-      yield* store.admit(admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 0 }))
-      yield* store.admit(admission({ inboxKey: "a", id: "000000000001", sequence: 0, now: 1 }))
-
-      const usage = yield* store.usage("a")
-      assert.strictEqual(usage.pendingCount, 1, "quota is derived from rows, so replays cannot inflate it")
-    }).pipe(Effect.provide(layer)))
+    })
+  }
 })
