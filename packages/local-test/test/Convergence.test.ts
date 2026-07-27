@@ -299,6 +299,10 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
           [...leftLabels.map((label) => `left:${label}`), ...rightLabels.map((label) => `right:${label}`)]
         )
       })),
-    { fastCheck: { numRuns: 8 } }
+    // Its own timeout rather than the 5s default. Every other check here is a single scenario,
+    // while this one seeds a replica pair, applies concurrent mutations and drains a partition
+    // eight times over, so it is the one check in the suite whose wall clock tracks how loaded the
+    // machine is rather than how much work the property describes.
+    { timeout: 60_000, fastCheck: { numRuns: 8 } }
   )
 })
