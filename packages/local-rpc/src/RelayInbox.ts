@@ -297,7 +297,23 @@ export const layer = (options: Options) =>
           session.settlements.clear()
           yield* Scope.close(session.scope, Exit.void)
           yield* Queue.end(session.outbound)
-        })
+        }).pipe(
+          // Atomic once it starts. The first step takes the session out of `sessionRef`, which is
+          // the only handle anything holds on it — the session scope is detached and its fibers are
+          // forked as daemons into it — so an interrupt landing before `Scope.close` and
+          // `Queue.end` finish orphans the dispatcher, the delivery fibers, the scope and the queue
+          // with nothing left able to close them. `Scope.close` marks the scope closed *before*
+          // running its finalizers and runs them sequentially, so the ones it had not reached are
+          // gone for good: the dispatcher keeps draining this inbox and the recipient's stream
+          // never ends, which is the one thing that would have told it to reconnect.
+          //
+          // Stated here rather than at each call site because every caller can be interrupted while
+          // it runs: `Subscribe` deliberately restores interruption around it, the rpc lane is
+          // interrupted by a client interrupt or by entity shutdown, and the sweeper is interrupted
+          // when the entity scope closes. The wait this costs is already bounded by the same fiber
+          // interruption `Scope.close` performs.
+          Effect.uninterruptible
+        )
 
       const closeCurrentSession = Ref.get(sessionRef).pipe(
         Effect.flatMap(Option.match({ onNone: () => Effect.void, onSome: closeSession }))

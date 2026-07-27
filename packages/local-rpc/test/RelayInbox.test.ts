@@ -10,6 +10,7 @@ import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
 import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
 import * as MessageStorage from "effect/unstable/cluster/MessageStorage"
@@ -394,6 +395,61 @@ describe("RelayInbox", () => {
         "nothing is stranded by the replacement and nothing is delivered twice"
       )
     }).pipe(Effect.provide(layer)))
+
+  it.effect("closes a replaced session even when the replacing subscribe is interrupted", () =>
+    Effect.gen(function*() {
+      const client = yield* inbox
+      yield* client.Deliver(deliver({ id: "000000000001", sequence: 0 }))
+
+      const incumbent = sessionId("00000000000a")
+      const delivered = yield* Queue.unbounded<PeerRpc.StoredMessage>()
+      const stream = yield* Effect.forkChild(
+        Stream.runForEach(
+          client.Subscribe({ sessionId: incumbent }),
+          (message) => Queue.offer(delivered, message)
+        )
+      )
+      const head = yield* Queue.take(delivered)
+
+      // Parks the incumbent's delivering fiber inside a durable write that interruption cannot cut
+      // short. This is faithful rather than convenient: `sql.withTransaction` runs connection
+      // acquisition, BEGIN and COMMIT inside an uninterruptible mask, so a real delivering fiber
+      // genuinely sits in a region that `Scope.close` has to wait out.
+      yield* Effect.forkChild(
+        client.Settle({
+          sessionId: incumbent,
+          relayMessageId: head.relayMessageId,
+          claimToken: head.claimToken,
+          messageHash: head.messageHash,
+          outcome: "Acknowledged"
+        }).pipe(Effect.exit)
+      )
+      yield* TestClock.adjust(1)
+
+      // The replacement takes the incumbent out of `sessionRef` — the only handle anything holds on
+      // it — and then blocks closing its scope. A front door that loses its socket at that instant
+      // interrupts this call, and everything the close had not reached yet is orphaned: the
+      // dispatcher keeps draining this inbox and the outbound queue is never ended, so the
+      // recipient's stream never terminates and it is never told to reconnect.
+      const replacement = yield* Effect.forkChild(
+        Stream.runDrain(client.Subscribe({ sessionId: sessionId("00000000000b") }))
+      )
+      yield* TestClock.adjust(1)
+      yield* Fiber.interrupt(replacement)
+      yield* TestClock.adjust(Duration.toMillis(Duration.hours(4)))
+
+      assert.isTrue(
+        stream.pollUnsafe() !== undefined,
+        "a replaced session's stream must end; a half closed session leaves nothing able to close it"
+      )
+    }).pipe(Effect.provide(relay({
+      store: storeFailing((real) => ({
+        settle: (key, relayMessageId, options) =>
+          Effect.uninterruptible(Effect.sleep(Duration.hours(1))).pipe(
+            Effect.andThen(real.settle(key, relayMessageId, options))
+          )
+      }))
+    }))))
 
   it.effect("leaves no dispatcher behind when a subscribe is interrupted", () =>
     Effect.gen(function*() {
