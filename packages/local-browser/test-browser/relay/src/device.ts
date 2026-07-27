@@ -19,7 +19,6 @@ import * as Context from "effect/Context"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
-import * as Option from "effect/Option"
 import * as Redacted from "effect/Redacted"
 import * as Stream from "effect/Stream"
 import { Atom } from "effect/unstable/reactivity"
@@ -61,7 +60,22 @@ const DeviceLive = PeerRelayClientRuntime.layerSql.pipe(Layer.provideMerge(Repli
 
 const runtime = Atom.runtime(DeviceLive)
 
-export const documentIdAtom = Atom.make(Option.none<Identity.DocumentId>())
+/**
+ * The documents this device syncs with its peer, as a stable key.
+ *
+ * A session covers a fixed set of documents chosen when it opens, so this is the set - not a
+ * "currently selected" document. Held as a sorted joined string because the atom re-runs, and so
+ * tears the session down and rebuilds it, whenever this value changes; a fresh array would do that
+ * on every render, and editing a document must not reopen its session.
+ */
+export const syncedDocumentsAtom = Atom.make("")
+
+export const syncDocument = Atom.fnSync((documentId: Identity.DocumentId, get) => {
+  const current = get(syncedDocumentsAtom)
+  const next = new Set(current === "" ? [] : current.split(","))
+  next.add(documentId)
+  get.set(syncedDocumentsAtom, [...next].toSorted().join(","))
+})
 
 export const createTask = runtime.fn<string>()(
   Effect.fnUntraced(function*(title, get) {
@@ -72,7 +86,7 @@ export const createTask = runtime.fn<string>()(
         value: { title, labels: [] }
       })
     )
-    get.set(documentIdAtom, Option.some(documentId))
+    get.set(syncDocument, documentId)
     return documentId
   })
 )
@@ -130,14 +144,14 @@ export const restoreBackup = runtime.fn<ReadonlyArray<number>>()(
 
 const transportOptions = (
   self: DeviceIdentity,
-  documentId: Identity.DocumentId,
+  documentIds: ReadonlyArray<Identity.DocumentId>,
   senderReplicaIncarnation: Identity.ReplicaIncarnation
 ): RpcPeerTransport.Options => ({
   expectedLocal: self.principal,
   senderReplicaIncarnation,
   expectedRelayPeerId: self.relayPeerId,
   remote: { subjectId: remote.principal.subjectId, peerId: remote.principal.peerId },
-  documents: [{ document: TaskDocument, documentId }],
+  documents: documentIds.map((documentId) => ({ document: TaskDocument, documentId })),
   definition,
   receiptRetentionMillis: PeerRelayReceiptLimits.defaults.receiptRetentionMillis,
   senderRetryHorizonMillis: Duration.toMillis(Duration.days(7)),
@@ -153,13 +167,13 @@ class RelaySession extends Context.Service<RelaySession, PeerSession.SupervisedP
  * constructor alone builds the socket and its pump, hands back a client, then releases both when
  * the constructor returns, leaving every request waiting forever on a transport that is gone.
  */
-const layerSession = (documentId: Identity.DocumentId) =>
+const layerSession = (documentIds: ReadonlyArray<Identity.DocumentId>) =>
   Layer.effect(RelaySession)(
     Effect.gen(function*() {
       const gate = yield* ReplicaGate.ReplicaGate
       const incarnation = (yield* gate.current).incarnation
       const client = yield* PeerRpc.makeRpcClient
-      return yield* RpcPeerTransport.makeSession(client, transportOptions(identity, documentId, incarnation))
+      return yield* RpcPeerTransport.makeSession(client, transportOptions(identity, documentIds, incarnation))
     })
   ).pipe(
     Layer.provide(RpcClient.layerProtocolSocket()),
@@ -180,13 +194,18 @@ const layerSession = (documentId: Identity.DocumentId) =>
  * effect returns, taking the socket and the receive loop with it and leaving a session object that
  * can still be called and can no longer deliver anything.
  */
-export const sessionAtom = runtime.atom((get) =>
-  Option.match(get(documentIdAtom), {
-    onNone: () => Effect.never,
-    onSome: (documentId) =>
-      Effect.map(Layer.build(layerSession(documentId)), (context) => Context.get(context, RelaySession))
+export const sessionAtom = runtime.atom((get) => {
+  const key = get(syncedDocumentsAtom)
+  if (key === "") return Effect.never
+  const documentIds = key.split(",").map((id) => Identity.DocumentId.make(id))
+  return Effect.gen(function*() {
+    const context = yield* Layer.build(layerSession(documentIds))
+    const session = Context.get(context, RelaySession)
+    for (const documentId of documentIds) yield* session.markDirty(documentId)
+    yield* session.flush
+    return session
   })
-)
+})
 
 export const push = runtime.fn<Identity.DocumentId>()(
   Effect.fnUntraced(function*(documentId, get) {

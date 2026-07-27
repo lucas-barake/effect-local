@@ -1,6 +1,5 @@
 import { useAtomMount, useAtomSet } from "@effect/atom-react"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
-import * as Option from "effect/Option"
 import { useEffect } from "react"
 import * as Device from "./device.ts"
 
@@ -27,7 +26,7 @@ export const App = () => {
   useAtomMount(Device.sessionAtom)
 
   const createTask = useAtomSet(Device.createTask, { mode: "promise" })
-  const adoptTask = useAtomSet(Device.documentIdAtom)
+  const adoptTask = useAtomSet(Device.syncDocument)
   const addLabel = useAtomSet(Device.addLabel, { mode: "promise" })
   const readTask = useAtomSet(Device.readTask, { mode: "promise" })
   const exportBackup = useAtomSet(Device.exportBackup, { mode: "promise" })
@@ -37,7 +36,7 @@ export const App = () => {
   useEffect(() => {
     window.relayFixture = {
       createTask,
-      adoptTask: (documentId) => adoptTask(Option.some(documentId)),
+      adoptTask,
       addLabel,
       readTask,
       exportBackup,
