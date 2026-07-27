@@ -7,6 +7,7 @@ import * as PeerRelayOutboxLimits from "@lucas-barake/effect-local-sql/PeerRelay
 import * as PeerRelayReceiptLimits from "@lucas-barake/effect-local-sql/PeerRelayReceiptLimits"
 import * as ReplicaGate from "@lucas-barake/effect-local-sql/ReplicaGate"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
+import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -339,13 +340,12 @@ const seedPair = Effect.gen(function*() {
   const sender = Context.get(senderContext, Replica.Replica)
   const recipient = Context.get(recipientContext, Replica.Replica)
 
-  const created = yield* sender.create(Task, {
-    commandId: yield* Identity.makeCommandId,
-    value: { title: "one", labels: [] }
-  })
-  if (created._tag !== "DurablyCommittedLocal") {
-    return yield* Effect.die(`create did not commit: ${created._tag}`)
-  }
+  const documentId = yield* CommandOutcome.committedOrFail(
+    yield* sender.create(Task, {
+      commandId: yield* Identity.makeCommandId,
+      value: { title: "one", labels: [] }
+    })
+  )
   const backup = yield* sender.exportBackup({ maxBytes: replicaLimits.maxBackupBytes }).pipe(Stream.runCollect)
   yield* recipient.restoreBackup({
     expectedDefinitionHash: definition.hash,
@@ -356,7 +356,7 @@ const seedPair = Effect.gen(function*() {
   })
 
   return {
-    documentId: created.value,
+    documentId,
     sender: {
       context: senderContext,
       replica: sender,
@@ -434,12 +434,13 @@ describe("relay custody against a real relay", () => {
             [recipient, "from-recipient"]
           ] as const
         ) {
-          const committed = yield* side.replica.mutate(AddLabel, {
-            commandId: yield* Identity.makeCommandId,
-            documentId,
-            payload: label
-          })
-          assert.strictEqual(committed._tag, "DurablyCommittedLocal")
+          yield* CommandOutcome.committedOrFail(
+            yield* side.replica.mutate(AddLabel, {
+              commandId: yield* Identity.makeCommandId,
+              documentId,
+              payload: label
+            })
+          )
         }
         assert.deepStrictEqual(
           [...(yield* recipient.store.load(Task, documentId).pipe(Effect.orDie)).encoded.labels],
