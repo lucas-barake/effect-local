@@ -182,12 +182,21 @@ interface Session {
 
 const makeClaimToken = Effect.sync(() => `clm_${crypto.randomUUID()}` as PeerRpc.ClaimToken)
 
+/**
+ * The in-flight key for a channel.
+ *
+ * Must name every component of `ChannelKey`. The store partitions heads by the full key including
+ * the connection epoch, so two epochs of one sender are two heads at once; a coarser key here marks
+ * both busy from one delivery and lets a stale epoch's unsettled head hold the live epoch's stream
+ * for the life of the session.
+ */
 const channelId = (channel: RelayInboxStore.ChannelKey): string =>
   JSON.stringify([
     channel.tenantId,
     channel.senderSubjectId,
     channel.senderPeerId,
-    channel.senderReplicaIncarnation
+    channel.senderReplicaIncarnation,
+    channel.senderConnectionEpoch
   ])
 
 export const layer = (options: Options) =>
@@ -217,8 +226,15 @@ export const layer = (options: Options) =>
             Option.filter((current) => current.sessionId !== session.sessionId)
           )
           for (const settlement of session.settlements.values()) {
+            // Only the delivering fiber awaits this, and closing the scope interrupts it anyway.
             yield* Deferred.interrupt(settlement.requested)
-            yield* Deferred.interrupt(settlement.durable)
+            // The recipient awaits this one through the `Settle` rpc, which declares a closed error
+            // union. Interrupting it answers the caller outside that union: an interrupt cannot be
+            // caught by the front door's typed handlers, so instead of a retryable failure it takes
+            // down the peer's acknowledgement fiber.
+            yield* Effect.ignore(
+              Deferred.fail(settlement.durable, new PeerRpcError.ServerUnavailable())
+            )
           }
           session.settlements.clear()
           yield* Scope.close(session.scope, Exit.void)
@@ -312,13 +328,17 @@ export const layer = (options: Options) =>
             )),
           // Fails any settle still waiting on this delivery so the recipient retries rather than
           // believing an acknowledgement landed.
-          Effect.ensuring(
-            Deferred.fail(
-              session.settlements.get(head.relayMessageId)?.durable ??
-                Deferred.makeUnsafe<void, PeerRpcError.ServerUnavailable>(),
-              new PeerRpcError.ServerUnavailable()
-            ).pipe(Effect.ignore)
-          ),
+          //
+          // Suspended because the settlement is registered by the body above, which has not run
+          // when this pipeline is built. Reading the map eagerly here always found nothing, and the
+          // failure went to a throwaway deferred while the recipient's `Settle` waited forever —
+          // holding the entity's single handler permit against every other request for the device.
+          Effect.ensuring(Effect.suspend(() => {
+            const settlement = session.settlements.get(head.relayMessageId)
+            return settlement === undefined
+              ? Effect.void
+              : Effect.ignore(Deferred.fail(settlement.durable, new PeerRpcError.ServerUnavailable()))
+          })),
           Effect.ensuring(Effect.sync(() => {
             session.settlements.delete(head.relayMessageId)
             session.busyChannels.delete(channelId(head.channel))
