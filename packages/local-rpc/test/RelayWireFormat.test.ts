@@ -131,7 +131,21 @@ describe("relay wire format", () => {
                 validUntil: Number.MAX_SAFE_INTEGER,
                 invalidated: Effect.never
               }),
-            PeerRelayAuthorization.denyUnsafeUnboundedAutomerge3Decode
+            (request) =>
+              Effect.succeed({
+                _tag: "UnsafeUnboundedAutomerge3DecodeGrant" as const,
+                risk: PeerRelayAuthorization.unsafeUnboundedAutomerge3DecodeRisk,
+                principal: request.principal,
+                remote: {
+                  tenantId: request.principal.tenantId,
+                  subjectId: request.remote.subjectId,
+                  peerId: request.remote.peerId
+                },
+                direction: request.direction,
+                documents: request.documents,
+                validUntil: Number.MAX_SAFE_INTEGER,
+                invalidated: Effect.never
+              })
           ))
         )
 

@@ -15,6 +15,7 @@ import * as PeerRelayLimits from "./PeerRelayLimits.js"
 import * as PeerRpc from "./PeerRpc.js"
 import * as PeerRpcError from "./PeerRpcError.js"
 import * as RelayInbox from "./RelayInbox.js"
+import * as RelayInboxMaintenance from "./RelayInboxMaintenance.js"
 
 /**
  * The relay's public front door.
@@ -127,6 +128,29 @@ export const layerHandlers = (options: Options) =>
       Effect.gen(function*() {
         const authenticated = yield* PeerAuthentication.AuthenticatedPeer
         const session = yield* sessionFor(payload.sessionId, authenticated.principal)
+
+        // Re-authorized here, not merely at the handshake. Settling is a durable mutation of the
+        // relay's state, and a principal whose Receive authority has been withdrawn must not be
+        // able to perform one. The session monitor also ends a session whose grants lapse, but that
+        // is asynchronous, so on its own it leaves a window in which a revoked peer can still
+        // settle — and it reports the wrong thing, `SessionUnavailable` rather than `AccessDenied`.
+        const receive = yield* authorization.authorize({
+          direction: "Receive",
+          principal: session.principal,
+          remote: session.remote,
+          documents: session.documents
+        })
+        if (receive.documents.length === 0) {
+          return yield* new PeerRpcError.AccessDenied()
+        }
+        yield* authorization.authorizeUnsafeUnboundedAutomerge3Decode({
+          risk: PeerRelayAuthorization.unsafeUnboundedAutomerge3DecodeRisk,
+          direction: "Receive",
+          principal: session.principal,
+          remote: session.remote,
+          documents: session.documents
+        })
+
         // Keyed by the caller's own inbox, so settling another device's message is not expressible.
         yield* bounded(
           inboxClient(session.inboxKeySelf).Settle({
@@ -141,207 +165,231 @@ export const layerHandlers = (options: Options) =>
           Effect.catchTag("AlreadyProcessingMessage", () => new PeerRpcError.SessionOverloaded()),
           Effect.catchTag("PersistenceError", () => new PeerRpcError.ServerUnavailable())
         )
-      })
+      }).pipe(
+        // Identifiers only. The session id is unguessable but not secret, and the message hash is
+        // already a digest; the payload is never an attribute.
+        Effect.withSpan("RelayServer.Settle", {
+          attributes: { relay_message_id: payload.relayMessageId, outcome }
+        })
+      )
 
     return PeerRpc.Rpcs.of({
       Open: (payload) =>
-        Stream.unwrap(Effect.gen(function*() {
-          const authenticated = yield* PeerAuthentication.AuthenticatedPeer
-          const principal = authenticated.principal
-          const now = yield* Clock.currentTimeMillis
+        // Spans the handshake, not the session: the stream it returns outlives this effect.
+        Stream.unwrap(
+          Effect.withSpan("RelayServer.Open", {
+            attributes: { remote_peer_id: payload.remote.peerId }
+          })(Effect.gen(function*() {
+            const authenticated = yield* PeerAuthentication.AuthenticatedPeer
+            const principal = authenticated.principal
+            const now = yield* Clock.currentTimeMillis
 
-          if (authenticated.validUntil <= now) {
-            return yield* new PeerRpcError.AuthenticationFailure()
-          }
-          if (payload.protocolVersion !== PeerRpc.protocolVersion) {
-            return yield* new PeerRpcError.UnsupportedVersion()
-          }
-          // The client states who it believes it is and which relay it believes it reached. Both
-          // are checked against the authenticated identity rather than trusted, so a credential can
-          // never be used to open a session for another device.
-          if (
-            payload.expectedRelayPeerId !== options.peerId ||
-            payload.expectedLocal.tenantId !== principal.tenantId ||
-            payload.expectedLocal.subjectId !== principal.subjectId ||
-            payload.expectedLocal.peerId !== principal.peerId
-          ) {
-            return yield* new PeerRpcError.PeerMismatch()
-          }
-          if (principal.tenantId !== options.tenantId) {
-            return yield* new PeerRpcError.AccessDenied()
-          }
-          // The negotiated windows have to nest: a receipt must outlive both the message and the
-          // window in which its sender may replay it, or a redelivery could be applied twice.
-          if (
-            payload.senderRetryHorizonMillis > limits.maximumSenderRetryHorizonMillis ||
-            payload.receiptRetentionMillis > limits.maximumReceiptRetentionMillis ||
-            payload.receiptRetentionMillis <
-              Math.max(limits.messageTtlMillis, payload.senderRetryHorizonMillis) +
-                limits.minimumTerminalRetentionMillis
-          ) {
-            return yield* new PeerRpcError.InvalidRequest()
-          }
-
-          const send = yield* authorization.authorize({
-            direction: "Send",
-            principal,
-            remote: payload.remote,
-            documents: payload.documents
-          })
-          const receive = yield* authorization.authorize({
-            direction: "Receive",
-            principal,
-            remote: payload.remote,
-            documents: payload.documents
-          })
-          // Authorization is not instantaneous, so both grants and the credential are rechecked
-          // against the clock afterwards rather than against the time the request arrived.
-          const authorizedAt = yield* Clock.currentTimeMillis
-          if (authenticated.validUntil <= authorizedAt) {
-            return yield* new PeerRpcError.AuthenticationFailure()
-          }
-          if (send.validUntil <= authorizedAt || receive.validUntil <= authorizedAt) {
-            return yield* new PeerRpcError.AccessDenied()
-          }
-
-          // Sessions are the front door's only unbounded resource, and an authenticated client can
-          // open them in a loop. Checked before minting an id so a refusal costs nothing.
-          let heldBySubject = 0
-          for (const held of sessions.values()) {
-            if (
-              held.principal.tenantId === principal.tenantId &&
-              held.principal.subjectId === principal.subjectId
-            ) {
-              heldBySubject += 1
+            if (authenticated.validUntil <= now) {
+              return yield* new PeerRpcError.AuthenticationFailure()
             }
-          }
-          if (heldBySubject >= limits.maxSessionsPerSubject) {
-            return yield* new PeerRpcError.RequestCapacityExceeded()
-          }
+            if (payload.protocolVersion !== PeerRpc.protocolVersion) {
+              return yield* new PeerRpcError.UnsupportedVersion()
+            }
+            // The client states who it believes it is and which relay it believes it reached. Both
+            // are checked against the authenticated identity rather than trusted, so a credential can
+            // never be used to open a session for another device.
+            if (
+              payload.expectedRelayPeerId !== options.peerId ||
+              payload.expectedLocal.tenantId !== principal.tenantId ||
+              payload.expectedLocal.subjectId !== principal.subjectId ||
+              payload.expectedLocal.peerId !== principal.peerId
+            ) {
+              return yield* new PeerRpcError.PeerMismatch()
+            }
+            if (principal.tenantId !== options.tenantId) {
+              return yield* new PeerRpcError.AccessDenied()
+            }
+            // The negotiated windows have to nest: a receipt must outlive both the message and the
+            // window in which its sender may replay it, or a redelivery could be applied twice.
+            if (
+              payload.senderRetryHorizonMillis > limits.maximumSenderRetryHorizonMillis ||
+              payload.receiptRetentionMillis > limits.maximumReceiptRetentionMillis ||
+              payload.receiptRetentionMillis <
+                Math.max(limits.messageTtlMillis, payload.senderRetryHorizonMillis) +
+                  limits.minimumTerminalRetentionMillis
+            ) {
+              return yield* new PeerRpcError.InvalidRequest()
+            }
 
-          const sessionId = yield* Identity.makeSessionId.pipe(
-            Effect.provideService(Crypto.Crypto, crypto),
-            // The platform's randomness failing is an environment fault, not something the client
-            // can act on, so it is reported as the relay being unavailable.
-            Effect.catchTag("PlatformError", () => new PeerRpcError.ServerUnavailable())
-          )
-          const inboxKeySelf = yield* encodeInboxKey(principal).pipe(
-            Effect.provideService(Crypto.Crypto, crypto),
-            Effect.catchTag("ReplicaError", () => new PeerRpcError.ServerUnavailable())
-          )
-          const inboxKeyRemote = yield* encodeInboxKey(send.remote).pipe(
-            Effect.provideService(Crypto.Crypto, crypto),
-            Effect.catchTag("ReplicaError", () => new PeerRpcError.ServerUnavailable())
-          )
+            const send = yield* authorization.authorize({
+              direction: "Send",
+              principal,
+              remote: payload.remote,
+              documents: payload.documents
+            })
+            const receive = yield* authorization.authorize({
+              direction: "Receive",
+              principal,
+              remote: payload.remote,
+              documents: payload.documents
+            })
+            // Authorization is not instantaneous, so both grants and the credential are rechecked
+            // against the clock afterwards rather than against the time the request arrived.
+            const authorizedAt = yield* Clock.currentTimeMillis
+            if (authenticated.validUntil <= authorizedAt) {
+              return yield* new PeerRpcError.AuthenticationFailure()
+            }
+            if (send.validUntil <= authorizedAt || receive.validUntil <= authorizedAt) {
+              return yield* new PeerRpcError.AccessDenied()
+            }
 
-          const session: Session = {
-            sessionId,
-            principal,
-            remote: send.remote,
-            documents: payload.documents,
-            senderReplicaIncarnation: payload.senderReplicaIncarnation,
-            senderRetryHorizonMillis: payload.senderRetryHorizonMillis,
-            inboxKeySelf,
-            inboxKeyRemote
-          }
+            // Sessions are the front door's only unbounded resource, and an authenticated client can
+            // open them in a loop. Checked before minting an id so a refusal costs nothing.
+            let heldBySubject = 0
+            for (const held of sessions.values()) {
+              if (
+                held.principal.tenantId === principal.tenantId &&
+                held.principal.subjectId === principal.subjectId
+              ) {
+                heldBySubject += 1
+              }
+            }
+            if (heldBySubject >= limits.maxSessionsPerSubject) {
+              return yield* new PeerRpcError.RequestCapacityExceeded()
+            }
 
-          sessions.set(sessionId, session)
-          yield* Effect.addFinalizer(() =>
-            Effect.sync(() => {
-              sessions.delete(sessionId)
-            }).pipe(
-              // Best effort: the entity's own liveness deadline is what actually bounds an
-              // abandoned session, because this never runs when the node itself fails.
-              Effect.andThen(Effect.ignore(inboxClient(inboxKeySelf).EndSession({ sessionId })))
+            const sessionId = yield* Identity.makeSessionId.pipe(
+              Effect.provideService(Crypto.Crypto, crypto),
+              // The platform's randomness failing is an environment fault, not something the client
+              // can act on, so it is reported as the relay being unavailable.
+              Effect.catchTag("PlatformError", () => new PeerRpcError.ServerUnavailable())
             )
-          )
+            const inboxKeySelf = yield* encodeInboxKey(principal).pipe(
+              Effect.provideService(Crypto.Crypto, crypto),
+              Effect.catchTag("ReplicaError", () => new PeerRpcError.ServerUnavailable())
+            )
+            const inboxKeyRemote = yield* encodeInboxKey(send.remote).pipe(
+              Effect.provideService(Crypto.Crypto, crypto),
+              Effect.catchTag("ReplicaError", () => new PeerRpcError.ServerUnavailable())
+            )
 
-          // A session must not outlive what authorized it. The credential and both grants each
-          // expose an `invalidated` signal and a deadline, and none of them is observed by the
-          // client, so the relay is the only place that can end the session when authority is
-          // withdrawn. Without this the heartbeat below would keep an unauthorized session alive
-          // for as long as the socket stays open.
-          const authorityLapsesAt = Math.min(
-            authenticated.validUntil,
-            send.validUntil,
-            receive.validUntil
-          )
-          yield* Effect.raceAll([
-            authenticated.invalidated,
-            send.invalidated,
-            receive.invalidated,
-            Effect.sleep(Math.max(0, authorityLapsesAt - authorizedAt))
-          ]).pipe(
-            Effect.andThen(
-              Effect.logInfo("Relay session authority withdrawn; ending session").pipe(
-                Effect.annotateLogs({ sessionId })
+            const session: Session = {
+              sessionId,
+              principal,
+              remote: send.remote,
+              documents: payload.documents,
+              senderReplicaIncarnation: payload.senderReplicaIncarnation,
+              senderRetryHorizonMillis: payload.senderRetryHorizonMillis,
+              inboxKeySelf,
+              inboxKeyRemote
+            }
+
+            sessions.set(sessionId, session)
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                sessions.delete(sessionId)
+              }).pipe(
+                // Best effort: the entity's own liveness deadline is what actually bounds an
+                // abandoned session, because this never runs when the node itself fails.
+                Effect.andThen(Effect.ignore(inboxClient(inboxKeySelf).EndSession({ sessionId })))
               )
-            ),
-            Effect.andThen(Effect.ignore(inboxClient(inboxKeySelf).EndSession({ sessionId }))),
-            Effect.forkScoped
-          )
+            )
 
-          // Proves this node and its socket are still alive. Stopping is the signal.
-          yield* Effect.ignore(inboxClient(inboxKeySelf).Heartbeat({ sessionId })).pipe(
-            Effect.repeat(Schedule.spaced(options.heartbeatIntervalMillis)),
-            Effect.forkScoped
-          )
-
-          const opened: PeerRpc.OpenEvent = {
-            _tag: "Opened",
-            protocolVersion: PeerRpc.protocolVersion,
-            sessionId,
-            remotePeerId: send.remote.peerId,
-            authenticatedLocal: principal
-          }
-
-          // `Stream.concat` builds the second stream only after the first completes, so the
-          // subscription attaches after `Opened` reaches the wire. A client that sees `Opened` has
-          // a session the relay accepted, not yet one the owning entity has attached.
-          return Stream.concat(
-            Stream.succeed(opened),
-            inboxClient(inboxKeySelf).Subscribe({ sessionId }).pipe(
-              // Re-authorized per message rather than once at handshake. A grant can be narrowed
-              // or revoked mid session, and anything with a Send grant to this device can write
-              // into its inbox, so the handshake's Receive decision cannot stand in for the
-              // recipient's right to see a particular document. A message that fails here is left
-              // unsettled and simply not emitted, so it stays durable for a later session.
-              Stream.filterEffect((message) =>
-                authorization.authorize({
-                  direction: "Receive",
-                  principal: session.principal,
-                  remote: session.remote,
-                  documents: [{
-                    documentType: message.document.documentType,
-                    documentId: message.document.documentId
-                  }]
-                }).pipe(
-                  Effect.as(true),
-                  Effect.catchTag("AccessDenied", () =>
-                    Effect.logInfo("Withheld a delivery the recipient may no longer receive").pipe(
-                      Effect.annotateLogs({
-                        sessionId,
-                        documentId: message.document.documentId
-                      }),
-                      Effect.as(false)
-                    )),
-                  Effect.catchTag("ServerUnavailable", () => Effect.succeed(false))
+            // A session must not outlive what authorized it. The credential and both grants each
+            // expose an `invalidated` signal and a deadline, and none of them is observed by the
+            // client, so the relay is the only place that can end the session when authority is
+            // withdrawn. Without this the heartbeat below would keep an unauthorized session alive
+            // for as long as the socket stays open.
+            const authorityLapsesAt = Math.min(
+              authenticated.validUntil,
+              send.validUntil,
+              receive.validUntil
+            )
+            yield* Effect.raceAll([
+              authenticated.invalidated,
+              send.invalidated,
+              receive.invalidated,
+              Effect.sleep(Math.max(0, authorityLapsesAt - authorizedAt))
+            ]).pipe(
+              Effect.andThen(
+                Effect.logInfo("Relay session authority withdrawn; ending session").pipe(
+                  Effect.annotateLogs({ sessionId })
                 )
               ),
-              // Cluster level failures are not part of the public contract, so each is reported as
-              // the wire error that tells the client what to do about it.
-              Stream.catchTag("MailboxFull", () => Stream.fail(new PeerRpcError.SessionOverloaded())),
-              Stream.catchTag(
-                "AlreadyProcessingMessage",
-                () => Stream.fail(new PeerRpcError.SessionOverloaded())
-              ),
-              Stream.catchTag(
-                "PersistenceError",
-                () => Stream.fail(new PeerRpcError.ServerUnavailable())
+              Effect.andThen(Effect.ignore(inboxClient(inboxKeySelf).EndSession({ sessionId }))),
+              Effect.forkScoped
+            )
+
+            // Proves this node and its socket are still alive. Stopping is the signal.
+            yield* Effect.ignore(inboxClient(inboxKeySelf).Heartbeat({ sessionId })).pipe(
+              Effect.repeat(Schedule.spaced(options.heartbeatIntervalMillis)),
+              Effect.forkScoped
+            )
+
+            const opened: PeerRpc.OpenEvent = {
+              _tag: "Opened",
+              protocolVersion: PeerRpc.protocolVersion,
+              sessionId,
+              remotePeerId: send.remote.peerId,
+              authenticatedLocal: principal
+            }
+
+            // `Stream.concat` builds the second stream only after the first completes, so the
+            // subscription attaches after `Opened` reaches the wire. A client that sees `Opened` has
+            // a session the relay accepted, not yet one the owning entity has attached.
+            return Stream.concat(
+              Stream.succeed(opened),
+              inboxClient(inboxKeySelf).Subscribe({ sessionId }).pipe(
+                // Re-authorized per message rather than once at handshake. A grant can be narrowed
+                // or revoked mid session, and anything with a Send grant to this device can write
+                // into its inbox, so the handshake's Receive decision cannot stand in for the
+                // recipient's right to see a particular document. A message that fails here is left
+                // unsettled and simply not emitted, so it stays durable for a later session.
+                Stream.filterEffect((message) =>
+                  authorization.authorize({
+                    direction: "Receive",
+                    principal: session.principal,
+                    remote: session.remote,
+                    documents: [{
+                      documentType: message.document.documentType,
+                      documentId: message.document.documentId
+                    }]
+                  }).pipe(
+                    // Delivering commits this peer to decoding the document, so the same risk
+                    // acknowledgement the sender needed is required again on the receiving side, per
+                    // message rather than once at the handshake.
+                    Effect.andThen(authorization.authorizeUnsafeUnboundedAutomerge3Decode({
+                      risk: PeerRelayAuthorization.unsafeUnboundedAutomerge3DecodeRisk,
+                      direction: "Receive",
+                      principal: session.principal,
+                      remote: session.remote,
+                      documents: [{
+                        documentType: message.document.documentType,
+                        documentId: message.document.documentId
+                      }]
+                    })),
+                    Effect.as(true),
+                    Effect.catchTag("AccessDenied", () =>
+                      Effect.logInfo("Withheld a delivery the recipient may no longer receive").pipe(
+                        Effect.annotateLogs({
+                          sessionId,
+                          documentId: message.document.documentId
+                        }),
+                        Effect.as(false)
+                      )),
+                    Effect.catchTag("ServerUnavailable", () => Effect.succeed(false))
+                  )
+                ),
+                // Cluster level failures are not part of the public contract, so each is reported as
+                // the wire error that tells the client what to do about it.
+                Stream.catchTag("MailboxFull", () => Stream.fail(new PeerRpcError.SessionOverloaded())),
+                Stream.catchTag(
+                  "AlreadyProcessingMessage",
+                  () => Stream.fail(new PeerRpcError.SessionOverloaded())
+                ),
+                Stream.catchTag(
+                  "PersistenceError",
+                  () => Stream.fail(new PeerRpcError.ServerUnavailable())
+                )
               )
             )
-          )
-        })),
+          }))
+        ),
 
       Push: (payload) =>
         Effect.gen(function*() {
@@ -379,6 +427,17 @@ export const layerHandlers = (options: Options) =>
           if (send.documents.length === 0) {
             return yield* new PeerRpcError.AccessDenied()
           }
+          // Relaying a document commits its recipient to decoding it, and that decode is not
+          // allocation bounded on the Automerge version this protocol targets. The deployment has
+          // to acknowledge that risk explicitly for this document rather than inherit it from the
+          // ordinary Send grant, which is why it is a separate port that denies by default.
+          yield* authorization.authorizeUnsafeUnboundedAutomerge3Decode({
+            risk: PeerRelayAuthorization.unsafeUnboundedAutomerge3DecodeRisk,
+            direction: "Send",
+            principal: session.principal,
+            remote: session.remote,
+            documents: [document]
+          })
 
           const outerEnvelopeDigest = yield* PeerSyncEnvelope.digestRelayOuterEnvelope({
             domain: PeerSyncEnvelope.relayOuterEnvelopeDomain,
@@ -449,7 +508,11 @@ export const layerHandlers = (options: Options) =>
             Effect.catchTag("AlreadyProcessingMessage", () => new PeerRpcError.SessionOverloaded()),
             Effect.catchTag("PersistenceError", () => new PeerRpcError.ServerUnavailable())
           )
-        }),
+        }).pipe(
+          Effect.withSpan("RelayServer.Push", {
+            attributes: { relay_message_id: payload.relayMessageId }
+          })
+        ),
 
       Acknowledge: (payload) => settle(payload, "Acknowledged"),
 
@@ -464,8 +527,25 @@ export const layerHandlers = (options: Options) =>
  * an in-memory single process for tests, one runner over SQL, or many runners sharded across
  * machines — without the relay changing.
  */
-export const layer = (options: Options & { readonly inbox: RelayInbox.Options }) =>
-  Layer.merge(layerHandlers(options), RelayInbox.layer(options.inbox)).pipe(
+export const layer = (
+  options: Options & {
+    readonly inbox: RelayInbox.Options
+    /**
+     * Retention for every inbox in the deployment.
+     *
+     * Required rather than optional, and composed here rather than left to the consumer, because
+     * `messageTtlMillis` and `terminalRetentionMillis` are inert without it: a deployment that
+     * forgot to add the singleton separately would expire nothing and collect nothing, and would
+     * only find out when the table had grown past the point where admission still succeeded.
+     */
+    readonly maintenance: RelayInboxMaintenance.Options
+  }
+) =>
+  Layer.mergeAll(
+    layerHandlers(options),
+    RelayInbox.layer(options.inbox),
+    RelayInboxMaintenance.layer(options.maintenance)
+  ).pipe(
     // Two independently configured values have to agree or every session is reaped on a fixed
     // cycle and no client can hold a delivery stream — a total outage that only appears under a
     // particular configuration, so it is refused at construction rather than discovered in
