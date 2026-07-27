@@ -1,5 +1,5 @@
 import * as Identity from "@lucas-barake/effect-local/Identity"
-import type * as Cause from "effect/Cause"
+import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -204,7 +204,7 @@ interface Settlement {
 
 interface Session {
   readonly sessionId: Identity.SessionId
-  readonly outbound: Queue.Queue<PeerRpc.StoredMessage, Cause.Done>
+  readonly outbound: Queue.Queue<PeerRpc.StoredMessage, PeerRpcError.ServerUnavailable | Cause.Done>
   readonly settlements: Map<Identity.RelayMessageId, Settlement>
   /** Channels with a delivery in flight. One message per channel at a time preserves order. */
   readonly busyChannels: Set<string>
@@ -465,9 +465,18 @@ export const layer = (options: Options) =>
         Effect.forkScoped
       )
 
-      // Runs before the framework's own termination handshake, which otherwise waits the full
-      // `entityTerminationTimeout` for a forked streaming handler that never returns on its own,
-      // rejecting deliveries and settlements for the whole of that window on every rebalance.
+      // Closes whatever session is live when this entity is torn down.
+      //
+      // It does NOT run before the framework's termination handshake, and the ordering cannot be
+      // changed from here. This build effect's `Scope` is the `ResourceRef`'s inner scope
+      // (`entityManager.ts:162`), while the handshake that writes `Eof` and then waits on
+      // `endLatch` is registered on the outer entity scope afterwards (`entityManager.ts:372-381`).
+      // Scope finalizers run last-registered-first, so the handshake goes first and waits the full
+      // `entityTerminationTimeout` for the forked `Subscribe`, which never returns on its own —
+      // rejecting `Deliver` and `Settle` for that whole window. The behaviour is handed no
+      // reference to the outer scope, so this is a property of the deployment's
+      // `entityTerminationTimeout`, not something the entity can fix: size it knowing a rebalance
+      // costs each moving device up to that long before its next session can be served.
       yield* Effect.addFinalizer(() => Effect.orDie(closeCurrentSession))
 
       const currentSession = (sessionId: Identity.SessionId) =>
@@ -569,7 +578,10 @@ export const layer = (options: Options) =>
 
                     const scope = yield* Scope.make()
                     const install = Effect.gen(function*() {
-                      const outbound = yield* Queue.bounded<PeerRpc.StoredMessage, Cause.Done>(0)
+                      const outbound = yield* Queue.bounded<
+                        PeerRpc.StoredMessage,
+                        PeerRpcError.ServerUnavailable | Cause.Done
+                      >(0)
                       const now = yield* Clock.currentTimeMillis
                       const deadlineAt = yield* Ref.make(now + options.sessionDeadlineMillis)
                       const session: Session = {
@@ -582,7 +594,30 @@ export const layer = (options: Options) =>
                         scope,
                         deadlineAt
                       }
-                      yield* Effect.forkIn(dispatch(session), scope)
+                      // Observed rather than left to run alone. `dispatch` never returns, so any
+                      // exit but interruption is a defect in it — and a forked fiber's defect
+                      // reaches nothing: not `RpcServer`'s defect path, not the entity's own defect
+                      // restart. The session would stay installed and keep looking healthy, with
+                      // heartbeats extending its deadline and `Deliver` still reporting success to
+                      // senders, while the device received nothing at all until it happened to
+                      // reconnect. Handing the cause to the outbound queue is what makes the
+                      // recipient notice: its stream fails, the front door's session finalizer then
+                      // ends the session from a fiber that does not own this scope, and the client
+                      // opens a fresh one. The cause is preserved rather than translated, because a
+                      // dead dispatcher is a bug in the relay and not a decision about this peer.
+                      yield* dispatch(session).pipe(
+                        Effect.onExit((exit) =>
+                          Exit.isFailure(exit) && Cause.hasDies(exit.cause)
+                            ? Effect.logFatal("Relay inbox dispatcher died", exit.cause).pipe(
+                              Effect.annotateLogs({ inboxKey, sessionId: payload.sessionId }),
+                              Effect.andThen(
+                                Queue.fail(outbound, new PeerRpcError.ServerUnavailable())
+                              )
+                            )
+                            : Effect.void
+                        ),
+                        Effect.forkIn(scope)
+                      )
                       yield* Ref.set(sessionRef, Option.some(session))
                       return outbound
                     })

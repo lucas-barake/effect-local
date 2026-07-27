@@ -306,7 +306,12 @@ export const layerHandlers = (options: Options) =>
               }).pipe(
                 // Best effort: the entity's own liveness deadline is what actually bounds an
                 // abandoned session, because this never runs when the node itself fails.
-                Effect.andThen(Effect.ignore(inboxClient(inboxKeySelf).EndSession({ sessionId })))
+                // Bounded, and deliberately so. Finalizers run uninterruptibly, and `Sharding`
+                // retries `EntityNotAssignedToRunner` and `RunnerUnavailable` forever, so during a
+                // rebalance an unbounded call here never returns: the request fiber never exits,
+                // `RpcServer`'s shutdown latch never opens, and the whole node hangs on shutdown
+                // over a session that is already gone.
+                Effect.andThen(Effect.ignore(bounded(inboxClient(inboxKeySelf).EndSession({ sessionId }))))
               )
             )
 
@@ -331,12 +336,14 @@ export const layerHandlers = (options: Options) =>
                   Effect.annotateLogs({ sessionId })
                 )
               ),
-              Effect.andThen(Effect.ignore(inboxClient(inboxKeySelf).EndSession({ sessionId }))),
+              Effect.andThen(Effect.ignore(bounded(inboxClient(inboxKeySelf).EndSession({ sessionId })))),
               Effect.forkScoped
             )
 
             // Proves this node and its socket are still alive. Stopping is the signal.
-            yield* Effect.ignore(inboxClient(inboxKeySelf).Heartbeat({ sessionId })).pipe(
+            // Bounded per beat rather than per session: a heartbeat that hung would stall the
+            // repeat itself, and the session it exists to keep alive would then lapse.
+            yield* Effect.ignore(bounded(inboxClient(inboxKeySelf).Heartbeat({ sessionId }))).pipe(
               Effect.repeat(Schedule.spaced(options.heartbeatIntervalMillis)),
               Effect.forkScoped
             )

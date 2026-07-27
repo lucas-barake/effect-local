@@ -3,9 +3,12 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
 import * as MessageStorage from "effect/unstable/cluster/MessageStorage"
@@ -408,6 +411,36 @@ describe("RelayInbox", () => {
         "an orphaned dispatcher would have consumed or duplicated these"
       )
     }).pipe(Effect.provide(layer)))
+
+  it.effect("ends the delivery stream when its dispatcher dies", () =>
+    Effect.gen(function*() {
+      const client = yield* inbox
+      yield* client.Deliver(deliver({ id: "000000000001", sequence: 0 }))
+
+      // The dispatcher runs on a forked fiber nobody observes, so a defect in it simply makes the
+      // fiber disappear. Left unnoticed the session stays installed and looks perfectly healthy:
+      // the front door keeps heartbeating it, `Deliver` keeps reporting success to senders, and the
+      // device receives nothing at all until it happens to reconnect. The framework does not catch
+      // it either — a forked fiber's defect never reaches the entity's own defect restart — so the
+      // dispatcher has to hand its cause to the one thing the recipient is watching.
+      const exit = yield* client.Subscribe({ sessionId: sessionId("000000000001") }).pipe(
+        Stream.runDrain,
+        Effect.exit
+      )
+      assert.isTrue(Exit.isFailure(exit), "the recipient is told, rather than waiting forever")
+      if (Exit.isSuccess(exit)) return
+      // Retryable, and never a clean end of stream. `Subscribe` declares a closed error union, so a
+      // raw defect on the queue reaches nobody; the defect itself goes to the log at fatal with its
+      // whole cause, and the recipient is told the one thing it can act on — come back.
+      assert.deepStrictEqual(
+        Cause.findErrorOption(exit.cause).pipe(Option.map((error) => error._tag)),
+        Option.some("ServerUnavailable")
+      )
+    }).pipe(Effect.provide(relay({
+      store: storeFailing(() => ({
+        pendingHeads: () => Effect.die(new Error("dispatcher fault"))
+      }))
+    }))))
 
   it.effect("releases a session whose liveness deadline lapses", () =>
     Effect.gen(function*() {
