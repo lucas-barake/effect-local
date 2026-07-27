@@ -29,6 +29,20 @@ describe("PeerRpc", () => {
     assert.deepStrictEqual(Schema.decodeUnknownSync(PeerRpc.OpenEvent)(opened), opened)
   })
 
+  it("pins the handshake protocol version so a foreign version fails to decode", () => {
+    // `Opened` carries a literal, not a number, so a client cannot be talked into continuing
+    // against a relay speaking a version it does not implement.
+    assert.throws(() =>
+      Schema.decodeUnknownSync(PeerRpc.OpenEvent)({
+        _tag: "Opened",
+        protocolVersion: PeerRpc.protocolVersion + 1,
+        sessionId,
+        remotePeerId,
+        authenticatedLocal: { tenantId: "tenant", subjectId: "subject", peerId: localPeerId }
+      })
+    )
+  })
+
   it("roundtrips every relay request and stored message field", () => {
     const open = PeerRpc.OpenRpc.payloadSchema.make({
       protocolVersion: PeerRpc.protocolVersion,
