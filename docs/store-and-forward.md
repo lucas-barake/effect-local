@@ -142,7 +142,7 @@ Claims are finite fences. A stale worker can duplicate delivery after its claim 
 acknowledge or reject the new claim. Retry uses bounded exponential delay with jitter. The sender outbox keeps pending
 admissions until custody succeeds or their configured retry horizon expires.
 
-`PeerRelayLimits.maximumDeliveryAttempts` caps recipient delivery. The default is `16`. A failed, interrupted,
+`RelayInbox.Options.maxDeliveries` caps recipient delivery. It is required per deployment. A failed, interrupted,
 disconnected, or expired claim durably advances the attempt count. When that count reaches the configured cap, the
 relay moves the message to `DeadLettered`, erases its payload, and retains only bounded terminal deduplication
 evidence. Process restart does not reset the count. Message expiry can terminalize the row before the attempt cap.

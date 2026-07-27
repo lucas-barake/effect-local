@@ -5,235 +5,80 @@ import * as Schema from "effect/Schema"
 import type * as SchemaIssue from "effect/SchemaIssue"
 import * as PeerRpcProtocol from "./internal/peerRpcProtocol.js"
 
+/**
+ * The relay's deployment-tunable limits.
+ *
+ * Every value here is read by something. That is a deliberate property rather than an accident:
+ * this used to carry the tuning surface of a single-process relay that owned its own socket
+ * framing, claim leases, SQL lanes and cross-scope quota counters, and none of that machinery
+ * survives the move to cluster entities. Configuration that no longer reaches any code is worse
+ * than absent — an operator who sets a quota that is silently never enforced believes their
+ * deployment is bounded when it is not — so the orphaned values were removed rather than retained
+ * for a future that may never use them.
+ *
+ * Two families are gone with no replacement here, and both are accepted regressions rather than
+ * oversights. Per-scope quotas (per sender peer, recipient peer, recipient subject, tenant, shard)
+ * span many inboxes, so no entity is their sole writer and enforcing them would reintroduce exactly
+ * the cross-process arbitration this design removes; admission is now bounded **per inbox** by
+ * `RelayInbox.Options`, inside the same transaction as the write. Connection and frame accounting
+ * belonged to the bespoke length-prefixed framing, which standard Effect RPC over a socket replaces;
+ * a single relayed payload is still bounded, by `PeerRpc`'s schema check against
+ * `maximumRelayPayloadBytes`, but concurrent connections and in-flight frame bytes are now the
+ * deployment's socket server to bound.
+ */
+
 const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0))
 const PositiveNumber = Schema.Number.check(Schema.isFinite(), Schema.isGreaterThan(0))
 const NegotiatedDuration = PositiveInt.check(
   Schema.isLessThanOrEqualTo(PeerRpcProtocol.maximumNegotiatedDurationMillis)
 )
-const Percentage = PositiveNumber.check(Schema.isLessThanOrEqualTo(100))
 
 export const Values = Schema.Struct({
-  maxActiveMessagesPerSenderPeer: PositiveInt,
-  maxActiveBytesPerSenderPeer: PositiveInt,
-  maxActiveMessagesPerRecipientPeer: PositiveInt,
-  maxActiveBytesPerRecipientPeer: PositiveInt,
-  maxActiveMessagesPerRecipientSubject: PositiveInt,
-  maxActiveBytesPerRecipientSubject: PositiveInt,
-  maxActiveMessagesPerTenant: PositiveInt,
-  maxActiveBytesPerTenant: PositiveInt,
-  maxActiveMessagesPerShard: PositiveInt,
-  maxActiveBytesPerShard: PositiveInt,
-
-  maxRetainedRowsPerSenderPeer: PositiveInt,
-  maxRetainedBytesPerSenderPeer: PositiveInt,
-  maxRetainedRowsPerRecipientPeer: PositiveInt,
-  maxRetainedBytesPerRecipientPeer: PositiveInt,
-  maxRetainedRowsPerRecipientSubject: PositiveInt,
-  maxRetainedBytesPerRecipientSubject: PositiveInt,
-  maxRetainedRowsPerTenant: PositiveInt,
-  maxRetainedBytesPerTenant: PositiveInt,
-  maxRetainedRowsPerShard: PositiveInt,
-  maxRetainedBytesPerShard: PositiveInt,
-
+  /** How long an undelivered message survives in an inbox before it is expired. */
   messageTtlMillis: NegotiatedDuration,
+  /** The longest replay window a client may negotiate at `Open`. */
   maximumSenderRetryHorizonMillis: NegotiatedDuration,
+  /** The slack a receipt must outlive its message and that message's replay window by. */
   minimumTerminalRetentionMillis: NegotiatedDuration,
+  /** The longest receipt retention a client may negotiate at `Open`. */
   maximumReceiptRetentionMillis: NegotiatedDuration,
-  claimLeaseMillis: PositiveInt,
-  maximumRecipientProcessingMillis: PositiveInt,
-  acknowledgementTimeoutMillis: PositiveInt,
-  claimSafetyMarginMillis: PositiveInt,
-  retryBaseDelayMillis: PositiveInt,
-  retryMaximumDelayMillis: PositiveInt,
-  maximumDeliveryAttempts: PositiveInt,
-  sqliteLockRetryBaseDelayMillis: PositiveInt,
-  sqliteLockRetryMaximumDelayMillis: PositiveInt,
-  sqliteLockRetryMaxAttempts: PositiveInt,
 
-  maxRelayConnections: PositiveInt,
-  maximumRawChunkBytes: PositiveInt,
-  maximumDeclaredFrameBytes: PositiveInt,
-  maximumIncompleteFrameBytes: PositiveInt,
-  incompleteFrameTimeoutMillis: PositiveInt,
-  maximumSharedPayloadBytes: PositiveInt,
-  maximumByteReservationWaiters: PositiveInt,
+  /** Credentials verified concurrently. Beyond this a caller is told to come back. */
   maxInFlightAuthentication: PositiveInt,
+  /** Sustained authentication attempts allowed per client. */
   authenticationRatePerSecond: PositiveNumber,
+  /** Authentication attempts a client may spend at once before the sustained rate applies. */
   authenticationBurst: PositiveInt,
-
-  maxSessionsPerSubject: PositiveInt,
-  maxInFlightOpen: PositiveInt,
-  maxInFlightOpenPerSubject: PositiveInt,
-  openRatePerSecond: PositiveNumber,
-  openBurst: PositiveInt,
-  maxInFlightPush: PositiveInt,
-  maxInFlightPushPerSubject: PositiveInt,
-  admissionRatePerSecond: PositiveNumber,
-  admissionBurst: PositiveInt,
+  /** Rate-limiter state retained for idle clients, so the table cannot grow without bound. */
   maxRetainedRateLimitedConnections: PositiveInt,
-  maxRetainedRateLimitedSubjects: PositiveInt,
+  /** How long a client's rate-limiter state is kept after its last request. */
   rateLimitIdleRetentionMillis: PositiveInt,
 
-  terminalResponseQueueCapacity: PositiveInt,
-  maxInFlightTerminalResponses: PositiveInt,
-  maxInFlightTerminalResponsesPerSubject: PositiveInt,
-  terminalResponseRatePerSecond: PositiveNumber,
-  terminalResponseBurst: PositiveInt,
-  maxRetainedTerminalResponseSubjects: PositiveInt,
-  terminalResponseSubjectIdleRetentionMillis: PositiveInt,
-
-  newWorkQueueCapacity: PositiveInt,
-  retryQueueCapacity: PositiveInt,
-  relayWorkerConcurrency: PositiveInt,
-  newWorkWeight: PositiveInt,
-  retryWorkWeight: PositiveInt,
-  maxActiveChannels: PositiveInt,
-  compensationIntervalMillis: PositiveInt,
-  compensationBatchSize: PositiveInt,
-
-  sqlAdmissionQueueCapacity: PositiveInt,
-  sqlTerminalQueueCapacity: PositiveInt,
-  sqlDeliveryQueueCapacity: PositiveInt,
-  sqlMaintenanceQueueCapacity: PositiveInt,
-  maxInFlightSqlTransactions: PositiveInt,
-  maxInFlightSqlAdmission: PositiveInt,
-  maxInFlightSqlTerminal: PositiveInt,
-  maxInFlightSqlDelivery: PositiveInt,
-  maxInFlightSqlMaintenance: PositiveInt,
-
-  maintenanceIntervalMillis: PositiveInt,
-  claimRecoveryBatchSize: PositiveInt,
-  claimRecoveryRowsPerSecond: PositiveNumber,
-  expiryBatchSize: PositiveInt,
-  expiryRowsPerSecond: PositiveNumber,
-  integrityBatchSize: PositiveInt,
-  integrityRowsPerSecond: PositiveNumber,
-  reconciliationBatchSize: PositiveInt,
-  reconciliationRowsPerSecond: PositiveNumber,
-  terminalCollectionBatchSize: PositiveInt,
-  terminalCollectionRowsPerSecond: PositiveNumber,
-  orphanChannelCleanupBatchSize: PositiveInt,
-  orphanChannelCleanupRowsPerSecond: PositiveNumber,
-  sqliteTransactionCapacityPerSecond: PositiveNumber,
-  sqliteCapacityHeadroomPercent: Percentage,
-
-  shutdownReleaseConcurrency: PositiveInt,
-  shutdownReleaseTimeoutMillis: PositiveInt
+  /**
+   * Live relay sessions one subject may hold.
+   *
+   * Sessions are the front door's only unbounded resource and an authenticated client can open them
+   * in a loop, so this is the cap that makes a refusal possible.
+   */
+  maxSessionsPerSubject: PositiveInt
 })
 export type Values = typeof Values.Type
 
-const kibibyte = 1_024
-const mebibyte = 1_024 * kibibyte
-const gibibyte = 1_024 * mebibyte
 const day = 24 * 60 * 60 * 1_000
 
 export const defaults: Values = Values.make({
-  maxActiveMessagesPerSenderPeer: 10_000,
-  maxActiveBytesPerSenderPeer: 256 * mebibyte,
-  maxActiveMessagesPerRecipientPeer: 10_000,
-  maxActiveBytesPerRecipientPeer: 256 * mebibyte,
-  maxActiveMessagesPerRecipientSubject: 40_000,
-  maxActiveBytesPerRecipientSubject: gibibyte,
-  maxActiveMessagesPerTenant: 100_000,
-  maxActiveBytesPerTenant: 4 * gibibyte,
-  maxActiveMessagesPerShard: 1_000_000,
-  maxActiveBytesPerShard: 16 * gibibyte,
-
-  maxRetainedRowsPerSenderPeer: 10_000,
-  maxRetainedBytesPerSenderPeer: 64 * mebibyte,
-  maxRetainedRowsPerRecipientPeer: 10_000,
-  maxRetainedBytesPerRecipientPeer: 64 * mebibyte,
-  maxRetainedRowsPerRecipientSubject: 40_000,
-  maxRetainedBytesPerRecipientSubject: 256 * mebibyte,
-  maxRetainedRowsPerTenant: 100_000,
-  maxRetainedBytesPerTenant: gibibyte,
-  maxRetainedRowsPerShard: 1_000_000,
-  maxRetainedBytesPerShard: 8 * gibibyte,
-
   messageTtlMillis: 7 * day,
   maximumSenderRetryHorizonMillis: 7 * day,
   minimumTerminalRetentionMillis: day,
   maximumReceiptRetentionMillis: 8 * day,
-  claimLeaseMillis: 60_000,
-  maximumRecipientProcessingMillis: 40_000,
-  acknowledgementTimeoutMillis: 10_000,
-  claimSafetyMarginMillis: 5_000,
-  retryBaseDelayMillis: 250,
-  retryMaximumDelayMillis: 30_000,
-  maximumDeliveryAttempts: 16,
-  sqliteLockRetryBaseDelayMillis: 10,
-  sqliteLockRetryMaximumDelayMillis: 250,
-  sqliteLockRetryMaxAttempts: 5,
 
-  maxRelayConnections: 1_024,
-  maximumRawChunkBytes: 8 * mebibyte + 4,
-  maximumDeclaredFrameBytes: 8 * mebibyte,
-  maximumIncompleteFrameBytes: 8 * mebibyte + 4,
-  incompleteFrameTimeoutMillis: 10_000,
-  maximumSharedPayloadBytes: 64 * mebibyte,
-  maximumByteReservationWaiters: 1_024,
   maxInFlightAuthentication: 64,
   authenticationRatePerSecond: 16,
   authenticationBurst: 64,
-
-  maxSessionsPerSubject: 4,
-  maxInFlightOpen: 32,
-  maxInFlightOpenPerSubject: 2,
-  openRatePerSecond: 16,
-  openBurst: 32,
-  maxInFlightPush: 128,
-  maxInFlightPushPerSubject: 8,
-  admissionRatePerSecond: 100,
-  admissionBurst: 128,
   maxRetainedRateLimitedConnections: 10_000,
-  maxRetainedRateLimitedSubjects: 10_000,
   rateLimitIdleRetentionMillis: 10 * 60_000,
 
-  terminalResponseQueueCapacity: 256,
-  maxInFlightTerminalResponses: 64,
-  maxInFlightTerminalResponsesPerSubject: 4,
-  terminalResponseRatePerSecond: 100,
-  terminalResponseBurst: 128,
-  maxRetainedTerminalResponseSubjects: 10_000,
-  terminalResponseSubjectIdleRetentionMillis: 10 * 60_000,
-
-  newWorkQueueCapacity: 1_024,
-  retryQueueCapacity: 1_024,
-  relayWorkerConcurrency: 8,
-  newWorkWeight: 3,
-  retryWorkWeight: 1,
-  maxActiveChannels: 10_000,
-  compensationIntervalMillis: 1_000,
-  compensationBatchSize: 256,
-
-  sqlAdmissionQueueCapacity: 256,
-  sqlTerminalQueueCapacity: 256,
-  sqlDeliveryQueueCapacity: 256,
-  sqlMaintenanceQueueCapacity: 256,
-  maxInFlightSqlTransactions: 16,
-  maxInFlightSqlAdmission: 4,
-  maxInFlightSqlTerminal: 4,
-  maxInFlightSqlDelivery: 4,
-  maxInFlightSqlMaintenance: 4,
-
-  maintenanceIntervalMillis: 1_000,
-  claimRecoveryBatchSize: 100,
-  claimRecoveryRowsPerSecond: 100,
-  expiryBatchSize: 100,
-  expiryRowsPerSecond: 100,
-  integrityBatchSize: 100,
-  integrityRowsPerSecond: 100,
-  reconciliationBatchSize: 100,
-  reconciliationRowsPerSecond: 100,
-  terminalCollectionBatchSize: 100,
-  terminalCollectionRowsPerSecond: 100,
-  orphanChannelCleanupBatchSize: 100,
-  orphanChannelCleanupRowsPerSecond: 100,
-  sqliteTransactionCapacityPerSecond: 200,
-  sqliteCapacityHeadroomPercent: 20,
-
-  shutdownReleaseConcurrency: 16,
-  shutdownReleaseTimeoutMillis: 30_000
+  maxSessionsPerSubject: 4
 })
 
 export class InvalidPeerRelayLimits extends Schema.TaggedErrorClass<InvalidPeerRelayLimits>(
@@ -263,166 +108,24 @@ const firstField = (issue: SchemaIssue.Issue): string | undefined => {
 const validate = (values: Values) => {
   const relations: ReadonlyArray<readonly [field: keyof Values, valid: boolean]> = [
     [
-      "maxActiveMessagesPerRecipientSubject",
-      values.maxActiveMessagesPerRecipientSubject >= values.maxActiveMessagesPerRecipientPeer
-    ],
-    [
-      "maxActiveBytesPerRecipientSubject",
-      values.maxActiveBytesPerRecipientSubject >= values.maxActiveBytesPerRecipientPeer
-    ],
-    [
-      "maxActiveMessagesPerTenant",
-      values.maxActiveMessagesPerTenant >= values.maxActiveMessagesPerRecipientSubject &&
-      values.maxActiveMessagesPerTenant >= values.maxActiveMessagesPerSenderPeer
-    ],
-    [
-      "maxActiveBytesPerTenant",
-      values.maxActiveBytesPerTenant >= values.maxActiveBytesPerRecipientSubject &&
-      values.maxActiveBytesPerTenant >= values.maxActiveBytesPerSenderPeer
-    ],
-    ["maxActiveMessagesPerShard", values.maxActiveMessagesPerShard >= values.maxActiveMessagesPerTenant],
-    ["maxActiveBytesPerShard", values.maxActiveBytesPerShard >= values.maxActiveBytesPerTenant],
-    [
-      "maxRetainedRowsPerRecipientSubject",
-      values.maxRetainedRowsPerRecipientSubject >= values.maxRetainedRowsPerRecipientPeer
-    ],
-    [
-      "maxRetainedBytesPerRecipientSubject",
-      values.maxRetainedBytesPerRecipientSubject >= values.maxRetainedBytesPerRecipientPeer
-    ],
-    [
-      "maxRetainedRowsPerTenant",
-      values.maxRetainedRowsPerTenant >= values.maxRetainedRowsPerRecipientSubject &&
-      values.maxRetainedRowsPerTenant >= values.maxRetainedRowsPerSenderPeer
-    ],
-    [
-      "maxRetainedBytesPerTenant",
-      values.maxRetainedBytesPerTenant >= values.maxRetainedBytesPerRecipientSubject &&
-      values.maxRetainedBytesPerTenant >= values.maxRetainedBytesPerSenderPeer
-    ],
-    ["maxRetainedRowsPerShard", values.maxRetainedRowsPerShard >= values.maxRetainedRowsPerTenant],
-    ["maxRetainedBytesPerShard", values.maxRetainedBytesPerShard >= values.maxRetainedBytesPerTenant],
-    [
+      // The windows have to nest. A receipt that lapses while its sender may still replay the
+      // message lets that replay land after the deduplication record is gone, and the recipient
+      // applies it a second time. The front door refuses a handshake that would breach this, so the
+      // two checks have to agree — this is the one that makes the deployment's own numbers legal.
       "maximumReceiptRetentionMillis",
       values.maximumReceiptRetentionMillis >=
         Math.max(values.messageTtlMillis, values.maximumSenderRetryHorizonMillis) +
           values.minimumTerminalRetentionMillis
     ],
     [
-      "claimLeaseMillis",
-      values.maximumRecipientProcessingMillis +
-          values.acknowledgementTimeoutMillis +
-          values.claimSafetyMarginMillis <
-        values.claimLeaseMillis
-    ],
-    ["claimLeaseMillis", values.claimLeaseMillis < values.messageTtlMillis],
-    ["retryMaximumDelayMillis", values.retryMaximumDelayMillis >= values.retryBaseDelayMillis],
-    ["retryMaximumDelayMillis", values.retryMaximumDelayMillis < values.claimLeaseMillis],
-    [
-      "sqliteLockRetryMaximumDelayMillis",
-      values.sqliteLockRetryMaximumDelayMillis >= values.sqliteLockRetryBaseDelayMillis
-    ],
-    ["maximumRawChunkBytes", values.maximumRawChunkBytes <= values.maximumIncompleteFrameBytes],
-    ["maximumDeclaredFrameBytes", values.maximumDeclaredFrameBytes + 4 <= values.maximumIncompleteFrameBytes],
-    ["maximumDeclaredFrameBytes", values.maximumDeclaredFrameBytes >= PeerRpcProtocol.maximumRelayPayloadBytes],
-    ["maximumSharedPayloadBytes", values.maximumSharedPayloadBytes >= values.maximumIncompleteFrameBytes],
-    [
-      "maximumSharedPayloadBytes",
-      values.relayWorkerConcurrency * PeerRpcProtocol.maximumRelayPayloadBytes <=
-        values.maximumSharedPayloadBytes
-    ],
-    ["maximumByteReservationWaiters", values.maximumByteReservationWaiters >= values.maxRelayConnections],
-    ["authenticationBurst", values.authenticationBurst >= values.maxInFlightAuthentication],
-    ["maxSessionsPerSubject", values.maxSessionsPerSubject <= values.maxRelayConnections],
-    ["maxInFlightOpen", values.maxInFlightOpen <= values.maxRelayConnections],
-    ["maxInFlightOpenPerSubject", values.maxInFlightOpenPerSubject <= values.maxInFlightOpen],
-    ["openBurst", values.openBurst >= values.maxInFlightOpen],
-    ["maxInFlightPushPerSubject", values.maxInFlightPushPerSubject <= values.maxInFlightPush],
-    ["admissionBurst", values.admissionBurst >= values.maxInFlightPush],
-    ["maxRetainedRateLimitedConnections", values.maxRetainedRateLimitedConnections >= values.maxRelayConnections],
-    ["maxRetainedRateLimitedSubjects", values.maxRetainedRateLimitedSubjects >= values.maxInFlightOpen],
-    [
-      "maxInFlightTerminalResponsesPerSubject",
-      values.maxInFlightTerminalResponsesPerSubject <= values.maxInFlightTerminalResponses
-    ],
-    ["terminalResponseQueueCapacity", values.terminalResponseQueueCapacity >= values.maxInFlightTerminalResponses],
-    ["terminalResponseBurst", values.terminalResponseBurst >= values.maxInFlightTerminalResponses],
-    ["terminalResponseRatePerSecond", values.terminalResponseRatePerSecond >= values.admissionRatePerSecond],
-    [
-      "maxRetainedTerminalResponseSubjects",
-      values.maxRetainedTerminalResponseSubjects >= values.maxInFlightTerminalResponses
-    ],
-    ["compensationBatchSize", values.compensationBatchSize <= values.maxActiveChannels],
-    ["sqlAdmissionQueueCapacity", values.sqlAdmissionQueueCapacity >= values.maxInFlightSqlAdmission],
-    ["sqlTerminalQueueCapacity", values.sqlTerminalQueueCapacity >= values.maxInFlightSqlTerminal],
-    ["sqlDeliveryQueueCapacity", values.sqlDeliveryQueueCapacity >= values.maxInFlightSqlDelivery],
-    ["sqlMaintenanceQueueCapacity", values.sqlMaintenanceQueueCapacity >= values.maxInFlightSqlMaintenance],
-    [
-      "maxInFlightSqlTransactions",
-      values.maxInFlightSqlAdmission +
-          values.maxInFlightSqlTerminal +
-          values.maxInFlightSqlDelivery +
-          values.maxInFlightSqlMaintenance <=
-        values.maxInFlightSqlTransactions
-    ],
-    [
-      "maintenanceIntervalMillis",
-      [
-        values.claimRecoveryBatchSize,
-        values.expiryBatchSize,
-        values.integrityBatchSize,
-        values.reconciliationBatchSize,
-        values.terminalCollectionBatchSize
-      ].every((batchSize) => batchSize * 1_000 / values.maintenanceIntervalMillis >= values.admissionRatePerSecond)
-    ],
-    ["claimRecoveryRowsPerSecond", values.claimRecoveryRowsPerSecond >= values.admissionRatePerSecond],
-    [
-      "claimRecoveryRowsPerSecond",
-      values.claimRecoveryRowsPerSecond >=
-        values.claimRecoveryBatchSize * 1_000 / values.maintenanceIntervalMillis
-    ],
-    ["expiryRowsPerSecond", values.expiryRowsPerSecond >= values.admissionRatePerSecond],
-    [
-      "expiryRowsPerSecond",
-      values.expiryRowsPerSecond >=
-        values.expiryBatchSize * 1_000 / values.maintenanceIntervalMillis
-    ],
-    ["integrityRowsPerSecond", values.integrityRowsPerSecond >= values.admissionRatePerSecond],
-    [
-      "integrityRowsPerSecond",
-      values.integrityRowsPerSecond >=
-        values.integrityBatchSize * 1_000 / values.maintenanceIntervalMillis
-    ],
-    ["reconciliationRowsPerSecond", values.reconciliationRowsPerSecond >= values.admissionRatePerSecond],
-    [
-      "reconciliationRowsPerSecond",
-      values.reconciliationRowsPerSecond >=
-        values.reconciliationBatchSize * 1_000 / values.maintenanceIntervalMillis
-    ],
-    ["terminalCollectionRowsPerSecond", values.terminalCollectionRowsPerSecond >= values.admissionRatePerSecond],
-    [
-      "terminalCollectionRowsPerSecond",
-      values.terminalCollectionRowsPerSecond >=
-        values.terminalCollectionBatchSize * 1_000 / values.maintenanceIntervalMillis
-    ],
-    ["orphanChannelCleanupRowsPerSecond", values.orphanChannelCleanupRowsPerSecond >= values.admissionRatePerSecond],
-    ["shutdownReleaseConcurrency", values.shutdownReleaseConcurrency <= values.maxInFlightSqlTransactions],
-    ["shutdownReleaseTimeoutMillis", values.shutdownReleaseTimeoutMillis < values.claimLeaseMillis]
+      // A burst smaller than the concurrency cap would refuse callers the concurrency limit was
+      // sized to admit, so the rate limiter would be the binding constraint rather than the pool.
+      "authenticationBurst",
+      values.authenticationBurst >= values.maxInFlightAuthentication
+    ]
   ]
   const firstInvalid = relations.find(([, valid]) => !valid)
-  if (firstInvalid !== undefined) return invalid(firstInvalid[0])
-
-  const requiredTransactionsPerSecond = values.admissionRatePerSecond +
-    values.claimRecoveryRowsPerSecond / values.claimRecoveryBatchSize +
-    values.expiryRowsPerSecond / values.expiryBatchSize +
-    values.integrityRowsPerSecond / values.integrityBatchSize +
-    values.reconciliationRowsPerSecond / values.reconciliationBatchSize +
-    values.terminalCollectionRowsPerSecond / values.terminalCollectionBatchSize +
-    values.orphanChannelCleanupRowsPerSecond / values.orphanChannelCleanupBatchSize
-  return values.sqliteTransactionCapacityPerSecond >=
-      requiredTransactionsPerSecond * (1 + values.sqliteCapacityHeadroomPercent / 100)
-    ? Effect.succeed(values)
-    : invalid("sqliteTransactionCapacityPerSecond")
+  return firstInvalid === undefined ? Effect.succeed(values) : invalid(firstInvalid[0])
 }
 
 export const make = (values: Values) =>

@@ -224,12 +224,6 @@ describe("PeerRpcObservability", () => {
         assert.isTrue(Exit.isFailure(exit))
         if (Exit.isFailure(exit)) assert.strictEqual(exit.cause, cause)
       }
-      yield* PeerRpcObservability.recordRelayQuotaRejection("Shard")
-      yield* PeerRpcObservability.setRelayPending(2, 8)
-      yield* PeerRpcObservability.setRelayActiveClaims(1)
-      yield* PeerRpcObservability.setRelayWorkers(3)
-      yield* PeerRpcObservability.setRelayReadyQueueItems("New", 2)
-      yield* PeerRpcObservability.setRelayReadyQueueItems("Retry", 1)
       yield* PeerRpcObservability.recordRelayOutcome({
         operation: "RelayAcknowledge",
         direction: "Receive",
@@ -292,34 +286,6 @@ describe("PeerRpcObservability", () => {
           PeerRpcObservability.relayDurationMillis("RelayAdmit", "Send", "Failure")
         )).count,
         causes.length
-      )
-      assert.strictEqual(
-        (yield* metricValue(PeerRpcObservability.relayQuotaRejections("Shard"))).count,
-        1
-      )
-      assert.strictEqual(
-        (yield* metricValue(PeerRpcObservability.relayPendingItems())).value,
-        2
-      )
-      assert.strictEqual(
-        (yield* metricValue(PeerRpcObservability.relayPendingBytes())).value,
-        8
-      )
-      assert.strictEqual(
-        (yield* metricValue(PeerRpcObservability.relayActiveClaims())).value,
-        1
-      )
-      assert.strictEqual(
-        (yield* metricValue(PeerRpcObservability.relayWorkers())).value,
-        3
-      )
-      assert.strictEqual(
-        (yield* metricValue(PeerRpcObservability.relayReadyQueueItems("New"))).value,
-        2
-      )
-      assert.strictEqual(
-        (yield* metricValue(PeerRpcObservability.relayReadyQueueItems("Retry"))).value,
-        1
       )
       assert.strictEqual(
         (yield* metricValue(

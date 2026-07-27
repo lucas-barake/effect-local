@@ -161,7 +161,7 @@ idempotent during the negotiated window.
 Relay FIFO ordering is scoped to one exact directed peer channel. One claimed head blocks later rows in that channel.
 Unrelated channels do not share that ordering fence.
 
-Recipient delivery attempts are durable and bounded by `PeerRelayLimits.maximumDeliveryAttempts`, which defaults to
+Recipient delivery attempts are durable and bounded by `RelayInbox.Options.maxDeliveries`, which is set to
 `16`. Failed, interrupted, disconnected, and expired claims advance the count. Reaching the cap changes the message
 to `DeadLettered` and erases the payload. Restart cannot reset this poison bound.
 

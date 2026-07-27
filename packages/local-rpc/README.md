@@ -10,7 +10,7 @@ and recipient receipts remain SQLite.
 Automerge `3.3.2` has no allocation bounded semantic decode API, so safe relay composition explicitly passes
 `denyUnsafeUnboundedAutomerge3Decode`. A separate exact unsafe resource trust grant is required to proceed. Ordinary
 authentication and document authorization do not provide that grant.
-Delivery attempts are durable and bounded. `PeerRelayLimits.maximumDeliveryAttempts` defaults to `16`, then dead
+Delivery attempts are durable and bounded. `RelayInbox.Options.maxDeliveries` is required per deployment, then dead
 letters the message and erases its payload.
 Policy revocation and each bounded relay operation contend on a local gate. Revocation admitted first prevents SQL
 mutation or payload emission. An operation admitted first may finish. Revocation drains it and blocks later work.

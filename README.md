@@ -1231,27 +1231,27 @@ validate their bounds in the Effect error channel with the tagged `InvalidOption
 
 Consistency guarantees:
 
-| Boundary                 | Guarantee                                                                                                                    |
-| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
-| One document command     | Serialized through its Cluster entity and committed with canonical state, projections, receipt, sequence, and stored reply   |
-| Command retry            | Within one replica incarnation, the same command ID and canonical request returns the durable result                         |
-| Different command input  | Within one replica incarnation, reusing a command ID for different input fails                                               |
-| Query                    | Reads local projection state under the replica operation gate                                                                |
-| Multi document invariant | Not transactional. Model one aggregate document or an explicit Workflow                                                      |
-| Peer convergence         | Replicas converge after receiving the same valid Automerge change set                                                        |
-| Cross lineage sync       | Refused, never merged. A rewritten document stops synchronizing with every peer that holds the superseded lineage            |
-| Restore                  | Exclusive, fenced, staged, schema checked, and projection rebuilding                                                         |
-| Atom invalidation        | Reactive cache refresh, not a durability acknowledgement                                                                     |
-| Presence                 | Expiring best effort state with no durability guarantee                                                                      |
-| Automerge observation    | The peer's sync state reports all current local changes observed. It does not prove remote storage durability                |
-| RPC `Open` handshake     | One authenticated, authorized, bounded durable session exists for exactly the selected whole documents                       |
-| RPC `Push` success       | The backend relay store committed the complete envelope and quota reservation before replying                                |
-| Relay recipient ack      | The recipient SQL sync workflow and sender scoped receipt committed before the fenced acknowledgement was attempted          |
-| Relay delivery           | At least once within configured retry, expiry, retention, authorization, and capacity boundaries                             |
-| Relay poison bound       | Delivery attempts are durable. Reaching `maximumDeliveryAttempts`, default `16`, dead letters the row and erases its payload |
-| Effect RPC stream ack    | The response chunk was acknowledged by the RPC protocol. It is neither a byte credit nor an application receipt              |
-| WebSocket frame order    | Frames are ordered within one live RFC 6455 connection. Reconnect, replay, authorization, and persistence are separate       |
-| `durableConfirmation`    | Always `false` in the shipped peer transports                                                                                |
+| Boundary                 | Guarantee                                                                                                                            |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| One document command     | Serialized through its Cluster entity and committed with canonical state, projections, receipt, sequence, and stored reply           |
+| Command retry            | Within one replica incarnation, the same command ID and canonical request returns the durable result                                 |
+| Different command input  | Within one replica incarnation, reusing a command ID for different input fails                                                       |
+| Query                    | Reads local projection state under the replica operation gate                                                                        |
+| Multi document invariant | Not transactional. Model one aggregate document or an explicit Workflow                                                              |
+| Peer convergence         | Replicas converge after receiving the same valid Automerge change set                                                                |
+| Cross lineage sync       | Refused, never merged. A rewritten document stops synchronizing with every peer that holds the superseded lineage                    |
+| Restore                  | Exclusive, fenced, staged, schema checked, and projection rebuilding                                                                 |
+| Atom invalidation        | Reactive cache refresh, not a durability acknowledgement                                                                             |
+| Presence                 | Expiring best effort state with no durability guarantee                                                                              |
+| Automerge observation    | The peer's sync state reports all current local changes observed. It does not prove remote storage durability                        |
+| RPC `Open` handshake     | One authenticated, authorized, bounded durable session exists for exactly the selected whole documents                               |
+| RPC `Push` success       | The backend relay store committed the complete envelope and quota reservation before replying                                        |
+| Relay recipient ack      | The recipient SQL sync workflow and sender scoped receipt committed before the fenced acknowledgement was attempted                  |
+| Relay delivery           | At least once within configured retry, expiry, retention, authorization, and capacity boundaries                                     |
+| Relay poison bound       | Delivery attempts are durable. Reaching `RelayInbox.Options.maxDeliveries` dead letters the row, which stops it blocking its channel |
+| Effect RPC stream ack    | The response chunk was acknowledged by the RPC protocol. It is neither a byte credit nor an application receipt                      |
+| WebSocket frame order    | Frames are ordered within one live RFC 6455 connection. Reconnect, replay, authorization, and persistence are separate               |
+| `durableConfirmation`    | Always `false` in the shipped peer transports                                                                                        |
 
 ### Retry and ambiguity
 
@@ -1272,9 +1272,10 @@ Consistency guarantees:
 - Retry relay admission with the same stable `RelayMessageId` and exact outer envelope. A lost custody response,
   recipient acknowledgement, reconnect, or expired claim can duplicate delivery. Sender scoped recipient receipts
   suppress repeated application during the negotiated retention window.
-- Failed, interrupted, disconnected, and expired relay claims advance the durable delivery attempt count. Reaching
-  `PeerRelayLimits.maximumDeliveryAttempts` dead letters the message and erases its payload. Restart does not reset
-  the count.
+- A relay delivery advances the durable attempt count once the message has provably reached the transport, so a
+  message prepared for a channel and then abandoned on a flaky connection costs nothing. Reaching
+  `RelayInbox.Options.maxDeliveries` dead letters the message so it stops blocking its channel. Restart does not
+  reset the count.
 - Durable commit events are retried until publication into the bounded process local stream. Subscriber delivery is
   best effort because the stream uses sliding capacity. A later sequence gap, `FullRefreshRequired`, or refresh
   generation change instructs the subscriber to reread canonical state. If no later event arrives, no notification

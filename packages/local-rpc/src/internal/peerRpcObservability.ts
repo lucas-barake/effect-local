@@ -7,6 +7,21 @@ import * as Option from "effect/Option"
 import * as References from "effect/References"
 import * as Tracer from "effect/Tracer"
 
+/**
+ * Spans and metrics for the peer RPC boundary.
+ *
+ * Trimmed with the single-process relay. The gauges it used to publish — active sessions, queue
+ * depth, pending items and bytes, active claims, worker count, ready-queue depth, per-scope quota
+ * rejections — were all written by `PeerRpcServer` and `PeerRelayIngress`, and nothing writes them
+ * now: durable inbox depth belongs to the entity's store, and worker and queue accounting belongs
+ * to the cluster. They were removed rather than left declared, because a gauge that is always zero
+ * reads to an operator as "there is no backlog" rather than as "nobody is measuring".
+ *
+ * What remains is what the surviving code actually drives: the authentication boundary counter, and
+ * the relay outcome, byte, item, attempt, duration and latency families that `observeRelay` records
+ * from the client transport.
+ */
+
 export type Operation =
   | "Authentication"
   | "Open"
@@ -86,14 +101,6 @@ export type RelayMaintenanceStage =
   | "Reconcile"
   | "Collect"
   | "Usage"
-
-export type RelayQuotaDomain =
-  | "Payload"
-  | "SenderPeer"
-  | "RecipientPeer"
-  | "RecipientSubject"
-  | "Tenant"
-  | "Shard"
 
 export interface RelayFacts {
   readonly bytes?: number
@@ -204,70 +211,14 @@ export const relayLatencyMillis = (
     boundaries: [0, 1, 5, 10, 25, 50, 100, 250, 500, 1_000, 5_000, 30_000, 300_000, 3_600_000, 86_400_000]
   })
 
-export const relayQuotaRejections = (domain: RelayQuotaDomain) =>
-  Metric.counter("effect_local_rpc_relay_quota_rejection_total", {
-    incremental: true,
-    attributes: { domain }
-  })
-
-export const relayPendingItems = () => Metric.gauge("effect_local_rpc_relay_pending_items")
-
-export const relayPendingBytes = () => Metric.gauge("effect_local_rpc_relay_pending_bytes")
-
-export const relayActiveClaims = () => Metric.gauge("effect_local_rpc_relay_active_claims")
-
-export const relayWorkers = () => Metric.gauge("effect_local_rpc_relay_workers")
-
-export const relayReadyQueueItems = (lane: "New" | "Retry") =>
-  Metric.gauge("effect_local_rpc_relay_ready_queue_items", {
-    attributes: { lane }
-  })
-
 export const boundary = (operation: Operation, result: Result) =>
   Metric.counter("effect_local_rpc_boundary_total", {
     incremental: true,
     attributes: { operation, result }
   })
 
-export const activeSessions = () => Metric.gauge("effect_local_rpc_active_sessions")
-
-export const queueItems = (operation: "Inbound" | "Outbound") =>
-  Metric.gauge("effect_local_rpc_queue_items", { attributes: { operation } })
-
-export const bytes = (operation: "Inbound" | "Outbound") =>
-  Metric.histogram("effect_local_rpc_message_bytes", {
-    attributes: { operation },
-    boundaries: [0, 64, 256, 1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576]
-  })
-
-export const selectedDocuments = () =>
-  Metric.histogram("effect_local_rpc_selected_documents", {
-    attributes: { operation: "Open" },
-    boundaries: [0, 1, 2, 4, 8, 16, 32, 64, 128]
-  })
-
-export const record = (operation: Operation, result: Result, amount: number) =>
+const record = (operation: Operation, result: Result, amount: number) =>
   Metric.update(boundary(operation, result), amount).pipe(
-    Effect.provideService(Metric.CurrentMetricAttributes, {})
-  )
-
-export const modifyActiveSessions = (amount: number) =>
-  Metric.modify(activeSessions(), amount).pipe(
-    Effect.provideService(Metric.CurrentMetricAttributes, {})
-  )
-
-export const modifyQueueItems = (operation: "Inbound" | "Outbound", amount: number) =>
-  Metric.modify(queueItems(operation), amount).pipe(
-    Effect.provideService(Metric.CurrentMetricAttributes, {})
-  )
-
-export const recordBytes = (operation: "Inbound" | "Outbound", amount: number) =>
-  Metric.update(bytes(operation), amount).pipe(
-    Effect.provideService(Metric.CurrentMetricAttributes, {})
-  )
-
-export const recordSelectedDocuments = (amount: number) =>
-  Metric.update(selectedDocuments(), amount).pipe(
     Effect.provideService(Metric.CurrentMetricAttributes, {})
   )
 
@@ -466,25 +417,6 @@ export const recordRelayOutcome = (options: {
   }
   return Effect.all(updates, { discard: true }).pipe(withoutMetricAttributes)
 }
-
-export const recordRelayQuotaRejection = (domain: RelayQuotaDomain) =>
-  Metric.update(relayQuotaRejections(domain), 1).pipe(withoutMetricAttributes)
-
-export const setRelayPending = (items: number, amountBytes: number) =>
-  Effect.all([
-    Metric.update(relayPendingItems(), items),
-    Metric.update(relayPendingBytes(), amountBytes)
-  ], { discard: true }).pipe(withoutMetricAttributes)
-
-export const setRelayActiveClaims = (amount: number) =>
-  Metric.update(relayActiveClaims(), amount).pipe(withoutMetricAttributes)
-
-export const setRelayWorkers = (amount: number) => Metric.update(relayWorkers(), amount).pipe(withoutMetricAttributes)
-
-export const setRelayReadyQueueItems = (
-  lane: "New" | "Retry",
-  amount: number
-) => Metric.update(relayReadyQueueItems(lane), amount).pipe(withoutMetricAttributes)
 
 export const observe = <A, E, R,>(options: {
   readonly effect: Effect.Effect<A, E, R>
