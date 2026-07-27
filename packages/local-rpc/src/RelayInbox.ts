@@ -474,7 +474,15 @@ export const layer = (options: Options) =>
               Effect.logWarning("Relay inbox admission failed").pipe(
                 Effect.annotateLogs({ inboxKey, reason: error.reason._tag }),
                 Effect.andThen(new PeerRpcError.ServerUnavailable())
-              ))
+              )),
+            // `inboxKey` is a digest and the ids are opaque, so both are safe to record. The
+            // envelope and its payload never become attributes.
+            Effect.withSpan("RelayInbox.Deliver", {
+              attributes: {
+                inbox_key: inboxKey,
+                relay_message_id: payload.envelope.relayMessageId
+              }
+            })
           ),
 
         // Forked so it does not hold the entity's sequential handler permit. Without this the
@@ -482,39 +490,45 @@ export const layer = (options: Options) =>
         // each delivery could never be handled, stalling the inbox with no error anywhere.
         Subscribe: ({ payload }) =>
           Rpc.fork(
-            sessionLock.withPermit(
-              // Installation is uninterruptible up to the point the session becomes reachable
-              // through `sessionRef`. An interrupt in between would strand the scope — nothing
-              // else holds a reference to close it — and could leave a dispatcher polling for a
-              // session no one owns, delivering alongside its own replacement.
-              Effect.uninterruptibleMask((restore) =>
-                Effect.gen(function*() {
-                  yield* restore(closeCurrentSession)
+            // Spans the installation of the session, not its lifetime: the handler returns the
+            // queue as soon as the session is reachable, and the stream outlives it.
+            Effect.withSpan(
+              sessionLock.withPermit(
+                // Installation is uninterruptible up to the point the session becomes reachable
+                // through `sessionRef`. An interrupt in between would strand the scope — nothing
+                // else holds a reference to close it — and could leave a dispatcher polling for a
+                // session no one owns, delivering alongside its own replacement.
+                Effect.uninterruptibleMask((restore) =>
+                  Effect.gen(function*() {
+                    yield* restore(closeCurrentSession)
 
-                  const scope = yield* Scope.make()
-                  const install = Effect.gen(function*() {
-                    const outbound = yield* Queue.bounded<PeerRpc.StoredMessage, Cause.Done>(0)
-                    const now = yield* Clock.currentTimeMillis
-                    const deadlineAt = yield* Ref.make(now + options.sessionDeadlineMillis)
-                    const session: Session = {
-                      sessionId: payload.sessionId,
-                      outbound,
-                      settlements: new Map(),
-                      busyChannels: new Set(),
-                      wake: yield* Latch.make(true),
-                      scope,
-                      deadlineAt
-                    }
-                    yield* Effect.forkIn(dispatch(session), scope)
-                    yield* Ref.set(sessionRef, Option.some(session))
-                    return outbound
+                    const scope = yield* Scope.make()
+                    const install = Effect.gen(function*() {
+                      const outbound = yield* Queue.bounded<PeerRpc.StoredMessage, Cause.Done>(0)
+                      const now = yield* Clock.currentTimeMillis
+                      const deadlineAt = yield* Ref.make(now + options.sessionDeadlineMillis)
+                      const session: Session = {
+                        sessionId: payload.sessionId,
+                        outbound,
+                        settlements: new Map(),
+                        busyChannels: new Set(),
+                        wake: yield* Latch.make(true),
+                        scope,
+                        deadlineAt
+                      }
+                      yield* Effect.forkIn(dispatch(session), scope)
+                      yield* Ref.set(sessionRef, Option.some(session))
+                      return outbound
+                    })
+                    return yield* Effect.onError(
+                      install,
+                      () => Effect.orDie(Scope.close(scope, Exit.void))
+                    )
                   })
-                  return yield* Effect.onError(
-                    install,
-                    () => Effect.orDie(Scope.close(scope, Exit.void))
-                  )
-                })
-              )
+                )
+              ),
+              "RelayInbox.Subscribe",
+              { attributes: { inbox_key: inboxKey } }
             )
           ),
 
@@ -539,9 +553,21 @@ export const layer = (options: Options) =>
             // relay receipt on this reply, so a premature success would leave neither side holding
             // the message.
             yield* Deferred.await(settlement.durable)
-          }),
+          }).pipe(
+            Effect.withSpan("RelayInbox.Settle", {
+              attributes: {
+                inbox_key: inboxKey,
+                relay_message_id: payload.relayMessageId,
+                outcome: payload.outcome
+              }
+            })
+          ),
 
-        Heartbeat: ({ payload }) => currentSession(payload.sessionId).pipe(Effect.flatMap(extendDeadline)),
+        Heartbeat: ({ payload }) =>
+          currentSession(payload.sessionId).pipe(
+            Effect.flatMap(extendDeadline),
+            Effect.withSpan("RelayInbox.Heartbeat", { attributes: { inbox_key: inboxKey } })
+          ),
 
         EndSession: ({ payload }) =>
           sessionLock.withPermit(
@@ -549,6 +575,8 @@ export const layer = (options: Options) =>
               Effect.flatMap(closeSession),
               Effect.catchTag("SessionUnavailable", () => Effect.void)
             )
+          ).pipe(
+            Effect.withSpan("RelayInbox.EndSession", { attributes: { inbox_key: inboxKey } })
           )
       })
     }),

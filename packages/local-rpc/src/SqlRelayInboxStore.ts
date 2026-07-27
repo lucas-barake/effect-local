@@ -567,15 +567,52 @@ export const make = Effect.gen(function*() {
       return rows.length
     })
 
+  // Spanned at the boundary rather than inside each body, so every database round trip is visible
+  // with a stable name. `inbox_key` is a digest and safe to record; the envelope and payload are
+  // never attributes.
   return RelayInboxStore.RelayInboxStore.of({
-    admit,
-    pendingHeads,
-    recordDelivery,
-    settle,
-    usage,
-    abandoned,
-    expire,
-    collect
+    admit: (request) =>
+      admit(request).pipe(
+        Effect.withSpan("SqlRelayInboxStore.admit", {
+          attributes: { inbox_key: request.inboxKey, relay_message_id: request.envelope.relayMessageId }
+        })
+      ),
+    pendingHeads: (inboxKey, options) =>
+      pendingHeads(inboxKey, options).pipe(
+        Effect.withSpan("SqlRelayInboxStore.pendingHeads", {
+          attributes: { inbox_key: inboxKey, limit: options.limit }
+        })
+      ),
+    recordDelivery: (inboxKey, relayMessageId, options) =>
+      recordDelivery(inboxKey, relayMessageId, options).pipe(
+        Effect.withSpan("SqlRelayInboxStore.recordDelivery", {
+          attributes: { inbox_key: inboxKey, relay_message_id: relayMessageId, max_deliveries: options.maxDeliveries }
+        })
+      ),
+    settle: (inboxKey, relayMessageId, options) =>
+      settle(inboxKey, relayMessageId, options).pipe(
+        Effect.withSpan("SqlRelayInboxStore.settle", {
+          attributes: { inbox_key: inboxKey, relay_message_id: relayMessageId, outcome: options.outcome }
+        })
+      ),
+    usage: (inboxKey) =>
+      usage(inboxKey).pipe(
+        Effect.withSpan("SqlRelayInboxStore.usage", { attributes: { inbox_key: inboxKey } })
+      ),
+    abandoned: (inboxKey, options) =>
+      abandoned(inboxKey, options).pipe(
+        Effect.withSpan("SqlRelayInboxStore.abandoned", {
+          attributes: { inbox_key: inboxKey, limit: options.limit }
+        })
+      ),
+    expire: (options) =>
+      expire(options).pipe(
+        Effect.withSpan("SqlRelayInboxStore.expire", { attributes: { limit: options.limit } })
+      ),
+    collect: (options) =>
+      collect(options).pipe(
+        Effect.withSpan("SqlRelayInboxStore.collect", { attributes: { limit: options.limit } })
+      )
   })
 }) satisfies Effect.Effect<
   RelayInboxStore.RelayInboxStore["Service"],
