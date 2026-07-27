@@ -360,7 +360,9 @@ export const make = Effect.gen(function*() {
         return { _tag: "Recorded", deliveries: 0 } as const
       }
       const deliveries = current.value.deliveries
-      if (current.value.state === "Pending" && deliveries >= options.maxDeliveries) {
+      // Strictly greater: the attempt that spends the last of the budget is still a real delivery
+      // the recipient can settle, so dead lettering at equality would waste it.
+      if (current.value.state === "Pending" && deliveries > options.maxDeliveries) {
         yield* sql`
           UPDATE ${sql(table)}
           SET state = 'DeadLettered', terminal_at = ${options.now}
