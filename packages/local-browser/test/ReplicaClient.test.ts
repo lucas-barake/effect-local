@@ -234,35 +234,24 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.strictEqual(error.reason._tag, "ProtocolMismatch")
     })).pipe(Effect.provide(Owner)))
 
-  it.effect("decodes and rejects owners using an older protocol", () =>
+  // The version is a schema literal, so an owner from another build is refused when its handshake
+  // is decoded rather than by a check the client has to remember to make.
+  it.effect("refuses a handshake carrying any other protocol version", () =>
     Effect.scoped(Effect.gen(function*() {
       const open = ReplicaRpc.group.requests.get("OpenSession")
       if (open?._tag !== "OpenSession") return yield* Effect.die(new Error("OpenSession RPC not found"))
-      yield* Schema.decodeUnknownEffect(open.successSchema)({
+      const handshake = (protocolVersion: number) => ({
         leaseMillis: 1_000,
-        protocolVersion: ReplicaRpc.protocolVersion - 1,
+        protocolVersion,
         definitionHash: definition.hash,
         ownerEpoch: "owner"
       })
-      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-      const older = new Proxy(rpc, {
-        get(target, property, receiver) {
-          const value = Reflect.get(target, property, receiver)
-          if (property !== "OpenSession") return value
-          return (payload: never) =>
-            value(payload).pipe(Effect.map((lease) => ({
-              ...(lease as {
-                readonly leaseMillis: number
-                readonly protocolVersion: number
-                readonly definitionHash: string
-                readonly ownerEpoch: string
-              }),
-              protocolVersion: ReplicaRpc.protocolVersion - 1
-            })))
-        }
-      })
-      const error = yield* Effect.flip(ReplicaClient.fromRpcClient(definition, older))
-      assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+      const decode = Schema.decodeUnknownEffect(open.successSchema)
+
+      yield* decode(handshake(ReplicaRpc.protocolVersion))
+      for (const other of [ReplicaRpc.protocolVersion - 1, ReplicaRpc.protocolVersion + 1]) {
+        assert.strictEqual((yield* Effect.exit(decode(handshake(other))))._tag, "Failure")
+      }
     })).pipe(Effect.provide(Owner)))
 
   it.effect("recovers ambiguous commands through typed receipt lookup", () =>

@@ -25,22 +25,16 @@ const ExportedDocument = Schema.Struct({
 const JsonOutcome = CommandOutcome.schema(Schema.Json, Schema.Json)
 const DocumentIdOutcome = CommandOutcome.schema(Identity.DocumentId, Schema.Never)
 /**
- * The tab to owner protocol version. There is exactly one, and this is it.
- *
- * It counted to four while the protocol was being built, which implied three predecessors that were
- * never released and can never be spoken. `PeerRpc` was reset to `1` for the same reason.
- *
- * The field stays on the wire even though only one value is legal, because a `SharedWorker` outlives
- * the page that started it: a tab from a new deployment can meet an owner from the old one, in
- * either direction. That is what this catches, and it is why the version is compared in the handler
- * rather than pinned as a schema literal - a literal would turn a stale build into an undecodable
- * message instead of the typed `ProtocolMismatch` that `ReplicaClient` recovers from.
+ * There is exactly one version of the tab to owner protocol, and a `SharedWorker` outlives the page
+ * that started it, so a tab from a new deployment can meet an owner from the old one. Pinning the
+ * literal makes that mismatch a decode failure at the boundary rather than a check every handler
+ * has to remember.
  */
 export const protocolVersion = 1
 const SessionLease = Schema.Struct({ leaseMillis: Schema.Int })
 export const SessionHandshake = Schema.Struct({
   leaseMillis: Schema.Int,
-  protocolVersion: Schema.Int,
+  protocolVersion: Schema.Literal(protocolVersion),
   definitionHash: Schema.String,
   ownerEpoch: Schema.String,
   maxChunkBytes: Schema.optional(Schema.Int),
@@ -104,9 +98,7 @@ export const group = RpcGroup.make(
   Rpc.make("OpenSession", {
     payload: {
       sessionId: Identity.SessionId,
-      // Required. It was optional to tolerate a client that predated the field, and no such client
-      // was ever released; every client that has ever existed sends it.
-      protocolVersion: Schema.Int,
+      protocolVersion: Schema.Literal(protocolVersion),
       definitionHash: Schema.String
     },
     success: SessionHandshake,

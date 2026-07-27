@@ -93,13 +93,7 @@ const admission = (options: {
   quota: options.quota ?? quota
 })
 
-/**
- * Reads a stored row behind the store's own API.
- *
- * Payload erasure is a property of what the database still holds, and no store method reports the
- * bytes of a terminal row — that is precisely the point of erasing them. Observing it therefore
- * means looking at the row. Decoded rather than asserted, like every other read of this table.
- */
+/** No store method reports the bytes of a terminal row, which is the point of erasing them. */
 const StoredRow = Schema.Struct({
   state: Schema.String,
   envelope: Schema.String,
@@ -385,8 +379,6 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
         "",
         "an acknowledged message's bytes must not sit in the relay for the retention window"
       )
-      // Erasure removes the payload, not the identity. The evidence a replay is matched against has
-      // to outlive the bytes, otherwise data minimization buys itself a redelivery.
       assert.strictEqual(row.message_hash, "a".repeat(64))
       assert.strictEqual(row.outer_envelope_digest, "b".repeat(64))
 
@@ -426,9 +418,8 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
       )
       yield* store.expire({ now: 4_005_000, limit: 1_000, terminalRetentionMillis: 1_000 })
 
-      // The boundary erasure is allowed to cross. `admit`'s revive path reuses this envelope in
-      // place, so erasing on every terminal transition would destroy the last durable copy of a
-      // message whose sender is still holding custody of it.
+      // `admit`'s revive path replays this envelope, so erasing every terminal state would destroy the
+      // last durable copy of a message whose sender still holds custody.
       const row = yield* storedRow("erase-expired", relayId("000000000001"))
       assert.strictEqual(row.state, "Expired")
       assert.notStrictEqual(row.envelope, "", "an expired message keeps the bytes a revive replays")

@@ -6,13 +6,7 @@ import type * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 
-/**
- * The smallest domain that can show a change crossing the relay.
- *
- * `labels` is a list rather than another scalar because a list merges additively: one device
- * holding the other's label is evidence the change arrived, not evidence of who won a
- * last-writer-wins coin toss.
- */
+/** `labels` is a list so the merge is additive: holding the other's label is evidence of arrival. */
 export const TaskDocument = Document.make("RelayTask", {
   schema: Schema.Struct({
     title: Schema.String,
@@ -41,7 +35,6 @@ export const Handlers = AddLabel.toLayer(({ draft, payload }) => {
 
 export const DomainLive = Layer.mergeAll(Handlers)
 
-/** Generous, because the fixture is about reachability rather than about pressure. */
 export const limits: ReplicaLimits.Values = {
   maxBackupBytes: 16 * 1024 * 1024,
   maxChunkBytes: 64 * 1024,

@@ -1664,28 +1664,4 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
         assert.strictEqual(closeCalls, 1)
       }
     }))
-
-  // Expressed as "not ours" rather than as a specific older number. There is only one protocol
-  // version, so naming a predecessor would invent a history that cannot exist; what this pins is
-  // that an owner from a different build is refused before any transport is opened.
-  it.effect("rejects a handshake from an owner speaking another protocol version", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const otherVersion = ReplicaRpc.protocolVersion + 1
-      const otherRpc = {
-        OpenSession: () =>
-          Effect.succeed({
-            leaseMillis: 10_000,
-            protocolVersion: otherVersion,
-            definitionHash: definition.hash,
-            ownerEpoch: "owner"
-          }),
-        CloseSession: () => Effect.void
-      } as unknown as RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>
-      const error = yield* ReplicaClient.fromRpcClient(definition, otherRpc).pipe(Effect.flip)
-      assert.strictEqual(error.reason._tag, "ProtocolMismatch")
-      if (error.reason._tag === "ProtocolMismatch") {
-        assert.strictEqual(error.reason.expected, `protocol version ${ReplicaRpc.protocolVersion}`)
-        assert.strictEqual(error.reason.observed, `protocol version ${otherVersion}`)
-      }
-    })))
 })

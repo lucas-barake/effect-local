@@ -450,16 +450,9 @@ export const make = Effect.gen(function*() {
       // The horizon only ever grows. Shrinking it would reopen a deduplication window a sender may
       // still be replaying into.
       const greatest = greatestFn
-      // The payload is erased here and nowhere else. A settled message has reached the recipient
-      // that was allowed to read it, so the relay holding its bytes for the rest of the retention
-      // window is storage it no longer has a reason for. What has to survive is the evidence a
-      // replay is matched against — `message_hash`, `outer_envelope_digest` and the horizon — and
-      // none of that is the payload.
-      //
-      // Only `Acknowledged` and `Rejected` reach this statement, and neither is ever revived.
-      // `DeadLettered` and `Expired` are, and `admit`'s revive path replays this very column, so
-      // erasing on every terminal transition would destroy the last durable copy of a message whose
-      // sender still holds custody of it.
+      // Only `Acknowledged` and `Rejected` reach this statement and neither is ever revived, so this is
+      // the one place a payload may be cleared. `DeadLettered` and `Expired` are replayed by `admit`.
+      // What a replay is matched against - the hash, the digest, the horizon - is not the payload.
       yield* sql`
         UPDATE ${sql(table)}
         SET state = ${options.outcome}, terminal_at = ${options.now}, envelope = '',

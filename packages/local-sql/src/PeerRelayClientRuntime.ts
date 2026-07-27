@@ -206,11 +206,8 @@ export const makeScoped = Effect.gen(function*() {
 export const layer = Layer.effect(PeerRelayClientRuntime, makeScoped)
 
 /**
- * The runtime over the SQL outbox, which is the only outbox this package ships.
- *
- * `layer` leaves `PeerRelayOutbox` to the consumer, so every relay client had to rediscover that it
- * is satisfied by `PeerRelayOutbox.layerSql` and that both then want the same `ReplicaGate`,
- * `ReplicaLimits` and `SqlClient`. That composition existed only inside this package's own tests.
+ * `layer` leaves `PeerRelayOutbox` to the consumer, so every relay client had to rediscover that
+ * it is satisfied by `layerSql` and that both want the same gate, limits and client.
  */
 export const layerSql: Layer.Layer<
   PeerRelayClientRuntime,

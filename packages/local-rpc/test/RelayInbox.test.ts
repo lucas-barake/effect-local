@@ -396,11 +396,8 @@ describe("RelayInbox", () => {
       )
     }).pipe(Effect.provide(layer)))
 
-  // Its own timeout rather than the 5s default. Advancing four hours of virtual time makes the
-  // runtime walk every task scheduled in that window, which costs real CPU proportional to the
-  // span: this check runs for roughly 845ms on an idle machine against 5 to 27ms for every other
-  // check in this file, so it is the one whose wall clock tracks machine load rather than the work
-  // it describes, and it timed out under a full parallel suite run.
+  // Its own timeout: advancing four hours of virtual time makes the runtime walk every task
+  // scheduled in that window, which costs ~845ms against 5-27ms for every other check here.
   it.effect("closes a replaced session even when the replacing subscribe is interrupted", () =>
     Effect.gen(function*() {
       const client = yield* inbox

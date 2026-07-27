@@ -1,12 +1,6 @@
 import * as Identity from "@lucas-barake/effect-local/Identity"
 
-/**
- * The fixed cast for the fixture: one relay, one tenant, two devices.
- *
- * Shared by the relay server and the page so the two cannot drift. The peer ids and the tenant are
- * part of the version 1 handshake, so a disagreement here is a failed connection rather than a
- * mismatch anything reports usefully.
- */
+/** Shared by the relay server and the page: the peer ids are part of the version 1 handshake. */
 
 const relayPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-00000000ffff")
 

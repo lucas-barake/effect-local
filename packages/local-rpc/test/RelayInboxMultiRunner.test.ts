@@ -73,12 +73,8 @@ class PgContainer extends Context.Service<PgContainer>()(
 }
 
 /**
- * A client for one database inside the shared container.
- *
- * The database, not just the table prefix, is the isolation boundary that matters here:
- * `SqlRunnerStorage` takes its shard locks with `pg_try_advisory_lock`, and PostgreSQL advisory
- * locks are scoped to a database rather than to a table. Two runners pointed at differently
- * prefixed tables in one database would still contend for the same locks.
+ * The database, not the table prefix, is the isolation boundary: `SqlRunnerStorage` takes shard
+ * locks with `pg_try_advisory_lock`, and those are scoped per database.
  */
 const clientFor = (database?: string) =>
   Layer.unwrap(Effect.gen(function*() {
@@ -88,7 +84,6 @@ const clientFor = (database?: string) =>
     return Layer.orDie(PgClient.layer({ url: Redacted.make(url) }))
   }))
 
-/** An ephemeral port the OS has just confirmed is free. */
 const freePort: Effect.Effect<number> = Effect.acquireUseRelease(
   Effect.sync(() => Net.createServer()),
   (server) =>
@@ -111,13 +106,9 @@ const createDatabase = (name: string) =>
   }).pipe(Effect.orDie, Effect.provide(clientFor()), Effect.scoped)
 
 /**
- * One runner: the entity, a real socket transport, real ping health, and its own SQL cluster
- * storage over the shared database.
- *
- * `Runners.layerNoop` is deliberately absent. Every `RelayInbox` rpc is volatile, and
- * `Sharding.sendOutgoing` routes a volatile message for a remote shard through `Runners.send`,
- * which under `layerNoop` fails `EntityNotAssignedToRunner` forever. A socket transport is the
- * only thing that lets a non-owning runner reach the owner.
+ * `Runners.layerNoop` is deliberately absent. Every `RelayInbox` rpc is volatile, so a message for
+ * a remote shard routes through `Runners.send`, which under `layerNoop` fails
+ * `EntityNotAssignedToRunner` forever rather than surfacing.
  */
 const runner = (port: number, sql: Layer.Layer<SqlClient.SqlClient, never, PgContainer>) => {
   const config = ShardingConfig.layer({
@@ -132,16 +123,13 @@ const runner = (port: number, sql: Layer.Layer<SqlClient.SqlClient, never, PgCon
     shardsPerGroup: 8
   })
 
-  // This runner's own SQL cluster storage over the shared database, not a shared in-process
-  // instance. Two runners in production are two processes, each with its own client.
   const clusterStorage = Layer.mergeAll(
     Layer.orDie(SqlMessageStorage.layerWith({ prefix: "effect_local_cluster" })),
     Layer.orDie(SqlRunnerStorage.layerWith({ prefix: "effect_local_runner" }))
   ).pipe(Layer.provide(config))
 
-  // Real liveness, not `RunnerHealth.layerNoop`: an unhealthy runner is dropped from the hash ring,
-  // which is the mechanism that moves a shard's ownership. A noop health check asserts liveness by
-  // construction, which is the exact thing this test exists to stop doing.
+  // Real liveness: dropping an unhealthy runner from the hash ring is the mechanism that moves
+  // ownership, so a noop health check would assert the property under test by construction.
   const health = RunnerHealth.layerPing.pipe(
     Layer.provide(Runners.layerRpc),
     Layer.provide(NodeClusterSocket.layerClientProtocol),
@@ -201,21 +189,13 @@ const deliver = (id: string, sequence: number) => ({
 })
 
 /**
- * Brings two runners up and runs the ownership probe against them.
- *
- * `isolated` puts runner B in its own database. That is the negative control: neither runner sees
- * the other in `getRunners`, they take their shard locks in different advisory lock spaces, and so
- * each acquires every shard and serves its own instance of the inbox. Everything else is held
- * constant — same entity, same options, real sockets, real ping health — so the only thing the
- * probe can be reacting to is whether the two runners share a shard map.
+ * `isolated` puts runner B in its own database, so neither sees the other and each acquires every
+ * shard. That is the control: without it, a single owner proves nothing about sharing.
  */
 const probe = (options: { readonly isolated: boolean; readonly window: Duration.Duration }) =>
   Effect.gen(function*() {
     if (options.isolated) yield* createDatabase("runner_b")
 
-    // Ports are taken from the ephemeral range at run time. Fixed ports collide with anything else
-    // on the machine and with a second copy of this file, which is a failure mode that looks like a
-    // clustering bug rather than a port clash.
     const [portA, portB] = yield* Effect.forEach([0, 1], () => freePort)
     const contextA = yield* Layer.build(runner(portA!, clientFor()))
     const contextB = yield* Layer.build(
@@ -227,10 +207,8 @@ const probe = (options: { readonly isolated: boolean; readonly window: Duration.
     const clientA = makeA(inboxKey)
     const clientB = makeB(inboxKey)
 
-    // Membership has to converge before the probe, and `Deliver` alone is not that barrier: it
-    // returns as soon as ANY runner owns the shard, which is true while runner A is still alone in
-    // the ring. Probing then races the rebalance that follows runner B joining, and the entity is
-    // observed mid-migration.
+    // `Deliver` is not a barrier: it returns as soon as any runner owns the shard, which is true
+    // while runner A is still alone in the ring.
     const expectedRunners = options.isolated ? 1 : 2
     yield* Effect.forEach([contextA, contextB], (context) =>
       RunnerStorage.RunnerStorage.pipe(
@@ -244,15 +222,8 @@ const probe = (options: { readonly isolated: boolean; readonly window: Duration.
         Effect.provideContext(context)
       ))
 
-    // Membership converging is not the same as the shard being acquired: the ring is recomputed
-    // locally by each runner, but ownership only actually moves when a runner takes the shard's
-    // advisory lock. So wait on the acquisition itself, read off each runner's own shard map.
-    //
-    // Confirmed over consecutive polls rather than on first sight. While runner B is still
-    // acquiring, runner A holds every shard and the count reads as one owner - the right number for
-    // the wrong reason. Requiring the answer to hold still is what separates a settled assignment
-    // from a snapshot taken mid-rebalance, and it waits on the condition rather than on a duration
-    // guessed from the refresh intervals.
+    // Confirmed over consecutive polls: while runner B is still acquiring, runner A holds every
+    // shard and the owner count reads as one for the wrong reason.
     const shardId = yield* RelayInbox.RelayInbox.getShardId(EntityId.make(inboxKey)).pipe(
       Effect.provideContext(contextA)
     )
@@ -284,11 +255,9 @@ const probe = (options: { readonly isolated: boolean; readonly window: Duration.
       )
     )
 
-    // Positive evidence that runner A's session is live and the entity is delivering into it.
     const head = yield* Queue.take(delivered)
     assert.strictEqual(head.relayMessageId, relayId("000000000001"))
 
-    // The same inbox key, a different session, through the OTHER runner.
     yield* Effect.forkChild(
       Stream.runDrain(clientB.Subscribe({ sessionId: sessionId("00000000000b") }))
     )
@@ -297,9 +266,7 @@ const probe = (options: { readonly isolated: boolean; readonly window: Duration.
       Effect.timeoutOrElse({ duration: options.window, orElse: () => Effect.succeed(undefined) })
     )
 
-    // How many runners are actually hosting an instance of this entity. `activeEntityCount` is each
-    // runner's own count of live entities, so this reads ownership off the runners themselves
-    // rather than inferring it from the stream.
+    // Ownership read off each runner's own shard map rather than inferred from the stream.
     const hosting = yield* Effect.forEach([contextA, contextB], (context) =>
       Sharding.Sharding.pipe(
         Effect.flatMap((sharding) => sharding.activeEntityCount),
@@ -311,11 +278,9 @@ const probe = (options: { readonly isolated: boolean; readonly window: Duration.
 
 describe("RelayInbox multi-runner", () => {
   /**
-   * `it.live` rather than `it.effect`. Everything that makes two runners cooperate is scheduled
-   * against the real clock inside layers this test does not drive: the shard assignment refresh
-   * loop, `RunnerStorage` lock acquisition and expiry, the ping health check's own timeout and
-   * retry schedule, and the socket transport's connect. Under the virtual clock `it.effect`
-   * installs, none of those fibers run and `Layer.build` of the first runner never returns.
+   * `it.live`: assignment refresh, lock acquisition and expiry, the ping health check's own timeout
+   * and the socket connect all run against the real clock in layers this test does not drive, so
+   * under a virtual clock `Layer.build` of the first runner never returns.
    */
   it.live("gives one inbox key a single owning runner across two runners", () =>
     Effect.gen(function*() {
@@ -326,15 +291,9 @@ describe("RelayInbox multi-runner", () => {
         [0, 1],
         "exactly one of the two runners hosts this inbox key, and the other serves its client over the wire"
       )
-      // A session replacement ends the stream cleanly, so this also rules out the stream having
-      // ended because the entity or its transport fell over.
       assert.isTrue(exit !== undefined && Exit.isSuccess(exit), "runner A's stream ended cleanly")
     }).pipe(Effect.provide(PgContainer.layer)), 180_000)
 
-  /**
-   * The control that gives the check above its meaning: with the runners split across databases,
-   * the same script leaves two live instances of the inbox and runner A's stream open.
-   */
   it.live("leaves both runners hosting the key when they do not share a shard map", () =>
     Effect.gen(function*() {
       // A shorter window than the positive case, which is a generous timeout on an event that is

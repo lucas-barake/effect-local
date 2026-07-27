@@ -130,13 +130,8 @@ const relayEntry = (payload: Uint8Array): PeerRelayOutbox.Entry => ({
 })
 
 /**
- * `overrides` re-derives the outer digest from the tampered envelope rather than tampering the
- * stored message afterwards.
- *
- * That distinction is the whole point: a message edited after the fact fails the digest check, so
- * it proves nothing about the endpoint and selected-document checks that run alongside it. What has
- * to be modelled is a message that is internally consistent and still addressed to the wrong place
- * — a relay handing this peer somebody else's traffic.
+ * `overrides` re-derives the digest from the tampered envelope. A message edited afterwards fails
+ * the digest check, so it proves nothing about the endpoint and document checks beside it.
  */
 const makeStoredMessage = (
   payloadSeed: Uint8Array,
@@ -477,17 +472,10 @@ describe("RpcPeerTransport", () => {
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
-  // A correct digest is not an address.
-  //
-  // The three cases are not equivalent, and the difference is worth stating because it decides
-  // which production guard each one actually pins. `digestRelayOuterEnvelope` is recomputed from
-  // the *configured* `expectedSender` and `expectedRecipient`, so a message addressed to or from
-  // the wrong principal fails the digest no matter what: the `samePrincipal` checks above it are an
-  // earlier and clearer rejection of the same thing, not a separate guard, and removing them keeps
-  // this suite green. The document is the exception - the digest takes `document` from the event
-  // itself, so a misdirected document produces a perfectly valid digest and only the
-  // selected-document check stands between it and the replica. That check was pinned by nothing in
-  // the repository: removing it left all 1019 tests green.
+  // The digest is recomputed from the CONFIGURED sender and recipient, so a wrong principal fails it
+  // whatever the endpoint checks do. The document is taken from the event itself, so a misdirected
+  // one produces a valid digest and only the selected-document check refuses it - and that check was
+  // pinned by nothing in the repository.
   for (
     const wrong of [
       {
@@ -524,8 +512,6 @@ describe("RpcPeerTransport", () => {
     it.effect(`refuses a stored message carrying ${wrong.name}`, () =>
       Effect.scoped(
         Effect.gen(function*() {
-          // Built through the envelope, so its digest is correct for what it claims to be. The
-          // digest check therefore cannot be what rejects it.
           const misaddressed = yield* makeStoredMessage(Uint8Array.of(1, 2, 3), undefined, wrong.overrides)
           const acknowledgements = yield* Ref.make(0)
           const client = makeRelayClient(
@@ -536,8 +522,6 @@ describe("RpcPeerTransport", () => {
           const connection = yield* connectRelay(client, makeRuntime())
           const error = yield* Stream.runHead(connection.receive).pipe(Effect.flip)
           assert.strictEqual(error.reason._tag, "ProtocolMismatch")
-          // Never acknowledged: settling a message this peer refused would tell the relay to drop
-          // it on behalf of whoever it was actually addressed to.
           assert.strictEqual(yield* Ref.get(acknowledgements), 0)
           yield* connection.close
         }).pipe(Effect.provide(NodeCrypto.layer))
@@ -872,10 +856,8 @@ describe("RpcPeerTransport", () => {
     )
   })
 
-  // `isRetryable` is the classifier a reconnect supervisor uses to tell "the relay is down, come
-  // back" apart from "this exchange will never be accepted". Reconnect policy is the application's
-  // per the responsibility table, so nothing in this package calls it - which is exactly why the
-  // classification needs pinning here rather than being discovered wrong by a consumer.
+  // Nothing in this package calls it: reconnect policy is the application's. That is exactly why
+  // the classification is pinned here rather than discovered wrong by a consumer.
   describe("isRetryable", () => {
     it("treats unavailability as retryable and every permanent rejection as not", () => {
       assert.isTrue(

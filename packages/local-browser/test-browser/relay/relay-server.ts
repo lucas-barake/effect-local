@@ -28,25 +28,13 @@ import { definition } from "./src/domain.ts"
 import { devices } from "./src/identities.ts"
 
 /**
- * A relay the browser fixture can actually connect to.
- *
- * Everything the deployment owns is supplied here, because that is the point: the package ships the
- * front door, the entity and the store, and leaves authentication, authorization, the socket and
- * the cluster to whoever runs it. This file is the smallest honest version of that.
- *
- * Single runner on purpose. Multi-runner ownership is covered by `RelayInboxMultiRunner.test.ts`
- * against PostgreSQL; what this fixture has to prove is that a browser client can talk to a relay
- * at all, so it uses in-memory cluster storage and one node.
+ * Everything the deployment owns, written out: the package ships the front door, the entity and
+ * the store, and leaves authentication, authorization, the socket and the cluster to whoever runs
+ * it. Single runner on purpose - multi-runner ownership is covered by `RelayInboxMultiRunner`.
  */
 
 const port = Number(process.env.EFFECT_LOCAL_RELAY_PORT ?? 4176)
 
-/**
- * Bearer tokens to principals.
- *
- * A real deployment verifies a signed token here. The fixture keeps a fixed table so the browser
- * can present a token that means something without this file growing a token issuer.
- */
 const principals = new Map(devices.map((device) => [device.token, device.principal]))
 
 const Authenticator = Layer.succeed(PeerAuthenticator.PeerAuthenticator)({
@@ -63,16 +51,10 @@ const Authenticator = Layer.succeed(PeerAuthenticator.PeerAuthenticator)({
 })
 
 /**
- * Every authenticated device of this tenant may relay to any other, for the documents it asks for.
- *
- * The second callback is the one that matters here. Automerge 3.3.2 has no allocation bounded
- * decode, so relay send admission and recipient delivery both require an explicit
- * `UnsafeUnboundedAutomerge3DecodeGrant` on top of ordinary authorization. Default deny therefore
- * means a deployment cannot relay Automerge at all until it consciously accepts that risk.
- *
- * This fixture grants it because it owns both producers: they are two pages of this same test. A
- * product may only do the same where it has independently established that the producer's bytes are
- * resource trusted, and being authenticated or allowed to edit the document is not that.
+ * Automerge 3.3.2 has no allocation bounded decode, so relaying it at all requires an explicit
+ * `UnsafeUnboundedAutomerge3DecodeGrant` on top of ordinary authorization. Granted here because
+ * both producers are pages of this same test; a product needs the producer's bytes to be resource
+ * trusted, which being authenticated is not.
  */
 const Authorization = PeerRelayAuthorization.layer(
   (request) =>
@@ -82,8 +64,6 @@ const Authorization = PeerRelayAuthorization.layer(
         subjectId: request.remote.subjectId,
         peerId: request.remote.peerId
       },
-      // The relay resolves a requested `documentType` against the deployment's own definition. It
-      // is the application that knows what a document type means; the package only routes bytes.
       documents: request.documents.flatMap((requested) => {
         const document = definition.documents.byName.get(requested.documentType)
         return document === undefined ? [] : [{ document, documentId: requested.documentId }]
@@ -149,8 +129,6 @@ const Relay = RelayServer.layer({
   Layer.provide(NodeCrypto.layer)
 )
 
-// The websocket front door. `RpcServer` owns the request lifecycle; the upgrade, the port and the
-// process belong to the deployment, which is why they are written out here rather than shipped.
 const Rpc = RpcServer.layer(PeerRpc.Rpcs).pipe(
   Layer.provide(Relay),
   Layer.provide(PeerAuthentication.layerServer),
@@ -160,7 +138,7 @@ const Rpc = RpcServer.layer(PeerRpc.Rpcs).pipe(
   Layer.provide(RpcSerialization.layerJson)
 )
 
-// A plain health route so the harness can wait for readiness without opening a websocket.
+// Readiness without opening a websocket.
 const Ready = HttpRouter.add("GET", "/ready", HttpServerResponse.text("ok"))
 
 HttpRouter.serve(Layer.mergeAll(Rpc, Ready)).pipe(

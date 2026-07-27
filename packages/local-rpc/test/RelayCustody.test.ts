@@ -282,18 +282,8 @@ const relayBackend = Effect.gen(function*() {
 // ---------------------------------------------------------------------------
 
 /**
- * A whole replica stack, constructed fresh on every call.
- *
- * Built as a function rather than module constants because two of these have to coexist: a sender
- * and a recipient, each with its own SQLite database, its own `Sharding`, and its own relay client
- * runtime. Layer memoization is by reference, so reusing one value would silently give both peers
- * the same replica and the exchange would prove nothing.
- *
- * `SqlReplica.layerRelay` is the composition a relay deployment actually ships, and until now it
- * had no caller anywhere in the repository. Building on it rather than on hand-assembled parts is
- * what makes this an end-to-end test rather than a test of a composition invented for the test:
- * the real `Replica`, the relay flavoured `PeerSync`, the real `ReplicaGate` and a real `Sharding`
- * all come from it, and nothing here substitutes a `CommandExecutor`.
+ * A function rather than module constants: layer memoization is by reference, so two peers
+ * sharing one value would silently be one replica and the exchange would prove nothing.
  */
 const clientStack = () => {
   const Base = Layer.mergeAll(
@@ -313,12 +303,7 @@ const clientStack = () => {
   return Layer.mergeAll(ReplicaLayer, Store, Runtime)
 }
 
-/**
- * Transport options for one direction of the exchange.
- *
- * `expectedLocal` and `remote` are what `validateStoredMessage` recomputes the outer envelope
- * digest against, so the recipient's options are the sender's with the two principals swapped.
- */
+/** The recipient's options are the sender's with the two principals swapped. */
 const transportOptions = (
   self: PeerAuthentication.PeerPrincipal,
   peer: PeerAuthentication.PeerPrincipal,
@@ -345,11 +330,8 @@ const outboxRows = (sql: SqlClient.SqlClient) =>
   `.pipe(Effect.orDie)
 
 /**
- * A replica pair that already shares a document, the way two devices of one subject do.
- *
- * The recipient is a clone of the sender rather than an independently created replica: a document
- * created twice for the same id is two lineages, and the exchange under test is a sync between two
- * copies of one lineage. This is the same seeding the convergence suite uses.
+ * The recipient is a clone rather than an independently created replica: a document created
+ * twice for the same id is two lineages, and this exchange syncs two copies of one.
  */
 const seedPair = Effect.gen(function*() {
   const senderContext = yield* Layer.build(clientStack())
@@ -411,8 +393,6 @@ describe("relay custody against a real relay", () => {
           yield* session.markDirty(documentId)
           yield* session.flush
 
-          // Filed under the recipient's inbox, addressed by the recipient's own principal. A message
-          // filed anywhere else would never reach the device it was sent to.
           const heads = yield* backend.store
             .pendingHeads(yield* inboxKeyOf(remotePrincipal, backend.crypto), { limit: 10 })
             .pipe(Effect.orDie)
@@ -425,8 +405,7 @@ describe("relay custody against a real relay", () => {
           assert.strictEqual(head.envelope.document.documentType, Task.name)
           assert.isAbove(head.envelope.payload.byteLength, 0)
 
-          // Nothing was filed under the sender's own inbox. Getting this wrong routes every message
-          // back to the device that sent it, and a pending-count check on one inbox would not see it.
+          // A count on the recipient's inbox alone would not catch a message filed back to its sender.
           assert.deepStrictEqual(
             yield* backend.store
               .pendingHeads(yield* inboxKeyOf(localPrincipal, backend.crypto), { limit: 10 })
@@ -434,8 +413,6 @@ describe("relay custody against a real relay", () => {
             []
           )
 
-          // `markCustody` retired the outbox row: the relay now holds the only copy the sender is
-          // relying on.
           assert.strictEqual((yield* outboxRows(sender.sql)).length, 0)
         }))
       }).pipe(Effect.provide(NodeCrypto.layer))
@@ -449,11 +426,8 @@ describe("relay custody against a real relay", () => {
         const recipientClient = yield* backend.clientFor("remote")
         const { documentId, recipient, sender } = yield* seedPair
 
-        // One label on each side, neither of which the other has seen. Both peers therefore have
-        // something the exchange has to carry, which is what makes convergence below evidence of
-        // both directions: if only the sender had a change, the recipient's head set would collapse
-        // onto the sender's the moment it merged, and agreement would follow from the forward
-        // direction alone.
+        // One label each. With a change on one side only, the recipient's head set collapses onto the
+        // sender's on merge, and agreement would follow from the forward direction alone.
         for (
           const [side, label] of [
             [sender, "from-sender"],
@@ -494,11 +468,7 @@ describe("relay custody against a real relay", () => {
           yield* senderSession.flush
           yield* TestClock.adjust(5000)
 
-          // The whole point, and it is symmetric. Each replica holds the other's label, which means
-          // a stored message travelled each way and survived `validateStoredMessage` - endpoint,
-          // selected document and a recomputed outer envelope digest - before being applied through
-          // the real `DocumentEntity`. Sorted because the merge order of two concurrent list
-          // insertions is Automerge's to choose, not this test's.
+          // Sorted because the merge order of two concurrent list insertions is Automerge's choice.
           const recipientLoaded = yield* recipient.store.load(Task, documentId).pipe(Effect.orDie)
           const senderLoaded = yield* sender.store.load(Task, documentId).pipe(Effect.orDie)
           assert.deepStrictEqual(
@@ -516,8 +486,6 @@ describe("relay custody against a real relay", () => {
             "both replicas agree on the document after the exchange"
           )
 
-          // Every message was acknowledged, so neither inbox is still holding one, and the sender
-          // has no outbox entry it believes the relay still owes it.
           for (const principal of [localPrincipal, remotePrincipal]) {
             assert.deepStrictEqual(
               yield* backend.store
@@ -548,17 +516,13 @@ describe("relay custody against a real relay", () => {
         const options = transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
         const recipientInbox = yield* inboxKeyOf(remotePrincipal, backend.crypto)
 
-        // A relay that accepts the session but cannot take the message. This is the situation the
-        // outbox exists for: the sender has already durably admitted the change, so dropping it here
-        // would lose it with no one holding a copy.
+        // The situation the outbox exists for: the change is already durably admitted, so dropping it
+        // here would lose it with nobody holding a copy.
         const unavailable: PeerRpc.RpcClient = {
           ...client,
-          // Cast because `Push` is overloaded on its discard flag and this stand-in answers both
-          // forms the same way. It fails inside the declared channel rather than defecting.
           Push: ((() => Effect.fail(new PeerRpcError.ServerUnavailable())) as PeerRpc.RpcClient["Push"])
         }
-        // The whole session is taken as an exit: a push that fails is fatal to the connection, so
-        // closing the scope reports it too. Losing the session is exactly the scenario.
+        // A failed push is fatal to the connection, so closing the scope reports it too.
         const attempt = yield* Effect.exit(Effect.scoped(Effect.gen(function*() {
           const session = yield* RpcPeerTransport.makeSession(unavailable, options).pipe(
             Effect.provideContext(sender.context)
@@ -568,15 +532,11 @@ describe("relay custody against a real relay", () => {
         })))
         assert.strictEqual(attempt._tag, "Failure")
 
-        // The entry is still the sender's responsibility, because the relay never took custody of it.
         const pending = yield* outboxRows(sender.sql)
         assert.strictEqual(pending.length, 1)
 
-        // Opening a fresh session is enough on its own. Nothing here marks the document dirty or
-        // flushes, so the entry the first session admitted can only reach the relay through the
-        // connect-time replay. Identified by its own relay message id rather than by counting: the
-        // new session also generates a sync message of its own, and a count would not distinguish
-        // the replayed entry from that one.
+        // Nothing here marks dirty or flushes, so the entry can only arrive through connect-time replay.
+        // Identified by relay message id because the new session also sends one of its own.
         yield* Effect.scoped(Effect.gen(function*() {
           yield* RpcPeerTransport.makeSession(client, options).pipe(Effect.provideContext(sender.context))
 

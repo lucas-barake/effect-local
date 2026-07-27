@@ -78,9 +78,7 @@ const SqliteLayer = Effect.gen(function*() {
   return SqliteClient.layer({ filename: `${directory}/relay-inbox.sqlite` })
 }).pipe(Layer.unwrap, Layer.provide(NodeFileSystem.layer))
 
-// The client is merged out rather than kept private: payload erasure is a property of what the row
-// still holds, and no store method reports the bytes of a terminal row, so the contract has to be
-// able to look at the table it is asserting about.
+// Merged out rather than kept private: observing payload erasure means reading the row.
 const storeFor = (client: Layer.Layer<SqlClient.SqlClient, unknown, never>) =>
   SqlRelayInboxStore.layer.pipe(
     Layer.provideMerge(client),

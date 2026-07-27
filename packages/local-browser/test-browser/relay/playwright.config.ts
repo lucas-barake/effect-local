@@ -13,8 +13,6 @@ export default defineConfig({
     baseURL: "http://127.0.0.1:4177",
     browserName: "chromium"
   },
-  // Two servers: the page, and a real relay for it to talk to. The relay is an ordinary Node
-  // process composed from this package's own building blocks, which is the point of the fixture.
   webServer: [
     {
       command: "pnpm exec tsx test-browser/relay/relay-server.ts",
