@@ -17,7 +17,8 @@ WebSocket, serialization, routing, and server ownership to Effect and the applic
 
 > **Beta:** The library targets Effect `4.0.0-beta.99` and Automerge `3.3.2`. Durable formats,
 > worker protocols, and public APIs can still change. Read [Limits and security](#limits-and-security) before adopting
-> it for user data. The external RPC transport is alpha and live only. It does not claim durable remote custody.
+> it for user data. External RPC uses one durable version `1` relay topology with an at least once delivery contract.
+> The built in SQL custody store supports SQLite, PostgreSQL, and MySQL. It is not a managed global relay service.
 
 ## Retrieval contract
 
@@ -54,14 +55,14 @@ sessions, peer sessions, and presence connect processes without becoming another
 
 This separates concerns that are often collapsed into one client state library:
 
-| Concern                  | Responsibility                                                            | What it does not own                                                                                         |
-| ------------------------ | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| Canonical recovery state | Automerge changes, heads, checkpoints, tombstones, and command receipts   | Physical storage bytes or UI cache state                                                                     |
-| Physical persistence     | SQLite transactions and database bytes, stored in OPFS in the browser     | Merge semantics or permanent browser retention                                                               |
-| Local execution          | Serialized commands, durable replies, maintenance workflows, and recovery | Replicated convergence                                                                                       |
-| Derived durable views    | SQL projection tables optimized for application queries                   | Canonical history                                                                                            |
-| Ephemeral views          | Atom caches, RPC leases, and presence                                     | Durable facts                                                                                                |
-| Connectivity             | Worker RPC, peer sessions, and application supplied transports            | Identity issuance, application routing policy, platform socket or server ownership, or durable relay custody |
+| Concern                  | Responsibility                                                                        | What it does not own                                                               |
+| ------------------------ | ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Canonical recovery state | Automerge changes, heads, checkpoints, tombstones, and command receipts               | Physical storage bytes or UI cache state                                           |
+| Physical persistence     | SQLite transactions and database bytes, stored in OPFS in the browser                 | Merge semantics or permanent browser retention                                     |
+| Local execution          | Serialized commands, durable replies, maintenance workflows, and recovery             | Replicated convergence                                                             |
+| Derived durable views    | SQL projection tables optimized for application queries                               | Canonical history                                                                  |
+| Ephemeral views          | Atom caches, RPC leases, and presence                                                 | Durable facts                                                                      |
+| Connectivity             | Worker RPC, durable peer sessions, application supplied transports, and relay custody | Identity issuance, application routing policy, platform socket or server ownership |
 
 The distinction follows Automerge's separation between a
 [CRDT document and its storage adapter](https://automerge.org/docs/reference/repositories/storage/) and SQLite's
@@ -93,7 +94,8 @@ SQLite does not decide how concurrent document changes merge. Automerge `save` e
 | **Invalidation key**         | Notification metadata for refreshing a document or projection read. It is not canonical data or a durability acknowledgement.                                                                                                                 |
 | **Presence**                 | Expiring best effort metadata about connected peers or tabs. Presence is never durable state and must never authorize an operation.                                                                                                           |
 | **Hosted canonical replica** | One ordinary `SqlReplica` running in a server process. It participates as a CRDT peer. It is not a transaction authority for other replicas.                                                                                                  |
-| **Live relay**               | The bounded in memory `Open` stream and `Push` path owned by `PeerRpcServer`. It has no durable custody or replay log.                                                                                                                        |
+| **Store and forward relay**  | The version `1` RPC topology. A stable sender outbox transfers custody to an injected durable backend store for at least once reconnect delivery.                                                                                             |
+| **Relay acknowledgement**    | A fenced recipient response sent only after the production SQL sync workflow and sender scoped replay receipt commit. It can retire only the exact live claim.                                                                                |
 | **Principal**                | A request scoped `tenantId`, `subjectId`, and stable `peerId` produced by `PeerAuthenticator`. It is derived from a credential on every RPC operation.                                                                                        |
 | **Authorization lease**      | A bounded grant for exactly the requested whole document set. Expiry or invalidation terminates the session. It is not a distributed lock.                                                                                                    |
 | **RPC session**              | One scoped live mapping between an authenticated peer and a SQL `PeerSession`. A replacement connection closes the previous incarnation.                                                                                                      |
@@ -165,21 +167,22 @@ and [Atom](https://github.com/Effect-TS/effect/blob/eb9b10256c8558881b441c2fef83
 
 Transport neutral synchronization has three layers. The optional RPC package adds a contract and adapter:
 
-| Layer              | Responsibility                                                                                                                                                                           |
-| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PeerTransport`    | Application supplied connection, peer identity, routing, security, receive stream, send operation, and close operation.                                                                  |
-| `PeerSync`         | Persistent receive identity, epoch scoped outbox, sequencing, replay, and received change application. Automerge `SyncState` remains in memory for one connection.                       |
-| `PeerSession`      | Scoped orchestration that binds one transport connection to one replica incarnation and a selected set of whole document instances.                                                      |
-| `PeerRpc`          | Versioned `Open` and `Push` contract plus the generated Effect RPC client. It does not own an Effect `RpcClient.Protocol`, `RpcServer.Protocol`, serializer, platform socket, or server. |
-| `RpcPeerTransport` | Adapter from the generated RPC client to `PeerTransport`, then to the existing SQL `PeerSession`.                                                                                        |
+| Layer              | Responsibility                                                                                                                                                     |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `PeerTransport`    | Application supplied connection, peer identity, routing, security, receive stream, send operation, and close operation.                                            |
+| `PeerSync`         | Persistent receive identity, epoch scoped outbox, sequencing, replay, and received change application. Automerge `SyncState` remains in memory for one connection. |
+| `PeerSession`      | Scoped orchestration that binds one transport connection to one replica incarnation and a selected set of whole document instances.                                |
+| `PeerRpc`          | Durable version `1` `Open`, `Push`, `Acknowledge`, and `Reject` contract plus the generated Effect RPC client.                                                     |
+| `RpcPeerTransport` | Adapter from the generated RPC client to `PeerTransport`, then to the existing SQL `PeerSession`.                                                                  |
+| Relay SQL state    | Frontend SQLite outbox and receipts plus injected backend custody for at least once reconnect delivery.                                                            |
 
 `observedByPeer` means Automerge's per peer sync state indicates that the peer has all local changes. It does not prove
 remote storage durability. Effect Local therefore keeps durable confirmation separate and currently reports it as
 false.
 
 Effect RPC response acknowledgements bound streamed response chunks. They are not byte credits, durable receipts, or
-proof that Automerge applied a message. `PeerRpcServer` adds item limits, byte reservations, quotas, rate limits, and
-admission concurrency above the RPC stream. WebSocket ordering applies only within one live connection.
+proof that Automerge applied a message. `RelayServer` adds per inbox admission quotas, authentication rate limits,
+and a per subject session cap above the RPC stream. WebSocket ordering applies only within one live connection.
 
 The browser topology also assigns distinct roles:
 
@@ -220,20 +223,21 @@ always recover by reading the replica again because Atom is not part of the pers
 
 ### Choosing the right abstraction
 
-| Need                                      | Use                                                  |
-| ----------------------------------------- | ---------------------------------------------------- |
-| Change one aggregate atomically           | One document mutation                                |
-| Read one aggregate with causal metadata   | `Replica.get`                                        |
-| Filter, sort, or join local data          | Projection plus query                                |
-| Keep React views current                  | `ReplicaAtom` builders                               |
-| Retry a command after losing the response | The same command ID, then the matching lookup method |
-| Coordinate several durable steps          | Effect Workflow                                      |
-| Exchange changes with another replica     | `PeerSession` and an application supplied transport  |
-| Host a live authenticated replica peer    | `PeerRpcServer` plus application owned Effect RPC    |
-| Connect through the generated RPC client  | `RpcPeerTransport.makeSession`                       |
-| Bound a high churn document's checkpoint  | `ReplicaWorkflow.HistoryRewriteWorkflow`             |
-| Show cursors or online state              | Presence                                             |
-| Move or recover all local data            | Backup and restore                                   |
+| Need                                      | Use                                                                   |
+| ----------------------------------------- | --------------------------------------------------------------------- |
+| Change one aggregate atomically           | One document mutation                                                 |
+| Read one aggregate with causal metadata   | `Replica.get`                                                         |
+| Filter, sort, or join local data          | Projection plus query                                                 |
+| Keep React views current                  | `ReplicaAtom` builders                                                |
+| Retry a command after losing the response | The same command ID, then the matching lookup method                  |
+| Coordinate several durable steps          | Effect Workflow                                                       |
+| Exchange changes with another replica     | `PeerSession` and an application supplied transport                   |
+| Host a live authenticated replica peer    | `RelayServer` plus a cluster and application owned Effect RPC         |
+| Connect through the generated RPC client  | `RpcPeerTransport.makeSession`                                        |
+| Bound a high churn document's checkpoint  | `ReplicaWorkflow.HistoryRewriteWorkflow`                              |
+| Add asynchronous relay custody            | The opt in [store and forward](docs/store-and-forward.md) composition |
+| Show cursors or online state              | Presence                                                              |
+| Move or recover all local data            | Backup and restore                                                    |
 
 The main design rule is simple: durable facts flow outward from canonical recovery state into projections and reactive
 views. They never flow back from a cache, presence record, or transport connection into canonical history without a
@@ -298,13 +302,13 @@ pnpm add -D @effect/platform-node@4.0.0-beta.99 @effect/platform-node-shared@4.0
 
 Package roles:
 
-| Package                              | Purpose                                                                                                           |
-| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
-| `@lucas-barake/effect-local`         | Documents, mutations, projections, queries, backups, sync transport, and `Replica`                                |
-| `@lucas-barake/effect-local-sql`     | SQLite persistence, durable Cluster execution, Workflow, recovery, compaction, and peer sync                      |
-| `@lucas-barake/effect-local-browser` | Effect Worker and RPC composition, OPFS ports, sessions, presence, and Atom builders                              |
-| `@lucas-barake/effect-local-test`    | In memory production shaped replicas and deterministic bounded peer faults                                        |
-| `@lucas-barake/effect-local-rpc`     | Effect RPC contract, authentication middleware, authorization policy, bounded server sessions, and client adapter |
+| Package                              | Purpose                                                                                                         |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| `@lucas-barake/effect-local`         | Documents, mutations, projections, queries, backups, sync transport, and `Replica`                              |
+| `@lucas-barake/effect-local-sql`     | SQLite persistence, durable execution, recovery, compaction, peer sync, sender relay outbox, and relay receipts |
+| `@lucas-barake/effect-local-browser` | Effect Worker and RPC composition, OPFS ports, sessions, presence, and Atom builders                            |
+| `@lucas-barake/effect-local-test`    | In memory production shaped replicas and deterministic bounded peer faults                                      |
+| `@lucas-barake/effect-local-rpc`     | Durable relay protocol, injectable custody, policies, bounded server, and client adapter                        |
 
 Package dependency direction is:
 
@@ -340,7 +344,12 @@ The RPC package itself is platform neutral. A network deployment requires an Eff
 `RpcClient.Protocol`, the same `RpcSerialization` on both ends, a platform `Socket`, an HTTP server, TLS, WebSocket
 upgrade routing, Origin policy, ingress byte and connection limits, credential issuance, secret rotation, tenant
 routing, process supervision, and graceful shutdown. None of those responsibilities are inferred from
-`PeerRpcServer.layerHandlers`.
+`RelayServer.layerHandlers`.
+
+The durable relay speaks standard Effect RPC over a socket with `RpcSerialization`. The application also owns the
+cluster: `RelayServer` requires a `Sharding` and never builds one, so single process, one runner over SQL, and many
+sharded runners are all its choice. The application owns TLS, routing, identity, policy, process supervision, and the
+SQLite, PostgreSQL, or MySQL deployment behind the relay.
 
 ## Composition recipes
 
@@ -889,8 +898,8 @@ backup limits.
 
 For a custom transport, the application provides `PeerTransport` and owns its identity, authentication, authorization,
 encryption, discovery, and routing. For Effect RPC, do not implement another `PeerTransport`. `RpcPeerTransport`
-supplies it from `PeerRpc.RpcClient`. `PeerAuthentication`, `PeerAuthorization`, and the application owned Effect RPC
-protocol retain those responsibilities.
+supplies it from `PeerRpc.RpcClient`. `PeerAuthentication`, `PeerRelayAuthorization`, and the application owned socket
+composition retain those responsibilities.
 
 ```ts
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -905,7 +914,7 @@ declare const openAuthenticatedConnection: (
 ) => Effect.Effect<PeerTransport.Connection, ReplicaError.ReplicaError, Scope.Scope>
 
 export const TransportLive = Layer.succeed(PeerTransport.PeerTransport, {
-  capabilities: { storeAndForward: false },
+  capabilities: { lineageAware: true },
   connect: ({ peerId }) => openAuthenticatedConnection(peerId)
 })
 ```
@@ -982,210 +991,38 @@ responsibility.
 Expiry is enforced lazily when `values` reads. Entries stay resident until then, so a peer that only writes never
 reclaims expired entries.
 
-### 12. Host a canonical replica over Effect RPC
+### 12. Host a durable relay over Effect RPC
 
-The hosted process runs the same `SqlReplica` composition as any Node replica. The RPC package adds a live transport
-surface. It does not introduce a server database model, second Automerge repository, or durable relay.
+The RPC package exposes one protocol, `PeerRpc` version `1`. Its procedures are `Open`, `Push`,
+`Acknowledge`, and `Reject`. Every connection uses durable custody. There is no direct in memory RPC topology.
 
-The application provides two Effect capabilities:
+Applications provide `PeerAuthenticator`, `PeerRelayAuthorization`, `PeerRelayLimits`, a socket, and a `Sharding`.
+The semantic store is injectable through `RelayInboxStore`; the built in `SqlRelayInboxStore.layer` requires a
+generic `SqlClient` and supports SQLite, PostgreSQL, and MySQL. The frontend replica, sender outbox, and recipient
+receipts remain SQLite.
 
-- `PeerAuthenticator` verifies one redacted credential on every `Open` and `Push`. It returns a request scoped
-  `PeerPrincipal`, a finite validity deadline, and an invalidation Effect.
-- `PeerAuthorization` maps the principal and requested document identities to the server's actual document
-  definitions. Authorization is exact and all or nothing. It returns its own finite validity deadline and invalidation
-  Effect.
-
-`PeerCredentials`, `PeerAuthenticator`, and `PeerAuthorization` are Context services because credential retrieval and
-policy evaluation are application capabilities. They can be asynchronous, fail in the typed channel, depend on other
-services, and be replaced by Layers without changing middleware constructors.
-
-`invalidated` is a nonfailing revocation signal. It must remain pending while the authentication or authorization
-decision remains valid and complete once that decision is revoked. Use `Effect.never` when no early invalidation signal
-exists. It must not fail or defect. The `validUntil` deadline and `maximumReauthorizationInterval` remain independent
-upper bounds.
-
-`PeerPrincipal.peerId` identifies the authenticated calling replica. `PeerRpcServer.layerHandlers({ peerId })`
-identifies the hosted server replica. On the client, `RpcPeerTransport.makeSession({ peerId })` must receive that hosted
-server replica ID. Name these values `authenticatedClientPeerId` and `hostedServerPeerId`. Do not derive one from the
-other.
-
-The following excerpt is the public server composition.
-
-```ts
-import * as PeerAuthentication from "@lucas-barake/effect-local-rpc/PeerAuthentication"
-import * as PeerAuthenticator from "@lucas-barake/effect-local-rpc/PeerAuthenticator"
-import * as PeerAuthorization from "@lucas-barake/effect-local-rpc/PeerAuthorization"
-import * as PeerRpc from "@lucas-barake/effect-local-rpc/PeerRpc"
-import * as PeerRpcError from "@lucas-barake/effect-local-rpc/PeerRpcError"
-import * as PeerRpcLimits from "@lucas-barake/effect-local-rpc/PeerRpcLimits"
-import * as PeerRpcServer from "@lucas-barake/effect-local-rpc/PeerRpcServer"
-import * as Identity from "@lucas-barake/effect-local/Identity"
-import * as Effect from "effect/Effect"
-import * as Layer from "effect/Layer"
-import * as Redacted from "effect/Redacted"
-import * as HttpRouter from "effect/unstable/http/HttpRouter"
-import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import * as RpcServer from "effect/unstable/rpc/RpcServer"
-import { definition, Task } from "./domain.js"
-
-declare const authenticatedClientPeerId: Identity.PeerId
-declare const hostedServerPeerId: Identity.PeerId
-declare const documentId: Identity.DocumentId
-declare const expectedCredential: string
-
-const PoliciesLive = Layer.mergeAll(
-  PeerRpcLimits.layerDefaults,
-  Layer.succeed(PeerAuthenticator.PeerAuthenticator)({
-    authenticate: (credential) =>
-      Redacted.value(credential) === expectedCredential
-        ? Effect.succeed({
-          principal: PeerAuthentication.PeerPrincipal.make({
-            tenantId: "acme",
-            subjectId: "user-42",
-            peerId: authenticatedClientPeerId
-          }),
-          validUntil: Date.now() + 60_000,
-          invalidated: Effect.never
-        })
-        : Effect.fail(new PeerRpcError.AuthenticationFailure())
-  }),
-  PeerAuthorization.layer((request) => {
-    const requested = request.documents[0]
-    return request.principal.tenantId === "acme" &&
-        request.documents.length === 1 &&
-        requested?.documentType === Task.name &&
-        requested.documentId === documentId
-      ? Effect.succeed({
-        documents: [{ document: Task, documentId }],
-        validUntil: Date.now() + 60_000,
-        invalidated: Effect.never
-      })
-      : Effect.fail(new PeerRpcError.AccessDenied())
-  })
-)
-
-const AuthenticationLive = PeerAuthentication.layerServer.pipe(
-  Layer.provide(PoliciesLive)
-)
-
-const HandlersLive = PeerRpcServer.layerHandlers({
-  tenantId: "acme",
-  peerId: hostedServerPeerId,
-  definition
-}).pipe(Layer.provide(PoliciesLive))
-
-const WsProtocol = RpcServer.layerProtocolWebsocket({ path: "/rpc" }).pipe(
-  Layer.provide(HttpRouter.layer)
-)
-
-const PeerRpcLive = RpcServer.layer(PeerRpc.Rpcs, {
-  disableFatalDefects: true
-}).pipe(
-  Layer.provide([HandlersLive, AuthenticationLive]),
-  Layer.provideMerge(WsProtocol),
-  Layer.provide(HttpRouter.serve(WsProtocol)),
-  Layer.provide(RpcSerialization.layerMsgPack)
-)
-```
-
-The application must still provide `HttpServer` and the platform WebSocket implementation required by the Effect
-server protocol. `PeerRpcServer.layerHandlers` specifically requires `CommitPublisher`, `PeerRpcLimits`, core
-`ReplicaLimits`, `PeerAuthorization`, `Crypto`, `PeerSync`, `ReplicaGate`, and `Sharding`. `disableFatalDefects: true`
-is required so one unexpected request defect is encoded as the fixed `InternalError` sentinel instead of terminating
-unrelated requests multiplexed over the connection. Typed policy failures remain `PeerRpcError` values.
-
-One `PeerRpcServer` Layer instance serves exactly one configured tenant and one canonical SQL replica. The canonical
-schema has no tenant column. Multi tenant deployment therefore requires isolated replicas, databases, schemas, or
-processes. Do not route principals from different tenants into one handler Layer.
-
-`layerHandlers` owns one server scoped `CommitPublisher` subscription, not one subscription per peer. It indexes
-document interest, coalesces dirty notifications, and flushes interested sessions with bounded worker concurrency. Its
-registry enforces one active incarnation per tenant and peer, per subject session and in flight quotas, subject token
-buckets, item capacity, per session bytes, total buffered bytes, lease invalidation, and bounded shutdown cleanup
-concurrency. `PeerAuthentication.layerServer` separately owns connection authentication buckets keyed by the Effect RPC
-client ID. Reopening the same authenticated peer replaces and closes the prior incarnation. Cleanup has bounded
-parallelism but no time bound because each session scope is closed uninterruptibly.
+The relay is a cluster of `RelayInbox` entities, one per recipient device, each the sole writer for its device's
+inbox. `RelayServer.layerHandlers(options)` builds the front door alone, which is what composes into an existing RPC
+server. `RelayServer.layer(options)` is the whole thing: front door, entity behaviour, and the retention singleton
+that makes `messageTtl` and `terminalRetention` actually run. Because ownership comes from sharding rather than from
+process local state, several relay nodes can serve one database. A successful `Push` means the owning entity
+committed custody before replying.
 
 ### 13. Connect an RPC peer
 
-The client composes the generated client with an application owned Effect RPC protocol. `layerClient` retrieves a
-fresh redacted credential from `PeerCredentials` and overwrites any credential present in the request payload. The
-preferred `RpcPeerTransport.makeSession` path adapts that generated client to the transport neutral SQL
-`PeerSession.makeLive` implementation.
+Create `PeerRpc.RpcClient` through `PeerRpc.makeRpcClient`, then adapt it with
+`RpcPeerTransport.layer` or `RpcPeerTransport.makeSession`. Options bind the expected local principal, relay peer,
+remote peer, selected documents, replica incarnation, receipt retention, retry horizon, and replay batch size.
 
-```ts
-import { NodeSocket } from "@effect/platform-node"
-import * as PeerAuthentication from "@lucas-barake/effect-local-rpc/PeerAuthentication"
-import * as PeerCredentials from "@lucas-barake/effect-local-rpc/PeerCredentials"
-import * as PeerRpc from "@lucas-barake/effect-local-rpc/PeerRpc"
-import * as RpcPeerTransport from "@lucas-barake/effect-local-rpc/RpcPeerTransport"
-import * as Identity from "@lucas-barake/effect-local/Identity"
-import * as Effect from "effect/Effect"
-import * as Layer from "effect/Layer"
-import * as Redacted from "effect/Redacted"
-import * as RpcClient from "effect/unstable/rpc/RpcClient"
-import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import { definition, Task } from "./domain.js"
-import { EngineLive } from "./replica.js"
+The connection always exposes the relay peer and an acknowledged delivery stream. `PeerSession` acknowledges only
+after the production SQL sync workflow and sender scoped receipt commit. Lost responses or expired claims can
+redeliver a message, so delivery is at least once and receipt suppression is durable.
 
-declare const documentId: Identity.DocumentId
-declare const hostedServerPeerId: Identity.PeerId
+Automerge `3.3.2` does not expose an allocation bounded semantic decode API. Relay admission therefore requires the
+separate exact `UnsafeUnboundedAutomerge3DecodeGrant`. The recommended default remains
+`PeerRelayAuthorization.denyUnsafeUnboundedAutomerge3Decode`.
 
-const CredentialsLive = Layer.succeed(PeerCredentials.PeerCredentials)({
-  get: Effect.succeed(Redacted.make("rotating-credential"))
-})
-
-const AuthenticationLive = PeerAuthentication.layerClient.pipe(
-  Layer.provide(CredentialsLive)
-)
-
-const ProtocolLive = RpcClient.layerProtocolSocket().pipe(
-  Layer.provide([
-    NodeSocket.layerWebSocket("wss://sync.example.com/rpc"),
-    RpcSerialization.layerMsgPack
-  ])
-)
-
-const synchronize = Effect.scoped(Effect.gen(function*() {
-  const client = yield* PeerRpc.makeRpcClient
-  const session = yield* RpcPeerTransport.makeSession(client, {
-    peerId: hostedServerPeerId,
-    documents: [{ document: Task, documentId }],
-    definition
-  })
-  yield* session.flush
-  return yield* session.observedByPeer(documentId)
-})).pipe(Effect.provide(Layer.mergeAll(EngineLive, ProtocolLive, AuthenticationLive)))
-```
-
-`EngineLive` is the local `SqlReplica` Layer from recipe 6. It supplies the `CommitPublisher`, `PeerSync`, `ReplicaGate`,
-`ReplicaLimits`, `Crypto`, and `Sharding` requirements listed in
-[RPC environment requirements](#rpc-environment-requirements).
-
-The complete scoped synchronization Effect is the reconnect unit. Real applications keep all session use inside that
-scope. Effect's socket protocol may reconnect the socket, but it cannot replay an already failed `Open` response
-stream. On retry, recreate the client scope and peer session. Reuse the same stable remote `PeerId` and requested
-document identities. A fresh Automerge sync state generates new messages from persisted canonical causal history.
-The prior epoch's SQL outbox is not resumed. Do not cache `SessionId`, connection epoch, stream, or middleware lease
-across scopes. During a graceful server restart, close client connection scopes or otherwise close upgraded WebSocket
-connections before awaiting the HTTP server shutdown.
-
-Closing an `RpcPeerTransport` connection interrupts any fiber parked consuming its `receive` stream, so that consumer
-observes an interrupt only `Exit` rather than a failure, and does not wait for the enclosing scope to close. A consumer
-inside its element handler is not interrupted mid handler. It finishes that handler, may still receive a payload the
-transport already pulled from the peer, and then observes the interrupt on its next pull. Payloads that arrive after
-close are not delivered.
-
-`RpcPeerTransport.isRetryable` classifies only `ReplicaError(StorageUnavailable)` as retryable. Authentication,
-authorization, version, peer identity, request shape, declared limit, and document lineage failures map to
-`ReplicaError(ProtocolMismatch)` and require configuration or policy correction. A remote
-`PeerRpcError(DocumentLineageChanged)` arrives as `ProtocolMismatch` with the tag in `observed`, because the wire
-error carries no document identity and the adapter will not invent one. Retrying it cannot succeed. `Push` success
-means only that the current server session accepted the bytes into bounded memory. `storeAndForward` and
-`durableConfirmation` are both false. Inbound item or byte overflow is terminal for that incarnation. An outbound capacity timeout during initial
-synchronization, a Push reply, or commit driven flush is also terminal. The triggering operation and active `Open`
-stream fail with `SessionOverloaded`. Later pushes for that session receive `SessionUnavailable`, so recovery creates a
-fresh connection scope and session.
+See [Store and forward](docs/store-and-forward.md) for complete composition, custody, security, and failure semantics.
 
 ### 14. Run compaction and recovery workflows
 
@@ -1369,7 +1206,7 @@ it.layer(NodeCrypto.layer)("replica", (it) => {
 
 Every `TestReplica` constructor installs the SQL binding Layers passed in `projections`. Consumer Layers provide only
 mutation and query handlers. `layer` and `layerWithLimits` use the full durable runtime. `layerWithSync` and
-`layerWithSyncAndLimits` use the direct protocol graph for deterministic peer tests.
+`layerWithSyncAndLimits` use the lower level sync graph for deterministic peer tests.
 
 For sync tests use `TestReplica.layerWithSync`, `TestPeer.layer`, and `FaultInjection.layerSequence`. Fault decisions
 can deterministically drop, duplicate, delay, reorder, partition, heal, and flush bounded peer traffic. Effect's
@@ -1392,30 +1229,35 @@ validate their bounds in the Effect error channel with the tagged `InvalidOption
 | Atom values                              | Atom registry            | No      | No                                                  | Yes, from `Replica` reads and queries               |
 | Presence and tab sessions                | Browser process          | No      | Best effort transport only                          | Not applicable                                      |
 | RPC principals, leases, sessions, queues | RPC process scope        | No      | No                                                  | Recreated by authentication and synchronization     |
+| Sender relay outbox                      | Sender SQLite replica    | Yes     | No                                                  | Removed after relay custody or retry horizon        |
+| Relay custody and terminal evidence      | Backend relay SQL store  | Yes     | No                                                  | Active payload is not reconstructable after expiry  |
+| Recipient relay receipts                 | Recipient SQLite replica | Yes     | No                                                  | Bounded replay evidence, not canonical CRDT history |
 
 ### Boundary guarantees
 
 Consistency guarantees:
 
-| Boundary                 | Guarantee                                                                                                                  |
-| ------------------------ | -------------------------------------------------------------------------------------------------------------------------- |
-| One document command     | Serialized through its Cluster entity and committed with canonical state, projections, receipt, sequence, and stored reply |
-| Command retry            | Within one replica incarnation, the same command ID and canonical request returns the durable result                       |
-| Different command input  | Within one replica incarnation, reusing a command ID for different input fails                                             |
-| Query                    | Reads local projection state under the replica operation gate                                                              |
-| Multi document invariant | Not transactional. Model one aggregate document or an explicit Workflow                                                    |
-| Peer convergence         | Replicas converge after receiving the same valid Automerge change set                                                      |
-| Cross lineage sync       | Refused, never merged. A rewritten document stops synchronizing with every peer that holds the superseded lineage          |
-| Restore                  | Exclusive, fenced, staged, schema checked, and projection rebuilding                                                       |
-| Atom invalidation        | Reactive cache refresh, not a durability acknowledgement                                                                   |
-| Presence                 | Expiring best effort state with no durability guarantee                                                                    |
-| Direct peer send         | Local SQL outbox exists before send. A successful send permits local `markSent`. It does not prove remote application      |
-| Automerge observation    | The peer's sync state reports all current local changes observed. It does not prove remote storage durability              |
-| RPC `Open` handshake     | One authenticated, authorized, bounded live session exists for exactly the selected whole documents                        |
-| RPC `Push` success       | Bytes were accepted into the current bounded in memory session. No custody, replay, or remote durability is implied        |
-| Effect RPC stream ack    | The response chunk was acknowledged by the RPC protocol. It is neither a byte credit nor an application receipt            |
-| WebSocket frame order    | Frames are ordered within one live RFC 6455 connection. Reconnect, replay, authorization, and persistence are separate     |
-| `durableConfirmation`    | Always `false` in the shipped peer transports                                                                              |
+| Boundary                 | Guarantee                                                                                                                            |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| One document command     | Serialized through its Cluster entity and committed with canonical state, projections, receipt, sequence, and stored reply           |
+| Command retry            | Within one replica incarnation, the same command ID and canonical request returns the durable result                                 |
+| Different command input  | Within one replica incarnation, reusing a command ID for different input fails                                                       |
+| Query                    | Reads local projection state under the replica operation gate                                                                        |
+| Multi document invariant | Not transactional. Model one aggregate document or an explicit Workflow                                                              |
+| Peer convergence         | Replicas converge after receiving the same valid Automerge change set                                                                |
+| Cross lineage sync       | Refused, never merged. A rewritten document stops synchronizing with every peer that holds the superseded lineage                    |
+| Restore                  | Exclusive, fenced, staged, schema checked, and projection rebuilding                                                                 |
+| Atom invalidation        | Reactive cache refresh, not a durability acknowledgement                                                                             |
+| Presence                 | Expiring best effort state with no durability guarantee                                                                              |
+| Automerge observation    | The peer's sync state reports all current local changes observed. It does not prove remote storage durability                        |
+| RPC `Open` handshake     | One authenticated, authorized, bounded durable session exists for exactly the selected whole documents                               |
+| RPC `Push` success       | The backend relay store committed the complete envelope and quota reservation before replying                                        |
+| Relay recipient ack      | The recipient SQL sync workflow and sender scoped receipt committed before the fenced acknowledgement was attempted                  |
+| Relay delivery           | At least once within configured retry, expiry, retention, authorization, and capacity boundaries                                     |
+| Relay poison bound       | Delivery attempts are durable. Reaching `RelayInbox.Options.maxDeliveries` dead letters the row, which stops it blocking its channel |
+| Effect RPC stream ack    | The response chunk was acknowledged by the RPC protocol. It is neither a byte credit nor an application receipt                      |
+| WebSocket frame order    | Frames are ordered within one live RFC 6455 connection. Reconnect, replay, authorization, and persistence are separate               |
+| `durableConfirmation`    | Always `false` in the shipped peer transports                                                                                        |
 
 ### Retry and ambiguity
 
@@ -1433,6 +1275,13 @@ Consistency guarantees:
   safe. This is endpoint deduplication, not exactly once transport delivery.
 - Retry `RpcPeerTransport` only for `StorageUnavailable`. Rebuild the complete connection scope. Policy and protocol
   mismatches are not transient.
+- Retry relay admission with the same stable `RelayMessageId` and exact outer envelope. A lost custody response,
+  recipient acknowledgement, reconnect, or expired claim can duplicate delivery. Sender scoped recipient receipts
+  suppress repeated application during the negotiated retention window.
+- A relay delivery advances the durable attempt count once the message has provably reached the transport, so a
+  message prepared for a channel and then abandoned on a flaky connection costs nothing. Reaching
+  `RelayInbox.Options.maxDeliveries` dead letters the message so it stops blocking its channel. Restart does not
+  reset the count.
 - Durable commit events are retried until publication into the bounded process local stream. Subscriber delivery is
   best effort because the stream uses sliding capacity. A later sequence gap, `FullRefreshRequired`, or refresh
   generation change instructs the subscriber to reread canonical state. If no later event arrives, no notification
@@ -1462,6 +1311,18 @@ Consistency guarantees:
 10. All long lived connections, subscriptions, streams, queues, fibers, and server sessions must be owned by an Effect
     `Scope`. Native documents may instead use a deterministic acquisition bracket. Scope close is cleanup. It is not
     persistence.
+11. Relay ordering is FIFO only within one exact tenant, sender subject, sender peer, sender replica incarnation,
+    recipient subject, and recipient peer channel.
+12. One SQLite process and durable volume must own each relay shard. The application must not run a second authority
+    or open that database through a network file system.
+13. Relay authentication and ordinary document authorization must not imply unsafe Automerge resource trust. The
+    explicit grant must match the principal, resolved remote, direction, complete document set, finite lease, and
+    revocation Effect.
+14. Relay infrastructure validates bounded opaque envelope structure, routing, hashes, digest, and provenance shape.
+    Relay enabled `PeerSync` performs the one semantic Automerge decode.
+15. After fresh ordinary and unsafe grants, relay policy revocation and the bounded operation contend on a local gate.
+    Revocation admitted first prevents SQL mutation or payload emission. An operation admitted first may finish and
+    returns its real result. Revocation drains that in flight operation and blocks later work.
 
 ### Invalid compositions
 
@@ -1477,6 +1338,10 @@ Consistency guarantees:
   as authorization evidence.
 - Do not share one RPC handler Layer across tenants when the underlying SQL replica has no tenant column.
 - Do not treat `Push`, WebSocket, stream acknowledgement, `markSent`, or `observedByPeer` as remote durable custody.
+- Do not treat store and forward as exactly once delivery. A stale claim may duplicate delivery, but its old token
+  cannot retire a newer claim.
+- Do not run two relay custody authorities for one shard or infer automatic failover, quorum, or split brain recovery.
+- Do not grant `UnsafeUnboundedAutomerge3DecodeGrant` merely because a peer is authenticated or document authorized.
 - Do not resume an `Open` stream or Automerge connection state after reconnect. Create a fresh scope and session.
 - Do not keep the browser SQLite connection in page code or open the same OPFS database outside the elected owner.
 - Do not add a second Automerge repository or backend materialization and call it canonical. Projections remain
@@ -1486,9 +1351,8 @@ Consistency guarantees:
 
 This beta deliberately provides building blocks rather than a complete collaboration product.
 
-- The RPC package provides a live server replica protocol and policy extension points. It does not provide a managed
-  backend, durable relay, peer discovery, asynchronous store and forward, account system, credential issuer, or tenant
-  registry.
+- The RPC package provides one durable store and forward protocol. It does not provide a managed backend, peer
+  discovery, account system, credential issuer, or tenant registry.
 - The application owns credential issuance and rotation, authenticator and authorization implementations, stable peer
   identity assignment, tenant routing, TLS, Origin validation, ingress controls, logging policy, and end to end
   encryption when required.
@@ -1500,14 +1364,22 @@ This beta deliberately provides building blocks rather than a complete collabora
   identity, and payload content must not be attached to spans or metrics. Application logs must preserve the same rule.
 - Authentication and authorization leases are upper bounds on reuse. Their invalidation Effects may terminate them
   earlier. They do not revoke data already synchronized to an authorized replica.
+- Automerge `3.3.2` does not expose allocation bounded semantic decode. Relay policy must deny
+  `authorizeUnsafeUnboundedAutomerge3Decode` unless the application controls and resource trusts the producer bytes.
+  Ordinary authentication and document authorization are insufficient. The exact grant binds principal, remote,
+  direction, documents, finite expiry, and revocation. A future allocation bounded Automerge API should replace this
+  exception and remove the unsafe grant.
+- Relay revocation is not atomic with SQLite. It does not retroactively cancel an operation that already won the local
+  gate. That bounded operation may finish its durable commit or delivery and returns its real result. Revocation drains
+  it and prevents later operations. If revocation wins the gate first, no SQL mutation or payload emission occurs.
 - `AuthenticationFailure` and `AccessDenied` intentionally disclose no reason. `UnsupportedVersion`, `PeerMismatch`,
   `InvalidRequest`, and limit errors are typed protocol failures. Capacity and session availability errors are live
   resource failures.
 - A missing session and a session owned by another tenant, subject, or peer both return the same fieldless
   `SessionUnavailable`. Applications must not wrap this result with ownership or existence detail because that creates
   a session enumeration oracle.
-- `PeerRpcLimits.defaults` are conservative library defaults, not product capacity planning. Configure them with core
-  `ReplicaLimits`, process memory, expected document size, ingress limits, and subject quotas.
+- `PeerRelayLimits.defaults` are conservative library defaults, not product capacity planning. Configure them with
+  process memory, expected document size, ingress limits, database capacity, and subject quotas.
 - OPFS is origin scoped. Browser storage starts as best effort, can be evicted unless persistence is granted, and is
   deleted when the user clears the site's storage.
 - Existing secondary tabs do not yet promote themselves when the provisioning tab disappears. A new attachment can
@@ -1517,12 +1389,13 @@ This beta deliberately provides building blocks rather than a complete collabora
 - An old backup can require a matching application build until versioned migration support exists.
 - One mutation targets one document. There is no replicated transaction across documents.
 - Whole document sync is the only sync granularity. Subtree sync is not implemented.
-- Store and forward capability is a transport declaration. The shipped direct and RPC transports report it as false.
 - Document lineage is an unauthenticated peer assertion. It is carried on the sync envelope, it is not covered by the
   envelope's message digest, and no authorization check restricts what a peer may claim. It exists to stop an honest
   but stale peer from silently resurrecting discarded history. It is not evidence about the peer and must not be used
   as one. A refusal is not proof that the local document is stale. Confirm locally that a rewrite ran first. A
   forged lineage costs the forger that one document in that one session and nothing else.
+- `RpcPeerTransport.layer` and `makeSession` expose only the durable acknowledged topology after the version `1`
+  handshake.
 - Conflict inspection, history browsing, sharing policy, and resolution UI belong to the application.
 - Presence is not durable awareness and must not carry authorization decisions.
 - Limits must be selected for the product. They bound backup bytes, archive records, JSON depth, sync messages,
@@ -1537,11 +1410,11 @@ This beta deliberately provides building blocks rather than a complete collabora
 
 | Owner                  | Required responsibility                                                                                           |
 | ---------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| Application            | `PeerCredentials`, `PeerAuthenticator`, `PeerAuthorization`, tenant mapping, stable peer IDs, reconnect policy    |
+| Application            | Credentials, authentication, relay authorization, tenant mapping, stable peer IDs, reconnect policy               |
 | Effect RPC composition | `RpcClient.Protocol`, `RpcServer.Protocol`, serialization, request and stream lifecycle                           |
 | Platform               | Socket and WebSocket implementation, HTTP server, TLS, DNS, process signals                                       |
 | Ingress                | Origin policy, connection limits, upgrade timeout, maximum frame and request bytes, load shedding                 |
-| Effect Local RPC       | Versioned `Open` and `Push`, required auth middleware, exact authorization, bounded live registry and adapter     |
+| Effect Local RPC       | Durable version `1`, required auth middleware, bounded sessions, custody adapter, and limits                      |
 | SQL replica            | Canonical Automerge state, durable peer outbox and receipts, fencing, recovery, projections                       |
 | Operations             | Secret rotation, telemetry redaction, capacity configuration, backup policy, incident response, graceful shutdown |
 
@@ -1551,12 +1424,13 @@ bounded number of concurrent session cleanups to complete before terminating the
 not bounded. Operations that require a hard process deadline must enforce it outside the Layer and decide when to force
 termination.
 
-Read [architecture](docs/architecture.md), [durability](docs/durability.md), [sync](docs/sync.md), and
-[schema evolution](docs/schema-evolution.md) for the detailed contracts.
+Read [architecture](docs/architecture.md), [durability](docs/durability.md), [sync](docs/sync.md),
+[store and forward](docs/store-and-forward.md), and [schema evolution](docs/schema-evolution.md) for the detailed
+contracts.
 
 ## Non goals
 
-- Durable opaque envelope relay, custody receipts, remote durable cursors, and asynchronous replay.
+- Globally replicated relay custody, automatic failover, quorum operation, shard rebalance, and cross region routing.
 - Backend owned application state outside the canonical Automerge SQL replica.
 - NATS, Kafka, broker, Cluster, or Workflow orchestration for live network sessions.
 - Automatic token issuance, user storage, tenant registry, policy language, peer discovery, or sharing UI.
@@ -1566,7 +1440,7 @@ Read [architecture](docs/architecture.md), [durability](docs/durability.md), [sy
 - Automatic, scheduled, or threshold triggered history truncation, and any path that lets a rewritten document
   resume synchronizing with a peer that still holds the superseded lineage.
 - Remote durability confirmation. The current `durableConfirmation` API returns only `false`.
-- Protocol compatibility with versions other than `PeerRpc.protocolVersion`.
+- Protocol compatibility with versions other than the declared direct and relay protocol versions.
 - React APIs in the RPC package. React consumers continue to use `ReplicaAtom` over their local replica.
 
 ## Repository scripts
@@ -1592,12 +1466,6 @@ Run commands from the repository root.
 | `pnpm docgen`           | Compile documentation through the root TypeScript graph           |
 | `pnpm clean`            | Remove generated build artifacts                                  |
 
-`pnpm bench` excludes `PeerRpcServerPerformance.bench.ts`. That harness imports an instrumentation module created only
-by `base-admission-instrumentation.patch` or `candidate-admission-instrumentation.patch` inside detached benchmark
-worktrees. It must never run against or add hooks to the shipped source. After applying the matching patch, run it with
-`pnpm exec vitest bench --run --config packages/local-rpc/bench/vitest.admission.config.ts`. Base and candidate must use
-the same harness, dependency lock, sample count, and machine.
-
 ## Public API inventory
 
 Every root package exports module namespaces. Every module is also available through its public subpath, such as
@@ -1606,15 +1474,15 @@ Every root package exports module namespaces. Every module is also available thr
 The export surface supports several assembly levels. Most applications start with everyday domain and composition
 modules. Feature and advanced services remain public for products that need direct control.
 
-| Level                       | Modules                                                                                                                                                                  |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Everyday domain             | `Document`, `DocumentSet`, `Mutation`, `Projection`, `Query`, `ReplicaDefinition`, `Replica`, `CommandOutcome`, `Snapshot`, `Identity`, `ReplicaStatus`, `Backup`        |
-| Durable runtime             | `SqlProjection`, `SqlReplica`, `BrowserReplica`, `BrowserSqlite`                                                                                                         |
-| Reactive and test adapters  | `ReplicaAtom`, `TestReplica`                                                                                                                                             |
-| Optional features           | `PeerTransport`, `PeerSession`, `Presence`, `ReplicaWorkflow`, `TestPeer`, `FaultInjection`, `PeerRpc`, `RpcPeerTransport`                                               |
-| RPC policy and server       | `PeerCredentials`, `PeerAuthenticator`, `PeerAuthentication`, `PeerAuthorization`, `PeerRpcLimits`, `PeerRpcServer`, `PeerRpcError`                                      |
-| Advanced assembly           | `CommitPublisher`, `Compaction`, `Recovery`, `PeerSync`, `DurableRuntime`, `ReplicaClient`, `ReplicaOwner`, `SessionManager`                                             |
-| Advanced framework assembly | `CommandExecutor`, `DocumentEntity`, `DocumentStore`, `EntityReplica`, `Migrations`, `ProjectionStore`, `QueryExecutor`, `ReplicaBootstrap`, `ReplicaGate`, `ReplicaRpc` |
+| Level                       | Modules                                                                                                                                                                                                                  |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Everyday domain             | `Document`, `DocumentSet`, `Mutation`, `Projection`, `Query`, `ReplicaDefinition`, `Replica`, `CommandOutcome`, `Snapshot`, `Identity`, `ReplicaStatus`, `Backup`                                                        |
+| Durable runtime             | `SqlProjection`, `SqlReplica`, `BrowserReplica`, `BrowserSqlite`                                                                                                                                                         |
+| Reactive and test adapters  | `ReplicaAtom`, `TestReplica`                                                                                                                                                                                             |
+| Optional features           | `PeerTransport`, `PeerSession`, `Presence`, `ReplicaWorkflow`, `TestPeer`, `FaultInjection`, `PeerRpc`, `RpcPeerTransport`                                                                                               |
+| RPC policy and server       | `PeerCredentials`, `PeerAuthenticator`, `PeerAuthentication`, `PeerRelayAuthorization`, `PeerRelayLimits`, `RelayInboxStore`, `SqlRelayInboxStore`, `RelayInbox`, `RelayInboxMaintenance`, `RelayServer`, `PeerRpcError` |
+| Advanced assembly           | `CommitPublisher`, `Compaction`, `Recovery`, `PeerSync`, `DurableRuntime`, `ReplicaClient`, `ReplicaOwner`, `SessionManager`                                                                                             |
+| Advanced framework assembly | `CommandExecutor`, `DocumentEntity`, `DocumentStore`, `EntityReplica`, `Migrations`, `ProjectionStore`, `QueryExecutor`, `ReplicaBootstrap`, `ReplicaGate`, `ReplicaRpc`                                                 |
 
 These public framework assembly modules support custom runtimes and diagnostics. Paths under `internal/*` remain
 private and unsupported. The public assembly modules are not required for the normal application path shown in the
@@ -1630,9 +1498,9 @@ composition recipes.
 | `Commit`            | `Heads`, `Commit` and their inferred types                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `Document`          | `WireSchema`, `AutomergeEncoded`, `DocumentSchema`, `Document`, `Any`, `make`, `isAutomergeValue`, `decode`, `encode`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `DocumentSet`       | `DocumentSet`, `make`, `get`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| `Identity`          | Schemas and types for `ReplicaId`, `ReplicaIncarnation`, `SessionId`, `DocumentId`, `CommandId`, `WriterGeneration`, `CommitSequence`, `PeerId`, `ProjectionVersion`, and `DocumentLineage`. `genesisLineage`, `makeReplicaId`, `makeSessionId`, `makeDocumentId`, `makeCommandId`, `makePeerId`, `makeDocumentLineage`, `documentIdFromCommandId`                                                                                                                                                                                                                                                                   |
+| `Identity`          | Schemas and types for `ReplicaId`, `ReplicaIncarnation`, `SessionId`, `DocumentId`, `CommandId`, `RelayMessageId`, `WriterGeneration`, `CommitSequence`, `PeerId`, `ProjectionVersion`, and `DocumentLineage`. `genesisLineage`, identity generators including `makeRelayMessageId`, `makeDocumentLineage`, `documentIdFromCommandId`                                                                                                                                                                                                                                                                                |
 | `Mutation`          | `DraftValue`, `Draft`, `SuccessResult`, `HandlerResult`, `HandlerOptions`, `Handler`, `HandlerService`, `Mutation`, `Any`, `make`; definitions expose `payloadSchema`, `successSchema`, `errorSchema`, `of`, and `toLayer`; `toLayer` accepts a handler or an Effect that builds one                                                                                                                                                                                                                                                                                                                                 |
-| `PeerTransport`     | `Capabilities`, `Connection`, `ConnectOptions`, `PeerTransport` service                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `PeerTransport`     | `Capabilities`, `PermanentRejectReason`, `RelayDeliveryIdentity`, `AcknowledgedDelivery`, `Connection`, `ConnectOptions`, `PeerTransport` service                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `Projection`        | `Projection`, `Any`, `make`, `assertUniqueKeys`, `evaluate`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `Query`             | `Handler`, `HandlerService`, `Query`, `Any`, `make`; definitions expose `payloadSchema`, `successSchema`, `errorSchema`, `of`, and `toLayer`; `toLayer` accepts a handler or an Effect that builds one                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `Replica`           | `Replica` service                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -1716,27 +1584,32 @@ descriptor does not install its handler.
 
 ### `@lucas-barake/effect-local-sql`
 
-| Namespace          | Public API                                                                                                                                                                                                                                                                                      |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BackupStore`      | `BackupStore` service, `layer`                                                                                                                                                                                                                                                                  |
-| `CommandExecutor`  | `createRequestHash`, `mutationRequestHash`, `deleteRequestHash`, `CommandExecutor` service, `MutationHandlers`, `layer`                                                                                                                                                                         |
-| `CommitPublisher`  | `CommitEvent`, `CommitSubscription`, `CommitPublisher` service, `layer`                                                                                                                                                                                                                         |
-| `Compaction`       | `OperationId`, `PreparedCheckpoint`, `CompactResult`, `Compaction` service, `layer`                                                                                                                                                                                                             |
-| `DocumentEntity`   | Cluster RPC definitions `Create`, `Mutate`, `Delete`, `ApplySync`, plus `ApplySyncResult`, `DocumentEntity`, `layer`                                                                                                                                                                            |
-| `DocumentStore`    | `Stored`, `DocumentStore` service, `layer`                                                                                                                                                                                                                                                      |
-| `DurableRuntime`   | `layer`, `layerWith`                                                                                                                                                                                                                                                                            |
-| `EntityReplica`    | `layer`                                                                                                                                                                                                                                                                                         |
-| `Migrations`       | `canonicalStoreChecksum`, `peerSyncChecksum`, `durabilityIndexesChecksum`, `projectionReadinessChecksum`, `pendingReceiptIndexesChecksum`, `peerWriterProvenanceChecksum`, `replicaHealthIndexesChecksum`, `documentLineageChecksum`, `historyRewriteMarkersChecksum`, `loader`, `run`, `layer` |
-| `PeerSession`      | `SelectedDocument`, `PeerSession`, `SupervisedPeerSession`, `SyncEnvelope`, `maximumSyncEnvelopeBytes`, `makeTestClient`, `makeSupervised`, `make`, `makeLive`                                                                                                                                  |
-| `PeerSync`         | `Session`, `Outbound`, `Reply`, `Generated`, `Received`, `PeerSync` service, `layer`                                                                                                                                                                                                            |
-| `ProjectionStore`  | `ProjectionStore` service, `BindingServices`, `layer`                                                                                                                                                                                                                                           |
-| `QueryExecutor`    | `QueryExecutor` service, `QueryHandlers`, `layer`                                                                                                                                                                                                                                               |
-| `Recovery`         | `RawRecoveryExport`, `Recovery` service, `make`, `layer`                                                                                                                                                                                                                                        |
-| `ReplicaBootstrap` | `State`, `ReplicaBootstrap` service, `make`, `layer`                                                                                                                                                                                                                                            |
-| `ReplicaGate`      | `Permit`, `ReplicaGate` service, `layer`                                                                                                                                                                                                                                                        |
-| `ReplicaWorkflow`  | `OperationId` re-exported from `Compaction`, `CompactReplica`, `RewriteDocumentHistory`, `Execution`, `DocumentExecution`, `CompactionWorkflow`, `HistoryRewriteWorkflow`, `layerRegistration`, `layerRuntime`, `layerHistoryRewriteRegistration`, `layerHistoryRewriteRuntime`                 |
-| `SqlProjection`    | `Migration`, `SqlProjection`, `BindingService`, `make`, `Any`                                                                                                                                                                                                                                   |
-| `SqlReplica`       | `layerFromServices`, `layer`, `layerWithBindings`                                                                                                                                                                                                                                               |
+| Namespace                | Public API                                                                                                                                                                                                                                                                                                                |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BackupStore`            | `BackupStore` service, `layer`                                                                                                                                                                                                                                                                                            |
+| `CommandExecutor`        | `createRequestHash`, `mutationRequestHash`, `deleteRequestHash`, `CommandExecutor` service, `MutationHandlers`, `layer`                                                                                                                                                                                                   |
+| `CommitPublisher`        | `CommitEvent`, `CommitSubscription`, `CommitPublisher` service, `layer`                                                                                                                                                                                                                                                   |
+| `Compaction`             | `OperationId`, `PreparedCheckpoint`, `CompactResult`, `Compaction` service, `layer`                                                                                                                                                                                                                                       |
+| `DocumentEntity`         | Cluster RPC definitions `Create`, `Mutate`, `Delete`, `ApplySync`, plus `ApplySyncResult`, `DocumentEntity`, `layer`                                                                                                                                                                                                      |
+| `DocumentStore`          | `Stored`, `DocumentStore` service, `layer`                                                                                                                                                                                                                                                                                |
+| `DurableRuntime`         | `layer`, `layerWith`, `layerRelay`                                                                                                                                                                                                                                                                                        |
+| `EntityReplica`          | `layer`                                                                                                                                                                                                                                                                                                                   |
+| `Migrations`             | `canonicalStoreChecksum`, `peerSyncChecksum`, `durabilityIndexesChecksum`, `projectionReadinessChecksum`, `pendingReceiptIndexesChecksum`, `peerWriterProvenanceChecksum`, `replicaHealthIndexesChecksum`, `documentLineageChecksum`, `historyRewriteMarkersChecksum`, `peerRelayStateChecksum`, `loader`, `run`, `layer` |
+| `PeerRelayClientRuntime` | `ConnectionConfiguration`, `PeerRelayClientRuntime` service, `makeScoped`, `layer`                                                                                                                                                                                                                                        |
+| `PeerRelayOutbox`        | `Endpoint`, `AdmitInput`, `ReplayInput`, `CustodyInput`, `Entry`, `Usage`, `PeerRelayOutbox` service, `layerSql`                                                                                                                                                                                                          |
+| `PeerRelayOutboxLimits`  | `Values`, `defaults`, `PeerRelayOutboxLimits` service, `make`, `layer`, `layerDefaults`                                                                                                                                                                                                                                   |
+| `PeerRelayReceiptLimits` | `Values`, `defaults`, `PeerRelayReceiptLimits` service, `make`, `layer`, `layerDefaults`                                                                                                                                                                                                                                  |
+| `PeerSession`            | `SelectedDocument`, `PeerSession`, `SupervisedPeerSession`, `SyncEnvelope`, `maximumSyncEnvelopeBytes`, `makeTestClient`, `makeSupervised`, `make`, `makeLive`                                                                                                                                                            |
+| `PeerSync`               | `Session`, `Outbound`, `Reply`, `Generated`, `Received`, `RelayReceipt`, `PeerSync` service, `layer`, `layerRelay`                                                                                                                                                                                                        |
+| `PeerSyncEnvelope`       | Direct and relay envelope schemas, validation, encoding, canonical outer digest, and declared size bounds                                                                                                                                                                                                                 |
+| `ProjectionStore`        | `ProjectionStore` service, `BindingServices`, `layer`                                                                                                                                                                                                                                                                     |
+| `QueryExecutor`          | `QueryExecutor` service, `QueryHandlers`, `layer`                                                                                                                                                                                                                                                                         |
+| `Recovery`               | `RawRecoveryExport`, `Recovery` service, `make`, `layer`                                                                                                                                                                                                                                                                  |
+| `ReplicaBootstrap`       | `State`, `ReplicaBootstrap` service, `make`, `layer`                                                                                                                                                                                                                                                                      |
+| `ReplicaGate`            | `Permit`, `ReplicaGate` service, `layer`                                                                                                                                                                                                                                                                                  |
+| `ReplicaWorkflow`        | `OperationId` reexported from `Compaction`, `CompactReplica`, `RewriteDocumentHistory`, `Execution`, `DocumentExecution`, `CompactionWorkflow`, `HistoryRewriteWorkflow`, `layerRegistration`, `layerRuntime`, `layerHistoryRewriteRegistration`, `layerHistoryRewriteRuntime`                                            |
+| `SqlProjection`          | `Migration`, `SqlProjection`, `BindingService`, `make`, `Any`                                                                                                                                                                                                                                                             |
+| `SqlReplica`             | `layerFromServices`, `layer`, `layerRelay`, `layerWithBindings`                                                                                                                                                                                                                                                           |
 
 Public SQL service methods:
 
@@ -1747,6 +1620,8 @@ Public SQL service methods:
 | `CommitPublisher`        | `publishPending`, `invalidate(keys)`, scoped `subscribe`                                                                                                                                                                                                            |
 | `Compaction`             | `prepare(document, documentId)`, `publish(checkpoint)`, `compact(document, documentId)`, `prune(documentId)`, `pruneCommandReceipts`, `rewriteHistory(document, documentId, operationId)`                                                                           |
 | `DocumentStore`          | `create`, `load`, `stage`, `tombstone`, `persist`; callers own the native document returned by `load`                                                                                                                                                               |
+| `PeerRelayClientRuntime` | Stable admission, exact endpoint replay, custody retirement, receipt pruning signal, health, and fatal failure observation                                                                                                                                          |
+| `PeerRelayOutbox`        | `admit`, `dueForEndpoint`, `maximumPendingHorizon`, `markCustody`, `pruneExpired`, `usage`, `validateReplicaIncarnation`                                                                                                                                            |
 | `PeerSync`               | `open(peerId)`, `reset(session)`, `generate(document, documentId, session, peer)`, `receive(document, documentId, session, input)`, `enqueue(session, reply)`, `pending(session)`, `markSent(session, sendSequence, messageHash)`, `invalidateDocument(documentId)` |
 | `ProjectionStore`        | `clear`, `replace(binding, snapshot, destinationTable)`, `replaceDocument(document, snapshot, commitSequence)`                                                                                                                                                      |
 | `QueryExecutor`          | `execute(query, payload)` and reactive `reactive(query, payload)`                                                                                                                                                                                                   |
@@ -1880,14 +1755,14 @@ Do not expose the browser owner protocol as an internet peer API.
 | `TestReplica`    | `defaultLimits`, `layerWithLimits`, `layer`, `layerWithSyncAndLimits`, `layerWithSync`                                                                                                |
 
 `TestReplica.layer` and `layerWithLimits` run the full Cluster and Workflow production path against in memory Node
-SQLite. `layerWithSync` and `layerWithSyncAndLimits` expose the lower level direct protocol graph. All constructors
+SQLite. `layerWithSync` and `layerWithSyncAndLimits` expose the lower level sync graph. All constructors
 still require the domain's generated mutation and query handler services and install the supplied SQL projection
 bindings.
 
 `FaultInjection.Decision` controls drop, finite copy count, finite nonnegative delay, and pairwise reorder. A
 `layerSequence` repeats its final decision for later packets. `TestPeer` validates queue capacity, maximum copies, and
 maximum delay. Its methods connect peers, partition, heal, and flush traffic. `transportLayer` adapts one peer to core
-`PeerTransport`; the resulting capability has no store and forward guarantee.
+`PeerTransport` with the same acknowledged delivery shape used by production transports.
 
 `TestReplica.defaultLimits` is the only exported `ReplicaLimits` preset. It is intended for tests, not production capacity
 planning:
@@ -1905,131 +1780,31 @@ planning:
 
 ### `@lucas-barake/effect-local-rpc`
 
-| Namespace            | Public API                                                                                                                                                                                                                                                                                                                      |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PeerAuthentication` | `PeerPrincipal` schema and type, request service `AuthenticatedPeer`, required RPC middleware `PeerAuthentication`, argument free `layerServer`, argument free `layerClient`                                                                                                                                                    |
-| `PeerAuthenticator`  | `PeerAuthenticator` service. `authenticate(Redacted<string>)` returns principal, finite `validUntil`, and `invalidated`, or `AuthenticationFailure`                                                                                                                                                                             |
-| `PeerAuthorization`  | `PeerAuthorization` service and validating constructor `layer`. `authorize` returns exactly resolved `SelectedDocument` values, finite `validUntil`, and `invalidated`, or `AccessDenied` or `ServerUnavailable`                                                                                                                |
-| `PeerCredentials`    | `PeerCredentials` service. `get` is an Effect that returns a rotating `Redacted<string>` or `AuthenticationFailure`                                                                                                                                                                                                             |
-| `PeerRpc`            | `protocolVersion`, `DefinitionHash`, `RequestedDocument`, `Opened`, `Message`, `OpenEvent`, `OpenRpc`, `PushRpc`, `Rpcs`, generated `RpcClient`, `makeRpcClient`                                                                                                                                                                |
-| `PeerRpcError`       | `AuthenticationFailure`, `AccessDenied`, `UnsupportedVersion`, `PeerMismatch`, `DefinitionMismatch`, `InvalidRequest`, `RequestLimitExceeded`, `RequestCapacityExceeded`, `SessionUnavailable`, `SessionOverloaded`, `ServerUnavailable`, `DocumentLineageChanged`, union schema and type `PeerRpcError`, fixed `Defect` schema |
-| `PeerRpcLimits`      | `Values` schema and type, `defaults`, `InvalidPeerRpcLimits`, `PeerRpcLimits` service, `make`, `layer`, `layerDefaults`                                                                                                                                                                                                         |
-| `PeerRpcServer`      | `layerHandlers({ tenantId, peerId, definition })`                                                                                                                                                                                                                                                                               |
-| `RpcPeerTransport`   | `isRetryable`, advanced `layer(client, { documents, definition })`, preferred `makeSession(client, { peerId, documents, definition })`                                                                                                                                                                                          |
+| Module                   | Public contract                                                                                            |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| `PeerAuthentication`     | Required client and server middleware for every relay request                                              |
+| `PeerAuthenticator`      | Application credential verification service                                                                |
+| `PeerCredentials`        | Client credential provider                                                                                 |
+| `PeerRelayAuthorization` | Exact send and receive authorization plus the explicit Automerge resource trust grant                      |
+| `PeerRelayLimits`        | Negotiation windows, authentication rate limits, and the per subject session cap                           |
+| `PeerRpc`                | Durable protocol version `1`, `Open`, `Push`, `Acknowledge`, `Reject`, events, group, and generated client |
+| `RelayInboxStore`        | Injectable semantic custody contract for one device's inbox                                                |
+| `SqlRelayInboxStore`     | Generic `SqlClient` implementation with `make` and `layer` for SQLite, PostgreSQL, and MySQL               |
+| `RelayInbox`             | The cluster entity that owns one device's inbox, with `layer` and `Options`                                |
+| `RelayInboxMaintenance`  | Deployment wide expiry and collection, as a cluster singleton                                              |
+| `RelayServer`            | `layerHandlers` for the front door alone, `layer` for the front door plus entity plus retention            |
+| `RpcPeerTransport`       | Durable `Options`, `layer`, `makeSession`, and `isRetryable`                                               |
 
-#### RPC procedure contract
+The `Open` stream starts with `Opened` and then emits `StoredMessage` values. `Push` succeeds only after durable
+custody. `Acknowledge` and `Reject` use the claim token minted for that delivery attempt plus the message hash. Every
+procedure can fail with a fieldless `PeerRpcError`.
 
-| Procedure | Request                                                                                                                                              | Success                                                               | Typed errors         | Lifecycle                                                                                                                                                                                                     |
-| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Open`    | `protocolVersion`, `expectedPeerId`, `definitionHash`, unique requested whole documents, optional client `capabilities`, middleware owned credential | Stream beginning with one `Opened`, followed only by `Message` events | Every `PeerRpcError` | Stream interruption is connection close. One active incarnation exists per authenticated peer                                                                                                                 |
-| `Push`    | Current `sessionId`, bounded byte payload, middleware owned credential                                                                               | `void` after bounded in memory admission                              | Every `PeerRpcError` | Authenticated identity, current authorized session, ownership, lease, and limits are checked. Inbound overflow or any outbound capacity timeout revokes the session and fails `Open` with `SessionOverloaded` |
-
-Protocol version `2` requires a canonical `definitionHash` in the `def_` plus 16 lowercase hexadecimal format. Version
-`1` requests remain decodable only so the server can reject them with `UnsupportedVersion`. `Opened` contains the
-negotiated version, new `SessionId`, server `PeerId`, and `capabilities`. Server `capabilities` are
-`{ storeAndForward: false, lineageAware: true }`. `lineageAware` is an optional key on the schema, so an `Opened` frame
-from a build that predates it still decodes and reads as not lineage aware. The `Open` request carries the mirrored
-optional client `capabilities: { lineageAware }`, which is how the server learns the same fact about the caller.
-`Message` contains one `Uint8Array`. `OpenRpc` and `PushRpc` both carry the
-required `PeerAuthentication` middleware. `makeRpcClient` requires `RpcClient.Protocol`, client authentication
-middleware, and `Scope`. It deliberately does not return a package owned connection service.
-
-RPC environment requirements:
-
-| Constructor or Layer                           | Required Effect services                                                                                                                                                |
-| ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PeerAuthentication.layerClient`               | `PeerCredentials`                                                                                                                                                       |
-| `PeerAuthentication.layerServer`               | `PeerAuthenticator`, `PeerRpcLimits`                                                                                                                                    |
-| `PeerAuthorization.layer(authorize)`           | None. The callback must return an environment free Effect. Build `PeerAuthorization` with an application `Layer.effect` instead when authorization needs other services |
-| `PeerRpcLimits.make`, `layer`, `layerDefaults` | Core `ReplicaLimits`                                                                                                                                                    |
-| `PeerRpcServer.layerHandlers`                  | `CommitPublisher`, `PeerRpcLimits`, core `ReplicaLimits`, `PeerAuthorization`, `Crypto`, `PeerSync`, `ReplicaGate`, `Sharding`                                          |
-| `PeerRpc.makeRpcClient`                        | `RpcClient.Protocol`, required client `PeerAuthentication` middleware, `Scope`                                                                                          |
-| `RpcPeerTransport.layer`                       | `Scope` for each connection acquisition                                                                                                                                 |
-| `RpcPeerTransport.makeSession`                 | `Scope`, `CommitPublisher`, `Crypto`, `PeerSync`, `ReplicaGate`, core `ReplicaLimits`, `Sharding`; the adapter supplies `PeerTransport`                                 |
-
-`PeerPrincipal` is `{ tenantId, subjectId, peerId }`. `RequestedDocument` is `{ documentType, documentId }`. Every
-`PeerRpcError` class is a fieldless tagged error, including `DocumentLineageChanged`. A peer therefore learns that
-its view of a document lineage is stale, never which document and never the lineage values, because reflecting
-those back would attach document identity to the RPC boundary. `InvalidPeerRpcLimits` is separate from the wire
-error union and carries `field` for relational configuration failures. Middleware supplies the redacted
-`credential` field on every request. Callers must not treat a payload supplied credential as authoritative because
-`layerClient` overwrites it.
-
-#### RPC limits contract
-
-`PeerRpcLimits.Values` contains these required fields:
-
-| Category          | Fields                                                                                          |
-| ----------------- | ----------------------------------------------------------------------------------------------- |
-| Session and queue | `maxSessionsPerSubject`, `inboundItemCapacity`, `outboundItemCapacity`                          |
-| Byte memory       | `maxInboundBufferedBytesPerSession`, `maxOutboundBufferedBytesPerSession`, `maxBufferedBytes`   |
-| Authentication    | `maxInFlightAuthentication`, `authenticationRatePerSecond`, `authenticationBurst`               |
-| Open admission    | `maxInFlightOpen`, `maxInFlightOpenPerSubject`, `openRatePerSecond`, `openBurst`                |
-| Push admission    | `maxInFlightPush`, `maxInFlightPushPerSubject`, `pushRatePerSecond`, `pushBurst`                |
-| Retained state    | `maxRetainedRateLimitedConnections`, `maxRetainedRateLimitedSubjects`, `rateLimitIdleRetention` |
-| Lease and workers | `maximumReauthorizationInterval`, `commitFlushConcurrency`, `shutdownCleanupConcurrency`        |
-
-Every scalar is finite and positive. Integer fields must be positive integers. `make` also checks the relational byte
-constraints against core `ReplicaLimits.maxSyncMessageBytes`. Scalar decode failures preserve Effect Schema's issue
-tree. Relational failures use `InvalidPeerRpcLimits` with the failing field. The defaults are inspectable through
-`PeerRpcLimits.defaults` and installable with `layerDefaults`.
-
-`PeerRpcLimits.defaults` has these exact values:
-
-| Category            | Exact defaults                                                                                                 |
-| ------------------- | -------------------------------------------------------------------------------------------------------------- |
-| Session and items   | `maxSessionsPerSubject = 4`, `inboundItemCapacity = 1`, `outboundItemCapacity = 1`                             |
-| Byte memory         | Per session inbound `4 MiB`, per session outbound `4 MiB`, total `64 MiB`                                      |
-| Authentication      | `maxInFlightAuthentication = 64`, `authenticationRatePerSecond = 16`, `authenticationBurst = 32`               |
-| Open                | `maxInFlightOpen = 16`, per subject `2`, rate per second `2`, burst `4`                                        |
-| Push                | `maxInFlightPush = 128`, per subject `8`, rate per second `64`, burst `128`                                    |
-| Retained rate state | Connections `10_000`, subjects `10_000`, idle retention `600_000 ms`                                           |
-| Policy and workers  | Maximum reauthorization interval `300_000 ms`, commit flush concurrency `8`, shutdown cleanup concurrency `16` |
-
-#### RPC observability contract
-
-RPC spans are `effect_local_rpc.authentication`, `effect_local_rpc.server.open`,
-`effect_local_rpc.server.push`, `effect_local_rpc.adapter.open`, and `effect_local_rpc.adapter.push`. Every span has the
-fixed `rpc.operation` and `rpc.result` attributes. Open spans may add finite `rpc.selected_documents`. Push spans may add
-finite `rpc.payload_bytes`.
-
-The fixed operation vocabulary is `Authentication`, `Open`, `Push`, `AdapterOpen`, `AdapterPush`, `Inbound`, `Outbound`,
-and `Server`. The fixed result vocabulary is `Attempt`, `Success`, `AuthenticationDenied`, `AuthorizationDenied`,
-`ProtocolRejected`, `CapacityRejected`, `Overloaded`, `Failure`, `Replaced`, and `ShutdownClosed`.
-
-| Metric                                | Attributes and observation                                                                                                          |
-| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `effect_local_rpc_boundary_total`     | Counter with fixed `operation` and `result`                                                                                         |
-| `effect_local_rpc_active_sessions`    | Gauge without identity attributes                                                                                                   |
-| `effect_local_rpc_queue_items`        | Gauge with fixed `operation: Inbound \| Outbound`                                                                                   |
-| `effect_local_rpc_message_bytes`      | Histogram with fixed `operation: Inbound \| Outbound` and boundaries `0, 64, 256, 1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576` |
-| `effect_local_rpc_selected_documents` | Histogram with fixed `operation: Open` and boundaries `0, 1, 2, 4, 8, 16, 32, 64, 128`                                              |
-
-The library clears ambient metric attributes before updating these instruments. The library does not attach credential,
-tenant, subject, peer, session, or document identity, document content, raw payload bytes, or unbounded failure text to
-these spans or metrics. Applications and exporters must preserve the same exclusion.
-
-## Architecture evidence
-
-The repository is pinned to Effect `4.0.0-beta.99` at commit
-[`eb9b10256`](https://github.com/Effect-TS/effect/tree/eb9b10256c8558881b441c2fef833b7037174400) and Automerge
-`3.3.2` at commit
-[`b4a1bbe9`](https://github.com/automerge/automerge/tree/b4a1bbe9fc17d26c4d3f1819f9ee3b318de3a516).
-The following references are the exact upstream contracts used by this implementation.
-
-| Design contract               | Version matched source                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Consequence in Effect Local                                                                                                                            |
-| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Services and construction     | Effect [`Context.Service`](https://github.com/Effect-TS/effect/blob/eb9b10256c8558881b441c2fef833b7037174400/packages/effect/src/Context.ts#L200-L259), [`Layer`](https://github.com/Effect-TS/effect/blob/eb9b10256c8558881b441c2fef833b7037174400/packages/effect/src/Layer.ts#L974-L1064), and [`Scope`](https://github.com/Effect-TS/effect/blob/eb9b10256c8558881b441c2fef833b7037174400/packages/effect/src/Scope.ts#L366-L480)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Long lived application capabilities are services. Resource constructors are scoped Layers or Effects. Cleanup follows scope ownership                  |
-| Durable command execution     | Effect Cluster [`Persisted`, `WithTransaction`, and `Uninterruptible`](https://github.com/Effect-TS/effect/blob/eb9b10256c8558881b441c2fef833b7037174400/packages/effect/src/unstable/cluster/ClusterSchema.ts#L26-L115) and [entity transaction handling](https://github.com/Effect-TS/effect/blob/eb9b10256c8558881b441c2fef833b7037174400/packages/effect/src/unstable/cluster/internal/entityManager.ts#L205-L223)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Document commands serialize through entities and durable replies share the configured SQL transaction boundary                                         |
-| Durable maintenance           | Effect [`Workflow`](https://github.com/Effect-TS/effect/blob/eb9b10256c8558881b441c2fef833b7037174400/packages/effect/src/unstable/workflow/Workflow.ts#L429-L500) and [`WorkflowEngine`](https://github.com/Effect-TS/effect/blob/eb9b10256c8558881b441c2fef833b7037174400/packages/effect/src/unstable/workflow/WorkflowEngine.ts#L37-L107)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Compaction can resume activities without changing backup or command durability semantics                                                               |
-| Reactive invalidation         | Effect [`Reactivity`](https://github.com/Effect-TS/effect/blob/eb9b10256c8558881b441c2fef833b7037174400/packages/effect/src/unstable/reactivity/Reactivity.ts#L41-L80)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Commit publication invalidates rebuildable views. The notification is not canonical state                                                              |
-| RPC naming and ownership      | Effect Cluster's generated [`Rpcs`, `RpcClient`, and `makeRpcClient`](https://github.com/Effect-TS/effect/blob/eb9b10256c8558881b441c2fef833b7037174400/packages/effect/src/unstable/cluster/Runners.ts#L472-L526) and Effect [`RpcClient.make`](https://github.com/Effect-TS/effect/blob/eb9b10256c8558881b441c2fef833b7037174400/packages/effect/src/unstable/rpc/RpcClient.ts#L620-L640)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | The RPC package exports the contract and generated client directly. It does not wrap the connection in a parallel client abstraction                   |
-| RPC middleware                | Effect RPC [required client middleware fixture](https://github.com/Effect-TS/effect/blob/eb9b10256c8558881b441c2fef833b7037174400/packages/platform-node/test/fixtures/rpc-schemas.ts#L9-L31)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | `PeerAuthentication` is ordinary required RPC middleware. `AuthenticatedPeer` is request scoped context                                                |
-| WebSocket ownership           | Effect [`RpcServer.layerProtocolWebsocket`](https://github.com/Effect-TS/effect/blob/eb9b10256c8558881b441c2fef833b7037174400/packages/effect/src/unstable/rpc/RpcServer.ts#L927-L960) and its [Node integration test](https://github.com/Effect-TS/effect/blob/eb9b10256c8558881b441c2fef833b7037174400/packages/platform-node/test/RpcServer.test.ts#L54-L75)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Applications compose protocol, router, serialization, platform socket, and HTTP server around `PeerRpc.Rpcs`                                           |
-| Stream acknowledgements       | Effect RPC [response stream acknowledgement path](https://github.com/Effect-TS/effect/blob/eb9b10256c8558881b441c2fef833b7037174400/packages/effect/src/unstable/rpc/RpcServer.ts#L394-L430)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Acknowledgements bound response chunks but do not claim byte credit, remote Automerge message application, or persistence                              |
-| Queue overflow                | Effect [`Queue.dropping`](https://github.com/Effect-TS/effect/blob/eb9b10256c8558881b441c2fef833b7037174400/packages/effect/src/Queue.ts#L538-L563)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Bounded admission reports overload instead of growing memory or silently blocking every handler. Inbound overflow terminates that session              |
-| Canonical document operations | Automerge JavaScript [`init` and `free`](https://github.com/automerge/automerge/blob/b4a1bbe9fc17d26c4d3f1819f9ee3b318de3a516/javascript/src/implementation.ts#L232-L353), [`change`](https://github.com/automerge/automerge/blob/b4a1bbe9fc17d26c4d3f1819f9ee3b318de3a516/javascript/src/implementation.ts#L433-L521), [`load`](https://github.com/automerge/automerge/blob/b4a1bbe9fc17d26c4d3f1819f9ee3b318de3a516/javascript/src/implementation.ts#L704-L807), [`save`](https://github.com/automerge/automerge/blob/b4a1bbe9fc17d26c4d3f1819f9ee3b318de3a516/javascript/src/implementation.ts#L809-L864), [`applyChanges`](https://github.com/automerge/automerge/blob/b4a1bbe9fc17d26c4d3f1819f9ee3b318de3a516/javascript/src/implementation.ts#L987-L1054), and [`getHeads`](https://github.com/automerge/automerge/blob/b4a1bbe9fc17d26c4d3f1819f9ee3b318de3a516/javascript/src/implementation.ts#L1279-L1291) | Create, change, save, load, replay, heads, and freeing remain Automerge operations behind the SQL adapter                                              |
-| Sync state lifetime           | Automerge [`sync::State`](https://github.com/automerge/automerge/blob/b4a1bbe9fc17d26c4d3f1819f9ee3b318de3a516/rust/automerge/src/sync/state.rs#L45-L78) and JavaScript [sync API](https://github.com/automerge/automerge/blob/b4a1bbe9fc17d26c4d3f1819f9ee3b318de3a516/javascript/src/implementation.ts#L1143-L1250)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Sent hashes, in flight state, and peer knowledge are connection state. Reconnect creates a fresh sync state while persisted history drives convergence |
+`PeerAuthentication.layerClient` requires `PeerCredentials`.
+`PeerAuthentication.layerServer` requires `PeerAuthenticator` and `PeerRelayLimits`.
+`RelayServer.layerHandlers` requires `Crypto`, `PeerRelayAuthorization`, `PeerRelayLimits`, and `Sharding`.
+`RelayServer.layer` additionally registers the entity behaviour and the retention singleton, so it also requires
+`RelayInboxStore`. `SqlRelayInboxStore.layer` requires `SqlClient` and `Crypto`. `RpcPeerTransport.layer`
+additionally uses `PeerRelayClientRuntime`.
 
 ### Research basis
 

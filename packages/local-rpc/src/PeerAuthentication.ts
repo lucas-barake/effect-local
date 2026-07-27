@@ -1,6 +1,7 @@
 import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
@@ -12,8 +13,8 @@ import type { PeerPrincipal } from "./internal/peerPrincipal.js"
 import * as PeerRpcObservability from "./internal/peerRpcObservability.js"
 import * as PeerAuthenticator from "./PeerAuthenticator.js"
 import * as PeerCredentials from "./PeerCredentials.js"
+import * as PeerRelayLimits from "./PeerRelayLimits.js"
 import * as PeerRpcError from "./PeerRpcError.js"
-import * as PeerRpcLimits from "./PeerRpcLimits.js"
 
 export { PeerPrincipal } from "./internal/peerPrincipal.js"
 
@@ -39,8 +40,11 @@ export const layerServer = Layer.effect(
   PeerAuthentication,
   Effect.gen(function*() {
     const authenticator = yield* PeerAuthenticator.PeerAuthenticator
-    const limits = yield* PeerRpcLimits.PeerRpcLimits
+    const limits = yield* PeerRelayLimits.PeerRelayLimits
     const verifierPermits = yield* Semaphore.make(limits.maxInFlightAuthentication)
+    // Converted once here rather than on every request: the rate limiter's arithmetic is in
+    // milliseconds, while the configuration states a duration.
+    const rateLimitIdleRetentionMillis = Duration.toMillis(limits.rateLimitIdleRetention)
     const rateStateLock = yield* Semaphore.make(1)
     type RateState = {
       tokens: number
@@ -54,7 +58,7 @@ export const layerServer = Layer.effect(
     const expireOldestInactive = (now: number) => {
       const oldest = inactiveRateState.entries().next().value
       if (oldest === undefined) return
-      if (now - oldest[1].lastUsedAt < limits.rateLimitIdleRetention) return
+      if (now - oldest[1].lastUsedAt < rateLimitIdleRetentionMillis) return
       inactiveRateState.delete(oldest[0])
       rateState.delete(oldest[0])
     }
@@ -70,7 +74,7 @@ export const layerServer = Layer.effect(
         let entry = rateState.get(clientId)
         if (entry?.inFlight === 0) {
           inactiveRateState.delete(clientId)
-          if (now - entry.lastUsedAt >= limits.rateLimitIdleRetention) {
+          if (now - entry.lastUsedAt >= rateLimitIdleRetentionMillis) {
             rateState.delete(clientId)
             entry = undefined
           }

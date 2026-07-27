@@ -21,7 +21,8 @@ const expectations = {
       [6, "peer_writer_provenance"],
       [7, "replica_health_indexes"],
       [8, "document_lineage"],
-      [9, "history_rewrite_markers"]
+      [9, "history_rewrite_markers"],
+      [10, "peer_relay_state"]
     ],
     outbox: "none"
   },
@@ -33,7 +34,8 @@ const expectations = {
       [6, "peer_writer_provenance"],
       [7, "replica_health_indexes"],
       [8, "document_lineage"],
-      [9, "history_rewrite_markers"]
+      [9, "history_rewrite_markers"],
+      [10, "peer_relay_state"]
     ],
     outbox: "backfilled"
   },
@@ -44,7 +46,8 @@ const expectations = {
       [6, "peer_writer_provenance"],
       [7, "replica_health_indexes"],
       [8, "document_lineage"],
-      [9, "history_rewrite_markers"]
+      [9, "history_rewrite_markers"],
+      [10, "peer_relay_state"]
     ],
     outbox: { frozen: "2020-01-01T00:00:00.000Z" }
   }
@@ -131,7 +134,8 @@ const assertMigrationHistory = Effect.gen(function*() {
     { migration_id: 6, name: "peer_writer_provenance" },
     { migration_id: 7, name: "replica_health_indexes" },
     { migration_id: 8, name: "document_lineage" },
-    { migration_id: 9, name: "history_rewrite_markers" }
+    { migration_id: 9, name: "history_rewrite_markers" },
+    { migration_id: 10, name: "peer_relay_state" }
   ])
 
   const catalog = yield* SqlSchema.findAll({
@@ -152,7 +156,8 @@ const assertMigrationHistory = Effect.gen(function*() {
       migration_id: 9,
       name: "history_rewrite_markers",
       checksum: Migrations.historyRewriteMarkersChecksum
-    }
+    },
+    { migration_id: 10, name: "peer_relay_state", checksum: Migrations.peerRelayStateChecksum }
   ])
 })
 

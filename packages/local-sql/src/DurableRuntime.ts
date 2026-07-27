@@ -9,9 +9,10 @@ import * as PeerSync from "./PeerSync.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
 import * as ReplicaWorkflow from "./ReplicaWorkflow.js"
 
-export const layerWith = <A, E, R,>(
+const layerWithPeerSync = <A, E, R, EPeer, RPeer,>(
   definition: ReplicaDefinition.Any,
-  workflowRegistrations: Layer.Layer<A, E, R>
+  workflowRegistrations: Layer.Layer<A, E, R>,
+  peerSync: Layer.Layer<PeerSync.PeerSync, EPeer, RPeer>
 ) =>
   Layer.unwrap(Effect.gen(function*() {
     yield* ReplicaBootstrap.ReplicaBootstrap
@@ -29,13 +30,22 @@ export const layerWith = <A, E, R,>(
     )
     // `PeerSync` is provided to both branches, not just the entity. A workflow that changes what a
     // document's history is has to be able to reach the in-memory sync state keyed on that document,
-    // and it is reachable only from whatever branch the layer is provided into. `PeerSync.layer`
-    // requires no cluster service, so hoisting it above `cluster` introduces no cycle.
+    // and it is reachable only from whatever branch the layer is provided into. The selected
+    // `peerSync` layer requires no cluster service, so hoisting it above `cluster` introduces no
+    // cycle and preserves the relay-specific implementation.
     return Layer.merge(DocumentEntity.layer(definition), workflows)
       .pipe(
-        Layer.provideMerge(PeerSync.layer),
+        Layer.provideMerge(peerSync),
         Layer.provideMerge(cluster)
       )
   }))
 
+export const layerWith = <A, E, R,>(
+  definition: ReplicaDefinition.Any,
+  workflowRegistrations: Layer.Layer<A, E, R>
+) => layerWithPeerSync(definition, workflowRegistrations, PeerSync.layer)
+
 export const layer = (definition: ReplicaDefinition.Any) => layerWith(definition, Layer.empty)
+
+export const layerRelay = (definition: ReplicaDefinition.Any) =>
+  layerWithPeerSync(definition, Layer.empty, PeerSync.layerRelay)

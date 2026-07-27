@@ -152,6 +152,52 @@ describe("BackupStore", () => {
     Limits,
     ProjectedBackup
   )
+  const seedRelayState = (documentId: Identity.DocumentId) =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const current = yield* ReplicaGate.ReplicaGate.pipe(Effect.flatMap((gate) => gate.current))
+      const relayMessageId = "rly_00000000-0000-4000-8000-000000000001"
+      const senderPeerId = "peer_00000000-0000-4000-8000-000000000001"
+      const remotePeerId = "peer_00000000-0000-4000-8000-000000000002"
+      yield* sql`INSERT INTO effect_local_peer_receipts (
+        replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id,
+        message_hash, reply, reply_hash, pending_message, heads, accepted_heads,
+        commit_sequence, accepted_at, writer_provenance, relay_sender_tenant_id,
+        relay_sender_subject_id, relay_sender_peer_id, relay_message_id,
+        relay_outer_envelope_digest, relay_receipt_expires_at, relay_encoded_size
+      ) VALUES (
+        ${current.incarnation}, ${remotePeerId}, 'sender-epoch', 0, ${documentId},
+        ${"a".repeat(64)}, NULL, NULL, NULL, '[]', '[]', 0,
+        '2026-07-25T00:00:00.000Z', '[]', 'tenant', 'sender', ${senderPeerId},
+        ${relayMessageId}, ${"b".repeat(64)}, '2026-08-02T00:00:00.000Z', 128
+      )`
+      yield* sql`INSERT INTO effect_local_peer_relay_receipt_usage (
+        replica_incarnation, sender_tenant_id, sender_subject_id, sender_peer_id,
+        receipt_count, encoded_bytes
+      ) VALUES (${current.incarnation}, 'tenant', 'sender', ${senderPeerId}, 1, 128)`
+      yield* sql`INSERT INTO effect_local_peer_relay_outbox (
+        replica_id, replica_incarnation, writer_generation, expected_local_tenant_id,
+        expected_local_subject_id, expected_local_peer_id, remote_tenant_id,
+        remote_subject_id, remote_peer_id, relay_peer_id, relay_message_id,
+        outer_envelope_digest, protocol_version, payload_version, sender_connection_epoch,
+        sender_sequence, document_id, document_type, writer_provenance, message_hash,
+        payload, encoded_size, created_at, retry_deadline, next_attempt_at, custody_state
+      ) VALUES (
+        ${current.replicaId}, ${current.incarnation}, ${current.writerGeneration},
+        'tenant', 'local', ${senderPeerId},
+        'tenant', 'remote', ${remotePeerId}, ${senderPeerId}, ${relayMessageId},
+        ${"b".repeat(64)}, 1, 1, 'sender-epoch', 0, ${documentId}, ${Task.name}, '[]',
+        ${"a".repeat(64)}, ${Uint8Array.of(1)}, 1, '2026-07-25T00:00:00.000Z',
+        '2026-08-01T00:00:00.000Z', '2026-07-25T00:00:00.000Z', 'Pending'
+      )`
+      yield* sql`INSERT INTO effect_local_peer_relay_outbox_remote_usage (
+        replica_incarnation, remote_tenant_id, remote_subject_id, remote_peer_id,
+        message_count, encoded_bytes
+      ) VALUES (${current.incarnation}, 'tenant', 'remote', ${remotePeerId}, 1, 1)`
+      yield* sql`INSERT INTO effect_local_peer_relay_outbox_replica_usage (
+        replica_incarnation, message_count, encoded_bytes
+      ) VALUES (${current.incarnation}, 1, 1)`
+    })
   const ProjectedRecovery = Recovery.layer.pipe(Layer.provide(ProjectedLive))
   const ProjectedCompaction = Compaction.layer.pipe(
     Layer.provide(Layer.merge(ProjectedLive, ProjectedRecovery))
@@ -591,7 +637,12 @@ describe("BackupStore", () => {
   it.effect("retires cluster request and reply state during restore", () =>
     Effect.gen(function*() {
       const backups = yield* BackupStore.BackupStore
+      const store = yield* DocumentStore.DocumentStore
       const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "relay state" })
+      InternalAutomerge.free(created.automerge)
+      yield* seedRelayState(documentId)
       yield* sql`CREATE TABLE ${sql(`${ClusterStorage.messagePrefix}_messages`)} (id INTEGER PRIMARY KEY)`
       yield* sql`CREATE TABLE ${sql(`${ClusterStorage.messagePrefix}_replies`)} (id INTEGER PRIMARY KEY)`
       yield* sql`INSERT INTO ${sql(`${ClusterStorage.messagePrefix}_messages`)} (id) VALUES (1)`
@@ -606,10 +657,34 @@ describe("BackupStore", () => {
         expectedDefinitionHash: definition.hash
       })
 
-      const rows = yield* sql<{ readonly messages: number; readonly replies: number }>`SELECT
+      const rows = yield* sql<{
+        readonly deleteTokens: number
+        readonly messages: number
+        readonly outbox: number
+        readonly outboxRemoteUsage: number
+        readonly outboxReplicaUsage: number
+        readonly receipts: number
+        readonly receiptUsage: number
+        readonly replies: number
+      }>`SELECT
         (SELECT COUNT(*) FROM ${sql(`${ClusterStorage.messagePrefix}_messages`)}) AS messages,
-        (SELECT COUNT(*) FROM ${sql(`${ClusterStorage.messagePrefix}_replies`)}) AS replies`
-      assert.deepStrictEqual(rows[0], { messages: 0, replies: 0 })
+        (SELECT COUNT(*) FROM ${sql(`${ClusterStorage.messagePrefix}_replies`)}) AS replies,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_outbox) AS outbox,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_outbox_remote_usage) AS outboxRemoteUsage,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_outbox_replica_usage) AS outboxReplicaUsage,
+        (SELECT COUNT(*) FROM effect_local_peer_receipts WHERE relay_message_id IS NOT NULL) AS receipts,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS receiptUsage,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_delete_tokens) AS deleteTokens`
+      assert.deepStrictEqual(rows[0], {
+        deleteTokens: 0,
+        messages: 0,
+        outbox: 0,
+        outboxRemoteUsage: 0,
+        outboxReplicaUsage: 0,
+        receipts: 0,
+        receiptUsage: 0,
+        replies: 0
+      })
     }).pipe(Effect.provide(Live)))
 
   it.effect("reports invalid local rows as storage corruption during export", () =>
@@ -646,6 +721,7 @@ describe("BackupStore", () => {
         draft.title = "preserved"
       })
       const current = yield* store.persist(Task, documentId, created, staged)
+      yield* seedRelayState(documentId)
       yield* sql`CREATE TRIGGER fence_restore
         AFTER DELETE ON effect_local_documents
         BEGIN
@@ -666,6 +742,28 @@ describe("BackupStore", () => {
         SELECT installation_id FROM effect_local_backup_installations
       `
       assert.strictEqual(installations.length, 0)
+      const relayRows = yield* sql<{
+        readonly deleteTokens: number
+        readonly outbox: number
+        readonly outboxRemoteUsage: number
+        readonly outboxReplicaUsage: number
+        readonly receipts: number
+        readonly receiptUsage: number
+      }>`SELECT
+        (SELECT COUNT(*) FROM effect_local_peer_relay_outbox) AS outbox,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_outbox_remote_usage) AS outboxRemoteUsage,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_outbox_replica_usage) AS outboxReplicaUsage,
+        (SELECT COUNT(*) FROM effect_local_peer_receipts WHERE relay_message_id IS NOT NULL) AS receipts,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS receiptUsage,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_delete_tokens) AS deleteTokens`
+      assert.deepStrictEqual(relayRows, [{
+        deleteTokens: 0,
+        outbox: 1,
+        outboxRemoteUsage: 1,
+        outboxReplicaUsage: 1,
+        receipts: 1,
+        receiptUsage: 1
+      }])
       InternalAutomerge.free(preserved.automerge)
       InternalAutomerge.free(current.automerge)
       InternalAutomerge.free(staged)

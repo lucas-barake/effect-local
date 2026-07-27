@@ -39,6 +39,9 @@ export type PeerId = typeof PeerId.Type
 export const BackupInstallationId = identifier("BackupInstallationId", "bak")
 export type BackupInstallationId = typeof BackupInstallationId.Type
 
+export const RelayMessageId = identifier("RelayMessageId", "rly")
+export type RelayMessageId = typeof RelayMessageId.Type
+
 export const ProjectionVersion = Schema.Int.check(Schema.isGreaterThan(0)).pipe(
   Schema.brand("@lucas-barake/effect-local/ProjectionVersion")
 )
@@ -70,6 +73,9 @@ export const makePeerId = Crypto.Crypto.use((crypto) =>
 )
 export const makeBackupInstallationId = Crypto.Crypto.use((crypto) =>
   crypto.randomUUIDv4.pipe(Effect.map((uuid) => BackupInstallationId.make(`bak_${uuid}`)))
+)
+export const makeRelayMessageId = Crypto.Crypto.use((crypto) =>
+  crypto.randomUUIDv4.pipe(Effect.map((uuid) => RelayMessageId.make(`rly_${uuid}`)))
 )
 
 export const makeDocumentLineage = Crypto.Crypto.use((crypto) =>

@@ -781,6 +781,16 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 ${options.installationId}, ${options.mode}, ${manifestEnvelope.checksum},
                 ${DateTime.formatIso(yield* DateTime.now)}, ${restoredPermit.incarnation}
               )`
+                yield* sql`DELETE FROM effect_local_peer_relay_outbox`
+                yield* sql`DELETE FROM effect_local_peer_relay_outbox_remote_usage`
+                yield* sql`DELETE FROM effect_local_peer_relay_outbox_replica_usage`
+                yield* sql`INSERT INTO effect_local_peer_relay_receipt_delete_tokens (receipt_row_id)
+                  SELECT row_id
+                  FROM effect_local_peer_receipts
+                  WHERE relay_message_id IS NOT NULL`
+                yield* sql`DELETE FROM effect_local_peer_receipts
+                  WHERE relay_message_id IS NOT NULL`
+                yield* sql`DELETE FROM effect_local_peer_relay_receipt_usage`
                 const clusterTables = yield* findClusterTables(undefined)
                 if (clusterTables.some((table) => table.name === `${ClusterStorage.messagePrefix}_replies`)) {
                   yield* sql`DELETE FROM ${sql(`${ClusterStorage.messagePrefix}_replies`)}`

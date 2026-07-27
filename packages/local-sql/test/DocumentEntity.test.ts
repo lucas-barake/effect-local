@@ -108,7 +108,8 @@ describe("DocumentEntity", () => {
       enqueue: (_session, reply) =>
         Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
       pending: () => Effect.succeed([]),
-      markSent: () => Effect.succeed(false)
+      markSent: () => Effect.succeed(false),
+      pruneRelayReceipts: Effect.succeed(0)
     })
   const replicaGate = (permit: ReplicaGate.Permit) =>
     ReplicaGate.ReplicaGate.of({
@@ -303,6 +304,63 @@ describe("DocumentEntity", () => {
     )
   })
 
+  it("scopes relay sync primary keys by the complete sender identity", () => {
+    const relayPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001")
+    const senderPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000002")
+    const relayMessageId = Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000001")
+    const hash = "a".repeat(64)
+    const base = {
+      replicaIncarnation: Identity.ReplicaIncarnation.make(1),
+      peerId: relayPeerId,
+      connectionEpoch: "sender-epoch",
+      localConnectionEpoch: "local-epoch",
+      receiveSequence: 2,
+      documentType: Task.name,
+      messageHash: hash,
+      message: new Uint8Array([1]),
+      writerProvenance: [],
+      relay: {
+        relayMessageId,
+        relayPeerId,
+        senderTenantId: "tenant",
+        senderSubjectId: "sender-a",
+        senderPeerId,
+        senderReplicaIncarnation: Identity.ReplicaIncarnation.make(3),
+        messageHash: hash,
+        outerEnvelopeDigest: "b".repeat(64),
+        receiptExpiresAt: "2026-08-02T00:00:00.000Z",
+        encodedSize: 10
+      }
+    }
+    const keyOf = (payload: unknown) => {
+      if (!PrimaryKey.isPrimaryKey(payload)) throw new TypeError("Expected a primary key payload")
+      return PrimaryKey.value(payload)
+    }
+    const key = keyOf(DocumentEntity.ApplySync.payloadSchema.make(base))
+    assert.strictEqual(
+      key,
+      keyOf(DocumentEntity.ApplySync.payloadSchema.make({
+        ...base,
+        connectionEpoch: "another-epoch",
+        receiveSequence: 99
+      }))
+    )
+    assert.notStrictEqual(
+      key,
+      keyOf(DocumentEntity.ApplySync.payloadSchema.make({
+        ...base,
+        relay: { ...base.relay, senderSubjectId: "sender-b" }
+      }))
+    )
+    assert.notStrictEqual(
+      key,
+      keyOf(DocumentEntity.ApplySync.payloadSchema.make({
+        ...base,
+        relay: { ...base.relay, outerEnvelopeDigest: "c".repeat(64) }
+      }))
+    )
+  })
+
   it("persists RPCs in the shared SQL transaction without server interruption", () => {
     for (const rpc of [DocumentEntity.Create, DocumentEntity.Mutate, DocumentEntity.Delete]) {
       assert.strictEqual(Context.get(rpc.annotations, ClusterSchema.Persisted), true)
@@ -342,10 +400,15 @@ describe("DocumentEntity", () => {
           }>
         >([])
         const receivedLineages = yield* Ref.make<ReadonlyArray<Identity.DocumentLineage>>([])
+        const receivedRelay = yield* Ref.make<PeerSync.RelayReceipt | undefined>(undefined)
         const sync = peerSync((_document, _documentId, _session, input) =>
           Effect.all([
             Ref.set(receivedProvenance, input.writerProvenance),
-            Ref.update(receivedLineages, (lineages) => [...lineages, input.lineage])
+            Ref.update(receivedLineages, (lineages) => [
+              ...lineages,
+              input.lineage ?? Identity.genesisLineage
+            ]),
+            Ref.set(receivedRelay, input.relay)
           ]).pipe(Effect.as(syncResult))
         )
         const makeClient = yield* Entity.makeTestClient(
@@ -440,6 +503,39 @@ describe("DocumentEntity", () => {
         })
         assert.deepStrictEqual(rewritten, syncResult)
         assert.deepStrictEqual(yield* Ref.get(receivedLineages), [Identity.genesisLineage, rewrittenLineage])
+        const messageHash = yield* Canonical.digest(message)
+        const relay = {
+          relayMessageId: Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000001"),
+          relayPeerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001"),
+          senderTenantId: "tenant",
+          senderSubjectId: "sender",
+          senderPeerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000002"),
+          senderReplicaIncarnation: Identity.ReplicaIncarnation.make(4),
+          messageHash,
+          outerEnvelopeDigest: "b".repeat(64),
+          receiptExpiresAt: "2026-08-02T00:00:00.000Z",
+          encodedSize: 128
+        } satisfies PeerSync.RelayReceipt
+        assert.deepStrictEqual(
+          yield* client.ApplySync({
+            replicaIncarnation: permit.incarnation,
+            peerId: relay.relayPeerId,
+            connectionEpoch: "relay-connection",
+            localConnectionEpoch: "local-connection",
+            receiveSequence: 1,
+            documentType: Task.name,
+            messageHash,
+            message,
+            writerProvenance,
+            relay
+          }),
+          syncResult
+        )
+        assert.deepStrictEqual(yield* Ref.get(receivedRelay), relay)
+        assert.deepStrictEqual(
+          yield* Ref.get(receivedLineages),
+          [Identity.genesisLineage, rewrittenLineage, Identity.genesisLineage]
+        )
         const stale = yield* Effect.exit(client.ApplySync({
           replicaIncarnation: Identity.ReplicaIncarnation.make(permit.incarnation - 1),
           peerId: (yield* Identity.makePeerId),

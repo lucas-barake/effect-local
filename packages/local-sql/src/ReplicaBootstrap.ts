@@ -35,13 +35,6 @@ const metadataMissing = () =>
     })
   })
 
-const failStorageCorrupt = (cause: unknown) =>
-  Effect.fail(
-    new ReplicaError.ReplicaError({
-      reason: new ReplicaError.StorageCorrupt({ cause })
-    })
-  )
-
 const unsupportedStorageFormat = (observedVersion: number) =>
   new ReplicaError.ReplicaError({
     reason: new ReplicaError.UnsupportedStorageFormatVersion({
@@ -102,7 +95,12 @@ export const make = (definition: ReplicaDefinition.Any) =>
       }
       if (stored.storage_format_version === storageFormatVersion) return
       return yield* unsupportedStorageFormat(stored.storage_format_version)
-    }).pipe(Effect.catchTag("SchemaError", failStorageCorrupt))
+    }).pipe(Effect.catchTag("SchemaError", (cause) =>
+      Effect.fail(
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.StorageCorrupt({ cause })
+        })
+      )))
     yield* Migrations.run
     const findMetadata = SqlSchema.findAll({
       Request: Schema.Void,
@@ -217,7 +215,12 @@ export const make = (definition: ReplicaDefinition.Any) =>
         writerGeneration: row.writer_generation,
         definitionHash: definition.hash
       }
-    })).pipe(Effect.catchTag("SchemaError", failStorageCorrupt))
+    })).pipe(Effect.catchTag("SchemaError", (cause) =>
+      Effect.fail(
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.StorageCorrupt({ cause })
+        })
+      )))
   })
 
 export const layer = (

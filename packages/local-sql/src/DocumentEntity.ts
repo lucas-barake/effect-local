@@ -45,16 +45,43 @@ const syncPrimaryKey = (payload: {
   readonly messageHash: string
   readonly lineage?: Identity.DocumentLineage
   readonly writerProvenance: ReadonlyArray<WriterProvenance.ChangeProvenance>
+  readonly relay?: PeerSync.RelayReceipt | undefined
 }) =>
-  JSON.stringify([
-    payload.replicaIncarnation,
-    payload.peerId,
-    payload.connectionEpoch,
-    payload.receiveSequence,
-    payload.messageHash,
-    WriterProvenance.canonicalize(payload.writerProvenance),
-    payload.lineage ?? Identity.genesisLineage
-  ])
+  payload.relay === undefined
+    ? JSON.stringify([
+      payload.replicaIncarnation,
+      payload.peerId,
+      payload.connectionEpoch,
+      payload.receiveSequence,
+      payload.messageHash,
+      WriterProvenance.canonicalize(payload.writerProvenance),
+      payload.lineage ?? Identity.genesisLineage
+    ])
+    : JSON.stringify([
+      "Relay",
+      payload.replicaIncarnation,
+      payload.relay.relayPeerId,
+      payload.relay.senderTenantId,
+      payload.relay.senderSubjectId,
+      payload.relay.senderPeerId,
+      payload.relay.senderReplicaIncarnation,
+      payload.relay.relayMessageId,
+      payload.relay.messageHash,
+      payload.relay.outerEnvelopeDigest
+    ])
+
+const RelayReceipt = Schema.Struct({
+  relayMessageId: Identity.RelayMessageId,
+  relayPeerId: Identity.PeerId,
+  senderTenantId: Schema.NonEmptyString,
+  senderSubjectId: Schema.NonEmptyString,
+  senderPeerId: Identity.PeerId,
+  senderReplicaIncarnation: Identity.ReplicaIncarnation,
+  messageHash: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/)),
+  outerEnvelopeDigest: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/)),
+  receiptExpiresAt: Schema.NonEmptyString,
+  encodedSize: Schema.Int.check(Schema.isGreaterThan(0))
+})
 
 export const Create = Rpc.make("Create", {
   payload: { ...commandFields, payload: Schema.Uint8ArrayFromBase64 },
@@ -115,7 +142,8 @@ export const ApplySync = Rpc.make("ApplySync", {
     // previous build has no lineage key, and a required field would make it fail to decode on
     // replay instead of replaying as the genesis lineage it was written under.
     lineage: Schema.optionalKey(Identity.DocumentLineage),
-    writerProvenance: WriterProvenance.ChangeProvenances
+    writerProvenance: WriterProvenance.ChangeProvenances,
+    relay: Schema.optional(RelayReceipt)
   },
   success: ApplySyncResult,
   error: ReplicaError.ReplicaError,
@@ -311,7 +339,8 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   receiveSequence: request.payload.receiveSequence,
                   lineage: request.payload.lineage ?? Identity.genesisLineage,
                   message: request.payload.message,
-                  writerProvenance: request.payload.writerProvenance
+                  writerProvenance: request.payload.writerProvenance,
+                  ...(request.payload.relay === undefined ? {} : { relay: request.payload.relay })
                 }
               )
             })

@@ -13,7 +13,17 @@ const makeBytes = (size: number) => {
 }
 
 const peerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001")
+const localPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000002")
+const remotePeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000003")
 const sessionId = Identity.SessionId.make("ses_00000000-0000-4000-8000-000000000001")
+const relayMessageId = Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000001")
+const claimToken = PeerRpc.ClaimToken.make("clm_00000000-0000-4000-8000-000000000001")
+const benchmarkDocumentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
+const expectedLocal = {
+  tenantId: "tenant",
+  subjectId: "local",
+  peerId: localPeerId
+}
 const credential = Redacted.make("benchmark-credential")
 
 const wireParsers = (envelope: RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded) => {
@@ -37,8 +47,15 @@ const decodeOpenPayload = Schema.decodeUnknownSync(openPayloadCodec)
 for (const documentCount of [1, 16, 64] as const) {
   const decoded = PeerRpc.OpenRpc.payloadSchema.make({
     protocolVersion: PeerRpc.protocolVersion,
-    expectedPeerId: peerId,
-    definitionHash: "def_0000000000000000",
+    expectedRelayPeerId: peerId,
+    expectedLocal,
+    senderReplicaIncarnation: Identity.ReplicaIncarnation.make(1),
+    remote: {
+      subjectId: "remote",
+      peerId: remotePeerId
+    },
+    receiptRetentionMillis: 1,
+    senderRetryHorizonMillis: 1,
     credential,
     documents: Array.from({ length: documentCount }, (_, index) => ({
       documentType: "Task",
@@ -114,7 +131,7 @@ for (
   ] as const
 ) {
   const bytes = makeBytes(size)
-  const decodedPush = PeerRpc.PushRpc.payloadSchema.make({ sessionId, payload: bytes, credential })
+  const decodedPush = PeerRpc.PushRpc.payloadSchema.make({ sessionId, relayMessageId, payload: bytes, credential })
   const encodedPush = encodePushPayload(decodedPush)
   const pushEnvelope: RpcMessage.RequestEncoded = {
     _tag: "Request",
@@ -124,7 +141,30 @@ for (
     headers: []
   }
   const pushWire = wireParsers(pushEnvelope)
-  const decodedChunk = [PeerRpc.Message.make({ _tag: "Message", payload: bytes })] as const
+  const decodedChunk = [PeerRpc.StoredMessage.make({
+    _tag: "StoredMessage",
+    relayMessageId,
+    claimToken,
+    relayPeerId: peerId,
+    sender: {
+      tenantId: "tenant",
+      subjectId: "remote",
+      peerId: remotePeerId,
+      replicaIncarnation: Identity.ReplicaIncarnation.make(1),
+      connectionEpoch: "benchmark-epoch",
+      sequence: 0
+    },
+    recipient: expectedLocal,
+    payloadVersion: 1,
+    document: {
+      documentType: "Task",
+      documentId: benchmarkDocumentId
+    },
+    writerProvenance: [],
+    messageHash: "1".repeat(64),
+    outerEnvelopeDigest: "2".repeat(64),
+    payload: bytes
+  })] as const
   const encodedChunk = nonEmptyValues(encodeOpenChunk(decodedChunk))
   const chunkEnvelope: RpcMessage.ResponseChunkEncoded = {
     _tag: "Chunk",
@@ -151,7 +191,7 @@ for (
     warmupTime: 0
   })
 
-  bench(`Schema JSON codec Open Message chunk encode ${label}`, () => {
+  bench(`Schema JSON codec Open StoredMessage chunk encode ${label}`, () => {
     encodeOpenChunk(decodedChunk)
   }, {
     iterations,
@@ -160,7 +200,7 @@ for (
     warmupTime: 0
   })
 
-  bench(`Schema JSON codec Open Message chunk decode ${label}`, () => {
+  bench(`Schema JSON codec Open StoredMessage chunk decode ${label}`, () => {
     decodeOpenChunk(encodedChunk)
   }, {
     iterations,
@@ -214,8 +254,8 @@ const openedEnvelope: RpcMessage.ResponseChunkEncoded = {
       _tag: "Opened",
       protocolVersion: PeerRpc.protocolVersion,
       sessionId,
-      peerId,
-      capabilities: { storeAndForward: false }
+      remotePeerId,
+      authenticatedLocal: expectedLocal
     })
   ]))
 }

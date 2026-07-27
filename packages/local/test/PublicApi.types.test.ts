@@ -1,6 +1,9 @@
 import { assert, describe, it } from "@effect/vitest"
+import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
-import { Document, DocumentSet, Mutation, Query, SchemaDescriptor } from "../src/index.js"
+import * as Stream from "effect/Stream"
+import { Document, DocumentSet, Identity, Mutation, PeerTransport, Query, SchemaDescriptor } from "../src/index.js"
+import type * as ReplicaError from "../src/ReplicaError.js"
 
 type Equal<A, B,> = (<T,>() => T extends A ? 1 : 2) extends <T,>() => T extends B ? 1 : 2 ? true : false
 
@@ -86,5 +89,57 @@ describe("public API types", () => {
   it("exports the schema descriptor contract", () => {
     const descriptor: SchemaDescriptor.Descriptor = SchemaDescriptor.make(Schema.String)
     assert.isDefined(descriptor)
+  })
+
+  it("requires acknowledged durable relay delivery", () => {
+    const peerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000002")
+    const relayMessageId = Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000003")
+    const relayPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000004")
+    const identity: PeerTransport.RelayDeliveryIdentity = {
+      relayMessageId,
+      relayPeerId: peerId,
+      senderTenantId: "tenant",
+      senderSubjectId: "subject",
+      senderPeerId: peerId,
+      senderReplicaIncarnation: Identity.ReplicaIncarnation.make(1),
+      messageHash: "a".repeat(64),
+      outerEnvelopeDigest: "b".repeat(64)
+    }
+    const delivery: PeerTransport.AcknowledgedDelivery = {
+      message: new Uint8Array([1]),
+      identity,
+      receiptRetentionMillis: 1,
+      acknowledge: Effect.void,
+      reject: (_reason) => Effect.void
+    }
+    const connection = {
+      peerId,
+      relayPeerId,
+      capabilities: {},
+      receive: Stream.make(delivery),
+      send: () => Effect.void,
+      close: Effect.void
+    } satisfies PeerTransport.Connection
+    const acknowledgedReceive: Equal<
+      PeerTransport.Connection["receive"],
+      Stream.Stream<PeerTransport.AcknowledgedDelivery, ReplicaError.ReplicaError>
+    > = true
+    const requiredRelayPeerId: Equal<
+      PeerTransport.Connection["relayPeerId"],
+      Identity.PeerId
+    > = true
+    const transport = PeerTransport.PeerTransport.of({
+      capabilities: {},
+      connect: () => Effect.succeed(connection)
+    })
+    const protocolRejection = delivery.reject("ProtocolInvalid")
+    const applicationRejection = delivery.reject("ApplicationRejected")
+    assert.isDefined(transport)
+    assert.strictEqual(connection.relayPeerId, relayPeerId)
+    assert.isDefined(connection.receive)
+    assert.isTrue(acknowledgedReceive)
+    assert.isTrue(requiredRelayPeerId)
+    assert.isDefined(protocolRejection)
+    assert.isDefined(applicationRejection)
   })
 })

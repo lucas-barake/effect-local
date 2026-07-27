@@ -1,3 +1,4 @@
+import * as PeerSyncEnvelope from "@lucas-barake/effect-local-sql/PeerSyncEnvelope"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
@@ -8,10 +9,26 @@ import type * as RpcClient_ from "effect/unstable/rpc/RpcClient"
 import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
+import * as PeerRpcProtocol from "./internal/peerRpcProtocol.js"
 import * as PeerAuthentication from "./PeerAuthentication.js"
 import * as PeerRpcError from "./PeerRpcError.js"
 
-export const protocolVersion = 2
+export const protocolVersion = PeerSyncEnvelope.relayProtocolVersion
+
+export const maximumNegotiatedDurationMillis = PeerRpcProtocol.maximumNegotiatedDurationMillis
+export const maximumRelayPayloadBytes = PeerRpcProtocol.maximumRelayPayloadBytes
+export const maximumRequestedDocuments = 1_000
+
+const DurationMillis = Schema.Int.check(
+  Schema.isGreaterThan(0),
+  Schema.isLessThanOrEqualTo(maximumNegotiatedDurationMillis)
+)
+
+const Credential = Schema.optionalKey(Schema.RedactedFromValue(Schema.String))
+const BoundedName = Schema.NonEmptyString.check(Schema.isMaxLength(256))
+const BoundedPeerPrincipal = PeerSyncEnvelope.RelayPeerPrincipal
+const MessageHash = PeerSyncEnvelope.RelayOuterEnvelope.fields.messageHash
+const Payload = PeerSyncEnvelope.RelayOuterEnvelope.fields.payload
 
 export const RequestedDocument = Schema.Struct({
   documentType: Schema.NonEmptyString,
@@ -19,59 +36,68 @@ export const RequestedDocument = Schema.Struct({
 })
 export type RequestedDocument = typeof RequestedDocument.Type
 
+export const ClaimToken = Schema.String.check(
+  Schema.isPattern(/^clm_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+).pipe(Schema.brand("@lucas-barake/effect-local-rpc/ClaimToken"))
+export type ClaimToken = typeof ClaimToken.Type
+
+export const RelayDigest = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
+export type RelayDigest = typeof RelayDigest.Type
+
 export const Opened = Schema.TaggedStruct("Opened", {
   protocolVersion: Schema.Literal(protocolVersion),
   sessionId: Identity.SessionId,
-  peerId: Identity.PeerId,
-  // `lineageAware` is `optionalKey` and never `Schema.Boolean` alone: this struct decodes every
-  // `Opened` frame, including one from a peer built before lineage existed, and a required key
-  // would make that frame fail to decode instead of reading as "not lineage aware".
-  capabilities: Schema.Struct({
-    storeAndForward: Schema.Literal(false),
-    lineageAware: Schema.optionalKey(Schema.Boolean)
-  })
+  remotePeerId: Identity.PeerId,
+  authenticatedLocal: BoundedPeerPrincipal
 })
 export type Opened = typeof Opened.Type
 
-export const Message = Schema.TaggedStruct("Message", {
-  payload: Schema.Uint8Array
+export const StoredMessage = Schema.TaggedStruct("StoredMessage", {
+  relayMessageId: Identity.RelayMessageId,
+  claimToken: ClaimToken,
+  relayPeerId: Identity.PeerId,
+  sender: Schema.Struct({
+    tenantId: PeerSyncEnvelope.RelayPeerPrincipal.fields.tenantId,
+    subjectId: PeerSyncEnvelope.RelayPeerPrincipal.fields.subjectId,
+    peerId: PeerSyncEnvelope.RelayPeerPrincipal.fields.peerId,
+    replicaIncarnation: Identity.ReplicaIncarnation,
+    connectionEpoch: PeerSyncEnvelope.RelayOuterEnvelope.fields.senderConnectionEpoch,
+    sequence: PeerSyncEnvelope.RelayOuterEnvelope.fields.senderSequence
+  }),
+  recipient: BoundedPeerPrincipal,
+  payloadVersion: PeerSyncEnvelope.RelayOuterEnvelope.fields.payloadVersion,
+  document: PeerSyncEnvelope.RelayOuterEnvelope.fields.document,
+  writerProvenance: PeerSyncEnvelope.RelayOuterEnvelope.fields.writerProvenance,
+  messageHash: MessageHash,
+  outerEnvelopeDigest: RelayDigest,
+  payload: Payload
 })
-export type Message = typeof Message.Type
+export type StoredMessage = typeof StoredMessage.Type
 
-export const OpenEvent = Schema.Union([Opened, Message])
+export const OpenEvent = Schema.Union([Opened, StoredMessage])
 export type OpenEvent = typeof OpenEvent.Type
 
-const Credential = Schema.optionalKey(Schema.RedactedFromValue(Schema.String))
-
-export const DefinitionHash = Schema.String.check(Schema.isPattern(/^def_[0-9a-f]{16}$/))
-
-const OpenPayload = Schema.Struct({
-  protocolVersion: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  expectedPeerId: Identity.PeerId,
-  definitionHash: Schema.optionalKey(DefinitionHash),
-  documents: Schema.Array(RequestedDocument),
-  // What the opening client claims about itself, and the only thing that tells the server whether
-  // this peer compares document lineage before it merges. `optionalKey` at both levels and never a
-  // required key: a client built before lineage sends neither, and a required key would make its
-  // `Open` fail to decode instead of reading as "not lineage aware".
-  //
-  // `protocolVersion` was deliberately not bumped for lineage, so an older build passes the version
-  // check and this advertisement is the only thing that distinguishes it. Absent is the fail closed
-  // answer: such a client unions whatever it is given, so a rewritten document sent to it comes
-  // straight back carrying the history the rewrite discarded.
-  capabilities: Schema.optionalKey(Schema.Struct({
-    lineageAware: Schema.optionalKey(Schema.Boolean)
-  })),
-  credential: Credential
-}).check(
-  Schema.makeFilter(
-    (request) => request.protocolVersion !== protocolVersion || request.definitionHash !== undefined,
-    { expected: `definitionHash for protocol version ${protocolVersion}` }
-  )
-)
+export const RejectReason = Schema.Literals(["ProtocolInvalid", "ApplicationRejected"])
+export type RejectReason = typeof RejectReason.Type
 
 export class OpenRpc extends Rpc.make("Open", {
-  payload: OpenPayload,
+  payload: {
+    protocolVersion: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+    expectedRelayPeerId: Identity.PeerId,
+    expectedLocal: BoundedPeerPrincipal,
+    senderReplicaIncarnation: Identity.ReplicaIncarnation,
+    remote: Schema.Struct({
+      subjectId: BoundedName,
+      peerId: Identity.PeerId
+    }),
+    documents: Schema.Array(RequestedDocument).check(
+      Schema.isMinLength(1),
+      Schema.isMaxLength(maximumRequestedDocuments)
+    ),
+    receiptRetentionMillis: DurationMillis,
+    senderRetryHorizonMillis: DurationMillis,
+    credential: Credential
+  },
   success: OpenEvent,
   error: PeerRpcError.PeerRpcError,
   defect: PeerRpcError.Defect,
@@ -81,14 +107,43 @@ export class OpenRpc extends Rpc.make("Open", {
 export class PushRpc extends Rpc.make("Push", {
   payload: {
     sessionId: Identity.SessionId,
-    payload: Schema.Uint8Array,
+    relayMessageId: Identity.RelayMessageId,
+    payload: Payload,
     credential: Credential
   },
   error: PeerRpcError.PeerRpcError,
   defect: PeerRpcError.Defect
 }) {}
 
-export class Rpcs extends RpcGroup.make(OpenRpc, PushRpc).middleware(PeerAuthentication.PeerAuthentication) {}
+const TerminalPayload = {
+  sessionId: Identity.SessionId,
+  relayMessageId: Identity.RelayMessageId,
+  claimToken: ClaimToken,
+  messageHash: MessageHash,
+  credential: Credential
+}
+
+export class AcknowledgeRpc extends Rpc.make("Acknowledge", {
+  payload: TerminalPayload,
+  error: PeerRpcError.PeerRpcError,
+  defect: PeerRpcError.Defect
+}) {}
+
+export class RejectRpc extends Rpc.make("Reject", {
+  payload: {
+    ...TerminalPayload,
+    reason: RejectReason
+  },
+  error: PeerRpcError.PeerRpcError,
+  defect: PeerRpcError.Defect
+}) {}
+
+export class Rpcs extends RpcGroup.make(
+  OpenRpc,
+  PushRpc,
+  AcknowledgeRpc,
+  RejectRpc
+).middleware(PeerAuthentication.PeerAuthentication) {}
 
 export interface RpcClient extends RpcClient_.FromGroup<typeof Rpcs, RpcClientError> {}
 

@@ -1,284 +1,200 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
-import * as Deferred from "effect/Deferred"
-import * as Effect from "effect/Effect"
-import * as Option from "effect/Option"
-import * as Queue from "effect/Queue"
-import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
-import * as Stream from "effect/Stream"
-import * as RpcClient from "effect/unstable/rpc/RpcClient"
-import type * as RpcMessage from "effect/unstable/rpc/RpcMessage"
-import * as RpcServer from "effect/unstable/rpc/RpcServer"
-import * as PeerAuthentication from "../src/PeerAuthentication.js"
-import * as PeerAuthenticator from "../src/PeerAuthenticator.js"
-import * as PeerCredentials from "../src/PeerCredentials.js"
 import * as PeerRpc from "../src/PeerRpc.js"
-import * as PeerRpcError from "../src/PeerRpcError.js"
-import * as PeerRpcLimits from "../src/PeerRpcLimits.js"
 
-const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
-const peerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001")
+const localPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001")
+const remotePeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000002")
+const relayPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000003")
 const sessionId = Identity.SessionId.make("ses_00000000-0000-4000-8000-000000000001")
+const relayMessageId = Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000001")
+const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
+const claimToken = PeerRpc.ClaimToken.make("clm_00000000-0000-4000-8000-000000000001")
+const hash = "0".repeat(64)
 
 describe("PeerRpc", () => {
-  it.effect("executes the generated client through handlers and client authentication middleware", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const openRequest = yield* Deferred.make<typeof PeerRpc.OpenRpc.payloadSchema.Type>()
-      const pushRequest = yield* Deferred.make<typeof PeerRpc.PushRpc.payloadSchema.Type>()
-      const disconnects = yield* Queue.unbounded<number>()
-      const clients = new Set<number>()
-      let sendToServer: (clientId: number, request: RpcMessage.FromClientEncoded) => Effect.Effect<void> = () =>
-        Effect.void
-      let sendToClient: (clientId: number, response: RpcMessage.FromServerEncoded) => Effect.Effect<void> = () =>
-        Effect.void
-      const serverProtocol = yield* RpcServer.Protocol.make((writeRequest) =>
-        Effect.sync(() => {
-          sendToServer = writeRequest
-          return {
-            disconnects,
-            send: (clientId, response) => sendToClient(clientId, response),
-            end: () => Effect.void,
-            clientIds: Effect.succeed(clients),
-            initialMessage: Effect.succeed(Option.none()),
-            supportsAck: true,
-            supportsTransferables: false,
-            supportsSpanPropagation: true
-          }
-        })
-      )
-      const clientProtocol = yield* RpcClient.Protocol.make((writeResponse, clientIds) =>
-        Effect.sync(() => {
-          clients.clear()
-          for (const clientId of clientIds) clients.add(clientId)
-          sendToClient = writeResponse
-          return {
-            send: (clientId, request) => sendToServer(clientId, request),
-            supportsAck: true,
-            supportsTransferables: false
-          }
-        })
-      )
-      const authenticated = {
-        principal: PeerAuthentication.PeerPrincipal.make({
-          tenantId: "tenant",
-          subjectId: "subject",
-          peerId
-        }),
-        validUntil: Number.MAX_SAFE_INTEGER,
-        invalidated: Effect.void
-      }
-      const handlers = PeerRpc.Rpcs.toLayer(PeerRpc.Rpcs.of({
-        Open: (request) =>
-          Stream.fromEffect(
-            Deferred.succeed(openRequest, request).pipe(
-              Effect.as(PeerRpc.Opened.make({
-                _tag: "Opened",
-                protocolVersion: PeerRpc.protocolVersion,
-                sessionId,
-                peerId,
-                capabilities: { storeAndForward: false }
-              }))
-            )
-          ),
-        Push: (request) => Deferred.succeed(pushRequest, request).pipe(Effect.asVoid)
-      }))
-      yield* RpcServer.make(PeerRpc.Rpcs).pipe(
-        Effect.provideService(RpcServer.Protocol, serverProtocol),
-        Effect.provide(handlers),
-        Effect.provide(PeerAuthentication.layerServer),
-        Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
-          authenticate: (credential) => {
-            assert.strictEqual(Redacted.value(credential), "secret")
-            return Effect.succeed(authenticated)
-          }
-        }),
-        Effect.provideService(PeerRpcLimits.PeerRpcLimits, PeerRpcLimits.defaults),
-        Effect.forkScoped
-      )
-      const client = yield* PeerRpc.makeRpcClient.pipe(
-        Effect.provideService(RpcClient.Protocol, clientProtocol),
-        Effect.provide(PeerAuthentication.layerClient),
-        Effect.provideService(PeerCredentials.PeerCredentials, {
-          get: Effect.succeed(Redacted.make("secret"))
-        })
-      )
-      const events = yield* client.Open({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: peerId,
-        definitionHash: "def_0000000000000000",
-        documents: [{ documentType: "Task", documentId }]
-      }).pipe(Stream.runCollect)
-      yield* client.Push({ sessionId, payload: Uint8Array.of(4, 5, 6) })
-      assert.deepStrictEqual(events, [PeerRpc.Opened.make({
-        _tag: "Opened",
-        protocolVersion: PeerRpc.protocolVersion,
-        sessionId,
-        peerId,
-        capabilities: { storeAndForward: false }
-      })])
-      assert.strictEqual(Redacted.value((yield* Deferred.await(openRequest)).credential!), "secret")
-      assert.strictEqual(Redacted.value((yield* Deferred.await(pushRequest)).credential!), "secret")
-    })))
-
-  it("roundtrips every current-version request and response event", () => {
-    const open = PeerRpc.OpenRpc.payloadSchema.make({
-      protocolVersion: PeerRpc.protocolVersion,
-      expectedPeerId: peerId,
-      definitionHash: "def_0000000000000000",
-      capabilities: { lineageAware: true },
-      documents: [{ documentType: "Task", documentId }]
-    })
+  it("roundtrips the strict version 1 handshake", () => {
     const opened = PeerRpc.Opened.make({
       _tag: "Opened",
       protocolVersion: PeerRpc.protocolVersion,
       sessionId,
-      peerId,
-      capabilities: { storeAndForward: false }
+      remotePeerId,
+      authenticatedLocal: {
+        tenantId: "tenant",
+        subjectId: "subject",
+        peerId: localPeerId
+      }
     })
-    const message = PeerRpc.Message.make({ _tag: "Message", payload: Uint8Array.of(1, 2, 3) })
-    const push = PeerRpc.PushRpc.payloadSchema.make({ sessionId, payload: Uint8Array.of(4, 5, 6) })
 
-    assert.deepStrictEqual(Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)(open), open)
     assert.deepStrictEqual(Schema.decodeUnknownSync(PeerRpc.OpenEvent)(opened), opened)
-    assert.deepStrictEqual(Schema.decodeUnknownSync(PeerRpc.OpenEvent)(message), message)
-    assert.deepStrictEqual(Schema.decodeUnknownSync(PeerRpc.PushRpc.payloadSchema)(push), push)
-    assert.strictEqual(PeerRpc.OpenRpc._tag, "Open")
-    assert.strictEqual(PeerRpc.PushRpc._tag, "Push")
   })
 
-  it("roundtrips every tagged wire error with its exact tag", () => {
-    const errors = [
-      new PeerRpcError.AuthenticationFailure(),
-      new PeerRpcError.AccessDenied(),
-      new PeerRpcError.UnsupportedVersion(),
-      new PeerRpcError.PeerMismatch(),
-      new PeerRpcError.DefinitionMismatch(),
-      new PeerRpcError.InvalidRequest(),
-      new PeerRpcError.RequestLimitExceeded(),
-      new PeerRpcError.RequestCapacityExceeded(),
-      new PeerRpcError.SessionUnavailable(),
-      new PeerRpcError.SessionOverloaded(),
-      new PeerRpcError.ServerUnavailable(),
-      new PeerRpcError.DocumentLineageChanged()
-    ]
-
-    for (const error of errors) {
-      const encoded = Schema.encodeSync(PeerRpcError.PeerRpcError)(error)
-      assert.deepStrictEqual(encoded, { _tag: error._tag })
-      assert.strictEqual(Schema.decodeUnknownSync(PeerRpcError.PeerRpcError)(encoded)._tag, error._tag)
-    }
-  })
-
-  it("keeps the lineage rewrite wire error free of document identity", () => {
-    const encoded = Schema.encodeSync(PeerRpcError.PeerRpcError)(new PeerRpcError.DocumentLineageChanged())
-    assert.deepStrictEqual(encoded, { _tag: "DocumentLineageChanged" })
-  })
-
-  it("redacts defects to one fixed sentinel", () => {
-    assert.deepStrictEqual(Schema.encodeSync(PeerRpcError.Defect)(new Error("secret")), { _tag: "InternalError" })
-    assert.isUndefined(Schema.decodeUnknownSync(PeerRpcError.Defect)({ _tag: "InternalError", secret: "ignored" }))
-  })
-
-  it("rejects malformed identities and empty document types", () => {
+  it("pins the handshake protocol version so a foreign version fails to decode", () => {
+    // `Opened` carries a literal, not a number, so a client cannot be talked into continuing
+    // against a relay speaking a version it does not implement.
     assert.throws(() =>
-      Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)({
-        protocolVersion: 1,
-        expectedPeerId: "peer_invalid",
-        definitionHash: "def_0000000000000000",
-        documents: [{ documentType: "", documentId }]
+      Schema.decodeUnknownSync(PeerRpc.OpenEvent)({
+        _tag: "Opened",
+        protocolVersion: PeerRpc.protocolVersion + 1,
+        sessionId,
+        remotePeerId,
+        authenticatedLocal: { tenantId: "tenant", subjectId: "subject", peerId: localPeerId }
       })
     )
   })
 
-  it("rejects malformed definition hashes at the wire boundary", () => {
-    for (
-      const definitionHash of [
-        "",
-        "def_short",
-        "bad_0000000000000000",
-        "def_000000000000000G",
-        "def_000000000000000A",
-        "def_00000000000000000",
-        "x".repeat(1024 * 1024)
-      ]
-    ) {
+  it("roundtrips every relay request and stored message field", () => {
+    const open = PeerRpc.OpenRpc.payloadSchema.make({
+      protocolVersion: PeerRpc.protocolVersion,
+      expectedRelayPeerId: relayPeerId,
+      expectedLocal: {
+        tenantId: "tenant",
+        subjectId: "subject",
+        peerId: localPeerId
+      },
+      senderReplicaIncarnation: Identity.ReplicaIncarnation.make(1),
+      remote: {
+        subjectId: "remote",
+        peerId: remotePeerId
+      },
+      documents: [{ documentType: "Task", documentId }],
+      receiptRetentionMillis: 8 * 24 * 60 * 60 * 1_000,
+      senderRetryHorizonMillis: 7 * 24 * 60 * 60 * 1_000
+    })
+    const stored = PeerRpc.StoredMessage.make({
+      _tag: "StoredMessage",
+      relayMessageId,
+      claimToken,
+      relayPeerId,
+      sender: {
+        tenantId: "tenant",
+        subjectId: "subject",
+        peerId: localPeerId,
+        replicaIncarnation: Identity.ReplicaIncarnation.make(1),
+        connectionEpoch: "epoch",
+        sequence: 0
+      },
+      recipient: {
+        tenantId: "tenant",
+        subjectId: "remote",
+        peerId: remotePeerId
+      },
+      payloadVersion: 1,
+      document: { documentType: "Task", documentId },
+      writerProvenance: [],
+      messageHash: hash,
+      outerEnvelopeDigest: hash,
+      payload: Uint8Array.of(1, 2, 3)
+    })
+    const push = PeerRpc.PushRpc.payloadSchema.make({
+      sessionId,
+      relayMessageId,
+      payload: Uint8Array.of(1, 2, 3)
+    })
+    const acknowledge = PeerRpc.AcknowledgeRpc.payloadSchema.make({
+      sessionId,
+      relayMessageId,
+      claimToken,
+      messageHash: hash
+    })
+    const reject = PeerRpc.RejectRpc.payloadSchema.make({
+      ...acknowledge,
+      reason: "ProtocolInvalid"
+    })
+
+    assert.deepStrictEqual(Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)(open), open)
+    assert.deepStrictEqual(Schema.decodeUnknownSync(PeerRpc.OpenEvent)(stored), stored)
+    assert.deepStrictEqual(Schema.decodeUnknownSync(PeerRpc.PushRpc.payloadSchema)(push), push)
+    assert.deepStrictEqual(
+      Schema.decodeUnknownSync(PeerRpc.AcknowledgeRpc.payloadSchema)(acknowledge),
+      acknowledge
+    )
+    assert.deepStrictEqual(Schema.decodeUnknownSync(PeerRpc.RejectRpc.payloadSchema)(reject), reject)
+  })
+
+  it("rejects invalid durations, empty document sets, identifiers, hashes, and oversized payloads", () => {
+    const baseOpen = {
+      protocolVersion: PeerRpc.protocolVersion,
+      expectedRelayPeerId: relayPeerId,
+      expectedLocal: {
+        tenantId: "tenant",
+        subjectId: "subject",
+        peerId: localPeerId
+      },
+      senderReplicaIncarnation: 1,
+      remote: {
+        subjectId: "remote",
+        peerId: remotePeerId
+      },
+      documents: [{ documentType: "Task", documentId }],
+      receiptRetentionMillis: 1,
+      senderRetryHorizonMillis: 1
+    }
+
+    for (const duration of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
       assert.throws(() =>
         Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)({
-          protocolVersion: PeerRpc.protocolVersion,
-          expectedPeerId: peerId,
-          definitionHash,
-          documents: [{ documentType: "Task", documentId }]
+          ...baseOpen,
+          receiptRetentionMillis: duration
         })
       )
     }
-  })
-
-  it("requires a definition hash for the current protocol version", () => {
+    assert.throws(() => Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)({ ...baseOpen, documents: [] }))
     assert.throws(() =>
-      Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)({
-        protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: peerId,
-        documents: [{ documentType: "Task", documentId }]
+      Schema.decodeUnknownSync(PeerRpc.AcknowledgeRpc.payloadSchema)({
+        sessionId,
+        relayMessageId: "rly_invalid",
+        claimToken,
+        messageHash: hash
       })
     )
-  })
-
-  it("decodes an Open from a client that predates lineage without a capability advertisement", () => {
-    // The whole reason the field is `optionalKey`. `protocolVersion` was not bumped for lineage, so
-    // a client on an older build sends exactly this payload and passes the version check. A required
-    // key would make its `Open` fail to decode outright; absent has to read as "not lineage aware"
-    // instead, which is what the server then refuses to send a rewritten document to.
-    const legacy = Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)({
-      protocolVersion: PeerRpc.protocolVersion,
-      expectedPeerId: peerId,
-      definitionHash: "def_0000000000000000",
-      documents: [{ documentType: "Task", documentId }]
-    })
-    assert.isUndefined(legacy.capabilities)
-
-    // An advertisement that is present but says nothing about lineage decodes the same way, so the
-    // server reads the flag itself rather than the presence of the object carrying it.
-    const silent = Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)({
-      protocolVersion: PeerRpc.protocolVersion,
-      expectedPeerId: peerId,
-      definitionHash: "def_0000000000000000",
-      documents: [{ documentType: "Task", documentId }],
-      capabilities: {}
-    })
-    assert.isUndefined(silent.capabilities?.lineageAware)
-
-    const advertised = Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)({
-      protocolVersion: PeerRpc.protocolVersion,
-      expectedPeerId: peerId,
-      definitionHash: "def_0000000000000000",
-      documents: [{ documentType: "Task", documentId }],
-      capabilities: { lineageAware: true }
-    })
-    assert.deepStrictEqual(advertised.capabilities, { lineageAware: true })
-  })
-
-  it("keeps version one requests decodable for a typed version rejection", () => {
-    const legacy = Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)({
-      protocolVersion: 1,
-      expectedPeerId: peerId,
-      documents: [{ documentType: "Task", documentId }]
-    })
-    assert.strictEqual(legacy.protocolVersion, 1)
-    assert.notStrictEqual(PeerRpc.protocolVersion, 1)
-
-    const VersionOneOpen = Schema.Struct({
-      protocolVersion: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-      expectedPeerId: Identity.PeerId,
-      documents: Schema.Array(PeerRpc.RequestedDocument)
-    })
-    const decodedByVersionOne = Schema.decodeUnknownSync(VersionOneOpen)({
-      protocolVersion: PeerRpc.protocolVersion,
-      expectedPeerId: peerId,
-      definitionHash: "def_0000000000000000",
-      documents: [{ documentType: "Task", documentId }]
-    })
-    assert.strictEqual(decodedByVersionOne.protocolVersion, PeerRpc.protocolVersion)
-    assert.notStrictEqual(decodedByVersionOne.protocolVersion, 1)
+    assert.throws(() =>
+      Schema.decodeUnknownSync(PeerRpc.AcknowledgeRpc.payloadSchema)({
+        sessionId,
+        relayMessageId,
+        claimToken,
+        messageHash: "not-a-hash"
+      })
+    )
+    assert.throws(() =>
+      Schema.decodeUnknownSync(PeerRpc.PushRpc.payloadSchema)({
+        sessionId,
+        relayMessageId,
+        payload: new Uint8Array(PeerRpc.maximumRelayPayloadBytes + 1)
+      })
+    )
+    assert.throws(() =>
+      Schema.decodeUnknownSync(PeerRpc.OpenEvent)(
+        PeerRpc.StoredMessage.make({
+          _tag: "StoredMessage",
+          relayMessageId,
+          claimToken,
+          relayPeerId,
+          sender: {
+            tenantId: "tenant",
+            subjectId: "subject",
+            peerId: localPeerId,
+            replicaIncarnation: Identity.ReplicaIncarnation.make(1),
+            connectionEpoch: "epoch",
+            sequence: 0
+          },
+          recipient: {
+            tenantId: "tenant",
+            subjectId: "remote",
+            peerId: remotePeerId
+          },
+          payloadVersion: 1,
+          document: { documentType: "Task", documentId },
+          writerProvenance: [{
+            changeHash: hash,
+            writerSchemaVersion: 1,
+            writerDefinitionHash: "invalid\"definition"
+          }],
+          messageHash: hash,
+          outerEnvelopeDigest: hash,
+          payload: Uint8Array.of(1)
+        })
+      )
+    )
   })
 })

@@ -1,10 +1,10 @@
-import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Document from "@lucas-barake/effect-local/Document"
-import * as Identity from "@lucas-barake/effect-local/Identity"
+import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
+import * as Clock from "effect/Clock"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -17,8 +17,9 @@ import * as Stream from "effect/Stream"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
 import * as CommitPublisher from "./CommitPublisher.js"
 import * as DocumentEntity from "./DocumentEntity.js"
-import * as WriterProvenance from "./internal/writerProvenance.js"
+import * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
 import * as PeerSync from "./PeerSync.js"
+import * as PeerSyncEnvelope from "./PeerSyncEnvelope.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
 export interface SelectedDocument {
@@ -39,53 +40,11 @@ export interface SupervisedPeerSession extends PeerSession {
   readonly awaitDisconnect: Effect.Effect<never, ReplicaError.ReplicaError>
 }
 
-export const SyncEnvelope = Schema.Struct({
-  connectionEpoch: Schema.NonEmptyString,
-  sequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  documentId: Identity.DocumentId,
-  documentType: Schema.String,
-  messageHash: Schema.String,
-  message: Schema.Uint8ArrayFromBase64,
-  // `optionalKey`, so an envelope from a peer built before lineage still decodes. An absent key
-  // decodes as absent and never as the genesis lineage, so every reader normalizes it with
-  // `?? Identity.genesisLineage` at the point the envelope enters the system.
-  lineage: Schema.optionalKey(Identity.DocumentLineage),
-  writerProvenance: WriterProvenance.ChangeProvenances
-})
-// The lineage field is bounded by its own schema at 40 characters, so it costs at most ~60 bytes of
-// JSON on top of an envelope that already reserves 4 KiB of fixed headroom.
-export const maximumSyncEnvelopeBytes = (
-  maxSyncMessageBytes: number,
-  maxSyncChangesPerMessage: number
-) => maxSyncMessageBytes * 2 + maxSyncChangesPerMessage * 512 + 4_096
-const SyncEnvelopeJson = Schema.fromJsonString(Schema.toCodecJson(SyncEnvelope))
+class RelayProtocolInvalid extends Schema.TaggedErrorClass<RelayProtocolInvalid>(
+  "@lucas-barake/effect-local-sql/PeerSession/RelayProtocolInvalid"
+)("RelayProtocolInvalid", {}) {}
 
 const key = (documentType: string, documentId: Identity.DocumentId) => `${documentType}:${documentId}`
-
-const encode = (envelope: typeof SyncEnvelope.Type) =>
-  Schema.encodeEffect(SyncEnvelopeJson)(envelope).pipe(
-    Effect.map((value) => new TextEncoder().encode(value)),
-    Effect.mapError((cause) =>
-      new ReplicaError.ReplicaError({
-        reason: new ReplicaError.ProtocolMismatch({
-          expected: "encodable sync envelope",
-          observed: String(cause)
-        })
-      })
-    )
-  )
-
-const decode = (bytes: Uint8Array) =>
-  Schema.decodeUnknownEffect(SyncEnvelopeJson)(new TextDecoder().decode(bytes)).pipe(
-    Effect.mapError((cause) =>
-      new ReplicaError.ReplicaError({
-        reason: new ReplicaError.ProtocolMismatch({
-          expected: "sync envelope",
-          observed: String(cause)
-        })
-      })
-    )
-  )
 
 const supervise = (
   terminalFailure: Deferred.Deferred<never, ReplicaError.ReplicaError>,
@@ -132,6 +91,16 @@ const makeWithTerminal = (
     const transport = yield* PeerTransport.PeerTransport
     const sync = yield* PeerSync.PeerSync
     const crypto = yield* Crypto.Crypto
+    const relayReceiptLimits = yield* Effect.serviceOption(PeerRelayReceiptLimits.PeerRelayReceiptLimits)
+    const decodeRelay = (bytes: Uint8Array) =>
+      PeerSyncEnvelope.decodeSyncEnvelope(bytes, limits).pipe(
+        Effect.provideService(Crypto.Crypto, crypto),
+        Effect.catchReason(
+          "ReplicaError",
+          "ProtocolMismatch",
+          () => Effect.fail(new RelayProtocolInvalid())
+        )
+      )
     const selected = new Set(options.documents.map((entry) => key(entry.document.name, entry.documentId)))
     const selectedDocumentIds = new Set(options.documents.map((entry) => entry.documentId))
     if (
@@ -236,7 +205,7 @@ const makeWithTerminal = (
         Effect.gen(function*() {
           if (!(yield* Ref.get(active))) return
           const entry = yield* selectedById(outbound.documentId)
-          const bytes = yield* encode({
+          const bytes = yield* PeerSyncEnvelope.encodeSyncEnvelope({
             connectionEpoch: session.connectionEpoch,
             sequence: outbound.sendSequence,
             documentId: outbound.documentId,
@@ -397,56 +366,55 @@ const makeWithTerminal = (
       )
     const guardedFlush = guardTerminal(flush)
 
-    const receive = (bytes: Uint8Array) =>
+    const bindRemoteEpoch = (connectionEpoch: string, rotate: boolean) =>
       Effect.gen(function*() {
-        const maximumBytes = maximumSyncEnvelopeBytes(
-          limits.maxSyncMessageBytes,
-          limits.maxSyncChangesPerMessage
-        )
-        if (bytes.byteLength > maximumBytes) {
-          return yield* new ReplicaError.ReplicaError({
-            reason: new ReplicaError.ProtocolMismatch({
-              expected: `sync envelope at most ${maximumBytes} bytes`,
-              observed: String(bytes.byteLength)
-            })
-          })
-        }
-        const envelope = yield* decode(bytes)
-        const boundEpoch = yield* Ref.modify(
+        const transition = yield* Ref.modify(
           remoteEpoch,
-          (current) => current === null ? [envelope.connectionEpoch, envelope.connectionEpoch] : [current, current]
+          (current): [{ readonly bound: string; readonly previous: string | null }, string] => {
+            if (current === null) return [{ bound: connectionEpoch, previous: null }, connectionEpoch]
+            if (current === connectionEpoch) return [{ bound: current, previous: null }, current]
+            if (rotate) return [{ bound: connectionEpoch, previous: current }, connectionEpoch]
+            return [{ bound: current, previous: null }, current]
+          }
         )
-        if (boundEpoch !== envelope.connectionEpoch) {
+        if (transition.bound !== connectionEpoch) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.ProtocolMismatch({
-              expected: boundEpoch,
-              observed: envelope.connectionEpoch
+              expected: transition.bound,
+              observed: connectionEpoch
             })
           })
         }
-        const selectedDocument = selected.has(key(envelope.documentType, envelope.documentId))
-        // Dropped before the digest and entity dispatch, not after. Nothing can restore the refused
-        // lineage inside this session, so hashing and dispatching every further message the peer
-        // sends for it would be a peer driven retry loop over CPU, allocation, and storage.
-        if (selectedDocument && (yield* Ref.get(refused)).has(envelope.documentId)) return
-        const messageHash = yield* Canonical.digest(envelope.message).pipe(
-          Effect.provideService(Crypto.Crypto, crypto)
-        )
-        if (messageHash !== envelope.messageHash) {
-          return yield* new ReplicaError.ReplicaError({
-            reason: new ReplicaError.ProtocolMismatch({
-              expected: messageHash,
-              observed: envelope.messageHash
-            })
+        if (transition.previous !== null) {
+          yield* sync.reset({
+            peerId: connection.peerId,
+            connectionEpoch: transition.previous,
+            replicaIncarnation: session.replicaIncarnation
           })
+        }
+        return transition.bound
+      })
+
+    const processReceive = (
+      bytes: Uint8Array,
+      delivery: PeerTransport.AcknowledgedDelivery
+    ) =>
+      Effect.gen(function*() {
+        const protocolInvalid = (expected: string, observed: string) => Effect.fail(new RelayProtocolInvalid())
+        const envelope = yield* decodeRelay(bytes)
+        const boundEpoch = yield* bindRemoteEpoch(envelope.connectionEpoch, true)
+        const selectedDocument = selected.has(key(envelope.documentType, envelope.documentId))
+        // Dropped after envelope validation but before entity dispatch. Nothing can restore the
+        // refused lineage inside this session, so dispatching every further message the peer sends
+        // for it would be a peer driven retry loop over allocation and storage.
+        if (selectedDocument && (yield* Ref.get(refused)).has(envelope.documentId)) {
+          return "ApplicationRejected" as const
         }
         if (!selectedDocument) {
-          return yield* new ReplicaError.ReplicaError({
-            reason: new ReplicaError.ProtocolMismatch({
-              expected: "selected whole document",
-              observed: `${envelope.documentType}:${envelope.documentId}`
-            })
-          })
+          return yield* protocolInvalid(
+            "selected whole document",
+            `${envelope.documentType}:${envelope.documentId}`
+          )
         }
         const result = yield* withSyncLock(
           envelope.documentId,
@@ -455,9 +423,10 @@ const makeWithTerminal = (
               const permit = yield* gate.shared
               if (permit.incarnation !== session.replicaIncarnation) {
                 return yield* new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.ProtocolMismatch({
-                    expected: String(session.replicaIncarnation),
-                    observed: String(permit.incarnation)
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause: new Error(
+                      `Replica incarnation changed from ${session.replicaIncarnation} to ${permit.incarnation}`
+                    )
                   })
                 })
               }
@@ -465,7 +434,38 @@ const makeWithTerminal = (
             }))
             const observationRevision = (yield* Ref.get(observed)).get(envelope.documentId)?.revision ?? 0
             const client = yield* entity(envelope.documentId)
-            const result = yield* client.ApplySync({
+            const relay = yield* Effect.gen(function*() {
+              if (relayReceiptLimits._tag === "None") {
+                return yield* new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause: new Error("Relay receipt limits are unavailable")
+                  })
+                })
+              }
+              if (
+                !Number.isSafeInteger(delivery.receiptRetentionMillis) ||
+                delivery.receiptRetentionMillis <= 0 ||
+                delivery.receiptRetentionMillis > relayReceiptLimits.value.receiptRetentionMillis
+              ) {
+                return yield* new RelayProtocolInvalid()
+              }
+              if (delivery.identity.relayPeerId !== connection.relayPeerId) {
+                return yield* new RelayProtocolInvalid()
+              }
+              if (delivery.identity.senderPeerId !== connection.peerId) {
+                return yield* new RelayProtocolInvalid()
+              }
+              if (delivery.identity.messageHash !== envelope.messageHash) {
+                return yield* new RelayProtocolInvalid()
+              }
+              const nowMillis = yield* Clock.currentTimeMillis
+              return {
+                ...delivery.identity,
+                receiptExpiresAt: new Date(nowMillis + delivery.receiptRetentionMillis).toISOString(),
+                encodedSize: bytes.byteLength
+              } satisfies PeerSync.RelayReceipt
+            })
+            const applySync = client.ApplySync({
               replicaIncarnation: incarnation,
               peerId: connection.peerId,
               connectionEpoch: boundEpoch,
@@ -476,8 +476,9 @@ const makeWithTerminal = (
               message: envelope.message,
               // The single point an envelope's lineage enters the system, so the single point the
               // absent key of a pre lineage peer becomes the genesis lineage.
-              lineage: envelope.lineage ?? Identity.genesisLineage,
-              writerProvenance: envelope.writerProvenance
+              lineage: envelope.lineage,
+              writerProvenance: envelope.writerProvenance,
+              relay
             }).pipe(
               Effect.catchTag(
                 ["MailboxFull", "AlreadyProcessingMessage", "PersistenceError"],
@@ -489,6 +490,26 @@ const makeWithTerminal = (
                       })
                     })
                   )
+              )
+            )
+            const result = yield* applySync.pipe(
+              Effect.catchReason(
+                "ReplicaError",
+                "ProtocolMismatch",
+                () =>
+                  Effect.gen(function*() {
+                    const current = yield* gate.current
+                    if (current.incarnation === session.replicaIncarnation) {
+                      return yield* new RelayProtocolInvalid()
+                    }
+                    return yield* new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageUnavailable({
+                        cause: new Error(
+                          `Replica incarnation changed from ${session.replicaIncarnation} to ${current.incarnation}`
+                        )
+                      })
+                    })
+                  })
               )
             )
             yield* Ref.update(observed, (values) => {
@@ -511,14 +532,44 @@ const makeWithTerminal = (
             (reason) => refuse(envelope.documentId, reason).pipe(Effect.as(null))
           )
         )
-        if (result === null) return
+        if (result === null) return "ApplicationRejected" as const
         yield* publisher.publishPending
         if (result.reply !== null) {
           yield* sync.enqueue(session, result.reply).pipe(Effect.flatMap(schedule))
           yield* Queue.offer(flushRequests, undefined)
         }
+        return "Applied" as const
       })
 
+    const relayCall = (
+      operation: string,
+      effect: Effect.Effect<void, ReplicaError.ReplicaError>
+    ) =>
+      effect.pipe(
+        Effect.timeout(limits.maxPeerSendMillis),
+        Effect.catchTag("TimeoutError", () =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.OperationTimeout({
+                operation,
+                timeoutMillis: limits.maxPeerSendMillis
+              })
+            })
+          ))
+      )
+
+    const receiveAcknowledged = (delivery: PeerTransport.AcknowledgedDelivery) =>
+      processReceive(delivery.message, delivery).pipe(
+        Effect.flatMap((outcome) =>
+          outcome === "ApplicationRejected"
+            ? relayCall("relay reject", delivery.reject("ApplicationRejected"))
+            : relayCall("relay acknowledge", delivery.acknowledge)
+        ),
+        Effect.catchTag(
+          "RelayProtocolInvalid",
+          () => relayCall("relay reject", delivery.reject("ProtocolInvalid"))
+        )
+      )
     yield* Effect.addFinalizer(() =>
       Effect.gen(function*() {
         const boundEpoch = yield* Ref.get(remoteEpoch)
@@ -540,7 +591,7 @@ const makeWithTerminal = (
     )
     yield* supervise(
       terminalFailure,
-      Stream.runForEach(connection.receive, receive).pipe(
+      Stream.runForEach(connection.receive, receiveAcknowledged).pipe(
         Effect.andThen(
           Effect.fail(
             new ReplicaError.ReplicaError({

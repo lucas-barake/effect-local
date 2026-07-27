@@ -4,13 +4,10 @@ Read this file before any work. Treat these rules as required for every package.
 
 ## Coordination
 
-- Read `AGENTS.local.md` before editing.
-- Only the main task owner edits or replaces `AGENTS.local.md`, and only when the repository level task changes to unrelated work.
-- The main task owner records the task, branch, PR, ownership, checkpoints, commands, results, decisions, and next actions.
-- The main task owner checks `git status` and the remote branch before mutation, rebases before every push, and pushes each independently verified fix.
+- Check `git status` and the remote branch before mutation, rebase before every push, and push each independently verified fix.
 - Never overwrite, revert, or reformat another contributor's work.
 - Keep commits narrow.
-- Use one production owner for overlapping files. Review agents must not edit production code, tests, shared ledgers, commits, branches, or PR state.
+- Use one production owner for overlapping files. Review agents must not edit production code, tests, commits, branches, or PR state.
 
 ## Effect Source Of Truth
 
@@ -25,6 +22,8 @@ Read this file before any work. Treat these rules as required for every package.
 - Define every library owned typed error with `Schema.TaggedErrorClass<Self>(identifier)("Tag", fields)`.
 - Give every typed failure a stable `_tag`. Do not add untagged or `Data.TaggedError` library error types.
 - Discriminate tagged errors with `_tag`. Do not use `instanceof` for error discrimination.
+- Do not define shared error transformers such as `toSomeError`, `mapErrors`, or helpers that accept `unknown` and return another error. Handle each inferred failure directly at the call site with explicit `_tag` based `Effect.catchTag`, `catchTags`, `catchReason`, or `catchReasons` branches. Use `catchCause` at the call site only when the full Cause must be preserved. Accept small duplication so error channels stay narrow and every handled failure remains explicit.
+- Do not use generic `E` intersections, structural `_tag` probes, `typeof error === "object"`, or property existence checks to claim that an Effect failure is a specific tagged error. Let the Effect error channel prove the tag and use the matching typed catch combinator. If the combinator does not typecheck, the call site has not proved that it can fail with that error.
 - When a consumer error can share an infrastructure `_tag`, use the infrastructure package's precise guard instead of `catchTag`.
 - Use `Effect.catchTag` or `catchTags` for `_tag` failures. Use `catchReason` or `catchReasons` for nested tagged reasons. Use `catchIf`, `catchFilter`, or a specialized combinator for other selected typed failures.
 - Use `Effect.catch` only when one handler intentionally covers the complete typed failure channel. It does not catch defects or interruption.
@@ -39,7 +38,10 @@ Read this file before any work. Treat these rules as required for every package.
 - For a service that requires cleanup, acquire it with `Effect.acquireRelease` or another scoped `Effect`, and provide it with `Layer.effect`.
 - Keep Layer construction configurable. Do not hide lifecycle, persistence, concurrency, or security choices behind defaults.
 - Do not capture consumer specific runtime values in module global state. Pass them through service implementations, Layer constructors, or operation arguments.
-- A Layer must capture every service used later by its methods or expose that service as a Layer requirement.
+- Resolve dependencies once while the Layer is being built and close over them. A service method must not leave a service in its own requirement channel.
+- A service's methods should be `Effect<A, E, never>`. Leak a requirement only when the dependency is genuinely per call, such as a request scoped context or an ambient `Scope` the caller owns, and say why at the definition.
+- A leaked requirement is a real cost: it spreads to every transitive caller, it lets a method be invoked under a context the Layer never validated, and it hides which services an implementation actually needs behind the call sites instead of stating it once at construction.
+- A Layer must capture every service used later by its methods.
 - Export a constructor or use `Layer.fresh` when a context sensitive Layer must build independently more than once under one memo map.
 
 ## Composition And Effects
@@ -69,6 +71,9 @@ Read this file before any work. Treat these rules as required for every package.
 
 - Optimize public APIs for low setup friction and explicit consumer control.
 - For pipeable public combinators, use `Function.dual` when data first and data last forms materially improve use.
+- Express a configurable duration as `Duration.Input`, never as a bare number named with a unit suffix such as `Millis`. `Duration.Input` lets a consumer write `"30 seconds"`, `Duration.minutes(5)`, or a raw number, and it states the unit in the type instead of in the identifier.
+- Convert a configured duration once, with `Duration.toMillis`, at the point the Layer or service is constructed, and close over the result. Do not convert per call and do not thread `Duration.Input` into arithmetic.
+- A duration that crosses a wire protocol or is persisted stays a plain number with its unit in the name. `Duration` has no stable serialized encoding, so a protocol or column must name its unit.
 - Use `camelCase` for values and functions. Use `PascalCase` for types, services, schemas, and error classes.
 - Add an `Error` suffix when it improves clarity. Preserve established class names and serialized `_tag` values for public or protocol errors.
 - Name Layer values and constructors so their implementation, configuration, or lifecycle is clear.

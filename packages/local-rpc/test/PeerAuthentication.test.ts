@@ -24,13 +24,20 @@ import * as PeerRpcObservability from "../src/internal/peerRpcObservability.js"
 import * as PeerAuthentication from "../src/PeerAuthentication.js"
 import * as PeerAuthenticator from "../src/PeerAuthenticator.js"
 import * as PeerCredentials from "../src/PeerCredentials.js"
+import * as PeerRelayLimits from "../src/PeerRelayLimits.js"
 import * as PeerRpc from "../src/PeerRpc.js"
 import * as PeerRpcError from "../src/PeerRpcError.js"
-import * as PeerRpcLimits from "../src/PeerRpcLimits.js"
 
 const peerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001")
+const remotePeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000002")
 const principal = PeerAuthentication.PeerPrincipal.make({ tenantId: "tenant", subjectId: "subject", peerId })
 const sessionId = Identity.SessionId.make("ses_00000000-0000-4000-8000-000000000001")
+const relayMessageId = Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000001")
+const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
+const terminalHandlers = {
+  Acknowledge: () => Effect.void,
+  Reject: () => Effect.void
+}
 
 const invoke = (
   middleware: PeerAuthentication.PeerAuthentication["Service"],
@@ -63,7 +70,8 @@ describe("PeerAuthentication", () => {
       const authenticatedWith = yield* Deferred.make<Redacted.Redacted<string>>()
       const handlers = PeerRpc.Rpcs.toLayer(PeerRpc.Rpcs.of({
         Open: () => Stream.empty,
-        Push: () => Effect.void
+        Push: () => Effect.void,
+        ...terminalHandlers
       }))
       const client = yield* RpcTest.makeClient(PeerRpc.Rpcs).pipe(
         Effect.provide(handlers),
@@ -75,10 +83,10 @@ describe("PeerAuthentication", () => {
         Effect.provideService(PeerCredentials.PeerCredentials, {
           get: Effect.succeed(Redacted.make("constant"))
         }),
-        Effect.provideService(PeerRpcLimits.PeerRpcLimits, PeerRpcLimits.defaults)
+        Effect.provideService(PeerRelayLimits.PeerRelayLimits, PeerRelayLimits.defaults)
       )
 
-      yield* client.Push({ sessionId, payload: Uint8Array.of(1) })
+      yield* client.Push({ sessionId, relayMessageId, payload: Uint8Array.of(1) })
       assert.strictEqual(Redacted.value(yield* Deferred.await(authenticatedWith)), "constant")
     }))
 
@@ -110,12 +118,13 @@ describe("PeerAuthentication", () => {
                 _tag: "Opened",
                 protocolVersion: PeerRpc.protocolVersion,
                 sessionId,
-                peerId,
-                capabilities: { storeAndForward: false }
+                remotePeerId,
+                authenticatedLocal: principal
               })
             })
           ),
-        Push: () => PeerAuthentication.AuthenticatedPeer.pipe(Effect.asVoid)
+        Push: () => PeerAuthentication.AuthenticatedPeer.pipe(Effect.asVoid),
+        ...terminalHandlers
       }))
       const client = yield* RpcTest.makeClient(PeerRpc.Rpcs).pipe(
         Effect.provide(handlers),
@@ -134,18 +143,25 @@ describe("PeerAuthentication", () => {
             get: Effect.sync(() => Redacted.make(credential))
           })
         ),
-        Effect.provideService(PeerRpcLimits.PeerRpcLimits, PeerRpcLimits.defaults)
+        Effect.provideService(PeerRelayLimits.PeerRelayLimits, PeerRelayLimits.defaults)
       )
 
       yield* client.Open({
         protocolVersion: PeerRpc.protocolVersion,
-        expectedPeerId: peerId,
-        definitionHash: "def_0000000000000000",
-        documents: [],
+        expectedRelayPeerId: peerId,
+        expectedLocal: principal,
+        senderReplicaIncarnation: Identity.ReplicaIncarnation.make(1),
+        remote: {
+          subjectId: "remote",
+          peerId: remotePeerId
+        },
+        documents: [{ documentType: "Task", documentId }],
+        receiptRetentionMillis: 1,
+        senderRetryHorizonMillis: 1,
         credential: Redacted.make("caller")
       }).pipe(Stream.runDrain)
       credential = "second"
-      yield* client.Push({ sessionId, payload: Uint8Array.of(1) })
+      yield* client.Push({ sessionId, relayMessageId, payload: Uint8Array.of(1) })
       assert.deepStrictEqual(credentials, ["first", "second"])
     }))
 
@@ -156,7 +172,8 @@ describe("PeerAuthentication", () => {
       const authenticatedWith = yield* Deferred.make<Redacted.Redacted<string>>()
       const handlers = PeerRpc.Rpcs.toLayer(PeerRpc.Rpcs.of({
         Open: () => Stream.empty,
-        Push: () => Effect.void
+        Push: () => Effect.void,
+        ...terminalHandlers
       }))
       const client = yield* RpcTest.makeClient(PeerRpc.Rpcs).pipe(
         Effect.provide(handlers),
@@ -168,10 +185,12 @@ describe("PeerAuthentication", () => {
         Effect.provideService(PeerCredentials.PeerCredentials, {
           get: Deferred.succeed(requested, undefined).pipe(Effect.andThen(Deferred.await(credential)))
         }),
-        Effect.provideService(PeerRpcLimits.PeerRpcLimits, PeerRpcLimits.defaults)
+        Effect.provideService(PeerRelayLimits.PeerRelayLimits, PeerRelayLimits.defaults)
       )
 
-      const request = yield* client.Push({ sessionId, payload: Uint8Array.of(1) }).pipe(Effect.forkChild)
+      const request = yield* client.Push({ sessionId, relayMessageId, payload: Uint8Array.of(1) }).pipe(
+        Effect.forkChild
+      )
       yield* Deferred.await(requested)
       assert.isTrue(Option.isNone(yield* Deferred.poll(authenticatedWith)))
       yield* Deferred.succeed(credential, Redacted.make("asynchronous"))
@@ -194,7 +213,7 @@ describe("PeerAuthentication", () => {
       Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
         authenticate: () => Effect.succeed(authenticated)
       }),
-      Effect.provideService(PeerRpcLimits.PeerRpcLimits, PeerRpcLimits.defaults)
+      Effect.provideService(PeerRelayLimits.PeerRelayLimits, PeerRelayLimits.defaults)
     ))
 
   it.effect("rejects verifier concurrency immediately", () =>
@@ -211,8 +230,8 @@ describe("PeerAuthentication", () => {
               return authenticated
             })
         }),
-        Effect.provideService(PeerRpcLimits.PeerRpcLimits, {
-          ...PeerRpcLimits.defaults,
+        Effect.provideService(PeerRelayLimits.PeerRelayLimits, {
+          ...PeerRelayLimits.defaults,
           maxInFlightAuthentication: 1
         })
       )
@@ -251,8 +270,8 @@ describe("PeerAuthentication", () => {
         Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
           authenticate: () => Deferred.succeed(authenticatedOnce, undefined).pipe(Effect.as(authenticated))
         }),
-        Effect.provideService(PeerRpcLimits.PeerRpcLimits, {
-          ...PeerRpcLimits.defaults,
+        Effect.provideService(PeerRelayLimits.PeerRelayLimits, {
+          ...PeerRelayLimits.defaults,
           authenticationRatePerSecond: 1,
           authenticationBurst: 1
         })
@@ -286,7 +305,7 @@ describe("PeerAuthentication", () => {
         Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
           authenticate: () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never))
         }),
-        Effect.provideService(PeerRpcLimits.PeerRpcLimits, PeerRpcLimits.defaults)
+        Effect.provideService(PeerRelayLimits.PeerRelayLimits, PeerRelayLimits.defaults)
       )
       const fiber = yield* invoke(middleware, { credential: Redacted.make("credential") }, 1).pipe(Effect.forkChild)
 
@@ -322,8 +341,8 @@ describe("PeerAuthentication", () => {
               })
               : Effect.succeed(authenticated)
         }),
-        Effect.provideService(PeerRpcLimits.PeerRpcLimits, {
-          ...PeerRpcLimits.defaults,
+        Effect.provideService(PeerRelayLimits.PeerRelayLimits, {
+          ...PeerRelayLimits.defaults,
           authenticationBurst: 1,
           maxRetainedRateLimitedConnections: 1
         })
@@ -344,8 +363,8 @@ describe("PeerAuthentication", () => {
         Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
           authenticate: () => Effect.succeed(authenticated)
         }),
-        Effect.provideService(PeerRpcLimits.PeerRpcLimits, {
-          ...PeerRpcLimits.defaults,
+        Effect.provideService(PeerRelayLimits.PeerRelayLimits, {
+          ...PeerRelayLimits.defaults,
           authenticationRatePerSecond: 1,
           authenticationBurst: 1,
           maxRetainedRateLimitedConnections: 3
@@ -380,8 +399,8 @@ describe("PeerAuthentication", () => {
           Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
             authenticate: () => Effect.succeed(authenticated)
           }),
-          Effect.provideService(PeerRpcLimits.PeerRpcLimits, {
-            ...PeerRpcLimits.defaults,
+          Effect.provideService(PeerRelayLimits.PeerRelayLimits, {
+            ...PeerRelayLimits.defaults,
             authenticationRatePerSecond: Number.MIN_VALUE,
             authenticationBurst: 1,
             rateLimitIdleRetention: 1_000,
@@ -414,8 +433,8 @@ describe("PeerAuthentication", () => {
       Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
         authenticate: () => Effect.succeed(authenticated)
       }),
-      Effect.provideService(PeerRpcLimits.PeerRpcLimits, {
-        ...PeerRpcLimits.defaults,
+      Effect.provideService(PeerRelayLimits.PeerRelayLimits, {
+        ...PeerRelayLimits.defaults,
         authenticationBurst: 1
       })
     ))
@@ -430,7 +449,7 @@ describe("PeerAuthentication", () => {
       Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
         authenticate: () => Effect.succeed({ ...authenticated, validUntil: 0 })
       }),
-      Effect.provideService(PeerRpcLimits.PeerRpcLimits, PeerRpcLimits.defaults)
+      Effect.provideService(PeerRelayLimits.PeerRelayLimits, PeerRelayLimits.defaults)
     ))
 
   it.effect("records authentication denial without credential identity or verifier defects", () => {
@@ -492,7 +511,7 @@ describe("PeerAuthentication", () => {
             Effect.andThen(Effect.die(new Error("verifier-forbidden-value")))
           )
       }),
-      Effect.provideService(PeerRpcLimits.PeerRpcLimits, PeerRpcLimits.defaults),
+      Effect.provideService(PeerRelayLimits.PeerRelayLimits, PeerRelayLimits.defaults),
       Effect.provideService(Metric.MetricRegistry, new Map()),
       Effect.provideService(Tracer.Tracer, tracer)
     )
@@ -509,7 +528,7 @@ describe("PeerAuthentication", () => {
         Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
           authenticate: () => Effect.succeed({ ...authenticated, validUntil })
         }),
-        Effect.provideService(PeerRpcLimits.PeerRpcLimits, PeerRpcLimits.defaults)
+        Effect.provideService(PeerRelayLimits.PeerRelayLimits, PeerRelayLimits.defaults)
       ))
   }
 })
