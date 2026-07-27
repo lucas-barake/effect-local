@@ -159,16 +159,30 @@ client. `@effect/platform-browser` already provides one.
 ```ts
 import * as BrowserSocket from "@effect/platform-browser/BrowserSocket"
 import * as PeerRpc from "@lucas-barake/effect-local-rpc/PeerRpc"
+import * as RpcPeerTransport from "@lucas-barake/effect-local-rpc/RpcPeerTransport"
 import { RpcClient, RpcSerialization } from "effect/unstable/rpc"
 
-const relayRpcClient = PeerRpc.makeRpcClient.pipe(
+// Provide the transport to the whole effect that USES the session, not to `makeRpcClient` alone.
+const relaySession = Effect.gen(function*() {
+  const client = yield* PeerRpc.makeRpcClient
+  const session = yield* RpcPeerTransport.makeSession(client, relayOptions)
+  yield* useTheSession(session)
+}).pipe(
   Effect.provide(RpcClient.layerProtocolSocket()),
   Effect.provide(BrowserSocket.layerWebSocket(relayUrl)),
   Effect.provide(RpcSerialization.layerJson),
   Effect.provide(PeerAuthentication.layerClient),
-  Effect.provideService(PeerCredentials.PeerCredentials, credentials)
+  Effect.provideService(PeerCredentials.PeerCredentials, credentials),
+  Effect.scoped
 )
 ```
+
+The scoping above is load bearing and the mistake it avoids is silent. A `Layer` provided to
+`makeRpcClient` alone lives exactly as long as that constructor: the socket and its pump are built,
+a client is handed back, and both are released before the client is ever used. What is left is a
+client whose every request waits forever on a transport that no longer exists - no socket is opened,
+nothing is logged, and nothing fails. Provide the transport around the work, not around the
+constructor.
 
 `credentials` is the application's. `PeerAuthentication.layerClient` calls `PeerCredentials.get` once per request, so a
 `Ref` or `Deferred` backed implementation that the page refreshes is a valid shape. Supplying it inside a SharedWorker

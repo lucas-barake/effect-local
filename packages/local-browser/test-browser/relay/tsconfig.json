@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json.schemastore.org/tsconfig",
+  "extends": "../../../../tsconfig.base.json",
+  "include": ["src", "relay-server.ts"],
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "dist",
+    "lib": ["ES2022", "DOM", "WebWorker"],
+    "types": ["vite/client", "node"]
+  },
+  "references": [
+    { "path": "../../../local" },
+    { "path": "../../../local-rpc" },
+    { "path": "../../../local-sql" },
+    { "path": "../.." }
+  ]
+}
