@@ -19,7 +19,9 @@ const layer = SqlRelayInboxStore.layer.pipe(
 
 const quota = { maxPendingMessages: 100, maxPendingBytes: 10_000_000 }
 
-const channel = (options?: { readonly epoch?: string; readonly subject?: string }) => ({
+const channel = (
+  options?: { readonly epoch?: string | undefined; readonly subject?: string | undefined }
+) => ({
   tenantId: "tenant-a",
   senderSubjectId: options?.subject ?? "sender-a",
   senderPeerId: peer("00000000aaa1"),
