@@ -87,10 +87,18 @@ const publishMissingFixtures = (destinationDirectory: string) =>
 
     // Publication is append only. Interruption or a competing publisher can leave a valid prefix
     // that the next run completes, while deleting links could create an unrecoverable version gap.
+    //
+    // Each link is uninterruptible so that "the next run completes it" is actually true. `fs.link`
+    // resumes through a callback with no canceler, so an interrupted fiber parked in it is
+    // abandoned while the syscall keeps going and publishes the fixture afterwards — leaving the
+    // directory ahead of what this run reported. The next run then snapshots a fixture as missing,
+    // regenerates it, and fails its own link with `EEXIST` when the abandoned one lands. The
+    // `yieldNow` between links is what keeps the publication interruptible at all, and it is now
+    // the only point at which it can be interrupted.
     yield* Effect.forEach(
       pending,
       ({ path, published: destination }) =>
-        fs.link(path, destination).pipe(
+        Effect.uninterruptible(fs.link(path, destination)).pipe(
           Effect.andThen(Effect.yieldNow)
         ),
       { discard: true }
@@ -147,6 +155,36 @@ describe("migration fixture generation", () => {
 
       yield* publishMissingFixtures(directory)
       for (const spec of fixtures) assert.isTrue(yield* fs.exists(`${directory}/${spec.file}`))
+    }).pipe(Effect.provide(NodeFileSystem.layer)))
+
+  // Live rather than virtual: the property is about a syscall the runtime may abandon, which no
+  // amount of `TestClock` advancement can surface.
+  it.live("publishes nothing more once it reports the publication was interrupted", () =>
+    Effect.gen(function*() {
+      const fs = yield* FileSystem
+      // `fs.link` resumes through a callback with no canceler, so interrupting a fiber parked in it
+      // abandons the fiber while the syscall keeps going and creates the link afterwards. That made
+      // an interrupted publication keep growing the directory after it had already reported being
+      // interrupted, and the run that completes it would then regenerate a fixture that was about
+      // to exist and fail its own link with `EEXIST`.
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const directory = yield* fs.makeTempDirectoryScoped()
+        const publisher = yield* publishMissingFixtures(directory).pipe(Effect.forkChild)
+        while (!(yield* fs.exists(`${directory}/${fixtures[0]!.file}`))) yield* Effect.yieldNow
+        yield* Fiber.interrupt(publisher)
+
+        const published = (files: ReadonlyArray<string>) =>
+          files.filter((file) => fixtures.some((spec) => spec.file === file)).sort()
+        const reported = published(yield* fs.readDirectory(directory))
+        // Long enough that an abandoned link has landed many times over: measured against this
+        // publisher, leaving the link interruptible grows the directory within 20ms.
+        yield* Effect.sleep("200 millis")
+        assert.deepStrictEqual(
+          published(yield* fs.readDirectory(directory)),
+          reported,
+          "an interrupted publication must leave the directory exactly as it reported it"
+        )
+      }
     }).pipe(Effect.provide(NodeFileSystem.layer)))
 
   it.effect("does not replace a fixture published concurrently after the prefix snapshot", () =>
