@@ -387,7 +387,23 @@ On a rebalance, an entity's termination handshake waits up to the cluster's `ent
 subscription before the session is closed, and rejects `Deliver` and `Settle` for that device during the window. Size
 that value accordingly.
 
-Single owner per key across multiple runners is not verified by this package's test suite, which is single process.
+Single owner per key across multiple runners is verified rather than assumed. `RelayInboxMultiRunner.test.ts` brings
+up two socket runners against one PostgreSQL, and reads ownership off each runner's own shard map: exactly one hosts a
+given inbox key, the other reaches it over the wire, and a second session opened through the non-owner replaces the
+first runner's session. Its control splits the two runners across databases, where each acquires every shard and hosts
+its own instance instead — which is what gives the first result meaning.
+
+That test also pins an operational requirement worth stating plainly: **a multi-node relay needs a real inter-runner
+transport, and configuring one without it fails silently rather than loudly.** Every `RelayInbox` rpc is deliberately
+volatile, so `Sharding` routes a message for a remote shard through `Runners.send`; under `Runners.layerNoop` that
+fails `EntityNotAssignedToRunner`, and the failure is retried forever rather than surfaced. Two nodes wired that way
+hang instead of erroring. Use a socket runner, and note that `RunnerHealth.layerNoop` is likewise wrong for more than
+one node, because dropping an unhealthy runner from the hash ring is the mechanism that moves ownership.
+
+For contrast, the cluster inside `SqlReplica` is single node by construction and correctly so — a client replica is
+one process, and `internal/clusterStorage.ts` pairs `Runners.layerNoop` with `RunnerHealth.layerNoop` deliberately.
+The relay's `Sharding` is the application's to supply and is the one that has to be socket backed.
+
 This package supplies a relay building block. It does not claim global availability, managed operations, peer
 discovery, end to end encryption, account management, or tenant routing.
 
