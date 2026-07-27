@@ -70,12 +70,20 @@ const runtime = Atom.runtime(DeviceLive)
  */
 export const syncedDocumentsAtom = Atom.make("")
 
-export const syncDocument = Atom.fnSync((documentId: Identity.DocumentId, get) => {
-  const current = get(syncedDocumentsAtom)
-  const next = new Set(current === "" ? [] : current.split(","))
-  next.add(documentId)
-  get.set(syncedDocumentsAtom, [...next].toSorted().join(","))
-})
+/**
+ * Resolves once the session covering the document is open, rather than when the set has been
+ * written. A caller that returns before the socket exists has no way to know when its next write
+ * will actually be sent, and nothing else reports it.
+ */
+export const syncDocument = runtime.fn<Identity.DocumentId>()(
+  Effect.fnUntraced(function*(documentId, get) {
+    const current = get(syncedDocumentsAtom)
+    const next = new Set(current === "" ? [] : current.split(","))
+    next.add(documentId)
+    get.set(syncedDocumentsAtom, [...next].toSorted().join(","))
+    yield* get.result(sessionAtom, { suspendOnWaiting: true })
+  })
+)
 
 export const createTask = runtime.fn<string>()(
   Effect.fnUntraced(function*(title, get) {
@@ -86,7 +94,8 @@ export const createTask = runtime.fn<string>()(
         value: { title, labels: [] }
       })
     )
-    get.set(syncDocument, documentId)
+    get.set(syncedDocumentsAtom, documentId)
+    yield* get.result(sessionAtom, { suspendOnWaiting: true })
     return documentId
   })
 )
@@ -107,12 +116,15 @@ export const addLabel = runtime.fn<{
   })
 )
 
+// `concurrent`, because a polled read must not interrupt the read before it. An `Atom.fn` cancels
+// its in-flight call when set again, so a poll that outpaces the read never resolves at all.
 export const readTask = runtime.fn<Identity.DocumentId>()(
   Effect.fnUntraced(function*(documentId) {
     const replica = yield* Replica.Replica
     const snapshot = yield* replica.get(TaskDocument, documentId)
     return { title: snapshot.value.title, labels: [...snapshot.value.labels] }
-  })
+  }),
+  { concurrent: true }
 )
 
 export const exportBackup = runtime.fn<void>()(
@@ -209,7 +221,7 @@ export const sessionAtom = runtime.atom((get) => {
 
 export const push = runtime.fn<Identity.DocumentId>()(
   Effect.fnUntraced(function*(documentId, get) {
-    const session = yield* get.result(sessionAtom)
+    const session = yield* get.result(sessionAtom, { suspendOnWaiting: true })
     yield* session.markDirty(documentId)
     yield* session.flush
   })

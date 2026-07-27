@@ -5,7 +5,8 @@ const cwd = fileURLToPath(new URL("../..", import.meta.url))
 
 export default defineConfig({
   testDir: "./tests",
-  timeout: 60_000,
+  // CI runs this several times slower than a laptop, and the exchange itself is polled.
+  timeout: 180_000,
   // One worker. Every test in this project shares one relay process and one pair of device
   // identities, so running files in parallel makes them contend for the same inboxes.
   workers: 1,
