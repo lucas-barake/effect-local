@@ -5,10 +5,12 @@ import * as PeerSyncEnvelope from "@lucas-barake/effect-local-sql/PeerSyncEnvelo
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
+import * as Latch from "effect/Latch"
 import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
 import * as Redacted from "effect/Redacted"
@@ -679,6 +681,61 @@ describe("RelayServer", () => {
         { limit: 10 }
       )
       assert.strictEqual(pending.length, 1, "the terminal transition never ran")
+    })))
+
+  it.effect("surfaces an internal authorization fault as a defect rather than a typed error", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const peer = yield* harness({
+        knobs: {
+          allow: () => {
+            throw new Error("authorization backend is broken")
+          }
+        }
+      })
+
+      // A broken authorization backend is not a decision about this caller. Reporting it as
+      // AccessDenied would tell a legitimate client it is unauthorized and make it stop retrying,
+      // and the wire contract encodes a defect as InternalError precisely to keep them distinct.
+      const exit = yield* peer.client.Open(openRequest(sender, recipient)).pipe(
+        Stream.runDrain,
+        Effect.exit
+      )
+      assert.isTrue(exit._tag === "Failure")
+      if (exit._tag !== "Failure") return
+      assert.isTrue(Cause.hasDies(exit.cause), "the fault stays a defect")
+      assert.isFalse(
+        Cause.hasFails(exit.cause),
+        "and is never laundered into a typed PeerRpcError"
+      )
+    })))
+
+  it.effect("ends a session cleanly when its credential is invalidated", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const revoked = yield* Latch.make(false)
+      const peer = yield* harness({
+        knobs: {
+          authority: { validUntil: Number.MAX_SAFE_INTEGER, invalidated: revoked.await }
+        }
+      })
+      const senderSession = yield* open(peer, sender, recipient)
+      const recipientSession = yield* open(peer, recipient, sender)
+
+      yield* push(peer, senderSession.opened.sessionId, yield* encodePayload(peer))
+      const stored = yield* Queue.take(recipientSession.events)
+      assert.strictEqual(stored._tag, "StoredMessage")
+
+      // Nothing observes the credential except the relay, so it is the only thing that can end the
+      // session when authority is withdrawn. The stream must end, not error: revocation is an
+      // orderly close, and the client reconnects on its own terms.
+      yield* revoked.open
+      yield* Fiber.join(recipientSession.fiber)
+
+      // The message was delivered but never settled, so it is still the relay's responsibility.
+      const pending = yield* peer.store.pendingHeads(
+        yield* inboxKeyOf(peer, recipient),
+        { limit: 10 }
+      )
+      assert.strictEqual(pending.length, 1, "an unsettled message survives the revocation")
     })))
 
   it.effect("pins the handshake protocol version so a foreign version fails to decode", () =>
