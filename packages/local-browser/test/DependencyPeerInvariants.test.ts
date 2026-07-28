@@ -256,7 +256,13 @@ describe("dependency peer invariants", () => {
               type: "module",
               packageManager: "pnpm@10.18.1",
               dependencies: { ...documented, ...recipeArtifacts },
-              pnpm: { overrides: recipeArtifacts }
+              // vite 8's rolldown wasm binding currently ships an optional peer chain that
+              // strict peer resolution refuses in both npm and pnpm
+              // (@rolldown/binding-wasm32-wasi -> @napi-rs/wasm-runtime -> @emnapi/core). The
+              // repository's own dev tooling resolves on vite 7, so the consumer graph pins the
+              // same line in both managers until the upstream chain resolves cleanly again.
+              overrides: { vite: "7.2.7" },
+              pnpm: { overrides: { ...recipeArtifacts, vite: "7.2.7" } }
             })
           )
           const args = packageManager === "npm"
