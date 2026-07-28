@@ -267,16 +267,22 @@ export const layerRelay = <
   return EntityReplica.layer(definition).pipe(Layer.provideMerge(durable))
 }
 
+/**
+ * Every binding's own Layer, as one Layer.
+ *
+ * `Layer.empty` is a seed, not decoration: `Layer.mergeAll` takes a non-empty tuple, and a spread of
+ * `options.projections` is an array that may be empty.
+ */
+const bindingLayers = (projections: ReadonlyArray<SqlProjection.Any>) =>
+  Layer.mergeAll(Layer.empty, ...projections.map((binding) => binding.layer))
+
 export const layerWithBindings = <
   D extends ReplicaDefinition.Any,
   const Bindings extends ReadonlyArray<SqlProjection.Any>,
 >(
   definition: D,
   options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
-) =>
-  layer(definition, options).pipe(
-    Layer.provide(Layer.mergeAll(Layer.empty, ...options.projections.map((binding) => binding.layer)))
-  )
+) => layer(definition, options).pipe(Layer.provide(bindingLayers(options.projections)))
 
 /**
  * Without this a consumer with projections cannot reach the relay stack through the documented
@@ -289,7 +295,4 @@ export const layerRelayWithBindings = <
 >(
   definition: D,
   options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
-) =>
-  layerRelay(definition, options).pipe(
-    Layer.provide(Layer.mergeAll(Layer.empty, ...options.projections.map((binding) => binding.layer)))
-  )
+) => layerRelay(definition, options).pipe(Layer.provide(bindingLayers(options.projections)))
