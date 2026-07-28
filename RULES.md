@@ -53,6 +53,8 @@ Read this file before any work. Treat these rules as required for every package.
 - Add `Effect.withSpan` or named `Effect.fn` spans at meaningful workflow, I/O, and remote boundaries. Add stable names and nonsecret attributes.
 - Use Effect concurrency primitives with explicit owner, capacity, interruption, shutdown, and finalizer behavior.
 - Prefer `Effect.forkChild`, `forkScoped`, or `forkIn`. Use `forkDetach` only when global lifetime, shutdown, and failure observation are explicit.
+- Keep execution inside Effect. Do not call `Effect.runFork`, `Effect.runPromise`, `Effect.runSync`, or another detached `run*` runner from inside Effect code. Bridge external events in with `Deferred`, `Queue`, `FiberSet`, or `Effect.runtime`, so execution stays under the current scope, context, and interruption rules. Reserve `run*` calls for genuine entry points such as process mains and worker bootstraps.
+- Prefer Effect returning combinators over throwing synchronous variants inside Effect code, for example `Schema.decodeUnknownEffect` over `Schema.decodeUnknownSync`. Contain unavoidable throwing variants at the non Effect boundary that requires them.
 - Give queues, latches, subscriptions, and scopes a documented owner and cleanup path.
 - Attach cleanup immediately after acquiring a native resource so every later failure and interruption path releases it.
 - Recheck mutable admission, quota, and idempotency state inside the same lock or transaction that performs the write.
@@ -79,6 +81,7 @@ Read this file before any work. Treat these rules as required for every package.
 - Name Layer values and constructors so their implementation, configuration, or lifecycle is clear.
 - Keep internal modules under `src/internal`. Export only deliberate consumer APIs from package entry points.
 - Avoid redundant wrappers, aliases, and abstractions when an Effect primitive already expresses the contract.
+- Do not export aliases of Schema codec constructors such as `export const decodeFoo = Schema.decodeUnknownSync(Foo)` or `export const encodeFoo = Schema.encodeSync(Foo)`. Call the codec directly at each use site so the schema and the operation stay visible at the boundary.
 - Reuse established helpers and schemas before introducing another representation of the same concept.
 
 ## Tests And Changesets

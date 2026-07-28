@@ -251,7 +251,7 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
               let info: unknown
               if (options.info !== undefined) {
                 const value = yield* provideRuntime(runtime, options.info.make)
-                info = Schema.encodeSync(options.info.schema)(value)
+                info = yield* Schema.encodeEffect(options.info.schema)(value)
               }
               const ownerId = yield* Effect.orDie(crypto.randomUUIDv4)
               const snapshot: EngineSnapshot = { runtime, scope: engineScope, ownerId, info }
