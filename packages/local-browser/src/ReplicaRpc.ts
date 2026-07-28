@@ -48,7 +48,7 @@ export const SessionHandshake = Schema.Struct({
 })
 export type SessionHandshake = typeof SessionHandshake.Type
 
-const isMessagePort = (input: unknown): input is MessagePort => {
+export const isMessagePort = (input: unknown): input is MessagePort => {
   if (typeof input !== "object" || input === null) return false
   try {
     return (

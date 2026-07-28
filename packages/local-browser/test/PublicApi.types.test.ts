@@ -23,11 +23,11 @@ describe("public browser API types", () => {
     assert.isDefined(layer)
   })
 
-  it("exposes timeout options through every browser replica constructor", () => {
+  it("exposes client options through every browser replica constructor", () => {
     const timeouts = {
       sessionTimeout: "20 seconds",
       operationTimeout: "2 minutes"
-    } satisfies ReplicaClient.TimeoutOptions
+    } satisfies ReplicaClient.Options
     const worker = { size: 2, concurrency: 8 }
     assert.isDefined(BrowserReplica.layer(definition, timeouts))
     assert.isDefined(BrowserReplica.layerWith(definition, worker, timeouts))

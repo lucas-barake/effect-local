@@ -396,7 +396,7 @@ test("expires a stalled provisioning candidate before assigning a healthy provid
     const candidate = { messages: [] as Array<string>, provisionedAt: 0, replica, rpcPort: rpc.port2 }
     state.__effectLocalExpiredCandidate = candidate
     replica.port.start()
-    replica.port.postMessage({ _tag: "Attach", rpcPort: rpc.port1 }, [rpc.port1])
+    replica.port.postMessage({ _tag: "Attach", protocolVersion: 1, rpcPort: rpc.port1 }, [rpc.port1])
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(
         () => reject(new Error(`Candidate was not offered provisioning, saw [${candidate.messages.join(", ")}]`)),
@@ -526,27 +526,49 @@ test("reprovisions the durable owner after its database provider dies", async ({
   await takeoverPage.goto("/")
   await ownerInfo(takeoverPage)
   await expect(takeoverPage.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
-  const takeoverOwner = await takeoverPage.evaluate(() =>
-    (globalThis as typeof globalThis & {
-      readonly __effectLocalOwnerInfo: {
-        readonly ownerId: string
-        readonly provider: boolean
-        readonly replicaId: string
-        readonly writerGeneration: number
-      }
-    }).__effectLocalOwnerInfo
-  )
-  expect(takeoverOwner.provider).toBe(true)
+
+  // The coordinator provisions among every attached tab, so the surviving tab is offered the
+  // database first. Exactly one page becomes the provider and both pages converge on the same
+  // new owner with an advanced writer generation.
+  const readOwnerInfo = (target: typeof attachedPage) =>
+    target.evaluate(() =>
+      (globalThis as typeof globalThis & {
+        readonly __effectLocalOwnerInfo: {
+          readonly ownerId: string
+          readonly provider: boolean
+          readonly replicaId: string
+          readonly writerGeneration: number
+        }
+      }).__effectLocalOwnerInfo
+    )
+  await expect
+    .poll(async () => (await readOwnerInfo(attachedPage))?.ownerId, { timeout: 20_000 })
+    .not.toBe(firstOwner.ownerId)
+  await expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+
+  const [takeoverOwner, survivingOwner] = await Promise.all([
+    readOwnerInfo(takeoverPage),
+    readOwnerInfo(attachedPage)
+  ])
+  expect([takeoverOwner.provider, survivingOwner.provider].filter(Boolean)).toHaveLength(1)
+  expect(survivingOwner.ownerId).toBe(takeoverOwner.ownerId)
   expect(takeoverOwner.ownerId).not.toBe(firstOwner.ownerId)
   expect(takeoverOwner.replicaId).toBe(firstOwner.replicaId)
   expect(takeoverOwner.writerGeneration).toBeGreaterThan(firstOwner.writerGeneration)
+  expect(survivingOwner.writerGeneration).toBe(takeoverOwner.writerGeneration)
   await expect(takeoverPage.getByText(title, { exact: true })).toBeVisible()
+  await expect(attachedPage.getByText(title, { exact: true })).toBeVisible()
 
   const renamed = `${title} renamed`
   await takeoverPage.getByRole("button", { name: `Rename ${title}` }).click()
   await takeoverPage.getByLabel("Task title", { exact: true }).fill(renamed)
   await takeoverPage.getByRole("button", { name: "Save title" }).click()
   await expect(takeoverPage.getByText(renamed, { exact: true })).toBeVisible()
+
+  // A tab that was already attached when the provider died must be handed off to the new owner:
+  // it re-attaches on its own and sees every write the new owner commits.
+  await expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(attachedPage.getByText(renamed, { exact: true })).toBeVisible({ timeout: 20_000 })
 })
 
 test("keeps an accepted database provider while its acknowledgement is delayed", async ({ context, page }) => {
