@@ -334,18 +334,25 @@ export const fromRpcClient = (
         )
     )
     if (options?.closeSessionOnPageHide !== false && typeof globalThis.addEventListener === "function") {
+      const pageHidden = yield* Deferred.make<void>()
       yield* Effect.acquireRelease(
         Effect.sync(() => {
           const onPageHide = () => {
-            // The page is unloading, so the answer will never arrive: the close is posted to the
-            // owner and left at that. This is a best effort boundary outside any fiber tree, so a
-            // detached run with every outcome ignored is the explicit choice.
-            Effect.runFork(Effect.ignore(closeSession(SubscriptionRef.getUnsafe(sessions).sessionId)))
+            Deferred.doneUnsafe(pageHidden, Exit.void)
           }
           globalThis.addEventListener("pagehide", onPageHide)
           return onPageHide
         }),
         (onPageHide) => Effect.sync(() => globalThis.removeEventListener("pagehide", onPageHide))
+      )
+      // The pagehide event only releases the Deferred. The close itself runs as an ordinary
+      // scoped fiber of this client, so the RPC goes through the same runtime and interruption
+      // rules as every other session operation instead of a detached run.
+      yield* Deferred.await(pageHidden).pipe(
+        Effect.andThen(
+          Effect.flatMap(SubscriptionRef.get(sessions), (session) => Effect.ignore(closeSession(session.sessionId)))
+        ),
+        Effect.forkScoped
       )
     }
     type Session = Effect.Success<ReturnType<typeof openSession>>

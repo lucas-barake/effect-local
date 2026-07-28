@@ -186,7 +186,7 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
       })
 
       const post = (port: MessagePort, frame: OwnershipProtocol.OwnerToPageFrame) =>
-        Effect.sync(() => port.postMessage(OwnershipProtocol.encodeOwnerToPage(frame)))
+        Effect.sync(() => port.postMessage(Schema.encodeSync(OwnershipProtocol.OwnerToPageFrame)(frame)))
 
       const postOwnerError = (port: MessagePort, message: string, reason?: unknown) =>
         post(port, { _tag: "OwnerError", message, reason })
@@ -571,11 +571,11 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
             controlPort.addEventListener("message", (event: MessageEvent<unknown>) => {
               let frame: OwnershipProtocol.PageToOwnerFrame
               try {
-                frame = OwnershipProtocol.decodePageToOwner(event.data)
+                frame = Schema.decodeUnknownSync(OwnershipProtocol.PageToOwnerFrame)(event.data)
               } catch (cause) {
                 try {
                   controlPort.postMessage(
-                    OwnershipProtocol.encodeOwnerToPage({
+                    Schema.encodeSync(OwnershipProtocol.OwnerToPageFrame)({
                       _tag: "OwnerError",
                       message: `undecodable ownership frame: ${String(cause)}`.slice(0, 512)
                     })
@@ -629,7 +629,7 @@ export const runSharedWorker = <E, A = unknown, E2 = never,>(
       for (const controlPort of pending.splice(0)) {
         try {
           controlPort.postMessage(
-            OwnershipProtocol.encodeOwnerToPage({
+            Schema.encodeSync(OwnershipProtocol.OwnerToPageFrame)({
               _tag: "OwnerError",
               message: failure.message,
               reason: { _tag: "RuntimeLoadFailure", message: failure.message, name: failure.name }
@@ -747,7 +747,7 @@ const layerTabImpl = (
 
       const postFrame = (current: Connection, frame: OwnershipProtocol.PageToOwnerFrame) => {
         current.controlPort.postMessage(
-          OwnershipProtocol.encodePageToOwner(frame),
+          Schema.encodeSync(OwnershipProtocol.PageToOwnerFrame)(frame),
           [...OwnershipProtocol.transferOf(frame)]
         )
       }
@@ -812,7 +812,7 @@ const layerTabImpl = (
             }
             const channel = new MessageChannel()
             database.postMessage(
-              OwnershipProtocol.encodeDatabaseWorkerStart({
+              Schema.encodeSync(OwnershipProtocol.DatabaseWorkerStart)({
                 _tag: "DatabaseWorkerStart",
                 databasePort: channel.port1
               }),
@@ -858,7 +858,7 @@ const layerTabImpl = (
           onMessage: (event: MessageEvent<unknown>) => {
             let frame: OwnershipProtocol.OwnerToPageFrame
             try {
-              frame = OwnershipProtocol.decodeOwnerToPage(event.data)
+              frame = Schema.decodeUnknownSync(OwnershipProtocol.OwnerToPageFrame)(event.data)
             } catch (cause) {
               options.onOwnerError?.(`undecodable ownership frame: ${String(cause)}`.slice(0, 512))
               return
@@ -956,7 +956,7 @@ export const runDatabaseWorker = (options: DatabaseWorkerOptions): void => {
   globalThis.addEventListener("message", (event: MessageEvent<unknown>) => {
     let frame: OwnershipProtocol.DatabaseWorkerStart
     try {
-      frame = OwnershipProtocol.decodeDatabaseWorkerStart(event.data)
+      frame = Schema.decodeUnknownSync(OwnershipProtocol.DatabaseWorkerStart)(event.data)
     } catch (cause) {
       globalThis.reportError(cause)
       return

@@ -144,7 +144,7 @@ interface TestTab {
 
 const postToOwner = (tab: TestTab, frame: OwnershipProtocol.PageToOwnerFrame) => {
   tab.controlPort.postMessage(
-    OwnershipProtocol.encodePageToOwner(frame),
+    Schema.encodeSync(OwnershipProtocol.PageToOwnerFrame)(frame),
     [...OwnershipProtocol.transferOf(frame)]
   )
 }
@@ -156,7 +156,7 @@ const attachTab = Effect.gen(function*() {
   const frames = yield* Queue.unbounded<OwnershipProtocol.OwnerToPageFrame>()
   const receivedTags: Array<string> = []
   control.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
-    const frame = OwnershipProtocol.decodeOwnerToPage(event.data)
+    const frame = Schema.decodeUnknownSync(OwnershipProtocol.OwnerToPageFrame)(event.data)
     receivedTags.push(frame._tag)
     Queue.offerUnsafe(frames, frame)
   })
@@ -392,12 +392,12 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
         yield* coordinator.attach(control.port1)
         const frames = yield* Queue.unbounded<OwnershipProtocol.OwnerToPageFrame>()
         control.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
-          Queue.offerUnsafe(frames, OwnershipProtocol.decodeOwnerToPage(event.data))
+          Queue.offerUnsafe(frames, Schema.decodeUnknownSync(OwnershipProtocol.OwnerToPageFrame)(event.data))
         })
         control.port2.start()
         const rpcChannel = new MessageChannel()
         control.port2.postMessage(
-          OwnershipProtocol.encodePageToOwner({
+          Schema.encodeSync(OwnershipProtocol.PageToOwnerFrame)({
             _tag: "Attach",
             protocolVersion: OwnershipProtocol.protocolVersion + 1,
             rpcPort: rpcChannel.port1

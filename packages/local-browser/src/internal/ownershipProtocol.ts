@@ -85,14 +85,6 @@ export const DatabaseWorkerStart = Schema.TaggedStruct("DatabaseWorkerStart", {
 })
 export type DatabaseWorkerStart = typeof DatabaseWorkerStart.Type
 
-export const decodePageToOwner = Schema.decodeUnknownSync(PageToOwnerFrame)
-export const decodeOwnerToPage = Schema.decodeUnknownSync(OwnerToPageFrame)
-export const decodeDatabaseWorkerStart = Schema.decodeUnknownSync(DatabaseWorkerStart)
-
-export const encodePageToOwner = Schema.encodeSync(PageToOwnerFrame)
-export const encodeOwnerToPage = Schema.encodeSync(OwnerToPageFrame)
-export const encodeDatabaseWorkerStart = Schema.encodeSync(DatabaseWorkerStart)
-
 /**
  * Frames that carry a transferred port are posted with the port in the transfer list. Every other
  * frame travels as a plain structured clone.
