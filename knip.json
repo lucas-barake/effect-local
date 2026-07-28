@@ -11,9 +11,10 @@
         "test-browser/*/src/*.{ts,tsx}",
         "test-browser/*/tests/*.spec.ts",
         "test-browser/*/vite.config.ts",
-        "test-browser/*/public/service-worker.js"
+        "test-browser/*/public/service-worker.js",
+        "test-browser/*/relay-server.ts"
       ],
-      "ignoreDependencies": ["@effect/platform-browser"]
+      "ignoreDependencies": ["@effect/platform-browser", "tsx"]
     },
     "packages/local-test": {
       "ignoreDependencies": ["@effect/platform-node-shared"]

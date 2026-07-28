@@ -85,8 +85,6 @@ const seedPair = Effect.gen(function*() {
     commandId: (yield* Identity.makeCommandId),
     value: { title: "base", labels: [] }
   })
-  assert.strictEqual(created._tag, "DurablyCommittedLocal")
-  if (created._tag !== "DurablyCommittedLocal") return yield* Effect.die("create did not commit")
   const backup = yield* leftBuilt.replica.exportBackup({ maxBytes: TestReplica.defaultLimits.maxBackupBytes }).pipe(
     Stream.runCollect
   )
@@ -105,7 +103,7 @@ const seedPair = Effect.gen(function*() {
     ...rightBuilt,
     session: yield* rightBuilt.sync.open(peerLeft)
   }
-  return { documentId: created.value, left, right }
+  return { documentId: created, left, right }
 })
 
 const syncChangeHashes = (message: Uint8Array) => {
@@ -299,6 +297,8 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
           [...leftLabels.map((label) => `left:${label}`), ...rightLabels.map((label) => `right:${label}`)]
         )
       })),
-    { fastCheck: { numRuns: 8 } }
+    // Its own timeout: the only property check here, and it seeds a replica pair and drains a
+    // partition eight times over.
+    { timeout: 60_000, fastCheck: { numRuns: 8 } }
   )
 })

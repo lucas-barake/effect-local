@@ -3,6 +3,7 @@ import * as Match from "effect/Match"
 import * as Schema from "effect/Schema"
 import type * as Document from "./Document.js"
 import * as Identity from "./Identity.js"
+import * as ReplicaError from "./ReplicaError.js"
 
 export interface Rejected<E,> {
   readonly _tag: "Rejected"
@@ -20,12 +21,6 @@ export interface OutcomeUnknown {
   readonly _tag: "OutcomeUnknown"
   readonly commandId: Identity.CommandId
 }
-
-export class CommandOutcomeUnknown extends Schema.TaggedErrorClass<CommandOutcomeUnknown>(
-  "@lucas-barake/effect-local/CommandOutcome/CommandOutcomeUnknown"
-)("CommandOutcomeUnknown", {
-  commandId: Identity.CommandId
-}) {}
 
 export type CommandOutcome<A, E = never,> = Rejected<E> | DurablyCommittedLocal<A> | OutcomeUnknown
 
@@ -64,10 +59,54 @@ export const match = <A, E, B,>(
     OutcomeUnknown: handlers.onUnknown
   })(self)
 
+/**
+ * Projects an outcome into the Effect channels: the committed value on success, the declared error
+ * `E` unwrapped on rejection, and `ReplicaError.CommandOutcomeUnknown` when durability could not be
+ * established.
+ *
+ * `create`, `mutate` and `delete` already do this for you. Reach for it on a `lookup*` result, where
+ * an outcome is the honest answer because "what happened to this id" genuinely has three of them.
+ *
+ * `cause` is only known where the ambiguity arose, which for a lookup is the absence of a receipt.
+ */
+/**
+ * The inverse of `committedOrFail`, for a boundary that has to carry an outcome as a value.
+ *
+ * A `ReplicaError` stays in the error channel, because it says the replica failed rather than that
+ * the command produced a result. The exception is `CommandOutcomeUnknown`, which is precisely the
+ * third command result: it becomes `OutcomeUnknown` so the peer can resolve it with its own lookup.
+ * Its `cause` does not survive, because it describes this side's ambiguity and not the peer's.
+ */
+export const toOutcome = <A, E, R,>(
+  commandId: Identity.CommandId,
+  effect: Effect.Effect<A, E, R>
+): Effect.Effect<
+  CommandOutcome<A, Exclude<E, ReplicaError.ReplicaError>>,
+  ReplicaError.ReplicaError,
+  R
+> => {
+  type Declared = Exclude<E, ReplicaError.ReplicaError>
+  return effect.pipe(
+    Effect.map((value): CommandOutcome<A, Declared> => durablyCommitted(commandId, value)),
+    Effect.catch((error): Effect.Effect<CommandOutcome<A, Declared>, ReplicaError.ReplicaError> =>
+      ReplicaError.isReplicaError(error)
+        ? error.reason._tag === "CommandOutcomeUnknown"
+          ? Effect.succeed(unknown(error.reason.commandId))
+          : Effect.fail(error)
+        : Effect.succeed(rejected(commandId, error as Declared))
+    )
+  )
+}
+
 export const committedOrFail = <A, E,>(
-  self: CommandOutcome<A, E>
-): Effect.Effect<A, E | CommandOutcomeUnknown> => {
+  self: CommandOutcome<A, E>,
+  cause?: unknown
+): Effect.Effect<A, E | ReplicaError.ReplicaError> => {
   if (self._tag === "DurablyCommittedLocal") return Effect.succeed(self.value)
   if (self._tag === "Rejected") return Effect.fail(self.error)
-  return Effect.fail(new CommandOutcomeUnknown({ commandId: self.commandId }))
+  return Effect.fail(
+    new ReplicaError.ReplicaError({
+      reason: new ReplicaError.CommandOutcomeUnknown({ commandId: self.commandId, cause })
+    })
+  )
 }

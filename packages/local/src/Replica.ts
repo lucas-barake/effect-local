@@ -18,7 +18,7 @@ export class Replica extends Context.Service<Replica, {
       readonly commandId: Identity.CommandId
       readonly value: D["schema"]["Type"]
     }
-  ) => Effect.Effect<CommandOutcome.CommandOutcome<Identity.DocumentId>, ReplicaError.ReplicaError>
+  ) => Effect.Effect<Identity.DocumentId, ReplicaError.ReplicaError>
   readonly get: <D extends Document.Any,>(
     document: D,
     documentId: Identity.DocumentId
@@ -30,8 +30,8 @@ export class Replica extends Context.Service<Replica, {
       readonly documentId: Identity.DocumentId
     } & ([M["payloadSchema"]["Type"]] extends [void] ? object : { readonly payload: M["payloadSchema"]["Type"] })
   ) => Effect.Effect<
-    CommandOutcome.CommandOutcome<M["successSchema"]["Type"], M["errorSchema"]["Type"]>,
-    ReplicaError.ReplicaError
+    M["successSchema"]["Type"],
+    M["errorSchema"]["Type"] | ReplicaError.ReplicaError
   >
   readonly delete: <D extends Document.Any,>(
     document: D,
@@ -39,7 +39,7 @@ export class Replica extends Context.Service<Replica, {
       readonly commandId: Identity.CommandId
       readonly documentId: Identity.DocumentId
     }
-  ) => Effect.Effect<CommandOutcome.CommandOutcome<void>, ReplicaError.ReplicaError>
+  ) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly query: <Q extends Query.Any,>(
     query: Q,
     ...payload: [Q["payloadSchema"]["Type"]] extends [void] ? readonly []
@@ -76,5 +76,5 @@ export class Replica extends Context.Service<Replica, {
       readonly commandId: Identity.CommandId
       readonly value: Backup.ExportedDocument<D["schema"]["Encoded"]>
     }
-  ) => Effect.Effect<CommandOutcome.CommandOutcome<Identity.DocumentId>, ReplicaError.ReplicaError>
+  ) => Effect.Effect<Identity.DocumentId, ReplicaError.ReplicaError>
 }>()("@lucas-barake/effect-local/Replica") {}

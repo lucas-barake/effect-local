@@ -24,7 +24,18 @@ const ExportedDocument = Schema.Struct({
 
 const JsonOutcome = CommandOutcome.schema(Schema.Json, Schema.Json)
 const DocumentIdOutcome = CommandOutcome.schema(Identity.DocumentId, Schema.Never)
-export const protocolVersion = 4
+/**
+ * There is exactly one version of the tab to owner protocol, and a `SharedWorker` outlives the page
+ * that started it, so a tab from a new deployment can meet an owner from the old one.
+ *
+ * That mismatch is deliberately NOT expressed as a schema literal on either side. A payload the
+ * owner cannot decode is answered with `sendRequestDefect`, and a success value the tab cannot
+ * decode is rethrown by `RpcClient` under `Effect.orDie`. Both are defects, so the one peer that
+ * most needs to be told to reload would instead lose its replica to a cause it cannot discriminate
+ * on. The version has to survive decoding for a handler to refuse it with a typed
+ * `ReplicaError.ProtocolMismatch`.
+ */
+export const protocolVersion = 1
 const SessionLease = Schema.Struct({ leaseMillis: Schema.Int })
 export const SessionHandshake = Schema.Struct({
   leaseMillis: Schema.Int,
@@ -92,6 +103,8 @@ export const group = RpcGroup.make(
   Rpc.make("OpenSession", {
     payload: {
       sessionId: Identity.SessionId,
+      // Optional, so a tab old enough to omit the field is refused by the handler with a reason
+      // rather than by the decoder with a defect.
       protocolVersion: Schema.optional(Schema.Int),
       definitionHash: Schema.String
     },
@@ -186,7 +199,7 @@ export const group = RpcGroup.make(
     payload: { sessionId: Identity.SessionId },
     error: ReplicaError.ReplicaError
   }),
-  Rpc.make("BeginRestoreBackupV4", {
+  Rpc.make("BeginRestoreBackup", {
     payload: {
       sessionId: Identity.SessionId,
       mode: Schema.Literals(["clone", "replace"]),
@@ -200,7 +213,7 @@ export const group = RpcGroup.make(
     }),
     error: ReplicaError.ReplicaError
   }),
-  Rpc.make("FinishRestoreBackupV4", {
+  Rpc.make("FinishRestoreBackup", {
     payload: {
       sessionId: Identity.SessionId,
       nonce: RestoreProtocol.RestoreNonce

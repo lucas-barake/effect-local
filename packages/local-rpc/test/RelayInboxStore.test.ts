@@ -1,18 +1,16 @@
 import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
 import { MysqlClient } from "@effect/sql-mysql2"
-import { PgClient } from "@effect/sql-pg"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { describe, it } from "@effect/vitest"
 import { MySqlContainer, type StartedMySqlContainer } from "@testcontainers/mysql"
-import { PostgreSqlContainer } from "@testcontainers/postgresql"
 import * as Context from "effect/Context"
-import * as Data from "effect/Data"
 import * as Effect from "effect/Effect"
 import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
 import * as Redacted from "effect/Redacted"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlRelayInboxStore from "../src/SqlRelayInboxStore.js"
+import { ContainerError, PgContainer } from "./PgContainer.js"
 import { relayInboxStoreContract } from "./RelayInboxStoreContract.js"
 
 /**
@@ -24,30 +22,6 @@ import { relayInboxStoreContract } from "./RelayInboxStoreContract.js"
  * and MySQL compares identity columns case-insensitively without a binary collation. Both were real
  * bugs in this store, and both are invisible to SQLite.
  */
-
-class ContainerError extends Data.TaggedError("ContainerError")<{
-  readonly cause: unknown
-}> {}
-
-class PgContainer extends Context.Service<PgContainer>()(
-  "@lucas-barake/effect-local-rpc/test/PgContainer",
-  {
-    make: Effect.acquireRelease(
-      Effect.tryPromise({
-        try: () => new PostgreSqlContainer("postgres:alpine").start(),
-        catch: (cause) => new ContainerError({ cause })
-      }),
-      (container) => Effect.promise(() => container.stop())
-    )
-  }
-) {
-  static readonly layerClient = Layer.unwrap(
-    Effect.gen(function*() {
-      const container = yield* PgContainer
-      return PgClient.layer({ url: Redacted.make(container.getConnectionUri()) })
-    })
-  ).pipe(Layer.provide(Layer.effect(this)(this.make)))
-}
 
 class MysqlContainer extends Context.Service<MysqlContainer, StartedMySqlContainer>()(
   "@lucas-barake/effect-local-rpc/test/MysqlContainer"
@@ -78,9 +52,10 @@ const SqliteLayer = Effect.gen(function*() {
   return SqliteClient.layer({ filename: `${directory}/relay-inbox.sqlite` })
 }).pipe(Layer.unwrap, Layer.provide(NodeFileSystem.layer))
 
+// Merged out rather than kept private: observing payload erasure means reading the row.
 const storeFor = (client: Layer.Layer<SqlClient.SqlClient, unknown, never>) =>
   SqlRelayInboxStore.layer.pipe(
-    Layer.provide(client),
+    Layer.provideMerge(client),
     Layer.provide(NodeCrypto.layer),
     Layer.orDie
   )

@@ -109,15 +109,11 @@ describe("EntityReplica", () => {
           commandId: yield* Identity.makeCommandId,
           value: { title: "first" }
         })
-        assert.strictEqual(first._tag, "DurablyCommittedLocal")
-        if (first._tag !== "DurablyCommittedLocal") return
         const backup = yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
         const second = yield* replica.create(Task, {
           commandId: yield* Identity.makeCommandId,
           value: { title: "second" }
         })
-        assert.strictEqual(second._tag, "DurablyCommittedLocal")
-        if (second._tag !== "DurablyCommittedLocal") return
 
         armed = true
         const restore = yield* replica.restoreBackup({
@@ -133,8 +129,8 @@ describe("EntityReplica", () => {
         yield* release.open
         yield* Fiber.join(interrupt)
 
-        assert.strictEqual((yield* replica.get(Task, first.value)).value.title, "first")
-        assert.strictEqual((yield* Effect.exit(replica.get(Task, second.value)))._tag, "Failure")
+        assert.strictEqual((yield* replica.get(Task, first)).value.title, "first")
+        assert.strictEqual((yield* Effect.exit(replica.get(Task, second)))._tag, "Failure")
         assert.strictEqual((yield* publisher.subscribe).refreshGeneration, 1)
       }).pipe(Effect.scoped, Effect.provide(live), Effect.provide(database), TestClock.withLive)
     }))

@@ -138,6 +138,24 @@ export class DocumentLineageChanged extends Schema.TaggedErrorClass<DocumentLine
   remoteLineage: Identity.DocumentLineage
 }) {}
 
+/**
+ * The command may or may not have committed, and the replica cannot tell which.
+ *
+ * Not retryable. Reissuing the command would apply it twice if the first attempt did commit; the
+ * recovery is to keep `commandId` and ask, with `lookupCreate`, `lookupMutation` or `lookupDelete`.
+ * That is why the id is on the error: it is the only handle those methods accept.
+ *
+ * `cause` is whatever produced the ambiguity - a transport failure, a timeout, or a lookup that
+ * found no receipt. It is kept rather than flattened to a tag, because "we timed out" and "the
+ * owner answered but had no record" call for different operator responses.
+ */
+export class CommandOutcomeUnknown extends Schema.TaggedErrorClass<CommandOutcomeUnknown>(
+  "@lucas-barake/effect-local/ReplicaError/CommandOutcomeUnknown"
+)("CommandOutcomeUnknown", {
+  commandId: Identity.CommandId,
+  cause: Schema.Defect()
+}) {}
+
 export const Reason = Schema.Union([
   DocumentNotFound,
   DocumentDecodeError,
@@ -160,7 +178,8 @@ export const Reason = Schema.Union([
   OperationTimeout,
   UnsupportedStorageFormatVersion,
   CheckpointSuperseded,
-  DocumentLineageChanged
+  DocumentLineageChanged,
+  CommandOutcomeUnknown
 ])
 export type Reason = typeof Reason.Type
 
@@ -176,3 +195,12 @@ export class ReplicaError extends Schema.TaggedErrorClass<ReplicaError>("@lucas-
     return this.reason._tag
   }
 }
+
+/**
+ * Narrows a mixed failure channel to this error.
+ *
+ * A command's channel carries both this and the mutation's own declared error, and those are told
+ * apart by the schema rather than by probing for a `_tag` a consumer error could also happen to
+ * have.
+ */
+export const isReplicaError: (input: unknown) => input is ReplicaError = Schema.is(ReplicaError)

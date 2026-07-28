@@ -1,7 +1,9 @@
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import type * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
+import type * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -9,6 +11,7 @@ import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
+import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as OutboxMaintenance from "./internal/peerRelayOutboxMaintenance.js"
 import * as ReceiptMaintenance from "./internal/peerRelayReceiptMaintenance.js"
 import * as PeerRelayOutbox from "./PeerRelayOutbox.js"
@@ -201,3 +204,19 @@ export const makeScoped = Effect.gen(function*() {
 })
 
 export const layer = Layer.effect(PeerRelayClientRuntime, makeScoped)
+
+/**
+ * `layer` leaves `PeerRelayOutbox` to the consumer, so every relay client had to rediscover that
+ * it is satisfied by `layerSql` and that both want the same gate, limits and client.
+ */
+export const layerSql: Layer.Layer<
+  PeerRelayClientRuntime,
+  ReplicaError.ReplicaError,
+  | SqlClient.SqlClient
+  | Crypto.Crypto
+  | ReplicaLimits.ReplicaLimits
+  | ReplicaGate.ReplicaGate
+  | PeerSync.PeerSync
+  | PeerRelayOutboxLimits.PeerRelayOutboxLimits
+  | PeerRelayReceiptLimits.PeerRelayReceiptLimits
+> = layer.pipe(Layer.provide(PeerRelayOutbox.layerSql))

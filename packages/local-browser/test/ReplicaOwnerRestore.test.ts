@@ -22,7 +22,7 @@ import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
 import { definition, replica } from "./fixtures.js"
 
-it.layer(NodeCrypto.layer)("ReplicaOwner restore version 4", (it) => {
+it.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
   const limits = {
     maxBackupBytes: 1024,
     maxChunkBytes: 128,
@@ -99,7 +99,7 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore version 4", (it) => {
         protocolVersion: ReplicaRpc.protocolVersion,
         definitionHash: definition.hash
       })
-      assert.strictEqual(handshake.protocolVersion, 4)
+      assert.strictEqual(handshake.protocolVersion, ReplicaRpc.protocolVersion)
       assert.strictEqual(handshake.maxChunkBytes, limits.maxChunkBytes)
       assert.strictEqual(handshake.maxRestoreCoalesceMillis, limits.maxRestoreCoalesceMillis)
       assert.strictEqual(handshake.maxRestoreErrorBytes, limits.maxRestoreErrorBytes)
@@ -140,7 +140,7 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore version 4", (it) => {
       assert.isFalse(chunksRead)
       assert.strictEqual(legacyError.reason._tag, "ProtocolMismatch")
       if (legacyError.reason._tag === "ProtocolMismatch") {
-        assert.strictEqual(legacyError.reason.expected, "BeginRestoreBackupV4")
+        assert.strictEqual(legacyError.reason.expected, "BeginRestoreBackup")
         assert.strictEqual(legacyError.reason.observed, "RestoreBackup")
       }
 
@@ -164,7 +164,7 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore version 4", (it) => {
         definitionHash: definition.hash
       })
 
-      const invalid = yield* Effect.flip(rpc.BeginRestoreBackupV4({
+      const invalid = yield* Effect.flip(rpc.BeginRestoreBackup({
         sessionId,
         ...restoreOptions,
         maxBytes: 0
@@ -172,7 +172,7 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore version 4", (it) => {
       assert.strictEqual(invalid.reason._tag, "BackupInvalid")
       assert.strictEqual(yield* sessions.activeRestoreCount, 0)
 
-      const started = yield* rpc.BeginRestoreBackupV4({ sessionId, ...restoreOptions })
+      const started = yield* rpc.BeginRestoreBackup({ sessionId, ...restoreOptions })
       assert.match(started.nonce, /^rst_/u)
       assert.strictEqual(typeof started.port.postMessage, "function")
       assert.strictEqual(yield* sessions.activeRestoreCount, 1)
@@ -198,11 +198,11 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore version 4", (it) => {
           protocolVersion: ReplicaRpc.protocolVersion,
           definitionHash: definition.hash
         })
-        const started = yield* rpc.BeginRestoreBackupV4({ sessionId, ...restoreOptions })
+        const started = yield* rpc.BeginRestoreBackup({ sessionId, ...restoreOptions })
         yield* Effect.addFinalizer(() => Effect.sync(() => started.port.close()))
         started.port.start()
 
-        const finish = yield* rpc.FinishRestoreBackupV4({
+        const finish = yield* rpc.FinishRestoreBackup({
           sessionId,
           nonce: started.nonce
         }).pipe(Effect.forkChild({ startImmediately: true }))
@@ -237,8 +237,8 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore version 4", (it) => {
       const sessions = Context.get(contextA, SessionManager.SessionManager)
       const openA = yield* ReplicaRpc.group.accessHandler("OpenSession").pipe(Effect.provide(contextA))
       const openB = yield* ReplicaRpc.group.accessHandler("OpenSession").pipe(Effect.provide(contextB))
-      const beginA = yield* ReplicaRpc.group.accessHandler("BeginRestoreBackupV4").pipe(Effect.provide(contextA))
-      const beginB = yield* ReplicaRpc.group.accessHandler("BeginRestoreBackupV4").pipe(Effect.provide(contextB))
+      const beginA = yield* ReplicaRpc.group.accessHandler("BeginRestoreBackup").pipe(Effect.provide(contextA))
+      const beginB = yield* ReplicaRpc.group.accessHandler("BeginRestoreBackup").pipe(Effect.provide(contextB))
       const clientA = new Rpc.ServerClient(1)
       const clientB = new Rpc.ServerClient(2)
       const sessionA = yield* Identity.makeSessionId

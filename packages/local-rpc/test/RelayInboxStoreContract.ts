@@ -2,6 +2,10 @@ import { assert } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
+import * as Schema from "effect/Schema"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as Migrations from "../src/internal/relayInboxMigrations.js"
 import * as RelayInboxStore from "../src/RelayInboxStore.js"
 
 /**
@@ -89,9 +93,36 @@ const admission = (options: {
   quota: options.quota ?? quota
 })
 
+/** No store method reports the bytes of a terminal row, which is the point of erasing them. */
+const StoredRow = Schema.Struct({
+  state: Schema.String,
+  envelope: Schema.String,
+  message_hash: Schema.String,
+  outer_envelope_digest: Schema.String
+})
+
+const findStoredRow = SqlSchema.findOne({
+  Request: Schema.Struct({ inboxKey: Schema.String, relayMessageId: Schema.String }),
+  Result: StoredRow,
+  execute: (request) =>
+    SqlClient.SqlClient.use((sql) =>
+      sql`
+        SELECT state, envelope, message_hash, outer_envelope_digest FROM ${sql(Migrations.tableName)}
+        WHERE inbox_key = ${request.inboxKey} AND relay_message_id = ${request.relayMessageId}
+      `
+    )
+})
+
+const storedRow = (inboxKey: string, relayMessageId: string) =>
+  findStoredRow({ inboxKey, relayMessageId }).pipe(Effect.orDie)
+
 export interface ContractCheck {
   readonly name: string
-  readonly run: Effect.Effect<void, ReplicaError.ReplicaError, RelayInboxStore.RelayInboxStore>
+  readonly run: Effect.Effect<
+    void,
+    ReplicaError.ReplicaError,
+    RelayInboxStore.RelayInboxStore | SqlClient.SqlClient
+  >
 }
 
 export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
@@ -324,6 +355,74 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
         0,
         "an acknowledged message must not become deliverable again"
       )
+    })
+  },
+  {
+    name: "erases an acknowledged message's payload but keeps its deduplication evidence",
+    run: Effect.gen(function*() {
+      const store = yield* RelayInboxStore.RelayInboxStore
+      yield* store.admit(
+        admission({ inboxKey: "erase-ack", id: "000000000001", sequence: 0, now: 0, horizon: 100_000 })
+      )
+      const settled = yield* store.settle("erase-ack", relayId("000000000001"), {
+        outcome: "Acknowledged",
+        messageHash: "a".repeat(64),
+        now: 10,
+        terminalRetentionMillis: 100_000
+      })
+      assert.strictEqual(settled, "Settled")
+
+      const row = yield* storedRow("erase-ack", relayId("000000000001"))
+      assert.strictEqual(row.state, "Acknowledged")
+      assert.strictEqual(
+        row.envelope,
+        "",
+        "an acknowledged message's bytes must not sit in the relay for the retention window"
+      )
+      assert.strictEqual(row.message_hash, "a".repeat(64))
+      assert.strictEqual(row.outer_envelope_digest, "b".repeat(64))
+
+      const replay = yield* store.admit(
+        admission({ inboxKey: "erase-ack", id: "000000000001", sequence: 0, now: 20, horizon: 100_000 })
+      )
+      assert.strictEqual(replay._tag, "Duplicate")
+      assert.strictEqual(replay._tag === "Duplicate" ? replay.state : "", "Acknowledged")
+    })
+  },
+  {
+    name: "erases a rejected message's payload",
+    run: Effect.gen(function*() {
+      const store = yield* RelayInboxStore.RelayInboxStore
+      yield* store.admit(
+        admission({ inboxKey: "erase-reject", id: "000000000001", sequence: 0, now: 0, horizon: 100_000 })
+      )
+      const settled = yield* store.settle("erase-reject", relayId("000000000001"), {
+        outcome: "Rejected",
+        messageHash: "a".repeat(64),
+        now: 10,
+        terminalRetentionMillis: 100_000
+      })
+      assert.strictEqual(settled, "Settled")
+
+      const row = yield* storedRow("erase-reject", relayId("000000000001"))
+      assert.strictEqual(row.state, "Rejected")
+      assert.strictEqual(row.envelope, "", "a rejected message is settled for good and keeps no bytes")
+    })
+  },
+  {
+    name: "keeps an abandoned message's payload, because its sender may still revive it",
+    run: Effect.gen(function*() {
+      const store = yield* RelayInboxStore.RelayInboxStore
+      yield* store.admit(
+        admission({ inboxKey: "erase-expired", id: "000000000001", sequence: 0, now: 4_000_000, ttl: 1_000 })
+      )
+      yield* store.expire({ now: 4_005_000, limit: 1_000, terminalRetentionMillis: 1_000 })
+
+      // `admit`'s revive path replays this envelope, so erasing every terminal state would destroy the
+      // last durable copy of a message whose sender still holds custody.
+      const row = yield* storedRow("erase-expired", relayId("000000000001"))
+      assert.strictEqual(row.state, "Expired")
+      assert.notStrictEqual(row.envelope, "", "an expired message keeps the bytes a revive replays")
     })
   },
   {

@@ -1,3 +1,4 @@
+import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
@@ -77,7 +78,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
               }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               const outcome = yield* commands.create(document, { ...options, documentId, permit, requestHash })
               yield* publisher.publishPending
-              return outcome
+              return yield* CommandOutcome.committedOrFail(outcome)
             })
           ),
         get: (document, documentId) =>
@@ -115,7 +116,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
               }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               const outcome = yield* commands.mutate(mutation, { ...options, payload, permit, requestHash })
               yield* publisher.publishPending
-              return outcome
+              return yield* CommandOutcome.committedOrFail(outcome)
             })
           ),
         delete: (document, options) =>
@@ -129,7 +130,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
               }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               const outcome = yield* commands.delete(document, { ...options, permit, requestHash })
               yield* publisher.publishPending
-              return outcome
+              return yield* CommandOutcome.committedOrFail(outcome)
             })
           ),
         query: (query, ...payload) => withPermit(() => queries.execute(query, payload[0])),
@@ -267,13 +268,32 @@ export const layerRelay = <
   return EntityReplica.layer(definition).pipe(Layer.provideMerge(durable))
 }
 
+/**
+ * Every binding's own Layer, as one Layer.
+ *
+ * `Layer.empty` is a seed, not decoration: `Layer.mergeAll` takes a non-empty tuple, and a spread of
+ * `options.projections` is an array that may be empty.
+ */
+const bindingLayers = (projections: ReadonlyArray<SqlProjection.Any>) =>
+  Layer.mergeAll(Layer.empty, ...projections.map((binding) => binding.layer))
+
 export const layerWithBindings = <
   D extends ReplicaDefinition.Any,
   const Bindings extends ReadonlyArray<SqlProjection.Any>,
 >(
   definition: D,
   options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
-) =>
-  layer(definition, options).pipe(
-    Layer.provide(Layer.mergeAll(Layer.empty, ...options.projections.map((binding) => binding.layer)))
-  )
+) => layer(definition, options).pipe(Layer.provide(bindingLayers(options.projections)))
+
+/**
+ * Without this a consumer with projections cannot reach the relay stack through the documented
+ * constructors at all: `layerWithBindings` wraps `layer`, so every binding-shaped deployment is
+ * silently a direct-topology one, and `PeerRelayClientRuntime` then refuses to build on it.
+ */
+export const layerRelayWithBindings = <
+  D extends ReplicaDefinition.Any,
+  const Bindings extends ReadonlyArray<SqlProjection.Any>,
+>(
+  definition: D,
+  options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
+) => layerRelay(definition, options).pipe(Layer.provide(bindingLayers(options.projections)))

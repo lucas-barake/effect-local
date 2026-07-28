@@ -100,19 +100,19 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     typeof ReplicaRpc.group,
     RpcClientError.RpcClientError
   >
-  type FinishRestore = TestReplicaRpcClient["FinishRestoreBackupV4"]
+  type FinishRestore = TestReplicaRpcClient["FinishRestoreBackup"]
   const dropTerminalReady = (
     rpc: TestReplicaRpcClient,
     terminalDropped: Deferred.Deferred<void>,
-    finish: FinishRestore = rpc.FinishRestoreBackupV4
+    finish: FinishRestore = rpc.FinishRestoreBackup
   ): TestReplicaRpcClient =>
     new Proxy(rpc, {
       get(target, property, receiver) {
         const value = Reflect.get(target, property, receiver)
-        if (property === "FinishRestoreBackupV4") return finish
-        if (property !== "BeginRestoreBackupV4") return value
-        return (payload: Parameters<typeof target.BeginRestoreBackupV4>[0]) =>
-          target.BeginRestoreBackupV4(payload).pipe(
+        if (property === "FinishRestoreBackup") return finish
+        if (property !== "BeginRestoreBackup") return value
+        return (payload: Parameters<typeof target.BeginRestoreBackup>[0]) =>
+          target.BeginRestoreBackup(payload).pipe(
             Effect.flatMap(({ nonce, port: ownerPort }) =>
               Effect.gen(function*() {
                 const channel = new MessageChannel()
@@ -161,7 +161,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           documentId,
           payload: { title: "next" }
         })
-        assert.strictEqual(mutation._tag, "DurablyCommittedLocal")
+        assert.strictEqual(mutation, "renamed")
         assert.deepStrictEqual(yield* client.query(Read, "filter"), [{ title: "filter" }])
         const exported = yield* client.exportDocument(Task, documentId)
         assert.deepStrictEqual(exported, {
@@ -172,7 +172,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         const importCommandId = yield* Identity.makeCommandId
         assert.deepStrictEqual(
           yield* client.importDocument(Task, { commandId: importCommandId, value: exported }),
-          CommandOutcome.durablyCommitted(importCommandId, documentId)
+          documentId
         )
         assert.deepStrictEqual(Array.from(yield* client.status.pipe(Stream.take(1), Stream.runCollect)), [{
           _tag: "Ready",
@@ -234,6 +234,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.strictEqual(error.reason._tag, "ProtocolMismatch")
     })).pipe(Effect.provide(Owner)))
 
+  // Drives the real client, because the guard under test is the client's. The version deliberately
+  // survives decoding, so nothing but this check stands between a stale owner and the replica.
   it.effect("decodes and rejects owners using an older protocol", () =>
     Effect.scoped(Effect.gen(function*() {
       const open = ReplicaRpc.group.requests.get("OpenSession")
@@ -282,19 +284,19 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
 
       assert.deepStrictEqual(
         yield* client.create(Task, { commandId: createId, value: { title: "new" } }),
-        CommandOutcome.durablyCommitted(createId, documentId)
+        documentId
       )
       assert.deepStrictEqual(
         yield* client.mutate(Rename, { commandId: mutateId, documentId, payload: { title: "next" } }),
-        CommandOutcome.durablyCommitted(mutateId, "renamed")
+        "renamed"
       )
       assert.deepStrictEqual(
         yield* client.delete(Task, { commandId: deleteId, documentId }),
-        CommandOutcome.durablyCommitted(deleteId, undefined)
+        undefined
       )
     })).pipe(Effect.provide(Owner)))
 
-  it.effect("returns unknown when ambiguous command lookup also loses transport", () =>
+  it.effect("reports ambiguity, with its cause, when a command lookup also loses transport", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       const unavailable = new Proxy(rpc, {
@@ -307,10 +309,18 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       })
       const client = yield* ReplicaClient.fromRpcClient(definition, unavailable)
       const commandId = yield* Identity.makeCommandId
-      assert.deepStrictEqual(
-        yield* client.mutate(Rename, { commandId, documentId, payload: { title: "next" } }),
-        CommandOutcome.unknown(commandId)
+      const error = yield* Effect.flip(
+        client.mutate(Rename, { commandId, documentId, payload: { title: "next" } })
       )
+      // The channel now carries the mutation's own error too, so the replica failure is picked out
+      // by the schema rather than by probing for a `_tag` `RenameError` could also have had.
+      assert.isTrue(ReplicaError.isReplicaError(error))
+      if (!ReplicaError.isReplicaError(error)) return
+      assert.strictEqual(error.reason._tag, "CommandOutcomeUnknown")
+      if (error.reason._tag !== "CommandOutcomeUnknown") return
+      // The id is the handle `lookupMutation` needs, and the cause says why it is needed at all.
+      assert.strictEqual(error.reason.commandId, commandId)
+      assert.isTrue(Schema.is(RpcClientError.RpcClientError)(error.reason.cause))
     })).pipe(Effect.provide(Owner)))
 
   it.effect("streams commit invalidations with handshake coverage", () => {
@@ -810,8 +820,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       const unknownCommandId = yield* Identity.makeCommandId
       const rejected: Replica.Replica["Service"] = {
         ...replica,
-        mutate: (_mutation, options) =>
-          Effect.succeed(CommandOutcome.rejected(options.commandId, new RenameError())) as never,
+        // A declared rejection is now an ordinary typed failure from the replica itself.
+        mutate: () => Effect.fail(new RenameError()) as never,
         lookupMutation: () =>
           Effect.sync(() => {
             lookups++
@@ -826,9 +836,10 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
         const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
         const commandId = yield* Identity.makeCommandId
+        // The declared rejection arrives unwrapped, so `catchTag` on its own tag is enough.
         assert.deepStrictEqual(
-          yield* client.mutate(Rename, { commandId, documentId, payload: { title: "next" } }),
-          CommandOutcome.rejected(commandId, new RenameError())
+          yield* Effect.flip(client.mutate(Rename, { commandId, documentId, payload: { title: "next" } })),
+          new RenameError()
         )
         assert.strictEqual(lookups, 0)
       })).pipe(Effect.provide(RejectedOwner))
@@ -865,6 +876,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         Effect.flatMap(effect, (value) =>
           Deferred.isDeferred<A, E>(value) ? Deferred.await(value) : Effect.succeed(value))
 
+      // A tab old enough to omit the field entirely is still refused with a reason it can read,
+      // which is only reachable because the payload field stays optional rather than a literal.
       const legacySessionId = yield* Identity.makeSessionId
       assert.strictEqual(
         (yield* Effect.flip(unary(open({
@@ -1058,7 +1071,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         rpc,
         terminalDropped,
         ((payload) =>
-          rpc.FinishRestoreBackupV4(payload).pipe(
+          rpc.FinishRestoreBackup(payload).pipe(
             Effect.tap(() => Deferred.succeed(finishDelivered, undefined))
           )) as FinishRestore
       )
@@ -1195,7 +1208,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           rpc,
           terminalDropped,
           (payload) =>
-            rpc.FinishRestoreBackupV4(payload).pipe(
+            rpc.FinishRestoreBackup(payload).pipe(
               Effect.forkIn(finishScope, { startImmediately: true }),
               Effect.andThen(Effect.fail(disconnected()))
             )
@@ -1436,7 +1449,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         const observedRpc = new Proxy(rpc, {
           get(target, property, receiver) {
             const value = Reflect.get(target, property, receiver)
-            if (property !== "RestoreBackup" && property !== "BeginRestoreBackupV4") return value
+            if (property !== "RestoreBackup" && property !== "BeginRestoreBackup") return value
             return (payload: never) =>
               Deferred.succeed(outerDispatched, undefined).pipe(
                 Effect.andThen(value(payload))
@@ -1535,9 +1548,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
               return (payload: { readonly sessionId: Identity.SessionId }) =>
                 Deferred.succeed(opened, payload.sessionId).pipe(Effect.andThen(value(payload)))
             }
-            if (property === "BeginRestoreBackupV4") {
-              return (payload: Parameters<typeof target.BeginRestoreBackupV4>[0]) =>
-                target.BeginRestoreBackupV4(payload).pipe(
+            if (property === "BeginRestoreBackup") {
+              return (payload: Parameters<typeof target.BeginRestoreBackup>[0]) =>
+                target.BeginRestoreBackup(payload).pipe(
                   Effect.tap(({ port }) =>
                     Effect.sync(() => {
                       port.addEventListener("message", (event: MessageEvent<unknown>) => {
@@ -1658,10 +1671,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         Publisher,
         Layer.succeed(Replica.Replica, {
           ...replica,
-          importDocument: (_document, options) =>
-            Effect.sync(() => ++imports).pipe(
-              Effect.as(CommandOutcome.durablyCommitted(options.commandId, documentId))
-            )
+          importDocument: () => Effect.sync(() => ++imports).pipe(Effect.as(documentId))
         })
       ))
     )
@@ -1710,10 +1720,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         Publisher,
         Layer.succeed(Replica.Replica, {
           ...replica,
-          importDocument: (_document, options) =>
-            Effect.sync(() => ++imports).pipe(
-              Effect.as(CommandOutcome.durablyCommitted(options.commandId, documentId))
-            )
+          importDocument: () => Effect.sync(() => ++imports).pipe(Effect.as(documentId))
         })
       ))
     )
@@ -1779,7 +1786,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 : value(payload)
             }
           }
-          if (property === "BeginRestoreBackupV4") {
+          if (property === "BeginRestoreBackup") {
             return (payload: never) => {
               restoreCalls++
               return restoreCalls === 1
@@ -1832,7 +1839,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 )
             }
           }
-          if (property === "BeginRestoreBackupV4") {
+          if (property === "BeginRestoreBackup") {
             return () => {
               beginCalls++
               return Effect.fail(protocolMismatch("restore"))
@@ -1906,7 +1913,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 : value(payload)
             }
           }
-          if (property === "BeginRestoreBackupV4") {
+          if (property === "BeginRestoreBackup") {
             return (payload: never) => {
               restoreCalls++
               return Effect.fail(protocolMismatch("restore"))
@@ -1960,7 +1967,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 : value(payload)
             }
           }
-          if (property === "BeginRestoreBackupV4") {
+          if (property === "BeginRestoreBackup") {
             return (payload: never) => {
               restoreCalls++
               return Effect.fail(protocolMismatch("restore"))
@@ -2015,7 +2022,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
               return value(payload)
             }
           }
-          if (property === "BeginRestoreBackupV4") {
+          if (property === "BeginRestoreBackup") {
             return (payload: never) => {
               restoreCalls++
               return Deferred.succeed(restoreApplied, undefined).pipe(
@@ -2150,12 +2157,12 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 )
             }
             if (property === "RenewSession") return () => Effect.never
-            if (property === "BeginRestoreBackupV4") {
-              return (payload: Parameters<typeof target.BeginRestoreBackupV4>[0]) =>
+            if (property === "BeginRestoreBackup") {
+              return (payload: Parameters<typeof target.BeginRestoreBackup>[0]) =>
                 Effect.sync(() => {
                   beginCalls += 1
                 }).pipe(
-                  Effect.andThen(target.BeginRestoreBackupV4(payload)),
+                  Effect.andThen(target.BeginRestoreBackup(payload)),
                   Effect.map(({ nonce, port }) => {
                     const add = port.addEventListener.bind(port)
                     const remove = port.removeEventListener.bind(port)

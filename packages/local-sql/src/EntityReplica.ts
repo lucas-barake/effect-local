@@ -132,7 +132,9 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   ))
               )
               yield* publisher.publishPending
-              return yield* decode(CommandOutcome.schema(Identity.DocumentId, Schema.Never), result)
+              return yield* CommandOutcome.committedOrFail(
+                yield* decode(CommandOutcome.schema(Identity.DocumentId, Schema.Never), result)
+              )
             })),
         get: (document, documentId) =>
           withPermit(() =>
@@ -186,7 +188,9 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   ))
               )
               yield* publisher.publishPending
-              return yield* decode(CommandOutcome.schema(mutation.successSchema, mutation.errorSchema), result)
+              return yield* CommandOutcome.committedOrFail(
+                yield* decode(CommandOutcome.schema(mutation.successSchema, mutation.errorSchema), result)
+              )
             })),
         delete: (document, options) =>
           withCommandPermit(options.commandId, (permit) =>
@@ -214,7 +218,9 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   ))
               )
               yield* publisher.publishPending
-              return yield* decode(CommandOutcome.schema(Schema.Void, Schema.Never), result)
+              return yield* CommandOutcome.committedOrFail(
+                yield* decode(CommandOutcome.schema(Schema.Void, Schema.Never), result)
+              )
             })),
         query: (query, ...payload) => withPermit(() => queries.execute(query, payload[0])),
         lookupMutation: (mutation, commandId) =>

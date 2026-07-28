@@ -396,6 +396,8 @@ describe("RelayInbox", () => {
       )
     }).pipe(Effect.provide(layer)))
 
+  // Its own timeout: advancing four hours of virtual time makes the runtime walk every task
+  // scheduled in that window, which costs ~845ms against 5-27ms for every other check here.
   it.effect("closes a replaced session even when the replacing subscribe is interrupted", () =>
     Effect.gen(function*() {
       const client = yield* inbox
@@ -449,7 +451,7 @@ describe("RelayInbox", () => {
             Effect.andThen(real.settle(key, relayMessageId, options))
           )
       }))
-    }))))
+    }))), 60_000)
 
   it.effect("leaves no dispatcher behind when a subscribe is interrupted", () =>
     Effect.gen(function*() {

@@ -129,9 +129,27 @@ const relayEntry = (payload: Uint8Array): PeerRelayOutbox.Entry => ({
   nextAttemptAt: "2026-07-25T00:00:00.000Z"
 })
 
+/**
+ * `overrides` re-derives the digest from the tampered envelope. A message edited afterwards fails
+ * the digest check, so it proves nothing about the endpoint and document checks beside it.
+ *
+ * `storedSender` and `storedRecipient` are the opposite, and are what make the endpoint check
+ * pinnable at all. They leave the envelope - and therefore the digest - addressed correctly, and
+ * rewrite only the principals the `StoredMessage` carries. `validateStoredMessage` recomputes the
+ * digest from the CONFIGURED principals, so it still matches, and the endpoint check is then the
+ * only thing standing between the message and the replica. That is also the real threat: a relay
+ * handing over a message whose stated endpoints disagree with what the digest covers.
+ */
 const makeStoredMessage = (
   payloadSeed: Uint8Array,
-  lineage: Identity.DocumentLineage = Identity.genesisLineage
+  lineage: Identity.DocumentLineage = Identity.genesisLineage,
+  overrides?: {
+    readonly sender?: PeerSyncEnvelope.RelayPeerPrincipal
+    readonly recipient?: PeerSyncEnvelope.RelayPeerPrincipal
+    readonly document?: { readonly documentType: string; readonly documentId: Identity.DocumentId }
+    readonly storedSender?: PeerSyncEnvelope.RelayPeerPrincipal
+    readonly storedRecipient?: PeerSyncEnvelope.RelayPeerPrincipal
+  }
 ) =>
   Effect.gen(function*() {
     let source = Automerge.from(
@@ -174,12 +192,12 @@ const makeStoredMessage = (
     const envelope: PeerSyncEnvelope.RelayOuterEnvelope = {
       domain: PeerSyncEnvelope.relayOuterEnvelopeDomain,
       version: PeerSyncEnvelope.relayOuterEnvelopeVersion,
-      expectedLocal: {
+      expectedLocal: overrides?.sender ?? {
         tenantId: relayOptions.expectedLocal.tenantId,
         subjectId: relayOptions.remote.subjectId,
         peerId: relayOptions.remote.peerId
       },
-      remote: relayOptions.expectedLocal,
+      remote: overrides?.recipient ?? relayOptions.expectedLocal,
       relayPeerId,
       relayMessageId,
       protocolVersion: PeerRpc.protocolVersion,
@@ -187,7 +205,7 @@ const makeStoredMessage = (
       senderReplicaIncarnation,
       senderConnectionEpoch: "remote-epoch",
       senderSequence: 3,
-      document: { documentType: Task.name, documentId },
+      document: overrides?.document ?? { documentType: Task.name, documentId },
       lineage,
       writerProvenance,
       messageHash,
@@ -200,14 +218,16 @@ const makeStoredMessage = (
       claimToken,
       relayPeerId,
       sender: {
-        tenantId: envelope.expectedLocal.tenantId,
-        subjectId: envelope.expectedLocal.subjectId,
-        peerId: envelope.expectedLocal.peerId,
+        // `replicaIncarnation`, `connectionEpoch` and `sequence` are digested, so they must come
+        // from the envelope even when the principal is rewritten, or the digest check refuses first.
+        tenantId: (overrides?.storedSender ?? envelope.expectedLocal).tenantId,
+        subjectId: (overrides?.storedSender ?? envelope.expectedLocal).subjectId,
+        peerId: (overrides?.storedSender ?? envelope.expectedLocal).peerId,
         replicaIncarnation: envelope.senderReplicaIncarnation,
         connectionEpoch: envelope.senderConnectionEpoch,
         sequence: envelope.senderSequence
       },
-      recipient: envelope.remote,
+      recipient: overrides?.storedRecipient ?? envelope.remote,
       payloadVersion: envelope.payloadVersion,
       document: envelope.document,
       writerProvenance: envelope.writerProvenance,
@@ -462,6 +482,61 @@ describe("RpcPeerTransport", () => {
         yield* connection.close
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
+
+  // Each of these keeps the digest valid for what the message claims to be, so exactly one guard can
+  // refuse it. Tampering the envelope instead would fail the digest and prove nothing about the
+  // guard beside it.
+  for (
+    const wrong of [
+      {
+        name: "a sender that is not the configured remote peer",
+        overrides: {
+          storedSender: {
+            tenantId: "tenant",
+            subjectId: "remote-subject",
+            peerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-0000000000ff")
+          }
+        }
+      },
+      {
+        name: "a recipient that is not this peer",
+        overrides: {
+          storedRecipient: {
+            tenantId: "tenant",
+            subjectId: "local-subject",
+            peerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-0000000000fe")
+          }
+        }
+      },
+      {
+        name: "a document this session did not select",
+        overrides: {
+          document: {
+            documentType: Task.name,
+            documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-0000000000ff")
+          }
+        }
+      }
+    ]
+  ) {
+    it.effect(`refuses a stored message carrying ${wrong.name}`, () =>
+      Effect.scoped(
+        Effect.gen(function*() {
+          const misaddressed = yield* makeStoredMessage(Uint8Array.of(1, 2, 3), undefined, wrong.overrides)
+          const acknowledgements = yield* Ref.make(0)
+          const client = makeRelayClient(
+            () => Stream.fromIterable([relayOpened, misaddressed]).pipe(Stream.rechunk(1)),
+            undefined,
+            () => Ref.update(acknowledgements, (count) => count + 1)
+          )
+          const connection = yield* connectRelay(client, makeRuntime())
+          const error = yield* Stream.runHead(connection.receive).pipe(Effect.flip)
+          assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+          assert.strictEqual(yield* Ref.get(acknowledgements), 0)
+          yield* connection.close
+        }).pipe(Effect.provide(NodeCrypto.layer))
+      ))
+  }
 
   it.effect("reconstructs a non-genesis lineage when verifying the outer digest", () =>
     Effect.scoped(
@@ -789,5 +864,27 @@ describe("RpcPeerTransport", () => {
       Effect.provideService(Metric.MetricRegistry, new Map()),
       Effect.provideService(Tracer.Tracer, tracer)
     )
+  })
+
+  // Nothing in this package calls it: reconnect policy is the application's. That is exactly why
+  // the classification is pinned here rather than discovered wrong by a consumer.
+  describe("isRetryable", () => {
+    it("treats unavailability as retryable and every permanent rejection as not", () => {
+      assert.isTrue(
+        RpcPeerTransport.isRetryable(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageUnavailable({ cause: new Error("relay down") })
+          })
+        )
+      )
+      for (
+        const reason of [
+          new ReplicaError.ProtocolMismatch({ expected: "valid relay handshake", observed: "AccessDenied" }),
+          new ReplicaError.QuotaExceeded({ resource: "relay outbox", limit: 0 })
+        ]
+      ) {
+        assert.isFalse(RpcPeerTransport.isRetryable(new ReplicaError.ReplicaError({ reason })))
+      }
+    })
   })
 })

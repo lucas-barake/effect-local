@@ -450,9 +450,12 @@ export const make = Effect.gen(function*() {
       // The horizon only ever grows. Shrinking it would reopen a deduplication window a sender may
       // still be replaying into.
       const greatest = greatestFn
+      // Only `Acknowledged` and `Rejected` reach this statement and neither is ever revived, so this is
+      // the one place a payload may be cleared. `DeadLettered` and `Expired` are replayed by `admit`.
+      // What a replay is matched against - the hash, the digest, the horizon - is not the payload.
       yield* sql`
         UPDATE ${sql(table)}
-        SET state = ${options.outcome}, terminal_at = ${options.now},
+        SET state = ${options.outcome}, terminal_at = ${options.now}, envelope = '',
             deduplicate_until = ${sql.literal(greatest)}(deduplicate_until, ${horizon})
         WHERE inbox_key = ${inboxKey} AND relay_message_id = ${relayMessageId}
           AND state = 'Pending' AND message_hash = ${options.messageHash}

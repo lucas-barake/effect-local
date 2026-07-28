@@ -11,8 +11,10 @@ import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import * as Cause from "effect/Cause"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Latch from "effect/Latch"
 import * as Layer from "effect/Layer"
@@ -28,6 +30,9 @@ import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as CommitPublisher from "../src/CommitPublisher.js"
 import * as DocumentStore from "../src/DocumentStore.js"
 import * as ClusterStorage from "../src/internal/clusterStorage.js"
+import * as PeerRelayClientRuntime from "../src/PeerRelayClientRuntime.js"
+import * as PeerRelayOutboxLimits from "../src/PeerRelayOutboxLimits.js"
+import * as PeerRelayReceiptLimits from "../src/PeerRelayReceiptLimits.js"
 import * as ProjectionStore from "../src/ProjectionStore.js"
 import * as QueryExecutor from "../src/QueryExecutor.js"
 import * as Recovery from "../src/Recovery.js"
@@ -150,6 +155,63 @@ describe("SqlReplica", () => {
     )
   })
 
+  it("rejects duplicate bindings for one projection through the relay constructor too", () => {
+    assert.throws(
+      () => SqlReplica.layerRelayWithBindings(projectedDefinition, { projections: [TaskTitleSql, TaskTitleSql] }),
+      /exactly one SQL binding/
+    )
+  })
+
+  // The reason `layerRelayWithBindings` exists. A deployment with projections that reaches for the
+  // only bindings constructor there was got a direct `PeerSync`, and found out at the point it
+  // built a service it did not think it was choosing.
+  for (
+    const flavour of [
+      {
+        name: "direct",
+        build: () => SqlReplica.layerWithBindings(projectedDefinition, { projections: [TaskTitleSql] }),
+        relayRuntimeBuilds: false
+      },
+      {
+        name: "relay",
+        build: () => SqlReplica.layerRelayWithBindings(projectedDefinition, { projections: [TaskTitleSql] }),
+        relayRuntimeBuilds: true
+      }
+    ]
+  ) {
+    it.effect(`${flavour.name} bindings constructor: relay client runtime builds = ${flavour.relayRuntimeBuilds}`, () =>
+      Effect.gen(function*() {
+        const exit = yield* Effect.exit(Effect.scoped(Layer.build(
+          PeerRelayClientRuntime.layerSql.pipe(
+            Layer.provide(flavour.build()),
+            Layer.provide(Layer.mergeAll(
+              Database,
+              Handler,
+              Limits,
+              PeerRelayReceiptLimits.layer(PeerRelayReceiptLimits.defaults),
+              PeerRelayOutboxLimits.layer(PeerRelayOutboxLimits.defaults)
+            ))
+          )
+        )))
+        if (flavour.relayRuntimeBuilds) {
+          assert.strictEqual(exit._tag, "Success")
+          return
+        }
+        // Named rather than merely "it failed": the direct stack has to be rejected for being the
+        // wrong `PeerSync`, not for some unrelated wiring fault that would mask a real regression.
+        if (!Exit.isFailure(exit)) return assert.fail("the direct stack must not build a relay runtime")
+        const failure = Cause.findErrorOption(exit.cause)
+        if (Option.isNone(failure)) return assert.fail("expected a typed failure")
+        const error = failure.value
+        if (error._tag !== "ReplicaError") return assert.fail(`expected a ReplicaError, got ${error._tag}`)
+        const reason = error.reason
+        if (reason._tag !== "ProtocolMismatch") {
+          return assert.fail(`expected a ProtocolMismatch, got ${reason._tag}`)
+        }
+        assert.strictEqual(reason.expected, "relay enabled PeerSync")
+      }))
+  }
+
   it.effect("forwards the configured health sampling interval", () =>
     Effect.gen(function*() {
       const replica = yield* Replica.Replica
@@ -177,9 +239,7 @@ describe("SqlReplica", () => {
       assert.ok(yield* ReplicaWorkflow.CompactionWorkflow)
       const createCommandId = yield* Identity.makeCommandId
       const created = yield* replica.create(Task, { commandId: createCommandId, value: { title: "one" } })
-      assert.strictEqual(created._tag, "DurablyCommittedLocal")
-      if (created._tag !== "DurablyCommittedLocal") return
-      const documentId = created.value
+      const documentId = created
       assert.deepStrictEqual(
         yield* replica.create(Task, { commandId: createCommandId, value: { title: "one" } }),
         created
@@ -199,13 +259,13 @@ describe("SqlReplica", () => {
       const mutationCommandId = yield* Identity.makeCommandId
       assert.deepStrictEqual(
         yield* replica.mutate(Rename, { commandId: mutationCommandId, documentId, payload: "two" }),
-        CommandOutcome.durablyCommitted(mutationCommandId, undefined)
+        undefined
       )
       assert.deepStrictEqual((yield* replica.get(Task, documentId)).value, { title: "two" })
       const noopCommandId = yield* Identity.makeCommandId
       assert.deepStrictEqual(
         yield* replica.mutate(Noop, { commandId: noopCommandId, documentId }),
-        CommandOutcome.durablyCommitted(noopCommandId, undefined)
+        undefined
       )
       assert.deepStrictEqual((yield* replica.get(Task, documentId)).value, { title: "two" })
       assert.deepStrictEqual(
@@ -223,19 +283,15 @@ describe("SqlReplica", () => {
         commandId: (yield* Identity.makeCommandId),
         value: { title: "portable" }
       })
-      assert.strictEqual(portableCreated._tag, "DurablyCommittedLocal")
-      if (portableCreated._tag !== "DurablyCommittedLocal") return
-      const exported = yield* replica.exportDocument(Task, portableCreated.value)
+      const exported = yield* replica.exportDocument(Task, portableCreated)
       const importCommandId = yield* Identity.makeCommandId
       const imported = yield* replica.importDocument(Task, {
         commandId: importCommandId,
         value: exported
       })
-      assert.strictEqual(imported._tag, "DurablyCommittedLocal")
-      if (imported._tag !== "DurablyCommittedLocal") return
-      const importedSnapshot = yield* replica.get(Task, imported.value)
-      const sourceSnapshot = yield* replica.get(Task, portableCreated.value)
-      assert.notStrictEqual(imported.value, portableCreated.value)
+      const importedSnapshot = yield* replica.get(Task, imported)
+      const sourceSnapshot = yield* replica.get(Task, portableCreated)
+      assert.notStrictEqual(imported, portableCreated)
       assert.deepStrictEqual(importedSnapshot.value, { title: "portable" })
       assert.notStrictEqual(importedSnapshot.heads[0], sourceSnapshot.heads[0])
       assert.deepStrictEqual(
@@ -263,14 +319,12 @@ describe("SqlReplica", () => {
         commandId: yield* Identity.makeCommandId,
         value: { title: "projected" }
       })
-      assert.strictEqual(created._tag, "DurablyCommittedLocal")
-      if (created._tag !== "DurablyCommittedLocal") return
       const sql = yield* SqlClient.SqlClient
       const rows = yield* sql<{ readonly sourceDocumentId: string; readonly title: string }>`SELECT
         source_document_id AS sourceDocumentId,
         title
       FROM task_title_v1`
-      assert.deepStrictEqual(rows, [{ sourceDocumentId: created.value, title: "projected" }])
+      assert.deepStrictEqual(rows, [{ sourceDocumentId: created, title: "projected" }])
     }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive))
 
   // Deleting a document replaces its projection rows with none, driven by the
@@ -284,9 +338,7 @@ describe("SqlReplica", () => {
         commandId: yield* Identity.makeCommandId,
         value: { title: "projected" }
       })
-      assert.strictEqual(created._tag, "DurablyCommittedLocal")
-      if (created._tag !== "DurablyCommittedLocal") return
-      const documentId = created.value
+      const documentId = created
       const projected = () =>
         sql<{ readonly sourceDocumentId: string; readonly title: string }>`SELECT
           source_document_id AS sourceDocumentId, title FROM task_title_v1`
@@ -309,9 +361,7 @@ describe("SqlReplica", () => {
         commandId: yield* Identity.makeCommandId,
         value: { title: "source" }
       })
-      assert.strictEqual(created._tag, "DurablyCommittedLocal")
-      if (created._tag !== "DurablyCommittedLocal") return
-      const exported = yield* replica.exportDocument(Task, created.value)
+      const exported = yield* replica.exportDocument(Task, created)
       const wrongName = yield* Effect.flip(replica.importDocument(Task, {
         commandId: yield* Identity.makeCommandId,
         value: { ...exported, documentName: "Other" }
@@ -379,8 +429,6 @@ describe("SqlReplica", () => {
           commandId: yield* Identity.makeCommandId,
           value: { title: "before" }
         })
-        assert.strictEqual(created._tag, "DurablyCommittedLocal")
-        if (created._tag !== "DurablyCommittedLocal") return
         const backup = Array.from(
           yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
         )
@@ -421,10 +469,10 @@ describe("SqlReplica", () => {
           })
         )
 
-        const queued = yield* Effect.forkChild(replica.get(Task, created.value))
+        const queued = yield* Effect.forkChild(replica.get(Task, created))
         yield* Effect.yieldNow
 
-        const shed = yield* Effect.flip(replica.get(Task, created.value))
+        const shed = yield* Effect.flip(replica.get(Task, created))
         assert.strictEqual(shed.reason._tag, "QuotaExceeded")
         if (shed.reason._tag === "QuotaExceeded") {
           assert.strictEqual(shed.reason.resource, "queued permits")
@@ -496,12 +544,10 @@ describe("SqlReplica", () => {
           commandId: yield* Identity.makeCommandId,
           value: { title: "before" }
         })
-        assert.strictEqual(created._tag, "DurablyCommittedLocal")
-        if (created._tag !== "DurablyCommittedLocal") return
         const backup = yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
         yield* replica.mutate(Rename, {
           commandId: yield* Identity.makeCommandId,
-          documentId: created.value,
+          documentId: created,
           payload: "after"
         })
         let invalidated = false
@@ -523,7 +569,7 @@ describe("SqlReplica", () => {
         yield* release.open
         yield* Fiber.join(interrupt)
 
-        assert.strictEqual((yield* replica.get(Task, created.value)).value.title, "before")
+        assert.strictEqual((yield* replica.get(Task, created)).value.title, "before")
         assert.isTrue(invalidated)
       }).pipe(Effect.scoped, Effect.provide(services))
     }))

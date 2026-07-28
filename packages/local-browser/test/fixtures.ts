@@ -45,7 +45,7 @@ export const definition = ReplicaDefinition.make({
 export const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
 
 export const replica: Replica.Replica["Service"] = {
-  create: (_document, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, documentId)),
+  create: () => Effect.succeed(documentId),
   get: (_document, requestedId) =>
     Effect.succeed({
       documentId: requestedId,
@@ -55,9 +55,8 @@ export const replica: Replica.Replica["Service"] = {
       tombstone: false,
       projection: "Ready"
     }) as never,
-  mutate: (_mutation, options) =>
-    Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, "renamed")) as never,
-  delete: (_document, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
+  mutate: () => Effect.succeed("renamed") as never,
+  delete: () => Effect.void,
   query: (_query, ...payload) => Effect.succeed([{ title: String(payload[0]) }]) as never,
   lookupMutation: (_mutation, commandId) =>
     Effect.succeed(CommandOutcome.durablyCommitted(commandId, "renamed")) as never,
@@ -73,5 +72,5 @@ export const replica: Replica.Replica["Service"] = {
       schemaVersion: document.version,
       value: { title: "stored" }
     }) as never,
-  importDocument: (_document, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, documentId))
+  importDocument: () => Effect.succeed(documentId)
 }

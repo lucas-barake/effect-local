@@ -1,7 +1,6 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { assert, it } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
-import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -301,14 +300,11 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
         value: { title: "new" }
       }).pipe(Effect.forkChild)
       yield* TestClock.adjust(timeouts.operationTimeout)
-      assert.deepStrictEqual(
-        yield* Fiber.join(fiber),
-        CommandOutcome.durablyCommitted(commandId, documentId)
-      )
+      assert.strictEqual(yield* Fiber.join(fiber), documentId)
       assert.strictEqual(lookupExecutions, 1)
     })).pipe(Effect.provide(Owner)))
 
-  it.effect("returns unknown when a timed out command receipt lookup never responds", () =>
+  it.effect("reports ambiguity when a timed out command receipt lookup never responds", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       const lookupStarted = yield* Deferred.make<void>()
@@ -347,7 +343,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
       yield* TestClock.adjust(timeouts.operationTimeout - 1)
       assert.isUndefined(fiber.pollUnsafe())
       yield* TestClock.adjust(1)
-      assert.deepStrictEqual(yield* Fiber.join(fiber), CommandOutcome.unknown(commandId))
+      const error = yield* Effect.flip(Fiber.join(fiber))
+      assert.strictEqual(error.reason._tag, "CommandOutcomeUnknown")
+      if (error.reason._tag === "CommandOutcomeUnknown") assert.strictEqual(error.reason.commandId, commandId)
       assert.strictEqual(createCalls, 1)
       assert.strictEqual(lookupCalls, 1)
       assert.isTrue(yield* Deferred.isDone(lookupInterrupted))
@@ -392,7 +390,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
           if (property === "OpenSession") {
             return (payload: never) => Effect.sync(() => ++opens).pipe(Effect.andThen(value(payload)))
           }
-          if (property === "BeginRestoreBackupV4") {
+          if (property === "BeginRestoreBackup") {
             return () => {
               restores++
               return Effect.never

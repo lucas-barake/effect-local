@@ -85,12 +85,13 @@ const publishMissingFixtures = (destinationDirectory: string) =>
       }))
     yield* Effect.yieldNow
 
-    // Publication is append only. Interruption or a competing publisher can leave a valid prefix
-    // that the next run completes, while deleting links could create an unrecoverable version gap.
+    // Uninterruptible: `fs.link` resumes through a callback with no canceler, so an interrupted fiber
+    // is abandoned while the syscall keeps going and publishes afterwards, leaving the directory ahead
+    // of what this run reported. The `yieldNow` is now the only interruption point.
     yield* Effect.forEach(
       pending,
       ({ path, published: destination }) =>
-        fs.link(path, destination).pipe(
+        Effect.uninterruptible(fs.link(path, destination)).pipe(
           Effect.andThen(Effect.yieldNow)
         ),
       { discard: true }
@@ -147,6 +148,28 @@ describe("migration fixture generation", () => {
 
       yield* publishMissingFixtures(directory)
       for (const spec of fixtures) assert.isTrue(yield* fs.exists(`${directory}/${spec.file}`))
+    }).pipe(Effect.provide(NodeFileSystem.layer)))
+
+  it.live("publishes nothing more once it reports the publication was interrupted", () =>
+    Effect.gen(function*() {
+      const fs = yield* FileSystem
+      // Live rather than virtual: no amount of `TestClock` advancement surfaces an abandoned syscall.
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const directory = yield* fs.makeTempDirectoryScoped()
+        const publisher = yield* publishMissingFixtures(directory).pipe(Effect.forkChild)
+        while (!(yield* fs.exists(`${directory}/${fixtures[0]!.file}`))) yield* Effect.yieldNow
+        yield* Fiber.interrupt(publisher)
+
+        const published = (files: ReadonlyArray<string>) =>
+          files.filter((file) => fixtures.some((spec) => spec.file === file)).sort()
+        const reported = published(yield* fs.readDirectory(directory))
+        yield* Effect.sleep("200 millis")
+        assert.deepStrictEqual(
+          published(yield* fs.readDirectory(directory)),
+          reported,
+          "an interrupted publication must leave the directory exactly as it reported it"
+        )
+      }
     }).pipe(Effect.provide(NodeFileSystem.layer)))
 
   it.effect("does not replace a fixture published concurrently after the prefix snapshot", () =>

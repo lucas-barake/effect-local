@@ -103,7 +103,7 @@ it.effect("drops both lineages whole rather than truncating them when the budget
     assert.strictEqual(reason.remoteLineage, Identity.genesisLineage)
   }))
 
-const finishRpc = ReplicaRpc.group.requests.get("FinishRestoreBackupV4")!
+const finishRpc = ReplicaRpc.group.requests.get("FinishRestoreBackup")!
 const finishExitCodec = Schema.toCodecJson(Rpc.exitSchema(finishRpc))
 const restoreFailure = (replica: string) =>
   new RestoreProtocol.RestoreResultRestoreFailure({

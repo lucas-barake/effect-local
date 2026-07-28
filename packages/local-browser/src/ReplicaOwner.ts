@@ -1,5 +1,6 @@
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as Backup from "@lucas-barake/effect-local/Backup"
+import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import type * as Document from "@lucas-barake/effect-local/Document"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import type * as Query from "@lucas-barake/effect-local/Query"
@@ -91,7 +92,9 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           lookup(documents, "document", document).pipe(
             Effect.flatMap((definition) =>
               Wire.decode(definition.schema, value).pipe(
-                Effect.flatMap((decoded) => replica.create(definition, { commandId, value: decoded }))
+                Effect.flatMap((decoded) =>
+                  CommandOutcome.toOutcome(commandId, replica.create(definition, { commandId, value: decoded }))
+                )
               )
             )
           )
@@ -119,7 +122,12 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           lookup(mutations, "mutation", mutation).pipe(
             Effect.flatMap((definition) =>
               Wire.decode(definition.payloadSchema, payload).pipe(
-                Effect.flatMap((decoded) => replica.mutate(definition, { commandId, documentId, payload: decoded })),
+                Effect.flatMap((decoded) =>
+                  CommandOutcome.toOutcome(
+                    commandId,
+                    replica.mutate(definition, { commandId, documentId, payload: decoded })
+                  )
+                ),
                 Effect.flatMap((outcome) =>
                   Wire.encodeOutcome(definition.successSchema, definition.errorSchema, outcome)
                 )
@@ -133,7 +141,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           client.id,
           lookup(documents, "document", document).pipe(
             Effect.flatMap((definition) =>
-              replica.delete(definition, { commandId, documentId }).pipe(
+              CommandOutcome.toOutcome(commandId, replica.delete(definition, { commandId, documentId })).pipe(
                 Effect.flatMap((outcome) => Wire.encodeOutcome(Schema.Void, Schema.Never, outcome))
               )
             )
@@ -248,13 +256,13 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           Effect.fail(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.ProtocolMismatch({
-                expected: "BeginRestoreBackupV4",
+                expected: "BeginRestoreBackup",
                 observed: "RestoreBackup"
               })
             })
           )
         ),
-      BeginRestoreBackupV4: (
+      BeginRestoreBackup: (
         { expectedDefinitionHash, installationId, maxBytes, mode, sessionId },
         { client }
       ) =>
@@ -270,7 +278,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
             })
           )
         ),
-      FinishRestoreBackupV4: ({ nonce, sessionId }, { client }) =>
+      FinishRestoreBackup: ({ nonce, sessionId }, { client }) =>
         restoreTransport.finish({
           sessionId,
           clientId: client.id,
@@ -300,10 +308,13 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
             Effect.flatMap((definition) =>
               Wire.decode(Schema.toEncoded(definition.schema), value.value).pipe(
                 Effect.flatMap((decoded) =>
-                  replica.importDocument(definition, {
+                  CommandOutcome.toOutcome(
                     commandId,
-                    value: { ...value, value: decoded }
-                  })
+                    replica.importDocument(definition, {
+                      commandId,
+                      value: { ...value, value: decoded }
+                    })
+                  )
                 )
               )
             )
