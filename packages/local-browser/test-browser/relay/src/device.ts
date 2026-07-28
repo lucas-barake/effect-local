@@ -11,7 +11,6 @@ import * as PeerRelayReceiptLimits from "@lucas-barake/effect-local-sql/PeerRela
 import type * as PeerSession from "@lucas-barake/effect-local-sql/PeerSession"
 import * as ReplicaGate from "@lucas-barake/effect-local-sql/ReplicaGate"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
-import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
@@ -97,12 +96,10 @@ export const syncDocument = runtime.fn<Identity.DocumentId>()(
 export const createTask = runtime.fn<string>()(
   Effect.fnUntraced(function*(title, get) {
     const replica = yield* Replica.Replica
-    const documentId = yield* CommandOutcome.committedOrFail(
-      yield* replica.create(TaskDocument, {
-        commandId: yield* Identity.makeCommandId,
-        value: { title, labels: [] }
-      })
-    )
+    const documentId = yield* replica.create(TaskDocument, {
+      commandId: yield* Identity.makeCommandId,
+      value: { title, labels: [] }
+    })
     addSyncedDocument(get, documentId)
     yield* get.result(sessionAtom, { suspendOnWaiting: true })
     return documentId
@@ -115,13 +112,11 @@ export const addLabel = runtime.fn<{
 }>()(
   Effect.fnUntraced(function*({ documentId, label }) {
     const replica = yield* Replica.Replica
-    yield* CommandOutcome.committedOrFail(
-      yield* replica.mutate(AddLabel, {
-        commandId: yield* Identity.makeCommandId,
-        documentId,
-        payload: label
-      })
-    )
+    yield* replica.mutate(AddLabel, {
+      commandId: yield* Identity.makeCommandId,
+      documentId,
+      payload: label
+    })
   })
 )
 

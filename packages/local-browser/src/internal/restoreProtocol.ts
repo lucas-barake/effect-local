@@ -104,6 +104,10 @@ const DocumentLineageChanged = Schema.TaggedStruct("DocumentLineageChanged", {
   localLineage: Identity.DocumentLineage,
   remoteLineage: Identity.DocumentLineage
 })
+const CommandOutcomeUnknown = Schema.TaggedStruct("CommandOutcomeUnknown", {
+  commandId: Identity.CommandId,
+  cause: BoundedErrorDescription
+})
 
 export const RestoreWireError = Schema.Union([
   DocumentNotFound,
@@ -127,7 +131,8 @@ export const RestoreWireError = Schema.Union([
   OperationTimeout,
   UnsupportedStorageFormatVersion,
   CheckpointSuperseded,
-  DocumentLineageChanged
+  DocumentLineageChanged,
+  CommandOutcomeUnknown
 ])
 export type RestoreWireError = typeof RestoreWireError.Type
 
@@ -227,7 +232,8 @@ export const restoreWireErrorFields = fieldMetadata({
   OperationTimeout,
   UnsupportedStorageFormatVersion,
   CheckpointSuperseded,
-  DocumentLineageChanged
+  DocumentLineageChanged,
+  CommandOutcomeUnknown
 })
 
 export const boundedErrorDescriptionFields: ReadonlySet<string> = new Set(
@@ -417,6 +423,14 @@ export const encodeReplicaError = (
           observed: text(reason.observed)
         })
       )
+    case "CommandOutcomeUnknown":
+      // The command id is never truncated: it is the handle `lookup*` needs to resolve the very
+      // ambiguity this error reports, so a shortened one would strand the caller.
+      return encodeWithinBudget(
+        maxBytes,
+        { _tag: reason._tag, commandId: reason.commandId, cause: emptyErrorDescription },
+        ({ defect }) => ({ _tag: reason._tag, commandId: reason.commandId, cause: defect(reason.cause) })
+      )
     case "StorageUnavailable":
     case "CanonicalEncodeError":
     case "StorageCorrupt":
@@ -588,6 +602,12 @@ export const replicaErrorFromWire = (wire: RestoreWireError): ReplicaError.Repli
         commandId: wire.commandId,
         expected: wire.expected,
         observed: wire.observed
+      })
+      break
+    case "CommandOutcomeUnknown":
+      reason = new ReplicaError.CommandOutcomeUnknown({
+        commandId: wire.commandId,
+        cause: decodeDefect(wire.cause)
       })
       break
     case "StorageUnavailable":

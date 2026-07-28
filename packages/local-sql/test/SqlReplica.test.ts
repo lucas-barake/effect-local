@@ -239,9 +239,7 @@ describe("SqlReplica", () => {
       assert.ok(yield* ReplicaWorkflow.CompactionWorkflow)
       const createCommandId = yield* Identity.makeCommandId
       const created = yield* replica.create(Task, { commandId: createCommandId, value: { title: "one" } })
-      assert.strictEqual(created._tag, "DurablyCommittedLocal")
-      if (created._tag !== "DurablyCommittedLocal") return
-      const documentId = created.value
+      const documentId = created
       assert.deepStrictEqual(
         yield* replica.create(Task, { commandId: createCommandId, value: { title: "one" } }),
         created
@@ -261,13 +259,13 @@ describe("SqlReplica", () => {
       const mutationCommandId = yield* Identity.makeCommandId
       assert.deepStrictEqual(
         yield* replica.mutate(Rename, { commandId: mutationCommandId, documentId, payload: "two" }),
-        CommandOutcome.durablyCommitted(mutationCommandId, undefined)
+        undefined
       )
       assert.deepStrictEqual((yield* replica.get(Task, documentId)).value, { title: "two" })
       const noopCommandId = yield* Identity.makeCommandId
       assert.deepStrictEqual(
         yield* replica.mutate(Noop, { commandId: noopCommandId, documentId }),
-        CommandOutcome.durablyCommitted(noopCommandId, undefined)
+        undefined
       )
       assert.deepStrictEqual((yield* replica.get(Task, documentId)).value, { title: "two" })
       assert.deepStrictEqual(
@@ -285,19 +283,15 @@ describe("SqlReplica", () => {
         commandId: (yield* Identity.makeCommandId),
         value: { title: "portable" }
       })
-      assert.strictEqual(portableCreated._tag, "DurablyCommittedLocal")
-      if (portableCreated._tag !== "DurablyCommittedLocal") return
-      const exported = yield* replica.exportDocument(Task, portableCreated.value)
+      const exported = yield* replica.exportDocument(Task, portableCreated)
       const importCommandId = yield* Identity.makeCommandId
       const imported = yield* replica.importDocument(Task, {
         commandId: importCommandId,
         value: exported
       })
-      assert.strictEqual(imported._tag, "DurablyCommittedLocal")
-      if (imported._tag !== "DurablyCommittedLocal") return
-      const importedSnapshot = yield* replica.get(Task, imported.value)
-      const sourceSnapshot = yield* replica.get(Task, portableCreated.value)
-      assert.notStrictEqual(imported.value, portableCreated.value)
+      const importedSnapshot = yield* replica.get(Task, imported)
+      const sourceSnapshot = yield* replica.get(Task, portableCreated)
+      assert.notStrictEqual(imported, portableCreated)
       assert.deepStrictEqual(importedSnapshot.value, { title: "portable" })
       assert.notStrictEqual(importedSnapshot.heads[0], sourceSnapshot.heads[0])
       assert.deepStrictEqual(
@@ -325,14 +319,12 @@ describe("SqlReplica", () => {
         commandId: yield* Identity.makeCommandId,
         value: { title: "projected" }
       })
-      assert.strictEqual(created._tag, "DurablyCommittedLocal")
-      if (created._tag !== "DurablyCommittedLocal") return
       const sql = yield* SqlClient.SqlClient
       const rows = yield* sql<{ readonly sourceDocumentId: string; readonly title: string }>`SELECT
         source_document_id AS sourceDocumentId,
         title
       FROM task_title_v1`
-      assert.deepStrictEqual(rows, [{ sourceDocumentId: created.value, title: "projected" }])
+      assert.deepStrictEqual(rows, [{ sourceDocumentId: created, title: "projected" }])
     }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive))
 
   // Deleting a document replaces its projection rows with none, driven by the
@@ -346,9 +338,7 @@ describe("SqlReplica", () => {
         commandId: yield* Identity.makeCommandId,
         value: { title: "projected" }
       })
-      assert.strictEqual(created._tag, "DurablyCommittedLocal")
-      if (created._tag !== "DurablyCommittedLocal") return
-      const documentId = created.value
+      const documentId = created
       const projected = () =>
         sql<{ readonly sourceDocumentId: string; readonly title: string }>`SELECT
           source_document_id AS sourceDocumentId, title FROM task_title_v1`
@@ -371,9 +361,7 @@ describe("SqlReplica", () => {
         commandId: yield* Identity.makeCommandId,
         value: { title: "source" }
       })
-      assert.strictEqual(created._tag, "DurablyCommittedLocal")
-      if (created._tag !== "DurablyCommittedLocal") return
-      const exported = yield* replica.exportDocument(Task, created.value)
+      const exported = yield* replica.exportDocument(Task, created)
       const wrongName = yield* Effect.flip(replica.importDocument(Task, {
         commandId: yield* Identity.makeCommandId,
         value: { ...exported, documentName: "Other" }
@@ -441,8 +429,6 @@ describe("SqlReplica", () => {
           commandId: yield* Identity.makeCommandId,
           value: { title: "before" }
         })
-        assert.strictEqual(created._tag, "DurablyCommittedLocal")
-        if (created._tag !== "DurablyCommittedLocal") return
         const backup = Array.from(
           yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
         )
@@ -483,10 +469,10 @@ describe("SqlReplica", () => {
           })
         )
 
-        const queued = yield* Effect.forkChild(replica.get(Task, created.value))
+        const queued = yield* Effect.forkChild(replica.get(Task, created))
         yield* Effect.yieldNow
 
-        const shed = yield* Effect.flip(replica.get(Task, created.value))
+        const shed = yield* Effect.flip(replica.get(Task, created))
         assert.strictEqual(shed.reason._tag, "QuotaExceeded")
         if (shed.reason._tag === "QuotaExceeded") {
           assert.strictEqual(shed.reason.resource, "queued permits")
@@ -558,12 +544,10 @@ describe("SqlReplica", () => {
           commandId: yield* Identity.makeCommandId,
           value: { title: "before" }
         })
-        assert.strictEqual(created._tag, "DurablyCommittedLocal")
-        if (created._tag !== "DurablyCommittedLocal") return
         const backup = yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
         yield* replica.mutate(Rename, {
           commandId: yield* Identity.makeCommandId,
-          documentId: created.value,
+          documentId: created,
           payload: "after"
         })
         let invalidated = false
@@ -585,7 +569,7 @@ describe("SqlReplica", () => {
         yield* release.open
         yield* Fiber.join(interrupt)
 
-        assert.strictEqual((yield* replica.get(Task, created.value)).value.title, "before")
+        assert.strictEqual((yield* replica.get(Task, created)).value.title, "before")
         assert.isTrue(invalidated)
       }).pipe(Effect.scoped, Effect.provide(services))
     }))

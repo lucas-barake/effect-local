@@ -1,5 +1,4 @@
 import { assert, describe, it } from "@effect/vitest"
-import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Projection from "@lucas-barake/effect-local/Projection"
@@ -63,13 +62,13 @@ describe("ReplicaAtom", () => {
       const commandId = Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000010")
       const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000010")
       const options = { commandId, documentId, payload: { title: "renamed from atom" } }
-      const outcome = CommandOutcome.durablyCommitted(commandId, "renamed from atom")
+      const committed = "renamed from atom"
       const atomRuntime = Atom.runtime(Layer.succeed(Replica.Replica, {
         ...replica,
         mutate: (_mutation, received) =>
           Deferred.succeed(called, received as typeof options).pipe(
             Effect.andThen(Deferred.await(release)),
-            Effect.as(outcome)
+            Effect.as(committed)
           ) as never
       }))
       const registry = AtomRegistry.make()
@@ -82,7 +81,7 @@ describe("ReplicaAtom", () => {
       yield* Effect.yieldNow
       const value = registry.get(atom)
       assert.isTrue(AsyncResult.isSuccess(value))
-      if (AsyncResult.isSuccess(value)) assert.deepStrictEqual(value.value, outcome)
+      if (AsyncResult.isSuccess(value)) assert.deepStrictEqual(value.value, committed)
       unmount()
       registry.dispose()
     }))

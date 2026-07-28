@@ -62,14 +62,12 @@ it.layer(NodeCrypto.layer)("TestReplica", (it) => {
         commandId: (yield* Identity.makeCommandId),
         value: { title: "one" }
       })
-      assert.strictEqual(created._tag, "DurablyCommittedLocal")
-      if (created._tag !== "DurablyCommittedLocal") return
       yield* replica.mutate(Rename, {
         commandId: (yield* Identity.makeCommandId),
-        documentId: created.value,
+        documentId: created,
         payload: "two"
       })
-      assert.strictEqual((yield* replica.get(Task, created.value)).value.title, "two")
+      assert.strictEqual((yield* replica.get(Task, created)).value.title, "two")
     }).pipe(Effect.provide(Live), TestClock.withLive))
 
   it.effect("installs projection bindings for every test layer variant", () => {
@@ -84,12 +82,8 @@ it.layer(NodeCrypto.layer)("TestReplica", (it) => {
       create.pipe(Effect.provide(ProjectedLive)),
       create.pipe(Effect.provide(ProjectedSyncLive))
     ], { concurrency: 1 }).pipe(
-      Effect.map((outcomes) =>
-        assert.deepStrictEqual(outcomes.map((outcome) => outcome._tag), [
-          "DurablyCommittedLocal",
-          "DurablyCommittedLocal"
-        ])
-      ),
+      // Both variants committing is the assertion: `create` fails unless the command is durable.
+      Effect.map((documentIds) => assert.strictEqual(documentIds.length, 2)),
       TestClock.withLive
     )
   })

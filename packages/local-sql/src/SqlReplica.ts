@@ -1,3 +1,4 @@
+import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
@@ -77,7 +78,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
               }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               const outcome = yield* commands.create(document, { ...options, documentId, permit, requestHash })
               yield* publisher.publishPending
-              return outcome
+              return yield* CommandOutcome.committedOrFail(outcome)
             })
           ),
         get: (document, documentId) =>
@@ -115,7 +116,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
               }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               const outcome = yield* commands.mutate(mutation, { ...options, payload, permit, requestHash })
               yield* publisher.publishPending
-              return outcome
+              return yield* CommandOutcome.committedOrFail(outcome)
             })
           ),
         delete: (document, options) =>
@@ -129,7 +130,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
               }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               const outcome = yield* commands.delete(document, { ...options, permit, requestHash })
               yield* publisher.publishPending
-              return outcome
+              return yield* CommandOutcome.committedOrFail(outcome)
             })
           ),
         query: (query, ...payload) => withPermit(() => queries.execute(query, payload[0])),

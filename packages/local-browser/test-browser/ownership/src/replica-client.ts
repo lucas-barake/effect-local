@@ -1,7 +1,6 @@
 import { BrowserCrypto, BrowserWorker } from "@effect/platform-browser"
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
 import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
-import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Effect from "effect/Effect"
@@ -164,7 +163,7 @@ export const createTask = runtime.fn<{ readonly title: string }>()(
       return yield* replica.create(TaskDocument, {
         commandId: yield* Identity.makeCommandId,
         value: { title, completed: false, createdAt: now, updatedAt: now }
-      }).pipe(Effect.flatMap(CommandOutcome.committedOrFail))
+      })
     }),
   { concurrent: true, reactivityKeys: [TaskList.name] }
 )
@@ -180,7 +179,7 @@ export const renameTask = runtime.fn<{
         commandId: yield* Identity.makeCommandId,
         documentId,
         payload: { title }
-      }).pipe(Effect.flatMap(CommandOutcome.committedOrFail))
+      })
     }),
   { concurrent: true, reactivityKeys: [TaskList.name] }
 )
@@ -196,7 +195,7 @@ export const setTaskCompleted = runtime.fn<{
         commandId: yield* Identity.makeCommandId,
         documentId,
         payload: { completed }
-      }).pipe(Effect.flatMap(CommandOutcome.committedOrFail))
+      })
     }),
   { concurrent: true, reactivityKeys: [TaskList.name] }
 )
@@ -208,7 +207,7 @@ export const deleteTask = runtime.fn<{ readonly documentId: Identity.DocumentId 
       return yield* replica.delete(TaskDocument, {
         commandId: yield* Identity.makeCommandId,
         documentId
-      }).pipe(Effect.flatMap(CommandOutcome.committedOrFail))
+      })
     }),
   { concurrent: true, reactivityKeys: [TaskList.name] }
 )

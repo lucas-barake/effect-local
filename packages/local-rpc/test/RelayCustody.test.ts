@@ -8,7 +8,6 @@ import * as PeerRelayReceiptLimits from "@lucas-barake/effect-local-sql/PeerRela
 import * as ReplicaGate from "@lucas-barake/effect-local-sql/ReplicaGate"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as TestReplica from "@lucas-barake/effect-local-test/TestReplica"
-import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -313,12 +312,10 @@ const seedPair = Effect.gen(function*() {
   const sender = Context.get(senderContext, Replica.Replica)
   const recipient = Context.get(recipientContext, Replica.Replica)
 
-  const documentId = yield* CommandOutcome.committedOrFail(
-    yield* sender.create(Task, {
-      commandId: yield* Identity.makeCommandId,
-      value: { title: "one", labels: [] }
-    })
-  )
+  const documentId = yield* sender.create(Task, {
+    commandId: yield* Identity.makeCommandId,
+    value: { title: "one", labels: [] }
+  })
   const backup = yield* sender.exportBackup({ maxBytes: replicaLimits.maxBackupBytes }).pipe(Stream.runCollect)
   yield* recipient.restoreBackup({
     expectedDefinitionHash: definition.hash,
@@ -407,13 +404,11 @@ describe("relay custody against a real relay", () => {
             [recipient, "from-recipient"]
           ] as const
         ) {
-          yield* CommandOutcome.committedOrFail(
-            yield* side.replica.mutate(AddLabel, {
-              commandId: yield* Identity.makeCommandId,
-              documentId,
-              payload: label
-            })
-          )
+          yield* side.replica.mutate(AddLabel, {
+            commandId: yield* Identity.makeCommandId,
+            documentId,
+            payload: label
+          })
         }
         assert.deepStrictEqual(
           [...(yield* recipient.store.load(Task, documentId).pipe(Effect.orDie)).encoded.labels],

@@ -85,8 +85,6 @@ const seedPair = Effect.gen(function*() {
     commandId: (yield* Identity.makeCommandId),
     value: { title: "base", labels: [] }
   })
-  assert.strictEqual(created._tag, "DurablyCommittedLocal")
-  if (created._tag !== "DurablyCommittedLocal") return yield* Effect.die("create did not commit")
   const backup = yield* leftBuilt.replica.exportBackup({ maxBytes: TestReplica.defaultLimits.maxBackupBytes }).pipe(
     Stream.runCollect
   )
@@ -105,7 +103,7 @@ const seedPair = Effect.gen(function*() {
     ...rightBuilt,
     session: yield* rightBuilt.sync.open(peerLeft)
   }
-  return { documentId: created.value, left, right }
+  return { documentId: created, left, right }
 })
 
 const syncChangeHashes = (message: Uint8Array) => {

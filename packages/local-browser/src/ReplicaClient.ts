@@ -207,27 +207,47 @@ export const fromRpcClient = (
         })
     const boundSession = (operation: string) => boundBy(operation, sessionTimeout)
     const boundOperation = (operation: string) => boundBy(operation, operationTimeout)
-    const recoverCommand = <A,>(
+    /**
+     * Dispatches a command and, if the answer is lost in transit, asks the owner what happened to
+     * the id rather than reissuing it.
+     *
+     * Ambiguity leaves as a failure rather than an `OutcomeUnknown` value, and it carries the error
+     * that produced it: whether the dispatch timed out or the owner answered but held no receipt
+     * changes what an operator should do, and flattening both to a bare tag loses that.
+     */
+    const recoverCommand = <A extends CommandOutcome.CommandOutcome<unknown, unknown>,>(
       commandId: Identity.CommandId,
       dispatchOperation: string,
       dispatch: Effect.Effect<A, ReplicaError.ReplicaError | RpcClientError.RpcClientError>,
       lookupOperation: string,
       lookup: Effect.Effect<A, ReplicaError.ReplicaError | RpcClientError.RpcClientError>
-    ): Effect.Effect<A | CommandOutcome.OutcomeUnknown, ReplicaError.ReplicaError> => {
-      const unknown = () => Effect.succeed(CommandOutcome.unknown(commandId))
-      const lookupOrUnknown = lookup.pipe(
-        boundOperation(lookupOperation),
-        Effect.catchTags({
-          RpcClientError: unknown,
-          ReplicaError: (error) => error.reason._tag === "OperationTimeout" ? unknown() : Effect.fail(error)
-        })
-      )
+    ): Effect.Effect<A, ReplicaError.ReplicaError> => {
+      const ambiguous = (cause: unknown) =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.CommandOutcomeUnknown({ commandId, cause })
+          })
+        )
+      // `cause` is the dispatch failure that sent us here, not the lookup's own. A lookup that
+      // simply finds no receipt is the same ambiguity, and the useful half of the story is why the
+      // first answer went missing.
+      const lookupOrFail = (cause: unknown) =>
+        lookup.pipe(
+          boundOperation(lookupOperation),
+          Effect.catchTags({
+            RpcClientError: () => ambiguous(cause),
+            ReplicaError: (error) => error.reason._tag === "OperationTimeout" ? ambiguous(cause) : Effect.fail(error)
+          }),
+          Effect.flatMap((outcome) => outcome._tag === "OutcomeUnknown" ? ambiguous(cause) : Effect.succeed(outcome))
+        )
       return dispatch.pipe(
         boundOperation(dispatchOperation),
         Effect.catchTags({
-          RpcClientError: () => lookupOrUnknown,
-          ReplicaError: (error) => error.reason._tag === "OperationTimeout" ? lookupOrUnknown : Effect.fail(error)
-        })
+          RpcClientError: (error) => lookupOrFail(error),
+          ReplicaError: (error) => error.reason._tag === "OperationTimeout" ? lookupOrFail(error) : Effect.fail(error)
+        }),
+        // The owner can report ambiguity of its own, with no transport failure on this side.
+        Effect.flatMap((outcome) => outcome._tag === "OutcomeUnknown" ? ambiguous(undefined) : Effect.succeed(outcome))
       )
     }
     const closeSession = (sessionId: Identity.SessionId) =>
@@ -1092,7 +1112,7 @@ export const fromRpcClient = (
                   document: document.name,
                   commandId: options.commandId
                 })
-              ), { boundOperation: false })
+              ), { boundOperation: false }).pipe(Effect.flatMap(CommandOutcome.committedOrFail))
           )
         ),
       get: (document, documentId) =>
@@ -1134,7 +1154,8 @@ export const fromRpcClient = (
                 })
               ), { boundOperation: false })
           ),
-          Effect.flatMap((outcome) => Wire.decodeOutcome(mutation.successSchema, mutation.errorSchema, outcome))
+          Effect.flatMap((outcome) => Wire.decodeOutcome(mutation.successSchema, mutation.errorSchema, outcome)),
+          Effect.flatMap(CommandOutcome.committedOrFail)
         ),
       delete: (document, options) =>
         withSession("Delete", (session) =>
@@ -1145,7 +1166,8 @@ export const fromRpcClient = (
             "LookupDelete",
             rpc.LookupDelete({ sessionId: session.sessionId, document: document.name, commandId: options.commandId })
           ), { boundOperation: false }).pipe(
-            Effect.flatMap((outcome) => Wire.decodeOutcome(Schema.Void, Schema.Never, outcome))
+            Effect.flatMap((outcome) => Wire.decodeOutcome(Schema.Void, Schema.Never, outcome)),
+            Effect.flatMap(CommandOutcome.committedOrFail)
           ),
       query: (query, ...payload) =>
         Wire.encode(query.payloadSchema, payload[0]).pipe(
@@ -1498,7 +1520,8 @@ export const fromRpcClient = (
                       cause: error
                     })
                   })
-                ))
+                )),
+              Effect.flatMap(CommandOutcome.committedOrFail)
             )
           )
         )
