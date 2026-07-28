@@ -108,7 +108,13 @@ that raised it. Because the outcome is journaled per execution identity, retryin
 Adding a reason to `ReplicaError` is backward compatible for records an older build wrote, but not forward
 compatible. A record carrying a reason a build does not know fails to decode and becomes a defect, so a local
 replica database must not be opened by a build older than the one that wrote its workflow records. This release adds
-`DocumentLineageChanged`, so a journaled workflow record carrying it is undecodable by every earlier build.
+`DocumentLineageChanged` and `ReplicaMetadataMissing`, so a journaled workflow record carrying either is undecodable
+by every earlier build.
+
+`ReplicaMetadataMissing` reports that the metadata singleton row is gone, so the replica has no identity. It is
+replica wide and is deliberately not `StorageCorrupt`, which means one document's stored bytes are unusable and which
+consumers act on per document. Every read of that row answers with this one reason, and `operation` names the read
+that observed the absence.
 
 Projection rebuild, backup, and restore definitions reserve stable identities but are not registered operations in
 the current beta. Backup creation needs an explicit durable destination contract. Restore needs an explicit durable

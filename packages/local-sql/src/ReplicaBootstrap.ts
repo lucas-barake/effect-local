@@ -28,11 +28,15 @@ export class ReplicaBootstrap extends Context.Service<ReplicaBootstrap, State>()
 ) {}
 
 // A function, not a shared instance, so each failure captures its own stack at the site that observed it.
-const metadataMissing = () =>
+//
+// `ReplicaMetadataMissing`, not `StorageCorrupt`: this is the same replica-wide condition
+// `ReplicaGate.readState` reports, and one condition must have one answer. `StorageCorrupt` means a
+// single document's stored bytes are unusable, and consumers act on it per document -- so long as
+// bootstrap answered differently from the gate, whichever component happened to observe the absence
+// first decided how the replica described it.
+const metadataMissing = (operation: string) =>
   new ReplicaError.ReplicaError({
-    reason: new ReplicaError.StorageCorrupt({
-      cause: new Error("Replica metadata is missing")
-    })
+    reason: new ReplicaError.ReplicaMetadataMissing({ operation })
   })
 
 const unsupportedStorageFormat = (observedVersion: number) =>
@@ -89,7 +93,7 @@ export const make = (definition: ReplicaDefinition.Any) =>
       if (stored === undefined) {
         const populated = yield* findPopulatedBeforeMigrating(undefined)
         if (populated._tag === "Some" && populated.value.populated === 1) {
-          return yield* metadataMissing()
+          return yield* metadataMissing("ReplicaBootstrap.probe")
         }
         return
       }
@@ -158,7 +162,7 @@ export const make = (definition: ReplicaDefinition.Any) =>
       if (metadata.length === 0) {
         const populated = yield* findPopulated(undefined)
         if (populated._tag === "Some" && populated.value.populated === 1) {
-          return yield* metadataMissing()
+          return yield* metadataMissing("ReplicaBootstrap.populated")
         }
         yield* sql`INSERT INTO effect_local_metadata (
           singleton,
@@ -180,7 +184,7 @@ export const make = (definition: ReplicaDefinition.Any) =>
       }
       const format = (yield* findFormat(undefined))[0]
       if (format === undefined) {
-        return yield* metadataMissing()
+        return yield* metadataMissing("ReplicaBootstrap.format")
       }
       if (format.storage_format_version !== storageFormatVersion) {
         return yield* unsupportedStorageFormat(format.storage_format_version)
@@ -205,7 +209,7 @@ export const make = (definition: ReplicaDefinition.Any) =>
       }
       yield* sql`UPDATE effect_local_metadata SET writer_generation = writer_generation + 1 WHERE singleton = 1`
       const row = yield* findPermit(undefined).pipe(
-        Effect.catchTag("NoSuchElementError", () => metadataMissing())
+        Effect.catchTag("NoSuchElementError", () => metadataMissing("ReplicaBootstrap.permit"))
       )
       yield* sql`INSERT INTO effect_local_writer_generations (generation, claimed_at)
         VALUES (${row.writer_generation}, ${DateTime.formatIso(yield* DateTime.now)})`

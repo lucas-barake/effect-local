@@ -596,7 +596,12 @@ describe("ReplicaGate", () => {
       const result = yield* Effect.exit(gate.claim(() => Effect.void))
       assert.strictEqual(result._tag, "Failure")
       yield* sql`DROP TRIGGER fail_epoch_update`
-      assert.strictEqual((yield* gate.shared).replicaId, (yield* gate.current).replicaId)
+      // Acquired from a FOREIGN fiber on purpose. `sharedWith` short-circuits straight to `readLock`
+      // when `writer` still holds the acquiring fiber's id, so acquiring here would report success
+      // even if the release finalizer never ran and the gate were stranded for everyone else.
+      assert.isFalse(yield* gate.claiming)
+      const acquired = yield* Effect.forkChild(Effect.scoped(gate.shared))
+      assert.strictEqual((yield* Fiber.join(acquired)).replicaId, (yield* gate.current).replicaId)
     })).pipe(Effect.provide(Gate)))
 
   it.effect("publishes a claimed epoch after the caller commits", () =>
@@ -683,6 +688,11 @@ describe("ReplicaGate", () => {
       assert.isTrue(Result.isFailure(result))
       if (Result.isFailure(result)) {
         assert.strictEqual(result.failure.reason._tag, "ReplicaMetadataMissing")
+        // The label is the whole reason this reason carries a field: it names which read observed
+        // the absence. Without this assertion every call site could pass the same string.
+        if (result.failure.reason._tag === "ReplicaMetadataMissing") {
+          assert.strictEqual(result.failure.reason.operation, "ReplicaGate.validate")
+        }
       }
     }).pipe(Effect.provide(Gate)))
 
@@ -690,16 +700,20 @@ describe("ReplicaGate", () => {
     Effect.gen(function*() {
       const gate = yield* ReplicaGate.ReplicaGate
       const sql = yield* SqlClient.SqlClient
+      const permitBefore = yield* gate.current
       yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
       const result = yield* Effect.result(gate.refresh)
       assert.isTrue(Result.isFailure(result))
       if (Result.isFailure(result)) {
         assert.strictEqual(result.failure.reason._tag, "ReplicaMetadataMissing")
+        if (result.failure.reason._tag === "ReplicaMetadataMissing") {
+          assert.strictEqual(result.failure.reason.operation, "ReplicaGate.refresh")
+        }
       }
+      // `refresh` republishes what it read, so a failed one must leave the previous permit in place.
+      assert.deepStrictEqual(yield* gate.current, permitBefore)
     }).pipe(Effect.provide(Gate)))
 
-  // `claim` reads the singleton twice inside its own transaction, right after an UPDATE that matches
-  // zero rows. The exclusive permit must still be released, or every later acquirer deadlocks.
   it.effect("reports a missing metadata singleton from claim and still releases the gate", () =>
     Effect.scoped(Effect.gen(function*() {
       const gate = yield* ReplicaGate.ReplicaGate
@@ -707,13 +721,60 @@ describe("ReplicaGate", () => {
       yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
       const result = yield* Effect.result(gate.claim(() => Effect.void))
       assert.isTrue(Result.isFailure(result))
-      if (Result.isFailure(result) && result.failure._tag === "ReplicaError") {
-        assert.strictEqual(result.failure.reason._tag, "ReplicaMetadataMissing")
+      // Asserted, not branched on: `claim`'s channel is `E | ReplicaError | SqlError`, so a guard
+      // would silently skip the reason check if the failure ever took a different shape.
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure._tag, "ReplicaError")
+        if (result.failure._tag === "ReplicaError") {
+          assert.strictEqual(result.failure.reason._tag, "ReplicaMetadataMissing")
+          if (result.failure.reason._tag === "ReplicaMetadataMissing") {
+            assert.strictEqual(result.failure.reason.operation, "ReplicaGate.claim")
+          }
+        }
       }
-      const generations = yield* sql<{ readonly count: number }>`
-        SELECT COUNT(*) AS count FROM effect_local_writer_generations`
-      assert.strictEqual(generations[0]?.count, 1)
-      // Proves the exclusive permit was released rather than stranded.
-      yield* Effect.scoped(gate.shared)
+      // From a FOREIGN fiber: `sharedWith` short-circuits to `readLock` when `writer` still holds the
+      // acquiring fiber's id, so acquiring on this fiber would pass even with the gate stranded.
+      assert.isFalse(yield* gate.claiming)
+      yield* Fiber.join(yield* Effect.forkChild(Effect.scoped(gate.shared)))
     })).pipe(Effect.provide(Gate)))
+
+  // The case the test above cannot reach: with the row already gone the epoch UPDATE matches nothing,
+  // so there is no partial write to undo. Deleting it INSIDE `use` means the incarnation bump and the
+  // generation ledger insert both really land before the second read fails, which is the only way to
+  // prove the transaction rolls them back. Otherwise the next claim mints a generation the ledger
+  // already holds, and a peer that fenced on the durable value is told a generation that never
+  // committed.
+  it.effect("rolls the incarnation and the generation ledger back when the singleton vanishes mid-claim", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      const before = yield* sql<{ readonly replica_incarnation: number; readonly writer_generation: number }>`
+        SELECT replica_incarnation, writer_generation FROM effect_local_metadata WHERE singleton = 1`
+      const generationsBefore = yield* sql<{ readonly generation: number }>`
+        SELECT generation FROM effect_local_writer_generations ORDER BY generation`
+      const permitBefore = yield* gate.current
+
+      const result = yield* Effect.result(
+        gate.claim(() => sql`DELETE FROM effect_local_metadata WHERE singleton = 1`)
+      )
+
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure._tag, "ReplicaError")
+        if (result.failure._tag === "ReplicaError") {
+          assert.strictEqual(result.failure.reason._tag, "ReplicaMetadataMissing")
+        }
+      }
+      assert.deepStrictEqual(
+        yield* sql<{ readonly replica_incarnation: number; readonly writer_generation: number }>`
+          SELECT replica_incarnation, writer_generation FROM effect_local_metadata WHERE singleton = 1`,
+        before
+      )
+      assert.deepStrictEqual(
+        yield* sql<{ readonly generation: number }>`
+          SELECT generation FROM effect_local_writer_generations ORDER BY generation`,
+        generationsBefore
+      )
+      assert.deepStrictEqual(yield* gate.current, permitBefore)
+    }).pipe(Effect.provide(Gate)))
 })

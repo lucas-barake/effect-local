@@ -150,7 +150,7 @@ describe("ReplicaBootstrap", () => {
       if (!Result.isFailure(result)) return
       assert.strictEqual(result.failure._tag, "ReplicaError")
       if (result.failure._tag !== "ReplicaError") return
-      assert.strictEqual(result.failure.reason._tag, "StorageCorrupt")
+      assert.strictEqual(result.failure.reason._tag, "ReplicaMetadataMissing")
       const generations = yield* sql<{ readonly count: number }>`
         SELECT COUNT(*) AS count FROM effect_local_writer_generations
       `
@@ -185,7 +185,7 @@ describe("ReplicaBootstrap", () => {
       if (!Result.isFailure(result)) return
       assert.strictEqual(result.failure._tag, "ReplicaError")
       if (result.failure._tag !== "ReplicaError") return
-      assert.strictEqual(result.failure.reason._tag, "StorageCorrupt")
+      assert.strictEqual(result.failure.reason._tag, "ReplicaMetadataMissing")
 
       // a build that refuses to open the replica must not have migrated it on the way to refusing
       const applied = yield* sql<{ readonly migration_id: number }>`

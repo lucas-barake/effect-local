@@ -374,3 +374,65 @@ it.effect("guards transferred MessagePort values", () =>
     channel.port1.close()
     channel.port2.close()
   }))
+
+const metadataMissing = (operation: string) =>
+  new ReplicaError.ReplicaError({
+    reason: new ReplicaError.ReplicaMetadataMissing({ operation })
+  })
+
+it.effect("round trips a missing replica metadata reason with its operation intact", () =>
+  Effect.gen(function*() {
+    const original = metadataMissing("ReplicaGate.validate")
+    const encoded = RestoreProtocol.encodeReplicaError(original, 4_096)
+    assert.strictEqual(encoded._tag, "ReplicaMetadataMissing")
+    const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
+    assert.deepStrictEqual(RestoreProtocol.replicaErrorFromWire(decoded), original)
+  }))
+
+it.effect("preserves every ReplicaGate operation at the minimum configured error budget", () =>
+  Effect.gen(function*() {
+    for (const operation of ["ReplicaGate.claim", "ReplicaGate.refresh", "ReplicaGate.validate"]) {
+      const encoded = RestoreProtocol.encodeReplicaError(
+        metadataMissing(operation),
+        ReplicaLimits.minimumRestoreErrorBytes
+      )
+      assert.isTrue(RestoreProtocol.preflight(encoded, ReplicaLimits.minimumRestoreErrorBytes), operation)
+      const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
+      const reason = RestoreProtocol.replicaErrorFromWire(decoded).reason
+      assert.strictEqual(reason._tag, "ReplicaMetadataMissing")
+      if (reason._tag !== "ReplicaMetadataMissing") return
+      assert.strictEqual(reason.operation, operation)
+    }
+  }))
+
+// The page must still learn the replica has no identity even when the budget forces truncation, so
+// the member keeps its own tag and only `operation` is shortened.
+it.effect("keeps its own tag when the budget is exhausted and only truncates the operation", () =>
+  Effect.gen(function*() {
+    // The fixed shape costs 35 bytes (`_tag`, the tag itself, `operation`), so 40 leaves five.
+    const maxBytes = 40
+    const encoded = RestoreProtocol.encodeReplicaError(metadataMissing("ReplicaGate.validate"), maxBytes)
+    assert.isTrue(RestoreProtocol.preflight(encoded, maxBytes))
+    const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
+    const reason = RestoreProtocol.replicaErrorFromWire(decoded).reason
+    assert.strictEqual(reason._tag, "ReplicaMetadataMissing")
+    if (reason._tag !== "ReplicaMetadataMissing") return
+    assert.strictEqual(reason.operation, "Repli")
+  }))
+
+// `RestoreWireError` derives its field metadata from one record, so the three wire lists cannot drift
+// from each other. Nothing makes that union agree with `ReplicaError.Reason`, which is a different
+// module -- this guard covers exactly that seam, and it is the reason a forgotten reason is a test
+// failure rather than a silently rejected preflight.
+it("wires every ReplicaError reason into the restore wire field record", () => {
+  const tags = ReplicaError.Reason.members.map((member) =>
+    (member.fields._tag.ast as { readonly literal: string }).literal
+  )
+  assert.include(tags, "ReplicaMetadataMissing")
+  for (const tag of tags) {
+    assert.isTrue(
+      RestoreProtocol.restoreWireErrorFields[tag] !== undefined,
+      `${tag} is missing from restoreWireErrorFields`
+    )
+  }
+})
