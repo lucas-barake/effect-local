@@ -268,32 +268,53 @@ export const layer: Layer.Layer<
           sql`SELECT replica_id, replica_incarnation, writer_generation
             FROM effect_local_metadata WHERE singleton = 1`
       })
-      const readState = findState(undefined).pipe(
-        Effect.map((row): Permit => ({
-          replicaId: row.replica_id,
-          incarnation: row.replica_incarnation,
-          writerGeneration: row.writer_generation
-        })),
-        Effect.catchTags({
-          NoSuchElementError: () => Effect.die(new Error("Replica metadata was not initialized")),
-          SchemaError: (cause) =>
-            Effect.fail(
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.StorageCorrupt({
-                  cause
+      // The documented boundary where a missing metadata singleton stops being a defect.
+      //
+      // It was left as a defect deliberately, on the reasoning that a typed failure inside a
+      // `ClusterSchema.Persisted` entity handler would be recorded as a terminal reply and replayed
+      // for that primary key forever. Measured against the real cluster, that does not happen: every
+      // `DocumentEntity` RPC is also annotated `ClusterSchema.WithTransaction`, which makes the reply
+      // write share the handler's transaction, so a failing handler rolls the reply back and the
+      // message stays unprocessed. The defect, meanwhile, is not "retry until repaired" either --
+      // nothing recreates this row at runtime, so the entity rebuilds on a backoff forever while the
+      // caller waits for a reply that is never written.
+      //
+      // The reason is deliberately NOT `StorageCorrupt`. That one means a single document's stored
+      // bytes are unusable, and consumers act on it per document: `ReplicaEvolution` quarantines the
+      // document it was reading and `BackupStore` reports an invalid backup. A lost replica identity
+      // is neither.
+      const readState = (operation: string) =>
+        findState(undefined).pipe(
+          Effect.map((row): Permit => ({
+            replicaId: row.replica_id,
+            incarnation: row.replica_incarnation,
+            writerGeneration: row.writer_generation
+          })),
+          Effect.catchTags({
+            NoSuchElementError: () =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.ReplicaMetadataMissing({ operation })
                 })
-              })
-            ),
-          SqlError: (cause) =>
-            Effect.fail(
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.StorageUnavailable({
-                  cause
+              ),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageCorrupt({
+                    cause
+                  })
                 })
-              })
-            )
-        })
-      )
+              ),
+            SqlError: (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause
+                  })
+                })
+              )
+          })
+        )
       const validateState = SqlSchema.findAll({
         Request: Schema.Struct({
           incarnation: Identity.ReplicaIncarnation,
@@ -330,7 +351,7 @@ export const layer: Layer.Layer<
         // `writer` is set before `run` and cleared only after `run` has republished `state`, so a `false`
         // here proves `state` already carries the generation of the last claim that touched the database.
         claiming: Ref.get(writer).pipe(Effect.map((owner) => owner !== null)),
-        refresh: readState.pipe(Effect.tap((next) => Ref.set(state, next))),
+        refresh: readState("ReplicaGate.refresh").pipe(Effect.tap((next) => Ref.set(state, next))),
         shared: sharedWith(acquire),
         admit: sharedWith(acquireBounded),
         claim: (use) =>
@@ -345,11 +366,11 @@ export const layer: Layer.Layer<
                       replica_incarnation = replica_incarnation + 1,
                       writer_generation = writer_generation + 1
                       WHERE singleton = 1`
-                        const permit = yield* readState
+                        const permit = yield* readState("ReplicaGate.claim")
                         yield* sql`INSERT INTO effect_local_writer_generations (generation, claimed_at)
                       VALUES (${permit.writerGeneration}, ${DateTime.formatIso(yield* DateTime.now)})`
                         const result = yield* restore(use(permit))
-                        return [result, yield* readState] as const
+                        return [result, yield* readState("ReplicaGate.claim")] as const
                       })).pipe(
                         Effect.flatMap(([result, permit]) =>
                           publish ? Ref.set(state, permit).pipe(Effect.as(result)) : Effect.succeed(result)
@@ -380,7 +401,7 @@ export const layer: Layer.Layer<
         validate: (expected) =>
           validateState(expected).pipe(
             Effect.flatMap((rows) =>
-              rows.length === 1 ? Effect.void : readState.pipe(
+              rows.length === 1 ? Effect.void : readState("ReplicaGate.validate").pipe(
                 Effect.flatMap((observed) =>
                   Effect.fail(
                     new ReplicaError.ReplicaError({

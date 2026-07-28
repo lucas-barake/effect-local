@@ -13,7 +13,7 @@ import type * as Migrator from "effect/unstable/sql/Migrator"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
-import { storageFormatVersion } from "./internal/schema.js"
+import { populatedTables, storageFormatVersion } from "./internal/schema.js"
 import * as Migrations from "./Migrations.js"
 
 export interface State {
@@ -26,22 +26,6 @@ export interface State {
 export class ReplicaBootstrap extends Context.Service<ReplicaBootstrap, State>()(
   "@lucas-barake/effect-local-sql/ReplicaBootstrap"
 ) {}
-
-// A function, not a shared instance, so each failure captures its own stack at the site that observed it.
-const metadataMissing = () =>
-  new ReplicaError.ReplicaError({
-    reason: new ReplicaError.StorageCorrupt({
-      cause: new Error("Replica metadata is missing")
-    })
-  })
-
-const unsupportedStorageFormat = (observedVersion: number) =>
-  new ReplicaError.ReplicaError({
-    reason: new ReplicaError.UnsupportedStorageFormatVersion({
-      observedVersion,
-      supportedVersion: storageFormatVersion
-    })
-  })
 
 export const make = (definition: ReplicaDefinition.Any) =>
   Effect.gen(function*() {
@@ -56,28 +40,44 @@ export const make = (definition: ReplicaDefinition.Any) =>
       Result: Schema.Struct({ storage_format_version: Schema.Int }),
       execute: () => sql`SELECT storage_format_version FROM effect_local_metadata WHERE singleton = 1`
     })
-    // Migration 1 creates the metadata table together with every canonical store table, so whenever the
-    // metadata table exists these are readable too. A populated replica whose metadata singleton is gone is
-    // corrupt, and must be rejected before the migrator touches it rather than after. The peer tables are
-    // deliberately absent here because migration 2 creates them and they may not exist yet; findPopulated
-    // below covers them and stays the authoritative check.
-    const findPopulatedBeforeMigrating = SqlSchema.findOneOption({
+    // Which of the durable tables actually exist right now. The probe below has to run BEFORE the
+    // migrator, so it cannot assume the current schema: migration 2 creates the peer tables, 9 the
+    // rewrite markers and 10 the relay tables. Asking `sqlite_master` for exactly the known list lets
+    // one probe cover whatever this database has reached, and keeps that list the only place the set
+    // is written down: a name pattern here would have to be kept in agreement with it by hand.
+    const findExistingPopulatedTables = SqlSchema.findAll({
       Request: Schema.Void,
-      Result: Schema.Struct({ populated: Schema.Int }),
-      execute: () =>
-        sql`SELECT EXISTS (
-          SELECT 1 FROM effect_local_writer_generations
-          UNION ALL SELECT 1 FROM effect_local_documents
-          UNION ALL SELECT 1 FROM effect_local_changes
-          UNION ALL SELECT 1 FROM effect_local_checkpoints
-          UNION ALL SELECT 1 FROM effect_local_command_receipts
-          UNION ALL SELECT 1 FROM effect_local_projection_registry
-          UNION ALL SELECT 1 FROM effect_local_document_projections
-          UNION ALL SELECT 1 FROM effect_local_commit_outbox
-          UNION ALL SELECT 1 FROM effect_local_quarantine
-          UNION ALL SELECT 1 FROM effect_local_backup_installations
-        ) AS populated`
+      Result: Schema.Struct({ name: Schema.String }),
+      execute: () => sql`SELECT name FROM sqlite_master WHERE type = 'table' AND ${sql.in("name", populatedTables)}`
     })
+    // A populated replica whose metadata singleton is gone is corrupt, and must be rejected before the
+    // migrator touches it rather than after. Rejecting afterwards is not a cosmetic difference:
+    // migration 6 deletes every `effect_local_peer_receipts` row whose `pending_message` is NULL, so a
+    // replica holding only those would have its evidence destroyed on the way past and would then look
+    // fresh enough to be given a brand new identity.
+    //
+    // `addParens: false` matters. `sql.join` parenthesises by default, which would produce
+    // `SELECT EXISTS ((SELECT 1 ... UNION ALL SELECT 1 ...))` -- a SQLite syntax error as soon as
+    // there is more than one table. `names` can only hold values from the compile-time
+    // `populatedTables` list, because the query above selects by it, and each goes through `sql(name)`,
+    // which the dialect escapes, never `sql.literal`.
+    const findPopulatedIn = (names: ReadonlyArray<string>) =>
+      SqlSchema.findOneOption({
+        Request: Schema.Void,
+        Result: Schema.Struct({ populated: Schema.Int }),
+        execute: () =>
+          sql`SELECT EXISTS (${
+            sql.join(" UNION ALL ", false)(names.map((name) => sql`SELECT 1 FROM ${sql(name)}`))
+          }) AS populated`
+      })(undefined)
+
+    const isPopulated = Effect.gen(function*() {
+      const names = (yield* findExistingPopulatedTables(undefined)).map((row) => row.name)
+      if (names.length === 0) return false
+      const populated = yield* findPopulatedIn(names)
+      return populated._tag === "Some" && populated.value.populated === 1
+    })
+
     // The storage format version decides whether this build may touch the database at all, so it has to be
     // checked before Migrations.run, which commits its own transaction. Checking afterwards would mean a build
     // that refuses to open a replica has already migrated it. A database with no tables yet is a fresh one and
@@ -87,14 +87,20 @@ export const make = (definition: ReplicaDefinition.Any) =>
       if (table.length === 0) return
       const stored = (yield* findStorageFormat(undefined))[0]
       if (stored === undefined) {
-        const populated = yield* findPopulatedBeforeMigrating(undefined)
-        if (populated._tag === "Some" && populated.value.populated === 1) {
-          return yield* metadataMissing()
+        if (yield* isPopulated) {
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ReplicaMetadataMissing({ operation: "ReplicaBootstrap.probe" })
+          })
         }
         return
       }
       if (stored.storage_format_version === storageFormatVersion) return
-      return yield* unsupportedStorageFormat(stored.storage_format_version)
+      return yield* new ReplicaError.ReplicaError({
+        reason: new ReplicaError.UnsupportedStorageFormatVersion({
+          observedVersion: stored.storage_format_version,
+          supportedVersion: storageFormatVersion
+        })
+      })
     }).pipe(Effect.catchTag("SchemaError", (cause) =>
       Effect.fail(
         new ReplicaError.ReplicaError({
@@ -106,25 +112,6 @@ export const make = (definition: ReplicaDefinition.Any) =>
       Request: Schema.Void,
       Result: Schema.Struct({ singleton: Schema.Int }),
       execute: () => sql`SELECT singleton FROM effect_local_metadata WHERE singleton = 1`
-    })
-    const findPopulated = SqlSchema.findOneOption({
-      Request: Schema.Void,
-      Result: Schema.Struct({ populated: Schema.Int }),
-      execute: () =>
-        sql`SELECT EXISTS (
-          SELECT 1 FROM effect_local_writer_generations
-          UNION ALL SELECT 1 FROM effect_local_documents
-          UNION ALL SELECT 1 FROM effect_local_changes
-          UNION ALL SELECT 1 FROM effect_local_checkpoints
-          UNION ALL SELECT 1 FROM effect_local_command_receipts
-          UNION ALL SELECT 1 FROM effect_local_projection_registry
-          UNION ALL SELECT 1 FROM effect_local_document_projections
-          UNION ALL SELECT 1 FROM effect_local_commit_outbox
-          UNION ALL SELECT 1 FROM effect_local_quarantine
-          UNION ALL SELECT 1 FROM effect_local_backup_installations
-          UNION ALL SELECT 1 FROM effect_local_peer_receipts
-          UNION ALL SELECT 1 FROM effect_local_peer_outbox
-        ) AS populated`
     })
     const findFormat = SqlSchema.findAll({
       Request: Schema.Void,
@@ -156,9 +143,10 @@ export const make = (definition: ReplicaDefinition.Any) =>
     return yield* sql.withTransaction(Effect.gen(function*() {
       const metadata = yield* findMetadata(undefined)
       if (metadata.length === 0) {
-        const populated = yield* findPopulated(undefined)
-        if (populated._tag === "Some" && populated.value.populated === 1) {
-          return yield* metadataMissing()
+        if (yield* isPopulated) {
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ReplicaMetadataMissing({ operation: "ReplicaBootstrap.populated" })
+          })
         }
         yield* sql`INSERT INTO effect_local_metadata (
           singleton,
@@ -180,10 +168,17 @@ export const make = (definition: ReplicaDefinition.Any) =>
       }
       const format = (yield* findFormat(undefined))[0]
       if (format === undefined) {
-        return yield* metadataMissing()
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.ReplicaMetadataMissing({ operation: "ReplicaBootstrap.format" })
+        })
       }
       if (format.storage_format_version !== storageFormatVersion) {
-        return yield* unsupportedStorageFormat(format.storage_format_version)
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.UnsupportedStorageFormatVersion({
+            observedVersion: format.storage_format_version,
+            supportedVersion: storageFormatVersion
+          })
+        })
       }
       if (format.definition_hash !== definition.hash) {
         const stored = yield* findStoredVersions(undefined)
@@ -205,7 +200,12 @@ export const make = (definition: ReplicaDefinition.Any) =>
       }
       yield* sql`UPDATE effect_local_metadata SET writer_generation = writer_generation + 1 WHERE singleton = 1`
       const row = yield* findPermit(undefined).pipe(
-        Effect.catchTag("NoSuchElementError", () => metadataMissing())
+        Effect.catchTag("NoSuchElementError", () =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ReplicaMetadataMissing({ operation: "ReplicaBootstrap.permit" })
+            })
+          ))
       )
       yield* sql`INSERT INTO effect_local_writer_generations (generation, claimed_at)
         VALUES (${row.writer_generation}, ${DateTime.formatIso(yield* DateTime.now)})`

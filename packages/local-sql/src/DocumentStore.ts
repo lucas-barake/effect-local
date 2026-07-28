@@ -94,7 +94,12 @@ export const layer: Layer.Layer<
     })(undefined).pipe(
       Effect.map((row) => row.commit_sequence),
       Effect.catchTags({
-        NoSuchElementError: () => Effect.die(new Error("Replica metadata was not initialized")),
+        NoSuchElementError: () =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ReplicaMetadataMissing({ operation: "DocumentStore.nextSequence" })
+            })
+          ),
         SchemaError: (cause) =>
           Effect.fail(
             new ReplicaError.ReplicaError({
@@ -108,7 +113,12 @@ export const layer: Layer.Layer<
     const currentDefinitionHash = findDefinitionHash(undefined).pipe(
       Effect.map((row) => row.definition_hash),
       Effect.catchTags({
-        NoSuchElementError: () => Effect.die(new Error("Replica metadata was not initialized")),
+        NoSuchElementError: () =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ReplicaMetadataMissing({ operation: "DocumentStore.definitionHash" })
+            })
+          ),
         SchemaError: (cause) =>
           Effect.fail(
             new ReplicaError.ReplicaError({
@@ -116,6 +126,23 @@ export const layer: Layer.Layer<
             })
           )
       })
+    )
+
+    // Read on its own instead of as a scalar subquery inside `findPersistedDocument`. As a subquery an
+    // absent singleton yielded SQL NULL, which the non-nullable row schema turned into a `SchemaError`
+    // and then a per-document `StorageCorrupt`.
+    const metadataCommitSequence = SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: Schema.Struct({ commit_sequence: Identity.CommitSequence }),
+      execute: () => sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`
+    })(undefined).pipe(
+      Effect.map((row) => row.commit_sequence),
+      Effect.catchTag("NoSuchElementError", () =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ReplicaMetadataMissing({ operation: "DocumentStore.verifyPersisted" })
+          })
+        ))
     )
 
     const findPersistedChanges = SqlSchema.findAll({
@@ -138,7 +165,6 @@ export const layer: Layer.Layer<
       execute: (documentId) =>
         sql`SELECT
             accepted_heads, checkpoint_hash,
-            (SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1) AS commit_sequence,
             document_id, document_type, lineage, materialized_heads, observed_versions,
             projection_status, schema_version, tombstone
           FROM effect_local_documents WHERE document_id = ${documentId}`
@@ -175,6 +201,9 @@ export const layer: Layer.Layer<
               })
             ))
         )
+        // After the writes, exactly where the document read-back happens: the check proves the
+        // allocator still reads back the sequence this transaction allocated.
+        const storedSequence = yield* metadataCommitSequence
         return yield* Effect.try({
           try: () => {
             const expected = new Set(options.changes.map((change) => change.hash))
@@ -199,7 +228,7 @@ export const layer: Layer.Layer<
             if (
               row.document_type !== options.document.name ||
               row.schema_version !== options.document.version ||
-              row.commit_sequence !== options.sequence ||
+              storedSequence !== options.sequence ||
               (row.tombstone === 1) !== options.tombstone ||
               !Equal.equals(Schema.decodeUnknownSync(Heads)(row.materialized_heads), options.heads) ||
               !Equal.equals(Schema.decodeUnknownSync(Heads)(row.accepted_heads), options.heads)

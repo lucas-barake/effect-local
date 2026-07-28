@@ -1019,15 +1019,25 @@ const make = (
             AND accepted_at < ${cutoff}`
       }))
 
+    // Dominated by `gate.validate` on every path that reaches them, so these are defensive: they keep
+    // the one-condition-one-answer invariant if the statement order ever changes.
     const nextSequence = incrementCommitSequence(undefined).pipe(Effect.flatMap((rows) =>
       rows[0] === undefined
-        ? Effect.die(new Error("Replica metadata was not initialized"))
+        ? Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ReplicaMetadataMissing({ operation: "PeerSync.nextSequence" })
+          })
+        )
         : Effect.succeed(Identity.CommitSequence.make(rows[0].commit_sequence))
     ))
 
     const currentSequence = findCommitSequence(undefined).pipe(Effect.flatMap((rows) =>
       rows[0] === undefined
-        ? Effect.die(new Error("Replica metadata was not initialized"))
+        ? Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ReplicaMetadataMissing({ operation: "PeerSync.currentSequence" })
+          })
+        )
         : Effect.succeed(Identity.CommitSequence.make(rows[0].commit_sequence))
     ))
 

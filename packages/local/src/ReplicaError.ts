@@ -62,6 +62,23 @@ export class StorageCorrupt extends Schema.TaggedErrorClass<StorageCorrupt>(
   "@lucas-barake/effect-local/ReplicaError/StorageCorrupt"
 )("StorageCorrupt", { cause: Schema.Defect() }) {}
 
+/**
+ * The replica's metadata singleton row is gone, so the replica has no identity.
+ *
+ * Replica-wide and fatal, which is why it is not `StorageCorrupt`: that reason means one document's
+ * stored bytes are unusable, and consumers treat it that way. `ReplicaEvolution` quarantines the one
+ * document it was reading, and `BackupStore` reports it as an invalid backup. Routing a lost replica
+ * identity through either of those blames the wrong thing. `ReplicaHealth` already reports this
+ * condition separately, as `Failed { "Replica metadata is missing" }`.
+ *
+ * `operation` names the read that observed the absence, because the reason carries no cause of its
+ * own: nothing failed, a row that must exist simply is not there, and the only useful context is
+ * where that was noticed.
+ */
+export class ReplicaMetadataMissing extends Schema.TaggedErrorClass<ReplicaMetadataMissing>(
+  "@lucas-barake/effect-local/ReplicaError/ReplicaMetadataMissing"
+)("ReplicaMetadataMissing", { operation: Schema.String }) {}
+
 export class QuotaExceeded extends Schema.TaggedErrorClass<QuotaExceeded>(
   "@lucas-barake/effect-local/ReplicaError/QuotaExceeded"
 )("QuotaExceeded", {
@@ -167,6 +184,7 @@ export const Reason = Schema.Union([
   StorageUnavailable,
   CanonicalEncodeError,
   StorageCorrupt,
+  ReplicaMetadataMissing,
   QuotaExceeded,
   MigrationFailed,
   BackupInvalid,

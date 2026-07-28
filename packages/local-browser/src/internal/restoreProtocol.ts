@@ -21,119 +21,106 @@ export type BoundedErrorDescription = typeof BoundedErrorDescription.Type
 
 export const maxPageStagingBytes = 64 * 1024
 
-const DocumentNotFound = Schema.TaggedStruct("DocumentNotFound", {
-  documentId: Identity.DocumentId
+// The single source of truth for the wire error union. `Schema.TaggedUnion` builds one
+// `Schema.TaggedStruct` per key, in key order, so this is exactly the union that used to be spelled
+// out as 24 standalone structs plus a 24-entry member array. `restoreWireErrorFields` below reads
+// `cases` back off this same value, so the preflight field metadata cannot drift from the union:
+// before, a reason added to the union but forgotten in that record still compiled and silently made
+// `preflightReplicaError` reject it.
+export const RestoreWireError = Schema.TaggedUnion({
+  DocumentNotFound: {
+    documentId: Identity.DocumentId
+  },
+  DocumentDecodeError: {
+    documentId: Identity.DocumentId,
+    cause: BoundedErrorDescription
+  },
+  DocumentEncodeError: {
+    documentId: Identity.DocumentId,
+    cause: BoundedErrorDescription
+  },
+  UnsupportedDocumentVersion: {
+    documentId: Identity.DocumentId,
+    observedVersion: Schema.Int,
+    supportedVersion: Schema.Int
+  },
+  ProjectionBlocked: {
+    projection: Schema.String,
+    cause: BoundedErrorDescription
+  },
+  CommandIdConflict: {
+    commandId: Identity.CommandId
+  },
+  ReceiptOperationMismatch: {
+    commandId: Identity.CommandId,
+    expected: Schema.String,
+    observed: Schema.String
+  },
+  StorageUnavailable: {
+    cause: BoundedErrorDescription
+  },
+  CanonicalEncodeError: {
+    cause: BoundedErrorDescription
+  },
+  StorageCorrupt: {
+    cause: BoundedErrorDescription
+  },
+  // Deliberately its own member rather than folded into StorageCorrupt: the page has to be able to
+  // tell "this replica has no identity" from "one document's bytes are unusable".
+  ReplicaMetadataMissing: {
+    operation: Schema.String
+  },
+  QuotaExceeded: {
+    resource: Schema.String,
+    limit: Schema.Int
+  },
+  MigrationFailed: {
+    migration: Schema.String,
+    cause: BoundedErrorDescription
+  },
+  BackupInvalid: {
+    cause: BoundedErrorDescription
+  },
+  BackupTooLarge: {
+    limit: Schema.Int,
+    observed: Schema.Int
+  },
+  RestoreBusy: {
+    replica: Schema.String
+  },
+  RestoreFailed: {
+    cause: BoundedErrorDescription
+  },
+  ProtocolMismatch: {
+    expected: Schema.String,
+    observed: Schema.String
+  },
+  ReplicaFenced: {
+    expectedGeneration: Identity.WriterGeneration,
+    observedGeneration: Identity.WriterGeneration
+  },
+  OperationTimeout: {
+    operation: Schema.String,
+    timeoutMillis: Schema.Int
+  },
+  UnsupportedStorageFormatVersion: {
+    observedVersion: Schema.Int,
+    supportedVersion: Schema.Int
+  },
+  CheckpointSuperseded: {
+    documentIds: Schema.Array(Identity.DocumentId),
+    attempts: Schema.Int
+  },
+  DocumentLineageChanged: {
+    documentId: Identity.DocumentId,
+    localLineage: Identity.DocumentLineage,
+    remoteLineage: Identity.DocumentLineage
+  },
+  CommandOutcomeUnknown: {
+    commandId: Identity.CommandId,
+    cause: BoundedErrorDescription
+  }
 })
-const DocumentDecodeError = Schema.TaggedStruct("DocumentDecodeError", {
-  documentId: Identity.DocumentId,
-  cause: BoundedErrorDescription
-})
-const DocumentEncodeError = Schema.TaggedStruct("DocumentEncodeError", {
-  documentId: Identity.DocumentId,
-  cause: BoundedErrorDescription
-})
-const UnsupportedDocumentVersion = Schema.TaggedStruct("UnsupportedDocumentVersion", {
-  documentId: Identity.DocumentId,
-  observedVersion: Schema.Int,
-  supportedVersion: Schema.Int
-})
-const ProjectionBlocked = Schema.TaggedStruct("ProjectionBlocked", {
-  projection: Schema.String,
-  cause: BoundedErrorDescription
-})
-const CommandIdConflict = Schema.TaggedStruct("CommandIdConflict", {
-  commandId: Identity.CommandId
-})
-const ReceiptOperationMismatch = Schema.TaggedStruct("ReceiptOperationMismatch", {
-  commandId: Identity.CommandId,
-  expected: Schema.String,
-  observed: Schema.String
-})
-const StorageUnavailable = Schema.TaggedStruct("StorageUnavailable", {
-  cause: BoundedErrorDescription
-})
-const CanonicalEncodeError = Schema.TaggedStruct("CanonicalEncodeError", {
-  cause: BoundedErrorDescription
-})
-const StorageCorrupt = Schema.TaggedStruct("StorageCorrupt", {
-  cause: BoundedErrorDescription
-})
-const QuotaExceeded = Schema.TaggedStruct("QuotaExceeded", {
-  resource: Schema.String,
-  limit: Schema.Int
-})
-const MigrationFailed = Schema.TaggedStruct("MigrationFailed", {
-  migration: Schema.String,
-  cause: BoundedErrorDescription
-})
-const BackupInvalid = Schema.TaggedStruct("BackupInvalid", {
-  cause: BoundedErrorDescription
-})
-const BackupTooLarge = Schema.TaggedStruct("BackupTooLarge", {
-  limit: Schema.Int,
-  observed: Schema.Int
-})
-const RestoreBusy = Schema.TaggedStruct("RestoreBusy", {
-  replica: Schema.String
-})
-const RestoreFailed = Schema.TaggedStruct("RestoreFailed", {
-  cause: BoundedErrorDescription
-})
-const ProtocolMismatch = Schema.TaggedStruct("ProtocolMismatch", {
-  expected: Schema.String,
-  observed: Schema.String
-})
-const ReplicaFenced = Schema.TaggedStruct("ReplicaFenced", {
-  expectedGeneration: Identity.WriterGeneration,
-  observedGeneration: Identity.WriterGeneration
-})
-const OperationTimeout = Schema.TaggedStruct("OperationTimeout", {
-  operation: Schema.String,
-  timeoutMillis: Schema.Int
-})
-const UnsupportedStorageFormatVersion = Schema.TaggedStruct("UnsupportedStorageFormatVersion", {
-  observedVersion: Schema.Int,
-  supportedVersion: Schema.Int
-})
-const CheckpointSuperseded = Schema.TaggedStruct("CheckpointSuperseded", {
-  documentIds: Schema.Array(Identity.DocumentId),
-  attempts: Schema.Int
-})
-const DocumentLineageChanged = Schema.TaggedStruct("DocumentLineageChanged", {
-  documentId: Identity.DocumentId,
-  localLineage: Identity.DocumentLineage,
-  remoteLineage: Identity.DocumentLineage
-})
-const CommandOutcomeUnknown = Schema.TaggedStruct("CommandOutcomeUnknown", {
-  commandId: Identity.CommandId,
-  cause: BoundedErrorDescription
-})
-
-export const RestoreWireError = Schema.Union([
-  DocumentNotFound,
-  DocumentDecodeError,
-  DocumentEncodeError,
-  UnsupportedDocumentVersion,
-  ProjectionBlocked,
-  CommandIdConflict,
-  ReceiptOperationMismatch,
-  StorageUnavailable,
-  CanonicalEncodeError,
-  StorageCorrupt,
-  QuotaExceeded,
-  MigrationFailed,
-  BackupInvalid,
-  BackupTooLarge,
-  RestoreBusy,
-  RestoreFailed,
-  ProtocolMismatch,
-  ReplicaFenced,
-  OperationTimeout,
-  UnsupportedStorageFormatVersion,
-  CheckpointSuperseded,
-  DocumentLineageChanged,
-  CommandOutcomeUnknown
-])
 export type RestoreWireError = typeof RestoreWireError.Type
 
 const fields = {
@@ -210,31 +197,7 @@ const fieldMetadata = (
     )
   )
 
-export const restoreWireErrorFields = fieldMetadata({
-  DocumentNotFound,
-  DocumentDecodeError,
-  DocumentEncodeError,
-  UnsupportedDocumentVersion,
-  ProjectionBlocked,
-  CommandIdConflict,
-  ReceiptOperationMismatch,
-  StorageUnavailable,
-  CanonicalEncodeError,
-  StorageCorrupt,
-  QuotaExceeded,
-  MigrationFailed,
-  BackupInvalid,
-  BackupTooLarge,
-  RestoreBusy,
-  RestoreFailed,
-  ProtocolMismatch,
-  ReplicaFenced,
-  OperationTimeout,
-  UnsupportedStorageFormatVersion,
-  CheckpointSuperseded,
-  DocumentLineageChanged,
-  CommandOutcomeUnknown
-})
+export const restoreWireErrorFields = fieldMetadata(RestoreWireError.cases)
 
 export const boundedErrorDescriptionFields: ReadonlySet<string> = new Set(
   Object.keys(BoundedErrorDescription.fields)
@@ -441,6 +404,12 @@ export const encodeReplicaError = (
         { _tag: reason._tag, cause: emptyErrorDescription },
         ({ defect }) => ({ _tag: reason._tag, cause: defect(reason.cause) })
       )
+    case "ReplicaMetadataMissing":
+      return encodeWithinBudget(
+        maxBytes,
+        { _tag: reason._tag, operation: "" },
+        ({ text }) => ({ _tag: reason._tag, operation: text(reason.operation) })
+      )
     case "QuotaExceeded":
       return encodeWithinBudget(
         maxBytes,
@@ -618,6 +587,9 @@ export const replicaErrorFromWire = (wire: RestoreWireError): ReplicaError.Repli
       break
     case "StorageCorrupt":
       reason = new ReplicaError.StorageCorrupt({ cause: decodeDefect(wire.cause) })
+      break
+    case "ReplicaMetadataMissing":
+      reason = new ReplicaError.ReplicaMetadataMissing({ operation: wire.operation })
       break
     case "QuotaExceeded":
       reason = new ReplicaError.QuotaExceeded({ resource: wire.resource, limit: wire.limit })
