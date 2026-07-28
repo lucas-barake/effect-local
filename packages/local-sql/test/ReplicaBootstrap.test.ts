@@ -200,6 +200,132 @@ describe("ReplicaBootstrap", () => {
       Effect.provide(Layer.merge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer))
     ))
 
+  // The same shape as the test above, minus the `effect_local_documents` row. That single row is the
+  // only reason that one passes: the pre-migration probe covered the ten migration-1 tables and left
+  // the peer tables out, so a replica holding only peer rows walked straight past it.
+  //
+  // The consequence is worse than being migrated before rejection. Migration 6 deletes every
+  // `effect_local_peer_receipts` row whose `pending_message` is NULL, so by the time the authoritative
+  // post-migration probe runs the evidence is gone, bootstrap takes the fresh-replica branch, and it
+  // mints a NEW replica identity over the top of a database that still holds durable peer state.
+  //
+  // Reachable because the two peer tables' foreign keys into `effect_local_documents` are only
+  // enforced per connection: `@effect/sql-sqlite-node` inherits node:sqlite's default of ON, while
+  // `@effect/sql-sqlite-wasm` opens with no pragma at all, so the browser writes with them OFF.
+  it.effect("does not migrate a replica populated only with a peer receipt", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrator.make({})({
+        loader: Effect.map(Migrations.loader, (migrations) => migrations.slice(0, 2)),
+        table: "effect_local_migrations"
+      })
+      yield* sql`PRAGMA foreign_keys = OFF`
+      yield* sql`INSERT INTO effect_local_peer_receipts (
+        replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id,
+        message_hash, reply, reply_hash, pending_message, heads, accepted_heads,
+        commit_sequence, accepted_at
+      ) VALUES (
+        0, 'peer_1', 'connection_1', 1, 'doc_1', 'message_1',
+        NULL, NULL, NULL, '[]', '[]', 1, '2026-01-01T00:00:00.000Z'
+      )`
+
+      const result = yield* Effect.result(ReplicaBootstrap.make(definition))
+      assert.isTrue(Result.isFailure(result))
+      if (!Result.isFailure(result)) return
+      assert.strictEqual(result.failure._tag, "ReplicaError")
+      if (result.failure._tag !== "ReplicaError") return
+      assert.strictEqual(result.failure.reason._tag, "ReplicaMetadataMissing")
+
+      const applied = yield* sql<{ readonly migration_id: number }>`
+        SELECT migration_id FROM effect_local_migrations ORDER BY migration_id
+      `
+      assert.deepStrictEqual(applied.map((row) => row.migration_id), [1, 2])
+      // Migration 6 would have deleted this row on the way past.
+      const receipts = yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count FROM effect_local_peer_receipts
+      `
+      assert.strictEqual(receipts[0]?.count, 1)
+    }).pipe(
+      Effect.provide(Layer.merge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer))
+    ))
+
+  it.effect("does not migrate a replica populated only with a peer outbox row", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrator.make({})({
+        loader: Effect.map(Migrations.loader, (migrations) => migrations.slice(0, 2)),
+        table: "effect_local_migrations"
+      })
+      yield* sql`PRAGMA foreign_keys = OFF`
+      yield* sql`INSERT INTO effect_local_peer_outbox (
+        replica_incarnation, peer_id, connection_epoch, document_id,
+        send_sequence, message, message_hash, heads, status
+      ) VALUES (
+        0, 'peer_1', 'connection_1', 'doc_1', 1, x'00', 'message_1', '[]', 'Pending'
+      )`
+
+      const result = yield* Effect.result(ReplicaBootstrap.make(definition))
+      assert.isTrue(Result.isFailure(result))
+      if (!Result.isFailure(result)) return
+      assert.strictEqual(result.failure._tag, "ReplicaError")
+      if (result.failure._tag !== "ReplicaError") return
+      assert.strictEqual(result.failure.reason._tag, "ReplicaMetadataMissing")
+
+      const applied = yield* sql<{ readonly migration_id: number }>`
+        SELECT migration_id FROM effect_local_migrations ORDER BY migration_id
+      `
+      assert.deepStrictEqual(applied.map((row) => row.migration_id), [1, 2])
+    }).pipe(
+      Effect.provide(Layer.merge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer))
+    ))
+
+  // `effect_local_history_rewrites` has no foreign key at all, by design, so this state is reachable
+  // with foreign keys fully enforced - no browser writer required.
+  it.effect("does not migrate a replica populated only with a history rewrite marker", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrator.make({})({
+        loader: Effect.map(Migrations.loader, (migrations) => migrations.slice(0, 9)),
+        table: "effect_local_migrations"
+      })
+      yield* sql`INSERT INTO effect_local_history_rewrites (
+        replica_incarnation, operation_id, document_id, lineage, rewritten_at
+      ) VALUES (0, 'op_1', 'doc_1', 'lineage_1', '2026-01-01T00:00:00.000Z')`
+      yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
+
+      const result = yield* Effect.result(ReplicaBootstrap.make(definition))
+      assert.isTrue(Result.isFailure(result))
+      if (!Result.isFailure(result)) return
+      assert.strictEqual(result.failure._tag, "ReplicaError")
+      if (result.failure._tag !== "ReplicaError") return
+      assert.strictEqual(result.failure.reason._tag, "ReplicaMetadataMissing")
+    }).pipe(
+      Effect.provide(Layer.merge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer))
+    ))
+
+  // The counterweight. Widening the probe must not reject a database that is legitimately empty of
+  // durable state: the migrator writes its own bookkeeping rows on every migrated database, so a probe
+  // that counted those would refuse to create any replica at all.
+  it.effect("still mints an identity for a fresh database", () =>
+    Effect.gen(function*() {
+      const state = yield* ReplicaBootstrap.make(definition)
+      assert.strictEqual(state.incarnation, 0)
+      assert.strictEqual(state.definitionHash, definition.hash)
+    }).pipe(
+      Effect.provide(Layer.merge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer))
+    ))
+
+  // A first launch that was interrupted between the migration commit and the identity insert leaves a
+  // fully migrated database with no singleton and no durable rows. It has to recover, not brick.
+  it.effect("still mints an identity when migrations committed but the identity insert did not", () =>
+    Effect.gen(function*() {
+      yield* Migrations.run
+      const state = yield* ReplicaBootstrap.make(definition)
+      assert.strictEqual(state.incarnation, 0)
+    }).pipe(
+      Effect.provide(Layer.merge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer))
+    ))
+
   it.effect("rejects an incompatible replica definition without modifying metadata", () =>
     Effect.gen(function*() {
       const first = yield* ReplicaBootstrap.make(definition)
