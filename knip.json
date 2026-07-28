@@ -3,12 +3,8 @@
   "includeEntryExports": false,
   "workspaces": {
     "packages/local-sql": {
-      "entry": [
-        "test/crash-durability/childProcess.ts"
-      ],
-      "ignoreDependencies": [
-        "tsx"
-      ]
+      "entry": ["test/crash-durability/childProcess.ts"],
+      "ignoreDependencies": ["tsx"]
     },
     "packages/local-browser": {
       "entry": [
@@ -18,15 +14,10 @@
         "test-browser/*/public/service-worker.js",
         "test-browser/*/relay-server.ts"
       ],
-      "ignoreDependencies": [
-        "@effect/platform-browser",
-        "tsx"
-      ]
+      "ignoreDependencies": ["@effect/platform-browser", "tsx"]
     },
     "packages/local-test": {
-      "ignoreDependencies": [
-        "@effect/platform-node-shared"
-      ]
+      "ignoreDependencies": ["@effect/platform-node-shared"]
     }
   }
 }
