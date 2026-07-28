@@ -19,7 +19,6 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as DocumentStore from "./DocumentStore.js"
 import * as InternalAutomerge from "./internal/automerge.js"
-import { metadataMissing } from "./internal/errors.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
@@ -1024,13 +1023,21 @@ const make = (
     // the one-condition-one-answer invariant if the statement order ever changes.
     const nextSequence = incrementCommitSequence(undefined).pipe(Effect.flatMap((rows) =>
       rows[0] === undefined
-        ? Effect.fail(metadataMissing("PeerSync.nextSequence"))
+        ? Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ReplicaMetadataMissing({ operation: "PeerSync.nextSequence" })
+          })
+        )
         : Effect.succeed(Identity.CommitSequence.make(rows[0].commit_sequence))
     ))
 
     const currentSequence = findCommitSequence(undefined).pipe(Effect.flatMap((rows) =>
       rows[0] === undefined
-        ? Effect.fail(metadataMissing("PeerSync.currentSequence"))
+        ? Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ReplicaMetadataMissing({ operation: "PeerSync.currentSequence" })
+          })
+        )
         : Effect.succeed(Identity.CommitSequence.make(rows[0].commit_sequence))
     ))
 

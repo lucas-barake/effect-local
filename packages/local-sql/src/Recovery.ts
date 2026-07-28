@@ -15,7 +15,6 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as InternalAutomerge from "./internal/automerge.js"
-import { metadataMissing } from "./internal/errors.js"
 import * as Rows from "./internal/rows.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -89,7 +88,12 @@ export const make = Effect.gen(function*() {
     execute: () => sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`
   })(undefined).pipe(
     Effect.map((row) => row.commit_sequence),
-    Effect.catchTag("NoSuchElementError", () => Effect.fail(metadataMissing("Recovery.recover")))
+    Effect.catchTag("NoSuchElementError", () =>
+      Effect.fail(
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.ReplicaMetadataMissing({ operation: "Recovery.recover" })
+        })
+      ))
   )
 
   const findCheckpoints = SqlSchema.findAll({

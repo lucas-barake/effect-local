@@ -14,7 +14,6 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as InternalAutomerge from "./internal/automerge.js"
-import { metadataMissing } from "./internal/errors.js"
 import * as Rows from "./internal/rows.js"
 import * as Recovery from "./Recovery.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -95,7 +94,12 @@ export const layer: Layer.Layer<
     })(undefined).pipe(
       Effect.map((row) => row.commit_sequence),
       Effect.catchTags({
-        NoSuchElementError: () => Effect.fail(metadataMissing("DocumentStore.nextSequence")),
+        NoSuchElementError: () =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ReplicaMetadataMissing({ operation: "DocumentStore.nextSequence" })
+            })
+          ),
         SchemaError: (cause) =>
           Effect.fail(
             new ReplicaError.ReplicaError({
@@ -109,7 +113,12 @@ export const layer: Layer.Layer<
     const currentDefinitionHash = findDefinitionHash(undefined).pipe(
       Effect.map((row) => row.definition_hash),
       Effect.catchTags({
-        NoSuchElementError: () => Effect.fail(metadataMissing("DocumentStore.definitionHash")),
+        NoSuchElementError: () =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ReplicaMetadataMissing({ operation: "DocumentStore.definitionHash" })
+            })
+          ),
         SchemaError: (cause) =>
           Effect.fail(
             new ReplicaError.ReplicaError({
@@ -128,7 +137,12 @@ export const layer: Layer.Layer<
       execute: () => sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`
     })(undefined).pipe(
       Effect.map((row) => row.commit_sequence),
-      Effect.catchTag("NoSuchElementError", () => Effect.fail(metadataMissing("DocumentStore.verifyPersisted")))
+      Effect.catchTag("NoSuchElementError", () =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ReplicaMetadataMissing({ operation: "DocumentStore.verifyPersisted" })
+          })
+        ))
     )
 
     const findPersistedChanges = SqlSchema.findAll({

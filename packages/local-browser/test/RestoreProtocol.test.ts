@@ -375,16 +375,13 @@ it.effect("guards transferred MessagePort values", () =>
     channel.port2.close()
   }))
 
-const metadataMissing = (operation: string) =>
-  new ReplicaError.ReplicaError({
-    reason: new ReplicaError.ReplicaMetadataMissing({ operation })
-  })
-
 it.effect("preserves every ReplicaGate operation at the minimum configured error budget", () =>
   Effect.gen(function*() {
     for (const operation of ["ReplicaGate.claim", "ReplicaGate.refresh", "ReplicaGate.validate"]) {
       const encoded = RestoreProtocol.encodeReplicaError(
-        metadataMissing(operation),
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.ReplicaMetadataMissing({ operation })
+        }),
         ReplicaLimits.minimumRestoreErrorBytes
       )
       const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
@@ -401,7 +398,12 @@ it.effect("keeps its own tag when the budget is exhausted and only truncates the
   Effect.gen(function*() {
     // The fixed shape costs 35 bytes (`_tag`, the tag itself, `operation`), so 40 leaves five.
     const maxBytes = 40
-    const encoded = RestoreProtocol.encodeReplicaError(metadataMissing("ReplicaGate.validate"), maxBytes)
+    const encoded = RestoreProtocol.encodeReplicaError(
+      new ReplicaError.ReplicaError({
+        reason: new ReplicaError.ReplicaMetadataMissing({ operation: "ReplicaGate.validate" })
+      }),
+      maxBytes
+    )
     const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
     const reason = RestoreProtocol.replicaErrorFromWire(decoded).reason
     assert.strictEqual(reason._tag, "ReplicaMetadataMissing")

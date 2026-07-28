@@ -13,7 +13,6 @@ import type * as Migrator from "effect/unstable/sql/Migrator"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
-import { metadataMissing } from "./internal/errors.js"
 import { populatedTables, storageFormatVersion } from "./internal/schema.js"
 import * as Migrations from "./Migrations.js"
 
@@ -89,7 +88,9 @@ export const make = (definition: ReplicaDefinition.Any) =>
       const stored = (yield* findStorageFormat(undefined))[0]
       if (stored === undefined) {
         if (yield* isPopulated) {
-          return yield* metadataMissing("ReplicaBootstrap.probe")
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ReplicaMetadataMissing({ operation: "ReplicaBootstrap.probe" })
+          })
         }
         return
       }
@@ -143,7 +144,9 @@ export const make = (definition: ReplicaDefinition.Any) =>
       const metadata = yield* findMetadata(undefined)
       if (metadata.length === 0) {
         if (yield* isPopulated) {
-          return yield* metadataMissing("ReplicaBootstrap.populated")
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ReplicaMetadataMissing({ operation: "ReplicaBootstrap.populated" })
+          })
         }
         yield* sql`INSERT INTO effect_local_metadata (
           singleton,
@@ -165,7 +168,9 @@ export const make = (definition: ReplicaDefinition.Any) =>
       }
       const format = (yield* findFormat(undefined))[0]
       if (format === undefined) {
-        return yield* metadataMissing("ReplicaBootstrap.format")
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.ReplicaMetadataMissing({ operation: "ReplicaBootstrap.format" })
+        })
       }
       if (format.storage_format_version !== storageFormatVersion) {
         return yield* new ReplicaError.ReplicaError({
@@ -195,7 +200,12 @@ export const make = (definition: ReplicaDefinition.Any) =>
       }
       yield* sql`UPDATE effect_local_metadata SET writer_generation = writer_generation + 1 WHERE singleton = 1`
       const row = yield* findPermit(undefined).pipe(
-        Effect.catchTag("NoSuchElementError", () => metadataMissing("ReplicaBootstrap.permit"))
+        Effect.catchTag("NoSuchElementError", () =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ReplicaMetadataMissing({ operation: "ReplicaBootstrap.permit" })
+            })
+          ))
       )
       yield* sql`INSERT INTO effect_local_writer_generations (generation, claimed_at)
         VALUES (${row.writer_generation}, ${DateTime.formatIso(yield* DateTime.now)})`
