@@ -43,6 +43,7 @@ Read this file before any work. Treat these rules as required for every package.
 - A leaked requirement is a real cost: it spreads to every transitive caller, it lets a method be invoked under a context the Layer never validated, and it hides which services an implementation actually needs behind the call sites instead of stating it once at construction.
 - A Layer must capture every service used later by its methods.
 - Export a constructor or use `Layer.fresh` when a context sensitive Layer must build independently more than once under one memo map.
+- Wire reactive consumers through the shared `Atom.runtime` factory so every atom runtime builds under one `Layer.MemoMap` and shares service instances app wide. Do not pair a bespoke `ManagedRuntime` with `Atom.context({ memoMap })` to re-expose its context to atoms; reserve `ManagedRuntime` for non reactive entry points that need explicit disposal, such as worker bootstraps.
 
 ## Composition And Effects
 

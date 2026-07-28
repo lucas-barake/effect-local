@@ -6,11 +6,9 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
-import * as ManagedRuntime from "effect/ManagedRuntime"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { Atom } from "effect/unstable/reactivity"
-import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import { definition, ListTasks, RenameTask, SetTaskCompleted, TaskDocument, TaskList } from "./domain.ts"
 
 declare global {
@@ -59,11 +57,10 @@ const OwnershipLive = OwnershipCoordinator.layerTab({
 const ReplicaLive = Layer.merge(
   BrowserReplica.layerWithReactivity(definition).pipe(Layer.provide(Layer.merge(OwnershipLive, BrowserCrypto.layer))),
   BrowserCrypto.layer
-).pipe(Layer.provideMerge(Reactivity.layer))
-const replicaRuntime = ManagedRuntime.make(ReplicaLive)
-const runtime = Atom.context({ memoMap: replicaRuntime.memoMap })(
-  Layer.effectContext(replicaRuntime.contextEffect)
 )
+// The shared `Atom.runtime` factory supplies `Reactivity` and builds every Layer under the
+// default memo map, so these services are shared with any other atom runtime in the app.
+export const runtime = Atom.runtime(ReplicaLive)
 
 export const tasks = ReplicaAtom.queryFamily(runtime, ListTasks)
 export const task = ReplicaAtom.documentFamily(runtime, TaskDocument)
@@ -146,5 +143,3 @@ export const restoreBackup = runtime.fn<Uint8Array>()(
     }),
   { concurrent: false, reactivityKeys: [TaskList.name] }
 )
-
-export const dispose = () => replicaRuntime.dispose()
