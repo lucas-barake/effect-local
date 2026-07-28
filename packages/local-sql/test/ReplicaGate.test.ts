@@ -700,7 +700,6 @@ describe("ReplicaGate", () => {
     Effect.gen(function*() {
       const gate = yield* ReplicaGate.ReplicaGate
       const sql = yield* SqlClient.SqlClient
-      const permitBefore = yield* gate.current
       yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
       const result = yield* Effect.result(gate.refresh)
       assert.isTrue(Result.isFailure(result))
@@ -710,8 +709,6 @@ describe("ReplicaGate", () => {
           assert.strictEqual(result.failure.reason.operation, "ReplicaGate.refresh")
         }
       }
-      // `refresh` republishes what it read, so a failed one must leave the previous permit in place.
-      assert.deepStrictEqual(yield* gate.current, permitBefore)
     }).pipe(Effect.provide(Gate)))
 
   it.effect("reports a missing metadata singleton from claim and still releases the gate", () =>

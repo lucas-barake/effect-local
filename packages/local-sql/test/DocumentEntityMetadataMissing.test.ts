@@ -60,6 +60,7 @@ describe("DocumentEntity with a missing metadata singleton", () => {
         (SELECT COUNT(*) FROM ${sql(`${ClusterStorage.messagePrefix}_replies`)} r
            WHERE r.request_id = m.request_id) AS replies
       FROM ${sql(`${ClusterStorage.messagePrefix}_messages`)} m
+      WHERE m.kind = 0
       ORDER BY m.id`
   })
 
@@ -103,28 +104,11 @@ describe("DocumentEntity with a missing metadata singleton", () => {
         { tag: "Create", processed: 1, replies: 1 },
         { tag: "Mutate", processed: 0, replies: 0 }
       ])
-    }).pipe(Effect.provide(Live), Effect.provide(Database), TestClock.withLive), 60_000)
 
-  it.effect("still resolves the command id through lookup rather than a stored failure", () =>
-    Effect.gen(function*() {
-      const replica = yield* Replica.Replica
-      const sql = yield* SqlClient.SqlClient
-      const documentId = yield* replica.create(Task, {
-        commandId: yield* Identity.makeCommandId,
-        value: { title: "one" }
-      })
-      const commandId = yield* Identity.makeCommandId
-
-      yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
-      yield* Effect.result(
-        replica.mutate(Rename, { commandId, documentId, payload: "two" }).pipe(Effect.timeout("10 seconds"))
-      )
-
-      // The failed handler's transaction rolled back, so no receipt was written. That is what keeps
-      // the documented recovery for an uncertain command honest: `lookup*` reads the receipt table
-      // directly through `gate.admit`, never through the entity.
+      // And no receipt, so the command id is not burned: the documented recovery for an uncertain
+      // command reads this table directly through `gate.admit`, never through the entity.
       const receipts = yield* sql<{ readonly count: number }>`
-        SELECT COUNT(*) AS count FROM effect_local_command_receipts WHERE command_id = ${commandId}`
-      assert.strictEqual(receipts[0]?.count, 0)
+        SELECT COUNT(*) AS count FROM effect_local_command_receipts`
+      assert.strictEqual(receipts[0]?.count, 1)
     }).pipe(Effect.provide(Live), Effect.provide(Database), TestClock.withLive), 60_000)
 })

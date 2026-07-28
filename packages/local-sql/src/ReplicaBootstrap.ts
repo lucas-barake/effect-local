@@ -62,12 +62,13 @@ export const make = (definition: ReplicaDefinition.Any) =>
     })
     // Which of the durable tables actually exist right now. The probe below has to run BEFORE the
     // migrator, so it cannot assume the current schema: migration 2 creates the peer tables, 9 the
-    // rewrite markers and 10 the relay tables. Intersecting the known list with `sqlite_master` lets
-    // one probe cover whatever this database has reached.
-    const findExistingTables = SqlSchema.findAll({
+    // rewrite markers and 10 the relay tables. Asking `sqlite_master` for exactly the known list lets
+    // one probe cover whatever this database has reached, and keeps that list the only place the set
+    // is written down: a name pattern here would have to be kept in agreement with it by hand.
+    const findExistingPopulatedTables = SqlSchema.findAll({
       Request: Schema.Void,
       Result: Schema.Struct({ name: Schema.String }),
-      execute: () => sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'effect_local_%'`
+      execute: () => sql`SELECT name FROM sqlite_master WHERE type = 'table' AND ${sql.in("name", populatedTables)}`
     })
     // A populated replica whose metadata singleton is gone is corrupt, and must be rejected before the
     // migrator touches it rather than after. Rejecting afterwards is not a cosmetic difference:
@@ -77,8 +78,9 @@ export const make = (definition: ReplicaDefinition.Any) =>
     //
     // `addParens: false` matters. `sql.join` parenthesises by default, which would produce
     // `SELECT EXISTS ((SELECT 1 ... UNION ALL SELECT 1 ...))` -- a SQLite syntax error as soon as
-    // there is more than one table. The table names come from a compile-time constant and go through
-    // `sql(name)`, which the dialect escapes, never `sql.literal`.
+    // there is more than one table. `names` can only hold values from the compile-time
+    // `populatedTables` list, because the query above selects by it, and each goes through `sql(name)`,
+    // which the dialect escapes, never `sql.literal`.
     const findPopulatedIn = (names: ReadonlyArray<string>) =>
       SqlSchema.findOneOption({
         Request: Schema.Void,
@@ -90,8 +92,7 @@ export const make = (definition: ReplicaDefinition.Any) =>
       })(undefined)
 
     const isPopulated = Effect.gen(function*() {
-      const existing = new Set((yield* findExistingTables(undefined)).map((row) => row.name))
-      const names = populatedTables.filter((name) => existing.has(name))
+      const names = (yield* findExistingPopulatedTables(undefined)).map((row) => row.name)
       if (names.length === 0) return false
       const populated = yield* findPopulatedIn(names)
       return populated._tag === "Some" && populated.value.populated === 1

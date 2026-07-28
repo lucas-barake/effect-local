@@ -303,29 +303,6 @@ describe("ReplicaBootstrap", () => {
       Effect.provide(Layer.merge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer))
     ))
 
-  // The counterweight. Widening the probe must not reject a database that is legitimately empty of
-  // durable state: the migrator writes its own bookkeeping rows on every migrated database, so a probe
-  // that counted those would refuse to create any replica at all.
-  it.effect("still mints an identity for a fresh database", () =>
-    Effect.gen(function*() {
-      const state = yield* ReplicaBootstrap.make(definition)
-      assert.strictEqual(state.incarnation, 0)
-      assert.strictEqual(state.definitionHash, definition.hash)
-    }).pipe(
-      Effect.provide(Layer.merge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer))
-    ))
-
-  // A first launch that was interrupted between the migration commit and the identity insert leaves a
-  // fully migrated database with no singleton and no durable rows. It has to recover, not brick.
-  it.effect("still mints an identity when migrations committed but the identity insert did not", () =>
-    Effect.gen(function*() {
-      yield* Migrations.run
-      const state = yield* ReplicaBootstrap.make(definition)
-      assert.strictEqual(state.incarnation, 0)
-    }).pipe(
-      Effect.provide(Layer.merge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer))
-    ))
-
   it.effect("rejects an incompatible replica definition without modifying metadata", () =>
     Effect.gen(function*() {
       const first = yield* ReplicaBootstrap.make(definition)

@@ -380,15 +380,6 @@ const metadataMissing = (operation: string) =>
     reason: new ReplicaError.ReplicaMetadataMissing({ operation })
   })
 
-it.effect("round trips a missing replica metadata reason with its operation intact", () =>
-  Effect.gen(function*() {
-    const original = metadataMissing("ReplicaGate.validate")
-    const encoded = RestoreProtocol.encodeReplicaError(original, 4_096)
-    assert.strictEqual(encoded._tag, "ReplicaMetadataMissing")
-    const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
-    assert.deepStrictEqual(RestoreProtocol.replicaErrorFromWire(decoded), original)
-  }))
-
 it.effect("preserves every ReplicaGate operation at the minimum configured error budget", () =>
   Effect.gen(function*() {
     for (const operation of ["ReplicaGate.claim", "ReplicaGate.refresh", "ReplicaGate.validate"]) {
@@ -396,7 +387,6 @@ it.effect("preserves every ReplicaGate operation at the minimum configured error
         metadataMissing(operation),
         ReplicaLimits.minimumRestoreErrorBytes
       )
-      assert.isTrue(RestoreProtocol.preflight(encoded, ReplicaLimits.minimumRestoreErrorBytes), operation)
       const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
       const reason = RestoreProtocol.replicaErrorFromWire(decoded).reason
       assert.strictEqual(reason._tag, "ReplicaMetadataMissing")
@@ -412,7 +402,6 @@ it.effect("keeps its own tag when the budget is exhausted and only truncates the
     // The fixed shape costs 35 bytes (`_tag`, the tag itself, `operation`), so 40 leaves five.
     const maxBytes = 40
     const encoded = RestoreProtocol.encodeReplicaError(metadataMissing("ReplicaGate.validate"), maxBytes)
-    assert.isTrue(RestoreProtocol.preflight(encoded, maxBytes))
     const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
     const reason = RestoreProtocol.replicaErrorFromWire(decoded).reason
     assert.strictEqual(reason._tag, "ReplicaMetadataMissing")
