@@ -7,6 +7,7 @@ import * as PeerRelayOutboxLimits from "@lucas-barake/effect-local-sql/PeerRelay
 import * as PeerRelayReceiptLimits from "@lucas-barake/effect-local-sql/PeerRelayReceiptLimits"
 import * as ReplicaGate from "@lucas-barake/effect-local-sql/ReplicaGate"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
+import * as TestReplica from "@lucas-barake/effect-local-test/TestReplica"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
@@ -87,38 +88,10 @@ const remotePrincipal = PeerAuthentication.PeerPrincipal.make({
 })
 
 const replicaLimits: ReplicaLimits.Values = {
-  maxBackupBytes: 16 * 1024 * 1024,
-  maxChunkBytes: 64 * 1024,
-  maxArchiveRecords: 10_000,
-  maxJsonDepth: 64,
-  maxSyncMessageBytes: 1024 * 1024,
+  ...TestReplica.defaultLimits,
   // Deliberately large. Every `TestClock.adjust` that brings a runner up also advances the
   // `Effect.timeout` in `PeerSession.send` and in `PeerSession` relay settlement.
-  maxPeerSendMillis: 3_600_000,
-  maxSyncChangesPerMessage: 1000,
-  maxSyncDependencyEdgesPerMessage: 10_000,
-  maxSyncOperationsPerMessage: 100_000,
-  maxPendingBytesPerDocument: 16 * 1024 * 1024,
-  maxPendingBytesPerPeer: 32 * 1024 * 1024,
-  maxPendingBytesPerReplica: 64 * 1024 * 1024,
-  maxPendingAgeMillis: 60_000,
-  maxPendingChangesPerDocument: 10_000,
-  maxPendingChangesPerPeer: 20_000,
-  maxPendingChangesPerReplica: 50_000,
-  maxPendingDependencyEdgesPerDocument: 100_000,
-  maxPendingDependencyEdgesPerPeer: 200_000,
-  maxPendingDependencyEdgesPerReplica: 500_000,
-  maxSessions: 32,
-  maxStreamsPerSession: 32,
-  maxInFlightPerSession: 128,
-  maxQueuedRpc: 1024,
-  maxQueuedPermits: 1024,
-  maxActiveRestores: 1024,
-  maxRestoresPerSession: 128,
-  maxRestoreMillis: 30_000,
-  maxRestorePullMillis: 10_000,
-  maxRestoreCoalesceMillis: 25,
-  maxRestoreErrorBytes: 4_096
+  maxPeerSendMillis: 3_600_000
 }
 
 const outboxLimits: PeerRelayOutboxLimits.Values = PeerRelayOutboxLimits.defaults

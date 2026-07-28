@@ -132,6 +132,13 @@ const relayEntry = (payload: Uint8Array): PeerRelayOutbox.Entry => ({
 /**
  * `overrides` re-derives the digest from the tampered envelope. A message edited afterwards fails
  * the digest check, so it proves nothing about the endpoint and document checks beside it.
+ *
+ * `storedSender` and `storedRecipient` are the opposite, and are what make the endpoint check
+ * pinnable at all. They leave the envelope - and therefore the digest - addressed correctly, and
+ * rewrite only the principals the `StoredMessage` carries. `validateStoredMessage` recomputes the
+ * digest from the CONFIGURED principals, so it still matches, and the endpoint check is then the
+ * only thing standing between the message and the replica. That is also the real threat: a relay
+ * handing over a message whose stated endpoints disagree with what the digest covers.
  */
 const makeStoredMessage = (
   payloadSeed: Uint8Array,
@@ -140,6 +147,8 @@ const makeStoredMessage = (
     readonly sender?: PeerSyncEnvelope.RelayPeerPrincipal
     readonly recipient?: PeerSyncEnvelope.RelayPeerPrincipal
     readonly document?: { readonly documentType: string; readonly documentId: Identity.DocumentId }
+    readonly storedSender?: PeerSyncEnvelope.RelayPeerPrincipal
+    readonly storedRecipient?: PeerSyncEnvelope.RelayPeerPrincipal
   }
 ) =>
   Effect.gen(function*() {
@@ -209,14 +218,16 @@ const makeStoredMessage = (
       claimToken,
       relayPeerId,
       sender: {
-        tenantId: envelope.expectedLocal.tenantId,
-        subjectId: envelope.expectedLocal.subjectId,
-        peerId: envelope.expectedLocal.peerId,
+        // `replicaIncarnation`, `connectionEpoch` and `sequence` are digested, so they must come
+        // from the envelope even when the principal is rewritten, or the digest check refuses first.
+        tenantId: (overrides?.storedSender ?? envelope.expectedLocal).tenantId,
+        subjectId: (overrides?.storedSender ?? envelope.expectedLocal).subjectId,
+        peerId: (overrides?.storedSender ?? envelope.expectedLocal).peerId,
         replicaIncarnation: envelope.senderReplicaIncarnation,
         connectionEpoch: envelope.senderConnectionEpoch,
         sequence: envelope.senderSequence
       },
-      recipient: envelope.remote,
+      recipient: overrides?.storedRecipient ?? envelope.remote,
       payloadVersion: envelope.payloadVersion,
       document: envelope.document,
       writerProvenance: envelope.writerProvenance,
@@ -472,16 +483,15 @@ describe("RpcPeerTransport", () => {
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
-  // The digest is recomputed from the CONFIGURED sender and recipient, so a wrong principal fails it
-  // whatever the endpoint checks do. The document is taken from the event itself, so a misdirected
-  // one produces a valid digest and only the selected-document check refuses it - and that check was
-  // pinned by nothing in the repository.
+  // Each of these keeps the digest valid for what the message claims to be, so exactly one guard can
+  // refuse it. Tampering the envelope instead would fail the digest and prove nothing about the
+  // guard beside it.
   for (
     const wrong of [
       {
         name: "a sender that is not the configured remote peer",
         overrides: {
-          sender: {
+          storedSender: {
             tenantId: "tenant",
             subjectId: "remote-subject",
             peerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-0000000000ff")
@@ -491,7 +501,7 @@ describe("RpcPeerTransport", () => {
       {
         name: "a recipient that is not this peer",
         overrides: {
-          recipient: {
+          storedRecipient: {
             tenantId: "tenant",
             subjectId: "local-subject",
             peerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-0000000000fe")

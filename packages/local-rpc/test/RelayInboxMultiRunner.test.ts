@@ -2,9 +2,6 @@ import { NodeClusterSocket, NodeCrypto } from "@effect/platform-node"
 import { PgClient } from "@effect/sql-pg"
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
-import { PostgreSqlContainer } from "@testcontainers/postgresql"
-import * as Context from "effect/Context"
-import * as Data from "effect/Data"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -31,6 +28,7 @@ import * as Net from "node:net"
 import type * as PeerRpc from "../src/PeerRpc.js"
 import * as RelayInbox from "../src/RelayInbox.js"
 import * as SqlRelayInboxStore from "../src/SqlRelayInboxStore.js"
+import { PgContainer } from "./PgContainer.js"
 
 const peer = (value: string) => Identity.PeerId.make(`peer_00000000-0000-4000-8000-${value}`)
 const relayId = (value: string) => Identity.RelayMessageId.make(`rly_00000000-0000-4000-8000-${value}`)
@@ -51,25 +49,6 @@ const baseOptions: RelayInbox.Options = {
   maxPendingBytes: 10_000_000,
   mailboxCapacity: 16,
   maxIdleTime: Duration.hours(1)
-}
-
-class ContainerError extends Data.TaggedError("ContainerError")<{
-  readonly cause: unknown
-}> {}
-
-class PgContainer extends Context.Service<PgContainer>()(
-  "@lucas-barake/effect-local-rpc/test/MultiRunnerPgContainer",
-  {
-    make: Effect.acquireRelease(
-      Effect.tryPromise({
-        try: () => new PostgreSqlContainer("postgres:alpine").start(),
-        catch: (cause) => new ContainerError({ cause })
-      }),
-      (container) => Effect.promise(() => container.stop())
-    )
-  }
-) {
-  static readonly layer = Layer.effect(this)(this.make)
 }
 
 /**
@@ -296,13 +275,12 @@ describe("RelayInbox multi-runner", () => {
 
   it.live("leaves both runners hosting the key when they do not share a shard map", () =>
     Effect.gen(function*() {
-      // A shorter window than the positive case, which is a generous timeout on an event that is
-      // expected to arrive: in the shared run the replacement lands in well under a second, so five
-      // seconds is far past the point where one would have been observed. The load bearing
-      // assertion here is the hosting count, which is positive evidence either way.
-      const { exit, hosting } = yield* probe({ isolated: true, window: Duration.seconds(5) })
+      // The hosting count is the whole control, and it is positive evidence: each runner having its
+      // own instance is what distinguishes "sharding elected one owner" from "there was only ever
+      // one candidate". Deliberately no assertion on `exit` being absent - an absence bounded by a
+      // duration is satisfied by nothing happening, so it can only ever false-pass.
+      const { hosting } = yield* probe({ isolated: true, window: Duration.seconds(5) })
 
       assert.deepStrictEqual(hosting, [1, 1], "each runner served its own instance of the inbox")
-      assert.strictEqual(exit, undefined, "so nothing replaced session A and its stream stayed open")
     }).pipe(Effect.provide(PgContainer.layer)), 180_000)
 })

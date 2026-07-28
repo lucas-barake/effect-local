@@ -101,20 +101,20 @@ const StoredRow = Schema.Struct({
   outer_envelope_digest: Schema.String
 })
 
+const findStoredRow = SqlSchema.findOne({
+  Request: Schema.Struct({ inboxKey: Schema.String, relayMessageId: Schema.String }),
+  Result: StoredRow,
+  execute: (request) =>
+    SqlClient.SqlClient.use((sql) =>
+      sql`
+        SELECT state, envelope, message_hash, outer_envelope_digest FROM ${sql(Migrations.tableName)}
+        WHERE inbox_key = ${request.inboxKey} AND relay_message_id = ${request.relayMessageId}
+      `
+    )
+})
+
 const storedRow = (inboxKey: string, relayMessageId: string) =>
-  Effect.gen(function*() {
-    const sql = yield* SqlClient.SqlClient
-    const find = SqlSchema.findOne({
-      Request: Schema.Struct({ inboxKey: Schema.String, relayMessageId: Schema.String }),
-      Result: StoredRow,
-      execute: (request) =>
-        sql`
-          SELECT state, envelope, message_hash, outer_envelope_digest FROM ${sql(Migrations.tableName)}
-          WHERE inbox_key = ${request.inboxKey} AND relay_message_id = ${request.relayMessageId}
-        `
-    })
-    return yield* find({ inboxKey, relayMessageId })
-  }).pipe(Effect.orDie)
+  findStoredRow({ inboxKey, relayMessageId }).pipe(Effect.orDie)
 
 export interface ContractCheck {
   readonly name: string
