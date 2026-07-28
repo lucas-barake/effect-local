@@ -669,4 +669,51 @@ describe("ReplicaGate", () => {
       assert.isTrue(Result.isFailure(result))
       if (Result.isFailure(result)) assert.strictEqual(result.failure.reason._tag, "StorageCorrupt")
     }).pipe(Effect.provide(Gate)))
+
+  // A missing singleton is replica-wide, not one document's bytes, so it must not arrive as
+  // `StorageCorrupt`: `ReplicaEvolution` quarantines a document on that reason and `BackupStore`
+  // reports it as an invalid backup.
+  it.effect("reports a missing metadata singleton as a typed replica-wide failure", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      const permit = yield* gate.current
+      yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
+      const result = yield* Effect.result(gate.validate(permit))
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure.reason._tag, "ReplicaMetadataMissing")
+      }
+    }).pipe(Effect.provide(Gate)))
+
+  it.effect("reports a missing metadata singleton from refresh as well", () =>
+    Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
+      const result = yield* Effect.result(gate.refresh)
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure.reason._tag, "ReplicaMetadataMissing")
+      }
+    }).pipe(Effect.provide(Gate)))
+
+  // `claim` reads the singleton twice inside its own transaction, right after an UPDATE that matches
+  // zero rows. The exclusive permit must still be released, or every later acquirer deadlocks.
+  it.effect("reports a missing metadata singleton from claim and still releases the gate", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const gate = yield* ReplicaGate.ReplicaGate
+      const sql = yield* SqlClient.SqlClient
+      yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
+      const result = yield* Effect.result(gate.claim(() => Effect.void))
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result) && result.failure._tag === "ReplicaError") {
+        assert.strictEqual(result.failure.reason._tag, "ReplicaMetadataMissing")
+      }
+      const generations = yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count FROM effect_local_writer_generations`
+      assert.strictEqual(generations[0]?.count, 1)
+      // Proves the exclusive permit was released rather than stranded.
+      yield* Effect.scoped(gate.shared)
+    })).pipe(Effect.provide(Gate)))
 })

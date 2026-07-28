@@ -58,6 +58,11 @@ const CanonicalEncodeError = Schema.TaggedStruct("CanonicalEncodeError", {
 const StorageCorrupt = Schema.TaggedStruct("StorageCorrupt", {
   cause: BoundedErrorDescription
 })
+// Deliberately its own member rather than folded into StorageCorrupt: the page has to be able to tell
+// "this replica has no identity" from "one document's bytes are unusable".
+const ReplicaMetadataMissing = Schema.TaggedStruct("ReplicaMetadataMissing", {
+  operation: Schema.String
+})
 const QuotaExceeded = Schema.TaggedStruct("QuotaExceeded", {
   resource: Schema.String,
   limit: Schema.Int
@@ -120,6 +125,7 @@ export const RestoreWireError = Schema.Union([
   StorageUnavailable,
   CanonicalEncodeError,
   StorageCorrupt,
+  ReplicaMetadataMissing,
   QuotaExceeded,
   MigrationFailed,
   BackupInvalid,
@@ -221,6 +227,7 @@ export const restoreWireErrorFields = fieldMetadata({
   StorageUnavailable,
   CanonicalEncodeError,
   StorageCorrupt,
+  ReplicaMetadataMissing,
   QuotaExceeded,
   MigrationFailed,
   BackupInvalid,
@@ -441,6 +448,12 @@ export const encodeReplicaError = (
         { _tag: reason._tag, cause: emptyErrorDescription },
         ({ defect }) => ({ _tag: reason._tag, cause: defect(reason.cause) })
       )
+    case "ReplicaMetadataMissing":
+      return encodeWithinBudget(
+        maxBytes,
+        { _tag: reason._tag, operation: "" },
+        ({ text }) => ({ _tag: reason._tag, operation: text(reason.operation) })
+      )
     case "QuotaExceeded":
       return encodeWithinBudget(
         maxBytes,
@@ -618,6 +631,9 @@ export const replicaErrorFromWire = (wire: RestoreWireError): ReplicaError.Repli
       break
     case "StorageCorrupt":
       reason = new ReplicaError.StorageCorrupt({ cause: decodeDefect(wire.cause) })
+      break
+    case "ReplicaMetadataMissing":
+      reason = new ReplicaError.ReplicaMetadataMissing({ operation: wire.operation })
       break
     case "QuotaExceeded":
       reason = new ReplicaError.QuotaExceeded({ resource: wire.resource, limit: wire.limit })
