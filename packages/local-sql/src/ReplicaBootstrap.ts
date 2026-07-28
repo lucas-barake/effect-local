@@ -28,14 +28,6 @@ export class ReplicaBootstrap extends Context.Service<ReplicaBootstrap, State>()
   "@lucas-barake/effect-local-sql/ReplicaBootstrap"
 ) {}
 
-const unsupportedStorageFormat = (observedVersion: number) =>
-  new ReplicaError.ReplicaError({
-    reason: new ReplicaError.UnsupportedStorageFormatVersion({
-      observedVersion,
-      supportedVersion: storageFormatVersion
-    })
-  })
-
 export const make = (definition: ReplicaDefinition.Any) =>
   Effect.gen(function*() {
     const sql = yield* SqlClient.SqlClient
@@ -102,7 +94,12 @@ export const make = (definition: ReplicaDefinition.Any) =>
         return
       }
       if (stored.storage_format_version === storageFormatVersion) return
-      return yield* unsupportedStorageFormat(stored.storage_format_version)
+      return yield* new ReplicaError.ReplicaError({
+        reason: new ReplicaError.UnsupportedStorageFormatVersion({
+          observedVersion: stored.storage_format_version,
+          supportedVersion: storageFormatVersion
+        })
+      })
     }).pipe(Effect.catchTag("SchemaError", (cause) =>
       Effect.fail(
         new ReplicaError.ReplicaError({
@@ -171,7 +168,12 @@ export const make = (definition: ReplicaDefinition.Any) =>
         return yield* metadataMissing("ReplicaBootstrap.format")
       }
       if (format.storage_format_version !== storageFormatVersion) {
-        return yield* unsupportedStorageFormat(format.storage_format_version)
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.UnsupportedStorageFormatVersion({
+            observedVersion: format.storage_format_version,
+            supportedVersion: storageFormatVersion
+          })
+        })
       }
       if (format.definition_hash !== definition.hash) {
         const stored = yield* findStoredVersions(undefined)
