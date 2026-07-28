@@ -92,5 +92,8 @@ Read this file before any work. Treat these rules as required for every package.
 - Exercise production composition. Replace only true external boundaries.
 - Write Effect tests with `@effect/vitest` `it.effect` or `effect`.
 - Use `TestClock` from `effect/testing` for virtual time. Coordinate concurrency with production `Deferred`, `Latch`, `Queue`, fiber, and scope APIs. Do not use sleeps as synchronization.
+- Never synchronize a test on wall clock time. No `it.live` with `Effect.sleep`, real timer polling, or repetition loops that only pass when the machine is fast enough. A test whose runtime scales with real I/O against a fixed `testTimeout` is non deterministic by construction.
+- Every wait must rendezvous on observable state: a `Deferred`, `Latch`, `Queue`, or fiber join. Run time based code paths under `it.effect` so sleeps, timeouts, and retries resolve through `TestClock`, and advance them with `TestClock.adjust` or `setTime`.
+- When a hazard lives below the fiber, such as a cancel-less syscall that can outlive the interrupted fiber that issued it, observe it with a probe hooked into the callback boundary and gate it into the exact interleaving under test. An abandoned fiber runs nothing else, so Effect level tracking such as `Ref` or `ensuring` never sees it, and no real time delay can settle it deterministically.
 - Do not add tests that merely mirror private control flow.
 - Keep one initial release changeset for all packages changed before the first release.

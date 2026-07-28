@@ -4,10 +4,12 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import { FileSystem } from "effect/FileSystem"
+import * as Latch from "effect/Latch"
 import * as Schema from "effect/Schema"
 import * as Migrator from "effect/unstable/sql/Migrator"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as NFS from "node:fs"
 import * as Migrations from "../../src/Migrations.js"
 import type { FixtureSpec } from "./versions.js"
 import { fixtureDirectory, fixtures } from "./versions.js"
@@ -56,7 +58,55 @@ const generateFixtureSet = (directory: string, specs: ReadonlyArray<FixtureSpec>
     { discard: true }
   )
 
-const publishMissingFixtures = (destinationDirectory: string) =>
+// A cancel-less link syscall can outlive the fiber that issued it, so `Fiber.interrupt`
+// reporting success does not prove the kernel stopped publishing. Effect level tracking
+// (`Ref`, `ensuring`) never observes that, because an abandoned fiber runs nothing else.
+// The probe hooks the node callback itself, so syscall completion is seen from the event
+// loop even after the fiber is gone. The gate holds back every link after the first, so a
+// test interrupts inside one deterministic interleaving instead of racing real time.
+interface LinkProbe {
+  readonly awaitStarted: (index: number) => Effect.Effect<void>
+  readonly awaitCompleted: (index: number) => Effect.Effect<void>
+  readonly awaitQuiescent: Effect.Effect<void>
+  readonly release: Effect.Effect<void>
+  readonly link: (index: number, path: string, destination: string) => Effect.Effect<void>
+}
+
+const makeLinkProbe = (): LinkProbe => {
+  const started = fixtures.map(() => Latch.makeUnsafe())
+  const completed = fixtures.map(() => Latch.makeUnsafe())
+  const quiescent = Latch.makeUnsafe(true)
+  let inFlight = 0
+  let releaseGate!: () => void
+  const gate = new Promise<void>((resolve) => {
+    releaseGate = resolve
+  })
+  return {
+    awaitStarted: (index) => started[index]!.await,
+    awaitCompleted: (index) => completed[index]!.await,
+    awaitQuiescent: quiescent.await,
+    release: Effect.sync(() => releaseGate()),
+    link: (index, path, destination) =>
+      // Same shape as `FileSystem.link` (`effectify(NFS.link, ...)`): a callback with no
+      // canceler, so an interrupted fiber is abandoned while the syscall keeps going.
+      Effect.callback<void>((resume) => {
+        inFlight++
+        Latch.closeUnsafe(quiescent)
+        Latch.openUnsafe(started[index]!)
+        const issue = () =>
+          NFS.link(path, destination, (error) => {
+            inFlight--
+            if (inFlight === 0) Latch.openUnsafe(quiescent)
+            Latch.openUnsafe(completed[index]!)
+            resume(error === null ? Effect.void : Effect.die(error))
+          })
+        if (index === 0) issue()
+        else gate.then(issue)
+      })
+  }
+}
+
+const publishMissingFixtures = (destinationDirectory: string, probe?: LinkProbe) =>
   Effect.gen(function*() {
     const fs = yield* FileSystem
     const existing = yield* Effect.forEach(
@@ -85,13 +135,15 @@ const publishMissingFixtures = (destinationDirectory: string) =>
       }))
     yield* Effect.yieldNow
 
-    // Uninterruptible: `fs.link` resumes through a callback with no canceler, so an interrupted fiber
+    // Uninterruptible: the link resumes through a callback with no canceler, so an interrupted fiber
     // is abandoned while the syscall keeps going and publishes afterwards, leaving the directory ahead
     // of what this run reported. The `yieldNow` is now the only interruption point.
     yield* Effect.forEach(
       pending,
-      ({ path, published: destination }) =>
-        Effect.uninterruptible(fs.link(path, destination)).pipe(
+      ({ path, published: destination }, index) =>
+        Effect.uninterruptible(
+          probe === undefined ? fs.link(path, destination) : probe.link(index, path, destination)
+        ).pipe(
           Effect.andThen(Effect.yieldNow)
         ),
       { discard: true }
@@ -150,26 +202,30 @@ describe("migration fixture generation", () => {
       for (const spec of fixtures) assert.isTrue(yield* fs.exists(`${directory}/${spec.file}`))
     }).pipe(Effect.provide(NodeFileSystem.layer)))
 
-  it.live("publishes nothing more once it reports the publication was interrupted", () =>
+  it.effect("publishes nothing more once it reports the publication was interrupted", () =>
     Effect.gen(function*() {
       const fs = yield* FileSystem
-      // Live rather than virtual: no amount of `TestClock` advancement surfaces an abandoned syscall.
-      for (let attempt = 0; attempt < 8; attempt++) {
-        const directory = yield* fs.makeTempDirectoryScoped()
-        const publisher = yield* publishMissingFixtures(directory).pipe(Effect.forkChild)
-        while (!(yield* fs.exists(`${directory}/${fixtures[0]!.file}`))) yield* Effect.yieldNow
-        yield* Fiber.interrupt(publisher)
+      const directory = yield* fs.makeTempDirectoryScoped()
+      const probe = makeLinkProbe()
+      const publisher = yield* publishMissingFixtures(directory, probe).pipe(Effect.forkChild)
 
-        const published = (files: ReadonlyArray<string>) =>
-          files.filter((file) => fixtures.some((spec) => spec.file === file)).sort()
-        const reported = published(yield* fs.readDirectory(directory))
-        yield* Effect.sleep("200 millis")
-        assert.deepStrictEqual(
-          published(yield* fs.readDirectory(directory)),
-          reported,
-          "an interrupted publication must leave the directory exactly as it reported it"
-        )
-      }
+      // Interrupt with the second link mid flight, the one interleaving where a cancel-less
+      // syscall could outlive the fiber that reports the interruption.
+      yield* probe.awaitCompleted(0)
+      yield* probe.awaitStarted(1)
+      const interruption = yield* Fiber.interrupt(publisher).pipe(Effect.forkChild)
+      yield* probe.release
+      yield* Fiber.join(interruption)
+
+      const published = (files: ReadonlyArray<string>) =>
+        files.filter((file) => fixtures.some((spec) => spec.file === file)).sort()
+      const reported = published(yield* fs.readDirectory(directory))
+      yield* probe.awaitQuiescent
+      assert.deepStrictEqual(
+        published(yield* fs.readDirectory(directory)),
+        reported,
+        "an interrupted publication must leave the directory exactly as it reported it"
+      )
     }).pipe(Effect.provide(NodeFileSystem.layer)))
 
   it.effect("does not replace a fixture published concurrently after the prefix snapshot", () =>
