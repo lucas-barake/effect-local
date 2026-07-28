@@ -47,4 +47,14 @@ test("carries a change between two browsers through a real relay", async ({ brow
   await expect
     .poll(() => readLabels(beta, documentId), { timeout: 30_000 })
     .toEqual(["from-alpha", "from-beta"])
+
+  // Last, because it opens a second session on alpha. A session covers the set of documents this
+  // device syncs, so creating another task has to add to that set. Replacing it drops the task
+  // above, and the very next push for that task is refused as an unselected document.
+  //
+  // Appended to this test rather than given its own: the project runs one relay process and one
+  // fixed pair of device identities under `workers: 1`, so a second `test()` would start with the
+  // inbox rows this one left behind.
+  await alpha.evaluate(() => window.relayFixture!.createTask("another task"))
+  await alpha.evaluate((id) => window.relayFixture!.push(id), documentId)
 })

@@ -3,7 +3,6 @@ import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import type * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
-import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 
 /** `labels` is a list so the merge is additive: holding the other's label is evidence of arrival. */
@@ -28,12 +27,10 @@ export const definition = ReplicaDefinition.make({
   queries: []
 })
 
-export const Handlers = AddLabel.toLayer(({ draft, payload }) => {
+export const DomainLive = AddLabel.toLayer(({ draft, payload }) => {
   draft.labels.push(payload)
   return undefined
 })
-
-export const DomainLive = Layer.mergeAll(Handlers)
 
 export const limits: ReplicaLimits.Values = {
   maxBackupBytes: 16 * 1024 * 1024,

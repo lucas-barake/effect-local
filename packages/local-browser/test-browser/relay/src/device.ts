@@ -71,16 +71,25 @@ const runtime = Atom.runtime(DeviceLive)
 export const syncedDocumentsAtom = Atom.make("")
 
 /**
+ * Adds to the set rather than replacing it. Assigning would drop every document already being
+ * synced, and the session would reopen covering only the newest one - after which the next push for
+ * any of the others is refused as an unselected document.
+ */
+const addSyncedDocument = (get: Atom.FnContext, documentId: Identity.DocumentId) => {
+  const current = get(syncedDocumentsAtom)
+  const next = new Set(current === "" ? [] : current.split(","))
+  next.add(documentId)
+  get.set(syncedDocumentsAtom, [...next].toSorted().join(","))
+}
+
+/**
  * Resolves once the session covering the document is open, rather than when the set has been
  * written. A caller that returns before the socket exists has no way to know when its next write
  * will actually be sent, and nothing else reports it.
  */
 export const syncDocument = runtime.fn<Identity.DocumentId>()(
   Effect.fnUntraced(function*(documentId, get) {
-    const current = get(syncedDocumentsAtom)
-    const next = new Set(current === "" ? [] : current.split(","))
-    next.add(documentId)
-    get.set(syncedDocumentsAtom, [...next].toSorted().join(","))
+    addSyncedDocument(get, documentId)
     yield* get.result(sessionAtom, { suspendOnWaiting: true })
   })
 )
@@ -94,7 +103,7 @@ export const createTask = runtime.fn<string>()(
         value: { title, labels: [] }
       })
     )
-    get.set(syncedDocumentsAtom, documentId)
+    addSyncedDocument(get, documentId)
     yield* get.result(sessionAtom, { suspendOnWaiting: true })
     return documentId
   })
