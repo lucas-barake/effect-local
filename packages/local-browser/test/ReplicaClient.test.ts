@@ -234,24 +234,37 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.strictEqual(error.reason._tag, "ProtocolMismatch")
     })).pipe(Effect.provide(Owner)))
 
-  // The version is a schema literal, so an owner from another build is refused when its handshake
-  // is decoded rather than by a check the client has to remember to make.
-  it.effect("refuses a handshake carrying any other protocol version", () =>
+  // Drives the real client, because the guard under test is the client's. The version deliberately
+  // survives decoding, so nothing but this check stands between a stale owner and the replica.
+  it.effect("decodes and rejects owners using an older protocol", () =>
     Effect.scoped(Effect.gen(function*() {
       const open = ReplicaRpc.group.requests.get("OpenSession")
       if (open?._tag !== "OpenSession") return yield* Effect.die(new Error("OpenSession RPC not found"))
-      const handshake = (protocolVersion: number) => ({
+      yield* Schema.decodeUnknownEffect(open.successSchema)({
         leaseMillis: 1_000,
-        protocolVersion,
+        protocolVersion: ReplicaRpc.protocolVersion - 1,
         definitionHash: definition.hash,
         ownerEpoch: "owner"
       })
-      const decode = Schema.decodeUnknownEffect(open.successSchema)
-
-      yield* decode(handshake(ReplicaRpc.protocolVersion))
-      for (const other of [ReplicaRpc.protocolVersion - 1, ReplicaRpc.protocolVersion + 1]) {
-        assert.strictEqual((yield* Effect.exit(decode(handshake(other))))._tag, "Failure")
-      }
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const older = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property !== "OpenSession") return value
+          return (payload: never) =>
+            value(payload).pipe(Effect.map((lease) => ({
+              ...(lease as {
+                readonly leaseMillis: number
+                readonly protocolVersion: number
+                readonly definitionHash: string
+                readonly ownerEpoch: string
+              }),
+              protocolVersion: ReplicaRpc.protocolVersion - 1
+            })))
+        }
+      })
+      const error = yield* Effect.flip(ReplicaClient.fromRpcClient(definition, older))
+      assert.strictEqual(error.reason._tag, "ProtocolMismatch")
     })).pipe(Effect.provide(Owner)))
 
   it.effect("recovers ambiguous commands through typed receipt lookup", () =>
@@ -853,6 +866,17 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       const unary = <A, E, R,>(effect: Effect.Effect<A | Deferred.Deferred<A, E>, E, R>) =>
         Effect.flatMap(effect, (value) =>
           Deferred.isDeferred<A, E>(value) ? Deferred.await(value) : Effect.succeed(value))
+
+      // A tab old enough to omit the field entirely is still refused with a reason it can read,
+      // which is only reachable because the payload field stays optional rather than a literal.
+      const legacySessionId = yield* Identity.makeSessionId
+      assert.strictEqual(
+        (yield* Effect.flip(unary(open({
+          sessionId: legacySessionId,
+          definitionHash: definition.hash
+        }, options(owner, "open-legacy"))))).reason._tag,
+        "ProtocolMismatch"
+      )
 
       yield* unary(open({
         sessionId,

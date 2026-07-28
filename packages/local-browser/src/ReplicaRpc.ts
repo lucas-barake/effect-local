@@ -26,15 +26,20 @@ const JsonOutcome = CommandOutcome.schema(Schema.Json, Schema.Json)
 const DocumentIdOutcome = CommandOutcome.schema(Identity.DocumentId, Schema.Never)
 /**
  * There is exactly one version of the tab to owner protocol, and a `SharedWorker` outlives the page
- * that started it, so a tab from a new deployment can meet an owner from the old one. Pinning the
- * literal makes that mismatch a decode failure at the boundary rather than a check every handler
- * has to remember.
+ * that started it, so a tab from a new deployment can meet an owner from the old one.
+ *
+ * That mismatch is deliberately NOT expressed as a schema literal on either side. A payload the
+ * owner cannot decode is answered with `sendRequestDefect`, and a success value the tab cannot
+ * decode is rethrown by `RpcClient` under `Effect.orDie`. Both are defects, so the one peer that
+ * most needs to be told to reload would instead lose its replica to a cause it cannot discriminate
+ * on. The version has to survive decoding for a handler to refuse it with a typed
+ * `ReplicaError.ProtocolMismatch`.
  */
 export const protocolVersion = 1
 const SessionLease = Schema.Struct({ leaseMillis: Schema.Int })
 export const SessionHandshake = Schema.Struct({
   leaseMillis: Schema.Int,
-  protocolVersion: Schema.Literal(protocolVersion),
+  protocolVersion: Schema.Int,
   definitionHash: Schema.String,
   ownerEpoch: Schema.String,
   maxChunkBytes: Schema.optional(Schema.Int),
@@ -98,7 +103,9 @@ export const group = RpcGroup.make(
   Rpc.make("OpenSession", {
     payload: {
       sessionId: Identity.SessionId,
-      protocolVersion: Schema.Literal(protocolVersion),
+      // Optional, so a tab old enough to omit the field is refused by the handler with a reason
+      // rather than by the decoder with a defect.
+      protocolVersion: Schema.optional(Schema.Int),
       definitionHash: Schema.String
     },
     success: SessionHandshake,

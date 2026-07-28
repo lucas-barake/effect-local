@@ -79,7 +79,7 @@ const acceptedProtocolMismatch = (
 const protocolFailure = (observed: string) =>
   new ReplicaError.ReplicaError({
     reason: new ReplicaError.ProtocolMismatch({
-      expected: "restore protocol version 4",
+      expected: "the browser restore protocol",
       observed
     })
   })
@@ -261,6 +261,15 @@ export const fromRpcClient = (
           )),
         Effect.onInterrupt(() => Effect.ignore(closeSession(sessionId)))
       )
+      if (lease.protocolVersion !== ReplicaRpc.protocolVersion) {
+        yield* Effect.ignore(closeSession(sessionId))
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.ProtocolMismatch({
+            expected: `protocol version ${ReplicaRpc.protocolVersion}`,
+            observed: `protocol version ${lease.protocolVersion}`
+          })
+        })
+      }
       if (
         !isPositiveSafeInteger(lease.maxChunkBytes) ||
         !isPositiveSafeInteger(lease.maxRestoreCoalesceMillis) ||
