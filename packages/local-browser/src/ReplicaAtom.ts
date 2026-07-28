@@ -105,6 +105,18 @@ export const status = <R, E,>(runtime: Atom.AtomRuntime<Replica.Replica | R, E>)
   runtime.atom(
     Replica.Replica.pipe(
       Effect.map((replica) => replica.status),
-      Stream.unwrap
+      Stream.unwrap,
+      Stream.retry(
+        Schedule.spaced("1 second").pipe(
+          Schedule.setInputType<ReplicaError.ReplicaError>(),
+          // A session the owner no longer knows is replaced by `ReplicaClient` before the stream
+          // goes terminal, so resubscribing lands on the new owner after a takeover or a lease
+          // expiry instead of stranding the tab on the old owner's terminal mismatch. Any other
+          // protocol mismatch stays terminal: it means deployment skew, and the tab must reload.
+          Schedule.while(({ input }) =>
+            input.reason._tag === "ProtocolMismatch" && input.reason.expected === "active session"
+          )
+        )
+      )
     )
   )

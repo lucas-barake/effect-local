@@ -106,11 +106,13 @@ The owner claims a new writer generation before accepting commands. Every write 
 owner can no longer commit after another owner takes over.
 
 The provisioning contract requires a live page to create the OPFS worker. Provision requests carry an expiring
-nonce so an unresponsive candidate cannot stall later tabs. A new attachment probes the provider page over its
-control port and reprovisions a stale owner against the same OPFS database after bounded disposal. An already attached
-secondary tab does not yet promote itself when the provisioning tab disappears. That limitation remains visible
-rather than hidden behind a nonexistent global worker constructor. The dedicated database worker holds a Web Lock
-for the database lifetime, so a replacement waits instead of opening OPFS concurrently with a slow prior owner.
+nonce so an unresponsive candidate cannot stall later tabs, and a candidate that cannot answer or cannot produce a
+healthy engine is dropped until it attaches again. Every attach and every live engine is verified with a round trip
+through the database worker itself, never through the provisioning page, so a dead database behind a live page is
+still detected. On takeover the coordinator tells every served tab to re-attach and provisions the next engine among
+all attached tabs, so a secondary tab is handed off to the new owner instead of being stranded. The dedicated
+database worker holds a Web Lock for the database lifetime, so a replacement waits instead of opening OPFS
+concurrently with a slow prior owner.
 
 OPFS starts as best effort origin storage. The engine does not turn that bucket persistent by itself. Applications
 must request `navigator.storage.persist()`, show whether the grant was accepted, and keep user controlled exports.

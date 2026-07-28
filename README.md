@@ -718,33 +718,64 @@ Choose the constructor by assembly level:
 ### 7. Provide the official Effect Worker layer
 
 `BrowserReplica.layer(definition)` intentionally requires Effect's `WorkerPlatform` and `Spawner`. It does not create
-or hide a `SharedWorker`.
-
-The following snippet shows only the RPC attachment. A durable first launch also needs the application ownership
-protocol described immediately after it.
+or hide a `SharedWorker`. `OwnershipCoordinator.layerTab` is the shipped spawner layer. It attaches each spawned RPC
+worker to the coordinator, provisions the durable database worker when the coordinator offers it, re-attaches when
+ownership moves, and detaches on `pagehide`.
 
 ```ts
-import { BrowserCrypto, BrowserWorker } from "@effect/platform-browser"
+import { BrowserCrypto } from "@effect/platform-browser"
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
+import * as OwnershipCoordinator from "@lucas-barake/effect-local-browser/OwnershipCoordinator"
 import * as Layer from "effect/Layer"
 
-const WorkerLive = BrowserWorker.layer(() => {
-  const worker = new SharedWorker(new URL("./replica.shared-worker.ts", import.meta.url), {
-    name: "effect-local-tasks",
-    type: "module"
-  })
-  const channel = new MessageChannel()
-  worker.port.postMessage({ _tag: "Attach", rpcPort: channel.port1 }, [channel.port1])
-  worker.port.start()
-  return channel.port2
+const OwnershipLive = OwnershipCoordinator.layerTab({
+  name: "effect-local-tasks",
+  sharedWorker: () =>
+    new SharedWorker(new URL("./replica.shared-worker.ts", import.meta.url), {
+      name: "effect-local-tasks",
+      type: "module"
+    }),
+  databaseWorker: () =>
+    new Worker(new URL("./opfs.worker.ts", import.meta.url), {
+      name: "effect-local-tasks-opfs",
+      type: "module"
+    })
 })
 
 export const BrowserLive = BrowserReplica.layerWithReactivity(definition, {
   sessionTimeout: "10 seconds",
   operationTimeout: "30 seconds"
 }).pipe(
-  Layer.provide(Layer.merge(WorkerLive, BrowserCrypto.layer))
+  Layer.provide(Layer.merge(OwnershipLive, BrowserCrypto.layer))
 )
+```
+
+The SharedWorker entry loads the application engine composition and hands it to the coordinator. Connects arriving
+while the engine module is still loading are buffered, and a load failure is reported to every connecting tab.
+
+```ts
+import * as OwnershipCoordinator from "@lucas-barake/effect-local-browser/OwnershipCoordinator"
+
+OwnershipCoordinator.runSharedWorker(() =>
+  import("./replica.shared-worker-runtime.ts").then((module) => module.options)
+)
+```
+
+The engine composition builds the durable runtime over the transferred database port:
+`BrowserSqlite.layerMessagePort(databasePort)`, domain Layers, `SqlReplica.layerWithBindings`, and
+`SessionManager.layer` in a `ManagedRuntime`. The coordinator elects one provisioning tab per origin, proves each
+engine with a round trip through the actual database worker before and during its lifetime, hands already attached
+tabs off to the new owner on takeover, and drops provisioning candidates that cannot answer before their nonce
+expires. `OwnershipCoordinator.layerSharedWorker` exposes the same state machine as a service for custom worker
+entry points.
+
+The durable database worker entry holds a Web Lock for the database lifetime, so a replacement provider waits for
+the lock instead of opening OPFS concurrently with a slow prior owner.
+
+```ts
+import * as OwnershipCoordinator from "@lucas-barake/effect-local-browser/OwnershipCoordinator"
+
+OwnershipCoordinator.runDatabaseWorker({ name: "effect-local-tasks" })
 ```
 
 Session timeout applies to open, renewal, and close. Operation timeout applies independently to each unary RPC
@@ -766,12 +797,11 @@ before cancellation begins. `maxRestorePullMillis` bounds individual protocol wa
 `maxRestoreCoalesceMillis` bounds how long a partial frame waits for more immediately available bytes.
 `maxRestoreErrorBytes` bounds encoded source and result error details.
 
-The `Attach` message is application ownership protocol, not hidden library behavior. Production applications must also
-handle liveness, expiring provisioning nonces, OPFS worker creation, database port transfer, and provider loss.
-
-Inside the SharedWorker, compose `BrowserSqlite.layerMessagePort(databasePort)`, domain Layers, `SqlReplica.layer`, and
-`SessionManager.layer`. Serve each attached RPC port with `ReplicaOwner.layerWorker(definition)` and the official
-`BrowserWorkerRunner.layerMessagePort(rpcPort)` Layer.
+The tab to coordinator control protocol is Schema decoded on every frame and versioned beside the replica RPC
+protocol. Custom worker entry points that need more than `runSharedWorker` can drive the same state machine through
+the `OwnershipCoordinator` service: `layerSharedWorker` handles attach, provisioning, health verification, takeover
+handoff, and session cleanup, while serving each attached RPC port with `ReplicaOwner.layerWorker(definition)` and
+the official `BrowserWorkerRunner.layerMessagePort(rpcPort)` Layer.
 
 ### 8. Build reactive state with Effect Atom
 
@@ -1480,7 +1510,7 @@ modules. Feature and advanced services remain public for products that need dire
 | Reactive and test adapters  | `ReplicaAtom`, `TestReplica`                                                                                                                                                                                             |
 | Optional features           | `PeerTransport`, `PeerSession`, `Presence`, `ReplicaWorkflow`, `TestPeer`, `FaultInjection`, `PeerRpc`, `RpcPeerTransport`                                                                                               |
 | RPC policy and server       | `PeerCredentials`, `PeerAuthenticator`, `PeerAuthentication`, `PeerRelayAuthorization`, `PeerRelayLimits`, `RelayInboxStore`, `SqlRelayInboxStore`, `RelayInbox`, `RelayInboxMaintenance`, `RelayServer`, `PeerRpcError` |
-| Advanced assembly           | `CommitPublisher`, `Compaction`, `Recovery`, `PeerSync`, `DurableRuntime`, `ReplicaClient`, `ReplicaOwner`, `SessionManager`                                                                                             |
+| Advanced assembly           | `CommitPublisher`, `Compaction`, `Recovery`, `PeerSync`, `DurableRuntime`, `ReplicaClient`, `ReplicaOwner`, `SessionManager`, `OwnershipCoordinator`                                                                       |
 | Advanced framework assembly | `CommandExecutor`, `DocumentEntity`, `DocumentStore`, `EntityReplica`, `Migrations`, `ProjectionStore`, `QueryExecutor`, `ReplicaBootstrap`, `ReplicaGate`, `ReplicaRpc`                                                 |
 
 These public framework assembly modules support custom runtimes and diagnostics. Paths under `internal/*` remain
@@ -1690,10 +1720,11 @@ service directly because `PeerSession` owns sequencing, whole document allowlist
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | `BrowserReplica` | `layer`, `layerWith`, `layerWithReactivity`, `layerWithReactivityOptions`                                                       |
 | `BrowserSqlite`  | `DatabasePort` service, `layer`, `layerMessagePort`                                                                             |
+| `OwnershipCoordinator` | `EngineServices`, `OwnershipCoordinator` service, `layerSharedWorker`, `layerTab`, `runSharedWorker`, `runDatabaseWorker` |
 | `PeerSession`    | Compatibility reexport of the SQL package session API                                                                           |
 | `Presence`       | `Entry`, `Presence`, `make`                                                                                                     |
 | `ReplicaAtom`    | `layerReactivity`, `documentFamily`, `queryFamily`, `mutation`, `status`                                                        |
-| `ReplicaClient`  | `ReplicaClient` service, `TimeoutOptions`, `defaultSessionTimeout`, `defaultOperationTimeout`, `fromRpcClient`, `layer`         |
+| `ReplicaClient`  | `ReplicaClient` service, `Options`, `defaultSessionTimeout`, `defaultOperationTimeout`, `fromRpcClient`, `layer`                |
 | `ReplicaOwner`   | `layerHandlers`, `layer`, `layerWorker`                                                                                         |
 | `ReplicaRpc`     | `protocolVersion`, `SessionHandshake`, `MessagePortSchema`, `Invalidation`, `InvalidationMessage`, `ReplicaQueryError`, `group` |
 | `SessionManager` | `leaseDurationMillis`, `RestoreLease`, `SessionManager` service, `layer`                                                        |
@@ -1734,10 +1765,11 @@ Browser composition contracts:
 | Module           | Contract                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `BrowserSqlite`  | `DatabasePort` is the transferred dedicated worker capability. `layerMessagePort` installs a concrete port. Neither API opens a second database connection                                                                                                                                                                                                                                                                                                                                                     |
+| `OwnershipCoordinator` | `layerSharedWorker` runs the owner side state machine: election of one provisioning tab, expiring provision nonces, engine start proof, database round trip health verification, takeover with handoff of every attached tab, and drop of unresponsive candidates. `layerTab` is the page side drop in replacement for `BrowserWorker.layer`. `runSharedWorker` and `runDatabaseWorker` are the worker entry points. Every control frame is Schema decoded |
 | `ReplicaOwner`   | `layerHandlers` serves the internal `ReplicaRpc.group`. `layer` composes ownership services. `layerWorker` hosts them in the Effect Worker environment                                                                                                                                                                                                                                                                                                                                                         |
 | `SessionManager` | `open`, `renew`, `close`, `contains`, `activeCount`, `run`, and `stream` enforce client ownership, the exported 60 second lease, per session in flight limits, stream limits, and global queued RPC bounds. The exported restore limit fields, `acquireRestore`, `activeRestoreCount`, and `activeRestoreCountForSession` expose atomic restore admission and diagnostics                                                                                                                                      |
-| `ReplicaClient`  | Extends the core `Replica` service with `ownerEpoch` and invalidations. `fromRpcClient` owns session open, renewal, close, transient reconnect, command ambiguity recovery, and invalidation resubscription. `layer` builds the internal generated client. Session lifecycle RPCs default to 10 second timeouts. Unary operations default to 30 seconds. Restore uses one end to end deadline across transport and session replacement. `Invalidations`, `Status`, and `ExportBackup` streams remain unbounded |
-| `BrowserReplica` | `layer` is the standard page service. Every constructor accepts optional `TimeoutOptions`. `layerWith` and `layerWithReactivityOptions` also accept Worker options. Reactivity variants provide invalidation bridging                                                                                                                                                                                                                                                                                          |
+| `ReplicaClient`  | Extends the core `Replica` service with `ownerEpoch` and invalidations. `fromRpcClient` owns session open, renewal, close, transient reconnect, command ambiguity recovery, and invalidation resubscription. `layer` builds the internal generated client. Session lifecycle RPCs default to 10 second timeouts. Unary operations default to 30 seconds. Restore uses one end to end deadline across transport and session replacement. `Invalidations`, `Status`, and `ExportBackup` streams remain unbounded. The session closes on `pagehide` by default |
+| `BrowserReplica` | `layer` is the standard page service. Every constructor accepts optional `ReplicaClient.Options`. `layerWith` and `layerWithReactivityOptions` also accept Worker options. Reactivity variants provide invalidation bridging                                                                                                                                                                                                                                                                                          |
 | `ReplicaAtom`    | `documentFamily`, `queryFamily`, `mutation`, and `status` build reactive views over an Atom runtime. `layerReactivity` connects commit invalidations. Atom state remains rebuildable                                                                                                                                                                                                                                                                                                                           |
 | `Presence`       | `make` validates a positive finite TTL and returns `receive`, scoped `publish`, `remove`, and `values`. Concurrent writes for one peer resolve by arrival sequence, and a write older than the newest settled call for that peer is dropped without an error, including after the winner was removed or expired. Ordering covers arrival at this process, not transport reordering. Expiry is applied lazily on `values`. Presence is ephemeral and never authorization state                                  |
 

@@ -41,9 +41,16 @@ export class ReplicaClient extends Context.Service<
   "@lucas-barake/effect-local-browser/ReplicaClient"
 ) {}
 
-export interface TimeoutOptions {
+export interface Options {
   readonly sessionTimeout?: Duration.Input | undefined
   readonly operationTimeout?: Duration.Input | undefined
+  /**
+   * Closes the current owner session when the page fires `pagehide`, so a tab that navigates away
+   * or closes releases its session immediately instead of holding it until the owner side lease
+   * expires. Defaults to `true`; the lease remains the backstop for tabs that die without a
+   * `pagehide` event.
+   */
+  readonly closeSessionOnPageHide?: boolean | undefined
 }
 
 export const defaultSessionTimeout: Duration.Duration = Duration.seconds(10)
@@ -179,7 +186,7 @@ const isTransientStatus = (error: ReplicaError.ReplicaError) => {
 export const fromRpcClient = (
   definition: ReplicaDefinition.Any,
   rpc: RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>,
-  options?: TimeoutOptions
+  options?: Options
 ): Effect.Effect<ReplicaClient["Service"], ReplicaError.ReplicaError, Scope.Scope | Crypto.Crypto> =>
   Effect.gen(function*() {
     const sessionTimeout = Duration.fromInputUnsafe(options?.sessionTimeout ?? defaultSessionTimeout)
@@ -326,6 +333,21 @@ export const fromRpcClient = (
           Effect.flatMap((session) => Effect.ignore(closeSession(session.sessionId)))
         )
     )
+    if (options?.closeSessionOnPageHide !== false && typeof globalThis.addEventListener === "function") {
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          const onPageHide = () => {
+            // The page is unloading, so the answer will never arrive: the close is posted to the
+            // owner and left at that. This is a best effort boundary outside any fiber tree, so a
+            // detached run with every outcome ignored is the explicit choice.
+            Effect.runFork(Effect.ignore(closeSession(SubscriptionRef.getUnsafe(sessions).sessionId)))
+          }
+          globalThis.addEventListener("pagehide", onPageHide)
+          return onPageHide
+        }),
+        (onPageHide) => Effect.sync(() => globalThis.removeEventListener("pagehide", onPageHide))
+      )
+    }
     type Session = Effect.Success<ReturnType<typeof openSession>>
     type PendingStreamMismatch = {
       readonly stale: Session
@@ -1528,7 +1550,7 @@ export const fromRpcClient = (
     }
   })
 
-export const layer = (definition: ReplicaDefinition.Any, options?: TimeoutOptions) =>
+export const layer = (definition: ReplicaDefinition.Any, options?: Options) =>
   Layer.effect(
     ReplicaClient,
     RpcClient.make(ReplicaRpc.group).pipe(Effect.flatMap((rpc) => fromRpcClient(definition, rpc, options)))
