@@ -15,10 +15,7 @@ const start = async () => {
     }
   }
 
-  const [{ App }, { dispose }] = await Promise.all([
-    import("./app.tsx"),
-    import("./replica-client.ts")
-  ])
+  const { App } = await import("./app.tsx")
   const root = createRoot(document.querySelector("#root")!)
   root.render(
     <StrictMode>
@@ -27,8 +24,9 @@ const start = async () => {
       </RegistryProvider>
     </StrictMode>
   )
+  // Worker teardown on pagehide is owned by the library: the ownership tab layer detaches
+  // synchronously and the replica client closes its session.
   window.addEventListener("pagehide", () => {
-    void dispose()
     root.unmount()
   }, { once: true })
 }
