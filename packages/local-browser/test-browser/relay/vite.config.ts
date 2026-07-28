@@ -12,7 +12,7 @@ export default defineConfig({
   // Crawl both entries at startup. Without this the dev server discovers the worker's dependencies
   // only after the first page has loaded, re-optimizes, and forces a reload that destroys the
   // execution context a test is already talking to.
-  optimizeDeps: { entries: ["src/main.ts", "src/opfs.worker.ts"] },
+  optimizeDeps: { entries: ["src/main.tsx", "src/opfs.worker.ts"] },
   worker: { format: "es", plugins: () => [wasm()] },
   plugins: [wasm(), {
     name: "sqlite-wasm-development-asset",
