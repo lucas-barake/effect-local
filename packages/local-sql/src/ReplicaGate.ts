@@ -15,6 +15,7 @@ import * as TxReentrantLock from "effect/TxReentrantLock"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import { metadataMissing } from "./internal/errors.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
 
 export interface Permit {
@@ -291,12 +292,7 @@ export const layer: Layer.Layer<
             writerGeneration: row.writer_generation
           })),
           Effect.catchTags({
-            NoSuchElementError: () =>
-              Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.ReplicaMetadataMissing({ operation })
-                })
-              ),
+            NoSuchElementError: () => Effect.fail(metadataMissing(operation)),
             SchemaError: (cause) =>
               Effect.fail(
                 new ReplicaError.ReplicaError({

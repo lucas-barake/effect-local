@@ -14,6 +14,7 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as InternalAutomerge from "./internal/automerge.js"
+import { metadataMissing } from "./internal/errors.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as Recovery from "./Recovery.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -203,13 +204,6 @@ export class Compaction extends Context.Service<Compaction, {
  * process. Batching bounds that stall, and bounds the `RETURNING` set the count is derived from.
  */
 const receiptPruneBatchSize = 512
-
-// Dominated by `gate.validate` on the paths that reach them, so these are defensive: one condition
-// keeps one answer if the statement order ever changes.
-const metadataMissing = (operation: string) =>
-  new ReplicaError.ReplicaError({
-    reason: new ReplicaError.ReplicaMetadataMissing({ operation })
-  })
 
 export const layer: Layer.Layer<
   Compaction,

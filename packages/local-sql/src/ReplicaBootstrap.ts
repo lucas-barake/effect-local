@@ -13,6 +13,7 @@ import type * as Migrator from "effect/unstable/sql/Migrator"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import { metadataMissing } from "./internal/errors.js"
 import { populatedTables, storageFormatVersion } from "./internal/schema.js"
 import * as Migrations from "./Migrations.js"
 
@@ -26,18 +27,6 @@ export interface State {
 export class ReplicaBootstrap extends Context.Service<ReplicaBootstrap, State>()(
   "@lucas-barake/effect-local-sql/ReplicaBootstrap"
 ) {}
-
-// A function, not a shared instance, so each failure captures its own stack at the site that observed it.
-//
-// `ReplicaMetadataMissing`, not `StorageCorrupt`: this is the same replica-wide condition
-// `ReplicaGate.readState` reports, and one condition must have one answer. `StorageCorrupt` means a
-// single document's stored bytes are unusable, and consumers act on it per document -- so long as
-// bootstrap answered differently from the gate, whichever component happened to observe the absence
-// first decided how the replica described it.
-const metadataMissing = (operation: string) =>
-  new ReplicaError.ReplicaError({
-    reason: new ReplicaError.ReplicaMetadataMissing({ operation })
-  })
 
 const unsupportedStorageFormat = (observedVersion: number) =>
   new ReplicaError.ReplicaError({

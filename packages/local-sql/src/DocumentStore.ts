@@ -14,6 +14,7 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as InternalAutomerge from "./internal/automerge.js"
+import { metadataMissing } from "./internal/errors.js"
 import * as Rows from "./internal/rows.js"
 import * as Recovery from "./Recovery.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -79,13 +80,6 @@ export const layer: Layer.Layer<
     const sql = yield* SqlClient.SqlClient
     const gate = yield* ReplicaGate.ReplicaGate
     const recovery = yield* Recovery.make
-    // One reason for one condition: this row carries the replica's identity, so its absence is
-    // replica-wide and must not arrive as the per-document `StorageCorrupt`.
-    const metadataMissing = (operation: string) =>
-      new ReplicaError.ReplicaError({
-        reason: new ReplicaError.ReplicaMetadataMissing({ operation })
-      })
-
     const findDefinitionHash = SqlSchema.findOne({
       Request: Schema.Void,
       Result: Schema.Struct({ definition_hash: Schema.String }),

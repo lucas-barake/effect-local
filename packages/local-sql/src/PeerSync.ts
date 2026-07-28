@@ -19,6 +19,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as DocumentStore from "./DocumentStore.js"
 import * as InternalAutomerge from "./internal/automerge.js"
+import { metadataMissing } from "./internal/errors.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
@@ -1021,11 +1022,6 @@ const make = (
 
     // Dominated by `gate.validate` on every path that reaches them, so these are defensive: they keep
     // the one-condition-one-answer invariant if the statement order ever changes.
-    const metadataMissing = (operation: string) =>
-      new ReplicaError.ReplicaError({
-        reason: new ReplicaError.ReplicaMetadataMissing({ operation })
-      })
-
     const nextSequence = incrementCommitSequence(undefined).pipe(Effect.flatMap((rows) =>
       rows[0] === undefined
         ? Effect.fail(metadataMissing("PeerSync.nextSequence"))
