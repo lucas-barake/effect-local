@@ -204,6 +204,13 @@ export class Compaction extends Context.Service<Compaction, {
  */
 const receiptPruneBatchSize = 512
 
+// Dominated by `gate.validate` on the paths that reach them, so these are defensive: one condition
+// keeps one answer if the statement order ever changes.
+const metadataMissing = (operation: string) =>
+  new ReplicaError.ReplicaError({
+    reason: new ReplicaError.ReplicaMetadataMissing({ operation })
+  })
+
 export const layer: Layer.Layer<
   Compaction,
   never,
@@ -1182,7 +1189,7 @@ export const layer: Layer.Layer<
         }
         const definitionHash = yield* findDefinitionHash(undefined).pipe(
           Effect.map((row) => row.definition_hash),
-          Effect.catchTag("NoSuchElementError", () => Effect.die(new Error("Replica metadata was not initialized")))
+          Effect.catchTag("NoSuchElementError", () => Effect.fail(metadataMissing("Compaction.rewriteHistory")))
         )
         // The stored schema version, not `document.version`: `recover` decodes at the version the
         // row records and does not migrate, so the value the re-rooted change carries is encoded at
@@ -1294,7 +1301,7 @@ export const layer: Layer.Layer<
           }
           const commitSequence = yield* nextCommitSequence(undefined).pipe(
             Effect.map((row) => row.commit_sequence),
-            Effect.catchTag("NoSuchElementError", () => Effect.die(new Error("Replica metadata was not initialized")))
+            Effect.catchTag("NoSuchElementError", () => Effect.fail(metadataMissing("Compaction.rewriteHistory")))
           )
           const settledRelayReceipts = yield* expiredRelayReceipts({
             documentId,

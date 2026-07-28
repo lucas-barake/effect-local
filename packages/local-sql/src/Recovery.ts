@@ -66,7 +66,6 @@ export const make = Effect.gen(function*() {
       sql`SELECT
           accepted_heads,
           checkpoint_hash,
-          (SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1) AS commit_sequence,
           document_id,
           document_type,
           lineage,
@@ -77,6 +76,26 @@ export const make = Effect.gen(function*() {
           tombstone
         FROM effect_local_documents WHERE document_id = ${documentId}`
   })
+  // The replica-wide commit sequence, read on its own rather than smuggled into the per-document
+  // SELECT above as a scalar subquery. As a subquery an absent singleton yields SQL NULL, which the
+  // non-nullable row schema turned into a `SchemaError` and then into a per-document
+  // `StorageCorrupt` -- a replica-wide fault wearing a per-document reason. Read explicitly, an
+  // absent row is `ReplicaMetadataMissing` and an undecodable one is still `StorageCorrupt`, which is
+  // the distinction the rest of the package depends on.
+  const findCommitSequence = SqlSchema.findOne({
+    Request: Schema.Void,
+    Result: Schema.Struct({ commit_sequence: Identity.CommitSequence }),
+    execute: () => sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`
+  })(undefined).pipe(
+    Effect.map((row) => row.commit_sequence),
+    Effect.catchTag("NoSuchElementError", () =>
+      Effect.fail(
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.ReplicaMetadataMissing({ operation: "Recovery.recover" })
+        })
+      ))
+  )
+
   const findCheckpoints = SqlSchema.findAll({
     Request: Identity.DocumentId,
     Result: CheckpointRow,
@@ -197,12 +216,16 @@ export const make = Effect.gen(function*() {
     permit: ReplicaGate.Permit
   ) =>
     Effect.gen(function*() {
-      const { changes, checkpoints, option } = yield* sql.withTransaction(Effect.gen(function*() {
+      const { changes, checkpoints, commitSequence, option } = yield* sql.withTransaction(Effect.gen(function*() {
         const option = yield* findDocument(documentId)
+        // In the same transaction, so it reads the same snapshot the document row came from. It used
+        // to be a scalar subquery inside that SELECT, which is what let a replica-wide fault decode
+        // into a per-document `StorageCorrupt`.
+        const commitSequence = yield* findCommitSequence
         const checkpoints = yield* findVerifiedCheckpoints(documentId)
         const changes = yield* findChanges(documentId)
         yield* gate.validate(permit)
-        return { changes, checkpoints, option }
+        return { changes, checkpoints, commitSequence, option }
       })).pipe(
         Effect.catchTags({
           SqlError: (cause) =>
@@ -244,13 +267,6 @@ export const make = Effect.gen(function*() {
           })
         })
       }
-      const commitSequence = yield* Identity.CommitSequence.makeEffect(row.commit_sequence).pipe(
-        Effect.mapError((cause) =>
-          new ReplicaError.ReplicaError({
-            reason: new ReplicaError.StorageCorrupt({ cause })
-          })
-        )
-      )
       const actor = InternalAutomerge.actorId(permit.replicaId, permit.writerGeneration, documentId)
       const parsedHeads = yield* Effect.result(Effect.try({
         try: () => ({

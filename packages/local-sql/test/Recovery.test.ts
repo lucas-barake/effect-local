@@ -191,6 +191,45 @@ describe("Recovery", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(Services)))
 
+  // The absent row and an undecodable one are different faults and must not collapse. This one is
+  // replica-wide: reporting it as `StorageCorrupt` tells `ReplicaEvolution` to quarantine the one
+  // document it happened to be reading, and `BackupStore` to call the operator's backup invalid.
+  it.effect("reports a missing metadata singleton as a replica-wide failure, not document corruption", () =>
+    Effect.gen(function*() {
+      const recovery = yield* Recovery.Recovery
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one" })
+
+      yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
+
+      const result = yield* Effect.result(recovery.recover(Task, documentId)).pipe(
+        Effect.ensuring(Effect.sync(() => InternalAutomerge.free(created.automerge)))
+      )
+
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure.reason._tag, "ReplicaMetadataMissing")
+      }
+    }).pipe(Effect.provide(Services)))
+
+  // Precedence, pinned deliberately: the replica-wide answer wins over the per-document one, because
+  // `gate.validate` guards the same transaction. Answering `DocumentNotFound` on a replica that has
+  // lost its identity would invite the caller to create the document again.
+  it.effect("reports the replica-wide failure over DocumentNotFound when the singleton is gone", () =>
+    Effect.gen(function*() {
+      const recovery = yield* Recovery.Recovery
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      yield* sql`DELETE FROM effect_local_metadata WHERE singleton = 1`
+      const result = yield* Effect.result(recovery.recover(Task, documentId))
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure.reason._tag, "ReplicaMetadataMissing")
+      }
+    }).pipe(Effect.provide(Services)))
+
   it.effect("reports invalid commit sequence metadata as storage corruption", () =>
     Effect.gen(function*() {
       const recovery = yield* Recovery.Recovery

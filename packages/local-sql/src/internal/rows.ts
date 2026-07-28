@@ -16,7 +16,6 @@ import * as WriterProvenance from "./writerProvenance.js"
 export const DocumentRow = Schema.Struct({
   accepted_heads: Schema.String,
   checkpoint_hash: Schema.NullOr(Schema.String),
-  commit_sequence: Schema.Number,
   document_id: Schema.String,
   document_type: Schema.String,
   lineage: Identity.DocumentLineage,
