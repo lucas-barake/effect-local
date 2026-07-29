@@ -11,18 +11,21 @@ const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
  * shape rather than a consumer API. `Recovery` and `DocumentStore` share them so
  * the canonical read and the write path's read back decode the same row shape
  * through `SqlSchema` rather than asserting it with a bare `sql<T>` type
- * parameter. `BackupStore` keeps its own archive record schemas, and
- * `Migrations` still reads these tables with bare `sql<T>` type parameters.
+ * parameter. `BackupStore` keeps its own archive record schemas.
  */
+
+export const HistoryCountersRow = Schema.Struct({
+  history_bytes: Schema.NullOr(NonNegativeInt),
+  history_changes: Schema.NullOr(NonNegativeInt),
+  history_operations: Schema.NullOr(NonNegativeInt)
+})
 
 export const DocumentRow = Schema.Struct({
   accepted_heads: Schema.String,
   checkpoint_hash: Schema.NullOr(Schema.String),
   document_id: Schema.String,
   document_type: Schema.String,
-  history_bytes: Schema.NullOr(NonNegativeInt),
-  history_changes: Schema.NullOr(NonNegativeInt),
-  history_operations: Schema.NullOr(NonNegativeInt),
+  ...HistoryCountersRow.fields,
   lineage: Identity.DocumentLineage,
   materialized_heads: Schema.String,
   observed_versions: Schema.String,

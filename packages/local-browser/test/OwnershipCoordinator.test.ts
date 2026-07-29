@@ -6,13 +6,17 @@ import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as ManagedRuntime from "effect/ManagedRuntime"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Schema from "effect/Schema"
+import * as Scope from "effect/Scope"
 import { TestClock } from "effect/testing"
 import { RpcClient } from "effect/unstable/rpc"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
@@ -23,6 +27,7 @@ import * as NodeOs from "node:os"
 import * as NodePath from "node:path"
 import * as OwnershipProtocol from "../src/internal/ownershipProtocol.js"
 import * as OwnershipCoordinator from "../src/OwnershipCoordinator.js"
+import * as ReplicaClient from "../src/ReplicaClient.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
 import { Task } from "./fixtures.js"
@@ -218,7 +223,128 @@ const openSession = (rpcPort: MessagePort) =>
     Effect.provide(BrowserWorker.layerPlatform)
   )
 
+class TestErrorEvent extends Event implements ErrorEvent {
+  readonly colno = 0
+  readonly error: unknown
+  readonly filename = ""
+  readonly lineno = 0
+  readonly message: string
+
+  constructor(type: string, init?: ErrorEventInit) {
+    super(type)
+    this.error = init?.error
+    this.message = init?.message ?? ""
+  }
+}
+
 it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
+  it.effect("fails a pending client acquisition and retries after provisioning is rejected", () =>
+    Effect.gen(function*() {
+      const control = new MessageChannel()
+      const frames = yield* Queue.unbounded<OwnershipProtocol.PageToOwnerFrame>()
+      control.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
+        Queue.offerUnsafe(frames, Schema.decodeUnknownSync(OwnershipProtocol.PageToOwnerFrame)(event.data))
+      })
+      control.port2.start()
+
+      const created = yield* Queue.unbounded<{
+        readonly id: number
+        readonly worker: globalThis.Worker
+      }>()
+      const terminated = yield* Queue.unbounded<number>()
+      let nextWorkerId = 0
+      const databaseWorker = () => {
+        const id = ++nextWorkerId
+        const worker = {
+          postMessage() {},
+          terminate() {
+            Queue.offerUnsafe(terminated, id)
+          }
+        } as unknown as globalThis.Worker
+        Queue.offerUnsafe(created, { id, worker })
+        return worker
+      }
+      const sharedWorker = Object.assign(new EventTarget(), {
+        port: control.port1,
+        onerror: null
+      }) as unknown as SharedWorker
+      const previousErrorEvent = globalThis.ErrorEvent
+      globalThis.ErrorEvent = TestErrorEvent as typeof ErrorEvent
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          globalThis.ErrorEvent = previousErrorEvent
+        })
+      )
+
+      const Ownership = OwnershipCoordinator.layerTab({
+        name: "effect-local-rejected-provision-test",
+        sharedWorker: () => sharedWorker,
+        databaseWorker
+      })
+      const protocolScope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(protocolScope, Exit.void))
+      const protocolContext = yield* Layer.buildWithScope(
+        RpcClient.layerProtocolWorker({ size: 1, concurrency: 4 }).pipe(
+          Layer.provide(Ownership)
+        ),
+        protocolScope
+      )
+      const takePageFrame = <Tag extends OwnershipProtocol.PageToOwnerFrame["_tag"],>(
+        tag: Tag
+      ) =>
+        Queue.take(frames).pipe(
+          Effect.filterOrFail(
+            (frame): frame is Extract<OwnershipProtocol.PageToOwnerFrame, { readonly _tag: Tag }> => frame._tag === tag,
+            (frame) => new Error(`expected ${tag}, received ${frame._tag}`)
+          )
+        )
+
+      const firstAttach = yield* takePageFrame("Attach")
+      const rpcRequests = yield* Queue.unbounded<unknown>()
+      firstAttach.rpcPort.addEventListener("message", (event) => {
+        Queue.offerUnsafe(rpcRequests, event.data)
+      })
+      firstAttach.rpcPort.start()
+
+      const clientScope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(clientScope, Exit.void))
+      const acquisition = yield* Layer.buildWithScope(
+        ReplicaClient.layer(definition, { sessionTimeout: "10 seconds" }).pipe(
+          Layer.provide(Layer.succeedContext(protocolContext))
+        ),
+        clientScope
+      ).pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      assert.isUndefined(acquisition.pollUnsafe())
+
+      const firstNonce = Schema.decodeUnknownSync(OwnershipProtocol.ProvisionNonce)("rejected-provision")
+      control.port2.postMessage(
+        Schema.encodeSync(OwnershipProtocol.OwnerToPageFrame)({ _tag: "Provision", nonce: firstNonce })
+      )
+      const firstProvision = yield* takePageFrame("Provision")
+      assert.strictEqual(firstProvision.nonce, firstNonce)
+      const firstWorker = yield* Queue.take(created)
+      control.port2.postMessage(
+        Schema.encodeSync(OwnershipProtocol.OwnerToPageFrame)({
+          _tag: "ProvisionRejected",
+          nonce: firstNonce
+        })
+      )
+
+      yield* Queue.take(rpcRequests)
+      assert.strictEqual(yield* Queue.take(terminated), firstWorker.id)
+      const error = yield* Fiber.join(acquisition).pipe(Effect.flip)
+      if (!ReplicaError.isReplicaError(error)) {
+        assert.fail(`expected ReplicaError, received ${String(error)}`)
+      }
+      assert.strictEqual(error.reason._tag, "StorageUnavailable")
+
+      yield* TestClock.adjust("1 second")
+      const retryAttach = yield* takePageFrame("Attach")
+      // The worker waits uninterruptibly for readiness, so release the retry before closing its scope.
+      retryAttach.rpcPort.postMessage([0])
+    }).pipe(Effect.scoped))
+
   it.effect("provisions the first attach and serves an RPC session round trip", () =>
     Effect.gen(function*() {
       const started: Array<StartedEngine> = []

@@ -1,4 +1,5 @@
 import { NodeCrypto } from "@effect/platform-node"
+import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
@@ -8,8 +9,8 @@ import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
-import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
@@ -17,13 +18,21 @@ import * as Layer from "effect/Layer"
 import * as PrimaryKey from "effect/PrimaryKey"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
-import * as ClusterSchema from "effect/unstable/cluster/ClusterSchema"
+import { TestClock } from "effect/testing"
 import * as Entity from "effect/unstable/cluster/Entity"
+import * as RunnerHealth from "effect/unstable/cluster/RunnerHealth"
+import * as Runners from "effect/unstable/cluster/Runners"
+import * as Sharding from "effect/unstable/cluster/Sharding"
 import * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
+import * as SqlMessageStorage from "effect/unstable/cluster/SqlMessageStorage"
+import * as SqlRunnerStorage from "effect/unstable/cluster/SqlRunnerStorage"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as DocumentEntity from "../src/DocumentEntity.js"
+import * as ClusterStorage from "../src/internal/clusterStorage.js"
 import * as PeerSync from "../src/PeerSync.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
+import * as SqlReplica from "../src/SqlReplica.js"
 
 describe("DocumentEntity", () => {
   const Task = Document.make("Task", {
@@ -88,7 +97,8 @@ describe("DocumentEntity", () => {
       entityMailboxCapacity: limits.maxQueuedRpc,
       entityTerminationTimeout: 0,
       entityMessagePollInterval: 5_000,
-      sendRetryInterval: 100
+      sendRetryInterval: 100,
+      refreshAssignmentsInterval: 0
     }),
     NodeCrypto.layer
   )
@@ -370,16 +380,107 @@ describe("DocumentEntity", () => {
     )
   })
 
-  it("persists RPCs in the shared SQL transaction without server interruption", () => {
-    for (const rpc of [DocumentEntity.Create, DocumentEntity.Mutate, DocumentEntity.Delete, DocumentEntity.Resolve]) {
-      assert.strictEqual(Context.get(rpc.annotations, ClusterSchema.Persisted), true)
-      assert.strictEqual(Context.get(rpc.annotations, ClusterSchema.WithTransaction), true)
-      assert.isTrue(Context.get(rpc.annotations, ClusterSchema.Uninterruptible) === "client")
-    }
-    assert.strictEqual(Context.get(DocumentEntity.ApplySync.annotations, ClusterSchema.Persisted), true)
-    assert.strictEqual(Context.get(DocumentEntity.ApplySync.annotations, ClusterSchema.WithTransaction), true)
-    assert.strictEqual(Context.get(DocumentEntity.ApplySync.annotations, ClusterSchema.Uninterruptible), true)
-  })
+  it.effect("replays a committed command and rolls back a failed command with its durable reply", () =>
+    Effect.gen(function*() {
+      const database = Layer.merge(
+        SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+        NodeCrypto.layer
+      )
+      const inputs = Layer.mergeAll(
+        database,
+        ReplicaLimits.layer(limits),
+        Rename.toLayer(({ draft, payload }) => {
+          draft.title = payload
+          return payload
+        })
+      )
+      const services = SqlReplica.servicesLayerWithBindings(definition, { projections: [] })
+      const peerSync = PeerSync.layer.pipe(Layer.provideMerge(services))
+      const cluster = Sharding.layer.pipe(
+        Layer.provideMerge(Runners.layerNoop),
+        Layer.provideMerge(SqlMessageStorage.layerWith({ prefix: ClusterStorage.messagePrefix })),
+        Layer.provide([
+          Layer.orDie(SqlRunnerStorage.layerWith({ prefix: ClusterStorage.runnerPrefix })),
+          RunnerHealth.layerNoop
+        ]),
+        Layer.provide(TestShardingConfig)
+      )
+      const live = DocumentEntity.layer(definition).pipe(
+        Layer.provideMerge(peerSync),
+        Layer.provideMerge(cluster),
+        Layer.provideMerge(inputs)
+      )
+
+      yield* Effect.gen(function*() {
+        yield* TestClock.adjust(1)
+        const sql = yield* SqlClient.SqlClient
+        const gate = yield* ReplicaGate.ReplicaGate
+        const permit = yield* gate.current
+        const documentId = yield* Identity.makeDocumentId
+        const commandId = yield* Identity.makeCommandId
+        const failedCommandId = yield* Identity.makeCommandId
+        const makeClient = yield* DocumentEntity.DocumentEntity.client
+        const client = makeClient(documentId)
+        const value = { title: "first" }
+        const requestHash = yield* CommandExecutor.createRequestHash({
+          incarnation: permit.incarnation,
+          commandId,
+          document: Task,
+          documentId,
+          encoded: yield* Document.encode(Task, documentId, value)
+        })
+        const request = {
+          replicaIncarnation: permit.incarnation,
+          writerGeneration: permit.writerGeneration,
+          commandId,
+          documentType: Task.name,
+          payload: new TextEncoder().encode(JSON.stringify(value)),
+          requestHash
+        }
+
+        const first = yield* client.Create(request)
+        const replayed = yield* client.Create(request)
+        assert.deepStrictEqual(replayed, first)
+        assert.deepStrictEqual(
+          yield* Schema.decodeUnknownEffect(
+            Schema.toCodecJson(CommandOutcome.schema(Identity.DocumentId, Schema.Never))
+          )(JSON.parse(new TextDecoder().decode(replayed))),
+          CommandOutcome.durablyCommitted(commandId, documentId)
+        )
+
+        const failed = yield* Effect.flip(client.Create({
+          ...request,
+          commandId: failedCommandId,
+          payload: new TextEncoder().encode("{"),
+          requestHash: "failed-create-hash"
+        }))
+        if (!ReplicaError.isReplicaError(failed)) {
+          assert.fail(`Expected ReplicaError, got ${failed._tag}`)
+        }
+        assert.strictEqual(failed.reason._tag, "ProtocolMismatch")
+
+        const durableRows = yield* sql<{
+          readonly documents: number
+          readonly receipts: number
+        }>`SELECT
+          (SELECT COUNT(*) FROM effect_local_documents) AS documents,
+          (SELECT COUNT(*) FROM effect_local_command_receipts) AS receipts`
+        assert.deepStrictEqual(durableRows[0], { documents: 1, receipts: 1 })
+        const clusterRows = yield* sql<{
+          readonly processed: number
+          readonly replies: number
+        }>`SELECT m.processed AS processed,
+            (SELECT COUNT(*) FROM ${sql(`${ClusterStorage.messagePrefix}_replies`)} r
+              WHERE r.request_id = m.request_id) AS replies
+          FROM ${sql(`${ClusterStorage.messagePrefix}_messages`)} m
+          WHERE m.kind = 0
+          ORDER BY m.rowid`
+        assert.deepStrictEqual(clusterRows, [
+          { processed: 1, replies: 1 },
+          { processed: 0, replies: 0 }
+        ])
+      }).pipe(Effect.scoped, Effect.provide(live))
+    }))
 
   it.effect("decodes commands and encodes their outcomes", () =>
     Effect.scoped(

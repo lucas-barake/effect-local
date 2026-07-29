@@ -1,6 +1,7 @@
 import * as Automerge from "@automerge/automerge"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
 import * as Migrator from "effect/unstable/sql/Migrator"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
@@ -413,7 +414,7 @@ describe("Migrations", () => {
       ])
     }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
 
-  it.effect("reconstructs counters only from complete raw histories without checkpoints", () =>
+  it.effect("reconstructs counters from every complete raw history even when a checkpoint exists", () =>
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
       yield* Migrator.make({})({
@@ -434,12 +435,10 @@ describe("Migrations", () => {
       const expectedOperations = decoded.reduce((total, change) => total + change.ops.length, 0)
       const expectedBytes = rawChanges.reduce((total, bytes) => total + bytes.byteLength, 0)
 
-      for (const documentId of ["complete", "checkpoint-backed"]) {
-        yield* sql`INSERT INTO effect_local_documents (
-          document_id, document_type, schema_version, observed_versions, materialized_heads,
-          accepted_heads, tombstone, projection_status, checkpoint_hash, lineage
-        ) VALUES (${documentId}, 'Task', 1, '[1]', ${heads}, ${heads}, 0, 'Ready', NULL, '')`
-      }
+      yield* sql`INSERT INTO effect_local_documents (
+        document_id, document_type, schema_version, observed_versions, materialized_heads,
+        accepted_heads, tombstone, projection_status, checkpoint_hash, lineage
+      ) VALUES ('checkpoint-backed', 'Task', 1, '[1]', ${heads}, ${heads}, 0, 'Ready', NULL, '')`
       for (let index = 0; index < rawChanges.length; index++) {
         const change = decoded[index]!
         yield* sql`INSERT INTO effect_local_changes (
@@ -447,7 +446,7 @@ describe("Migrations", () => {
           writer_definition_hash, actor, sequence, dependencies, bytes, applied,
           peer_id, accepted_at, commit_sequence
         ) VALUES (
-          ${change.hash}, 'complete', 'Task', 1, 'definition', ${change.actor}, ${change.seq},
+          ${change.hash}, 'checkpoint-backed', 'Task', 1, 'definition', ${change.actor}, ${change.seq},
           ${JSON.stringify(change.deps)}, ${rawChanges[index]!}, 1, NULL,
           '2026-01-01T00:00:00.000Z', ${index + 1}
         )`
@@ -459,6 +458,8 @@ describe("Migrations", () => {
       ) VALUES (
         'checkpoint', 'checkpoint-backed', ${heads}, ${checkpointBytes}, 'checksum', 2, 1, '[]', ''
       )`
+      yield* sql`UPDATE effect_local_documents SET checkpoint_hash = 'checkpoint'
+        WHERE document_id = 'checkpoint-backed'`
       yield* sql`INSERT INTO effect_local_documents (
         document_id, document_type, schema_version, observed_versions, materialized_heads,
         accepted_heads, tombstone, projection_status, checkpoint_hash, lineage
@@ -466,6 +467,50 @@ describe("Migrations", () => {
         'incomplete', 'Task', 1, '[1]', ${JSON.stringify(["f".repeat(64)])},
         ${JSON.stringify(["f".repeat(64)])}, 0, 'Ready', NULL, ''
       )`
+      for (
+        const [documentId, actor, malformedField] of [
+          ["malformed-hash", "c".repeat(32), "hash"],
+          ["malformed-row", "d".repeat(32), "applied"]
+        ] as const
+      ) {
+        const malformedSource = Automerge.from(
+          { value: { title: documentId }, tombstone: false },
+          { actor }
+        )
+        const malformedBytes = Automerge.getAllChanges(malformedSource)[0]!
+        const malformedChange = Automerge.decodeChange(malformedBytes)
+        const malformedHeads = JSON.stringify(Automerge.getHeads(malformedSource))
+        yield* sql`INSERT INTO effect_local_documents (
+          document_id, document_type, schema_version, observed_versions, materialized_heads,
+          accepted_heads, tombstone, projection_status, checkpoint_hash, lineage
+        ) VALUES (
+          ${documentId}, 'Task', 1, '[1]', ${malformedHeads}, ${malformedHeads}, 0, 'Ready', NULL, ''
+        )`
+        yield* sql`INSERT INTO effect_local_changes (
+          change_hash, document_id, document_type, writer_schema_version,
+          writer_definition_hash, actor, sequence, dependencies, bytes, applied,
+          peer_id, accepted_at, commit_sequence
+        ) VALUES (
+          ${malformedField === "hash" ? "legacy-hash" : malformedChange.hash},
+          ${documentId}, 'Task', 1, 'definition', ${malformedChange.actor}, ${malformedChange.seq},
+          ${JSON.stringify(malformedChange.deps)}, ${malformedBytes},
+          ${malformedField === "applied" ? "not-an-integer" : 1},
+          NULL, '2026-01-01T00:00:00.000Z', 1
+        )`
+        Automerge.free(malformedSource)
+      }
+      yield* sql`INSERT INTO effect_local_documents (
+        document_id, document_type, schema_version, observed_versions, materialized_heads,
+        accepted_heads, tombstone, projection_status, checkpoint_hash, lineage
+      ) VALUES
+        (
+          'malformed-document-type', ${new Uint8Array([1])}, 1, '[1]', '[]',
+          '[]', 0, 'Ready', NULL, ''
+        ),
+        (
+          'malformed-heads', 'Task', 1, '[1]', ${new Uint8Array([1])},
+          '[]', 0, 'Ready', NULL, ''
+        )`
 
       assert.deepStrictEqual(yield* Migrations.run, [[11, "document_history_counters"]])
       const counters = yield* sql<{
@@ -478,12 +523,6 @@ describe("Migrations", () => {
       assert.deepStrictEqual(counters, [
         {
           document_id: "checkpoint-backed",
-          history_bytes: null,
-          history_changes: null,
-          history_operations: null
-        },
-        {
-          document_id: "complete",
           history_bytes: expectedBytes,
           history_changes: rawChanges.length,
           history_operations: expectedOperations
@@ -493,9 +532,166 @@ describe("Migrations", () => {
           history_bytes: null,
           history_changes: null,
           history_operations: null
+        },
+        {
+          document_id: "malformed-document-type",
+          history_bytes: null,
+          history_changes: null,
+          history_operations: null
+        },
+        {
+          document_id: "malformed-hash",
+          history_bytes: null,
+          history_changes: null,
+          history_operations: null
+        },
+        {
+          document_id: "malformed-heads",
+          history_bytes: null,
+          history_changes: null,
+          history_operations: null
+        },
+        {
+          document_id: "malformed-row",
+          history_bytes: null,
+          history_changes: null,
+          history_operations: null
         }
       ])
       Automerge.free(source)
+    }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
+
+  it.effect("backfills complete histories across the 64 document page boundary", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrator.make({})({
+        loader: Effect.map(Migrations.loader, (migrations) => migrations.slice(0, 10)),
+        table: "effect_local_migrations"
+      })
+      yield* sql`WITH RECURSIVE documents(id) AS (
+          VALUES(1)
+          UNION ALL
+          SELECT id + 1 FROM documents WHERE id < 65
+        )
+        INSERT INTO effect_local_documents (
+          document_id, document_type, schema_version, observed_versions, materialized_heads,
+          accepted_heads, tombstone, projection_status, checkpoint_hash, lineage
+        )
+        SELECT printf('document-%02d', id), 'Task', 1, '[1]', '[]', '[]', 0, 'Ready', NULL, ''
+        FROM documents`
+      assert.deepStrictEqual(yield* Migrations.run, [[11, "document_history_counters"]])
+      const counters = yield* sql<{
+        readonly document_id: string
+        readonly history_bytes: number | null
+        readonly history_changes: number | null
+        readonly history_operations: number | null
+      }>`SELECT document_id, history_bytes, history_changes, history_operations
+        FROM effect_local_documents ORDER BY document_id`
+      assert.strictEqual(counters.length, 65)
+      assert.isTrue(counters.every((row) =>
+        row.history_bytes === 0 &&
+        row.history_changes === 0 &&
+        row.history_operations === 0
+      ))
+      assert.deepStrictEqual(counters.slice(63), [
+        {
+          document_id: "document-64",
+          history_bytes: 0,
+          history_changes: 0,
+          history_operations: 0
+        },
+        {
+          document_id: "document-65",
+          history_bytes: 0,
+          history_changes: 0,
+          history_operations: 0
+        }
+      ])
+    }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
+
+  it.effect("isolates malformed document identifiers without aborting the page", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrator.make({})({
+        loader: Effect.map(Migrations.loader, (migrations) => migrations.slice(0, 10)),
+        table: "effect_local_migrations"
+      })
+      yield* sql`INSERT INTO effect_local_documents (
+        document_id, document_type, schema_version, observed_versions, materialized_heads,
+        accepted_heads, tombstone, projection_status, checkpoint_hash, lineage
+      ) VALUES
+        ('valid', 'Task', 1, '[1]', '[]', '[]', 0, 'Ready', NULL, ''),
+        (${new Uint8Array([1])}, 'Task', 1, '[1]', '[]', '[]', 0, 'Ready', NULL, '')`
+
+      assert.deepStrictEqual(yield* Migrations.run, [[11, "document_history_counters"]])
+      const counters = yield* sql<{
+        readonly document_id_type: string
+        readonly history_bytes: number | null
+        readonly history_changes: number | null
+        readonly history_operations: number | null
+      }>`SELECT
+          typeof(document_id) AS document_id_type,
+          history_bytes,
+          history_changes,
+          history_operations
+        FROM effect_local_documents
+        ORDER BY rowid`
+      assert.deepStrictEqual(counters, [
+        {
+          document_id_type: "text",
+          history_bytes: 0,
+          history_changes: 0,
+          history_operations: 0
+        },
+        {
+          document_id_type: "blob",
+          history_bytes: null,
+          history_changes: null,
+          history_operations: null
+        }
+      ])
+    }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
+
+  it.effect("rolls back the format fence when its transition generation is already claimed", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrator.make({})({
+        loader: Effect.map(Migrations.loader, (migrations) => migrations.slice(0, 10)),
+        table: "effect_local_migrations"
+      })
+      yield* sql`INSERT INTO effect_local_metadata (
+        singleton, storage_format_version, replica_id, replica_incarnation,
+        writer_generation, definition_hash, commit_sequence
+      ) VALUES (
+        1, 1, 'rep_00000000-0000-4000-8000-000000000001', 0, 1, 'definition', 0
+      )`
+      yield* sql`INSERT INTO effect_local_writer_generations (generation, claimed_at) VALUES
+        (1, '2026-01-01T00:00:00.000Z'),
+        (2, '2026-01-01T00:00:00.000Z')`
+
+      const migration = yield* Effect.exit(Migrations.run)
+      assert.strictEqual(migration._tag, "Failure")
+      if (migration._tag !== "Failure") return
+      const failure = Cause.pretty(migration.cause)
+      assert.include(failure, "Migration \"11_document_history_counters\" failed")
+      assert.include(failure, "UNIQUE constraint failed: effect_local_writer_generations.generation")
+      const metadata = yield* sql<{
+        readonly storage_format_version: number
+        readonly writer_generation: number
+      }>`SELECT storage_format_version, writer_generation
+        FROM effect_local_metadata WHERE singleton = 1`
+      assert.deepStrictEqual(metadata, [{ storage_format_version: 1, writer_generation: 1 }])
+      assert.deepStrictEqual(
+        yield* sql`SELECT migration_id FROM effect_local_migrations WHERE migration_id = 11`,
+        []
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT migration_id FROM effect_local_migration_catalog WHERE migration_id = 11`,
+        []
+      )
+      const generations = yield* sql<{ readonly generation: number }>`
+        SELECT generation FROM effect_local_writer_generations ORDER BY generation`
+      assert.deepStrictEqual(generations, [{ generation: 1 }, { generation: 2 }])
     }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
 
   it.effect("enforces relay identity, payload, and usage invariants", () =>

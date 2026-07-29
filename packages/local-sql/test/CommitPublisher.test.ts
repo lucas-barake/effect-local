@@ -88,6 +88,62 @@ describe("CommitPublisher", () => {
       }).pipe(Effect.provide(Live))
     ))
 
+  it.effect("defers publication until an ambient transaction commits", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const publisher = yield* CommitPublisher.CommitPublisher
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const subscription = yield* publisher.subscribe
+      const event = yield* Stream.runHead(subscription.events).pipe(Effect.forkChild)
+
+      yield* sql.withTransaction(Effect.gen(function*() {
+        yield* sql`INSERT INTO effect_local_commit_outbox (
+          commit_sequence, document_id, invalidation_keys, published
+        ) VALUES (1, ${documentId}, '["Items"]', 0)`
+        assert.strictEqual(yield* publisher.publishPending, 0)
+        assert.isUndefined(event.pollUnsafe())
+        const pending = yield* sql<{ readonly published: number }>`
+          SELECT published FROM effect_local_commit_outbox WHERE commit_sequence = 1
+        `
+        assert.deepStrictEqual(pending, [{ published: 0 }])
+      }))
+
+      assert.isUndefined(event.pollUnsafe())
+      yield* TestClock.adjust("1 second")
+      assert.deepStrictEqual(Option.getOrThrow(yield* Fiber.join(event)), {
+        _tag: "Commit",
+        commitSequence: Identity.CommitSequence.make(1),
+        documentId,
+        keys: ["Items"],
+        refreshGeneration: 0
+      })
+      assert.strictEqual((yield* publisher.subscribe).watermark, 1)
+    })).pipe(Effect.provide(Live)))
+
+  it.effect("does not publish an ambient transaction that rolls back", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const publisher = yield* CommitPublisher.CommitPublisher
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const subscription = yield* publisher.subscribe
+      const event = yield* Stream.runHead(subscription.events).pipe(Effect.forkChild)
+
+      yield* sql.withTransaction(Effect.gen(function*() {
+        yield* sql`INSERT INTO effect_local_commit_outbox (
+          commit_sequence, document_id, invalidation_keys, published
+        ) VALUES (1, ${documentId}, '["Items"]', 0)`
+        assert.strictEqual(yield* publisher.publishPending, 0)
+        assert.isUndefined(event.pollUnsafe())
+        return yield* Effect.fail("rollback")
+      })).pipe(Effect.ignore)
+
+      yield* TestClock.adjust("1 second")
+      assert.isUndefined(event.pollUnsafe())
+      assert.strictEqual((yield* publisher.subscribe).watermark, 0)
+      const rows = yield* sql`SELECT commit_sequence FROM effect_local_commit_outbox`
+      assert.deepStrictEqual(rows, [])
+    })).pipe(Effect.provide(Live)))
+
   it.effect("serializes concurrent publishers", () =>
     Effect.gen(function*() {
       const publisher = yield* CommitPublisher.CommitPublisher

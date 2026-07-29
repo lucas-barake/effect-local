@@ -2,6 +2,7 @@ import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
+import type * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -25,6 +26,7 @@ import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlError from "effect/unstable/sql/SqlError"
 import * as BackupStore from "../src/BackupStore.js"
 import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as CommitPublisher from "../src/CommitPublisher.js"
@@ -134,6 +136,12 @@ describe("SqlReplica", () => {
   )
   const Limits = ReplicaLimits.layer(limits)
   const Live = SqlReplica.layerWithBindings(definition, { projections: [] }).pipe(
+    Layer.provide(Layer.mergeAll(Database, Handler, Limits))
+  )
+  const DirectLive = SqlReplica.layerFromServices(definition).pipe(
+    Layer.provideMerge(
+      SqlReplica.servicesLayerWithBindings(definition, { projections: [] })
+    ),
     Layer.provide(Layer.mergeAll(Database, Handler, Limits))
   )
   const SlowHealthLive = SqlReplica.layerWithBindings(definition, {
@@ -320,6 +328,138 @@ describe("SqlReplica", () => {
       assert.deepStrictEqual(rows[0], { changes: 6, clusterMessages: 8, documents: 4, receipts: 7 })
     }).pipe(Effect.provide(Live), Effect.provide(Database), TestClock.withLive))
 
+  it.effect("does not publish after a durable stale resolution rejection", () =>
+    Effect.gen(function*() {
+      const replica = yield* Replica.Replica
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* replica.create(Task, {
+        commandId: yield* Identity.makeCommandId,
+        value: { title: "one" }
+      })
+      const inspected = yield* replica.inspectConflicts(Task, documentId)
+      assert.deepStrictEqual(inspected.conflicts, [])
+      const commandId = yield* Identity.makeCommandId
+      const resolution: Conflict.Resolution = {
+        heads: [],
+        path: { parents: [], target: { _tag: "Key", key: "title" } },
+        choice: { _tag: "DeleteValue" }
+      }
+      yield* sql`UPDATE effect_local_commit_outbox
+        SET published = 0, invalidation_keys = 'invalid-json'
+        WHERE commit_sequence = (
+          SELECT MAX(commit_sequence) FROM effect_local_commit_outbox
+        )`
+
+      const stale = yield* Effect.flip(
+        replica.resolveConflict(Task, { commandId, documentId, resolution })
+      )
+      if (stale._tag !== "StaleConflictResolution") {
+        assert.fail(`Expected StaleConflictResolution, got ${stale._tag}`)
+      }
+      assert.deepStrictEqual(
+        yield* replica.lookupConflictResolution(Task, { commandId, documentId, resolution }),
+        CommandOutcome.rejected(commandId, stale)
+      )
+      const pending = yield* sql<{ readonly published: number }>`
+        SELECT published FROM effect_local_commit_outbox ORDER BY commit_sequence DESC LIMIT 1
+      `
+      assert.deepStrictEqual(pending[0], { published: 0 })
+    }).pipe(Effect.provide(DirectLive), Effect.provide(NodeCrypto.layer), TestClock.withLive))
+
+  it.effect("exposes a durable outcome after commit acknowledgement is lost", () =>
+    Effect.gen(function*() {
+      let loseCommitAcknowledgement = false
+      let reservedConnections = 0
+      const baseDatabase = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+      const instrumentedDatabase = Layer.effect(
+        SqlClient.SqlClient,
+        Effect.gen(function*() {
+          const sql = yield* SqlClient.SqlClient
+          return Object.assign(
+            ((...args: ReadonlyArray<unknown>) => (sql as any)(...args)) as SqlClient.SqlClient,
+            sql,
+            {
+              reserve: sql.reserve.pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    reservedConnections++
+                  })
+                ),
+                Effect.map((connection) =>
+                  Object.assign({}, connection, {
+                    executeUnprepared: (
+                      statement: string,
+                      params: ReadonlyArray<unknown>,
+                      transformRows: Parameters<typeof connection.executeUnprepared>[2]
+                    ) => {
+                      const executed = connection.executeUnprepared(statement, params, transformRows)
+                      if (statement !== "COMMIT" || !loseCommitAcknowledgement) return executed
+                      return executed.pipe(
+                        Effect.tap(() =>
+                          Effect.sync(() => {
+                            loseCommitAcknowledgement = false
+                          })
+                        ),
+                        Effect.andThen(Effect.fail(
+                          new SqlError.SqlError({
+                            reason: new SqlError.ConnectionError({
+                              cause: new Error("commit acknowledgement lost"),
+                              message: "commit acknowledgement lost",
+                              operation: "commit"
+                            })
+                          })
+                        ))
+                      )
+                    }
+                  })
+                )
+              )
+            }
+          )
+        })
+      ).pipe(Layer.provide(baseDatabase))
+      const database = Layer.merge(instrumentedDatabase, NodeCrypto.layer)
+      const services = SqlReplica.layerFromServices(definition).pipe(
+        Layer.provideMerge(
+          SqlReplica.servicesLayerWithBindings(definition, { projections: [] })
+        ),
+        Layer.provide(Layer.mergeAll(database, Handler, Limits))
+      )
+
+      yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const documentId = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "one" }
+        })
+        const commandId = yield* Identity.makeCommandId
+        assert.isAbove(reservedConnections, 0)
+        loseCommitAcknowledgement = true
+
+        const exit = yield* Effect.exit(replica.mutate(Rename, {
+          commandId,
+          documentId,
+          payload: "two"
+        }))
+
+        if (!Exit.isFailure(exit)) return assert.fail("expected the commit acknowledgement to be lost")
+        assert.isFalse(Cause.hasDies(exit.cause))
+        assert.strictEqual(exit.cause.reasons.length, 1)
+        const failure = Cause.findErrorOption(exit.cause)
+        if (Option.isNone(failure)) return assert.fail("expected a typed failure")
+        const unknown = failure.value
+        assert.strictEqual(unknown.reason._tag, "CommandOutcomeUnknown")
+        if (unknown.reason._tag === "CommandOutcomeUnknown") {
+          assert.strictEqual(unknown.reason.commandId, commandId)
+        }
+        assert.deepStrictEqual(
+          yield* replica.lookupMutation(Rename, commandId),
+          CommandOutcome.durablyCommitted(commandId, undefined)
+        )
+        assert.strictEqual((yield* replica.get(Task, documentId)).value.title, "two")
+      }).pipe(Effect.scoped, Effect.provide(services), Effect.provide(NodeCrypto.layer))
+    }))
+
   it.effect("provides nonempty projection bindings", () =>
     Effect.gen(function*() {
       const replica = yield* Replica.Replica
@@ -359,7 +499,11 @@ describe("SqlReplica", () => {
       const keys = yield* sql<{ readonly invalidation_keys: string }>`
         SELECT invalidation_keys FROM effect_local_commit_outbox ORDER BY commit_sequence DESC LIMIT 1
       `
-      assert.deepStrictEqual(JSON.parse(keys[0]!.invalidation_keys), ["Task", "TaskTitle"])
+      assert.deepStrictEqual(JSON.parse(keys[0]!.invalidation_keys), [
+        Task.name,
+        ReplicaDefinition.documentInstanceKey(Task.name, documentId),
+        TaskTitle.name
+      ])
     }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive))
 
   it.effect("rejects importing a document whose portable definition does not match", () =>

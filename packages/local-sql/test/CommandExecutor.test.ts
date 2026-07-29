@@ -2,20 +2,24 @@ import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
-import type * as Conflict from "@lucas-barake/effect-local/Conflict"
+import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
+import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Cause from "effect/Cause"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Result from "effect/Result"
-import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlError from "effect/unstable/sql/SqlError"
 import { vi } from "vitest"
 import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as Compaction from "../src/Compaction.js"
@@ -75,6 +79,49 @@ describe("CommandExecutor", () => {
   const RecoveryService = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(Base, Gate)))
   const CompactionService = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Base, Gate, RecoveryService)))
   const Live = Layer.mergeAll(Base, Gate, Store, Executor, CompactionService)
+  const ConflictLimits = ReplicaLimits.layer({ ...gateLimits, maxConflictValueBytes: 8 })
+  const ConflictLimitedGate = ReplicaGate.layer.pipe(
+    Layer.provide(Layer.merge(Base, ConflictLimits))
+  )
+  const ConflictLimitedStore = DocumentStore.layer.pipe(
+    Layer.provide(Layer.mergeAll(Base, ConflictLimits, ConflictLimitedGate))
+  )
+  const ConflictLimitedExecutor = CommandExecutor.layer(definition).pipe(
+    Layer.provide(Layer.mergeAll(
+      Base,
+      ConflictLimits,
+      ConflictLimitedGate,
+      ConflictLimitedStore,
+      Projections,
+      Handlers
+    ))
+  )
+  const ConflictLimitedLive = Layer.mergeAll(
+    Base,
+    ConflictLimits,
+    ConflictLimitedGate,
+    ConflictLimitedStore,
+    ConflictLimitedExecutor
+  )
+  const changingLimits = { ...gateLimits }
+  const ChangingLimits = Layer.succeed(ReplicaLimits.ReplicaLimits, changingLimits)
+  const ChangingGate = ReplicaGate.layer.pipe(
+    Layer.provide(Layer.merge(Base, ChangingLimits))
+  )
+  const ChangingStore = DocumentStore.layer.pipe(
+    Layer.provide(Layer.mergeAll(Base, ChangingLimits, ChangingGate))
+  )
+  const ChangingExecutor = CommandExecutor.layer(definition).pipe(
+    Layer.provide(Layer.mergeAll(
+      Base,
+      ChangingLimits,
+      ChangingGate,
+      ChangingStore,
+      Projections,
+      Handlers
+    ))
+  )
+  const ChangingLive = Layer.mergeAll(Base, ChangingLimits, ChangingGate, ChangingStore, ChangingExecutor)
 
   it.effect("deduplicates matching requests and rejects conflicting command reuse", () =>
     Effect.scoped(Effect.gen(function*() {
@@ -401,6 +448,112 @@ describe("CommandExecutor", () => {
       assert.strictEqual(conflicting.reason._tag, "CommandIdConflict")
     })).pipe(Effect.provide(Live)))
 
+  it.effect("enforces configured conflict limits before new resolution execution", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const executor = yield* CommandExecutor.CommandExecutor
+      const gate = yield* ReplicaGate.ReplicaGate
+      const permit = yield* gate.shared
+      const documentId = yield* Identity.makeDocumentId
+      const commandId = yield* Identity.makeCommandId
+      const resolution: Conflict.Resolution = {
+        heads: [],
+        path: { parents: [], target: { _tag: "Key", key: "title" } },
+        choice: { _tag: "ReplaceValue", value: "replacement exceeds eight bytes" }
+      }
+      const encoded = yield* Schema.encodeEffect(Conflict.Resolution)(resolution)
+      const requestHash = yield* CommandExecutor.resolutionRequestHash({
+        incarnation: permit.incarnation,
+        commandId,
+        document: Task,
+        documentId,
+        resolution: encoded
+      })
+
+      const resolveError = yield* Effect.flip(executor.resolve(Task, {
+        commandId,
+        documentId,
+        permit,
+        requestHash,
+        resolution
+      }))
+      assert.strictEqual(resolveError.reason._tag, "QuotaExceeded")
+      if (resolveError.reason._tag === "QuotaExceeded") {
+        assert.strictEqual(resolveError.reason.resource, "conflict value bytes")
+        assert.strictEqual(resolveError.reason.limit, 8)
+      }
+
+      assert.deepStrictEqual(
+        yield* executor.lookupResolution(Task, {
+          commandId,
+          documentId,
+          permit,
+          resolution
+        }),
+        CommandOutcome.unknown(commandId)
+      )
+    })).pipe(Effect.provide(ConflictLimitedLive)))
+
+  it.effect("replays an existing resolution receipt after conflict limits are lowered", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const executor = yield* CommandExecutor.CommandExecutor
+      const gate = yield* ReplicaGate.ReplicaGate
+      const { documentId, permit } = yield* seedTask
+      const commandId = yield* Identity.makeCommandId
+      const resolution: Conflict.Resolution = {
+        heads: [],
+        path: { parents: [], target: { _tag: "Key", key: "title" } },
+        choice: { _tag: "ReplaceValue", value: "replacement exceeds eight bytes" }
+      }
+      const encoded = yield* Schema.encodeEffect(Conflict.Resolution)(resolution)
+      const requestHash = yield* CommandExecutor.resolutionRequestHash({
+        incarnation: permit.incarnation,
+        commandId,
+        document: Task,
+        documentId,
+        resolution: encoded
+      })
+      const outcome = yield* executor.resolve(Task, {
+        commandId,
+        documentId,
+        permit,
+        requestHash,
+        resolution
+      })
+      assert.strictEqual(outcome._tag, "Rejected")
+
+      const previousLimit = changingLimits.maxConflictValueBytes
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          changingLimits.maxConflictValueBytes = 8
+        }),
+        () =>
+          Effect.sync(() => {
+            changingLimits.maxConflictValueBytes = previousLimit
+          })
+      )
+
+      assert.deepStrictEqual(
+        yield* executor.resolve(Task, {
+          commandId,
+          documentId,
+          permit,
+          requestHash,
+          resolution
+        }),
+        outcome
+      )
+      assert.deepStrictEqual(
+        yield* executor.lookupResolution(Task, {
+          commandId,
+          documentId,
+          permit,
+          resolution
+        }),
+        outcome
+      )
+      assert.strictEqual((yield* gate.current).incarnation, permit.incarnation)
+    })).pipe(Effect.provide(ChangingLive)))
+
   it.effect("frees the staged automerge document when a mutation is rejected", () =>
     Effect.scoped(Effect.gen(function*() {
       const executor = yield* CommandExecutor.CommandExecutor
@@ -448,43 +601,61 @@ describe("CommandExecutor", () => {
       assert.throws(() => InternalAutomerge.heads(staged!))
     })).pipe(Effect.provide(Live)))
 
-  it.effect("tracks a staged document before observing interruption", () =>
-    Effect.gen(function*() {
-      const acquired = yield* Deferred.make<InternalAutomerge.AnyDocument>()
+  it.effect("frees a staged document when an executor operation is interrupted", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const { documentId, executor, permit } = yield* seedTask
+      const before = yield* durableCounts
+      const persisted = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
-      const tracked = new Set<InternalAutomerge.AnyDocument>()
-      const fiber = yield* InternalAutomerge.acquireTracked(
-        Effect.sync(() =>
-          InternalAutomerge.initialize(
-            { title: "one" },
-            "00000000000000000000000000000001"
+      const finalized = yield* Deferred.make<void>()
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          interruptBoundary.afterChangeInsert = Deferred.succeed(persisted, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.uninterruptible
           )
-        ).pipe(
-          Effect.flatMap((document) =>
-            Deferred.succeed(acquired, document).pipe(
-              Effect.andThen(Deferred.await(release)),
-              Effect.as(document)
-            )
-          )
-        ),
-        (document) => {
-          tracked.add(document)
-          return document
-        }
-      ).pipe(
-        Effect.ensuring(Effect.sync(() => {
-          for (const document of tracked) InternalAutomerge.free(document)
-        })),
-        Effect.provideService(Scheduler.MaxOpsBeforeYield, 64),
-        Effect.forkDetach
+        }),
+        () =>
+          Effect.sync(() => {
+            interruptBoundary.afterChangeInsert = undefined
+          })
       )
-      const staged = yield* Deferred.await(acquired)
-      yield* Effect.sync(() => fiber.interruptUnsafe())
+      const stageSpy = vi.spyOn(InternalAutomerge, "stage")
+      yield* Effect.addFinalizer(() => Effect.sync(() => stageSpy.mockRestore()))
+      const commandId = yield* Identity.makeCommandId
+      const requestHash = yield* CommandExecutor.mutationRequestHash({
+        incarnation: permit.incarnation,
+        commandId,
+        documentId,
+        mutation: Rename,
+        payload: "two"
+      })
+      const operation = yield* executor.mutate(Rename, {
+        commandId,
+        documentId,
+        payload: "two",
+        permit,
+        requestHash
+      }).pipe(
+        Effect.ensuring(Deferred.succeed(finalized, undefined)),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Deferred.await(persisted)
+      const staged = stageSpy.mock.results.at(-1)?.value as InternalAutomerge.AnyDocument | undefined
+      assert.isDefined(staged)
+      const interrupt = yield* Fiber.interrupt(operation).pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
       yield* Deferred.succeed(release, undefined)
-      const exit = yield* Fiber.await(fiber).pipe(Effect.timeoutOption("2 seconds"))
-      assert.strictEqual(exit._tag, "Some")
-      assert.throws(() => InternalAutomerge.heads(staged))
-    }))
+      yield* Fiber.join(interrupt)
+      yield* Deferred.await(finalized)
+
+      const exit = yield* Fiber.await(operation)
+      if (!Exit.isFailure(exit)) return assert.fail("expected the executor operation to be interrupted")
+      assert.isTrue(Cause.hasInterrupts(exit.cause))
+      assert.throws(() => InternalAutomerge.heads(staged!))
+      assert.deepStrictEqual(yield* durableCounts, before)
+    })).pipe(Effect.provide(Probed)))
 
   it.effect("round trips void delete receipts", () =>
     Effect.scoped(Effect.gen(function*() {
@@ -615,8 +786,59 @@ describe("CommandExecutor", () => {
     probeLayer(probe).pipe(Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))),
     NodeCrypto.layer
   )
-  const ProbedBootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(ProbedDatabase))
-  const ProbedBase = Layer.merge(ProbedDatabase, ProbedBootstrap)
+  const interruptBoundary: {
+    afterChangeInsert: Effect.Effect<void> | undefined
+    rollbackFailuresRemaining: number
+  } = { afterChangeInsert: undefined, rollbackFailuresRemaining: 0 }
+  const BoundarySql = Layer.effect(
+    SqlClient.SqlClient,
+    Effect.map(SqlClient.SqlClient, (sql) =>
+      Object.assign(
+        ((...args: ReadonlyArray<unknown>) => (sql as any)(...args)) as SqlClient.SqlClient,
+        sql,
+        {
+          reserve: sql.reserve.pipe(
+            Effect.map((connection) =>
+              Object.assign({}, connection, {
+                execute: (
+                  statement: string,
+                  params: ReadonlyArray<unknown>,
+                  transformRows: Parameters<typeof connection.execute>[2]
+                ) => {
+                  const executed = connection.execute(statement, params, transformRows)
+                  return statement.includes("INSERT INTO effect_local_changes") &&
+                      interruptBoundary.afterChangeInsert !== undefined
+                    ? executed.pipe(Effect.tap(() => interruptBoundary.afterChangeInsert!))
+                    : executed
+                },
+                executeUnprepared: (
+                  statement: string,
+                  params: ReadonlyArray<unknown>,
+                  transformRows: Parameters<typeof connection.executeUnprepared>[2]
+                ) => {
+                  if (statement !== "ROLLBACK" || interruptBoundary.rollbackFailuresRemaining === 0) {
+                    return connection.executeUnprepared(statement, params, transformRows)
+                  }
+                  interruptBoundary.rollbackFailuresRemaining--
+                  return Effect.fail(
+                    new SqlError.SqlError({
+                      reason: new SqlError.ConnectionError({
+                        cause: new Error("forced rollback failure"),
+                        message: "forced rollback failure",
+                        operation: "rollback"
+                      })
+                    })
+                  )
+                }
+              })
+            )
+          )
+        }
+      ))
+  ).pipe(Layer.provide(ProbedDatabase))
+  const BoundaryDatabase = Layer.merge(BoundarySql, NodeCrypto.layer)
+  const ProbedBootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(BoundaryDatabase))
+  const ProbedBase = Layer.merge(BoundaryDatabase, ProbedBootstrap)
   const ProbedGate = ReplicaGate.layer.pipe(withGateLimits, Layer.provide(ProbedBase))
   const ProbedStore = DocumentStore.layer.pipe(Layer.provide(Layer.merge(ProbedBase, ProbedGate)))
   const ProbedProjections = ProjectionStore.layer([]).pipe(Layer.provide(ProbedBase))
@@ -661,26 +883,222 @@ describe("CommandExecutor", () => {
       return yield* executor.mutate(Rename, { commandId, documentId, payload: title, permit, requestHash })
     })
 
-  it.effect("reads the retained history once per mutation regardless of its length", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const { documentId, executor, permit } = yield* seedTask
-      yield* renameTask(executor, documentId, permit, "two")
-      yield* Effect.sync(() => probe.reset())
-      yield* renameTask(executor, documentId, permit, "three")
-      // `CommandExecutor.mutate` loads the document once; `DocumentStore.persist`
-      // must not reconstruct it a second time to build its result.
-      const shortHistory = probe.countHistoryReads()
-
-      for (const title of ["four", "five", "six", "seven"]) {
-        yield* renameTask(executor, documentId, permit, title)
+  const rejectStaleResolution = (
+    executor: CommandExecutor.CommandExecutor["Service"],
+    documentId: Identity.DocumentId,
+    permit: ReplicaGate.Permit
+  ) =>
+    Effect.gen(function*() {
+      const commandId = yield* Identity.makeCommandId
+      const resolution: Conflict.Resolution = {
+        heads: [],
+        path: { parents: [], target: { _tag: "Key", key: "title" } },
+        choice: { _tag: "DeleteValue" }
       }
-      yield* Effect.sync(() => probe.reset())
-      yield* renameTask(executor, documentId, permit, "eight")
-      const longHistory = probe.countHistoryReads()
+      const encoded = yield* InternalConflicts.encodeResolution(resolution, gateLimits)
+      const requestHash = yield* CommandExecutor.resolutionRequestHash({
+        incarnation: permit.incarnation,
+        commandId,
+        document: Task,
+        documentId,
+        resolution: encoded
+      })
+      return yield* Effect.exit(executor.resolve(Task, {
+        commandId,
+        documentId,
+        permit,
+        requestHash,
+        resolution
+      }))
+    })
 
-      assert.strictEqual(shortHistory, 1)
-      // Reconstruction cost must not grow with the retained history.
-      assert.strictEqual(longHistory, 1)
+  it.effect("recovers a resolution commit failure before releasing the connection", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const { documentId, executor, permit } = yield* seedTask
+      const before = yield* durableCounts
+      yield* sql`CREATE TABLE resolution_commit_parent (id INTEGER PRIMARY KEY)`
+      yield* sql`CREATE TABLE resolution_commit_child (
+        parent_id INTEGER NOT NULL,
+        FOREIGN KEY (parent_id) REFERENCES resolution_commit_parent(id) DEFERRABLE INITIALLY DEFERRED
+      )`
+      yield* sql`CREATE TRIGGER fail_resolution_commit
+        AFTER INSERT ON effect_local_command_receipts
+        WHEN NEW.mutation_name = '$resolve'
+        BEGIN
+          INSERT INTO resolution_commit_child(parent_id) VALUES (999);
+        END`
+
+      const exit = yield* rejectStaleResolution(executor, documentId, permit)
+
+      if (!Exit.isFailure(exit)) return assert.fail("expected the deferred constraint to reject the commit")
+      assert.isFalse(Cause.hasDies(exit.cause))
+      const failure = Cause.findErrorOption(exit.cause)
+      assert.strictEqual(failure._tag, "Some")
+      if (failure._tag === "Some") assert.strictEqual(failure.value.reason._tag, "StorageUnavailable")
+      assert.deepStrictEqual(yield* durableCounts, before)
+    })).pipe(Effect.provide(Probed)))
+
+  it.effect("does not persist a stale rejection when accepted heads are corrupt", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const { documentId, executor, permit } = yield* seedTask
+      const before = yield* durableCounts
+      yield* sql`UPDATE effect_local_documents SET accepted_heads = 'not-json'
+        WHERE document_id = ${documentId}`
+
+      const exit = yield* rejectStaleResolution(executor, documentId, permit)
+
+      if (!Exit.isFailure(exit)) return assert.fail("expected corrupt accepted heads to fail")
+      const failure = Cause.findErrorOption(exit.cause)
+      if (Option.isNone(failure)) return assert.fail("expected a typed failure")
+      assert.strictEqual(failure.value.reason._tag, "StorageCorrupt")
+      assert.deepStrictEqual(yield* durableCounts, before)
+    })).pipe(Effect.provide(Probed)))
+
+  it.effect("does not persist a stale rejection when materialized heads disagree with history", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const { documentId, executor, permit } = yield* seedTask
+      const before = yield* durableCounts
+      yield* sql`UPDATE effect_local_documents
+        SET materialized_heads = '["0000000000000000000000000000000000000000000"]'
+        WHERE document_id = ${documentId}`
+
+      const exit = yield* rejectStaleResolution(executor, documentId, permit)
+
+      if (!Exit.isFailure(exit)) return assert.fail("expected inconsistent materialized heads to fail")
+      const failure = Cause.findErrorOption(exit.cause)
+      if (Option.isNone(failure)) return assert.fail("expected a typed failure")
+      assert.strictEqual(failure.value.reason._tag, "StorageCorrupt")
+      assert.deepStrictEqual(yield* durableCounts, before)
+    })).pipe(Effect.provide(Probed)))
+
+  it.effect("rolls back a failed command that is caught inside an ambient transaction", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const { documentId, executor, permit } = yield* seedTask
+      const before = yield* durableCounts
+      yield* sql`CREATE TRIGGER fail_ambient_mutation_receipt
+        BEFORE INSERT ON effect_local_command_receipts
+        WHEN NEW.mutation_name = 'Rename'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced ambient receipt failure');
+        END`
+
+      yield* sql.withTransaction(
+        renameTask(executor, documentId, permit, "partial").pipe(
+          Effect.catchTag("ReplicaError", (error) => {
+            assert.strictEqual(error.reason._tag, "StorageUnavailable")
+            return Effect.void
+          })
+        )
+      )
+
+      assert.deepStrictEqual(yield* durableCounts, before)
+    })).pipe(Effect.provide(Probed)))
+
+  it.effect("preserves typed causes when an ambient transaction is rolled back automatically", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const { documentId, executor, permit } = yield* seedTask
+      const before = yield* durableCounts
+      yield* sql`CREATE TRIGGER fail_resolution_receipt
+        BEFORE INSERT ON effect_local_command_receipts
+        WHEN NEW.mutation_name = '$resolve'
+        BEGIN
+          SELECT RAISE(ROLLBACK, 'forced resolution rollback');
+        END`
+
+      const exit = yield* sql.withTransaction(Effect.gen(function*() {
+        const exit = yield* rejectStaleResolution(executor, documentId, permit)
+        yield* sql`BEGIN`
+        return exit
+      }))
+
+      if (!Exit.isFailure(exit)) return assert.fail("expected the receipt trigger to roll back the resolution")
+      assert.isFalse(Cause.hasDies(exit.cause))
+      assert.strictEqual(exit.cause.reasons.length, 2)
+      for (const reason of exit.cause.reasons) {
+        if (!Cause.isFailReason(reason)) return assert.fail(`expected a typed failure, got ${reason._tag}`)
+        assert.strictEqual(reason.error.reason._tag, "StorageUnavailable")
+      }
+      assert.deepStrictEqual(yield* durableCounts, before)
+    })).pipe(Effect.provide(Probed)))
+
+  it.effect("preserves rollback failure causes without poisoning the next transaction", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const { documentId, executor, permit } = yield* seedTask
+      const before = yield* durableCounts
+      yield* sql`CREATE TRIGGER fail_poisoned_mutation_receipt
+        BEFORE INSERT ON effect_local_command_receipts
+        WHEN NEW.mutation_name = 'Rename'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced body failure');
+        END`
+      interruptBoundary.rollbackFailuresRemaining = 1
+
+      const exit = yield* Effect.exit(renameTask(executor, documentId, permit, "poisoned"))
+
+      if (!Exit.isFailure(exit)) return assert.fail("expected the body and rollback to fail")
+      assert.isFalse(Cause.hasDies(exit.cause))
+      assert.strictEqual(exit.cause.reasons.length, 2)
+      const failures = exit.cause.reasons.flatMap((reason) => Cause.isFailReason(reason) ? [reason.error] : [])
+      assert.strictEqual(failures.length, 2)
+      assert.deepStrictEqual(
+        failures.map((failure) => failure.reason._tag),
+        ["StorageUnavailable", "StorageUnavailable"]
+      )
+      assert.isTrue(failures.some((failure) =>
+        failure.reason._tag === "StorageUnavailable" &&
+        String(failure.reason.cause).includes("forced rollback failure")
+      ))
+      const commandId = yield* Identity.makeCommandId
+      const requestHash = yield* CommandExecutor.mutationRequestHash({
+        incarnation: permit.incarnation,
+        commandId,
+        documentId,
+        mutation: Checked,
+        payload: "next"
+      })
+      assert.deepStrictEqual(
+        yield* executor.mutate(Checked, {
+          commandId,
+          documentId,
+          payload: "next",
+          permit,
+          requestHash
+        }),
+        CommandOutcome.rejected(commandId, new CheckedRejected())
+      )
+      assert.deepStrictEqual(yield* durableCounts, {
+        ...before,
+        receipts: before.receipts + 1
+      })
+    })).pipe(Effect.provide(Probed)))
+
+  it.effect("fails later commands immediately when transaction cleanup remains ambiguous", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const { documentId, executor, permit } = yield* seedTask
+      yield* sql`CREATE TRIGGER fail_ambiguous_mutation_receipt
+        BEFORE INSERT ON effect_local_command_receipts
+        WHEN NEW.mutation_name = 'Rename'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced ambiguous body failure');
+        END`
+      interruptBoundary.rollbackFailuresRemaining = 2
+
+      const first = yield* Effect.exit(renameTask(executor, documentId, permit, "ambiguous"))
+      if (!Exit.isFailure(first)) return assert.fail("expected ambiguous cleanup to fail")
+      assert.strictEqual(first.cause.reasons.length, 2)
+
+      const second = yield* Effect.exit(renameTask(executor, documentId, permit, "blocked"))
+      if (!Exit.isFailure(second)) return assert.fail("expected the poisoned executor to fail")
+      const failure = Cause.findErrorOption(second.cause)
+      if (Option.isNone(failure)) return assert.fail("expected a typed failure")
+      assert.strictEqual(failure.value.reason._tag, "StorageUnavailable")
     })).pipe(Effect.provide(Probed)))
 
   const durableCounts = Effect.gen(function*() {

@@ -3,6 +3,7 @@ import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import type * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import type * as Snapshot from "@lucas-barake/effect-local/Snapshot"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
@@ -15,6 +16,7 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as HistoryCounters from "./internal/historyCounters.js"
 import * as Rows from "./internal/rows.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -43,6 +45,17 @@ type RecoveredDocument<D extends Document.Any,> = {
   readonly historyOperations: number | null
 }
 
+export type ConflictSource<D extends Document.Any,> =
+  | {
+    readonly _tag: "Loaded"
+    readonly stored: RecoveredDocument<D>
+  }
+  | {
+    readonly _tag: "Stale"
+    readonly materializedHeads: ReadonlyArray<string>
+    readonly commitSequence: Identity.CommitSequence
+  }
+
 export class Recovery extends Context.Service<Recovery, {
   readonly recover: <D extends Document.Any,>(
     document: D,
@@ -53,6 +66,13 @@ export class Recovery extends Context.Service<Recovery, {
     documentId: Identity.DocumentId,
     permit: ReplicaGate.Permit
   ) => Effect.Effect<RecoveredDocument<D>, ReplicaError.ReplicaError>
+  readonly recoverConflictSource: <D extends Document.Any,>(
+    document: D,
+    documentId: Identity.DocumentId,
+    permit: ReplicaGate.Permit,
+    limits: ReplicaLimits.Values,
+    expectedHeads?: ReadonlyArray<string>
+  ) => Effect.Effect<ConflictSource<D>, ReplicaError.ReplicaError>
   readonly exportRaw: (documentId: Identity.DocumentId) => Effect.Effect<RawRecoveryExport, ReplicaError.ReplicaError>
 }>()("@lucas-barake/effect-local-sql/Recovery") {}
 
@@ -133,6 +153,21 @@ export const make = Effect.gen(function*() {
         WHERE document_id = ${documentId}
         ORDER BY commit_sequence, sequence, change_hash`
   })
+  const findChangesAfter = SqlSchema.findAll({
+    Request: Schema.Struct({
+      checkpointSequence: Schema.NullOr(Schema.Int),
+      documentId: Identity.DocumentId
+    }),
+    Result: ChangeRow,
+    execute: ({ checkpointSequence, documentId }) =>
+      sql`SELECT
+          actor, accepted_at, applied, bytes, change_hash, commit_sequence, dependencies,
+          document_id, document_type, peer_id, sequence, writer_definition_hash, writer_schema_version
+        FROM effect_local_changes
+        WHERE document_id = ${documentId}
+          AND (${checkpointSequence} IS NULL OR commit_sequence > ${checkpointSequence} OR applied = 0)
+        ORDER BY commit_sequence, sequence, change_hash`
+  })
 
   const exportRaw = (documentId: Identity.DocumentId) =>
     sql.withTransaction(Effect.gen(function*() {
@@ -195,74 +230,69 @@ export const make = Effect.gen(function*() {
         ))
     )
 
-  const invalidateCheckpoints = (
+  const invalidateCheckpointsInTransaction = (
     invalidCheckpoints: ReadonlyArray<string>,
     permit: ReplicaGate.Permit
   ) =>
-    sql.withTransaction(Effect.gen(function*() {
+    Effect.gen(function*() {
       for (const checkpointHash of invalidCheckpoints) {
         yield* sql`UPDATE effect_local_checkpoints SET verified = 0
             WHERE checkpoint_hash = ${checkpointHash}`
       }
       yield* gate.validate(permit)
-    })).pipe(
-      Effect.catchTag("SqlError", (cause) =>
-        Effect.fail(
-          new ReplicaError.ReplicaError({
-            reason: new ReplicaError.StorageUnavailable({
-              cause
-            })
-          })
-        ))
-    )
+    })
 
-  const recoverWithPermit = <D extends Document.Any,>(
+  type RecoveryTransactionOutcome<D extends Document.Any,> =
+    | {
+      readonly _tag: "Loaded"
+      readonly stored: RecoveredDocument<D>
+    }
+    | {
+      readonly _tag: "Stale"
+      readonly materializedHeads: ReadonlyArray<string>
+      readonly commitSequence: Identity.CommitSequence
+    }
+    | {
+      readonly _tag: "Quarantine"
+      readonly invalidCheckpoints: ReadonlyArray<string>
+      readonly reason: string
+      readonly error: ReplicaError.ReplicaError
+    }
+  type RecoveryOutcome<D extends Document.Any,> = Exclude<
+    RecoveryTransactionOutcome<D>,
+    { readonly _tag: "Quarantine" }
+  >
+
+  const recoverInTransaction = <D extends Document.Any,>(
     document: D,
     documentId: Identity.DocumentId,
-    permit: ReplicaGate.Permit
+    permit: ReplicaGate.Permit,
+    source?: {
+      readonly limits: ReplicaLimits.Values
+      readonly expectedHeads?: ReadonlyArray<string>
+    }
   ) =>
     Effect.gen(function*() {
-      const { changes, checkpoints, commitSequence, option } = yield* sql.withTransaction(Effect.gen(function*() {
-        const option = yield* findDocument(documentId)
-        // In the same transaction, so it reads the same snapshot the document row came from. It used
-        // to be a scalar subquery inside that SELECT, which is what let a replica-wide fault decode
-        // into a per-document `StorageCorrupt`.
-        const commitSequence = yield* findCommitSequence
-        const checkpoints = yield* findVerifiedCheckpoints(documentId)
-        const changes = yield* findChanges(documentId)
-        yield* gate.validate(permit)
-        return { changes, checkpoints, commitSequence, option }
-      })).pipe(
-        Effect.catchTags({
-          SqlError: (cause) =>
-            Effect.fail(
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.StorageUnavailable({
-                  cause
-                })
-              })
-            ),
-          SchemaError: (cause) =>
-            Effect.fail(
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.StorageCorrupt({
-                  cause
-                })
-              })
-            )
-        })
-      )
+      const option = yield* findDocument(documentId)
+      // In the same transaction, so it reads the same snapshot the document row came from. It used
+      // to be a scalar subquery inside that SELECT, which is what let a replica-wide fault decode
+      // into a per-document `StorageCorrupt`.
+      const commitSequence = yield* findCommitSequence
       if (option._tag === "None") {
         return yield* new ReplicaError.ReplicaError({ reason: new ReplicaError.DocumentNotFound({ documentId }) })
       }
       const row = option.value
       if (row.document_type !== document.name) {
-        yield* quarantine(documentId, [], `Stored document type does not match ${document.name}`, permit)
-        return yield* new ReplicaError.ReplicaError({
-          reason: new ReplicaError.StorageCorrupt({
-            cause: new Error(`Stored document type does not match ${document.name}`)
+        return {
+          _tag: "Quarantine" as const,
+          invalidCheckpoints: [],
+          reason: `Stored document type does not match ${document.name}`,
+          error: new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({
+              cause: new Error(`Stored document type does not match ${document.name}`)
+            })
           })
-        })
+        }
       }
       if (!Document.supportsStoredVersion(document, row.schema_version)) {
         return yield* new ReplicaError.ReplicaError({
@@ -287,11 +317,56 @@ export const make = Effect.gen(function*() {
           })
       }))
       if (Result.isFailure(parsedHeads)) {
-        yield* quarantine(documentId, [], "Invalid canonical head metadata", permit)
-        return yield* parsedHeads.failure
+        return {
+          _tag: "Quarantine" as const,
+          invalidCheckpoints: [],
+          reason: "Invalid canonical head metadata",
+          error: parsedHeads.failure
+        }
       }
       const materializedHeads = parsedHeads.success.materialized
       const acceptedHeads = parsedHeads.success.accepted
+      const counterState = HistoryCounters.classify({
+        bytes: row.history_bytes,
+        changes: row.history_changes,
+        operations: row.history_operations
+      })
+      if (counterState._tag === "Invalid") {
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.StorageCorrupt({
+            cause: new TypeError("History counters must either all be measured or all be null")
+          })
+        })
+      }
+
+      if (source !== undefined) {
+        yield* HistoryCounters.add(
+          {
+            bytes: row.history_bytes,
+            changes: row.history_changes,
+            operations: row.history_operations
+          },
+          { bytes: 0, changes: 0, operations: 0 },
+          source.limits
+        )
+        if (
+          source.expectedHeads !== undefined &&
+          !Equal.equals([...source.expectedHeads].toSorted(), [...materializedHeads].toSorted())
+        ) {
+          yield* gate.validate(permit)
+          return {
+            _tag: "Stale" as const,
+            materializedHeads,
+            commitSequence
+          }
+        }
+      }
+
+      const checkpoints = yield* findVerifiedCheckpoints(documentId)
+      const survivingChanges = yield* findChanges(documentId)
+      // Every surviving change row must agree with the writer provenance of any verified checkpoint
+      // that covers it, even when that row no longer participates in replay. Checking only the rows
+      // after a checkpoint would let a tampered covered row pass because replay never reads it.
       const provenanceConsistency = yield* Effect.result(Effect.try({
         try: () => {
           const checkpointProvenance = checkpoints.flatMap((checkpoint) => checkpoint.writer_provenance)
@@ -299,7 +374,7 @@ export const make = Effect.gen(function*() {
             [...new Set(checkpointProvenance.map((entry) => entry.changeHash))],
             [
               ...checkpointProvenance,
-              ...changes.map((change) => ({
+              ...survivingChanges.map((change) => ({
                 changeHash: change.change_hash,
                 writerSchemaVersion: change.writer_schema_version,
                 writerDefinitionHash: change.writer_definition_hash
@@ -313,8 +388,12 @@ export const make = Effect.gen(function*() {
           })
       }))
       if (Result.isFailure(provenanceConsistency)) {
-        yield* quarantine(documentId, [], "Conflicting canonical writer provenance", permit)
-        return yield* provenanceConsistency.failure
+        return {
+          _tag: "Quarantine" as const,
+          invalidCheckpoints: [],
+          reason: "Conflicting canonical writer provenance",
+          error: provenanceConsistency.failure
+        }
       }
       const invalidCheckpoints: Array<string> = []
       for (const checkpoint of [...checkpoints, null]) {
@@ -357,19 +436,16 @@ export const make = Effect.gen(function*() {
                     checksum !== checkpoint.checksum || checkpoint.checkpoint_hash !== checkpointHash ||
                     !Equal.equals(InternalAutomerge.heads(current!), checkpointHeads)
                   ) throw new TypeError(`Invalid checkpoint: ${checkpoint.checkpoint_hash}`)
-                  const checkpointHashes = WriterProvenance.changeHashes(current!)
-                  WriterProvenance.validateExact(checkpointHashes, checkpoint.writer_provenance)
-                  WriterProvenance.resolve(
-                    checkpointHashes,
-                    [
-                      ...checkpoint.writer_provenance,
-                      ...changes.map((change) => ({
-                        changeHash: change.change_hash,
-                        writerSchemaVersion: change.writer_schema_version,
-                        writerDefinitionHash: change.writer_definition_hash
-                      }))
-                    ]
-                  )
+                  const checkpointChangeHashes = WriterProvenance.changeHashes(current!)
+                  WriterProvenance.validateExact(checkpointChangeHashes, checkpoint.writer_provenance)
+                  WriterProvenance.resolve(checkpointChangeHashes, [
+                    ...checkpoint.writer_provenance,
+                    ...survivingChanges.map((change) => ({
+                      changeHash: change.change_hash,
+                      writerSchemaVersion: change.writer_schema_version,
+                      writerDefinitionHash: change.writer_definition_hash
+                    }))
+                  ])
                 },
                 catch: (cause) =>
                   new ReplicaError.ReplicaError({
@@ -379,17 +455,54 @@ export const make = Effect.gen(function*() {
                   })
               })
             }
-            current = yield* Effect.try({
-              try: () => {
-                for (const change of changes) {
-                  if (change.applied !== 1 || Automerge.hasHeads(current!, [change.change_hash])) continue
+            const changes = yield* findChangesAfter({
+              checkpointSequence: checkpoint?.commit_sequence ?? null,
+              documentId
+            })
+            const retainedChanges = yield* Effect.try({
+              try: () =>
+                changes.map((change) => {
                   const decoded = InternalAutomerge.decode(change.bytes)
                   if (
-                    change.document_type !== row.document_type || decoded.hash !== change.change_hash ||
+                    (change.applied !== 0 && change.applied !== 1) ||
+                    change.document_type !== row.document_type ||
+                    decoded.hash !== change.change_hash ||
                     decoded.actor !== change.actor ||
                     decoded.sequence !== change.sequence ||
                     encodeHeads(decoded.dependencies) !== change.dependencies
                   ) throw new TypeError(`Invalid stored change: ${change.change_hash}`)
+                  return { decoded, row: change }
+                }),
+              catch: (cause) =>
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageCorrupt({ cause })
+                })
+            })
+            yield* Effect.try({
+              try: () => {
+                const checkpointProvenance = checkpoint?.writer_provenance ?? []
+                const required = [
+                  ...checkpointProvenance.map((entry) => entry.changeHash),
+                  ...retainedChanges.map(({ decoded }) => decoded.hash)
+                ]
+                WriterProvenance.resolve(required, [
+                  ...checkpointProvenance,
+                  ...retainedChanges.map(({ decoded, row: change }) => ({
+                    changeHash: decoded.hash,
+                    writerSchemaVersion: change.writer_schema_version,
+                    writerDefinitionHash: change.writer_definition_hash
+                  }))
+                ])
+              },
+              catch: (cause) =>
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageCorrupt({ cause })
+                })
+            })
+            current = yield* Effect.try({
+              try: () => {
+                for (const { row: change } of retainedChanges) {
+                  if (change.applied !== 1 || Automerge.hasHeads(current!, [change.change_hash])) continue
                   current = InternalAutomerge.replay(current!, [change.bytes])
                 }
                 if (
@@ -405,7 +518,7 @@ export const make = Effect.gen(function*() {
                   })
                 })
             })
-            return current
+            return { automerge: current, retainedChanges }
           }).pipe(
             Effect.onError(() =>
               Effect.sync(() => {
@@ -418,7 +531,39 @@ export const make = Effect.gen(function*() {
           if (checkpoint !== null) invalidCheckpoints.push(checkpoint.checkpoint_hash)
           continue
         }
-        const automerge = recovered.success
+        const { automerge, retainedChanges } = recovered.success
+        if (counterState._tag === "Measured") {
+          yield* Effect.try({
+            try: () => {
+              const stats = Automerge.stats(automerge)
+              let pendingBytes = 0
+              let pendingChanges = 0
+              let pendingOperations = 0
+              for (const { decoded } of retainedChanges) {
+                if (Automerge.hasHeads(automerge, [decoded.hash])) continue
+                pendingBytes += decoded.bytes.byteLength
+                pendingChanges++
+                pendingOperations += decoded.operations
+              }
+              if (
+                stats.numChanges + pendingChanges !== counterState.counters.changes ||
+                stats.numOps + pendingOperations !== counterState.counters.operations ||
+                (
+                  checkpoint === null &&
+                  retainedChanges.reduce((total, change) => total + change.decoded.bytes.byteLength, 0) !==
+                    counterState.counters.bytes
+                ) ||
+                pendingBytes > counterState.counters.bytes
+              ) throw new TypeError("Stored history counters do not match recovered history")
+            },
+            catch: (cause) =>
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause })
+              })
+          }).pipe(
+            Effect.onError(() => Effect.sync(() => InternalAutomerge.free(automerge)))
+          )
+        }
         const encoded = InternalAutomerge.value(automerge)
         if (InternalAutomerge.tombstone(automerge) !== (row.tombstone === 1)) {
           InternalAutomerge.free(automerge)
@@ -435,41 +580,119 @@ export const make = Effect.gen(function*() {
           if (checkpoint !== null) invalidCheckpoints.push(checkpoint.checkpoint_hash)
           continue
         }
-        yield* invalidateCheckpoints(invalidCheckpoints, permit).pipe(
+        yield* invalidateCheckpointsInTransaction(invalidCheckpoints, permit).pipe(
           Effect.onError(() => Effect.sync(() => InternalAutomerge.free(automerge)))
         )
         return {
-          automerge,
-          encoded,
-          snapshot: {
-            documentId,
-            value: decoded.success,
-            version: row.schema_version,
-            heads: materializedHeads,
-            tombstone: row.tombstone === 1,
-            projection: row.projection_status
-          },
-          materializedHeads,
-          acceptedHeads,
-          commitSequence,
-          historyBytes: row.history_bytes,
-          historyChanges: row.history_changes,
-          historyOperations: row.history_operations
+          _tag: "Loaded" as const,
+          stored: {
+            automerge,
+            encoded,
+            snapshot: {
+              documentId,
+              value: decoded.success,
+              version: row.schema_version,
+              heads: materializedHeads,
+              tombstone: row.tombstone === 1,
+              projection: row.projection_status
+            },
+            materializedHeads,
+            acceptedHeads,
+            commitSequence,
+            historyBytes: row.history_bytes,
+            historyChanges: row.history_changes,
+            historyOperations: row.history_operations
+          }
         }
       }
 
-      yield* quarantine(documentId, invalidCheckpoints, "Canonical recovery failed", permit)
-      return yield* new ReplicaError.ReplicaError({
-        reason: new ReplicaError.StorageCorrupt({
-          cause: new Error(`No complete verified history for document ${documentId}`)
+      return {
+        _tag: "Quarantine" as const,
+        invalidCheckpoints,
+        reason: "Canonical recovery failed",
+        error: new ReplicaError.ReplicaError({
+          reason: new ReplicaError.StorageCorrupt({
+            cause: new Error(`No complete verified history for document ${documentId}`)
+          })
         })
-      })
+      }
     })
+
+  const executeRecovery = <D extends Document.Any,>(
+    document: D,
+    documentId: Identity.DocumentId,
+    permit: ReplicaGate.Permit,
+    source?: {
+      readonly limits: ReplicaLimits.Values
+      readonly expectedHeads?: ReadonlyArray<string>
+    }
+  ): Effect.Effect<RecoveryOutcome<D>, ReplicaError.ReplicaError> =>
+    sql.withTransaction(recoverInTransaction(document, documentId, permit, source)).pipe(
+      Effect.catchTags({
+        SqlError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause })
+            })
+          ),
+        SchemaError: (cause) =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+          )
+      }),
+      Effect.flatMap((outcome): Effect.Effect<RecoveryOutcome<D>, ReplicaError.ReplicaError> => {
+        if (outcome._tag === "Quarantine") {
+          return quarantine(documentId, outcome.invalidCheckpoints, outcome.reason, permit).pipe(
+            Effect.andThen(Effect.fail(outcome.error))
+          )
+        }
+        return Effect.succeed(outcome)
+      })
+    )
+
+  const recoverWithPermit = <D extends Document.Any,>(
+    document: D,
+    documentId: Identity.DocumentId,
+    permit: ReplicaGate.Permit
+  ) =>
+    executeRecovery(document, documentId, permit).pipe(
+      Effect.flatMap((outcome) =>
+        outcome._tag === "Loaded"
+          ? Effect.succeed(outcome.stored)
+          : Effect.die(new Error("Recovery returned a stale result without expected heads"))
+      )
+    )
+
+  const recoverConflictSource = <D extends Document.Any,>(
+    document: D,
+    documentId: Identity.DocumentId,
+    permit: ReplicaGate.Permit,
+    limits: ReplicaLimits.Values,
+    expectedHeads?: ReadonlyArray<string>
+  ): Effect.Effect<ConflictSource<D>, ReplicaError.ReplicaError> =>
+    executeRecovery(
+      document,
+      documentId,
+      permit,
+      expectedHeads === undefined ? { limits } : { limits, expectedHeads }
+    ).pipe(
+      Effect.map((outcome): ConflictSource<D> =>
+        outcome._tag === "Loaded"
+          ? outcome
+          : {
+            _tag: "Stale",
+            materializedHeads: outcome.materializedHeads,
+            commitSequence: outcome.commitSequence
+          }
+      )
+    )
 
   const recover = <D extends Document.Any,>(document: D, documentId: Identity.DocumentId) =>
     gate.current.pipe(Effect.flatMap((permit) => recoverWithPermit(document, documentId, permit)))
 
-  return Recovery.of({ exportRaw, recover, recoverWithPermit })
+  return Recovery.of({ exportRaw, recover, recoverConflictSource, recoverWithPermit })
 })
 
 export const layer: Layer.Layer<Recovery, never, Crypto.Crypto | SqlClient.SqlClient | ReplicaGate.ReplicaGate> = Layer

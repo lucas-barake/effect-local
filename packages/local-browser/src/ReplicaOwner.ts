@@ -131,39 +131,11 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
                         ...inspection,
                         snapshot: { ...inspection.snapshot, value }
                       }
-                      const issue = Conflict.preflightUnknown(value, sessions.conflictLimits)
-                      if (issue !== undefined) {
-                        return Effect.fail(
-                          new ReplicaError.ReplicaError({
-                            reason: new ReplicaError.ProtocolMismatch({
-                              expected: "bounded conflict inspection",
-                              observed: issue._tag
-                            })
-                          })
-                        )
-                      }
-                      for (const record of inspection.conflicts) {
-                        for (const alternative of record.alternatives) {
-                          const alternativeIssue = Conflict.preflightNativeValue(
-                            alternative.value,
-                            sessions.conflictLimits
-                          )
-                          if (alternativeIssue !== undefined) {
-                            return Effect.fail(
-                              new ReplicaError.ReplicaError({
-                                reason: new ReplicaError.ProtocolMismatch({
-                                  expected: "bounded conflict inspection",
-                                  observed: alternativeIssue._tag
-                                })
-                              })
-                            )
-                          }
-                        }
-                      }
                       return Wire.encodeConflict(
                         Conflict.inspection(Schema.Json),
                         encoded,
-                        sessions.conflictLimits
+                        sessions.conflictLimits,
+                        Conflict.preflightInspection
                       )
                     })
                   )
@@ -181,7 +153,12 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           client.id,
           lookup(documents, "document", document).pipe(
             Effect.flatMap((definition) =>
-              Wire.decodeConflict(Conflict.Resolution, resolution, sessions.conflictLimits).pipe(
+              Wire.decodeConflict(
+                Conflict.Resolution,
+                resolution,
+                sessions.conflictLimits,
+                Conflict.preflightResolution
+              ).pipe(
                 Effect.flatMap((decoded) =>
                   CommandOutcome.toOutcome(
                     commandId,
@@ -307,7 +284,12 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           client.id,
           lookup(documents, "document", document).pipe(
             Effect.flatMap((definition) =>
-              Wire.decodeConflict(Conflict.Resolution, resolution, sessions.conflictLimits).pipe(
+              Wire.decodeConflict(
+                Conflict.Resolution,
+                resolution,
+                sessions.conflictLimits,
+                Conflict.preflightResolution
+              ).pipe(
                 Effect.flatMap((decoded) =>
                   replica.lookupConflictResolution(definition, {
                     commandId,

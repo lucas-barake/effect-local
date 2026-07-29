@@ -19,7 +19,8 @@ const AtomicRevisionString = ImmutableString.pipe(
       decode: (value) => value.toString(),
       encode: (value) => new Automerge.ImmutableString(value)
     })
-  )
+  ),
+  Schema.annotate({ identifier: "AtomicRevisionString" })
 )
 
 export const EditedMessage = Document.make("EditedMessage", {

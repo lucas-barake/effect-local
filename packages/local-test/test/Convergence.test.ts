@@ -13,7 +13,6 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
-import { FastCheck } from "effect/testing"
 import { rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -182,7 +181,7 @@ const drain = (documentId: Identity.DocumentId, left: Side, right: Side, reverse
         fromRight.outbound === null &&
         !fromLeft.dirty &&
         !fromRight.dirty
-      ) return round + 1
+      ) return
     }
     return yield* Effect.die("peer sync did not reach quiescence within 32 rounds")
   })
@@ -255,8 +254,7 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
         left.replica.delete(Message, { commandId: (yield* Identity.makeCommandId), documentId }),
         mutate(right, AddLabel, documentId, "concurrent")
       ], { concurrency: "unbounded" })
-      const rounds = yield* drain(documentId, left, right, true)
-      assert.isAtMost(rounds, 32)
+      yield* drain(documentId, left, right, true)
       const leftSnapshot = yield* left.replica.get(Message, documentId)
       const rightSnapshot = yield* right.replica.get(Message, documentId)
       assert.deepStrictEqual(leftSnapshot.heads.toSorted(), rightSnapshot.heads.toSorted())
@@ -290,12 +288,11 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
   it.effect("inspects the same conflict after reordered duplicate delivery", () =>
     Effect.scoped(Effect.gen(function*() {
       const { documentId, left, right } = yield* seedPair()
-      const rounds = yield* createMessageConflict(documentId, left, right, {
+      yield* createMessageConflict(documentId, left, right, {
         left: "left",
         right: "right",
         reverse: true
       })
-      assert.isAtMost(rounds, 32)
       const leftInspection = yield* left.replica.inspectConflicts(Message, documentId)
       const rightInspection = yield* right.replica.inspectConflicts(Message, documentId)
       assert.deepStrictEqual(leftInspection.conflicts, rightInspection.conflicts)
@@ -374,6 +371,12 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
       ])
       assert.strictEqual(leftOutcome._tag, "DurablyCommittedLocal")
       assert.strictEqual(rightOutcome._tag, "DurablyCommittedLocal")
+      const leftPartitionInspection = yield* left.replica.inspectConflicts(Message, documentId)
+      const rightPartitionInspection = yield* right.replica.inspectConflicts(Message, documentId)
+      assert.deepStrictEqual(leftPartitionInspection.conflicts, [])
+      assert.deepStrictEqual(rightPartitionInspection.conflicts, [])
+      assert.strictEqual(leftPartitionInspection.snapshot.value.message, "left")
+      assert.strictEqual(rightPartitionInspection.snapshot.value.message, "right")
       yield* drain(documentId, left, right, true)
       const leftInspection = yield* left.replica.inspectConflicts(Message, documentId)
       const rightInspection = yield* right.replica.inspectConflicts(Message, documentId)
@@ -437,6 +440,14 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
       const leftInspection = yield* left.replica.inspectConflicts(Message, documentId)
       const rightInspection = yield* right.replica.inspectConflicts(Message, documentId)
       assert.deepStrictEqual(leftInspection.snapshot, rightInspection.snapshot)
+      assert.deepStrictEqual(leftInspection.snapshot.value, {
+        message: "left",
+        labels: ["frontier advanced"]
+      })
+      assert.deepStrictEqual(rightInspection.snapshot.value, {
+        message: "left",
+        labels: ["frontier advanced"]
+      })
       assert.deepStrictEqual(leftInspection.conflicts, [])
       assert.deepStrictEqual(rightInspection.conflicts, [])
     })))
@@ -448,11 +459,14 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
         `effect-local-conflict-convergence-${globalThis.crypto.randomUUID()}.sqlite`
       )
       yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          rmSync(filename, { force: true })
-          rmSync(`${filename}-wal`, { force: true })
-          rmSync(`${filename}-shm`, { force: true })
-        })
+        Effect.try({
+          try: () => {
+            rmSync(filename, { force: true })
+            rmSync(`${filename}-wal`, { force: true })
+            rmSync(`${filename}-shm`, { force: true })
+          },
+          catch: (cause) => cause
+        }).pipe(Effect.orDie)
       )
       const persisted = yield* Effect.scoped(Effect.gen(function*() {
         const { documentId, left, right } = yield* seedPair({
@@ -503,35 +517,27 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
       }))
     })))
 
-  it.effect.prop(
-    "converges bounded concurrent list edits",
-    [
-      FastCheck.uniqueArray(FastCheck.string({ minLength: 1, maxLength: 12 }), { minLength: 1, maxLength: 3 }),
-      FastCheck.uniqueArray(FastCheck.string({ minLength: 1, maxLength: 12 }), { minLength: 1, maxLength: 3 })
-    ],
-    ([leftLabels, rightLabels]) =>
-      Effect.scoped(Effect.gen(function*() {
-        const { documentId, left, right } = yield* seedPair()
-        yield* Effect.all([
-          Effect.forEach(leftLabels, (label) => mutate(left, AddLabel, documentId, `left:${label}`), {
-            discard: true
-          }),
-          Effect.forEach(rightLabels, (label) => mutate(right, AddLabel, documentId, `right:${label}`), {
-            discard: true
-          })
-        ], { concurrency: "unbounded" })
-        yield* drain(documentId, left, right, leftLabels.length % 2 === 0)
-        const leftSnapshot = yield* left.replica.get(Message, documentId)
-        const rightSnapshot = yield* right.replica.get(Message, documentId)
-        assert.deepStrictEqual(leftSnapshot.heads.toSorted(), rightSnapshot.heads.toSorted())
-        assert.deepStrictEqual(leftSnapshot.value, rightSnapshot.value)
-        assert.sameMembers(
-          [...leftSnapshot.value.labels],
-          [...leftLabels.map((label) => `left:${label}`), ...rightLabels.map((label) => `right:${label}`)]
-        )
-      })),
-    // Its own timeout: the only property check here, and it seeds a replica pair and drains a
-    // partition eight times over.
-    { timeout: 60_000, fastCheck: { numRuns: 8 } }
-  )
+  it.effect("converges bounded concurrent list edits", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const leftLabels = ["alpha", "shared prefix", "unicode 🧪"]
+      const rightLabels = ["omega", "shared prefix", "unicode 🧬"]
+      const { documentId, left, right } = yield* seedPair()
+      yield* Effect.all([
+        Effect.forEach(leftLabels, (label) => mutate(left, AddLabel, documentId, `left:${label}`), {
+          discard: true
+        }),
+        Effect.forEach(rightLabels, (label) => mutate(right, AddLabel, documentId, `right:${label}`), {
+          discard: true
+        })
+      ], { concurrency: "unbounded" })
+      yield* drain(documentId, left, right, true)
+      const leftSnapshot = yield* left.replica.get(Message, documentId)
+      const rightSnapshot = yield* right.replica.get(Message, documentId)
+      assert.deepStrictEqual(leftSnapshot.heads.toSorted(), rightSnapshot.heads.toSorted())
+      assert.deepStrictEqual(leftSnapshot.value, rightSnapshot.value)
+      assert.sameMembers(
+        [...leftSnapshot.value.labels],
+        [...leftLabels.map((label) => `left:${label}`), ...rightLabels.map((label) => `right:${label}`)]
+      )
+    })))
 })

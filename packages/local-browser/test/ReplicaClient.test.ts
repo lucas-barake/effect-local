@@ -93,6 +93,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     Layer.provideMerge(Sessions),
     Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, replica)))
   )
+  const allInvalidationKeys = ReplicaDefinition.invalidationKeys(definition)
 
   const disconnected = () =>
     new RpcClientError.RpcClientError({
@@ -423,6 +424,106 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       )
     })).pipe(Effect.provide(Owner)))
 
+  it.effect("preserves interruption combined with an RPC command dispatch failure", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const interrupted = new Proxy(rpc, {
+        get(target, property, receiver) {
+          if (property === "Create") {
+            return () =>
+              Effect.failCause(Cause.combine(
+                Cause.fail(disconnected()),
+                Cause.interrupt(1)
+              ))
+          }
+          return Reflect.get(target, property, receiver)
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, interrupted)
+      const commandId = yield* Identity.makeCommandId
+      const exit = yield* Effect.exit(
+        client.create(Task, { commandId, value: { title: "new" } })
+      )
+
+      assert.isTrue(Exit.isFailure(exit))
+      if (Exit.isSuccess(exit)) return
+      assert.isTrue(Cause.hasInterrupts(exit.cause))
+      assert.isTrue(
+        exit.cause.reasons.some((reason) =>
+          Cause.isFailReason(reason) &&
+          Schema.is(RpcClientError.RpcClientError)(reason.error)
+        )
+      )
+      assert.isFalse(
+        exit.cause.reasons.some((reason) =>
+          Cause.isFailReason(reason) &&
+          ReplicaError.isReplicaError(reason.error) &&
+          reason.error.reason._tag === "CommandOutcomeUnknown"
+        )
+      )
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("recovers a direct unknown command outcome through receipt lookup", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      let dispatches = 0
+      let lookups = 0
+      const unknown = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property === "Mutate") {
+            return (payload: { readonly commandId: Identity.CommandId }) =>
+              Effect.sync(() => {
+                dispatches++
+                return CommandOutcome.unknown(payload.commandId)
+              })
+          }
+          if (property === "LookupMutation") {
+            return (payload: never) =>
+              Effect.sync(() => {
+                lookups++
+              }).pipe(Effect.andThen(value(payload)))
+          }
+          return value
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, unknown)
+      const commandId = yield* Identity.makeCommandId
+
+      assert.strictEqual(
+        yield* client.mutate(Rename, { commandId, documentId, payload: { title: "next" } }),
+        "renamed"
+      )
+      assert.strictEqual(dispatches, 1)
+      assert.strictEqual(lookups, 1)
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("reports ambiguity when dispatch and lookup return direct unknown outcomes", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const unknown = new Proxy(rpc, {
+        get(target, property, receiver) {
+          if (property === "Mutate" || property === "LookupMutation") {
+            return (payload: { readonly commandId: Identity.CommandId }) =>
+              Effect.succeed(CommandOutcome.unknown(payload.commandId))
+          }
+          return Reflect.get(target, property, receiver)
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, unknown)
+      const commandId = yield* Identity.makeCommandId
+      const error = yield* Effect.flip(
+        client.mutate(Rename, { commandId, documentId, payload: { title: "next" } })
+      )
+
+      assert.isTrue(ReplicaError.isReplicaError(error))
+      if (!ReplicaError.isReplicaError(error)) return
+      assert.strictEqual(error.reason._tag, "CommandOutcomeUnknown")
+      if (error.reason._tag === "CommandOutcomeUnknown") {
+        assert.strictEqual(error.reason.commandId, commandId)
+      }
+    })).pipe(Effect.provide(Owner)))
+
   it.effect("recovers a lost conflict resolution response through complete lookup", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
@@ -593,7 +694,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.deepStrictEqual(Array.from(yield* Fiber.join(fiber)), [{
         _tag: "FullRefreshRequired",
         ownerEpoch: client.ownerEpoch,
-        keys: [Task.name]
+        keys: allInvalidationKeys
       }])
       assert.strictEqual(subscriptions, 2)
     })).pipe(Effect.provide(Owner)))
@@ -617,7 +718,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.deepStrictEqual(Array.from(yield* Stream.runCollect(client.invalidations)), [{
         _tag: "FullRefreshRequired",
         ownerEpoch: client.ownerEpoch,
-        keys: [Task.name]
+        keys: allInvalidationKeys
       }])
     })).pipe(Effect.provide(Owner)))
 
@@ -640,7 +741,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.deepStrictEqual(Array.from(yield* Stream.runCollect(client.invalidations)), [{
         _tag: "FullRefreshRequired",
         ownerEpoch: client.ownerEpoch,
-        keys: [Task.name]
+        keys: allInvalidationKeys
       }])
     })).pipe(Effect.provide(Owner)))
 
@@ -711,7 +812,6 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       const invalidationsStarted = yield* Deferred.make<void>()
       const ownerRestarted = yield* Deferred.make<void>()
       let openSessions = 0
-      let restarted = false
       const restarting = new Proxy(rpc, {
         get(target, property, receiver) {
           const value = Reflect.get(target, property, receiver)
@@ -722,19 +822,6 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                   value(payload).pipe(Effect.map((lease: object) => ({ ...lease, ownerEpoch: `owner-${generation}` })))
                 )
               )
-          }
-          if (property === "Get") {
-            return (payload: { readonly sessionId: Identity.SessionId }) =>
-              restarted && openSessions === 1
-                ? Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.ProtocolMismatch({
-                      expected: "active session",
-                      observed: payload.sessionId
-                    })
-                  })
-                )
-                : value(payload)
           }
           if (property === "Invalidations") {
             return ({ ownerEpoch }: { readonly ownerEpoch: string }) =>
@@ -752,14 +839,19 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                         Stream.fail(
                           new ReplicaError.ReplicaError({
                             reason: new ReplicaError.ProtocolMismatch({
-                              expected: "active session",
-                              observed: "owner restarted"
+                              expected: "owner-2",
+                              observed: ownerEpoch
                             })
                           })
                         )
                       )
                     )
-                    : Stream.never
+                    : Stream.make({
+                      _tag: "Invalidation" as const,
+                      ownerEpoch,
+                      sequence: Identity.CommitSequence.make(1),
+                      keys: [Task.name]
+                    })
                 )
               )
           }
@@ -768,19 +860,119 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       })
       const client = yield* ReplicaClient.fromRpcClient(definition, restarting)
       const initialOwnerEpoch = client.ownerEpoch
-      const invalidation = yield* client.invalidations.pipe(Stream.take(1), Stream.runCollect, Effect.forkChild)
+      const invalidation = yield* client.invalidations.pipe(Stream.take(2), Stream.runCollect, Effect.forkChild)
       yield* Deferred.await(invalidationsStarted)
-      restarted = true
-      assert.deepStrictEqual(yield* client.get(Task, documentId), yield* replica.get(Task, documentId))
       yield* Deferred.succeed(ownerRestarted, undefined)
+      const collected = Array.from(yield* Fiber.join(invalidation))
       assert.strictEqual(openSessions, 2)
       assert.notStrictEqual(client.ownerEpoch, initialOwnerEpoch)
-      assert.deepStrictEqual(Array.from(yield* Fiber.join(invalidation)), [{
-        _tag: "FullRefreshRequired",
-        ownerEpoch: client.ownerEpoch,
-        keys: [Task.name]
-      }])
+      assert.deepStrictEqual(collected, [
+        {
+          _tag: "FullRefreshRequired",
+          ownerEpoch: client.ownerEpoch,
+          keys: allInvalidationKeys
+        },
+        {
+          _tag: "Invalidation",
+          ownerEpoch: client.ownerEpoch,
+          sequence: Identity.CommitSequence.make(1),
+          keys: [Task.name]
+        }
+      ])
       assert.strictEqual(yield* sessions.activeCount, 1)
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("preserves a healthy session after a local protocol mismatch", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      let openSessions = 0
+      let gets = 0
+      const locallyRejected = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property === "OpenSession") {
+            return (payload: never) =>
+              Effect.sync(() => {
+                openSessions++
+              }).pipe(Effect.andThen(value(payload)))
+          }
+          if (property === "Get") {
+            return (payload: never) =>
+              Effect.sync(() => ++gets).pipe(
+                Effect.flatMap((attempt) =>
+                  attempt === 1
+                    ? Effect.fail(
+                      new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.ProtocolMismatch({
+                          expected: "bounded conflict response",
+                          observed: "invalid local value"
+                        })
+                      })
+                    )
+                    : value(payload)
+                )
+              )
+          }
+          return value
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, locallyRejected)
+
+      const error = yield* Effect.flip(client.get(Task, documentId))
+      assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+      assert.strictEqual(openSessions, 1)
+      assert.strictEqual(gets, 1)
+
+      assert.strictEqual((yield* client.get(Task, documentId)).documentId, documentId)
+      assert.strictEqual(openSessions, 1)
+      assert.strictEqual(gets, 2)
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("rejects an invalid replacement without dispatching or replacing the session", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      let openSessions = 0
+      let resolutions = 0
+      const observed = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property === "OpenSession") {
+            return (payload: never) =>
+              Effect.sync(() => {
+                openSessions++
+              }).pipe(Effect.andThen(value(payload)))
+          }
+          if (property === "ResolveConflict") {
+            return (payload: never) =>
+              Effect.sync(() => {
+                resolutions++
+              }).pipe(Effect.andThen(value(payload)))
+          }
+          return value
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, observed)
+      const invalid = {
+        heads: [],
+        path: { parents: [], target: { _tag: "Key", key: "title" } },
+        choice: { _tag: "ReplaceValue", value: Number.NaN }
+      } as never
+
+      const error = yield* Effect.flip(
+        client.resolveConflict(Task, {
+          commandId: (yield* Identity.makeCommandId),
+          documentId,
+          resolution: invalid
+        })
+      )
+      if (!Schema.is(ReplicaError.ReplicaError)(error)) {
+        assert.fail(`Expected ReplicaError, got ${error._tag}`)
+      }
+      assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+      assert.strictEqual(openSessions, 1)
+      assert.strictEqual(resolutions, 0)
+      assert.strictEqual((yield* client.get(Task, documentId)).documentId, documentId)
+      assert.strictEqual(openSessions, 1)
     })).pipe(Effect.provide(Owner)))
 
   it.effect("serializes concurrent session reopen attempts", () =>
@@ -913,7 +1105,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.deepStrictEqual(Array.from(yield* Stream.runCollect(client.invalidations)), [{
         _tag: "FullRefreshRequired",
         ownerEpoch: client.ownerEpoch,
-        keys: [Task.name]
+        keys: allInvalidationKeys
       }])
     })).pipe(Effect.provide(Owner)))
 
@@ -956,7 +1148,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         {
           _tag: "FullRefreshRequired",
           ownerEpoch: client.ownerEpoch,
-          keys: [Task.name]
+          keys: allInvalidationKeys
         },
         {
           _tag: "FullRefreshRequired",
@@ -966,7 +1158,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         {
           _tag: "FullRefreshRequired",
           ownerEpoch: client.ownerEpoch,
-          keys: [Task.name]
+          keys: allInvalidationKeys
         },
         {
           _tag: "Invalidation",

@@ -24,6 +24,7 @@ export interface Change {
   readonly actor: string
   readonly sequence: number
   readonly dependencies: ReadonlyArray<string>
+  readonly operations: number
   readonly bytes: Uint8Array
 }
 
@@ -34,6 +35,7 @@ export const decode = (bytes: Uint8Array): Change => {
     actor: decoded.actor,
     sequence: decoded.seq,
     dependencies: decoded.deps,
+    operations: decoded.ops.length,
     bytes
   }
 }

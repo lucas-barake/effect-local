@@ -2,34 +2,33 @@ import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
+import type * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Context from "effect/Context"
+import type * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import { TestClock } from "effect/testing"
-import * as Reactivity from "effect/unstable/reactivity/Reactivity"
-import * as BackupStore from "../src/BackupStore.js"
-import * as CommandExecutor from "../src/CommandExecutor.js"
-import * as CommitPublisher from "../src/CommitPublisher.js"
-import * as Compaction from "../src/Compaction.js"
-import * as DocumentStore from "../src/DocumentStore.js"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as DurableRuntime from "../src/DurableRuntime.js"
 import * as EntityReplica from "../src/EntityReplica.js"
-import * as ProjectionStore from "../src/ProjectionStore.js"
-import * as QueryExecutor from "../src/QueryExecutor.js"
-import * as Recovery from "../src/Recovery.js"
-import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
-import * as ReplicaGate from "../src/ReplicaGate.js"
-import * as ReplicaHealth from "../src/ReplicaHealth.js"
+import * as SqlReplica from "../src/SqlReplica.js"
 
 describe("EntityReplica in-flight command limit", () => {
+  class DirectReplica extends Context.Service<DirectReplica, Replica.Replica["Service"]>()(
+    "@lucas-barake/effect-local-sql/test/DirectReplica"
+  ) {}
+
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
   const definition = ReplicaDefinition.make({
     name: "tasks",
@@ -79,55 +78,89 @@ describe("EntityReplica in-flight command limit", () => {
     maxRestoreErrorBytes: 4_096
   }
 
-  const buildLive = (executor: Layer.Layer<CommandExecutor.CommandExecutor>) => {
-    const database = Layer.merge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer)
-    const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provideMerge(database))
-    const infrastructure = Layer.mergeAll(bootstrap, ReplicaLimits.layer(limits))
-    const gate = ReplicaGate.layer.pipe(Layer.provideMerge(infrastructure))
-    const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
-    const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
-    const compaction = Compaction.layer.pipe(Layer.provideMerge(recovery))
-    const projections = ProjectionStore.layer([]).pipe(Layer.provideMerge(store))
-    const health = ReplicaHealth.layer(definition, ReplicaHealth.defaultOptions).pipe(Layer.provideMerge(projections))
-    const commands = Layer.merge(executor, health)
-    const queries = QueryExecutor.layer(definition).pipe(
-      Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
+  const database = Layer.merge(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer
+  )
+
+  const databaseWithTransactionProbe = (
+    probe: { armed: boolean },
+    onTransaction: Effect.Effect<void>
+  ) => {
+    const baseDatabase = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+    const instrumentedDatabase = Layer.effect(
+      SqlClient.SqlClient,
+      Effect.gen(function*() {
+        const sql = yield* SqlClient.SqlClient
+        return Object.assign(
+          ((...args: ReadonlyArray<unknown>) => (sql as any)(...args)) as SqlClient.SqlClient,
+          sql,
+          {
+            withTransaction: <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
+              Effect.serviceOption(sql.transactionService).pipe(
+                Effect.flatMap((transaction) =>
+                  sql.withTransaction(effect).pipe(
+                    Effect.tap(() =>
+                      Effect.sync(() => {
+                        if (!probe.armed || Option.isSome(transaction)) return false
+                        probe.armed = false
+                        return true
+                      }).pipe(
+                        Effect.flatMap((pause) => pause ? onTransaction : Effect.void)
+                      )
+                    )
+                  )
+                )
+              )
+          }
+        )
+      })
+    ).pipe(Layer.provideMerge(baseDatabase))
+    return Layer.merge(instrumentedDatabase, NodeCrypto.layer)
+  }
+
+  const productionLive = (
+    database: Layer.Layer<SqlClient.SqlClient | Crypto.Crypto>
+  ) =>
+    Layer.merge(
+      SqlReplica.layerWithBindings(definition, { projections: [] }).pipe(
+        Layer.provide(Layer.merge(database, ReplicaLimits.layer(limits)))
+      ),
+      database
     )
-    const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
-    const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
-    const durable = DurableRuntime.layer(definition).pipe(
-      Layer.provideMerge(Layer.merge(backups, compaction))
+
+  const productionLiveWithDirectReplica = (
+    database: Layer.Layer<SqlClient.SqlClient | Crypto.Crypto>
+  ) => {
+    const services = SqlReplica.servicesLayerWithBindings(definition, { projections: [] })
+    const direct = Layer.effect(DirectReplica, Replica.Replica).pipe(
+      Layer.provide(SqlReplica.layerFromServices(definition).pipe(Layer.provideMerge(services)))
     )
-    return EntityReplica.layer(definition).pipe(Layer.provideMerge(durable))
+    const durable = DurableRuntime.layer(definition).pipe(Layer.provideMerge(services))
+    const entity = EntityReplica.layer(definition).pipe(Layer.provideMerge(durable))
+    return Layer.merge(entity, direct).pipe(
+      Layer.provideMerge(Layer.merge(database, ReplicaLimits.layer(limits)))
+    )
   }
 
   it.effect("rejects a concurrent distinct command beyond the in-flight limit", () =>
     Effect.gen(function*() {
       const started = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
-      const executor = Layer.succeed(
-        CommandExecutor.CommandExecutor,
-        CommandExecutor.CommandExecutor.of({
-          create: (_document, options) =>
-            Deferred.succeed(started, undefined).pipe(
-              Effect.andThen(Deferred.await(release)),
-              Effect.as(CommandOutcome.durablyCommitted(options.commandId, options.documentId))
-            ),
-          mutate: (_mutation, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
-          delete: (_document, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
-          resolve: (_document, options) =>
-            Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
-          lookupCreate: (id) => Effect.succeed(CommandOutcome.unknown(id)),
-          lookupMutation: (_mutation, id) => Effect.succeed(CommandOutcome.unknown(id)),
-          lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id)),
-          lookupResolution: (_document, options) => Effect.succeed(CommandOutcome.unknown(options.commandId))
-        })
+      const probe = { armed: false }
+      const probedDatabase = databaseWithTransactionProbe(
+        probe,
+        Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release)))
       )
       yield* Effect.gen(function*() {
         const replica = yield* Replica.Replica
+        const sql = yield* SqlClient.SqlClient
         const firstId = yield* Identity.makeCommandId
         const secondId = yield* Identity.makeCommandId
-        const first = yield* Effect.forkChild(replica.create(Task, { commandId: firstId, value: { title: "first" } }))
+        probe.armed = true
+        const first = yield* replica.create(Task, { commandId: firstId, value: { title: "first" } }).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
         yield* Deferred.await(started)
         const rejected = yield* Effect.flip(replica.create(Task, { commandId: secondId, value: { title: "second" } }))
         assert.strictEqual(rejected.reason._tag, "QuotaExceeded")
@@ -138,7 +171,127 @@ describe("EntityReplica in-flight command limit", () => {
         }
         yield* Deferred.succeed(release, undefined)
         // Joining without a flip is the assertion: the admitted command commits rather than failing.
-        yield* Fiber.join(first)
-      }).pipe(Effect.provide(buildLive(executor)))
+        const documentId = yield* Fiber.join(first)
+        const rows = yield* sql<{
+          readonly documents: number
+          readonly receipts: number
+        }>`SELECT
+          (SELECT COUNT(*) FROM effect_local_documents
+            WHERE document_id = ${documentId}) AS documents,
+          (SELECT COUNT(*) FROM effect_local_command_receipts
+            WHERE command_id IN (${firstId}, ${secondId})) AS receipts`
+        assert.deepStrictEqual(rows[0], { documents: 1, receipts: 1 })
+      }).pipe(Effect.provide(productionLive(probedDatabase)))
+    }).pipe(TestClock.withLive))
+
+  it.effect("does not publish a durably rejected resolution and replays the persisted result", () =>
+    Effect.gen(function*() {
+      yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const sql = yield* SqlClient.SqlClient
+        const documentId = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "one" }
+        })
+        const commandId = yield* Identity.makeCommandId
+        const resolution: Conflict.Resolution = {
+          heads: [],
+          path: { parents: [], target: { _tag: "Key", key: "title" } },
+          choice: { _tag: "DeleteValue" }
+        }
+        yield* sql`UPDATE effect_local_commit_outbox
+          SET published = 0, invalidation_keys = 'invalid-json'
+          WHERE commit_sequence = (
+            SELECT MAX(commit_sequence) FROM effect_local_commit_outbox
+          )`
+
+        const first = yield* Effect.flip(replica.resolveConflict(Task, { commandId, documentId, resolution }))
+        if (first._tag !== "StaleConflictResolution") {
+          assert.fail(`Expected StaleConflictResolution, got ${first._tag}`)
+        }
+        const replayed = yield* Effect.flip(replica.resolveConflict(Task, { commandId, documentId, resolution }))
+        if (replayed._tag !== "StaleConflictResolution") {
+          assert.fail(`Expected StaleConflictResolution, got ${replayed._tag}`)
+        }
+        assert.deepStrictEqual(
+          yield* replica.lookupConflictResolution(Task, { commandId, documentId, resolution }),
+          CommandOutcome.rejected(commandId, first)
+        )
+        const rows = yield* sql<{
+          readonly published: number
+          readonly receipts: number
+        }>`SELECT
+          (SELECT published FROM effect_local_commit_outbox
+            ORDER BY commit_sequence DESC LIMIT 1) AS published,
+          (SELECT COUNT(*) FROM effect_local_command_receipts
+            WHERE command_id = ${commandId}) AS receipts`
+        assert.deepStrictEqual(rows[0], { published: 0, receipts: 1 })
+      }).pipe(Effect.provide(productionLive(database)))
+    }).pipe(TestClock.withLive))
+
+  it.effect("shares an exact resolution retry without admitting a distinct command", () =>
+    Effect.gen(function*() {
+      const release = yield* Deferred.make<void>()
+      const retryAdmitted = yield* Deferred.make<void>()
+      const probe = { armed: false }
+      const probedDatabase = databaseWithTransactionProbe(
+        probe,
+        Deferred.succeed(retryAdmitted, undefined).pipe(Effect.andThen(Deferred.await(release)))
+      )
+      yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const direct = yield* DirectReplica
+        const sql = yield* SqlClient.SqlClient
+        const documentId = yield* direct.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "one" }
+        })
+        const commandId = yield* Identity.makeCommandId
+        const resolution: Conflict.Resolution = {
+          heads: [],
+          path: { parents: [], target: { _tag: "Key", key: "title" } },
+          choice: { _tag: "DeleteValue" }
+        }
+        const first = yield* Effect.flip(direct.resolveConflict(Task, { commandId, documentId, resolution }))
+        if (first._tag !== "StaleConflictResolution") {
+          assert.fail(`Expected StaleConflictResolution, got ${first._tag}`)
+        }
+
+        probe.armed = true
+        const exact = yield* Effect.flip(
+          replica.resolveConflict(Task, { commandId, documentId, resolution })
+        ).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(retryAdmitted)
+        const distinctCommandId = yield* Identity.makeCommandId
+        const distinct = yield* Effect.flip(replica.resolveConflict(Task, {
+          commandId: distinctCommandId,
+          documentId,
+          resolution
+        }))
+        if (!Schema.is(ReplicaError.ReplicaError)(distinct)) {
+          assert.fail(`Expected ReplicaError, got ${distinct._tag}`)
+        }
+        assert.strictEqual(distinct.reason._tag, "QuotaExceeded")
+        if (distinct.reason._tag === "QuotaExceeded") {
+          assert.strictEqual(distinct.reason.resource, "in-flight commands")
+          assert.strictEqual(distinct.reason.limit, limits.maxQueuedRpc)
+        }
+        yield* Deferred.succeed(release, undefined)
+        const replayed = yield* Fiber.join(exact)
+        if (replayed._tag !== "StaleConflictResolution") {
+          assert.fail(`Expected StaleConflictResolution, got ${replayed._tag}`)
+        }
+        assert.deepStrictEqual(
+          yield* replica.lookupConflictResolution(Task, { commandId, documentId, resolution }),
+          CommandOutcome.rejected(commandId, first)
+        )
+        const rows = yield* sql<{ readonly receipts: number }>`
+          SELECT COUNT(*) AS receipts
+          FROM effect_local_command_receipts
+          WHERE command_id IN (${commandId}, ${distinctCommandId})`
+        assert.deepStrictEqual(rows[0], { receipts: 1 })
+      }).pipe(Effect.provide(productionLiveWithDirectReplica(probedDatabase)))
     }).pipe(TestClock.withLive))
 })

@@ -341,14 +341,52 @@ describe("DurableRuntime", () => {
       const filename = join(tmpdir(), `effect-local-workflow-${globalThis.crypto.randomUUID()}.sqlite`)
       yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(filename, { force: true })))
       const attempts = yield* Ref.make(0)
+      const firstSuspended = yield* Deferred.make<void>()
+      const restartedSuspended = yield* Deferred.make<void>()
+      const completed = yield* Deferred.make<void>()
       const registration = RestartWorkflow.toLayer(Effect.fn(function*() {
-        yield* Ref.update(attempts, (value) => value + 1)
+        const attempt = yield* Ref.updateAndGet(attempts, (value) => value + 1)
         yield* DurableClock.sleep({
           name: "RestartDelay",
           duration: "1 hour",
           inMemoryThreshold: 0
-        })
+        }).pipe(
+          Effect.ensuring(
+            attempt === 1
+              ? Deferred.succeed(firstSuspended, undefined).pipe(Effect.asVoid)
+              : attempt === 2
+              ? Deferred.succeed(restartedSuspended, undefined).pipe(Effect.asVoid)
+              : Effect.void
+          )
+        )
+        yield* Deferred.succeed(completed, undefined)
       }))
+      // Entity assignment and mailbox polling only advance under TestClock. The one hour durable
+      // clock cannot fire inside the drive budget, so driving toward a suspension can never resume
+      // the workflow early. Scope two fires the clock deliberately with a one hour adjustment.
+      const driveUntil = (
+        sharding: Sharding.Sharding["Service"],
+        signal: Deferred.Deferred<void>
+      ) =>
+        Effect.gen(function*() {
+          for (let round = 0; round < 12; round++) {
+            yield* sharding.pollStorage
+            if (yield* Deferred.isDone(signal)) return
+            yield* TestClock.adjust(5_000)
+          }
+          assert.fail("workflow did not reach the expected state within 12 storage polls")
+        })
+      const awaitResult = (
+        executionId: string,
+        expected: "Suspended" | "Complete"
+      ) =>
+        Effect.gen(function*() {
+          while (true) {
+            const result = yield* RestartWorkflow.poll(executionId)
+            if (Option.isSome(result) && result.value._tag === expected) return result.value
+            yield* Effect.yieldNow
+          }
+        })
       const executionId = yield* Effect.scoped(
         Effect.gen(function*() {
           const sharding = yield* Sharding.Sharding
@@ -356,13 +394,9 @@ describe("DurableRuntime", () => {
             { operationId: "restart-interrupted" },
             { discard: true }
           )
-          for (let round = 0; round < 4; round++) {
-            yield* sharding.pollStorage
-            yield* TestClock.adjust(5_000)
-          }
-          const suspended = yield* RestartWorkflow.poll(executionId)
-          assert.isTrue(Option.isSome(suspended))
-          if (Option.isSome(suspended)) assert.strictEqual(suspended.value._tag, "Suspended")
+          yield* driveUntil(sharding, firstSuspended)
+          const suspended = yield* awaitResult(executionId, "Suspended")
+          assert.strictEqual(suspended._tag, "Suspended")
           assert.strictEqual(yield* Ref.get(attempts), 1)
           return executionId
         }).pipe(Effect.provide(servicesAtWith(filename, registration)))
@@ -372,19 +406,13 @@ describe("DurableRuntime", () => {
         Effect.gen(function*() {
           const sharding = yield* Sharding.Sharding
           yield* RestartWorkflow.resume(executionId)
-          yield* sharding.pollStorage
+          yield* driveUntil(sharding, restartedSuspended)
           yield* TestClock.adjust("1 hour")
-          for (let round = 0; round < 4; round++) {
-            yield* sharding.pollStorage
-            yield* TestClock.adjust(5_000)
-          }
-          const reconciled = yield* RestartWorkflow.poll(executionId)
-          assert.isTrue(Option.isSome(reconciled))
-          if (Option.isSome(reconciled)) {
-            assert.strictEqual(reconciled.value._tag, "Complete")
-            if (reconciled.value._tag === "Complete") assert.isTrue(Exit.isSuccess(reconciled.value.exit))
-          }
-          assert.isAtLeast(yield* Ref.get(attempts), 2)
+          yield* driveUntil(sharding, completed)
+          const reconciled = yield* awaitResult(executionId, "Complete")
+          assert.strictEqual(reconciled._tag, "Complete")
+          if (reconciled._tag === "Complete") assert.isTrue(Exit.isSuccess(reconciled.exit))
+          assert.strictEqual(yield* Ref.get(attempts), 3)
         }).pipe(Effect.provide(servicesAtWith(filename, registration)))
       )
     }), 30_000)

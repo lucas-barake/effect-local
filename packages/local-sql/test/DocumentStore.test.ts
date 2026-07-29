@@ -8,6 +8,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
@@ -67,6 +68,18 @@ describe("DocumentStore", () => {
         persisted.historyBytes,
         changes.reduce((total, change) => total + change.bytes.byteLength, 0)
       )
+      const outbox = yield* sql<{ readonly invalidation_keys: string }>`
+        SELECT invalidation_keys FROM effect_local_commit_outbox
+        WHERE document_id = ${documentId}
+        ORDER BY commit_sequence
+      `
+      assert.deepStrictEqual(
+        outbox.map((row) => JSON.parse(row.invalidation_keys)),
+        [
+          ReplicaDefinition.documentCommitKeys(Task.name, documentId),
+          ReplicaDefinition.documentCommitKeys(Task.name, documentId)
+        ]
+      )
       const reloaded = yield* store.load(Task, documentId)
       assert.deepStrictEqual(reloaded.snapshot, persisted.snapshot)
       assert.strictEqual(reloaded.historyChanges, persisted.historyChanges)
@@ -77,6 +90,44 @@ describe("DocumentStore", () => {
       InternalAutomerge.free(staged)
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(Store)))
+
+  it.effect("keeps a successful conflict source handle alive when the same Effect later fails", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const store = yield* DocumentStore.DocumentStore
+        const sql = yield* SqlClient.SqlClient
+        const documentId = yield* Identity.makeDocumentId
+        const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+        InternalAutomerge.free(created.automerge)
+        const load = store.loadConflictSource(Task, documentId)
+        const first = yield* load
+        let firstNeedsFree = true
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            if (firstNeedsFree) InternalAutomerge.free(first.stored.automerge)
+          })
+        )
+
+        yield* sql`UPDATE effect_local_documents SET accepted_heads = 'not-json'
+        WHERE document_id = ${documentId}`
+        const second = yield* Effect.exit(load)
+        if (!Exit.isFailure(second)) return assert.fail("expected corrupt accepted heads to fail")
+
+        const readable = yield* Effect.sync(() => {
+          try {
+            InternalAutomerge.heads(first.stored.automerge)
+            return true
+          } catch {
+            return false
+          }
+        })
+        if (!readable) firstNeedsFree = false
+        assert.isTrue(readable)
+        InternalAutomerge.free(first.stored.automerge)
+        firstNeedsFree = false
+        assert.throws(() => InternalAutomerge.heads(first.stored.automerge))
+      }).pipe(Effect.provide(Store))
+    ))
 
   it.effect("rejects extending an unmeasured history without durable writes", () =>
     Effect.gen(function*() {

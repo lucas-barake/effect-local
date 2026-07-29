@@ -585,7 +585,7 @@ describe("Compaction", () => {
         [{
           commit_sequence: rewritten.commit_sequence,
           document_id: documentId as string,
-          invalidation_keys: JSON.stringify([Task.name]),
+          invalidation_keys: JSON.stringify(ReplicaDefinition.documentCommitKeys(Task.name, documentId)),
           published: 0
         }]
       )

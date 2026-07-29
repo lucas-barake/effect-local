@@ -1,6 +1,7 @@
 import * as Automerge from "@automerge/automerge"
 import * as Backup from "@lucas-barake/effect-local/Backup"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
+import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -658,7 +659,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               (document) => Effect.sync(() => InternalAutomerge.free(document))
             )
           })
-          const operationsByChange = new Map<string, number>()
+          const metadataByChange = new Map<string, {
+            readonly dependencies: ReadonlyArray<string>
+            readonly operations: number
+          }>()
           for (const record of decoded) {
             switch (record.kind) {
               case "Document": {
@@ -698,7 +702,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                     })
                   })
                 }
-                operationsByChange.set(record.value.change_hash, decodedChange.ops.length)
+                metadataByChange.set(record.value.change_hash, {
+                  dependencies: decodedChange.deps,
+                  operations: decodedChange.ops.length
+                })
                 break
               }
               case "Checkpoint": {
@@ -764,59 +771,52 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           }
           const historyByDocument = new Map<string, HistoryCounters.HistoryCounters | null>()
           for (const document of documentById.values()) {
-            if (checkpointDocuments.has(document.document_id)) {
-              historyByDocument.set(document.document_id, null)
-              continue
-            }
             const changes = changesByDocument.get(document.document_id) ?? []
-            const counters = yield* HistoryCounters.check(
-              HistoryCounters.measureDecoded(changes.map((change) => ({
-                bytes: change.bytes,
-                operations: operationsByChange.get(change.change_hash)!
-              }))),
-              limits
-            )
-            const applied = changes
-              .filter((change) => change.applied === 1)
-              .toSorted((left, right) =>
-                left.commit_sequence - right.commit_sequence ||
-                left.sequence - right.sequence ||
-                left.change_hash.localeCompare(right.change_hash)
-              )
-            const complete = yield* Effect.acquireUseRelease(
-              Effect.sync(() => ({
-                document: Automerge.init<InternalAutomerge.Root<unknown>>()
-              })),
-              (resource) =>
-                Effect.try({
-                  try: () => {
-                    if (applied.length > 0) {
-                      resource.document = Automerge.applyChanges(
-                        resource.document,
-                        applied.map((change) => change.bytes)
-                      )[0]
-                    }
-                    const expectedHeads = Schema.decodeSync(
-                      Schema.fromJsonString(Schema.Array(Schema.String))
-                    )(document.materialized_heads)
-                    const observedHeads = Automerge.getHeads(resource.document)
-                    return observedHeads.length === expectedHeads.length &&
-                      Automerge.hasHeads(resource.document, [...expectedHeads])
-                  },
-                  catch: (cause) =>
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.BackupInvalid({ cause })
-                    })
-                }),
-              (resource) => Effect.sync(() => InternalAutomerge.free(resource.document))
-            )
+            const complete = yield* Effect.try({
+              try: () => {
+                const appliedHashes = new Set(
+                  changes.flatMap((change) => change.applied === 1 ? [change.change_hash] : [])
+                )
+                const dependencies = new Set<string>()
+                for (const change of changes) {
+                  if (change.applied !== 1) continue
+                  for (const dependency of metadataByChange.get(change.change_hash)!.dependencies) {
+                    if (!appliedHashes.has(dependency)) return false
+                    dependencies.add(dependency)
+                  }
+                }
+                const observedHeads = [...appliedHashes]
+                  .filter((hash) => !dependencies.has(hash))
+                  .toSorted(Conflict.compareCodeUnits)
+                const expectedHeads = Schema.decodeSync(
+                  Schema.fromJsonString(Schema.Array(Schema.String))
+                )(document.materialized_heads).toSorted(Conflict.compareCodeUnits)
+                return observedHeads.length === expectedHeads.length &&
+                  observedHeads.every((head, index) => head === expectedHeads[index])
+              },
+              catch: (cause) =>
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.BackupInvalid({ cause })
+                })
+            }).pipe(Effect.catch(() => Effect.succeed(false)))
             if (!complete) {
+              if (checkpointDocuments.has(document.document_id)) {
+                historyByDocument.set(document.document_id, null)
+                continue
+              }
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
                   cause: new Error(`Incomplete retained history for ${document.document_id}`)
                 })
               })
             }
+            const counters = yield* HistoryCounters.check(
+              HistoryCounters.measureDecoded(changes.map((change) => ({
+                bytes: change.bytes,
+                operations: metadataByChange.get(change.change_hash)!.operations
+              }))),
+              limits
+            )
             historyByDocument.set(document.document_id, counters)
           }
           const nextReplicaId = options.mode === "clone"

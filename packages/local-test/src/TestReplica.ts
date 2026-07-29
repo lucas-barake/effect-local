@@ -1,5 +1,6 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
+import * as PeerSync from "@lucas-barake/effect-local-sql/PeerSync"
 import * as ReplicaHealth from "@lucas-barake/effect-local-sql/ReplicaHealth"
 import type * as SqlProjection from "@lucas-barake/effect-local-sql/SqlProjection"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
@@ -91,17 +92,22 @@ export const layerWithSyncAndLimits = <
     readonly projections: Bindings
     readonly limits: ReplicaLimits.Values
   }
-) =>
-  SqlReplica.layerWithBindings(definition, {
+) => {
+  const infrastructure = Layer.mergeAll(
+    SqliteClient.layer(options.database ?? { filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer,
+    ReplicaLimits.layer(options.limits)
+  )
+  const services = SqlReplica.servicesLayerWithBindings(definition, {
     health: options.health ?? ReplicaHealth.defaultOptions,
     projections: options.projections
-  }).pipe(
-    Layer.provideMerge([
-      SqliteClient.layer(options.database ?? { filename: ":memory:", disableWAL: true }),
-      NodeCrypto.layer,
-      ReplicaLimits.layer(options.limits)
-    ])
+  })
+  const sync = PeerSync.layer.pipe(Layer.provideMerge(services))
+  return SqlReplica.layerFromServices(definition).pipe(
+    Layer.provideMerge(sync),
+    Layer.provideMerge(infrastructure)
   )
+}
 
 export const layerWithSync = <
   D extends ReplicaDefinition.Any,

@@ -1,11 +1,12 @@
 import * as Automerge from "@automerge/automerge"
 import * as Conflict from "@lucas-barake/effect-local/Conflict"
-import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import type * as InternalAutomerge from "./automerge.js"
 import * as HistoryCounters from "./historyCounters.js"
+import { quotaExceeded } from "./quotaExceeded.js"
 
 type Backend = ReturnType<typeof Automerge.getBackend>
 type BackendValue = ReturnType<Backend["getAll"]>[number]
@@ -23,6 +24,7 @@ type TraversalLimits = Pick<
 
 interface Budget {
   readonly limits: TraversalLimits
+  readonly jsonBytes: Conflict.JsonByteBudget
   nodes: number
   alternatives: number
   failure: ResolutionFailure | undefined
@@ -50,10 +52,20 @@ export interface PreparedResolution {
 
 export type EncodedResolution = typeof Conflict.Resolution.Encoded
 
-const quota = (resource: string, limit: number) =>
-  new ReplicaError.ReplicaError({
-    reason: new ReplicaError.QuotaExceeded({ resource, limit })
-  })
+export const encodeResolutionCanonical = (
+  resolution: Conflict.Resolution
+): Effect.Effect<
+  EncodedResolution,
+  Conflict.UnsupportedConflictValue
+> =>
+  Schema.encodeEffect(Conflict.Resolution)(resolution).pipe(
+    Effect.mapError(() =>
+      new Conflict.UnsupportedConflictValue({
+        pathDepth: 0,
+        kind: "resolution"
+      })
+    )
+  )
 
 export const requireSourceBudget = (
   source: {
@@ -64,7 +76,7 @@ export const requireSourceBudget = (
   limits: ReplicaLimits.Values
 ): Effect.Effect<void, ReplicaError.ReplicaError> => {
   if (source.historyChanges === null || source.historyOperations === null || source.historyBytes === null) {
-    return Effect.fail(quota("unmeasured conflict source history", limits.maxConflictSourceChanges))
+    return Effect.fail(quotaExceeded("unmeasured conflict source history", limits.maxConflictSourceChanges))
   }
   return HistoryCounters.check({
     changes: source.historyChanges,
@@ -90,15 +102,15 @@ const preflightFailure = (
         kind: "cycle"
       })
     case "Depth":
-      return quota("conflict depth", issue.limit)
+      return quotaExceeded("conflict depth", issue.limit)
     case "Nodes":
-      return quota("conflict nodes", issue.limit)
+      return quotaExceeded("conflict nodes", issue.limit)
     case "Alternatives":
-      return quota("conflict alternatives", issue.limit)
+      return quotaExceeded("conflict alternatives", issue.limit)
     case "PathSegments":
-      return quota("conflict path segments", issue.limit)
+      return quotaExceeded("conflict path segments", issue.limit)
     case "Bytes":
-      return quota("conflict value bytes", issue.limit)
+      return quotaExceeded("conflict value bytes", issue.limit)
   }
 }
 
@@ -110,7 +122,7 @@ export const encodeResolution = (
   Conflict.UnsupportedConflictValue | Conflict.UnsupportedConflictKey | ReplicaError.ReplicaError
 > => {
   if (resolution.path.parents.length + 1 > limits.maxConflictPathSegments) {
-    return Effect.fail(quota("conflict path segments", limits.maxConflictPathSegments))
+    return Effect.fail(quotaExceeded("conflict path segments", limits.maxConflictPathSegments))
   }
   for (let index = 0; index < resolution.path.parents.length; index++) {
     const segment = resolution.path.parents[index]!
@@ -127,24 +139,17 @@ export const encodeResolution = (
     const issue = Conflict.preflightNativeValue(resolution.choice.value, limits)
     if (issue !== undefined) return Effect.fail(preflightFailure(issue))
   }
-  return Schema.encodeEffect(Conflict.Resolution)(resolution).pipe(
-    Effect.mapError(() =>
-      new Conflict.UnsupportedConflictValue({
-        pathDepth: 0,
-        kind: "resolution"
-      })
-    )
-  )
+  return encodeResolutionCanonical(resolution)
 }
 
 const consumeNode = (budget: Budget, depth: number): boolean => {
   if (depth > budget.limits.maxConflictDepth) {
-    budget.failure = quota("conflict depth", budget.limits.maxConflictDepth)
+    budget.failure = quotaExceeded("conflict depth", budget.limits.maxConflictDepth)
     return false
   }
   budget.nodes++
   if (budget.nodes > budget.limits.maxConflictNodes) {
-    budget.failure = quota("conflict nodes", budget.limits.maxConflictNodes)
+    budget.failure = quotaExceeded("conflict nodes", budget.limits.maxConflictNodes)
     return false
   }
   return true
@@ -153,7 +158,7 @@ const consumeNode = (budget: Budget, depth: number): boolean => {
 const consumeAlternatives = (budget: Budget, count: number): boolean => {
   budget.alternatives += count
   if (budget.alternatives > budget.limits.maxConflictAlternatives) {
-    budget.failure = quota("conflict alternatives", budget.limits.maxConflictAlternatives)
+    budget.failure = quotaExceeded("conflict alternatives", budget.limits.maxConflictAlternatives)
     return false
   }
   return true
@@ -199,38 +204,113 @@ const copyBackendValue = (
 ): { readonly value: Automerge.AutomergeValue } | undefined => {
   if (!consumeNode(budget, depth)) return undefined
   switch (tuple[0]) {
-    case "null":
+    case "null": {
+      if (Conflict.addJsonBytes(budget.jsonBytes, `{"_tag":"Null"}`.length)) {
+        budget.failure = quotaExceeded("conflict value bytes", budget.limits.maxConflictValueBytes)
+        return undefined
+      }
       return { value: null }
-    case "boolean":
+    }
+    case "boolean": {
+      if (
+        Conflict.addJsonBytes(budget.jsonBytes, `{"_tag":"Boolean","value":`.length) ||
+        Conflict.addJsonBytes(budget.jsonBytes, tuple[1] ? 4 : 5) ||
+        Conflict.addJsonBytes(budget.jsonBytes, 1)
+      ) {
+        budget.failure = quotaExceeded("conflict value bytes", budget.limits.maxConflictValueBytes)
+        return undefined
+      }
       return { value: tuple[1] }
-    case "str":
+    }
+    case "str": {
+      if (
+        Conflict.addJsonBytes(budget.jsonBytes, `{"_tag":"ImmutableString","value":`.length) ||
+        Conflict.addJsonStringBytes(budget.jsonBytes, tuple[1]) ||
+        Conflict.addJsonBytes(budget.jsonBytes, 1)
+      ) {
+        budget.failure = quotaExceeded("conflict value bytes", budget.limits.maxConflictValueBytes)
+        return undefined
+      }
       return { value: new Automerge.ImmutableString(tuple[1]) }
+    }
     case "int":
     case "uint":
-    case "f64":
+    case "f64": {
       if (typeof tuple[1] !== "number" || !Number.isFinite(tuple[1])) {
         budget.failure = unsupportedValue(depth, "number")
         return undefined
       }
+      if (
+        Conflict.addJsonBytes(budget.jsonBytes, `{"_tag":"Number","value":`.length) ||
+        Conflict.addJsonBytes(budget.jsonBytes, String(tuple[1]).length) ||
+        Conflict.addJsonBytes(budget.jsonBytes, 1)
+      ) {
+        budget.failure = quotaExceeded("conflict value bytes", budget.limits.maxConflictValueBytes)
+        return undefined
+      }
       return { value: tuple[1] }
+    }
     case "timestamp": {
       const value = new Date(tuple[1])
       if (Number.isNaN(value.getTime())) {
         budget.failure = unsupportedValue(depth, "date")
         return undefined
       }
+      if (
+        Conflict.addJsonBytes(budget.jsonBytes, `{"_tag":"Date","value":`.length) ||
+        Conflict.addJsonStringBytes(budget.jsonBytes, value.toISOString()) ||
+        Conflict.addJsonBytes(budget.jsonBytes, 1)
+      ) {
+        budget.failure = quotaExceeded("conflict value bytes", budget.limits.maxConflictValueBytes)
+        return undefined
+      }
       return { value }
     }
-    case "counter":
+    case "counter": {
       if (typeof tuple[1] !== "number" || !Number.isSafeInteger(tuple[1])) {
         budget.failure = unsupportedValue(depth, "counter")
         return undefined
       }
+      if (
+        Conflict.addJsonBytes(budget.jsonBytes, `{"_tag":"Counter","value":`.length) ||
+        Conflict.addJsonBytes(budget.jsonBytes, String(tuple[1]).length) ||
+        Conflict.addJsonBytes(budget.jsonBytes, 1)
+      ) {
+        budget.failure = quotaExceeded("conflict value bytes", budget.limits.maxConflictValueBytes)
+        return undefined
+      }
       return { value: new Automerge.Counter(tuple[1]) }
-    case "bytes":
+    }
+    case "bytes": {
+      const base64Bytes = 4 * Math.ceil(tuple[1].byteLength / 3)
+      if (
+        Conflict.addJsonBytes(budget.jsonBytes, `{"_tag":"Bytes","value":`.length) ||
+        Conflict.addJsonBytes(budget.jsonBytes, base64Bytes + 2) ||
+        Conflict.addJsonBytes(budget.jsonBytes, 1)
+      ) {
+        budget.failure = quotaExceeded("conflict value bytes", budget.limits.maxConflictValueBytes)
+        return undefined
+      }
       return { value: new Uint8Array(tuple[1]) }
-    case "text":
-      return { value: backend.text(tuple[1]) }
+    }
+    case "text": {
+      if (
+        Conflict.addJsonBytes(budget.jsonBytes, `{"_tag":"Text","value":`.length) ||
+        backend.length(tuple[1]) + 3 > Conflict.jsonByteBudgetRemaining(budget.jsonBytes)
+      ) {
+        budget.failure = quotaExceeded("conflict value bytes", budget.limits.maxConflictValueBytes)
+        return undefined
+      }
+      const value = backend.text(tuple[1])
+      if (
+        Conflict.addJsonStringBytes(budget.jsonBytes, value) ||
+        Conflict.addJsonBytes(budget.jsonBytes, 1)
+      ) {
+        budget.failure = quotaExceeded("conflict value bytes", budget.limits.maxConflictValueBytes)
+        return undefined
+      }
+      return { value }
+    }
     case "map":
     case "list":
       if (proxy === undefined || typeof proxy !== "object" || proxy === null) {
@@ -256,6 +336,14 @@ const copyContainer = (
     return undefined
   }
   if (Array.isArray(container)) {
+    if (
+      Conflict.addJsonBytes(budget.jsonBytes, `{"_tag":"List","values":[`.length) ||
+      Conflict.addJsonBytes(budget.jsonBytes, Math.max(0, container.length - 1)) ||
+      Conflict.addJsonBytes(budget.jsonBytes, 2)
+    ) {
+      budget.failure = quotaExceeded("conflict value bytes", budget.limits.maxConflictValueBytes)
+      return undefined
+    }
     const output = Array.from<Automerge.AutomergeValue>({ length: container.length })
     for (let index = 0; index < container.length; index++) {
       const values = backend.getAll(objectId, index)
@@ -271,11 +359,27 @@ const copyContainer = (
     return { value: output }
   }
 
-  const output = Object.create(null) as Record<string, Automerge.AutomergeValue>
   const keys = Object.keys(container).toSorted()
+  if (
+    Conflict.addJsonBytes(budget.jsonBytes, `{"_tag":"Map","entries":[`.length) ||
+    Conflict.addJsonBytes(budget.jsonBytes, Math.max(0, keys.length - 1)) ||
+    Conflict.addJsonBytes(budget.jsonBytes, 2)
+  ) {
+    budget.failure = quotaExceeded("conflict value bytes", budget.limits.maxConflictValueBytes)
+    return undefined
+  }
+  const output: Record<string, Automerge.AutomergeValue> = {}
   for (const key of keys) {
     if (!Conflict.isSupportedKey(key)) {
       budget.failure = new Conflict.UnsupportedConflictKey({ pathDepth: depth + 1 })
+      return undefined
+    }
+    if (
+      Conflict.addJsonBytes(budget.jsonBytes, `{"key":`.length) ||
+      Conflict.addJsonStringBytes(budget.jsonBytes, key) ||
+      Conflict.addJsonBytes(budget.jsonBytes, `,"value":`.length + 1)
+    ) {
+      budget.failure = quotaExceeded("conflict value bytes", budget.limits.maxConflictValueBytes)
       return undefined
     }
     const values = backend.getAll(objectId, key)
@@ -310,6 +414,79 @@ const parentSegment = (
 const targetSegment = (property: string | number): Conflict.TargetSegment =>
   typeof property === "number" ? { _tag: "Index", index: property } : { _tag: "Key", key: property }
 
+const addParentSegmentJsonBytes = (
+  budget: Conflict.JsonByteBudget,
+  segment: Conflict.ParentSegment
+): boolean => {
+  if (segment._tag === "Key") {
+    return Conflict.addJsonBytes(budget, `{"_tag":"Key","key":`.length) ||
+      Conflict.addJsonStringBytes(budget, segment.key) ||
+      (segment.alternative !== undefined && (
+        Conflict.addJsonBytes(budget, `,"alternative":`.length) ||
+        Conflict.addJsonStringBytes(budget, segment.alternative)
+      )) ||
+      Conflict.addJsonBytes(budget, 1)
+  }
+  return Conflict.addJsonBytes(budget, `{"_tag":"Index","index":`.length) ||
+    Conflict.addJsonBytes(budget, String(segment.index).length) ||
+    (segment.alternative !== undefined && (
+      Conflict.addJsonBytes(budget, `,"alternative":`.length) ||
+      Conflict.addJsonStringBytes(budget, segment.alternative)
+    )) ||
+    Conflict.addJsonBytes(budget, 1)
+}
+
+const addTargetSegmentJsonBytes = (
+  budget: Conflict.JsonByteBudget,
+  segment: Conflict.TargetSegment
+): boolean =>
+  segment._tag === "Key"
+    ? Conflict.addJsonBytes(budget, `{"_tag":"Key","key":`.length) ||
+      Conflict.addJsonStringBytes(budget, segment.key) ||
+      Conflict.addJsonBytes(budget, 1)
+    : Conflict.addJsonBytes(budget, `{"_tag":"Index","index":`.length) ||
+      Conflict.addJsonBytes(budget, String(segment.index).length) ||
+      Conflict.addJsonBytes(budget, 1)
+
+const addRecordMetadataJsonBytes = (
+  budget: Conflict.JsonByteBudget,
+  path: Conflict.Path,
+  visible: Conflict.AlternativeId,
+  ids: ReadonlyArray<Conflict.AlternativeId>,
+  separator: boolean
+): boolean => {
+  if (
+    (separator && Conflict.addJsonBytes(budget, 1)) ||
+    Conflict.addJsonBytes(budget, `{"path":{"parents":[`.length) ||
+    Conflict.addJsonBytes(budget, Math.max(0, path.parents.length - 1))
+  ) {
+    return true
+  }
+  for (const segment of path.parents) {
+    if (addParentSegmentJsonBytes(budget, segment)) return true
+  }
+  if (
+    Conflict.addJsonBytes(budget, `],"target":`.length) ||
+    addTargetSegmentJsonBytes(budget, path.target) ||
+    Conflict.addJsonBytes(budget, `},"visible":`.length) ||
+    Conflict.addJsonStringBytes(budget, visible) ||
+    Conflict.addJsonBytes(budget, `,"alternatives":[`.length) ||
+    Conflict.addJsonBytes(budget, Math.max(0, ids.length - 1))
+  ) {
+    return true
+  }
+  for (const id of ids) {
+    if (
+      Conflict.addJsonBytes(budget, `{"id":`.length) ||
+      Conflict.addJsonStringBytes(budget, id) ||
+      Conflict.addJsonBytes(budget, `,"value":`.length + 1)
+    ) {
+      return true
+    }
+  }
+  return Conflict.addJsonBytes(budget, 2)
+}
+
 const pathOrderKey = (path: Conflict.Path): string =>
   JSON.stringify([
     ...path.parents.map((segment) =>
@@ -320,16 +497,21 @@ const pathOrderKey = (path: Conflict.Path): string =>
     path.target._tag === "Key" ? ["Key", path.target.key] : ["Index", path.target.index]
   ])
 
+interface OrderedRecord {
+  readonly key: string
+  readonly record: Conflict.Record
+}
+
 const inspectContainer = (
   backend: Backend,
   container: Container,
   parents: ReadonlyArray<Conflict.ParentSegment>,
   budget: Budget,
-  records: Array<Conflict.Record>
+  records: Array<OrderedRecord>
 ): void => {
   if (budget.failure !== undefined) return
   if (parents.length + 1 > budget.limits.maxConflictPathSegments) {
-    budget.failure = quota("conflict path segments", budget.limits.maxConflictPathSegments)
+    budget.failure = quotaExceeded("conflict path segments", budget.limits.maxConflictPathSegments)
     return
   }
   if (!consumeNode(budget, parents.length)) return
@@ -352,26 +534,39 @@ const inspectContainer = (
     if (!consumeNode(budget, parents.length + 1)) return
     if (values.length === 0) continue
     const visibleId = Conflict.AlternativeId.make(alternativeId(values[values.length - 1]!))
-    const conflicts = values.length > 1 ? conflictsAt(container, property) : undefined
+    let conflicts: Record<string, Automerge.AutomergeValue> | undefined
     if (values.length > 1) {
       if (!consumeAlternatives(budget, values.length)) return
-      if (conflicts === undefined) {
-        budget.failure = unsupportedValue(parents.length + 1, "conflict")
-        return
+      const ids = values.map((value) => Conflict.AlternativeId.make(alternativeId(value)))
+      const path: Conflict.Path = { parents, target: targetSegment(property) }
+      if (values.some(isComposite)) {
+        conflicts = conflictsAt(container, property)
+        if (conflicts === undefined) {
+          budget.failure = unsupportedValue(parents.length + 1, "conflict")
+          return
+        }
       }
       const alternatives: Array<Conflict.Alternative> = []
-      for (const value of values) {
-        const id = Conflict.AlternativeId.make(alternativeId(value))
-        const copied = copyBackendValue(backend, value, conflicts[id], budget, parents.length + 1)
+      for (let index = 0; index < values.length; index++) {
+        const value = values[index]!
+        const id = ids[index]!
+        const copied = copyBackendValue(backend, value, conflicts?.[id], budget, parents.length + 1)
         if (copied === undefined) return
         alternatives.push({ id, value: copied.value })
       }
-      alternatives.sort((left, right) => left.id.localeCompare(right.id))
-      records.push({
-        path: { parents, target: targetSegment(property) },
+      // Metadata bytes are charged after the alternatives so an exhausted traversal budget is
+      // reported before the encoded size guard.
+      if (addRecordMetadataJsonBytes(budget.jsonBytes, path, visibleId, ids, records.length > 0)) {
+        budget.failure = quotaExceeded("conflict value bytes", budget.limits.maxConflictValueBytes)
+        return
+      }
+      const record: Conflict.Record = {
+        path,
         visible: visibleId,
         alternatives
-      })
+      }
+      alternatives.sort((left, right) => Conflict.compareCodeUnits(left.id, right.id))
+      records.push({ key: pathOrderKey(record.path), record })
     }
 
     for (const value of values) {
@@ -398,8 +593,14 @@ export const inspect = <E,>(
   limits: ReplicaLimits.Values
 ): Effect.Effect<ReadonlyArray<Conflict.Record>, ConflictFailure> =>
   Effect.suspend(() => {
-    const budget: Budget = { limits, nodes: 0, alternatives: 0, failure: undefined }
-    const records: Array<Conflict.Record> = []
+    const budget: Budget = {
+      limits,
+      jsonBytes: Conflict.createJsonByteBudget(limits.maxConflictValueBytes),
+      nodes: 0,
+      alternatives: 0,
+      failure: undefined
+    }
+    const records: Array<OrderedRecord> = []
     return Effect.sync(() => {
       Automerge.change(document, (draft) => {
         const root = draft.value
@@ -416,12 +617,17 @@ export const inspect = <E,>(
     }).pipe(
       Effect.flatMap(() => {
         if (budget.failure !== undefined) return Effect.fail(budget.failure as ConflictFailure)
-        const bytes = new TextEncoder().encode(JSON.stringify(records)).byteLength
-        if (bytes > limits.maxConflictValueBytes) {
-          return Effect.fail(quota("conflict value bytes", limits.maxConflictValueBytes))
-        }
-        records.sort((left, right) => pathOrderKey(left.path).localeCompare(pathOrderKey(right.path)))
-        return Effect.succeed(records)
+        records.sort((left, right) => Conflict.compareCodeUnits(left.key, right.key))
+        const result = records.map(({ record }) => record)
+        return Schema.encodeEffect(Conflict.Records)(result).pipe(
+          Effect.orDie,
+          Effect.flatMap((encoded) => {
+            const issue = Conflict.preflightUnknown(encoded, limits)
+            return issue?._tag === "Bytes"
+              ? Effect.fail(quotaExceeded("conflict value bytes", limits.maxConflictValueBytes))
+              : Effect.succeed(result)
+          })
+        )
       })
     )
   })
@@ -587,7 +793,13 @@ export const prepareResolution = <E,>(
   limits: ReplicaLimits.Values
 ): Effect.Effect<PreparedResolution, ResolutionFailure> =>
   Effect.suspend(() => {
-    const budget: Budget = { limits, nodes: 0, alternatives: 0, failure: undefined }
+    const budget: Budget = {
+      limits,
+      jsonBytes: Conflict.createJsonByteBudget(limits.maxConflictValueBytes),
+      nodes: 0,
+      alternatives: 0,
+      failure: undefined
+    }
     const backend = Automerge.getBackend(document)
     let located: LocateResult | undefined
     return Effect.sync(() => {
@@ -616,10 +828,10 @@ const cloneNative = (value: Automerge.AutomergeValue): Automerge.AutomergeValue 
   }
   if (value instanceof Date) return new Date(value)
   if (value instanceof Uint8Array) return new Uint8Array(value)
+  if (Array.isArray(value)) return Array.from(value, cloneNative)
   if (Automerge.isCounter(value)) return new Automerge.Counter(value.value)
   if (Automerge.isImmutableString(value)) return new Automerge.ImmutableString(value.val)
-  if (Array.isArray(value)) return value.map(cloneNative)
-  const output = Object.create(null) as Record<string, Automerge.AutomergeValue>
+  const output: Record<string, Automerge.AutomergeValue> = {}
   for (const [key, child] of Object.entries(value)) output[key] = cloneNative(child)
   return output
 }
@@ -663,6 +875,7 @@ export const applyResolution = (
       }
       const budget: Budget = {
         limits: Conflict.hardPreflightLimits,
+        jsonBytes: Conflict.createJsonByteBudget(Conflict.hardPreflightLimits.maxConflictValueBytes),
         nodes: 0,
         alternatives: 0,
         failure: undefined
@@ -681,17 +894,8 @@ export const applyResolution = (
   }
 
   if (!options.promoteParents) return
-  const backend = located.value.backend
   for (let index = located.value.frames.length - 1; index >= 0; index--) {
     const frame = located.value.frames[index]!
-    const budget: Budget = {
-      limits: Conflict.hardPreflightLimits,
-      nodes: 0,
-      alternatives: 0,
-      failure: undefined
-    }
-    const copied = copyContainer(backend, frame.selected, budget, index + 1)
-    if (copied === undefined) throw budget.failure ?? new Error("Prepared conflict branch is unavailable")
-    assignFresh(frame.parent, frame.property, copied.value)
+    assignFresh(frame.parent, frame.property, cloneNative(frame.selected))
   }
 }

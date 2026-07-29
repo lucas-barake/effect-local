@@ -36,7 +36,7 @@ const DocumentIdOutcome = CommandOutcome.schema(Identity.DocumentId, Schema.Neve
  * on. The version has to survive decoding for a handler to refuse it with a typed
  * `ReplicaError.ProtocolMismatch`.
  */
-export const protocolVersion = 2
+export const protocolVersion = 3
 const SessionLease = Schema.Struct({ leaseMillis: Schema.Int })
 export const ConflictLimits = Schema.Struct({
   maxConflictDepth: Schema.Int,

@@ -149,13 +149,12 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         inspectConflicts: (document, documentId) =>
           withPermit(() =>
             Effect.acquireUseRelease(
-              documents.load(document, documentId),
-              (stored) =>
-                InternalConflicts.requireSourceBudget(stored, limits).pipe(
-                  Effect.andThen(InternalConflicts.inspect(stored.automerge, limits)),
-                  Effect.map((conflicts) => ({ snapshot: stored.snapshot, conflicts }))
+              documents.loadConflictSource(document, documentId),
+              (source) =>
+                InternalConflicts.inspect(source.stored.automerge, limits).pipe(
+                  Effect.map((conflicts) => ({ snapshot: source.stored.snapshot, conflicts }))
                 ),
-              (stored) => Effect.sync(() => InternalAutomerge.free(stored.automerge))
+              (source) => Effect.sync(() => InternalAutomerge.free(source.stored.automerge))
             )
           ).pipe(
             Effect.withSpan("EntityReplica.inspectConflicts", {
@@ -165,7 +164,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         resolveConflict: (document, options) =>
           withCommandPermit(options.commandId, (permit) =>
             Effect.gen(function*() {
-              const resolution = yield* InternalConflicts.encodeResolution(options.resolution, limits)
+              const resolution = yield* InternalConflicts.encodeResolutionCanonical(options.resolution)
               const requestHash = yield* CommandExecutor.resolutionRequestHash({
                 incarnation: permit.incarnation,
                 commandId: options.commandId,
@@ -192,6 +191,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 CommandOutcome.schema(Schema.Void, Conflict.ResolutionError),
                 result
               )
+              yield* CommandOutcome.committedOrFail(outcome)
               yield* publisher.publishPending.pipe(
                 Effect.mapError((cause) =>
                   new ReplicaError.ReplicaError({
@@ -202,7 +202,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   })
                 )
               )
-              return yield* CommandOutcome.committedOrFail(outcome)
+              return undefined
             })).pipe(
               Effect.withSpan("EntityReplica.resolveConflict", {
                 attributes: {

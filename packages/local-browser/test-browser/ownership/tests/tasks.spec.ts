@@ -2,6 +2,8 @@ import { expect, test } from "@playwright/test"
 import type { Page } from "@playwright/test"
 import { readFile } from "node:fs/promises"
 
+const ownershipTransitionTimeout = 40_000
+
 const ownerInfo = (page: Page) =>
   expect.poll(async () => {
     try {
@@ -23,11 +25,11 @@ const ownerInfo = (page: Page) =>
       if (String(error).includes("Execution context was destroyed")) return undefined
       throw error
     }
-  }, { timeout: 40_000 }).not.toBeUndefined()
+  }, { timeout: ownershipTransitionTimeout }).not.toBeUndefined()
 
 test("creates, updates, completes, deletes, and reloads local tasks", async ({ page }) => {
   await page.goto("/")
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await expect(page.getByText(/Persistent storage|Best effort storage/)).toBeVisible()
 
   const title = `Task ${crypto.randomUUID()}`
@@ -46,7 +48,7 @@ test("creates, updates, completes, deletes, and reloads local tasks", async ({ p
   await expect(page.getByText(renamed, { exact: true })).toBeVisible()
 
   await page.reload()
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await page.getByRole("button", { name: "Completed" }).click()
   await expect(page.getByText(renamed, { exact: true })).toBeVisible()
 
@@ -57,7 +59,7 @@ test("creates, updates, completes, deletes, and reloads local tasks", async ({ p
 test("keeps local writes available while browser networking is offline", async ({ context, page }) => {
   await page.goto("/")
   await ownerInfo(page)
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await page.evaluate(() => navigator.serviceWorker.ready)
   await expect.poll(() => page.evaluate(() => navigator.serviceWorker.controller !== null)).toBe(true)
   await context.setOffline(true)
@@ -72,7 +74,7 @@ test("keeps local writes available while browser networking is offline", async (
 
   await page.reload()
   await ownerInfo(page)
-  await expect(page.getByText("Offline, saved locally")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Offline, saved locally")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await expect(page.getByText(title, { exact: true })).toBeVisible()
 
   await context.setOffline(false)
@@ -112,13 +114,15 @@ test("shows degraded status when the replica transport is lost", async ({ page }
         .__effectLocalStatusTransportFailed
     )
   ).toBe(true)
-  await expect(page.getByText("Local replica degraded: StorageUnavailable")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica degraded: StorageUnavailable")).toBeVisible({
+    timeout: ownershipTransitionTimeout
+  })
 })
 
 test("does not persist arbitrary same origin responses in the offline shell cache", async ({ context, page }) => {
   const privateUrl = `/private-api-${crypto.randomUUID()}`
   await page.goto("/")
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await page.evaluate(() => navigator.serviceWorker.ready)
   await expect.poll(() => page.evaluate(() => navigator.serviceWorker.controller !== null)).toBe(true)
   expect(await page.evaluate((url) => fetch(url).then((response) => response.text()), privateUrl)).toContain(
@@ -134,7 +138,7 @@ test("does not persist arbitrary same origin responses in the offline shell cach
 
 test("downloads and restores a canonical local backup", async ({ page }) => {
   await page.goto("/")
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
 
   const archivedTitle = `Archived backup ${crypto.randomUUID()}`
   const postBackupTitle = `Post backup ${crypto.randomUUID()}`
@@ -161,13 +165,13 @@ test("downloads and restores a canonical local backup", async ({ page }) => {
 
   page.once("dialog", (dialog) => void dialog.accept())
   await page.getByLabel("Choose backup file").setInputFiles(path!)
-  await expect(page.getByText("Backup restored")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Backup restored")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await expect(page.getByText(postBackupTitle, { exact: true })).not.toBeVisible()
   await page.getByRole("button", { name: "Completed" }).click()
   await expect(page.getByText(archivedTitle, { exact: true })).toBeVisible()
 
   await page.reload()
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await expect(page.getByText(postBackupTitle, { exact: true })).not.toBeVisible()
   await page.getByRole("button", { name: "Completed" }).click()
   await expect(page.getByText(archivedTitle, { exact: true })).toBeVisible()
@@ -204,7 +208,7 @@ test("fails safely and recovers after abrupt owner termination during restore", 
   })
   await page.goto("/")
   await ownerInfo(page)
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   const firstOwner = await page.evaluate(() =>
     (globalThis as typeof globalThis & {
       readonly __effectLocalOwnerInfo: {
@@ -279,7 +283,7 @@ test("fails safely and recovers after abrupt owner termination during restore", 
   const recoveredPage = await context.newPage()
   await recoveredPage.goto("/")
   await ownerInfo(recoveredPage)
-  await expect(recoveredPage.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(recoveredPage.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   const recoveredOwner = await recoveredPage.evaluate(() =>
     (globalThis as typeof globalThis & {
       readonly __effectLocalOwnerInfo: {
@@ -302,7 +306,7 @@ test("fails safely and recovers after abrupt owner termination during restore", 
   await recoveredPage.getByRole("button", { name: "Add task" }).click()
   await expect(recoveredPage.getByText(recoveryTitle, { exact: true })).toHaveCount(1)
   await recoveredPage.reload()
-  await expect(recoveredPage.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(recoveredPage.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await expect(recoveredPage.getByText(archivedTitle, { exact: true })).not.toBeVisible()
   await expect(recoveredPage.getByText(postBackupTitle, { exact: true })).toHaveCount(1)
   await expect(recoveredPage.getByText(recoveryTitle, { exact: true })).toHaveCount(1)
@@ -311,7 +315,7 @@ test("fails safely and recovers after abrupt owner termination during restore", 
 test("shares one durable owner across tabs", async ({ context, page }) => {
   await page.goto("/")
   await ownerInfo(page)
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   const firstOwner = await page.evaluate(() =>
     (globalThis as typeof globalThis & {
       readonly __effectLocalOwnerInfo: {
@@ -331,7 +335,7 @@ test("shares one durable owner across tabs", async ({ context, page }) => {
 
   const attachedPage = await context.newPage()
   await attachedPage.goto("/")
-  await expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await ownerInfo(attachedPage)
   await expect(attachedPage.getByText(firstTitle, { exact: true })).toBeVisible()
   const attachedOwner = await attachedPage.evaluate(() =>
@@ -356,10 +360,9 @@ test("shares one durable owner across tabs", async ({ context, page }) => {
 })
 
 test("expires a stalled provisioning candidate before assigning a healthy provider", async ({ context, page }) => {
-  test.setTimeout(90_000)
   await page.goto("/")
   await ownerInfo(page)
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   const firstOwner = await page.evaluate(() =>
     (globalThis as typeof globalThis & {
       readonly __effectLocalOwnerInfo: {
@@ -401,7 +404,7 @@ test("expires a stalled provisioning candidate before assigning a healthy provid
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(
         () => reject(new Error(`Candidate was not offered provisioning, saw [${candidate.messages.join(", ")}]`)),
-        40_000
+        20_000
       )
       replica.port.addEventListener("message", (event) => {
         const message = event.data as { readonly _tag: string }
@@ -418,7 +421,7 @@ test("expires a stalled provisioning candidate before assigning a healthy provid
   const healthyPage = await context.newPage()
   await healthyPage.goto("/")
   await ownerInfo(healthyPage)
-  await expect(healthyPage.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(healthyPage.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   expect(Date.now() - provisionedAt).toBeGreaterThanOrEqual(1_900)
   const healthyOwner = await healthyPage.evaluate(() =>
     (globalThis as typeof globalThis & {
@@ -445,7 +448,7 @@ test("expires a stalled provisioning candidate before assigning a healthy provid
   const attachedPage = await context.newPage()
   await attachedPage.goto("/")
   await ownerInfo(attachedPage)
-  await expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   const attachedOwner = await attachedPage.evaluate(() =>
     (globalThis as typeof globalThis & {
       readonly __effectLocalOwnerInfo: {
@@ -485,7 +488,7 @@ test("expires a stalled provisioning candidate before assigning a healthy provid
 
 test("reprovisions the durable owner after its database provider dies", async ({ context, page }) => {
   await page.goto("/")
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await ownerInfo(page)
   const firstOwner = await page.evaluate(() =>
     (globalThis as typeof globalThis & {
@@ -506,7 +509,7 @@ test("reprovisions the durable owner after its database provider dies", async ({
 
   const attachedPage = await context.newPage()
   await attachedPage.goto("/")
-  await expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await ownerInfo(attachedPage)
   const attachedOwner = await attachedPage.evaluate(() =>
     (globalThis as typeof globalThis & {
@@ -526,7 +529,7 @@ test("reprovisions the durable owner after its database provider dies", async ({
   const takeoverPage = await context.newPage()
   await takeoverPage.goto("/")
   await ownerInfo(takeoverPage)
-  await expect(takeoverPage.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(takeoverPage.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
 
   // The coordinator provisions among every attached tab, so the surviving tab is offered the
   // database first. Exactly one page becomes the provider and both pages converge on the same
@@ -543,9 +546,9 @@ test("reprovisions the durable owner after its database provider dies", async ({
       }).__effectLocalOwnerInfo
     )
   await expect
-    .poll(async () => (await readOwnerInfo(attachedPage))?.ownerId, { timeout: 20_000 })
+    .poll(async () => (await readOwnerInfo(attachedPage))?.ownerId, { timeout: ownershipTransitionTimeout })
     .not.toBe(firstOwner.ownerId)
-  await expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
 
   const [takeoverOwner, survivingOwner] = await Promise.all([
     readOwnerInfo(takeoverPage),
@@ -568,8 +571,8 @@ test("reprovisions the durable owner after its database provider dies", async ({
 
   // A tab that was already attached when the provider died must be handed off to the new owner:
   // it re-attaches on its own and sees every write the new owner commits.
-  await expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
-  await expect(attachedPage.getByText(renamed, { exact: true })).toBeVisible({ timeout: 20_000 })
+  await expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
+  await expect(attachedPage.getByText(renamed, { exact: true })).toBeVisible({ timeout: ownershipTransitionTimeout })
 })
 
 test("keeps an accepted database provider while its acknowledgement is delayed", async ({ context, page }) => {
@@ -594,7 +597,7 @@ test("keeps an accepted database provider while its acknowledgement is delayed",
   })
   await page.goto("/")
   await ownerInfo(page)
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await expect.poll(() =>
     page.evaluate(() =>
       (globalThis as typeof globalThis & { __effectLocalDelayedAcceptanceDelivered?: boolean })
@@ -605,5 +608,5 @@ test("keeps an accepted database provider while its acknowledgement is delayed",
   const attachedPage = await context.newPage()
   await attachedPage.goto("/")
   await ownerInfo(attachedPage)
-  await expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
 })

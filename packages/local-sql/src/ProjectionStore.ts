@@ -2,6 +2,7 @@ import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Document from "@lucas-barake/effect-local/Document"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Projection from "@lucas-barake/effect-local/Projection"
+import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as SchemaDescriptor from "@lucas-barake/effect-local/SchemaDescriptor"
 import type * as Snapshot from "@lucas-barake/effect-local/Snapshot"
@@ -209,7 +210,10 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
             }
             yield* sql`UPDATE effect_local_commit_outbox
               SET invalidation_keys = ${
-              Schema.encodeSync(StringArrayJson)([document.name, ...matching.map((binding) => binding.projection.name)])
+              Schema.encodeSync(StringArrayJson)([
+                ...ReplicaDefinition.documentCommitKeys(document.name, snapshot.documentId),
+                ...matching.map((binding) => binding.projection.name)
+              ])
             }
               WHERE commit_sequence = ${commitSequence} AND document_id = ${snapshot.documentId}`
           })).pipe(

@@ -2,6 +2,7 @@ import type * as Automerge from "@automerge/automerge"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
+import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import type * as Snapshot from "@lucas-barake/effect-local/Snapshot"
@@ -45,6 +46,29 @@ export interface Stored<D extends Document.Any,> {
   readonly historyOperations: number | null
 }
 
+export type ConflictSource<D extends Document.Any,> =
+  | {
+    readonly _tag: "Loaded"
+    readonly stored: Stored<D>
+  }
+  | {
+    readonly _tag: "Stale"
+    readonly materializedHeads: ReadonlyArray<string>
+    readonly commitSequence: Identity.CommitSequence
+  }
+
+export interface LoadConflictSource {
+  <D extends Document.Any,>(
+    document: D,
+    documentId: Identity.DocumentId
+  ): Effect.Effect<Extract<ConflictSource<D>, { readonly _tag: "Loaded" }>, ReplicaError.ReplicaError>
+  <D extends Document.Any,>(
+    document: D,
+    documentId: Identity.DocumentId,
+    expectedHeads: ReadonlyArray<string>
+  ): Effect.Effect<ConflictSource<D>, ReplicaError.ReplicaError>
+}
+
 export class DocumentStore extends Context.Service<DocumentStore, {
   readonly create: <D extends Document.Any,>(
     document: D,
@@ -55,6 +79,7 @@ export class DocumentStore extends Context.Service<DocumentStore, {
     document: D,
     documentId: Identity.DocumentId
   ) => Effect.Effect<Stored<D>, ReplicaError.ReplicaError>
+  readonly loadConflictSource: LoadConflictSource
   readonly stage: <D extends Document.Any,>(
     stored: Stored<D>,
     change: (draft: Mutation.Draft<D>) => void
@@ -137,11 +162,12 @@ export const layer: Layer.Layer<
     // Read on its own instead of as a scalar subquery inside `findPersistedDocument`. As a subquery an
     // absent singleton yielded SQL NULL, which the non-nullable row schema turned into a `SchemaError`
     // and then a per-document `StorageCorrupt`.
-    const metadataCommitSequence = SqlSchema.findOne({
+    const findMetadataCommitSequence = SqlSchema.findOne({
       Request: Schema.Void,
       Result: Schema.Struct({ commit_sequence: Identity.CommitSequence }),
       execute: () => sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`
-    })(undefined).pipe(
+    })
+    const metadataCommitSequence = findMetadataCommitSequence(undefined).pipe(
       Effect.map((row) => row.commit_sequence),
       Effect.catchTag("NoSuchElementError", () =>
         Effect.fail(
@@ -176,6 +202,57 @@ export const layer: Layer.Layer<
             projection_status, schema_version, tombstone
           FROM effect_local_documents WHERE document_id = ${documentId}`
     })
+    const loadConflictSource = (<D extends Document.Any,>(
+      document: D,
+      documentId: Identity.DocumentId,
+      expectedHeads?: ReadonlyArray<string>
+    ): Effect.Effect<ConflictSource<D>, ReplicaError.ReplicaError> =>
+      Effect.suspend(() => {
+        let acquired: Stored<D> | undefined
+        return gate.current.pipe(
+          Effect.flatMap((permit) =>
+            sql.withTransaction(Effect.gen(function*() {
+              const stored = yield* recovery.recoverWithPermit(document, documentId, permit)
+              acquired = stored
+              yield* HistoryCounters.add(
+                {
+                  bytes: stored.historyBytes,
+                  changes: stored.historyChanges,
+                  operations: stored.historyOperations
+                },
+                { bytes: 0, changes: 0, operations: 0 },
+                limits
+              )
+              if (
+                expectedHeads !== undefined &&
+                !Equal.equals([...expectedHeads].toSorted(), [...stored.materializedHeads].toSorted())
+              ) {
+                InternalAutomerge.free(stored.automerge)
+                acquired = undefined
+                return {
+                  _tag: "Stale" as const,
+                  materializedHeads: stored.materializedHeads,
+                  commitSequence: stored.commitSequence
+                }
+              }
+              return { _tag: "Loaded" as const, stored }
+            }))
+          ),
+          Effect.catchTags({
+            SqlError: (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({ cause })
+                })
+              )
+          }),
+          Effect.onError(() =>
+            Effect.sync(() => {
+              if (acquired !== undefined) InternalAutomerge.free(acquired.automerge)
+            })
+          )
+        )
+      })) as LoadConflictSource
 
     /**
      * Re-reads what the current `persist` just wrote and checks it round tripped.
@@ -270,24 +347,14 @@ export const layer: Layer.Layer<
         return sql.withTransaction(Effect.gen(function*() {
           const changes = InternalAutomerge.changesSince(staged, durable.materializedHeads)
           if (changes.length === 0) return durable
-          const history = yield* Effect.try({
-            try: () => HistoryCounters.measure(changes),
-            catch: (cause) =>
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.StorageCorrupt({ cause })
-              })
-          }).pipe(
-            Effect.flatMap((delta) =>
-              HistoryCounters.add(
-                {
-                  bytes: durable.historyBytes,
-                  changes: durable.historyChanges,
-                  operations: durable.historyOperations
-                },
-                delta,
-                limits
-              )
-            )
+          const history = yield* HistoryCounters.add(
+            {
+              bytes: durable.historyBytes,
+              changes: durable.historyChanges,
+              operations: durable.historyOperations
+            },
+            HistoryCounters.measureDecoded(changes),
+            limits
           )
           const encoded = InternalAutomerge.value(staged)
           const value = yield* Document.decode(document, documentId, encoded)
@@ -330,7 +397,12 @@ export const layer: Layer.Layer<
               AND history_operations = ${durable.historyOperations}`
           yield* sql`INSERT INTO effect_local_commit_outbox (
             commit_sequence, document_id, invalidation_keys, published
-          ) VALUES (${sequence}, ${documentId}, ${Schema.encodeSync(Heads)([document.name])}, 0)`
+          ) VALUES (
+            ${sequence},
+            ${documentId},
+            ${Schema.encodeSync(Heads)(ReplicaDefinition.documentCommitKeys(document.name, documentId))},
+            0
+          )`
 
           // The permit is sampled after the writes because that is where the
           // trailing recovery used to sample it. `materialize` holds no gate
@@ -463,13 +535,10 @@ export const layer: Layer.Layer<
           return yield* Effect.gen(function*() {
             const heads = InternalAutomerge.heads(automerge)
             const changes = InternalAutomerge.changesSince(automerge, [])
-            const history = yield* Effect.try({
-              try: () => HistoryCounters.measure(changes),
-              catch: (cause) =>
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageCorrupt({ cause })
-                })
-            }).pipe(Effect.flatMap((counters) => HistoryCounters.check(counters, limits)))
+            const history = yield* HistoryCounters.check(
+              HistoryCounters.measureDecoded(changes),
+              limits
+            )
             const sequence = yield* nextSequence
             const acceptedAt = DateTime.formatIso(yield* DateTime.now)
             const definitionHash = yield* currentDefinitionHash
@@ -496,7 +565,12 @@ export const layer: Layer.Layer<
             }
             yield* sql`INSERT INTO effect_local_commit_outbox (
               commit_sequence, document_id, invalidation_keys, published
-            ) VALUES (${sequence}, ${documentId}, ${Schema.encodeSync(Heads)([document.name])}, 0)`
+            ) VALUES (
+              ${sequence},
+              ${documentId},
+              ${Schema.encodeSync(Heads)(ReplicaDefinition.documentCommitKeys(document.name, documentId))},
+              0
+            )`
             return yield* recovery.recover(document, documentId)
           }).pipe(
             Effect.ensuring(Effect.sync(() => InternalAutomerge.free(automerge)))
@@ -511,6 +585,7 @@ export const layer: Layer.Layer<
               })
             ))
         ),
+      loadConflictSource,
       load: recovery.recover,
       stage: (stored, change) =>
         gate.current.pipe(Effect.map((epoch) =>

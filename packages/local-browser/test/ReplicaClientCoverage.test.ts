@@ -3,6 +3,7 @@ import { assert, it } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
@@ -985,7 +986,11 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
         Effect.flip
       )
       assert.deepStrictEqual(collected, [
-        { _tag: "FullRefreshRequired", ownerEpoch: client.ownerEpoch, keys: [Task.name] }
+        {
+          _tag: "FullRefreshRequired",
+          ownerEpoch: client.ownerEpoch,
+          keys: ReplicaDefinition.invalidationKeys(definition)
+        }
       ])
       assert.strictEqual(error.reason._tag, "QuotaExceeded")
     })).pipe(Effect.provide(Owner)))
@@ -1025,7 +1030,11 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
       yield* TestClock.adjust(SessionManager.leaseDurationMillis / 2 + 1)
       const error = yield* Fiber.join(fiber)
       assert.deepStrictEqual(collected, [
-        { _tag: "FullRefreshRequired", ownerEpoch: client.ownerEpoch, keys: [Task.name] }
+        {
+          _tag: "FullRefreshRequired",
+          ownerEpoch: client.ownerEpoch,
+          keys: ReplicaDefinition.invalidationKeys(definition)
+        }
       ])
       assert.strictEqual(error.reason._tag, "QuotaExceeded")
     })).pipe(Effect.provide(Owner)))

@@ -366,6 +366,41 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
       assert.isTrue(yield* Deferred.isDone(lookupInterrupted))
     })).pipe(Effect.provide(Owner)))
 
+  it.effect("interrupts an automatic lookup when the caller is interrupted", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const lookupStarted = yield* Deferred.make<void>()
+      const lookupInterrupted = yield* Deferred.make<void>()
+      const unknown = new Proxy(rpc, {
+        get(target, property, receiver) {
+          if (property === "Create") {
+            return (payload: { readonly commandId: Identity.CommandId }) =>
+              Effect.succeed(CommandOutcome.unknown(payload.commandId))
+          }
+          if (property === "LookupCreate") {
+            return () =>
+              Deferred.succeed(lookupStarted, undefined).pipe(
+                Effect.andThen(Effect.never),
+                Effect.ensuring(Deferred.succeed(lookupInterrupted, undefined))
+              )
+          }
+          return Reflect.get(target, property, receiver)
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, unknown, timeouts)
+      const fiber = yield* client.create(Task, {
+        commandId: (yield* Identity.makeCommandId),
+        value: { title: "new" }
+      }).pipe(Effect.forkChild)
+
+      yield* Deferred.await(lookupStarted)
+      yield* Fiber.interrupt(fiber)
+      const exit = yield* Fiber.await(fiber)
+      assert(Exit.isFailure(exit))
+      assert.isTrue(exit.cause.reasons.some((reason) => reason._tag === "Interrupt"))
+      yield* Deferred.await(lookupInterrupted)
+    })).pipe(Effect.provide(Owner)))
+
   it.effect("recovers a timed out conflict resolution through lookup", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
@@ -400,54 +435,6 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
       yield* Fiber.join(fiber)
       assert.strictEqual(dispatches, 1)
       assert.strictEqual(lookups, 1)
-    })).pipe(Effect.provide(Owner)))
-
-  it.effect("reports unknown when a timed out conflict lookup also times out", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-      const lookupStarted = yield* Deferred.make<void>()
-      const lookupInterrupted = yield* Deferred.make<void>()
-      let dispatches = 0
-      let lookups = 0
-      const delayed = new Proxy(rpc, {
-        get(target, property, receiver) {
-          const value = Reflect.get(target, property, receiver)
-          if (property === "ResolveConflict") {
-            return (payload: never) => {
-              dispatches++
-              return value(payload).pipe(Effect.andThen(Effect.never))
-            }
-          }
-          if (property === "LookupConflictResolution") {
-            return () => {
-              lookups++
-              return Deferred.succeed(lookupStarted, undefined).pipe(
-                Effect.andThen(Effect.never),
-                Effect.ensuring(Deferred.succeed(lookupInterrupted, undefined))
-              )
-            }
-          }
-          return value
-        }
-      })
-      const client = yield* ReplicaClient.fromRpcClient(definition, delayed, timeouts)
-      const commandId = yield* Identity.makeCommandId
-      const fiber = yield* client.resolveConflict(Task, {
-        commandId,
-        documentId,
-        resolution
-      }).pipe(Effect.forkChild)
-      yield* TestClock.adjust(timeouts.operationTimeout)
-      yield* Deferred.await(lookupStarted)
-      yield* TestClock.adjust(timeouts.operationTimeout)
-      const error = yield* Effect.flip(Fiber.join(fiber))
-      if (!ReplicaError.isReplicaError(error)) {
-        assert.fail(`Expected ReplicaError, received ${error._tag}`)
-      }
-      assert.strictEqual(error.reason._tag, "CommandOutcomeUnknown")
-      assert.strictEqual(dispatches, 1)
-      assert.strictEqual(lookups, 1)
-      assert.isTrue(yield* Deferred.isDone(lookupInterrupted))
     })).pipe(Effect.provide(Owner)))
 
   it.effect("supports manual conflict lookup after caller cancellation", () =>

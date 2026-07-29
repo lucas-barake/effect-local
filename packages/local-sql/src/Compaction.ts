@@ -2,6 +2,7 @@ import * as Automerge from "@automerge/automerge"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Context from "effect/Context"
@@ -1189,13 +1190,7 @@ export const layer: Layer.Layer<
             })
           })
         }
-        const history = yield* Effect.try({
-          try: () => HistoryCounters.measure(rootChanges),
-          catch: (cause) =>
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.StorageCorrupt({ cause })
-            })
-        }).pipe(Effect.flatMap((counters) => HistoryCounters.check(counters, limits)))
+        const history = yield* HistoryCounters.check(HistoryCounters.measureDecoded(rootChanges), limits)
         const definitionHash = yield* findDefinitionHash(undefined).pipe(
           Effect.map((row) => row.definition_hash),
           Effect.catchTag("NoSuchElementError", () =>
@@ -1442,7 +1437,10 @@ export const layer: Layer.Layer<
           // detector fires on the next commit because the sequence this rewrite consumed is missing.
           yield* sql`INSERT INTO effect_local_commit_outbox (
             commit_sequence, document_id, invalidation_keys, published
-          ) VALUES (${commitSequence}, ${documentId}, ${encodeHeads([document.name])}, 0)`
+          ) VALUES (
+            ${commitSequence}, ${documentId},
+            ${encodeHeads(ReplicaDefinition.documentCommitKeys(document.name, documentId))}, 0
+          )`
           // The marker the replay above consults, written by the same transaction as the rewrite it
           // records so it can never be observed apart from it. A plain insert rather than an upsert:
           // the recheck at the top of this transaction already proved no row exists, and a conflict

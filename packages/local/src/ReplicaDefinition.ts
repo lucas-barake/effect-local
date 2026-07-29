@@ -1,6 +1,7 @@
 import * as Canonical from "./Canonical.js"
 import type * as Document from "./Document.js"
 import type * as DocumentSet from "./DocumentSet.js"
+import type * as Identity from "./Identity.js"
 import type * as Mutation from "./Mutation.js"
 import type * as Projection from "./Projection.js"
 import type * as Query from "./Query.js"
@@ -23,10 +24,34 @@ export interface ReplicaDefinition<
 
 export type Any = ReplicaDefinition<any, any, any, any, any>
 
-export const invalidationKeys = (definition: Any): ReadonlyArray<string> => [
-  ...definition.documents.documents.map((document: Document.Any) => document.name),
-  ...definition.projections.map((projection: Projection.Any) => projection.name)
+const invalidationKeyDomain = "@lucas-barake/effect-local/invalidation"
+
+export const documentTypeQueryKey = (documentType: string): string => documentType
+
+export const documentInstanceKey = (
+  documentType: string,
+  documentId: Identity.DocumentId
+): string => Canonical.stringify([invalidationKeyDomain, "document-instance", documentType, documentId])
+
+export const documentTypeRefreshKey = (documentType: string): string =>
+  Canonical.stringify([invalidationKeyDomain, "document-type-refresh", documentType])
+
+export const documentCommitKeys = (
+  documentType: string,
+  documentId: Identity.DocumentId
+): ReadonlyArray<string> => [
+  documentTypeQueryKey(documentType),
+  documentInstanceKey(documentType, documentId)
 ]
+
+export const invalidationKeys = (definition: Any): ReadonlyArray<string> =>
+  Array.from(
+    new Set([
+      ...definition.documents.documents.map((document: Document.Any) => documentTypeQueryKey(document.name)),
+      ...definition.projections.map((projection: Projection.Any) => projection.name),
+      ...definition.documents.documents.map((document: Document.Any) => documentTypeRefreshKey(document.name))
+    ])
+  )
 
 const assertUnique = (kind: string, values: ReadonlyArray<{ readonly name: string }>): void => {
   const names = new Set<string>()

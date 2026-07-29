@@ -3,6 +3,7 @@ import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
+import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Clock from "effect/Clock"
@@ -2515,7 +2516,10 @@ const make = (
                           if (transition) {
                             yield* sql`INSERT INTO effect_local_commit_outbox (
               commit_sequence, document_id, invalidation_keys, published
-            ) VALUES (${commitSequence}, ${documentId}, ${Schema.encodeSync(Heads)([document.name])}, 0)`
+            ) VALUES (
+              ${commitSequence}, ${documentId},
+              ${Schema.encodeSync(Heads)(ReplicaDefinition.documentCommitKeys(document.name, documentId))}, 0
+            )`
                           }
                           const reply = generated[1] === null
                             ? null

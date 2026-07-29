@@ -202,9 +202,9 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
       tombstone: 0,
       projection_status: "ready",
       checkpoint_hash: null,
-      history_bytes: null,
-      history_changes: null,
-      history_operations: null,
+      history_bytes: 0,
+      history_changes: 0,
+      history_operations: 0,
       lineage: Identity.genesisLineage
     }])
 

@@ -81,7 +81,10 @@ const acceptedProtocolMismatch = (
   const reason = exit.cause.reasons[0]
   if (reason === undefined || !Cause.isFailReason(reason)) return undefined
   if (reason.error._tag === "RestoreBackupError") return undefined
-  return reason.error.reason._tag === "ProtocolMismatch" ? reason.error : undefined
+  return reason.error.reason._tag === "ProtocolMismatch" &&
+      reason.error.reason.expected === "active session"
+    ? reason.error
+    : undefined
 }
 
 const protocolFailure = (observed: string) =>
@@ -91,6 +94,9 @@ const protocolFailure = (observed: string) =>
       observed
     })
   })
+
+const isActiveSessionMismatch = (error: ReplicaError.ReplicaError): boolean =>
+  error.reason._tag === "ProtocolMismatch" && error.reason.expected === "active session"
 
 const storageFailure = (cause: unknown) =>
   new ReplicaError.ReplicaError({
@@ -116,19 +122,6 @@ const isValidConflictLimits = (
   value.maxConflictPathSegments <= ReplicaLimits.maxConflictPathSegmentsHardLimit &&
   isPositiveSafeInteger(value.maxConflictValueBytes) &&
   value.maxConflictValueBytes <= ReplicaLimits.maxConflictValueBytesHardLimit
-
-const preflightResolution = (
-  resolution: Conflict.Resolution,
-  limits: Conflict.PreflightLimits
-): Conflict.PreflightIssue | undefined => {
-  const structural = resolution.choice._tag === "ReplaceValue"
-    ? { ...resolution, choice: { ...resolution.choice, value: null } }
-    : resolution
-  return Conflict.preflightUnknown(structural, limits) ??
-    (resolution.choice._tag === "ReplaceValue"
-      ? Conflict.preflightNativeValue(resolution.choice.value, limits)
-      : undefined)
-}
 
 const isNativeErrorNamed = (value: unknown, name: string): boolean => {
   if (typeof value !== "object" || value === null) return false
@@ -229,18 +222,26 @@ export const fromRpcClient = (
     const boundBy =
       (operation: string, duration: Duration.Duration) =>
       <A, E, R,>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E | ReplicaError.ReplicaError, R> =>
-        Effect.timeoutOrElse(effect, {
-          duration,
-          orElse: () =>
-            Effect.fail(
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.OperationTimeout({
-                  operation,
-                  timeoutMillis: timeoutMillis(duration)
-                })
-              })
-            )
-        })
+        Effect.acquireUseRelease(
+          Effect.forkChild(Effect.interruptible(effect), { startImmediately: true }),
+          (fiber) =>
+            Fiber.join(fiber).pipe(
+              Effect.timeoutOption(duration),
+              Effect.flatMap((result) =>
+                Option.isSome(result)
+                  ? Effect.succeed(result.value)
+                  : Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.OperationTimeout({
+                        operation,
+                        timeoutMillis: timeoutMillis(duration)
+                      })
+                    })
+                  )
+              )
+            ),
+          Fiber.interrupt
+        )
     const boundSession = (operation: string) => boundBy(operation, sessionTimeout)
     const boundOperation = (operation: string) => boundBy(operation, operationTimeout)
     /**
@@ -271,43 +272,41 @@ export const fromRpcClient = (
         const lookupOrFail = (cause: unknown) =>
           restore(lookup.pipe(boundOperation(lookupOperation))).pipe(
             Effect.catchCause((lookupCause) => {
-              if (lookupCause.reasons.some(Cause.isInterruptReason)) {
-                return Effect.failCause(lookupCause)
+              if (Cause.hasInterrupts(lookupCause) || Cause.hasDies(lookupCause)) {
+                return Effect.failCause(lookupCause as Cause.Cause<never>)
               }
               const reason = lookupCause.reasons.length === 1 ? lookupCause.reasons[0] : undefined
               if (reason === undefined || !Cause.isFailReason(reason)) {
-                return Effect.failCause(lookupCause)
+                return Effect.failCause(lookupCause as Cause.Cause<never>)
               }
               if (Schema.is(RpcClientError.RpcClientError)(reason.error)) return ambiguous(cause)
-              if (
-                ReplicaError.isReplicaError(reason.error) &&
-                reason.error.reason._tag === "OperationTimeout"
-              ) {
-                return ambiguous(cause)
+              if (ReplicaError.isReplicaError(reason.error)) {
+                return reason.error.reason._tag === "OperationTimeout"
+                  ? ambiguous(cause)
+                  : Effect.fail(reason.error)
               }
-              return Effect.failCause(lookupCause)
+              return Effect.failCause(lookupCause as Cause.Cause<never>)
             }),
             Effect.flatMap((outcome) => outcome._tag === "OutcomeUnknown" ? ambiguous(cause) : Effect.succeed(outcome))
           )
         return restore(dispatch.pipe(boundOperation(dispatchOperation))).pipe(
           Effect.catchCause((dispatchCause) => {
-            if (dispatchCause.reasons.some(Cause.isInterruptReason)) {
-              return Effect.failCause(dispatchCause)
+            if (Cause.hasInterrupts(dispatchCause) || Cause.hasDies(dispatchCause)) {
+              return Effect.failCause(dispatchCause as Cause.Cause<never>)
             }
             const reason = dispatchCause.reasons.length === 1 ? dispatchCause.reasons[0] : undefined
             if (reason === undefined || !Cause.isFailReason(reason)) {
-              return Effect.failCause(dispatchCause)
+              return Effect.failCause(dispatchCause as Cause.Cause<never>)
             }
             if (Schema.is(RpcClientError.RpcClientError)(reason.error)) {
               return lookupOrFail(reason.error)
             }
-            if (
-              ReplicaError.isReplicaError(reason.error) &&
-              reason.error.reason._tag === "OperationTimeout"
-            ) {
-              return lookupOrFail(reason.error)
+            if (ReplicaError.isReplicaError(reason.error)) {
+              return reason.error.reason._tag === "OperationTimeout"
+                ? lookupOrFail(reason.error)
+                : Effect.fail(reason.error)
             }
-            return Effect.failCause(dispatchCause)
+            return Effect.failCause(dispatchCause as Cause.Cause<never>)
           }),
           // A postcommit publication failure can make the owner report ambiguity even though the
           // durable receipt is already visible. Look it up before reporting the outcome as unknown.
@@ -315,7 +314,7 @@ export const fromRpcClient = (
             outcome._tag === "OutcomeUnknown" ? lookupOrFail(undefined) : Effect.succeed(outcome)
           )
         )
-      }).pipe(Effect.catchTag("RpcClientError", ambiguous))
+      })
     }
     const closeSession = (sessionId: Identity.SessionId) =>
       rpc.CloseSession({ sessionId }).pipe(boundSession("CloseSession"))
@@ -512,7 +511,7 @@ export const fromRpcClient = (
                 reason === undefined ||
                 !Cause.isFailReason(reason) ||
                 !Schema.is(ReplicaError.ReplicaError)(reason.error) ||
-                reason.error.reason._tag !== "ProtocolMismatch"
+                !isActiveSessionMismatch(reason.error)
               ) {
                 return Effect.failCause(cause)
               }
@@ -550,7 +549,7 @@ export const fromRpcClient = (
         const tracked = (session: Session) => use(session).pipe(Stream.tap(() => Ref.set(emitted, true)))
         return tracked(session).pipe(
           Stream.catchTag("ReplicaError", (error) =>
-            Schema.is(ReplicaError.ReplicaError)(error) && error.reason._tag === "ProtocolMismatch"
+            Schema.is(ReplicaError.ReplicaError)(error) && isActiveSessionMismatch(error)
               ? Stream.unwrap(Effect.gen(function*() {
                 const hasEmitted = yield* Ref.get(emitted)
                 if (hasEmitted && pendingMismatchRef !== undefined) {
@@ -588,7 +587,14 @@ export const fromRpcClient = (
           schedule: retrySchedule,
           while: (error) => isTransient(error) || error.reason._tag === "OperationTimeout"
         }),
-        Effect.catchReason("ReplicaError", "ProtocolMismatch", () => reopen(session).pipe(Effect.as(undefined)))
+        Effect.catchReason(
+          "ReplicaError",
+          "ProtocolMismatch",
+          (reason, error) =>
+            reason.expected === "active session"
+              ? reopen(session).pipe(Effect.as(undefined))
+              : Effect.fail(error)
+        )
       )
       if (renewed !== undefined && renewed.leaseMillis !== session.lease.leaseMillis) {
         yield* SubscriptionRef.updateSome(
@@ -612,42 +618,47 @@ export const fromRpcClient = (
       ownerEpoch,
       keys: [...allInvalidationKeys]
     })
+    const invalidationsFor = (
+      session: Session
+    ): Stream.Stream<ReplicaRpc.InvalidationMessage, ReplicaError.ReplicaError> =>
+      rpc.Invalidations({ sessionId: session.sessionId, ownerEpoch: session.lease.ownerEpoch }).pipe(
+        Stream.catchTag("RpcClientError", (error) =>
+          Stream.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({
+                cause: error
+              })
+            })
+          )),
+        Stream.filter((event) => event.ownerEpoch === session.lease.ownerEpoch),
+        Stream.retry(
+          Schedule.exponential(250).pipe(
+            Schedule.upTo({ times: 3 }),
+            Schedule.setInputType<ReplicaError.ReplicaError>(),
+            Schedule.while(({ input }) => input.reason._tag === "StorageUnavailable")
+          )
+        ),
+        Stream.catchReason(
+          "ReplicaError",
+          "ProtocolMismatch",
+          (reason, error) =>
+            isActiveSessionMismatch(error) || reason.observed === session.lease.ownerEpoch
+              ? Stream.unwrap(reopen(session).pipe(Effect.map(invalidationsFor)))
+              : Stream.fail(error)
+        )
+      )
     const invalidationMessages: Stream.Stream<
       ReplicaRpc.InvalidationMessage,
       ReplicaError.ReplicaError
     > = Stream.unwrap(
       SubscriptionRef.get(sessions).pipe(
-        Effect.map((session) =>
-          rpc.Invalidations({ sessionId: session.sessionId, ownerEpoch: session.lease.ownerEpoch }).pipe(
-            Stream.catchTag("RpcClientError", (error) =>
-              Stream.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageUnavailable({
-                    cause: error
-                  })
-                })
-              )),
-            Stream.filter((event) => event.ownerEpoch === session.lease.ownerEpoch),
-            Stream.retry(
-              Schedule.exponential(250).pipe(
-                Schedule.upTo({ times: 3 }),
-                Schedule.setInputType<ReplicaError.ReplicaError>(),
-                Schedule.while(({ input }) => input.reason._tag === "StorageUnavailable")
-              )
-            ),
-            Stream.catchReason(
-              "ReplicaError",
-              "ProtocolMismatch",
-              (_, error) => Stream.unwrap(reopen(session).pipe(Effect.as(Stream.fail(error))))
-            )
-          )
-        )
+        Effect.map(invalidationsFor)
       )
     ).pipe(
       Stream.retry(
         Schedule.forever.pipe(
           Schedule.setInputType<ReplicaError.ReplicaError>(),
-          Schedule.while(({ input }) => input.reason._tag === "ProtocolMismatch")
+          Schedule.while(({ input }) => isActiveSessionMismatch(input))
         )
       )
     )
@@ -1236,7 +1247,8 @@ export const fromRpcClient = (
                 Wire.decodeConflict(
                   Conflict.inspection(Schema.Json),
                   encoded,
-                  session.lease.conflictLimits
+                  session.lease.conflictLimits,
+                  Conflict.preflightInspection
                 )
               ),
               Effect.flatMap((inspection) =>
@@ -1265,22 +1277,12 @@ export const fromRpcClient = (
         withSession(
           "ResolveConflict",
           (session) => {
-            const issue = preflightResolution(options.resolution, session.lease.conflictLimits)
-            if (issue !== undefined) {
-              return Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.ProtocolMismatch({
-                    expected: "bounded conflict resolution",
-                    observed: issue._tag
-                  })
-                })
-              )
-            }
             const outcomeSchema = CommandOutcome.schema(Schema.Void, Conflict.ResolutionError)
             return Wire.encodeConflict(
               Conflict.Resolution,
               options.resolution,
-              session.lease.conflictLimits
+              session.lease.conflictLimits,
+              Conflict.preflightResolution
             ).pipe(
               Effect.flatMap((resolution) =>
                 recoverCommand(
@@ -1431,22 +1433,12 @@ export const fromRpcClient = (
         withSession(
           "LookupConflictResolution",
           (session) => {
-            const issue = preflightResolution(options.resolution, session.lease.conflictLimits)
-            if (issue !== undefined) {
-              return Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.ProtocolMismatch({
-                    expected: "bounded conflict resolution",
-                    observed: issue._tag
-                  })
-                })
-              )
-            }
             const outcomeSchema = CommandOutcome.schema(Schema.Void, Conflict.ResolutionError)
             return Wire.encodeConflict(
               Conflict.Resolution,
               options.resolution,
-              session.lease.conflictLimits
+              session.lease.conflictLimits,
+              Conflict.preflightResolution
             ).pipe(
               Effect.flatMap((resolution) =>
                 rpc.LookupConflictResolution({

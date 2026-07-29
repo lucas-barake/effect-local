@@ -14,7 +14,7 @@ import * as Schema from "effect/Schema"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import type * as Migrator from "effect/unstable/sql/Migrator"
-import type * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as BackupStore from "./BackupStore.js"
 import * as CommandExecutor from "./CommandExecutor.js"
@@ -95,13 +95,12 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
         inspectConflicts: (document, documentId) =>
           withPermit(() =>
             Effect.acquireUseRelease(
-              documents.load(document, documentId),
-              (stored) =>
-                InternalConflicts.requireSourceBudget(stored, limits).pipe(
-                  Effect.andThen(InternalConflicts.inspect(stored.automerge, limits)),
-                  Effect.map((conflicts) => ({ snapshot: stored.snapshot, conflicts }))
+              documents.loadConflictSource(document, documentId),
+              (source) =>
+                InternalConflicts.inspect(source.stored.automerge, limits).pipe(
+                  Effect.map((conflicts) => ({ snapshot: source.stored.snapshot, conflicts }))
                 ),
-              (stored) => Effect.sync(() => InternalAutomerge.free(stored.automerge))
+              (source) => Effect.sync(() => InternalAutomerge.free(source.stored.automerge))
             )
           ).pipe(
             Effect.withSpan("SqlReplica.inspectConflicts", {
@@ -111,7 +110,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
         resolveConflict: (document, options) =>
           withPermit((permit) =>
             Effect.gen(function*() {
-              const resolution = yield* InternalConflicts.encodeResolution(options.resolution, limits)
+              const resolution = yield* InternalConflicts.encodeResolutionCanonical(options.resolution)
               const requestHash = yield* CommandExecutor.resolutionRequestHash({
                 incarnation: permit.incarnation,
                 commandId: options.commandId,
@@ -124,6 +123,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
                 permit,
                 requestHash
               })
+              yield* CommandOutcome.committedOrFail(outcome)
               yield* publisher.publishPending.pipe(
                 Effect.mapError((cause) =>
                   new ReplicaError.ReplicaError({
@@ -134,7 +134,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
                   })
                 )
               )
-              return yield* CommandOutcome.committedOrFail(outcome)
+              return undefined
             })
           ).pipe(
             Effect.withSpan("SqlReplica.resolveConflict", {
@@ -242,7 +242,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
     })
   )
 
-const makeBase = <
+export const servicesLayer = <
   D extends ReplicaDefinition.Any,
   const Bindings extends ReadonlyArray<SqlProjection.Any>,
 >(
@@ -273,7 +273,9 @@ const makeBase = <
   )
   const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
   const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
-  return { backups, compaction }
+  // Retain the client so service-level consumers observe the same database instance as the graph.
+  const sql = Layer.effect(SqlClient.SqlClient, SqlClient.SqlClient)
+  return Layer.mergeAll(backups, compaction, sql)
 }
 
 export const layer = <D extends ReplicaDefinition.Any, const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
@@ -296,10 +298,8 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   | Crypto.Crypto
   | SqlClient.SqlClient
 > => {
-  const { backups, compaction } = makeBase(definition, options)
-  const durable = DurableRuntime.layer(definition).pipe(
-    Layer.provideMerge(Layer.merge(backups, compaction))
-  )
+  const services = servicesLayer(definition, options)
+  const durable = DurableRuntime.layer(definition).pipe(Layer.provideMerge(services))
   return EntityReplica.layer(definition).pipe(Layer.provideMerge(durable))
 }
 
@@ -327,10 +327,8 @@ export const layerRelay = <
   | Crypto.Crypto
   | SqlClient.SqlClient
 > => {
-  const { backups, compaction } = makeBase(definition, options)
-  const durable = DurableRuntime.layerRelay(definition).pipe(
-    Layer.provideMerge(Layer.merge(backups, compaction))
-  )
+  const services = servicesLayer(definition, options)
+  const durable = DurableRuntime.layerRelay(definition).pipe(Layer.provideMerge(services))
   return EntityReplica.layer(definition).pipe(Layer.provideMerge(durable))
 }
 
@@ -342,6 +340,14 @@ export const layerRelay = <
  */
 const bindingLayers = (projections: ReadonlyArray<SqlProjection.Any>) =>
   Layer.mergeAll(Layer.empty, ...projections.map((binding) => binding.layer))
+
+export const servicesLayerWithBindings = <
+  D extends ReplicaDefinition.Any,
+  const Bindings extends ReadonlyArray<SqlProjection.Any>,
+>(
+  definition: D,
+  options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
+) => servicesLayer(definition, options).pipe(Layer.provide(bindingLayers(options.projections)))
 
 export const layerWithBindings = <
   D extends ReplicaDefinition.Any,
