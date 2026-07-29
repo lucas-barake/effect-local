@@ -178,31 +178,33 @@ export const fromRpcClient = (
   options?: Options
 ): Effect.Effect<ReplicaClient["Service"], ReplicaError.ReplicaError, Scope.Scope | Crypto.Crypto> =>
   Effect.gen(function*() {
-    const sessionTimeout = Duration.fromInputUnsafe(options?.sessionTimeout ?? defaultSessionTimeout)
-    const operationTimeout = Duration.fromInputUnsafe(options?.operationTimeout ?? defaultOperationTimeout)
-    const timeoutMillis = (duration: Duration.Duration) => {
-      const millis = Duration.toMillis(duration)
+    const sessionTimeoutMillis = Duration.toMillis(options?.sessionTimeout ?? defaultSessionTimeout)
+    const operationTimeoutMillis = Duration.toMillis(options?.operationTimeout ?? defaultOperationTimeout)
+    const reportedTimeoutMillis = (millis: number) => {
       if (millis <= 0 || Number.isNaN(millis)) return 0
       if (millis >= Number.MAX_SAFE_INTEGER) return Number.MAX_SAFE_INTEGER
       return Math.trunc(millis)
     }
+    const sessionReportedTimeoutMillis = reportedTimeoutMillis(sessionTimeoutMillis)
+    const operationReportedTimeoutMillis = reportedTimeoutMillis(operationTimeoutMillis)
     const boundBy =
-      (operation: string, duration: Duration.Duration) =>
+      (operation: string, durationMillis: number, timeoutMillis: number) =>
       <A, E, R,>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E | ReplicaError.ReplicaError, R> =>
         Effect.timeoutOrElse(effect, {
-          duration,
+          duration: durationMillis,
           orElse: () =>
             Effect.fail(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.OperationTimeout({
                   operation,
-                  timeoutMillis: timeoutMillis(duration)
+                  timeoutMillis
                 })
               })
             )
         })
-    const boundSession = (operation: string) => boundBy(operation, sessionTimeout)
-    const boundOperation = (operation: string) => boundBy(operation, operationTimeout)
+    const boundSession = (operation: string) => boundBy(operation, sessionTimeoutMillis, sessionReportedTimeoutMillis)
+    const boundOperation = (operation: string) =>
+      boundBy(operation, operationTimeoutMillis, operationReportedTimeoutMillis)
     /**
      * Dispatches a command and, if the answer is lost in transit, asks the owner what happened to
      * the id rather than reissuing it.
@@ -1507,7 +1509,7 @@ export const fromRpcClient = (
           const startedAt = yield* Clock.currentTimeMillis
           const deadline = Math.min(
             Number.MAX_SAFE_INTEGER,
-            startedAt + timeoutMillis(operationTimeout)
+            startedAt + operationReportedTimeoutMillis
           )
           const maxBytes = yield* Backup.validateMaxBytes(options.maxBytes)
           let acceptedTerminal:
@@ -1520,7 +1522,7 @@ export const fromRpcClient = (
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.OperationTimeout({
                 operation: "RestoreBackup",
-                timeoutMillis: timeoutMillis(operationTimeout)
+                timeoutMillis: operationReportedTimeoutMillis
               })
             })
           const withinDeadline = <E, R,>(

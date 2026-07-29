@@ -159,7 +159,7 @@ const RetainedSourceRow = Schema.Struct({
   relay_custody_accepted_at: Schema.NullOr(IsoDate),
   sender_custody_unconfirmed_at: Schema.NullOr(IsoDate)
 })
-const ReplayDeliveryRow = Schema.Struct({
+const ReplayDeliveryMessageRow = Schema.Struct({
   replica_id: Identity.ReplicaId,
   expected_local_tenant_id: Schema.String,
   expected_local_subject_id: Schema.String,
@@ -174,8 +174,11 @@ const ReplayDeliveryRow = Schema.Struct({
   sender_sequence: NonNegativeInt,
   document_id: Identity.DocumentId,
   created_at: IsoDate,
-  retry_deadline: IsoDate,
-  change_hash: Schema.NullOr(WriterProvenance.ChangeHash)
+  retry_deadline: IsoDate
+})
+const ReplayDeliveryChangeRow = Schema.Struct({
+  relay_message_id: Identity.RelayMessageId,
+  change_hash: WriterProvenance.ChangeHash
 })
 const replayRowBatchSize = 500
 
@@ -217,14 +220,15 @@ const make = Effect.gen(function*() {
 
   const decodeEndpoint = (input: Endpoint) =>
     Schema.decodeUnknownEffect(EndpointSchema)(input).pipe(
-      Effect.mapError(() =>
-        new ReplicaError.ReplicaError({
-          reason: new ReplicaError.ProtocolMismatch({
-            expected: "valid relay endpoint",
-            observed: "invalid relay endpoint"
+      Effect.catchTag("SchemaError", () =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: "valid relay endpoint",
+              observed: "invalid relay endpoint"
+            })
           })
-        })
-      )
+        ))
     )
 
   const findSource = SqlSchema.findAll({
@@ -357,37 +361,47 @@ const make = Effect.gen(function*() {
           AND ${sql.in("row_id", request.rowIds)}`
   })
 
-  const findReplayDeliveries = SqlSchema.findAll({
+  const findReplayDeliveryMessages = SqlSchema.findAll({
     Request: Schema.Struct({
       replicaIncarnation: Identity.ReplicaIncarnation,
       relayMessageIds: Schema.Array(Identity.RelayMessageId).check(Schema.isMinLength(1))
     }),
-    Result: ReplayDeliveryRow,
+    Result: ReplayDeliveryMessageRow,
     execute: (request) =>
       sql`SELECT
-        messages.replica_id,
-        messages.expected_local_tenant_id,
-        messages.expected_local_subject_id,
-        messages.expected_local_peer_id,
-        messages.remote_tenant_id,
-        messages.remote_subject_id,
-        messages.remote_peer_id,
-        messages.relay_peer_id,
-        messages.relay_message_id,
-        messages.outer_envelope_digest,
-        messages.sender_connection_epoch,
-        messages.sender_sequence,
-        messages.document_id,
-        messages.created_at,
-        messages.retry_deadline,
-        changes.change_hash
-      FROM effect_local_peer_relay_delivery_messages messages
-      LEFT JOIN effect_local_peer_relay_delivery_changes changes
-        ON changes.replica_incarnation = messages.replica_incarnation
-        AND changes.relay_message_id = messages.relay_message_id
-      WHERE messages.replica_incarnation = ${request.replicaIncarnation}
-        AND ${sql.in("messages.relay_message_id", request.relayMessageIds)}
-      ORDER BY messages.relay_message_id, changes.change_hash`
+        replica_id,
+        expected_local_tenant_id,
+        expected_local_subject_id,
+        expected_local_peer_id,
+        remote_tenant_id,
+        remote_subject_id,
+        remote_peer_id,
+        relay_peer_id,
+        relay_message_id,
+        outer_envelope_digest,
+        sender_connection_epoch,
+        sender_sequence,
+        document_id,
+        created_at,
+        retry_deadline
+      FROM effect_local_peer_relay_delivery_messages
+      WHERE replica_incarnation = ${request.replicaIncarnation}
+        AND ${sql.in("relay_message_id", request.relayMessageIds)}
+      ORDER BY relay_message_id`
+  })
+
+  const findReplayDeliveryChanges = SqlSchema.findAll({
+    Request: Schema.Struct({
+      replicaIncarnation: Identity.ReplicaIncarnation,
+      relayMessageIds: Schema.Array(Identity.RelayMessageId).check(Schema.isMinLength(1))
+    }),
+    Result: ReplayDeliveryChangeRow,
+    execute: (request) =>
+      sql`SELECT relay_message_id, change_hash
+      FROM effect_local_peer_relay_delivery_changes
+      WHERE replica_incarnation = ${request.replicaIncarnation}
+        AND ${sql.in("relay_message_id", request.relayMessageIds)}
+      ORDER BY relay_message_id, change_hash`
   })
 
   const insertRow = SqlSchema.findAll({
@@ -1085,33 +1099,54 @@ const make = Effect.gen(function*() {
         }
         const rowsById = new Map(rows.map((row) => [row.row_id, row]))
         const replayDeliveries = new Map<Identity.RelayMessageId, {
-          readonly message: typeof ReplayDeliveryRow.Type
+          readonly message: typeof ReplayDeliveryMessageRow.Type
           readonly changeHashes: Array<string>
+          readonly changeHashSet: Set<string>
         }>()
         for (let offset = 0; offset < rows.length; offset += replayRowBatchSize) {
-          const stored = yield* findReplayDeliveries({
+          const relayMessageIds = rows
+            .slice(offset, offset + replayRowBatchSize)
+            .map((row) => row.relay_message_id)
+          const messages = yield* findReplayDeliveryMessages({
             replicaIncarnation: permit.incarnation,
-            relayMessageIds: rows
-              .slice(offset, offset + replayRowBatchSize)
-              .map((row) => row.relay_message_id)
+            relayMessageIds
           })
-          for (const row of stored) {
-            const existing = replayDeliveries.get(row.relay_message_id)
-            if (existing === undefined) {
-              replayDeliveries.set(row.relay_message_id, {
-                message: row,
-                changeHashes: row.change_hash === null ? [] : [row.change_hash]
-              })
-            } else if (row.change_hash !== null) {
-              if (existing.changeHashes.includes(row.change_hash)) {
-                return yield* new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageCorrupt({
-                    cause: new Error("Duplicate relay delivery change identity")
-                  })
+          for (const message of messages) {
+            if (replayDeliveries.has(message.relay_message_id)) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({
+                  cause: new Error("Duplicate relay delivery message identity")
                 })
-              }
-              existing.changeHashes.push(row.change_hash)
+              })
             }
+            replayDeliveries.set(message.relay_message_id, {
+              message,
+              changeHashes: [],
+              changeHashSet: new Set()
+            })
+          }
+          const changes = yield* findReplayDeliveryChanges({
+            replicaIncarnation: permit.incarnation,
+            relayMessageIds
+          })
+          for (const change of changes) {
+            const delivery = replayDeliveries.get(change.relay_message_id)
+            if (delivery === undefined) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({
+                  cause: new Error("Relay delivery change has no message identity")
+                })
+              })
+            }
+            if (delivery.changeHashSet.has(change.change_hash)) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({
+                  cause: new Error("Duplicate relay delivery change identity")
+                })
+              })
+            }
+            delivery.changeHashSet.add(change.change_hash)
+            delivery.changeHashes.push(change.change_hash)
           }
         }
         const entries: Array<Entry> = []

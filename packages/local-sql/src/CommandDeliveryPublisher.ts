@@ -1,7 +1,6 @@
 import type * as CommandDelivery from "@lucas-barake/effect-local/CommandDelivery"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
-import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
@@ -104,7 +103,7 @@ export const layer = (options: Options): Layer.Layer<
           sequence: cursor.sequence,
           refreshEpoch: cursor.refreshEpoch
         })
-      })).pipe(Effect.asVoid)
+      }))
 
       // The caller's Scope owns the subscription and closes it when the consumer is done.
       const subscribe = Effect.gen(function*() {
@@ -162,10 +161,9 @@ export const layer = (options: Options): Layer.Layer<
       yield* Effect.sleep(publishIntervalMillis).pipe(
         Effect.andThen(
           drainPending.pipe(
-            Effect.catchCause((cause) =>
-              Cause.hasInterrupts(cause)
-                ? Effect.failCause(cause)
-                : Effect.logError("Command delivery event publication failed", cause)
+            Effect.catchTag(
+              "ReplicaError",
+              (error) => Effect.logError("Command delivery event publication failed", error)
             )
           )
         ),

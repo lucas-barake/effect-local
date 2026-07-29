@@ -41,6 +41,12 @@ import * as ReplicaHealth from "./ReplicaHealth.js"
 import type * as ReplicaWorkflow from "./ReplicaWorkflow.js"
 import type * as SqlProjection from "./SqlProjection.js"
 
+export interface Options<Bindings extends ReadonlyArray<SqlProjection.Any>,> {
+  readonly deliveryPublisher?: CommandDeliveryPublisher.Options
+  readonly health?: ReplicaHealth.Options
+  readonly projections: Bindings
+}
+
 export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Layer<
   Replica.Replica,
   never,
@@ -204,7 +210,7 @@ const makeBase = <
   const Bindings extends ReadonlyArray<SqlProjection.Any>,
 >(
   definition: D,
-  options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
+  options: Options<Bindings>
 ) => {
   const expected = new Set(definition.projections)
   const actual = new Set(options.projections.map((binding) => binding.projection))
@@ -230,7 +236,9 @@ const makeBase = <
   )
   const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
   const deliveryStore = CommandDeliveryStore.layer.pipe(Layer.provideMerge(gate))
-  const deliveryPublisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
+  const deliveryPublisher = CommandDeliveryPublisher.layer(
+    options.deliveryPublisher ?? CommandDeliveryPublisher.defaultOptions
+  ).pipe(
     Layer.provideMerge(deliveryStore)
   )
   const backups = BackupStore.layer(definition).pipe(
@@ -247,10 +255,11 @@ const makeBase = <
 
 export const layer = <D extends ReplicaDefinition.Any, const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
   definition: D,
-  options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
+  options: Options<Bindings>
 ): Layer.Layer<
   | CommitPublisher.CommitPublisher
   | CommandDeliveryPublisher.CommandDeliveryPublisher
+  | CommandDeliveryStore.CommandDeliveryStore
   | PeerConnectionStatus.PeerConnectionStatus
   | PeerConnectionStatus.Reporter
   | PeerSync.PeerSync
@@ -289,10 +298,11 @@ export const layerRelay = <
   const Bindings extends ReadonlyArray<SqlProjection.Any>,
 >(
   definition: D,
-  options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
+  options: Options<Bindings>
 ): Layer.Layer<
   | CommitPublisher.CommitPublisher
   | CommandDeliveryPublisher.CommandDeliveryPublisher
+  | CommandDeliveryStore.CommandDeliveryStore
   | PeerConnectionStatus.PeerConnectionStatus
   | PeerConnectionStatus.Reporter
   | PeerSync.PeerSync
@@ -335,7 +345,7 @@ export const layerWithBindings = <
   const Bindings extends ReadonlyArray<SqlProjection.Any>,
 >(
   definition: D,
-  options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
+  options: Options<Bindings>
 ) => layer(definition, options).pipe(Layer.provide(bindingLayers(options.projections)))
 
 /**
@@ -348,5 +358,5 @@ export const layerRelayWithBindings = <
   const Bindings extends ReadonlyArray<SqlProjection.Any>,
 >(
   definition: D,
-  options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
+  options: Options<Bindings>
 ) => layerRelay(definition, options).pipe(Layer.provide(bindingLayers(options.projections)))

@@ -164,6 +164,26 @@ describe("SqlReplica", () => {
     )
   })
 
+  it("validates command delivery publisher options through every public constructor", () => {
+    const options = {
+      projections: [],
+      deliveryPublisher: {
+        eventCapacity: 0,
+        publishInterval: "1 second"
+      }
+    } as const
+    for (
+      const build of [
+        () => SqlReplica.layer(definition, options),
+        () => SqlReplica.layerRelay(definition, options),
+        () => SqlReplica.layerWithBindings(definition, options),
+        () => SqlReplica.layerRelayWithBindings(definition, options)
+      ]
+    ) {
+      assert.throws(build, /positive integer/)
+    }
+  })
+
   // The reason `layerRelayWithBindings` exists. A deployment with projections that reaches for the
   // only bindings constructor there was got a direct `PeerSync`, and found out at the point it
   // built a service it did not think it was choosing.

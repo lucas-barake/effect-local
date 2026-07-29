@@ -437,11 +437,6 @@ export const layer = (
                         }))
                       )
 
-                    const pushAdmission = (admission: PeerRelayOutbox.Admission) =>
-                      admission._tag === "PendingRelayCustody"
-                        ? pushEntry(admission)
-                        : Effect.void
-
                     const replay = Effect.gen(function*() {
                       while (true) {
                         const entries = yield* runtime.dueForEndpoint({
@@ -461,7 +456,13 @@ export const layer = (
                             ...endpoint,
                             payload: message,
                             retryHorizonMillis: options.senderRetryHorizonMillis
-                          }).pipe(Effect.flatMap(pushAdmission)),
+                          }).pipe(
+                            Effect.flatMap((admission) =>
+                              admission._tag === "PendingRelayCustody"
+                                ? pushEntry(admission)
+                                : Effect.void
+                            )
+                          ),
                           sendLock
                         ),
                         operation: "AdapterPush",

@@ -287,11 +287,12 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
             ${options.permit.incarnation}, ${options.commandId}, ${options.documentId}, 0
           )`
         }).pipe(
-          Effect.mapError((cause) =>
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.StorageUnavailable({ cause })
-            })
-          )
+          Effect.catchTag("SqlError", (cause) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({ cause })
+              })
+            ))
         )
 
       const decodeReceipt = <A extends Document.WireSchema, E extends Document.WireSchema,>(

@@ -94,15 +94,6 @@ const withPageEvents = (target: EventTarget) =>
       })
   )
 
-const waitFor = (condition: Effect.Effect<boolean>) =>
-  Effect.gen(function*() {
-    for (let attempt = 0; attempt < 1000; attempt++) {
-      if (yield* condition) return
-      yield* Effect.yieldNow
-    }
-    assert.fail("condition was not met")
-  })
-
 it.layer(NodeCrypto.layer)("ReplicaClient pagehide", (it) => {
   it.effect("closes the owner session when the page hides", () =>
     Effect.gen(function*() {
@@ -111,10 +102,21 @@ it.layer(NodeCrypto.layer)("ReplicaClient pagehide", (it) => {
       yield* withPageEvents(target)
       yield* Effect.scoped(Effect.gen(function*() {
         const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-        yield* ReplicaClient.fromRpcClient(definition, rpc)
+        const closed = yield* Deferred.make<void>()
+        const observed = new Proxy(rpc, {
+          get(target, property, receiver) {
+            const value = Reflect.get(target, property, receiver)
+            if (property === "CloseSession") {
+              return (payload: never) => value(payload).pipe(Effect.ensuring(Deferred.succeed(closed, undefined)))
+            }
+            return value
+          }
+        })
+        yield* ReplicaClient.fromRpcClient(definition, observed)
         assert.strictEqual(yield* sessions.activeCount, 1)
         target.dispatchEvent(new Event("pagehide"))
-        yield* waitFor(sessions.activeCount.pipe(Effect.map((count) => count === 0)))
+        yield* Deferred.await(closed)
+        assert.strictEqual(yield* sessions.activeCount, 0)
       }))
     }).pipe(Effect.provide(Owner)))
 
@@ -136,7 +138,17 @@ it.layer(NodeCrypto.layer)("ReplicaClient pagehide", (it) => {
       yield* withPageEvents(target)
       yield* Effect.scoped(Effect.gen(function*() {
         const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-        const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
+        const closed = yield* Deferred.make<void>()
+        const observedRpc = new Proxy(rpc, {
+          get(target, property, receiver) {
+            const value = Reflect.get(target, property, receiver)
+            if (property === "CloseSession") {
+              return (payload: never) => value(payload).pipe(Effect.ensuring(Deferred.succeed(closed, undefined)))
+            }
+            return value
+          }
+        })
+        const client = yield* ReplicaClient.fromRpcClient(definition, observedRpc)
         const observed = yield* Deferred.make<void>()
         const commandId = yield* Identity.makeCommandId
         const stream = yield* client.commandDeliveryChanges(commandId).pipe(
@@ -146,8 +158,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient pagehide", (it) => {
         )
         yield* Deferred.await(observed)
         target.dispatchEvent(new Event("pagehide"))
+        yield* Deferred.await(closed)
         yield* Fiber.join(stream)
-        yield* waitFor(sessions.activeCount.pipe(Effect.map((count) => count === 0)))
+        assert.strictEqual(yield* sessions.activeCount, 0)
         yield* TestClock.adjust(SessionManager.leaseDurationMillis / 2 + 1)
         yield* Effect.yieldNow
         assert.strictEqual(yield* sessions.activeCount, 0)

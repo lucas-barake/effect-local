@@ -8,9 +8,11 @@ import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import { TestClock } from "effect/testing"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import type * as SqlConnection from "effect/unstable/sql/SqlConnection"
 import * as CommandDeliveryPublisher from "../src/CommandDeliveryPublisher.js"
 import * as CommandDeliveryStore from "../src/CommandDeliveryStore.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
@@ -101,8 +103,42 @@ describe("CommandDeliveryPublisher", () => {
       )
     }).pipe(Effect.provide(layer)))
 
-  it.effect("continues polling after a transaction commit defect", () => {
+  it.effect("retries polling after a typed storage failure", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const gate = yield* ReplicaGate.ReplicaGate
+      const permit = yield* gate.current
+      const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
+
+      yield* sql`INSERT INTO effect_local_command_delivery_events (
+        replica_incarnation, command_id, document_id, published
+      ) VALUES (${permit.incarnation}, NULL, ${documentId}, 0)`
+      yield* sql`PRAGMA query_only = ON`
+      yield* TestClock.adjust("1 second")
+      yield* Effect.yieldNow
+
+      assert.deepStrictEqual(
+        yield* sql`SELECT COUNT(*) AS count
+          FROM effect_local_command_delivery_events
+          WHERE published = 0`,
+        [{ count: 1 }]
+      )
+
+      yield* sql`PRAGMA query_only = OFF`
+      yield* TestClock.adjust("1 second")
+      yield* Effect.yieldNow
+
+      assert.deepStrictEqual(
+        yield* sql`SELECT COUNT(*) AS count
+          FROM effect_local_command_delivery_events
+          WHERE published = 0`,
+        [{ count: 0 }]
+      )
+    }).pipe(Effect.provide(layer)))
+
+  it.effect("stops polling when a transaction commit defects", () => {
     let failNextCommit = false
+    let commitAttempts = 0
     const baseDatabase = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
     const instrumentedDatabase = Layer.effect(
       SqlClient.SqlClient,
@@ -113,15 +149,29 @@ describe("CommandDeliveryPublisher", () => {
           sql,
           {
             withTransaction: <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
-              sql.withTransaction(effect).pipe(
-                Effect.tap(() =>
-                  Effect.suspend(() => {
-                    if (!failNextCommit) return Effect.void
+              Effect.scoped(Effect.gen(function*() {
+                const transaction = yield* Effect.serviceOption(sql.transactionService)
+                if (Option.isSome(transaction)) {
+                  return yield* sql.withTransaction(effect)
+                }
+                const connection = yield* sql.reserve
+                const instrumentedConnection: SqlConnection.Connection = {
+                  ...connection,
+                  executeUnprepared: (statement, params, transformRows) => {
+                    const execution = connection.executeUnprepared(statement, params, transformRows)
+                    if (statement !== "COMMIT") return execution
+                    commitAttempts++
+                    if (!failNextCommit) return execution
                     failNextCommit = false
-                    return Effect.die(new Error("simulated commit defect"))
-                  })
+                    return execution.pipe(
+                      Effect.andThen(Effect.die(new Error("simulated commit defect")))
+                    )
+                  }
+                }
+                return yield* sql.withTransaction(effect).pipe(
+                  Effect.provideService(sql.transactionService, [instrumentedConnection, -1])
                 )
-              )
+              }))
           }
         )
       })
@@ -142,6 +192,7 @@ describe("CommandDeliveryPublisher", () => {
       const permit = yield* gate.current
       const firstDocumentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
       const secondDocumentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000002")
+      const commitAttemptsBeforeDefect = commitAttempts
 
       failNextCommit = true
       yield* sql`INSERT INTO effect_local_command_delivery_events (
@@ -160,8 +211,9 @@ describe("CommandDeliveryPublisher", () => {
         yield* sql`SELECT COUNT(*) AS count
           FROM effect_local_command_delivery_events
           WHERE published = 0`,
-        [{ count: 0 }]
+        [{ count: 1 }]
       )
+      assert.strictEqual(commitAttempts - commitAttemptsBeforeDefect, 1)
     }).pipe(Effect.provide(testLayer))
   })
 })

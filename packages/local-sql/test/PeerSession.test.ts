@@ -29,6 +29,7 @@ import * as TestClock from "effect/testing/TestClock"
 import * as Entity from "effect/unstable/cluster/Entity"
 import * as Sharding from "effect/unstable/cluster/Sharding"
 import * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
+import * as CommandDeliveryStore from "../src/CommandDeliveryStore.js"
 import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as CommitPublisher from "../src/CommitPublisher.js"
 import * as DocumentEntity from "../src/DocumentEntity.js"
@@ -40,7 +41,23 @@ import * as PeerSyncEnvelope from "../src/PeerSyncEnvelope.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
 
-it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("PeerSession", (it) => {
+const deliveryStore = CommandDeliveryStore.CommandDeliveryStore.of({
+  lookup: () => Effect.die("unexpected command delivery lookup"),
+  snapshotWithCursor: () => Effect.die("unexpected command delivery snapshot"),
+  recordMessage: () => Effect.die("unexpected command delivery message"),
+  markAccepted: () => Effect.die("unexpected command delivery acceptance"),
+  markUnconfirmed: () => Effect.die("unexpected command delivery deadline"),
+  documentConfirmed: () => Effect.succeed(false),
+  pendingEvents: Effect.die("unexpected command delivery events"),
+  markEventsPublished: () => Effect.die("unexpected command delivery publication"),
+  cursor: Effect.die("unexpected command delivery cursor")
+})
+
+it.layer(Layer.mergeAll(
+  NodeCrypto.layer,
+  PeerRelayReceiptLimits.layerDefaults,
+  Layer.succeed(CommandDeliveryStore.CommandDeliveryStore, deliveryStore)
+))("PeerSession", (it) => {
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
   const definition = ReplicaDefinition.make({
     name: "tasks",

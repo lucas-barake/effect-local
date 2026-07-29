@@ -2,7 +2,6 @@ import * as CommandDelivery from "@lucas-barake/effect-local/CommandDelivery"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
-import type * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
@@ -19,7 +18,11 @@ const ReceiptRow = Schema.Struct({
   tracked: Schema.Int
 })
 
-const DeliveryRow = Schema.Struct({
+const SourceCountRow = Schema.Struct({
+  change_count: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+})
+
+const DeliveryAggregateRow = Schema.Struct({
   expected_local_tenant_id: Schema.String,
   expected_local_subject_id: Schema.String,
   expected_local_peer_id: Identity.PeerId,
@@ -27,12 +30,13 @@ const DeliveryRow = Schema.Struct({
   remote_subject_id: Schema.String,
   remote_peer_id: Identity.PeerId,
   relay_peer_id: Identity.PeerId,
-  relay_message_id: Identity.RelayMessageId,
-  change_hash: WriterProvenance.ChangeHash,
-  created_at: IsoDate,
-  retry_deadline: IsoDate,
-  relay_custody_accepted_at: Schema.NullOr(IsoDate),
-  sender_custody_unconfirmed_at: Schema.NullOr(IsoDate)
+  accepted_change_count: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  pending_change_count: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  accepted_at: Schema.NullOr(IsoDate),
+  first_pending_at: Schema.NullOr(IsoDate),
+  pending_retry_deadline: Schema.NullOr(IsoDate),
+  unconfirmed_at: Schema.NullOr(IsoDate),
+  unconfirmed_retry_deadline: Schema.NullOr(IsoDate)
 })
 
 const EventRow = Schema.Struct({
@@ -148,17 +152,6 @@ export interface Cursor {
   readonly refreshEpoch: number
 }
 
-const endpointKey = (endpoint: Endpoint): string =>
-  JSON.stringify([
-    endpoint.expectedLocal.tenantId,
-    endpoint.expectedLocal.subjectId,
-    endpoint.expectedLocal.peerId,
-    endpoint.remote.tenantId,
-    endpoint.remote.subjectId,
-    endpoint.remote.peerId,
-    endpoint.relayPeerId
-  ])
-
 export class CommandDeliveryStore extends Context.Service<CommandDeliveryStore, {
   readonly lookup: (
     commandId: Identity.CommandId
@@ -220,26 +213,25 @@ export const layer: Layer.Layer<
           AND receipts.command_id = ${request.commandId}`
     })
 
-    const findSourceChanges = SqlSchema.findAll({
+    const findSourceCount = SqlSchema.findAll({
       Request: Schema.Struct({
         replicaIncarnation: Identity.ReplicaIncarnation,
         commandId: Identity.CommandId
       }),
-      Result: Schema.Struct({ change_hash: WriterProvenance.ChangeHash }),
+      Result: SourceCountRow,
       execute: (request) =>
-        sql`SELECT change_hash
+        sql`SELECT COUNT(*) AS change_count
         FROM effect_local_command_delivery_changes
         WHERE replica_incarnation = ${request.replicaIncarnation}
-          AND command_id = ${request.commandId}
-        ORDER BY change_hash`
+          AND command_id = ${request.commandId}`
     })
 
-    const findDeliveryRows = SqlSchema.findAll({
+    const findDeliveryAggregates = SqlSchema.findAll({
       Request: Schema.Struct({
         replicaIncarnation: Identity.ReplicaIncarnation,
         commandId: Identity.CommandId
       }),
-      Result: DeliveryRow,
+      Result: DeliveryAggregateRow,
       execute: (request) =>
         sql`SELECT
           messages.expected_local_tenant_id,
@@ -249,12 +241,39 @@ export const layer: Layer.Layer<
           messages.remote_subject_id,
           messages.remote_peer_id,
           messages.relay_peer_id,
-          messages.relay_message_id,
-          message_changes.change_hash,
-          messages.created_at,
-          messages.retry_deadline,
-          messages.relay_custody_accepted_at,
-          messages.sender_custody_unconfirmed_at
+          COUNT(DISTINCT CASE
+            WHEN messages.relay_custody_accepted_at IS NOT NULL
+            THEN message_changes.change_hash
+          END) AS accepted_change_count,
+          COUNT(DISTINCT CASE
+            WHEN messages.relay_custody_accepted_at IS NULL
+              AND messages.sender_custody_unconfirmed_at IS NULL
+            THEN message_changes.change_hash
+          END) AS pending_change_count,
+          MAX(CASE
+            WHEN messages.relay_custody_accepted_at IS NOT NULL
+            THEN messages.relay_custody_accepted_at
+          END) AS accepted_at,
+          MIN(CASE
+            WHEN messages.relay_custody_accepted_at IS NULL
+              AND messages.sender_custody_unconfirmed_at IS NULL
+            THEN messages.created_at
+          END) AS first_pending_at,
+          MAX(CASE
+            WHEN messages.relay_custody_accepted_at IS NULL
+              AND messages.sender_custody_unconfirmed_at IS NULL
+            THEN messages.retry_deadline
+          END) AS pending_retry_deadline,
+          MAX(CASE
+            WHEN messages.relay_custody_accepted_at IS NULL
+              AND messages.sender_custody_unconfirmed_at IS NOT NULL
+            THEN messages.sender_custody_unconfirmed_at
+          END) AS unconfirmed_at,
+          MAX(CASE
+            WHEN messages.relay_custody_accepted_at IS NULL
+              AND messages.sender_custody_unconfirmed_at IS NOT NULL
+            THEN messages.retry_deadline
+          END) AS unconfirmed_retry_deadline
         FROM effect_local_command_delivery_changes command_changes
         INNER JOIN effect_local_peer_relay_delivery_changes message_changes
           ON message_changes.replica_incarnation = command_changes.replica_incarnation
@@ -264,11 +283,18 @@ export const layer: Layer.Layer<
           AND messages.relay_message_id = message_changes.relay_message_id
         WHERE command_changes.replica_incarnation = ${request.replicaIncarnation}
           AND command_changes.command_id = ${request.commandId}
+        GROUP BY
+          messages.expected_local_tenant_id,
+          messages.expected_local_subject_id,
+          messages.expected_local_peer_id,
+          messages.remote_tenant_id,
+          messages.remote_subject_id,
+          messages.remote_peer_id,
+          messages.relay_peer_id
         ORDER BY
           messages.relay_peer_id,
           messages.remote_peer_id,
-          messages.relay_message_id,
-          message_changes.change_hash`
+          MIN(messages.relay_message_id)`
     })
 
     const currentCursor = SqlSchema.findOne({
@@ -276,12 +302,13 @@ export const layer: Layer.Layer<
       Result: CursorRow,
       execute: () =>
         sql`SELECT
-          COALESCE(MAX(events.event_sequence), 0) AS event_sequence,
+          COALESCE((
+            SELECT MAX(event_sequence)
+            FROM effect_local_command_delivery_events
+          ), 0) AS event_sequence,
           control.refresh_epoch
         FROM effect_local_command_delivery_control control
-        LEFT JOIN effect_local_command_delivery_events events ON 1 = 1
-        WHERE control.singleton = 1
-        GROUP BY control.refresh_epoch`
+        WHERE control.singleton = 1`
     })(undefined).pipe(
       Effect.map((row) => ({
         sequence: row.event_sequence,
@@ -314,133 +341,61 @@ export const layer: Layer.Layer<
         }
         const receipt = receiptRows[0]!
         if (receipt.tracked !== 1) return CommandDelivery.untracked(commandId, receipt.document_id)
-        const sourceChanges = yield* findSourceChanges({
+        const sourceRows = yield* findSourceCount({
           replicaIncarnation: permit.incarnation,
           commandId
         })
-        if (sourceChanges.length === 0) return CommandDelivery.noChanges(commandId, receipt.document_id)
-        const rows = yield* findDeliveryRows({
-          replicaIncarnation: permit.incarnation,
-          commandId
-        })
-        const groups = new Map<string, {
-          readonly relayPeerId: Identity.PeerId
-          readonly remotePeerId: Identity.PeerId
-          readonly accepted: Set<string>
-          readonly pending: Set<string>
-          readonly unconfirmed: Set<string>
-          acceptedAt: DateTime.Utc | undefined
-          pendingAt: DateTime.Utc | undefined
-          pendingRetryDeadline: DateTime.Utc | undefined
-          unconfirmedAt: DateTime.Utc | undefined
-          unconfirmedRetryDeadline: DateTime.Utc | undefined
-        }>()
-        for (const row of rows) {
-          const key = endpointKey({
-            expectedLocal: {
-              tenantId: row.expected_local_tenant_id,
-              subjectId: row.expected_local_subject_id,
-              peerId: row.expected_local_peer_id
-            },
-            remote: {
-              tenantId: row.remote_tenant_id,
-              subjectId: row.remote_subject_id,
-              peerId: row.remote_peer_id
-            },
-            relayPeerId: row.relay_peer_id
+        if (sourceRows.length !== 1) {
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({
+              cause: new Error("Command delivery change count is missing")
+            })
           })
-          let group = groups.get(key)
-          if (group === undefined) {
-            group = {
+        }
+        const source = sourceRows[0]!
+        if (source.change_count === 0) return CommandDelivery.noChanges(commandId, receipt.document_id)
+        const rows = yield* findDeliveryAggregates({
+          replicaIncarnation: permit.incarnation,
+          commandId
+        })
+        const localChangeCount = source.change_count
+        const destinations = rows.map((row): CommandDelivery.Destination => {
+          if (row.accepted_change_count === localChangeCount) {
+            return {
               relayPeerId: row.relay_peer_id,
               remotePeerId: row.remote_peer_id,
-              accepted: new Set(),
-              pending: new Set(),
-              unconfirmed: new Set(),
-              acceptedAt: undefined,
-              pendingAt: undefined,
-              pendingRetryDeadline: undefined,
-              unconfirmedAt: undefined,
-              unconfirmedRetryDeadline: undefined
-            }
-            groups.set(key, group)
-          }
-          if (row.relay_custody_accepted_at !== null) {
-            group.accepted.add(row.change_hash)
-            if (
-              group.acceptedAt === undefined ||
-              row.relay_custody_accepted_at.epochMilliseconds > group.acceptedAt.epochMilliseconds
-            ) {
-              group.acceptedAt = row.relay_custody_accepted_at
-            }
-          } else if (row.sender_custody_unconfirmed_at !== null) {
-            group.unconfirmed.add(row.change_hash)
-            if (
-              group.unconfirmedAt === undefined ||
-              row.sender_custody_unconfirmed_at.epochMilliseconds > group.unconfirmedAt.epochMilliseconds
-            ) {
-              group.unconfirmedAt = row.sender_custody_unconfirmed_at
-            }
-            if (
-              group.unconfirmedRetryDeadline === undefined ||
-              row.retry_deadline.epochMilliseconds > group.unconfirmedRetryDeadline.epochMilliseconds
-            ) {
-              group.unconfirmedRetryDeadline = row.retry_deadline
-            }
-          } else {
-            group.pending.add(row.change_hash)
-            if (
-              group.pendingAt === undefined ||
-              row.created_at.epochMilliseconds < group.pendingAt.epochMilliseconds
-            ) {
-              group.pendingAt = row.created_at
-            }
-            if (
-              group.pendingRetryDeadline === undefined ||
-              row.retry_deadline.epochMilliseconds > group.pendingRetryDeadline.epochMilliseconds
-            ) {
-              group.pendingRetryDeadline = row.retry_deadline
-            }
-          }
-        }
-        const localChangeCount = sourceChanges.length
-        const destinations = [...groups.values()].map((group): CommandDelivery.Destination => {
-          if (group.accepted.size === localChangeCount) {
-            return {
-              relayPeerId: group.relayPeerId,
-              remotePeerId: group.remotePeerId,
               state: {
                 _tag: "RelayCustodyAccepted",
-                acceptedChangeCount: group.accepted.size,
-                acceptedAt: group.acceptedAt!,
-                ...(group.unconfirmedAt === undefined
+                acceptedChangeCount: row.accepted_change_count,
+                acceptedAt: row.accepted_at!,
+                ...(row.unconfirmed_at === null
                   ? {}
-                  : { senderCustodyUnconfirmedAt: group.unconfirmedAt })
+                  : { senderCustodyUnconfirmedAt: row.unconfirmed_at })
               }
             }
           }
-          if (group.pending.size > 0) {
+          if (row.pending_change_count > 0) {
             return {
-              relayPeerId: group.relayPeerId,
-              remotePeerId: group.remotePeerId,
+              relayPeerId: row.relay_peer_id,
+              remotePeerId: row.remote_peer_id,
               state: {
                 _tag: "PendingRelayCustody",
-                acceptedChangeCount: group.accepted.size,
-                pendingChangeCount: group.pending.size,
-                firstPendingAt: group.pendingAt!,
-                retryDeadline: group.pendingRetryDeadline!
+                acceptedChangeCount: row.accepted_change_count,
+                pendingChangeCount: row.pending_change_count,
+                firstPendingAt: row.first_pending_at!,
+                retryDeadline: row.pending_retry_deadline!
               }
             }
           }
           return {
-            relayPeerId: group.relayPeerId,
-            remotePeerId: group.remotePeerId,
+            relayPeerId: row.relay_peer_id,
+            remotePeerId: row.remote_peer_id,
             state: {
               _tag: "RelayCustodyUnconfirmedAtDeadline",
-              acceptedChangeCount: group.accepted.size,
-              unconfirmedChangeCount: localChangeCount - group.accepted.size,
-              deadline: group.unconfirmedRetryDeadline!,
-              observedAt: group.unconfirmedAt!
+              acceptedChangeCount: row.accepted_change_count,
+              unconfirmedChangeCount: localChangeCount - row.accepted_change_count,
+              deadline: row.unconfirmed_retry_deadline!,
+              observedAt: row.unconfirmed_at!
             }
           }
         })

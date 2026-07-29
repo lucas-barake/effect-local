@@ -727,6 +727,32 @@ const commandDeliveryMigration = Effect.gen(function*() {
     refresh_epoch INTEGER NOT NULL CHECK (refresh_epoch >= 0)
   )`
   yield* sql`INSERT INTO effect_local_command_delivery_control(singleton, refresh_epoch) VALUES (1, 0)`
+  yield* sql`INSERT INTO effect_local_peer_relay_delivery_messages (
+    replica_id, replica_incarnation,
+    expected_local_tenant_id, expected_local_subject_id, expected_local_peer_id,
+    remote_tenant_id, remote_subject_id, remote_peer_id, relay_peer_id,
+    relay_message_id, outer_envelope_digest, sender_connection_epoch,
+    sender_sequence, document_id, created_at, retry_deadline,
+    relay_custody_accepted_at, sender_custody_unconfirmed_at
+  )
+  SELECT
+    replica_id, replica_incarnation,
+    expected_local_tenant_id, expected_local_subject_id, expected_local_peer_id,
+    remote_tenant_id, remote_subject_id, remote_peer_id, relay_peer_id,
+    relay_message_id, outer_envelope_digest, sender_connection_epoch,
+    sender_sequence, document_id, created_at, retry_deadline,
+    NULL, NULL
+  FROM effect_local_peer_relay_outbox`
+  yield* sql`INSERT INTO effect_local_peer_relay_delivery_changes (
+    replica_incarnation, relay_message_id, change_hash
+  )
+  SELECT
+    outbox.replica_incarnation,
+    outbox.relay_message_id,
+    json_extract(provenance.value, '$.changeHash') AS change_hash
+  FROM effect_local_peer_relay_outbox AS outbox
+  INNER JOIN json_each(outbox.writer_provenance) AS provenance
+  ORDER BY outbox.replica_incarnation, outbox.relay_message_id, change_hash`
 
   yield* sql`CREATE TABLE effect_local_peer_relay_outbox_v11 (
     row_id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -8,7 +8,6 @@ import * as Clock from "effect/Clock"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
-import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
@@ -87,6 +86,7 @@ const makeWithTerminal = (
   OpenedSession,
   ReplicaError.ReplicaError,
   | Scope.Scope
+  | CommandDeliveryStore.CommandDeliveryStore
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
   | PeerConnectionStatus.Reporter
@@ -97,7 +97,7 @@ const makeWithTerminal = (
 > => {
   let cleanupOnError: Effect.Effect<void> = Effect.void
   return Effect.gen(function*() {
-    const deliveries = yield* Effect.serviceOption(CommandDeliveryStore.CommandDeliveryStore)
+    const deliveries = yield* CommandDeliveryStore.CommandDeliveryStore
     const gate = yield* ReplicaGate.ReplicaGate
     const publisher = yield* CommitPublisher.CommitPublisher
     const limits = yield* ReplicaLimits.ReplicaLimits
@@ -735,11 +735,7 @@ const makeWithTerminal = (
       flush: guardedFlush,
       observedByPeer: (documentId) =>
         Ref.get(observed).pipe(Effect.map((values) => values.get(documentId)?.value ?? false)),
-      durableConfirmation: (documentId) =>
-        Option.match(deliveries, {
-          onNone: () => Effect.succeed(false),
-          onSome: (store) => store.documentConfirmed(documentId, connection.relayEndpoint)
-        }),
+      durableConfirmation: (documentId) => deliveries.documentConfirmed(documentId, connection.relayEndpoint),
       awaitDisconnect: Deferred.await(terminalFailure)
     }
     return { session: sessionValue, disconnect, failTerminal }
@@ -761,6 +757,7 @@ export const makeTestClient = (
   PeerSession,
   ReplicaError.ReplicaError,
   | Scope.Scope
+  | CommandDeliveryStore.CommandDeliveryStore
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
   | PeerConnectionStatus.Reporter
@@ -781,6 +778,7 @@ export const makeSupervised = (options: {
   SupervisedPeerSession,
   ReplicaError.ReplicaError,
   | Scope.Scope
+  | CommandDeliveryStore.CommandDeliveryStore
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
   | PeerConnectionStatus.Reporter
@@ -808,6 +806,7 @@ export const make = (options: {
   PeerSession,
   ReplicaError.ReplicaError,
   | Scope.Scope
+  | CommandDeliveryStore.CommandDeliveryStore
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
   | PeerConnectionStatus.Reporter
@@ -825,6 +824,7 @@ export const makeLive = (options: {
   SupervisedPeerSession,
   ReplicaError.ReplicaError,
   | Scope.Scope
+  | CommandDeliveryStore.CommandDeliveryStore
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
   | PeerConnectionStatus.Reporter

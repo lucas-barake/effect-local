@@ -649,11 +649,12 @@ describe("PeerRelayOutbox", () => {
         })
       }
 
-      let queryCount = 0
+      const spans: Array<Tracer.NativeSpan> = []
       const tracer = Tracer.make({
         span: (options) => {
-          if (options.name === "sql.execute") queryCount++
-          return new Tracer.NativeSpan(options)
+          const span = new Tracer.NativeSpan(options)
+          if (options.name === "sql.execute") spans.push(span)
+          return span
         }
       })
       const entries = yield* outbox.dueForEndpoint({ ...endpoint, maximum: 8 }).pipe(
@@ -661,7 +662,25 @@ describe("PeerRelayOutbox", () => {
       )
 
       assert.strictEqual(entries.length, 8)
-      assert.isAtMost(queryCount, 3)
+      assert.isAtMost(spans.length, 4)
+      const deliveryQueries = spans
+        .map((span) => span.attributes.get("db.query.text"))
+        .filter((query): query is string =>
+          typeof query === "string" &&
+          query.includes("effect_local_peer_relay_delivery_")
+        )
+      assert.strictEqual(deliveryQueries.length, 2)
+      assert.isTrue(deliveryQueries.some((query) =>
+        query.includes("effect_local_peer_relay_delivery_messages") &&
+        !query.includes("effect_local_peer_relay_delivery_changes") &&
+        !query.includes("change_hash")
+      ))
+      assert.isTrue(deliveryQueries.some((query) =>
+        query.includes("effect_local_peer_relay_delivery_changes") &&
+        query.includes("relay_message_id") &&
+        query.includes("change_hash") &&
+        !query.includes("JOIN")
+      ))
     }).pipe(Effect.provide(layer(":memory:", {
       ...outboxLimits,
       maxMessagesPerRemote: 8,

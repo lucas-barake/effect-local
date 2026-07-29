@@ -428,12 +428,11 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                   const wasCandidate = Option.isSome(current.provisioning) &&
                     current.provisioning.value.candidate === event.controlPort
                   const starting = Option.getOrUndefined(current.starting)
-                  const wasStartingCandidate = starting?.candidate === event.controlPort
                   if (wasCandidate) current.provisioning = Option.none()
                   if (wasProvider) {
                     return resetEngine("the database provider detached")
                   }
-                  if (wasStartingCandidate && starting !== undefined) {
+                  if (starting?.candidate === event.controlPort) {
                     current.starting = Option.none()
                     current.epoch += 1
                     return Fiber.interrupt(starting.fiber).pipe(
