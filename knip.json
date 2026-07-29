@@ -3,7 +3,7 @@
   "includeEntryExports": false,
   "workspaces": {
     "packages/local-sql": {
-      "entry": ["test/crash-durability/childProcess.ts"],
+      "entry": ["test/crash-durability/childProcess.ts", "examples/*.ts"],
       "ignoreDependencies": ["tsx"]
     },
     "packages/local-browser": {
