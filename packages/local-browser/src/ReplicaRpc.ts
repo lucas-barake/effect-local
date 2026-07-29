@@ -45,6 +45,8 @@ const DocumentIdOutcome = CommandOutcome.schema(Identity.DocumentId, Schema.Neve
  */
 export const protocolVersion = 1
 export const commandDeliveryInvalidationKey = "@lucas-barake/effect-local/command-delivery"
+const DeliveryEventSequence = Schema.Int.check(Schema.isGreaterThan(0))
+const DeliveryCursor = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 const SessionLease = Schema.Struct({ leaseMillis: Schema.Int })
 export const SessionHandshake = Schema.Struct({
   leaseMillis: Schema.Int,
@@ -91,7 +93,7 @@ export const Invalidation = Schema.Union([
   }),
   Schema.TaggedStruct("DeliveryInvalidation", {
     ownerEpoch: Schema.String,
-    sequence: Schema.Int,
+    sequence: DeliveryEventSequence,
     keys: Schema.Array(Schema.String)
   }),
   Schema.TaggedStruct("DeliveryFullRefreshRequired", {
@@ -106,8 +108,8 @@ export const InvalidationMessage = Schema.Union([
     ownerEpoch: Schema.String,
     watermark: Identity.CommitSequence,
     refreshGeneration: Schema.Int,
-    deliveryWatermark: Schema.Int,
-    deliveryRefreshEpoch: Schema.Int
+    deliveryWatermark: DeliveryCursor,
+    deliveryRefreshEpoch: DeliveryCursor
   }),
   Invalidation
 ])

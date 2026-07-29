@@ -1,4 +1,5 @@
 import * as PeerRelayClientRuntime from "@lucas-barake/effect-local-sql/PeerRelayClientRuntime"
+import type * as PeerRelayOutbox from "@lucas-barake/effect-local-sql/PeerRelayOutbox"
 import * as PeerSession from "@lucas-barake/effect-local-sql/PeerSession"
 import * as PeerSyncEnvelope from "@lucas-barake/effect-local-sql/PeerSyncEnvelope"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
@@ -422,7 +423,7 @@ export const layer = (
                       )
 
                     const pushEntry = (
-                      entry: Effect.Success<ReturnType<typeof runtime.admit>>
+                      entry: PeerRelayOutbox.Entry
                     ) =>
                       client.Push({
                         sessionId: handshake.sessionId,
@@ -435,6 +436,11 @@ export const layer = (
                           outerEnvelopeDigest: entry.outerEnvelopeDigest
                         }))
                       )
+
+                    const pushAdmission = (admission: PeerRelayOutbox.Admission) =>
+                      admission._tag === "PendingRelayCustody"
+                        ? pushEntry(admission)
+                        : Effect.void
 
                     const replay = Effect.gen(function*() {
                       while (true) {
@@ -455,7 +461,7 @@ export const layer = (
                             ...endpoint,
                             payload: message,
                             retryHorizonMillis: options.senderRetryHorizonMillis
-                          }).pipe(Effect.flatMap(pushEntry)),
+                          }).pipe(Effect.flatMap(pushAdmission)),
                           sendLock
                         ),
                         operation: "AdapterPush",

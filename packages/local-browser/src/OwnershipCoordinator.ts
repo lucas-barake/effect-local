@@ -14,6 +14,7 @@ import * as Crypto from "effect/Crypto"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as ManagedRuntime from "effect/ManagedRuntime"
 import * as Option from "effect/Option"
@@ -110,11 +111,17 @@ interface Provisioning {
   readonly candidate: MessagePort
 }
 
+interface Starting {
+  readonly epoch: number
+  readonly candidate: MessagePort
+  readonly fiber: Fiber.Fiber<boolean>
+}
+
 interface CoordinatorState {
   readonly clients: Map<MessagePort, Client>
   engine: Option.Option<LiveEngine>
   provisioning: Option.Option<Provisioning>
-  starting: boolean
+  starting: Option.Option<Starting>
   disposing: boolean
   epoch: number
   readonly tried: Set<MessagePort>
@@ -185,7 +192,7 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
         clients: new Map(),
         engine: Option.none(),
         provisioning: Option.none(),
-        starting: false,
+        starting: Option.none(),
         disposing: false,
         epoch: 0,
         tried: new Set()
@@ -273,15 +280,14 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
         })
         return start.pipe(
           Effect.flatMap((exit) => Queue.offer(events, { _tag: "EngineStarted", epoch, nonce, candidate, exit })),
-          Effect.forkIn(layerScope),
-          Effect.asVoid
+          Effect.forkIn(layerScope)
         )
       }
 
       const kickProvisioning: Effect.Effect<void> = Effect.suspend(() => {
         const current = Ref.getUnsafe(state)
         if (
-          Option.isSome(current.engine) || Option.isSome(current.provisioning) || current.starting ||
+          Option.isSome(current.engine) || Option.isSome(current.provisioning) || Option.isSome(current.starting) ||
           current.disposing
         ) {
           return Effect.void
@@ -421,9 +427,20 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                     current.engine.value.provider === event.controlPort
                   const wasCandidate = Option.isSome(current.provisioning) &&
                     current.provisioning.value.candidate === event.controlPort
+                  const starting = Option.getOrUndefined(current.starting)
+                  const wasStartingCandidate = starting?.candidate === event.controlPort
                   if (wasCandidate) current.provisioning = Option.none()
                   if (wasProvider) {
                     return resetEngine("the database provider detached")
+                  }
+                  if (wasStartingCandidate && starting !== undefined) {
+                    current.starting = Option.none()
+                    current.epoch += 1
+                    return Fiber.interrupt(starting.fiber).pipe(
+                      Effect.forkIn(layerScope),
+                      Effect.andThen(kickProvisioning),
+                      Effect.asVoid
+                    )
                   }
                   return wasCandidate ? kickProvisioning : Effect.void
                 }
@@ -438,9 +455,16 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                   }
                   const nonce = current.provisioning.value.nonce
                   current.provisioning = Option.none()
-                  current.starting = true
                   current.epoch += 1
-                  return startEngine(current.epoch, nonce, event.controlPort, frame.databasePort)
+                  const epoch = current.epoch
+                  return startEngine(epoch, nonce, event.controlPort, frame.databasePort).pipe(
+                    Effect.tap((fiber) =>
+                      Effect.sync(() => {
+                        current.starting = Option.some({ epoch, candidate: event.controlPort, fiber })
+                      })
+                    ),
+                    Effect.asVoid
+                  )
                 }
               }
             }
@@ -461,8 +485,10 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
               )
             }
             case "EngineStarted": {
-              current.starting = false
-              if (event.epoch !== current.epoch || Option.isSome(current.engine)) {
+              const isCurrentStart = Option.isSome(current.starting) &&
+                current.starting.value.epoch === event.epoch &&
+                current.starting.value.candidate === event.candidate
+              if (!isCurrentStart || event.epoch !== current.epoch || Option.isSome(current.engine)) {
                 if (Exit.isSuccess(event.exit)) {
                   return disposeEngine(event.exit.value, Exit.void).pipe(
                     Effect.forkIn(layerScope),
@@ -471,6 +497,7 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                 }
                 return Effect.void
               }
+              current.starting = Option.none()
               if (Exit.isFailure(event.exit)) {
                 current.tried.add(event.candidate)
                 // Same drop as a provisioning timeout: the candidate could not produce a healthy

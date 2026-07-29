@@ -3,12 +3,16 @@ import { assert, it } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
+import * as CommandDelivery from "@lucas-barake/effect-local/CommandDelivery"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Stream from "effect/Stream"
+import { TestClock } from "effect/testing"
 import { RpcTest } from "effect/unstable/rpc"
 import * as ReplicaClient from "../src/ReplicaClient.js"
 import * as ReplicaOwner from "../src/ReplicaOwner.js"
@@ -113,6 +117,43 @@ it.layer(NodeCrypto.layer)("ReplicaClient pagehide", (it) => {
         yield* waitFor(sessions.activeCount.pipe(Effect.map((count) => count === 0)))
       }))
     }).pipe(Effect.provide(Owner)))
+
+  it.effect("does not reopen a delivery stream after the page hides", () => {
+    const activeReplica: Replica.Replica["Service"] = {
+      ...replica,
+      commandDeliveryChanges: (commandId) =>
+        Stream.make(CommandDelivery.unknown(commandId)).pipe(Stream.concat(Stream.never))
+    }
+    const ActiveOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
+      Layer.provideMerge(Sessions),
+      Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, activeReplica)))
+    )
+    return Effect.gen(function*() {
+      const sessions = yield* SessionManager.SessionManager
+      const target = new EventTarget()
+      yield* withPageEvents(target)
+      yield* Effect.scoped(Effect.gen(function*() {
+        const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+        const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
+        const observed = yield* Deferred.make<void>()
+        const commandId = yield* Identity.makeCommandId
+        const stream = yield* client.commandDeliveryChanges(commandId).pipe(
+          Stream.tap(() => Deferred.succeed(observed, undefined)),
+          Stream.runDrain,
+          Effect.forkChild
+        )
+        yield* Deferred.await(observed)
+        target.dispatchEvent(new Event("pagehide"))
+        yield* Fiber.join(stream)
+        yield* waitFor(sessions.activeCount.pipe(Effect.map((count) => count === 0)))
+        yield* TestClock.adjust(SessionManager.leaseDurationMillis / 2 + 1)
+        yield* Effect.yieldNow
+        assert.strictEqual(yield* sessions.activeCount, 0)
+      }))
+    }).pipe(Effect.provide(ActiveOwner))
+  })
 
   it.effect("keeps the owner session when pagehide closing is disabled", () =>
     Effect.gen(function*() {

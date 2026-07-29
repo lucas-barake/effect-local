@@ -12,6 +12,7 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Queue from "effect/Queue"
 import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
 import * as HttpClientError from "effect/unstable/http/HttpClientError"
@@ -95,6 +96,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
       let statusCalls = 0
       let activeStatus = 0
       let concurrentStatus = 0
+      const attempts = yield* Queue.unbounded<number>()
       const reconnecting = new Proxy(rpc, {
         get(target, property, receiver) {
           if (property !== "Status") return Reflect.get(target, property, receiver)
@@ -104,19 +106,27 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
               activeStatus++
               concurrentStatus = Math.max(concurrentStatus, activeStatus)
               const attempt = statusCalls
-              return (attempt === 1
-                ? Stream.make(ready).pipe(Stream.concat(Stream.fail(disconnected())))
-                : Stream.make(ready).pipe(Stream.concat(Stream.never))).pipe(
-                  Stream.ensuring(Effect.sync(() => {
-                    activeStatus--
-                  }))
+              return Stream.unwrap(
+                Queue.offer(attempts, attempt).pipe(
+                  Effect.as(
+                    (attempt === 1
+                      ? Stream.make(ready).pipe(Stream.concat(Stream.fail(disconnected())))
+                      : Stream.make(ready).pipe(Stream.concat(Stream.never))).pipe(
+                        Stream.ensuring(Effect.sync(() => {
+                          activeStatus--
+                        }))
+                      )
+                  )
                 )
+              )
             }))
         }
       })
       const client = yield* ReplicaClient.fromRpcClient(definition, reconnecting)
       const fiber = yield* client.status.pipe(Stream.take(3), Stream.runCollect, Effect.forkChild)
+      assert.strictEqual(yield* Queue.take(attempts), 1)
       yield* TestClock.adjust("1 second")
+      assert.strictEqual(yield* Queue.take(attempts), 2)
       const collected = Array.from(yield* Fiber.join(fiber))
       assert.deepStrictEqual(collected, [
         ready,
@@ -141,6 +151,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
       let openSessions = 0
       let statusCalls = 0
       let activeStatus = 0
+      const attempts = yield* Queue.unbounded<number>()
       const reconnecting = new Proxy(rpc, {
         get(target, property, receiver) {
           const value = Reflect.get(target, property, receiver)
@@ -166,29 +177,38 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
                 : attempt === 3
                 ? Stream.fail(queued)
                 : Stream.make(ready).pipe(Stream.concat(Stream.never))
-              return stream.pipe(
-                Stream.ensuring(Effect.sync(() => {
-                  activeStatus--
-                }))
+              return Stream.unwrap(
+                Queue.offer(attempts, attempt).pipe(
+                  Effect.as(
+                    stream.pipe(
+                      Stream.ensuring(Effect.sync(() => {
+                        activeStatus--
+                      }))
+                    )
+                  )
+                )
               )
             }))
         }
       })
       const client = yield* ReplicaClient.fromRpcClient(definition, reconnecting)
       const fiber = yield* client.status.pipe(Stream.take(4), Stream.runCollect, Effect.forkChild)
-      yield* Effect.yieldNow
+      assert.strictEqual(yield* Queue.take(attempts), 1)
       assert.strictEqual(statusCalls, 1)
       yield* TestClock.adjust("999 millis")
       assert.strictEqual(statusCalls, 1)
       yield* TestClock.adjust("1 millis")
+      assert.strictEqual(yield* Queue.take(attempts), 2)
       assert.strictEqual(statusCalls, 2)
       yield* TestClock.adjust("999 millis")
       assert.strictEqual(statusCalls, 2)
       yield* TestClock.adjust("1 millis")
+      assert.strictEqual(yield* Queue.take(attempts), 3)
       assert.strictEqual(statusCalls, 3)
       yield* TestClock.adjust("999 millis")
       assert.strictEqual(statusCalls, 3)
       yield* TestClock.adjust("1 millis")
+      assert.strictEqual(yield* Queue.take(attempts), 4)
       const collected = Array.from(yield* Fiber.join(fiber))
       assert.deepStrictEqual(collected, [
         { _tag: "Degraded", reason: "StorageUnavailable" },
@@ -341,6 +361,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
       const ready = { _tag: "Ready" as const, pendingCommands: 0 }
       let openSessions = 0
       let statusCalls = 0
+      const attempts = yield* Queue.unbounded<number>()
       const replacing = new Proxy(rpc, {
         get(target, property, receiver) {
           const value = Reflect.get(target, property, receiver)
@@ -353,12 +374,21 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
           if (property === "Status") {
             return () => {
               statusCalls++
-              if (statusCalls === 1) return Stream.fail(protocolMismatch("initial mismatch"))
-              if (statusCalls === 2) {
-                return Stream.make(ready).pipe(Stream.concat(Stream.fail(disconnected())))
-              }
-              return Stream.fail(
-                protocolMismatch(statusCalls === 3 ? "mismatch after recovery" : "replacement incorrectly resumed")
+              const attempt = statusCalls
+              const stream: Stream.Stream<
+                ReplicaStatus.ReplicaStatus,
+                ReplicaError.ReplicaError | RpcClientError.RpcClientError
+              > = attempt === 1
+                ? Stream.fail(protocolMismatch("initial mismatch"))
+                : attempt === 2
+                ? Stream.make(ready).pipe(Stream.concat(Stream.fail(disconnected())))
+                : Stream.fail(
+                  protocolMismatch(attempt === 3 ? "mismatch after recovery" : "replacement incorrectly resumed")
+                )
+              return Stream.unwrap(
+                Queue.offer(attempts, attempt).pipe(
+                  Effect.as(stream)
+                )
               )
             }
           }
@@ -372,7 +402,10 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
         Effect.flip,
         Effect.forkChild
       )
+      assert.strictEqual(yield* Queue.take(attempts), 1)
+      assert.strictEqual(yield* Queue.take(attempts), 2)
       yield* TestClock.adjust("1 second")
+      assert.strictEqual(yield* Queue.take(attempts), 3)
       const error = yield* Fiber.join(fiber)
       assert.deepStrictEqual(collected, [
         ready,

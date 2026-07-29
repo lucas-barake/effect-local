@@ -7,7 +7,9 @@ import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as ManagedRuntime from "effect/ManagedRuntime"
 import * as Option from "effect/Option"
@@ -98,12 +100,15 @@ interface StartedEngine {
 
 const makeEngineFactory = (
   started: Array<StartedEngine>,
-  filename: string
+  filename: string,
+  beforeStart?: ((attempt: number) => Effect.Effect<void>) | undefined
 ) => {
+  let attempt = 0
   const engine = (databasePort: MessagePort) => {
     void databasePort
+    attempt++
     const sqlite = ManagedRuntime.make(SqliteClient.layer({ filename, disableWAL: true }))
-    const EngineLive = Layer.merge(
+    const services = Layer.merge(
       SqlReplica.layerWithBindings(definition, { projections: [] }),
       SessionManager.layer
     ).pipe(
@@ -113,6 +118,9 @@ const makeEngineFactory = (
         ReplicaLimits.layer(limits)
       ))
     )
+    const EngineLive = beforeStart === undefined
+      ? services
+      : Layer.merge(services, Layer.effectDiscard(beforeStart(attempt)))
     const runtime = ManagedRuntime.make(EngineLive)
     started.push({ sqlite, runtime })
     return runtime
@@ -436,6 +444,52 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
         assert.isTrue(promoted._tag === "Attached" && promoted.provider)
       }).pipe(
         Effect.provide(coordinatorLayer(started)),
+        Effect.scoped
+      )
+    }))
+
+  it.effect("reprovisions immediately when the starting candidate detaches", () =>
+    Effect.gen(function*() {
+      const started: Array<StartedEngine> = []
+      const firstStartEntered = yield* Deferred.make<void>()
+      const releaseFirstStart = yield* Deferred.make<void>()
+      const engine = makeEngineFactory(
+        started,
+        ":memory:",
+        (attempt) =>
+          attempt === 1
+            ? Deferred.succeed(firstStartEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseFirstStart))
+            )
+            : Effect.void
+      )
+      const Coordinator = OwnershipCoordinator.layerSharedWorker({
+        name: "effect-local-ownership-starting-detach-test",
+        definition,
+        engine,
+        info: ownerInfo,
+        provisionTimeout: "500 millis",
+        engineStartTimeout: "5 seconds",
+        engineDisposeTimeout: "100 millis",
+        healthCheck: { interval: "100 millis", timeout: "500 millis" }
+      })
+
+      yield* Effect.gen(function*() {
+        const provider = yield* attachTab
+        yield* acceptNextProvision(provider)
+        yield* Deferred.await(firstStartEntered)
+
+        const secondary = yield* attachTab
+        postToOwner(provider, { _tag: "Detach" })
+
+        const provisioned = yield* Effect.raceFirst(
+          takeFrame(secondary, "Provision").pipe(Effect.as(true)),
+          Effect.sleep("100 millis").pipe(Effect.as(false))
+        ).pipe(Effect.forkChild)
+        yield* TestClock.adjust("100 millis")
+        assert.isTrue(yield* Fiber.join(provisioned))
+      }).pipe(
+        Effect.provide(Coordinator),
         Effect.scoped
       )
     }))

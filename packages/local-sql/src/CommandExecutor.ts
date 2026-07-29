@@ -271,12 +271,15 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
           ) VALUES (
             ${options.permit.incarnation}, ${options.commandId}, ${options.documentId}
           )`
-          for (const changeHash of options.changeHashes) {
-            yield* sql`INSERT INTO effect_local_command_delivery_changes (
-              replica_incarnation, command_id, change_hash
-            ) VALUES (
-              ${options.permit.incarnation}, ${options.commandId}, ${changeHash}
-            )`
+          const changes = options.changeHashes.map((changeHash) => ({
+            replica_incarnation: options.permit.incarnation,
+            command_id: options.commandId,
+            change_hash: changeHash
+          }))
+          for (let index = 0; index < changes.length; index += 50) {
+            yield* sql`INSERT INTO effect_local_command_delivery_changes ${
+              sql.insert(changes.slice(index, index + 50))
+            }`
           }
           yield* sql`INSERT INTO effect_local_command_delivery_events (
             replica_incarnation, command_id, document_id, published

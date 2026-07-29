@@ -94,10 +94,7 @@ export const make = (definition: ReplicaDefinition.Any) =>
         }
         return
       }
-      if (
-        stored.storage_format_version === storageFormatVersion ||
-        stored.storage_format_version === storageFormatVersion - 1
-      ) return
+      if (stored.storage_format_version === storageFormatVersion) return
       return yield* new ReplicaError.ReplicaError({
         reason: new ReplicaError.UnsupportedStorageFormatVersion({
           observedVersion: stored.storage_format_version,

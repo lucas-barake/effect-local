@@ -64,6 +64,59 @@ const StoredMessageRow = Schema.Struct({
   retry_deadline: Schema.String
 })
 
+const RelayPeerPrincipal = Schema.Struct({
+  tenantId: Schema.String,
+  subjectId: Schema.String,
+  peerId: Identity.PeerId
+})
+
+const MessageRequest = Schema.Struct({
+  replicaId: Identity.ReplicaId,
+  replicaIncarnation: Identity.ReplicaIncarnation,
+  relayMessageId: Identity.RelayMessageId,
+  outerEnvelopeDigest: Schema.String,
+  senderConnectionEpoch: Schema.String,
+  senderSequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  documentId: Identity.DocumentId,
+  createdAt: Schema.String,
+  retryDeadline: Schema.String,
+  changeHashes: Schema.Array(WriterProvenance.ChangeHash),
+  expectedLocal: RelayPeerPrincipal,
+  remote: RelayPeerPrincipal,
+  relayPeerId: Identity.PeerId
+})
+
+const MessageIdentityRequest = Schema.Struct({
+  replicaIncarnation: Identity.ReplicaIncarnation,
+  relayMessageId: Identity.RelayMessageId
+})
+
+const AcceptMessageRequest = Schema.Struct({
+  ...MessageIdentityRequest.fields,
+  outerEnvelopeDigest: Schema.String,
+  acceptedAt: Schema.String
+})
+
+const UnconfirmMessageRequest = Schema.Struct({
+  ...MessageIdentityRequest.fields,
+  observedAt: Schema.String
+})
+
+const RelayMessageIdRow = Schema.Struct({
+  relay_message_id: Identity.RelayMessageId
+})
+
+const StoredAcceptanceRow = Schema.Struct({
+  outer_envelope_digest: Schema.String,
+  accepted: Schema.NullOr(Schema.String)
+})
+
+const DeliveryChangeInsert = Schema.Struct({
+  replica_incarnation: Identity.ReplicaIncarnation,
+  relay_message_id: Identity.RelayMessageId,
+  change_hash: WriterProvenance.ChangeHash
+})
+
 export interface Endpoint {
   readonly expectedLocal: PeerSyncEnvelope.RelayPeerPrincipal
   readonly remote: PeerSyncEnvelope.RelayPeerPrincipal
@@ -80,7 +133,7 @@ export interface MessageInput extends Endpoint {
   readonly documentId: Identity.DocumentId
   readonly createdAt: string
   readonly retryDeadline: string
-  readonly changeHashes: ReadonlyArray<string>
+  readonly changeHashes: ReadonlyArray<typeof WriterProvenance.ChangeHash.Type>
 }
 
 export interface Event {
@@ -137,7 +190,6 @@ export class CommandDeliveryStore extends Context.Service<CommandDeliveryStore, 
     sequences: ReadonlyArray<number>
   ) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly cursor: Effect.Effect<Cursor, ReplicaError.ReplicaError>
-  readonly advanceRefreshEpoch: Effect.Effect<void, ReplicaError.ReplicaError>
 }>()("@lucas-barake/effect-local-sql/CommandDeliveryStore") {}
 
 export const layer: Layer.Layer<
@@ -279,8 +331,9 @@ export const layer: Layer.Layer<
           readonly unconfirmed: Set<string>
           acceptedAt: DateTime.Utc | undefined
           pendingAt: DateTime.Utc | undefined
-          retryDeadline: DateTime.Utc | undefined
+          pendingRetryDeadline: DateTime.Utc | undefined
           unconfirmedAt: DateTime.Utc | undefined
+          unconfirmedRetryDeadline: DateTime.Utc | undefined
         }>()
         for (const row of rows) {
           const key = endpointKey({
@@ -306,8 +359,9 @@ export const layer: Layer.Layer<
               unconfirmed: new Set(),
               acceptedAt: undefined,
               pendingAt: undefined,
-              retryDeadline: undefined,
-              unconfirmedAt: undefined
+              pendingRetryDeadline: undefined,
+              unconfirmedAt: undefined,
+              unconfirmedRetryDeadline: undefined
             }
             groups.set(key, group)
           }
@@ -326,7 +380,12 @@ export const layer: Layer.Layer<
               row.sender_custody_unconfirmed_at.epochMilliseconds > group.unconfirmedAt.epochMilliseconds
             ) {
               group.unconfirmedAt = row.sender_custody_unconfirmed_at
-              group.retryDeadline = row.retry_deadline
+            }
+            if (
+              group.unconfirmedRetryDeadline === undefined ||
+              row.retry_deadline.epochMilliseconds > group.unconfirmedRetryDeadline.epochMilliseconds
+            ) {
+              group.unconfirmedRetryDeadline = row.retry_deadline
             }
           } else {
             group.pending.add(row.change_hash)
@@ -337,15 +396,15 @@ export const layer: Layer.Layer<
               group.pendingAt = row.created_at
             }
             if (
-              group.retryDeadline === undefined ||
-              row.retry_deadline.epochMilliseconds > group.retryDeadline.epochMilliseconds
+              group.pendingRetryDeadline === undefined ||
+              row.retry_deadline.epochMilliseconds > group.pendingRetryDeadline.epochMilliseconds
             ) {
-              group.retryDeadline = row.retry_deadline
+              group.pendingRetryDeadline = row.retry_deadline
             }
           }
         }
         const localChangeCount = sourceChanges.length
-        const destinations = [...groups.values()].slice(0, 256).map((group): CommandDelivery.Destination => {
+        const destinations = [...groups.values()].map((group): CommandDelivery.Destination => {
           if (group.accepted.size === localChangeCount) {
             return {
               relayPeerId: group.relayPeerId,
@@ -369,7 +428,7 @@ export const layer: Layer.Layer<
                 acceptedChangeCount: group.accepted.size,
                 pendingChangeCount: group.pending.size,
                 firstPendingAt: group.pendingAt!,
-                retryDeadline: group.retryDeadline!
+                retryDeadline: group.pendingRetryDeadline!
               }
             }
           }
@@ -380,7 +439,7 @@ export const layer: Layer.Layer<
               _tag: "RelayCustodyUnconfirmedAtDeadline",
               acceptedChangeCount: group.accepted.size,
               unconfirmedChangeCount: localChangeCount - group.accepted.size,
-              deadline: group.retryDeadline!,
+              deadline: group.unconfirmedRetryDeadline!,
               observedAt: group.unconfirmedAt!
             }
           }
@@ -485,10 +544,7 @@ export const layer: Layer.Layer<
     })
 
     const findStoredMessageChanges = SqlSchema.findAll({
-      Request: Schema.Struct({
-        replicaIncarnation: Identity.ReplicaIncarnation,
-        relayMessageId: Identity.RelayMessageId
-      }),
+      Request: MessageIdentityRequest,
       Result: Schema.Struct({
         change_hash: WriterProvenance.ChangeHash
       }),
@@ -500,18 +556,11 @@ export const layer: Layer.Layer<
         ORDER BY change_hash`
     })
 
-    const recordMessage = (input: MessageInput) =>
-      Effect.gen(function*() {
-        const uniqueChangeHashes = [...new Set(input.changeHashes)].toSorted()
-        if (uniqueChangeHashes.length !== input.changeHashes.length) {
-          return yield* new ReplicaError.ReplicaError({
-            reason: new ReplicaError.StorageCorrupt({
-              cause: new Error("Relay delivery message contains duplicate change hashes")
-            })
-          })
-        }
-        const insertedMessages = yield* sql<{ readonly relay_message_id: string }>`
-        INSERT INTO effect_local_peer_relay_delivery_messages (
+    const insertMessage = SqlSchema.findAll({
+      Request: MessageRequest,
+      Result: RelayMessageIdRow,
+      execute: (input) =>
+        sql`INSERT INTO effect_local_peer_relay_delivery_messages (
           replica_id, replica_incarnation,
           expected_local_tenant_id, expected_local_subject_id, expected_local_peer_id,
           remote_tenant_id, remote_subject_id, remote_peer_id, relay_peer_id,
@@ -528,6 +577,27 @@ export const layer: Layer.Layer<
         )
         ON CONFLICT(replica_incarnation, relay_message_id) DO NOTHING
         RETURNING relay_message_id`
+    })
+
+    const insertMessageChanges = SqlSchema.findAll({
+      Request: Schema.Array(DeliveryChangeInsert),
+      Result: Schema.Struct({ change_hash: WriterProvenance.ChangeHash }),
+      execute: (changes) =>
+        sql`INSERT INTO effect_local_peer_relay_delivery_changes ${sql.insert(changes)}
+        RETURNING change_hash`
+    })
+
+    const recordMessage = (input: MessageInput) =>
+      sql.withTransaction(Effect.gen(function*() {
+        const uniqueChangeHashes = [...new Set(input.changeHashes)].toSorted()
+        if (uniqueChangeHashes.length !== input.changeHashes.length) {
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({
+              cause: new Error("Relay delivery message contains duplicate change hashes")
+            })
+          })
+        }
+        const insertedMessages = yield* insertMessage(input)
         if (insertedMessages.length === 0) {
           const existing = yield* findStoredMessage({
             replicaIncarnation: input.replicaIncarnation,
@@ -573,25 +643,24 @@ export const layer: Layer.Layer<
             })
           })
         }
-        for (const changeHash of uniqueChangeHashes) {
-          const insertedChanges = yield* sql<{ readonly change_hash: string }>`
-          INSERT INTO effect_local_peer_relay_delivery_changes (
-            replica_incarnation, relay_message_id, change_hash
-          ) VALUES (
-            ${input.replicaIncarnation}, ${input.relayMessageId}, ${changeHash}
-          )
-          ON CONFLICT(replica_incarnation, relay_message_id, change_hash) DO NOTHING
-          RETURNING change_hash`
-          if (insertedChanges.length !== 1) {
-            return yield* new ReplicaError.ReplicaError({
-              reason: new ReplicaError.StorageCorrupt({
-                cause: new Error("Duplicate relay delivery change identity")
-              })
+        const changes = uniqueChangeHashes.map((changeHash) => ({
+          replica_incarnation: input.replicaIncarnation,
+          relay_message_id: input.relayMessageId,
+          change_hash: changeHash
+        }))
+        let insertedChangeCount = 0
+        for (let index = 0; index < changes.length; index += 50) {
+          insertedChangeCount += (yield* insertMessageChanges(changes.slice(index, index + 50))).length
+        }
+        if (insertedChangeCount !== uniqueChangeHashes.length) {
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.StorageCorrupt({
+              cause: new Error("Duplicate relay delivery change identity")
             })
-          }
+          })
         }
         yield* insertEvents(input.replicaIncarnation, input.documentId, uniqueChangeHashes)
-      }).pipe(
+      })).pipe(
         Effect.catchTags({
           SqlError: (cause) =>
             new ReplicaError.ReplicaError({
@@ -626,27 +695,46 @@ export const layer: Layer.Layer<
       WHERE message_changes.replica_incarnation = ${replicaIncarnation}
         AND message_changes.relay_message_id = ${relayMessageId}`
 
+    const acceptMessage = SqlSchema.findAll({
+      Request: AcceptMessageRequest,
+      Result: RelayMessageIdRow,
+      execute: (request) =>
+        sql`UPDATE effect_local_peer_relay_delivery_messages
+          SET relay_custody_accepted_at = ${request.acceptedAt}
+          WHERE replica_incarnation = ${request.replicaIncarnation}
+            AND relay_message_id = ${request.relayMessageId}
+            AND outer_envelope_digest = ${request.outerEnvelopeDigest}
+            AND relay_custody_accepted_at IS NULL
+          RETURNING relay_message_id`
+    })
+
+    const findAcceptance = SqlSchema.findAll({
+      Request: MessageIdentityRequest,
+      Result: StoredAcceptanceRow,
+      execute: (request) =>
+        sql`SELECT
+          outer_envelope_digest,
+          relay_custody_accepted_at AS accepted
+        FROM effect_local_peer_relay_delivery_messages
+        WHERE replica_incarnation = ${request.replicaIncarnation}
+          AND relay_message_id = ${request.relayMessageId}`
+    })
+
     const markAccepted = (
       replicaIncarnation: Identity.ReplicaIncarnation,
       relayMessageId: Identity.RelayMessageId,
       outerEnvelopeDigest: string,
       acceptedAt: string
     ) =>
-      Effect.gen(function*() {
-        const rows = yield* sql<{ readonly relay_message_id: string }>`
-        UPDATE effect_local_peer_relay_delivery_messages
-          SET relay_custody_accepted_at = ${acceptedAt}
-          WHERE replica_incarnation = ${replicaIncarnation}
-            AND relay_message_id = ${relayMessageId}
-            AND outer_envelope_digest = ${outerEnvelopeDigest}
-            AND relay_custody_accepted_at IS NULL
-          RETURNING relay_message_id`
+      sql.withTransaction(Effect.gen(function*() {
+        const rows = yield* acceptMessage({
+          replicaIncarnation,
+          relayMessageId,
+          outerEnvelopeDigest,
+          acceptedAt
+        })
         if (rows.length === 0) {
-          const existing = yield* sql<{ readonly outer_envelope_digest: string; readonly accepted: string | null }>`
-            SELECT outer_envelope_digest, relay_custody_accepted_at AS accepted
-            FROM effect_local_peer_relay_delivery_messages
-            WHERE replica_incarnation = ${replicaIncarnation}
-              AND relay_message_id = ${relayMessageId}`
+          const existing = yield* findAcceptance({ replicaIncarnation, relayMessageId })
           if (
             existing.length !== 1 ||
             existing[0]!.outer_envelope_digest !== outerEnvelopeDigest ||
@@ -668,27 +756,43 @@ export const layer: Layer.Layer<
           })
         }
         yield* matchingCommands(replicaIncarnation, relayMessageId)
-      }).pipe(
-        Effect.catchTag("SqlError", (cause) =>
-          new ReplicaError.ReplicaError({
-            reason: new ReplicaError.StorageUnavailable({ cause })
-          }))
+      })).pipe(
+        Effect.catchTags({
+          SqlError: (cause) =>
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause })
+            }),
+          SchemaError: (cause) =>
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+        })
       )
+
+    const unconfirmMessage = SqlSchema.findAll({
+      Request: UnconfirmMessageRequest,
+      Result: RelayMessageIdRow,
+      execute: (request) =>
+        sql`UPDATE effect_local_peer_relay_delivery_messages
+          SET sender_custody_unconfirmed_at = ${request.observedAt}
+          WHERE replica_incarnation = ${request.replicaIncarnation}
+            AND relay_message_id = ${request.relayMessageId}
+            AND relay_custody_accepted_at IS NULL
+            AND sender_custody_unconfirmed_at IS NULL
+          RETURNING relay_message_id`
+    })
 
     const markUnconfirmed = (
       replicaIncarnation: Identity.ReplicaIncarnation,
       relayMessageId: Identity.RelayMessageId,
       observedAt: string
     ) =>
-      Effect.gen(function*() {
-        const rows = yield* sql<{ readonly relay_message_id: string }>`
-        UPDATE effect_local_peer_relay_delivery_messages
-          SET sender_custody_unconfirmed_at = ${observedAt}
-          WHERE replica_incarnation = ${replicaIncarnation}
-            AND relay_message_id = ${relayMessageId}
-            AND relay_custody_accepted_at IS NULL
-            AND sender_custody_unconfirmed_at IS NULL
-          RETURNING relay_message_id`
+      sql.withTransaction(Effect.gen(function*() {
+        const rows = yield* unconfirmMessage({
+          replicaIncarnation,
+          relayMessageId,
+          observedAt
+        })
         if (rows.length > 1) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
@@ -699,11 +803,17 @@ export const layer: Layer.Layer<
         if (rows.length === 1) {
           yield* matchingCommands(replicaIncarnation, relayMessageId)
         }
-      }).pipe(
-        Effect.catchTag("SqlError", (cause) =>
-          new ReplicaError.ReplicaError({
-            reason: new ReplicaError.StorageUnavailable({ cause })
-          }))
+      })).pipe(
+        Effect.catchTags({
+          SqlError: (cause) =>
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause })
+            }),
+          SchemaError: (cause) =>
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+        })
       )
 
     const documentConfirmed = (
@@ -828,16 +938,6 @@ export const layer: Layer.Layer<
       })
     )
 
-    const advanceRefreshEpoch = sql`UPDATE effect_local_command_delivery_control
-      SET refresh_epoch = refresh_epoch + 1
-      WHERE singleton = 1`.pipe(
-      Effect.catchTag("SqlError", (cause) =>
-        new ReplicaError.ReplicaError({
-          reason: new ReplicaError.StorageUnavailable({ cause })
-        })),
-      Effect.asVoid
-    )
-
     return CommandDeliveryStore.of({
       lookup,
       snapshotWithCursor,
@@ -847,8 +947,7 @@ export const layer: Layer.Layer<
       documentConfirmed,
       pendingEvents,
       markEventsPublished,
-      cursor,
-      advanceRefreshEpoch
+      cursor
     })
   })
 )

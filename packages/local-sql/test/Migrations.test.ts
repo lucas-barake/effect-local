@@ -411,6 +411,317 @@ describe("Migrations", () => {
       ])
     }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
 
+  it.effect("upgrades populated relay custody state without changing storage format", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrator.make({})({
+        loader: Effect.map(Migrations.loader, (migrations) => migrations.slice(0, 10)),
+        table: "effect_local_migrations"
+      })
+      yield* sql`INSERT INTO effect_local_metadata (
+        singleton, storage_format_version, replica_id, replica_incarnation,
+        writer_generation, definition_hash, commit_sequence
+      ) VALUES (
+        1, 1, 'rep_00000000-0000-4000-8000-000000000001', 3,
+        7, 'definition-1', 11
+      )`
+      yield* sql`INSERT INTO effect_local_documents (
+        document_id, document_type, schema_version, observed_versions, materialized_heads,
+        accepted_heads, tombstone, projection_status
+      ) VALUES (
+        'doc_00000000-0000-4000-8000-000000000001',
+        'Task',
+        1,
+        '[]',
+        '[]',
+        '[]',
+        0,
+        'Ready'
+      )`
+
+      const pendingPayload = Uint8Array.of(1, 2, 3)
+      const inFlightPayload = Uint8Array.of(4, 5, 6, 7)
+      yield* sql`INSERT INTO effect_local_peer_relay_outbox (
+        row_id, replica_id, replica_incarnation, writer_generation,
+        expected_local_tenant_id, expected_local_subject_id, expected_local_peer_id,
+        remote_tenant_id, remote_subject_id, remote_peer_id, relay_peer_id,
+        relay_message_id, outer_envelope_digest, protocol_version, payload_version,
+        sender_connection_epoch, sender_sequence, document_id, document_type,
+        writer_provenance, message_hash, payload, encoded_size, created_at,
+        retry_deadline, next_attempt_at, custody_state
+      ) VALUES
+        (
+          41, 'rep_00000000-0000-4000-8000-000000000001', 3, 7,
+          'tenant-1', 'local-subject', 'local-peer',
+          'tenant-1', 'remote-subject-1', 'remote-peer-1', 'relay-peer-1',
+          'relay-message-1', ${"a".repeat(64)}, 1, 1,
+          'sender-epoch-1', 101,
+          'doc_00000000-0000-4000-8000-000000000001', 'Task',
+          '[{"changeHash":"change-1"}]', ${"b".repeat(64)},
+          ${pendingPayload}, ${pendingPayload.byteLength},
+          '2026-01-01T00:00:00.000Z', '2026-01-08T00:00:00.000Z',
+          '2026-01-02T00:00:00.000Z', 'Pending'
+        ),
+        (
+          42, 'rep_00000000-0000-4000-8000-000000000001', 3, 8,
+          'tenant-1', 'local-subject', 'local-peer',
+          'tenant-1', 'remote-subject-2', 'remote-peer-2', 'relay-peer-2',
+          'relay-message-2', ${"c".repeat(64)}, 1, 1,
+          'sender-epoch-2', 102,
+          'doc_00000000-0000-4000-8000-000000000001', 'Task',
+          '[{"changeHash":"change-2"}]', ${"d".repeat(64)},
+          ${inFlightPayload}, ${inFlightPayload.byteLength},
+          '2026-02-01T00:00:00.000Z', '2026-02-08T00:00:00.000Z',
+          '2026-02-02T00:00:00.000Z', 'InFlight'
+        )`
+      yield* sql`INSERT INTO effect_local_peer_relay_outbox_remote_usage (
+        replica_incarnation, remote_tenant_id, remote_subject_id, remote_peer_id,
+        message_count, encoded_bytes
+      ) VALUES
+        (3, 'tenant-1', 'remote-subject-1', 'remote-peer-1', 1, ${pendingPayload.byteLength}),
+        (3, 'tenant-1', 'remote-subject-2', 'remote-peer-2', 1, ${inFlightPayload.byteLength})`
+      yield* sql`INSERT INTO effect_local_peer_relay_outbox_replica_usage (
+        replica_incarnation, message_count, encoded_bytes
+      ) VALUES (3, 2, ${pendingPayload.byteLength + inFlightPayload.byteLength})`
+
+      const selectDurableOutbox = sql<{
+        readonly created_at: string
+        readonly document_id: string
+        readonly document_type: string
+        readonly encoded_size: number
+        readonly expected_local_peer_id: string
+        readonly expected_local_subject_id: string
+        readonly expected_local_tenant_id: string
+        readonly message_hash: string
+        readonly next_attempt_at: string
+        readonly outer_envelope_digest: string
+        readonly payload_hex: string
+        readonly payload_version: number
+        readonly protocol_version: number
+        readonly relay_message_id: string
+        readonly relay_peer_id: string
+        readonly remote_peer_id: string
+        readonly remote_subject_id: string
+        readonly remote_tenant_id: string
+        readonly replica_id: string
+        readonly replica_incarnation: number
+        readonly retry_deadline: string
+        readonly row_id: number
+        readonly sender_connection_epoch: string
+        readonly sender_sequence: number
+        readonly writer_generation: number
+        readonly writer_provenance: string
+      }>`SELECT
+        row_id, replica_id, replica_incarnation, writer_generation,
+        expected_local_tenant_id, expected_local_subject_id, expected_local_peer_id,
+        remote_tenant_id, remote_subject_id, remote_peer_id, relay_peer_id,
+        relay_message_id, outer_envelope_digest, protocol_version, payload_version,
+        sender_connection_epoch, sender_sequence, document_id, document_type,
+        writer_provenance, message_hash, hex(payload) AS payload_hex, encoded_size,
+        created_at, retry_deadline, next_attempt_at
+      FROM effect_local_peer_relay_outbox
+      ORDER BY row_id`
+      const outboxBefore = yield* selectDurableOutbox
+      const remoteUsageBefore = yield* sql`SELECT *
+        FROM effect_local_peer_relay_outbox_remote_usage
+        ORDER BY remote_subject_id`
+      const replicaUsageBefore = yield* sql`SELECT *
+        FROM effect_local_peer_relay_outbox_replica_usage
+        ORDER BY replica_incarnation`
+
+      assert.deepStrictEqual(yield* Migrations.run, [[11, "command_delivery"]])
+      assert.deepStrictEqual(yield* selectDurableOutbox, outboxBefore)
+      assert.deepStrictEqual(
+        yield* sql`SELECT *
+          FROM effect_local_peer_relay_outbox_remote_usage
+          ORDER BY remote_subject_id`,
+        remoteUsageBefore
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT *
+          FROM effect_local_peer_relay_outbox_replica_usage
+          ORDER BY replica_incarnation`,
+        replicaUsageBefore
+      )
+
+      const outboxColumns = yield* sql<{ readonly name: string }>`
+        SELECT name FROM pragma_table_info('effect_local_peer_relay_outbox')
+      `
+      assert.isFalse(outboxColumns.some((column) => column.name === "custody_state"))
+      assert.deepStrictEqual(
+        yield* sql`SELECT storage_format_version FROM effect_local_metadata WHERE singleton = 1`,
+        [{ storage_format_version: 1 }]
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT migration_id, name
+          FROM effect_local_migrations
+          ORDER BY migration_id`,
+        [
+          { migration_id: 1, name: "canonical_store" },
+          { migration_id: 2, name: "peer_sync" },
+          { migration_id: 3, name: "durability_indexes" },
+          { migration_id: 4, name: "projection_readiness" },
+          { migration_id: 5, name: "pending_receipt_indexes" },
+          { migration_id: 6, name: "peer_writer_provenance" },
+          { migration_id: 7, name: "replica_health_indexes" },
+          { migration_id: 8, name: "document_lineage" },
+          { migration_id: 9, name: "history_rewrite_markers" },
+          { migration_id: 10, name: "peer_relay_state" },
+          { migration_id: 11, name: "command_delivery" }
+        ]
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT migration_id, name, checksum
+          FROM effect_local_migration_catalog
+          WHERE migration_id = 11`,
+        [{
+          migration_id: 11,
+          name: "command_delivery",
+          checksum: Migrations.commandDeliveryChecksum
+        }]
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT name FROM sqlite_master
+          WHERE type = 'index'
+            AND name IN (
+              'effect_local_peer_relay_outbox_due_endpoint',
+              'effect_local_peer_relay_outbox_retry_deadline'
+            )
+          ORDER BY name`,
+        [
+          { name: "effect_local_peer_relay_outbox_due_endpoint" },
+          { name: "effect_local_peer_relay_outbox_retry_deadline" }
+        ]
+      )
+    }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
+
+  it.effect("rolls back migration eleven when relay outbox copy fails", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrator.make({})({
+        loader: Effect.map(Migrations.loader, (migrations) => migrations.slice(0, 10)),
+        table: "effect_local_migrations"
+      })
+      yield* sql`INSERT INTO effect_local_metadata (
+        singleton, storage_format_version, replica_id, replica_incarnation,
+        writer_generation, definition_hash, commit_sequence
+      ) VALUES (
+        1, 1, 'rep_00000000-0000-4000-8000-000000000001', 0,
+        1, 'definition-1', 0
+      )`
+      yield* sql`INSERT INTO effect_local_documents (
+        document_id, document_type, schema_version, observed_versions, materialized_heads,
+        accepted_heads, tombstone, projection_status
+      ) VALUES (
+        'doc_00000000-0000-4000-8000-000000000001',
+        'Task',
+        1,
+        '[]',
+        '[]',
+        '[]',
+        0,
+        'Ready'
+      )`
+
+      const payload = Uint8Array.of(1, 2, 3)
+      yield* sql`PRAGMA ignore_check_constraints = ON`
+      yield* sql`INSERT INTO effect_local_peer_relay_outbox (
+        replica_id, replica_incarnation, writer_generation,
+        expected_local_tenant_id, expected_local_subject_id, expected_local_peer_id,
+        remote_tenant_id, remote_subject_id, remote_peer_id, relay_peer_id,
+        relay_message_id, outer_envelope_digest, protocol_version, payload_version,
+        sender_connection_epoch, sender_sequence, document_id, document_type,
+        writer_provenance, message_hash, payload, encoded_size, created_at,
+        retry_deadline, next_attempt_at, custody_state
+      ) VALUES (
+        'rep_00000000-0000-4000-8000-000000000001', 0, 1,
+        'tenant-local', 'local-subject', 'local-peer',
+        'tenant-remote', 'remote-subject', 'remote-peer', 'relay-peer',
+        'relay-message-1', ${"a".repeat(64)}, 1, 1,
+        'sender-epoch-1', 1,
+        'doc_00000000-0000-4000-8000-000000000001', 'Task',
+        '[]', ${"b".repeat(64)}, ${payload}, ${payload.byteLength},
+        '2026-01-01T00:00:00.000Z', '2026-01-08T00:00:00.000Z',
+        '2026-01-02T00:00:00.000Z', 'InFlight'
+      )`
+      yield* sql`PRAGMA ignore_check_constraints = OFF`
+
+      const outboxBefore = yield* sql`SELECT
+        row_id, replica_id, replica_incarnation, writer_generation,
+        expected_local_tenant_id, expected_local_subject_id, expected_local_peer_id,
+        remote_tenant_id, remote_subject_id, remote_peer_id, relay_peer_id,
+        relay_message_id, outer_envelope_digest, protocol_version, payload_version,
+        sender_connection_epoch, sender_sequence, document_id, document_type,
+        writer_provenance, message_hash, hex(payload) AS payload_hex, encoded_size,
+        created_at, retry_deadline, next_attempt_at, custody_state
+      FROM effect_local_peer_relay_outbox`
+      const indexesBefore = yield* sql`SELECT name, sql
+        FROM sqlite_master
+        WHERE type = 'index'
+          AND tbl_name = 'effect_local_peer_relay_outbox'
+        ORDER BY name`
+      const catalogBefore = yield* sql`SELECT migration_id, name, checksum
+        FROM effect_local_migration_catalog
+        ORDER BY migration_id`
+      const historyBefore = yield* sql`SELECT migration_id, name
+        FROM effect_local_migrations
+        ORDER BY migration_id`
+
+      assert.strictEqual((yield* Effect.exit(Migrations.run))._tag, "Failure")
+
+      const outboxColumns = yield* sql<{ readonly name: string }>`
+        SELECT name FROM pragma_table_info('effect_local_peer_relay_outbox')
+      `
+      assert.isTrue(outboxColumns.some((column) => column.name === "custody_state"))
+      assert.deepStrictEqual(
+        yield* sql`SELECT
+          row_id, replica_id, replica_incarnation, writer_generation,
+          expected_local_tenant_id, expected_local_subject_id, expected_local_peer_id,
+          remote_tenant_id, remote_subject_id, remote_peer_id, relay_peer_id,
+          relay_message_id, outer_envelope_digest, protocol_version, payload_version,
+          sender_connection_epoch, sender_sequence, document_id, document_type,
+          writer_provenance, message_hash, hex(payload) AS payload_hex, encoded_size,
+          created_at, retry_deadline, next_attempt_at, custody_state
+        FROM effect_local_peer_relay_outbox`,
+        outboxBefore
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT name, sql
+          FROM sqlite_master
+          WHERE type = 'index'
+            AND tbl_name = 'effect_local_peer_relay_outbox'
+          ORDER BY name`,
+        indexesBefore
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT migration_id, name, checksum
+          FROM effect_local_migration_catalog
+          ORDER BY migration_id`,
+        catalogBefore
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT migration_id, name
+          FROM effect_local_migrations
+          ORDER BY migration_id`,
+        historyBefore
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT storage_format_version FROM effect_local_metadata WHERE singleton = 1`,
+        [{ storage_format_version: 1 }]
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT name FROM sqlite_master
+          WHERE type = 'table'
+            AND (
+              name = 'effect_local_peer_relay_outbox_v11'
+              OR name LIKE 'effect_local_command_delivery_%'
+              OR name LIKE 'effect_local_peer_relay_delivery_%'
+            )
+          ORDER BY name`,
+        []
+      )
+    }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
+
   it.effect("enforces relay identity, payload, and usage invariants", () =>
     Effect.gen(function*() {
       yield* Migrations.run

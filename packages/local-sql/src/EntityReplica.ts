@@ -8,6 +8,7 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
 import * as RcMap from "effect/RcMap"
 import * as Schema from "effect/Schema"
@@ -244,11 +245,15 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         status: health.status,
         exportBackup: backups.export,
         restoreBackup: (options) =>
-          backups.restore(options).pipe(
-            Effect.ensuring(Effect.all([
-              publisher.invalidate(ReplicaDefinition.invalidationKeys(definition)),
-              deliveryPublisher.refresh.pipe(Effect.catch(() => Effect.void))
-            ], { discard: true }))
+          Effect.uninterruptibleMask((interruptible) =>
+            Effect.gen(function*() {
+              const restored = yield* Effect.exit(interruptible(backups.restore(options)))
+              const refreshed = yield* Effect.exit(Effect.all([
+                publisher.invalidate(ReplicaDefinition.invalidationKeys(definition)),
+                deliveryPublisher.refresh
+              ], { discard: true }))
+              return yield* Exit.asVoidAll([restored, refreshed])
+            })
           ),
         exportDocument: (document, documentId) =>
           withPermit(() =>

@@ -795,9 +795,6 @@ const commandDeliveryMigration = Effect.gen(function*() {
     )`
   yield* sql`CREATE INDEX effect_local_peer_relay_outbox_retry_deadline
     ON effect_local_peer_relay_outbox(replica_id, replica_incarnation, retry_deadline, row_id)`
-  yield* sql`UPDATE effect_local_metadata
-    SET storage_format_version = 2
-    WHERE singleton = 1 AND storage_format_version = 1`
   yield* sql`INSERT INTO effect_local_migration_catalog (migration_id, name, checksum)
     VALUES (11, 'command_delivery', ${commandDeliveryChecksum})`
 })

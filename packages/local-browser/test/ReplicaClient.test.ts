@@ -240,6 +240,69 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.strictEqual(observed[0]?._tag, "UnknownCommand")
     })).pipe(Effect.provide(Owner)))
 
+  it.effect("rejects negative delivery cursors at the RPC boundary", () =>
+    Effect.gen(function*() {
+      const delivery = yield* Effect.exit(
+        Schema.decodeUnknownEffect(ReplicaRpc.InvalidationMessage)({
+          _tag: "DeliveryInvalidation",
+          ownerEpoch: "owner",
+          sequence: -1,
+          keys: []
+        })
+      )
+      const ready = yield* Effect.exit(
+        Schema.decodeUnknownEffect(ReplicaRpc.InvalidationMessage)({
+          _tag: "InvalidationsReady",
+          ownerEpoch: "owner",
+          watermark: 0,
+          refreshGeneration: 0,
+          deliveryWatermark: -1,
+          deliveryRefreshEpoch: -1
+        })
+      )
+      assert.strictEqual(delivery._tag, "Failure")
+      assert.strictEqual(ready._tag, "Failure")
+    }))
+
+  it.effect("retries a command delivery stream after transient ownership transport loss", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const transportFailed = yield* Deferred.make<void>()
+      let subscriptions = 0
+      const reconnecting = new Proxy(rpc, {
+        get(target, property, receiver) {
+          if (property !== "CommandDeliveryChanges") return Reflect.get(target, property, receiver)
+          return (payload: never) =>
+            Stream.unwrap(Effect.sync(() => {
+              subscriptions++
+              return subscriptions === 1
+                ? Stream.fromEffect(
+                  Deferred.succeed(transportFailed, undefined).pipe(
+                    Effect.andThen(Effect.fail(
+                      new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.StorageUnavailable({
+                          cause: transientDisconnected()
+                        })
+                      })
+                    ))
+                  )
+                )
+                : target.CommandDeliveryChanges(payload).pipe(Stream.take(1))
+            }))
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, reconnecting)
+      const commandId = yield* Identity.makeCommandId
+      const completed = yield* client.commandDeliveryChanges(commandId).pipe(
+        Stream.runDrain,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Deferred.await(transportFailed)
+      yield* TestClock.adjust("1 second")
+      yield* Fiber.join(completed)
+      assert.strictEqual(subscriptions, 2)
+    })).pipe(Effect.provide(Owner)))
+
   it.effect("round trips tagged query errors through the wire", () => {
     const rejected: Replica.Replica["Service"] = {
       ...replica,

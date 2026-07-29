@@ -2,7 +2,6 @@ import * as Schema from "effect/Schema"
 import * as Identity from "./Identity.js"
 
 const Count = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
-const Destinations = <A extends Schema.Top,>(schema: A) => Schema.Array(schema).check(Schema.isMaxLength(256))
 
 export const PendingRelayCustody = Schema.TaggedStruct("PendingRelayCustody", {
   acceptedChangeCount: Count,
@@ -65,7 +64,7 @@ export const TrackedCommand = Schema.TaggedStruct("TrackedCommand", {
   commandId: Identity.CommandId,
   documentId: Identity.DocumentId,
   localChangeCount: Count,
-  destinations: Destinations(Destination)
+  destinations: Schema.Array(Destination)
 })
 export type TrackedCommand = typeof TrackedCommand.Type
 

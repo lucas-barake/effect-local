@@ -102,6 +102,7 @@ const makeRelayClient = (
   }) as never
 
 const relayEntry = (payload: Uint8Array): PeerRelayOutbox.Entry => ({
+  _tag: "PendingRelayCustody",
   rowId: 1,
   replicaId,
   replicaIncarnation: senderReplicaIncarnation,

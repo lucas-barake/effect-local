@@ -118,7 +118,9 @@ export const layerWithSyncAndLimits = <
   )
   const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
   const deliveryStore = CommandDeliveryStore.layer.pipe(Layer.provideMerge(gate))
-  const deliveryPublisher = CommandDeliveryPublisher.layer.pipe(Layer.provideMerge(deliveryStore))
+  const deliveryPublisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
+    Layer.provideMerge(deliveryStore)
+  )
   const backups = BackupStore.layer(definition).pipe(
     Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
   )

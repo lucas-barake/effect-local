@@ -9,6 +9,7 @@ import type * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import type { ConfigError } from "effect/Config"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
@@ -157,11 +158,15 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
         status: health.status,
         exportBackup: backups.export,
         restoreBackup: (options) =>
-          backups.restore(options).pipe(
-            Effect.ensuring(Effect.all([
-              publisher.invalidate(ReplicaDefinition.invalidationKeys(definition)),
-              deliveryPublisher.refresh.pipe(Effect.catch(() => Effect.void))
-            ], { discard: true }))
+          Effect.uninterruptibleMask((interruptible) =>
+            Effect.gen(function*() {
+              const restored = yield* Effect.exit(interruptible(backups.restore(options)))
+              const refreshed = yield* Effect.exit(Effect.all([
+                publisher.invalidate(ReplicaDefinition.invalidationKeys(definition)),
+                deliveryPublisher.refresh
+              ], { discard: true }))
+              return yield* Exit.asVoidAll([restored, refreshed])
+            })
           ),
         exportDocument: (document, documentId) =>
           withPermit(() =>
@@ -225,7 +230,9 @@ const makeBase = <
   )
   const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
   const deliveryStore = CommandDeliveryStore.layer.pipe(Layer.provideMerge(gate))
-  const deliveryPublisher = CommandDeliveryPublisher.layer.pipe(Layer.provideMerge(deliveryStore))
+  const deliveryPublisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
+    Layer.provideMerge(deliveryStore)
+  )
   const backups = BackupStore.layer(definition).pipe(
     Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
   )
