@@ -62,11 +62,22 @@ use a new version or protocol name.
 
 ## Projections
 
-Projection tables are derived state. When a projection's version, row schema, or table changes, the registry entry is
-reconciled at startup: stale rows are cleared, the entry is marked `Rebuilding`, and `ReplicaEvolution` re-projects
-every document of that type from verified canonical snapshots before marking the projection `Ready`. A projection
-added over existing documents rebuilds the same way. Queries that depend on a projection are blocked until it is
-`Ready`, so readers never observe a partially rebuilt table.
+Projection tables are derived state. A projection's name, row schema, and version are part of
+`ReplicaDefinition.hash`, so changing any of them changes the hash. The supported upgrade path is startup
+reconciliation, not an online swap: there is no shadow table, no concurrent old and new table, and no atomic
+publish while readers hold the replica.
+
+When a projection's version, row schema, or table changes, the registry entry is reconciled while the Layer
+graph builds: stale rows are cleared, the entry is marked `Rebuilding`, and `ReplicaEvolution` re-projects
+every document of that type from verified canonical snapshots before marking the projection `Ready`. A
+projection added over existing documents rebuilds the same way. Because the rebuild completes before the
+replica serves requests, and queries that depend on the projection are blocked until it is `Ready`, readers
+never observe a partially rebuilt table.
+
+A projection-only change passes the bootstrap compatibility check whenever every stored document version is
+already current, so the stored hash is updated and the replica opens after the rebuild. Peer sync, browser
+sessions, and restore still require an exact hash match: every replica and every restore archive must run the
+same build before they exchange data.
 
 Query results are schema decoded. A query deployment must accept the active projection version and return its declared
 success schema. Projection and query rollout should therefore happen in one application shell deployment.
