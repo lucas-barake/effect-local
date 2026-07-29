@@ -1,4 +1,4 @@
-import { useAtomMount, useAtomSet } from "@effect/atom-react"
+import { useAtomMount, useAtomSet, useAtomValue } from "@effect/atom-react"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import { useEffect } from "react"
 import * as Device from "./device.ts"
@@ -24,6 +24,7 @@ declare global {
 
 export const App = () => {
   useAtomMount(Device.sessionAtom)
+  const connectionStatus = useAtomValue(Device.peerConnectionStatus)
 
   const createTask = useAtomSet(Device.createTask, { mode: "promise" })
   const adoptTask = useAtomSet(Device.syncDocument)
@@ -45,6 +46,12 @@ export const App = () => {
     }
     document.body.dataset.ready = "true"
   }, [createTask, adoptTask, addLabel, readTask, exportBackup, restoreBackup, push])
+
+  useEffect(() => {
+    document.body.dataset.connectionStatus = connectionStatus._tag === "Success"
+      ? connectionStatus.value._tag
+      : connectionStatus._tag
+  }, [connectionStatus])
 
   return null
 }

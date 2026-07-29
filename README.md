@@ -832,6 +832,12 @@ including command receipt lookups. Restore uses one end to end deadline across t
 invalidation, and backup export streams are intentionally unbounded. The owner side session lease is 60 seconds
 (`SessionManager.leaseDurationMillis`) and the client renews it automatically.
 
+Each mounted remote peer connection Atom holds one global queued RPC admission, one stream permit, and one in
+flight permit for its session. Size `maxStreamsPerSession` for the invalidation stream, an optional replica
+status stream, and all mounted peer status streams. Size `maxInFlightPerSession` for those streams plus the
+unary operations that must run concurrently. Size `maxQueuedRpc` for all active unary and stream RPCs across
+sessions. Backup restore uses the separate `maxRestoresPerSession` and `maxActiveRestores` limits.
+
 The SharedWorker entry delegates to the coordinator:
 
 ```ts
@@ -883,10 +889,13 @@ import { Atom } from "effect/unstable/reactivity"
 import { ListTasks, RenameTask, TaskDocument, TaskList } from "./domain.js"
 import { runtime } from "./replica-client.js"
 
+declare const serverPeerId: Identity.PeerId
+
 export const tasks = ReplicaAtom.queryFamily(runtime, ListTasks)
 export const task = ReplicaAtom.documentFamily(runtime, TaskDocument)
 export const renameTask = ReplicaAtom.mutation(runtime, RenameTask)
 export const replicaStatus = ReplicaAtom.status(runtime)
+export const serverConnection = ReplicaAtom.peerConnectionStatus(runtime, serverPeerId)
 
 const allTasks = tasks({ search: "" })
 ```
@@ -896,6 +905,8 @@ const allTasks = tasks({ search: "" })
 - `documentFamily(runtime, document)` invalidates on the document key.
 - `mutation(runtime, mutation)` is a `runtime.fn` that invalidates the mutation's document key.
 - `status(runtime)` wraps the status stream and resubscribes only after a session replacement.
+- `peerConnectionStatus(runtime, peerId)` reports the actual peer session as `Disconnected`, `Connecting`, or
+  `Connected`. It does not read `navigator.onLine`.
 
 For commands with custom invalidation needs, use `runtime.fn` directly with `reactivityKeys`:
 
@@ -1052,6 +1063,43 @@ The session exposes `peerId`, `connectionEpoch`, `markDirty`, `flush`, `observed
 `durableConfirmation(documentId)`. `observedByPeer` reports Automerge sync state only: the peer has all current
 local changes. It does not prove remote storage durability, which is why `durableConfirmation` currently
 returns only `false`.
+
+Connection status is a separate, per peer current state:
+
+```ts
+import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as Stream from "effect/Stream"
+
+const observeServer = PeerConnectionStatus.PeerConnectionStatus.pipe(
+  Effect.flatMap((connections) =>
+    Stream.runForEach(connections.status(serverPeerId), (status) => Effect.logInfo(status._tag))
+  )
+)
+```
+
+The standard `SqlReplica` Layers provide `PeerConnectionStatus` and its internal `Reporter`. This works in
+Node, Expo, React Native, and other runtimes without DOM APIs. A custom runtime that constructs
+`PeerSession` directly must call `PeerConnectionStatus.layer()` once for that replica graph and provide the
+returned Layer to both the session and its observers.
+
+The states have deliberately narrow meanings:
+
+- `Disconnected` means no live session attempt exists for that peer.
+- `Connecting` begins before `PeerTransport.connect`.
+- `Connected` means the expected transport peer is validated, `PeerSync.open` succeeded, and receive
+  supervision is live. It does not mean caught up, fully flushed, or durably stored by the peer.
+- A terminal receive, send, protocol, or scoped cleanup transition reports `Disconnected` before transport
+  cleanup can block.
+
+Overlapping sessions aggregate by peer. Any live connected attempt keeps the peer `Connected`. Otherwise any
+opening attempt keeps it `Connecting`. Releasing the last attempt returns it to `Disconnected`. A new
+`PeerSession` scope is a new connection epoch. The status service never schedules reconnects.
+
+Browser pages receive the same service through the owner RPC connection, and
+`ReplicaAtom.peerConnectionStatus(runtime, peerId)` is a read only Atom over it. Losing the page to owner RPC
+connection fails that observation with `StorageUnavailable`. It does not invent a peer `Disconnected` value.
+`navigator.onLine` only describes a browser hint. Replica health, synchronization progress, and peer
+connectivity remain separate signals.
 
 Semantics to build on:
 
@@ -1529,6 +1577,8 @@ rest are advanced assembly for custom runtimes.
   `service` and `layer`.
 - `PeerSession`: `make`, `makeSupervised`, `makeLive`, `makeTestClient`; types `SelectedDocument`, `PeerSession`,
   `SupervisedPeerSession`. See [Peer synchronization](#peer-synchronization).
+- `PeerConnectionStatus`: `layer`, `Disconnected`, `Connecting`, `Connected`, `Status`, the read only
+  `PeerConnectionStatus` service, and the session lifecycle `Reporter`.
 - `ReplicaWorkflow`: `CompactionWorkflow`, `HistoryRewriteWorkflow`, `CompactReplica`, `RewriteDocumentHistory`,
   `OperationId`, `layerRegistration`, `layerRuntime`, `layerHistoryRewriteRegistration`,
   `layerHistoryRewriteRuntime`; types `Execution`, `DocumentExecution`.
@@ -1559,7 +1609,8 @@ and `Presence`.
 - `OwnershipCoordinator`: `layerTab`, `layerSharedWorker`, `runSharedWorker`, `runDatabaseWorker`; the
   `OwnershipCoordinator` service; types `SharedWorkerOptions`, `TabOptions`, `DatabaseWorkerOptions`,
   `EngineServices`.
-- `ReplicaAtom`: `documentFamily`, `queryFamily`, `mutation`, `status`, `layerReactivity`. See
+- `ReplicaAtom`: `documentFamily`, `queryFamily`, `mutation`, `status`, `peerConnectionStatus`,
+  `layerReactivity`. See
   [Reactive state](#reactive-state).
 - `Presence`: `make`; types `Presence`, `Entry`.
 - `PeerSession`: compatibility reexport of the SQL package session API. New code should import

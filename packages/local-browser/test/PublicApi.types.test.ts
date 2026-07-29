@@ -1,5 +1,6 @@
 import type * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { assert, describe, it } from "@effect/vitest"
+import type * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Crypto from "effect/Crypto"
@@ -16,7 +17,7 @@ import { definition } from "./fixtures.js"
 describe("public browser API types", () => {
   it("keeps worker creation as a layer requirement", () => {
     const layer: Layer.Layer<
-      Replica.Replica,
+      Replica.Replica | PeerConnectionStatus.PeerConnectionStatus,
       ReplicaError.ReplicaError | WorkerError.WorkerError,
       Crypto.Crypto | Worker.WorkerPlatform | Worker.Spawner
     > = BrowserReplica.layer(definition)

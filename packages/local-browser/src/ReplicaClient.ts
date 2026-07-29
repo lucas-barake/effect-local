@@ -1,3 +1,4 @@
+import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as Backup from "@lucas-barake/effect-local/Backup"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -36,6 +37,7 @@ export class ReplicaClient extends Context.Service<
   Replica.Replica["Service"] & {
     readonly ownerEpoch: string
     readonly invalidations: Stream.Stream<ReplicaRpc.Invalidation, ReplicaError.ReplicaError>
+    readonly peerConnectionStatus?: PeerConnectionStatus.PeerConnectionStatus["Service"] | undefined
   }
 >()(
   "@lucas-barake/effect-local-browser/ReplicaClient"
@@ -1274,6 +1276,24 @@ export const fromRpcClient = (
             })
           ))
       ),
+      peerConnectionStatus: PeerConnectionStatus.PeerConnectionStatus.of({
+        status: (peerId) =>
+          withSessionStream((session) =>
+            rpc.PeerConnectionStatus({
+              sessionId: session.sessionId,
+              peerId
+            })
+          ).pipe(
+            Stream.catchTag("RpcClientError", (error) =>
+              Stream.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause: error
+                  })
+                })
+              ))
+          )
+      }),
       status: Stream.unwrap(
         Effect.gen(function*() {
           const emitted = yield* Ref.make(false)

@@ -24,6 +24,7 @@ import * as DocumentStore from "./DocumentStore.js"
 import * as DurableRuntime from "./DurableRuntime.js"
 import * as EntityReplica from "./EntityReplica.js"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as PeerConnectionStatus from "./PeerConnectionStatus.js"
 import type * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
 import type * as PeerSync from "./PeerSync.js"
 import * as ProjectionStore from "./ProjectionStore.js"
@@ -207,7 +208,7 @@ const makeBase = <
   )
   const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
   const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
-  return { backups, compaction }
+  return { backups, compaction, connections: PeerConnectionStatus.layer() }
 }
 
 export const layer = <D extends ReplicaDefinition.Any, const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
@@ -215,6 +216,8 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
 ): Layer.Layer<
   | CommitPublisher.CommitPublisher
+  | PeerConnectionStatus.PeerConnectionStatus
+  | PeerConnectionStatus.Reporter
   | PeerSync.PeerSync
   | Replica.Replica
   | ReplicaEvolution.ReplicaEvolution
@@ -230,11 +233,14 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   | Crypto.Crypto
   | SqlClient.SqlClient
 > => {
-  const { backups, compaction } = makeBase(definition, options)
+  const { backups, compaction, connections } = makeBase(definition, options)
   const durable = DurableRuntime.layer(definition).pipe(
     Layer.provideMerge(Layer.merge(backups, compaction))
   )
-  return EntityReplica.layer(definition).pipe(Layer.provideMerge(durable))
+  return Layer.merge(
+    EntityReplica.layer(definition).pipe(Layer.provideMerge(durable)),
+    connections
+  )
 }
 
 export const layerRelay = <
@@ -245,6 +251,8 @@ export const layerRelay = <
   options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
 ): Layer.Layer<
   | CommitPublisher.CommitPublisher
+  | PeerConnectionStatus.PeerConnectionStatus
+  | PeerConnectionStatus.Reporter
   | PeerSync.PeerSync
   | Replica.Replica
   | ReplicaEvolution.ReplicaEvolution
@@ -261,11 +269,14 @@ export const layerRelay = <
   | Crypto.Crypto
   | SqlClient.SqlClient
 > => {
-  const { backups, compaction } = makeBase(definition, options)
+  const { backups, compaction, connections } = makeBase(definition, options)
   const durable = DurableRuntime.layerRelay(definition).pipe(
     Layer.provideMerge(Layer.merge(backups, compaction))
   )
-  return EntityReplica.layer(definition).pipe(Layer.provideMerge(durable))
+  return Layer.merge(
+    EntityReplica.layer(definition).pipe(Layer.provideMerge(durable)),
+    connections
+  )
 }
 
 /**

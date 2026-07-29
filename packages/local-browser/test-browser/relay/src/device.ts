@@ -1,6 +1,7 @@
 import * as BrowserCrypto from "@effect/platform-browser/BrowserCrypto"
 import * as BrowserSocket from "@effect/platform-browser/BrowserSocket"
 import * as BrowserSqlite from "@lucas-barake/effect-local-browser/BrowserSqlite"
+import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
 import * as PeerAuthentication from "@lucas-barake/effect-local-rpc/PeerAuthentication"
 import * as PeerCredentials from "@lucas-barake/effect-local-rpc/PeerCredentials"
 import * as PeerRpc from "@lucas-barake/effect-local-rpc/PeerRpc"
@@ -58,6 +59,8 @@ const ReplicaLive = SqlReplica.layerRelayWithBindings(definition, { projections:
 const DeviceLive = PeerRelayClientRuntime.layerSql.pipe(Layer.provideMerge(ReplicaLive), Layer.orDie)
 
 const runtime = Atom.runtime(DeviceLive)
+
+export const peerConnectionStatus = ReplicaAtom.peerConnectionStatus(runtime, remote.principal.peerId)
 
 /**
  * The documents this device syncs with its peer, as a stable key.

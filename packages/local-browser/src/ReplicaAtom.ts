@@ -1,3 +1,4 @@
+import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Document from "@lucas-barake/effect-local/Document"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
@@ -113,6 +114,25 @@ export const status = <R, E,>(runtime: Atom.AtomRuntime<Replica.Replica | R, E>)
           // goes terminal, so resubscribing lands on the new owner after a takeover or a lease
           // expiry instead of stranding the tab on the old owner's terminal mismatch. Any other
           // protocol mismatch stays terminal: it means deployment skew, and the tab must reload.
+          Schedule.while(({ input }) =>
+            input.reason._tag === "ProtocolMismatch" && input.reason.expected === "active session"
+          )
+        )
+      )
+    )
+  )
+
+export const peerConnectionStatus = <R, E,>(
+  runtime: Atom.AtomRuntime<PeerConnectionStatus.PeerConnectionStatus | R, E>,
+  peerId: Identity.PeerId
+) =>
+  runtime.atom(
+    PeerConnectionStatus.PeerConnectionStatus.pipe(
+      Effect.map((service) => service.status(peerId)),
+      Stream.unwrap,
+      Stream.retry(
+        Schedule.spaced("1 second").pipe(
+          Schedule.setInputType<ReplicaError.ReplicaError>(),
           Schedule.while(({ input }) =>
             input.reason._tag === "ProtocolMismatch" && input.reason.expected === "active session"
           )

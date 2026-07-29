@@ -122,7 +122,7 @@ export const deleteTask = runtime.fn<{ readonly documentId: Identity.DocumentId 
   { concurrent: true, reactivityKeys: [TaskList.name] }
 )
 
-export const connectionStatus = ReplicaAtom.status(runtime)
+export const replicaStatus = ReplicaAtom.status(runtime)
 
 export const exportBackup = runtime.fn<void>()(
   () => Replica.Replica.use((replica) => Stream.mkUint8Array(replica.exportBackup({ maxBytes: 32 * 1024 * 1024 }))),

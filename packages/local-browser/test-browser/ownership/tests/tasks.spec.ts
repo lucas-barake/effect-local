@@ -61,7 +61,7 @@ test("keeps local writes available while browser networking is offline", async (
   await page.evaluate(() => navigator.serviceWorker.ready)
   await expect.poll(() => page.evaluate(() => navigator.serviceWorker.controller !== null)).toBe(true)
   await context.setOffline(true)
-  await expect(page.getByText("Offline, saved locally")).toBeVisible()
+  await expect(page.getByText("Local replica ready")).toBeVisible()
 
   const title = `Offline ${crypto.randomUUID()}`
   const titleInput = page.getByLabel("New task title")
@@ -72,7 +72,7 @@ test("keeps local writes available while browser networking is offline", async (
 
   await page.reload()
   await ownerInfo(page)
-  await expect(page.getByText("Offline, saved locally")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
   await expect(page.getByText(title, { exact: true })).toBeVisible()
 
   await context.setOffline(false)

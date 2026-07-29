@@ -1,3 +1,4 @@
+import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -35,7 +36,7 @@ const DocumentIdOutcome = CommandOutcome.schema(Identity.DocumentId, Schema.Neve
  * on. The version has to survive decoding for a handler to refuse it with a typed
  * `ReplicaError.ProtocolMismatch`.
  */
-export const protocolVersion = 1
+export const protocolVersion = 2
 const SessionLease = Schema.Struct({ leaseMillis: Schema.Int })
 export const SessionHandshake = Schema.Struct({
   leaseMillis: Schema.Int,
@@ -186,6 +187,12 @@ export const group = RpcGroup.make(
   Rpc.make("Status", {
     payload: { sessionId: Identity.SessionId },
     success: ReplicaStatus.ReplicaStatus,
+    error: ReplicaError.ReplicaError,
+    stream: true
+  }),
+  Rpc.make("PeerConnectionStatus", {
+    payload: { sessionId: Identity.SessionId, peerId: Identity.PeerId },
+    success: PeerConnectionStatus.Status,
     error: ReplicaError.ReplicaError,
     stream: true
   }),
