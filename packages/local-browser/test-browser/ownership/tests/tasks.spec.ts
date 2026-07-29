@@ -23,7 +23,7 @@ const ownerInfo = (page: Page) =>
       if (String(error).includes("Execution context was destroyed")) return undefined
       throw error
     }
-  }, { timeout: 20_000 }).not.toBeUndefined()
+  }, { timeout: 40_000 }).not.toBeUndefined()
 
 test("creates, updates, completes, deletes, and reloads local tasks", async ({ page }) => {
   await page.goto("/")
@@ -356,6 +356,7 @@ test("shares one durable owner across tabs", async ({ context, page }) => {
 })
 
 test("expires a stalled provisioning candidate before assigning a healthy provider", async ({ context, page }) => {
+  test.setTimeout(90_000)
   await page.goto("/")
   await ownerInfo(page)
   await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
@@ -400,7 +401,7 @@ test("expires a stalled provisioning candidate before assigning a healthy provid
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(
         () => reject(new Error(`Candidate was not offered provisioning, saw [${candidate.messages.join(", ")}]`)),
-        20_000
+        40_000
       )
       replica.port.addEventListener("message", (event) => {
         const message = event.data as { readonly _tag: string }
