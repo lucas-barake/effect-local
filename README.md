@@ -879,10 +879,57 @@ The SharedWorker entry delegates to the coordinator:
 
 ```ts
 // replica.shared-worker.ts
-import * as OwnershipCoordinator from "@lucas-barake/effect-local-browser/OwnershipCoordinator"
+const pending: Array<MessagePort> = []
+let coordinatorImportFailure: { readonly message: string; readonly name: string } | undefined
+const bufferConnection = (event: Event) => {
+  if (!("ports" in event)) return
+  const ports: unknown = event.ports
+  if (typeof ports !== "object" || ports === null) return
+  const port = Reflect.get(ports, 0)
+  if (!(port instanceof MessagePort)) return
+  if (coordinatorImportFailure === undefined) {
+    pending.push(port)
+    return
+  }
+  try {
+    port.postMessage({
+      _tag: "OwnerError",
+      message: coordinatorImportFailure.message,
+      reason: { _tag: "RuntimeLoadFailure", ...coordinatorImportFailure }
+    })
+  } catch {
+  } finally {
+    port.close()
+  }
+}
 
-OwnershipCoordinator.runSharedWorker(() =>
-  import("./replica.shared-worker-runtime.ts").then((module) => module.options)
+globalThis.addEventListener("connect", bufferConnection)
+void import("@lucas-barake/effect-local-browser/OwnershipCoordinator").then(
+  (OwnershipCoordinator) => {
+    globalThis.removeEventListener("connect", bufferConnection)
+    OwnershipCoordinator.runSharedWorker(
+      () => import("./replica.shared-worker-runtime.ts").then((module) => module.options),
+      pending.splice(0)
+    )
+  },
+  (cause) => {
+    coordinatorImportFailure = cause instanceof Error
+      ? { message: cause.message, name: cause.name }
+      : { message: String(cause), name: "UnknownError" }
+    for (const port of pending.splice(0)) {
+      try {
+        port.postMessage({
+          _tag: "OwnerError",
+          message: coordinatorImportFailure.message,
+          reason: { _tag: "RuntimeLoadFailure", ...coordinatorImportFailure }
+        })
+      } catch {
+      } finally {
+        port.close()
+      }
+    }
+    globalThis.reportError(cause)
+  }
 )
 ```
 
@@ -890,7 +937,10 @@ The runtime module builds the engine over the transferred database port and hand
 `OwnershipCoordinator.SharedWorkerOptions` back: `name`, `definition`, and `engine`, a function from
 `MessagePort` to a `ManagedRuntime` containing `SqlReplica.layerWithBindings`, `SessionManager.layer`, the
 domain Layers, `ReplicaLimits`, `BrowserCrypto.layer`, and `BrowserSqlite.layerMessagePort(databasePort)`.
-Connects arriving while the engine module loads are buffered; a load failure is reported to every tab.
+The zero dependency entry buffer is installed before the coordinator dependency graph loads. It hands early
+connections to `runSharedWorker`, which installs its listener synchronously before loading the engine module.
+The buffer is transferred and cleared after a successful handoff. If either import fails, every current and
+future connection receives an owner error instead of waiting indefinitely.
 
 The database worker entry holds a Web Lock for the database lifetime, so a replacement provider waits for the
 lock instead of opening OPFS concurrently with a slow prior owner:

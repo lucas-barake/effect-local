@@ -640,11 +640,14 @@ const firstConnectPort = (event: Event): MessagePort | undefined => {
  * buffered until the coordinator is ready, so tabs connecting while the options module is still
  * loading are attached in order once it arrives. When the load fails, every buffered and future
  * connection is answered with an `OwnerError` frame whose reason is tagged `RuntimeLoadFailure`.
+ * Entries that dynamically import this module can pass ports captured before that import as
+ * `initialPorts`.
  */
 export const runSharedWorker = <E, A = unknown, E2 = never,>(
-  load: () => Promise<SharedWorkerOptions<E, A, E2>>
+  load: () => Promise<SharedWorkerOptions<E, A, E2>>,
+  initialPorts: ReadonlyArray<MessagePort> = []
 ): void => {
-  const pending: Array<MessagePort> = []
+  const pending = [...initialPorts]
   let coordinator: OwnershipCoordinator["Service"] | undefined
   let startupFailure: { readonly message: string; readonly name: string } | undefined
   const flush = () => {

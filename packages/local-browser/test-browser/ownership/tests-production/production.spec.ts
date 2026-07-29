@@ -108,9 +108,17 @@ const ownerError = (page: Page) =>
     }
   }, { timeout: 20_000 }).toBeTruthy()
 
+test.beforeEach(async ({ request }) => {
+  await Promise.all([
+    request.get("/__effect-local-coordinator/release"),
+    request.get("/__effect-local-runtime/release")
+  ])
+})
+
 test("starts concurrent built ownership clients and serves SQLite WASM", async ({ context, page, request }) => {
   await instrumentWorkerBoundaries(context)
   const attachedPage = await context.newPage()
+  await request.get("/__effect-local-coordinator/hold")
   await request.get("/__effect-local-runtime/hold")
   const wasmResponse = context.waitForEvent("response", {
     predicate: (response) => /\/wa-sqlite-[^/]+\.wasm$/.test(new URL(response.url()).pathname),
@@ -119,6 +127,11 @@ test("starts concurrent built ownership clients and serves SQLite WASM", async (
 
   await Promise.all([page.goto("/"), attachedPage.goto("/")])
   await Promise.all([attachPosted(page), attachPosted(attachedPage)])
+  await expect.poll(async () => Number(await (await request.get("/__effect-local-coordinator/waiting")).text()))
+    .toBeGreaterThan(0)
+  await request.get("/__effect-local-coordinator/release")
+  await expect.poll(async () => Number(await (await request.get("/__effect-local-runtime/waiting")).text()))
+    .toBeGreaterThan(0)
   await request.get("/__effect-local-runtime/release")
 
   await Promise.all([
@@ -224,6 +237,15 @@ test("surfaces a built ownership runtime load failure", async ({ context, page, 
     expect(attachedPage.getByText("Opening local database")).not.toBeVisible()
   ])
 
+  const futurePage = await context.newPage()
+  await futurePage.goto("/")
+  await Promise.all([
+    attachPosted(futurePage),
+    ownerError(futurePage),
+    expect(futurePage.getByRole("alert")).toBeVisible({ timeout: 20_000 }),
+    expect(futurePage.getByText("Opening local database")).not.toBeVisible()
+  ])
+
   expect(
     await Promise.all([
       page.evaluate(() =>
@@ -233,9 +255,59 @@ test("surfaces a built ownership runtime load failure", async ({ context, page, 
       attachedPage.evaluate(() =>
         (globalThis as typeof globalThis & { readonly __effectLocalDedicatedWorkerStarts?: number })
           .__effectLocalDedicatedWorkerStarts ?? 0
+      ),
+      futurePage.evaluate(() =>
+        (globalThis as typeof globalThis & { readonly __effectLocalDedicatedWorkerStarts?: number })
+          .__effectLocalDedicatedWorkerStarts ?? 0
       )
     ])
-  ).toEqual([0, 0])
+  ).toEqual([0, 0, 0])
+})
+
+test("surfaces a built ownership coordinator load failure", async ({ context, page, request }) => {
+  await instrumentWorkerBoundaries(context)
+  const attachedPage = await context.newPage()
+
+  await request.get("/__effect-local-coordinator/hold")
+  await Promise.all([page.goto("/"), attachedPage.goto("/")])
+  await Promise.all([attachPosted(page), attachPosted(attachedPage)])
+  await expect.poll(async () => Number(await (await request.get("/__effect-local-coordinator/waiting")).text()))
+    .toBeGreaterThan(0)
+  await request.get("/__effect-local-coordinator/fail")
+  await Promise.all([ownerError(page), ownerError(attachedPage)])
+
+  await Promise.all([
+    expect(page.getByRole("alert")).toBeVisible({ timeout: 20_000 }),
+    expect(attachedPage.getByRole("alert")).toBeVisible({ timeout: 20_000 }),
+    expect(page.getByText("Opening local database")).not.toBeVisible(),
+    expect(attachedPage.getByText("Opening local database")).not.toBeVisible()
+  ])
+
+  const futurePage = await context.newPage()
+  await futurePage.goto("/")
+  await Promise.all([
+    attachPosted(futurePage),
+    ownerError(futurePage),
+    expect(futurePage.getByRole("alert")).toBeVisible({ timeout: 20_000 }),
+    expect(futurePage.getByText("Opening local database")).not.toBeVisible()
+  ])
+
+  expect(
+    await Promise.all([
+      page.evaluate(() =>
+        (globalThis as typeof globalThis & { readonly __effectLocalDedicatedWorkerStarts?: number })
+          .__effectLocalDedicatedWorkerStarts ?? 0
+      ),
+      attachedPage.evaluate(() =>
+        (globalThis as typeof globalThis & { readonly __effectLocalDedicatedWorkerStarts?: number })
+          .__effectLocalDedicatedWorkerStarts ?? 0
+      ),
+      futurePage.evaluate(() =>
+        (globalThis as typeof globalThis & { readonly __effectLocalDedicatedWorkerStarts?: number })
+          .__effectLocalDedicatedWorkerStarts ?? 0
+      )
+    ])
+  ).toEqual([0, 0, 0])
 })
 
 test("does not retain failed post-ready connections across retries", async ({ context, page, request }) => {
