@@ -983,16 +983,21 @@ export interface DatabaseWorkerOptions {
  * Entry point of the durable database worker. The first message must be a Schema decodable
  * `DatabaseWorkerStart` frame carrying the database port. The worker then holds a Web Lock for the
  * database lifetime and runs the SQLite OPFS loop, so a replacement provider waits for the lock
- * instead of opening OPFS concurrently with a slow prior owner.
+ * instead of opening OPFS concurrently with a slow prior owner. An entry that dynamically imports
+ * this module can pass the message captured before that import as `initialMessage`.
  */
-export const runDatabaseWorker = (options: DatabaseWorkerOptions): void => {
+export const runDatabaseWorker = (
+  options: DatabaseWorkerOptions,
+  initialMessage?: MessageEvent<unknown>
+): void => {
   const dbName = options.dbName ?? `${options.name}.sqlite`
   const lockName = options.lockName ?? `${options.name}-opfs`
-  globalThis.addEventListener("message", (event: MessageEvent<unknown>) => {
+  const start = (event: MessageEvent<unknown>) => {
     let frame: OwnershipProtocol.DatabaseWorkerStart
     try {
       frame = Schema.decodeUnknownSync(OwnershipProtocol.DatabaseWorkerStart)(event.data)
     } catch (cause) {
+      for (const port of event.ports) port.close()
       globalThis.reportError(cause)
       return
     }
@@ -1002,5 +1007,10 @@ export const runDatabaseWorker = (options: DatabaseWorkerOptions): void => {
         Effect.tapCause(Effect.logError)
       )
     )
-  }, { once: true })
+  }
+  if (initialMessage !== undefined) {
+    start(initialMessage)
+    return
+  }
+  globalThis.addEventListener("message", start, { once: true })
 }

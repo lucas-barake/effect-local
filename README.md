@@ -833,11 +833,15 @@ const OwnershipLive = OwnershipCoordinator.layerTab({
   name: "effect-local-tasks",
   sharedWorker: () =>
     new SharedWorker(new URL("./replica.shared-worker.ts", import.meta.url), {
+      // Vite otherwise prepends a static environment import before the entry can buffer `connect`.
+      /* @vite-ignore */
       name: "effect-local-tasks",
       type: "module"
     }),
   databaseWorker: () =>
     new Worker(new URL("./opfs.worker.ts", import.meta.url), {
+      // Vite otherwise prepends a static environment import before the entry can buffer its port.
+      /* @vite-ignore */
       name: "effect-local-tasks-opfs",
       type: "module"
     })
@@ -947,9 +951,30 @@ lock instead of opening OPFS concurrently with a slow prior owner:
 
 ```ts
 // opfs.worker.ts
-import * as OwnershipCoordinator from "@lucas-barake/effect-local-browser/OwnershipCoordinator"
+const pending: Array<MessageEvent<unknown>> = []
+const bufferMessage = (event: MessageEvent<unknown>) => {
+  pending.push(event)
+}
 
-OwnershipCoordinator.runDatabaseWorker({ name: "effect-local-tasks" })
+globalThis.addEventListener("message", bufferMessage)
+void import("@lucas-barake/effect-local-browser/OwnershipCoordinator").then(
+  (OwnershipCoordinator) => {
+    globalThis.removeEventListener("message", bufferMessage)
+    const initialMessage = pending.shift()
+    for (const event of pending.splice(0)) {
+      for (const port of event.ports) port.close()
+    }
+    OwnershipCoordinator.runDatabaseWorker({ name: "effect-local-tasks" }, initialMessage)
+  },
+  (cause) => {
+    globalThis.removeEventListener("message", bufferMessage)
+    for (const event of pending.splice(0)) {
+      for (const port of event.ports) port.close()
+    }
+    globalThis.reportError(cause)
+    globalThis.close()
+  }
+)
 ```
 
 The complete checked application is

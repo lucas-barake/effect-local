@@ -32,11 +32,15 @@ const OwnershipLive = OwnershipCoordinator.layerTab({
   name: "effect-local-tasks",
   sharedWorker: () =>
     new SharedWorker(new URL("./replica.shared-worker.ts", import.meta.url), {
+      // Vite otherwise prepends a static environment import before the entry can buffer `connect`.
+      /* @vite-ignore */
       name: "effect-local-tasks",
       type: "module"
     }),
   databaseWorker: () =>
     new Worker(new URL("./opfs.worker.ts", import.meta.url), {
+      // Vite otherwise prepends a static environment import before the entry can buffer its port.
+      /* @vite-ignore */
       name: "effect-local-tasks-opfs",
       type: "module"
     }),
