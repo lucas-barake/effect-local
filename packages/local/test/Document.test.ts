@@ -39,6 +39,17 @@ describe("Document", () => {
     assert.isTrue(Document.isAutomergeValue(immutableString))
   })
 
+  it("accepts only portable finite numbers and safe integer counters", () => {
+    assert.isTrue(Document.isAutomergeValue(Number.MAX_VALUE))
+    assert.isFalse(Document.isAutomergeValue(Number.POSITIVE_INFINITY))
+    assert.isFalse(Document.isAutomergeValue(Number.NEGATIVE_INFINITY))
+    assert.isFalse(Document.isAutomergeValue(Number.NaN))
+    assert.isTrue(Document.isAutomergeValue(new Automerge.Counter(Number.MAX_SAFE_INTEGER)))
+    assert.isTrue(Document.isAutomergeValue(new Automerge.Counter(Number.MIN_SAFE_INTEGER)))
+    assert.isFalse(Document.isAutomergeValue(new Automerge.Counter(Number.MAX_SAFE_INTEGER + 1)))
+    assert.isFalse(Document.isAutomergeValue(new Automerge.Counter(Number.MIN_SAFE_INTEGER - 1)))
+  })
+
   it("rejects sparse arrays that Automerge treats as undefined", () => {
     const items: Array<string> = []
     items.length = 1

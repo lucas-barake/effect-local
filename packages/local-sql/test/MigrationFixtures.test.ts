@@ -22,7 +22,8 @@ const expectations = {
       [7, "replica_health_indexes"],
       [8, "document_lineage"],
       [9, "history_rewrite_markers"],
-      [10, "peer_relay_state"]
+      [10, "peer_relay_state"],
+      [11, "document_history_counters"]
     ],
     outbox: "none"
   },
@@ -35,7 +36,8 @@ const expectations = {
       [7, "replica_health_indexes"],
       [8, "document_lineage"],
       [9, "history_rewrite_markers"],
-      [10, "peer_relay_state"]
+      [10, "peer_relay_state"],
+      [11, "document_history_counters"]
     ],
     outbox: "backfilled"
   },
@@ -47,7 +49,8 @@ const expectations = {
       [7, "replica_health_indexes"],
       [8, "document_lineage"],
       [9, "history_rewrite_markers"],
-      [10, "peer_relay_state"]
+      [10, "peer_relay_state"],
+      [11, "document_history_counters"]
     ],
     outbox: { frozen: "2020-01-01T00:00:00.000Z" }
   }
@@ -135,7 +138,8 @@ const assertMigrationHistory = Effect.gen(function*() {
     { migration_id: 7, name: "replica_health_indexes" },
     { migration_id: 8, name: "document_lineage" },
     { migration_id: 9, name: "history_rewrite_markers" },
-    { migration_id: 10, name: "peer_relay_state" }
+    { migration_id: 10, name: "peer_relay_state" },
+    { migration_id: 11, name: "document_history_counters" }
   ])
 
   const catalog = yield* SqlSchema.findAll({
@@ -157,7 +161,12 @@ const assertMigrationHistory = Effect.gen(function*() {
       name: "history_rewrite_markers",
       checksum: Migrations.historyRewriteMarkersChecksum
     },
-    { migration_id: 10, name: "peer_relay_state", checksum: Migrations.peerRelayStateChecksum }
+    { migration_id: 10, name: "peer_relay_state", checksum: Migrations.peerRelayStateChecksum },
+    {
+      migration_id: 11,
+      name: "document_history_counters",
+      checksum: Migrations.documentHistoryCountersChecksum
+    }
   ])
 })
 
@@ -176,6 +185,9 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
         tombstone: Schema.Int,
         projection_status: Schema.String,
         checkpoint_hash: Schema.NullOr(Schema.String),
+        history_bytes: Schema.NullOr(Schema.Int),
+        history_changes: Schema.NullOr(Schema.Int),
+        history_operations: Schema.NullOr(Schema.Int),
         lineage: Identity.DocumentLineage
       }),
       execute: () => sql`SELECT * FROM effect_local_documents ORDER BY document_id`
@@ -190,6 +202,9 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
       tombstone: 0,
       projection_status: "ready",
       checkpoint_hash: null,
+      history_bytes: null,
+      history_changes: null,
+      history_operations: null,
       lineage: Identity.genesisLineage
     }])
 

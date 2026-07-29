@@ -50,6 +50,14 @@ describe("PeerSync", () => {
     maxChunkBytes: 64_000,
     maxArchiveRecords: 1_000,
     maxJsonDepth: 64,
+    maxConflictDepth: 64,
+    maxConflictNodes: 100_000,
+    maxConflictAlternatives: 10_000,
+    maxConflictPathSegments: 128,
+    maxConflictValueBytes: 16 * 1024 * 1024,
+    maxConflictSourceChanges: 100_000,
+    maxConflictSourceOperations: 100_000,
+    maxConflictSourceBytes: 64 * 1024 * 1024,
     maxSyncMessageBytes: 64_000,
     maxPeerSendMillis: 1_000,
     maxSyncChangesPerMessage: 100,
@@ -120,6 +128,12 @@ describe("PeerSync", () => {
   const StrictServices = Layer.merge(StrictInfrastructure, StrictStoreService)
   const StrictSyncService = PeerSync.layer.pipe(Layer.provide(StrictServices))
   const StrictLayer = Layer.merge(StrictServices, StrictSyncService)
+  const SourceLimits = ReplicaLimits.layer({ ...limits, maxConflictSourceChanges: 1 })
+  const SourceInfrastructure = Layer.mergeAll(Base, Gate, SourceLimits)
+  const SourceStoreService = DocumentStore.layer.pipe(Layer.provide(SourceInfrastructure))
+  const SourceServices = Layer.merge(SourceInfrastructure, SourceStoreService)
+  const SourceSyncService = PeerSync.layer.pipe(Layer.provide(SourceServices))
+  const SourceLayer = Layer.merge(SourceServices, SourceSyncService)
   const EdgeLimits = ReplicaLimits.layer({
     ...limits,
     maxPendingDependencyEdgesPerDocument: 100,
@@ -548,6 +562,25 @@ describe("PeerSync", () => {
       }
       const reloaded = yield* store.load(Task, documentId)
       assert.deepStrictEqual(reloaded.snapshot.value, { title: "remote", labels: ["synced"] })
+      const appliedChanges = yield* sql<{ readonly bytes: Uint8Array }>`
+        SELECT bytes FROM effect_local_changes
+        WHERE document_id = ${documentId} AND applied = 1
+      `
+      assert.strictEqual(reloaded.historyChanges, appliedChanges.length)
+      assert.strictEqual(
+        reloaded.historyOperations,
+        appliedChanges.reduce((total, change) => total + Automerge.decodeChange(change.bytes).ops.length, 0)
+      )
+      assert.strictEqual(
+        reloaded.historyBytes,
+        appliedChanges.reduce((total, change) => total + change.bytes.byteLength, 0)
+      )
+      const historyBytes = reloaded.historyBytes
+      const historyChanges = reloaded.historyChanges
+      const historyOperations = reloaded.historyOperations
+      assert.isNotNull(historyBytes)
+      assert.isNotNull(historyChanges)
+      assert.isNotNull(historyOperations)
       const duplicate = yield* sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: 0,
@@ -559,10 +592,78 @@ describe("PeerSync", () => {
       assert.deepStrictEqual(duplicate.reply?.message, received.reply?.message)
       const rows = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM effect_local_peer_receipts`
       assert.strictEqual(rows[0]?.count, 2)
+      const afterDuplicate = yield* sql<{
+        readonly history_bytes: number
+        readonly history_changes: number
+        readonly history_operations: number
+      }>`SELECT history_bytes, history_changes, history_operations
+        FROM effect_local_documents WHERE document_id = ${documentId}`
+      assert.deepStrictEqual(afterDuplicate, [{
+        history_bytes: historyBytes,
+        history_changes: historyChanges,
+        history_operations: historyOperations
+      }])
       InternalAutomerge.free(reloaded.automerge)
       InternalAutomerge.free(remote)
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(TestLayer)))
+
+  it.effect("rejects a peer change above the cumulative source change limit atomically", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      assert.strictEqual(created.historyChanges, 1)
+      const remote = Automerge.change(
+        Automerge.clone(created.automerge, { actor: "2".repeat(32) }),
+        (draft) => {
+          ;(draft.value as { title: string }).title = "remote"
+        }
+      )
+      let remoteState = Automerge.initSyncState()
+      let rejected = false
+      for (let sequence = 0; sequence < 4; sequence++) {
+        const generated = Automerge.generateSyncMessage(remote, remoteState)
+        remoteState = generated[0]
+        if (generated[1] === null) break
+        const before = yield* sql`SELECT
+          (SELECT COUNT(*) FROM effect_local_changes) AS changes,
+          (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts,
+          history_changes, history_operations, history_bytes
+          FROM effect_local_documents WHERE document_id = ${documentId}`
+        const result = yield* Effect.result(sync.receive(Task, documentId, session, {
+          remoteConnectionEpoch: session.connectionEpoch,
+          receiveSequence: sequence,
+          lineage: Identity.genesisLineage,
+          message: generated[1],
+          writerProvenance: provenanceFor(generated[1], Task.version, definition.hash)
+        }))
+        if (result._tag === "Failure") {
+          assert.strictEqual(result.failure.reason._tag, "QuotaExceeded")
+          if (result.failure.reason._tag === "QuotaExceeded") {
+            assert.strictEqual(result.failure.reason.resource, "conflict source changes")
+          }
+          const after = yield* sql`SELECT
+            (SELECT COUNT(*) FROM effect_local_changes) AS changes,
+            (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts,
+            history_changes, history_operations, history_bytes
+            FROM effect_local_documents WHERE document_id = ${documentId}`
+          assert.deepStrictEqual(after, before)
+          rejected = true
+          break
+        }
+        if (result.success.reply !== null) {
+          const applied = Automerge.receiveSyncMessage(remote, remoteState, result.success.reply.message)
+          remoteState = applied[1]
+        }
+      }
+      assert.isTrue(rejected)
+      InternalAutomerge.free(remote)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(SourceLayer)))
 
   it.effect("persists the wire declared writer provenance for an inbound change, not the receiver's own", () =>
     Effect.gen(function*() {

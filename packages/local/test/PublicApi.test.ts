@@ -8,6 +8,7 @@ describe("public API", () => {
       "Canonical",
       "CommandOutcome",
       "Commit",
+      "Conflict",
       "Document",
       "DocumentSet",
       "Identity",

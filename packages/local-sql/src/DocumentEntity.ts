@@ -1,5 +1,6 @@
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
+import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import type * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -113,6 +114,16 @@ export const Delete = Rpc.make("Delete", {
   "client"
 )
 
+export const Resolve = Rpc.make("Resolve", {
+  payload: { ...commandFields, resolution: Conflict.Resolution },
+  success: Schema.Uint8ArrayFromBase64,
+  error: ReplicaError.ReplicaError,
+  primaryKey
+}).annotate(ClusterSchema.Persisted, true).annotate(ClusterSchema.WithTransaction, true).annotate(
+  ClusterSchema.Uninterruptible,
+  "client"
+)
+
 export const ApplySyncResult = Schema.Struct({
   reply: Schema.NullOr(Schema.Struct({
     documentId: Identity.DocumentId,
@@ -153,7 +164,7 @@ export const ApplySync = Rpc.make("ApplySync", {
   true
 )
 
-export const DocumentEntity = Entity.make("EffectLocal/Document", [Create, Mutate, Delete, ApplySync])
+export const DocumentEntity = Entity.make("EffectLocal/Document", [Create, Mutate, Delete, Resolve, ApplySync])
 
 const decode = <S extends Document.WireSchema,>(
   schema: S,
@@ -301,6 +312,31 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               })
               return yield* encode(CommandOutcome.schema(Schema.Void, Schema.Never), outcome)
             })
+          },
+          Resolve: (request) => {
+            const documentId = Identity.DocumentId.make(request.address.entityId.toString())
+            return Effect.gen(function*() {
+              const document = yield* resolveDocument(definition, request.payload.documentType)
+              const outcome = yield* executor.resolve(document, {
+                commandId: request.payload.commandId,
+                documentId,
+                permit: yield* permit(request.payload),
+                requestHash: request.payload.requestHash,
+                resolution: request.payload.resolution
+              })
+              return yield* encode(
+                CommandOutcome.schema(Schema.Void, Conflict.ResolutionError),
+                outcome
+              )
+            }).pipe(
+              Effect.withSpan("DocumentEntity.resolveConflict", {
+                attributes: {
+                  documentType: request.payload.documentType,
+                  choiceTag: request.payload.resolution.choice._tag,
+                  pathDepth: request.payload.resolution.path.parents.length + 1
+                }
+              })
+            )
           },
           ApplySync: (request) => {
             const documentId = Identity.DocumentId.make(request.address.entityId.toString())

@@ -4,6 +4,8 @@ import { assert, it } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
+import * as Conflict from "@lucas-barake/effect-local/Conflict"
+import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
@@ -39,6 +41,14 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     maxChunkBytes: 128,
     maxArchiveRecords: 100,
     maxJsonDepth: 16,
+    maxConflictDepth: 16,
+    maxConflictNodes: 10_000,
+    maxConflictAlternatives: 1_000,
+    maxConflictPathSegments: 16,
+    maxConflictValueBytes: 1024 * 1024,
+    maxConflictSourceChanges: 10_000,
+    maxConflictSourceOperations: 100_000,
+    maxConflictSourceBytes: 64 * 1024 * 1024,
     maxSyncMessageBytes: 1024,
     maxPeerSendMillis: 1_000,
     maxSyncChangesPerMessage: 10,
@@ -184,6 +194,83 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       Effect.provide(Owner)
     ))
 
+  it.effect("round trips transformed conflict inspection, resolution, and lookup", () => {
+    const TransformedTask = Document.make("TransformedTask", {
+      schema: Schema.Struct({ title: Schema.NumberFromString }),
+      version: 1
+    })
+    const transformedDefinition = ReplicaDefinition.make({
+      name: "transformed-tasks",
+      documents: DocumentSet.make(TransformedTask),
+      mutations: [],
+      projections: [],
+      queries: []
+    })
+    const visible = Conflict.AlternativeId.make("2@actor")
+    const other = Conflict.AlternativeId.make("1@actor")
+    const path = { parents: [], target: { _tag: "Key" as const, key: "title" } }
+    const resolution = Conflict.Resolution.make({
+      heads: ["head"],
+      path,
+      choice: { _tag: "SelectAlternative", alternativeId: other }
+    })
+    let resolved: Conflict.Resolution | undefined
+    const transformedReplica: Replica.Replica["Service"] = {
+      ...replica,
+      inspectConflicts: (_document, requestedId) =>
+        Effect.succeed({
+          snapshot: {
+            documentId: requestedId,
+            value: { title: 42 },
+            version: 1,
+            heads: ["head"],
+            tombstone: false,
+            projection: "Ready"
+          },
+          conflicts: [{
+            path,
+            visible,
+            alternatives: [
+              { id: other, value: "41" },
+              { id: visible, value: "42" }
+            ]
+          }]
+        }) as never,
+      resolveConflict: (_document, options) =>
+        Effect.sync(() => {
+          resolved = options.resolution
+        }) as never,
+      lookupConflictResolution: (_document, options) =>
+        Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined))
+    }
+    const TransformedOwner = ReplicaOwner.layerHandlers(transformedDefinition).pipe(
+      Layer.provideMerge(Sessions),
+      Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, transformedReplica)))
+    )
+    return Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const client = yield* ReplicaClient.fromRpcClient(transformedDefinition, rpc)
+      const inspection = yield* client.inspectConflicts(TransformedTask, documentId)
+      assert.strictEqual(inspection.snapshot.value.title, 42)
+      assert.deepStrictEqual(
+        inspection.conflicts[0]?.alternatives.map(({ value }) => value),
+        ["41", "42"]
+      )
+
+      const commandId = yield* Identity.makeCommandId
+      yield* client.resolveConflict(TransformedTask, { commandId, documentId, resolution })
+      assert.deepStrictEqual(resolved, resolution)
+      assert.deepStrictEqual(
+        yield* client.lookupConflictResolution(TransformedTask, {
+          commandId,
+          documentId,
+          resolution
+        }),
+        CommandOutcome.durablyCommitted(commandId, undefined)
+      )
+    })).pipe(Effect.provide(TransformedOwner))
+  })
+
   it.effect("round trips tagged query errors through the wire", () => {
     const rejected: Replica.Replica["Service"] = {
       ...replica,
@@ -267,6 +354,46 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.strictEqual(error.reason._tag, "ProtocolMismatch")
     })).pipe(Effect.provide(Owner)))
 
+  it.effect("rejects malformed owner advertised conflict limits", () =>
+    Effect.gen(function*() {
+      const candidates: ReadonlyArray<ReplicaRpc.ConflictLimits | undefined> = [
+        undefined,
+        {
+          maxConflictDepth: 0,
+          maxConflictNodes: 1,
+          maxConflictAlternatives: 1,
+          maxConflictPathSegments: 1,
+          maxConflictValueBytes: 1
+        },
+        {
+          maxConflictDepth: ReplicaLimits.maxConflictDepthHardLimit + 1,
+          maxConflictNodes: 1,
+          maxConflictAlternatives: 1,
+          maxConflictPathSegments: 1,
+          maxConflictValueBytes: 1
+        }
+      ]
+
+      for (const conflictLimits of candidates) {
+        yield* Effect.scoped(Effect.gen(function*() {
+          const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+          const malformed = new Proxy(rpc, {
+            get(target, property, receiver) {
+              const value = Reflect.get(target, property, receiver)
+              if (property !== "OpenSession") return value
+              const openSession = target.OpenSession
+              return (payload: Parameters<typeof openSession>[0]) =>
+                openSession(payload).pipe(
+                  Effect.map((lease) => ({ ...lease, conflictLimits }))
+                )
+            }
+          })
+          const error = yield* Effect.flip(ReplicaClient.fromRpcClient(definition, malformed))
+          assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+        }))
+      }
+    }).pipe(Effect.provide(Owner)))
+
   it.effect("recovers ambiguous commands through typed receipt lookup", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
@@ -294,6 +421,42 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         yield* client.delete(Task, { commandId: deleteId, documentId }),
         undefined
       )
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("recovers a lost conflict resolution response through complete lookup", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      let dispatches = 0
+      let lookups = 0
+      const ambiguous = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property === "ResolveConflict") {
+            return (payload: never) => {
+              dispatches++
+              return value(payload).pipe(Effect.andThen(Effect.fail(disconnected())))
+            }
+          }
+          if (property === "LookupConflictResolution") {
+            return (payload: never) => {
+              lookups++
+              return value(payload)
+            }
+          }
+          return value
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, ambiguous)
+      const commandId = yield* Identity.makeCommandId
+      const resolution = Conflict.Resolution.make({
+        heads: [],
+        path: { parents: [], target: { _tag: "Key", key: "title" } },
+        choice: { _tag: "DeleteValue" }
+      })
+
+      yield* client.resolveConflict(Task, { commandId, documentId, resolution })
+      assert.strictEqual(dispatches, 1)
+      assert.strictEqual(lookups, 1)
     })).pipe(Effect.provide(Owner)))
 
   it.effect("reports ambiguity, with its cause, when a command lookup also loses transport", () =>
@@ -842,6 +1005,47 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           new RenameError()
         )
         assert.strictEqual(lookups, 0)
+      })).pipe(Effect.provide(RejectedOwner))
+    })
+
+    it.effect("preserves and manually looks up a durable stale conflict rejection", () => {
+      let lookups = 0
+      const resolution = Conflict.Resolution.make({
+        heads: ["expected"],
+        path: { parents: [], target: { _tag: "Key", key: "title" } },
+        choice: { _tag: "DeleteValue" }
+      })
+      const rejection = new Conflict.StaleConflictResolution({
+        expectedHeads: ["expected"],
+        observedHeads: ["observed"]
+      })
+      const rejected: Replica.Replica["Service"] = {
+        ...replica,
+        resolveConflict: () => Effect.fail(rejection),
+        lookupConflictResolution: (_document, options) =>
+          Effect.sync(() => {
+            lookups++
+            return CommandOutcome.rejected(options.commandId, rejection)
+          })
+      }
+      const RejectedOwner = ReplicaOwner.layerHandlers(definition).pipe(
+        Layer.provideMerge(Sessions),
+        Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, rejected)))
+      )
+      return Effect.scoped(Effect.gen(function*() {
+        const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+        const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
+        const commandId = yield* Identity.makeCommandId
+        const error = yield* Effect.flip(
+          client.resolveConflict(Task, { commandId, documentId, resolution })
+        )
+        assert.deepStrictEqual(error, rejection)
+        assert.strictEqual(lookups, 0)
+        assert.deepStrictEqual(
+          yield* client.lookupConflictResolution(Task, { commandId, documentId, resolution }),
+          CommandOutcome.rejected(commandId, rejection)
+        )
+        assert.strictEqual(lookups, 1)
       })).pipe(Effect.provide(RejectedOwner))
     })
   })

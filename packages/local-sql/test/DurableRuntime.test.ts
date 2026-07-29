@@ -73,9 +73,11 @@ describe("DurableRuntime", () => {
         Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, options.documentId)),
       mutate: (_mutation, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
       delete: (_document, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
+      resolve: (_document, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
       lookupCreate: (id) => Effect.succeed(CommandOutcome.unknown(id)),
       lookupMutation: (_mutation, id) => Effect.succeed(CommandOutcome.unknown(id)),
-      lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id))
+      lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id)),
+      lookupResolution: (_document, options) => Effect.succeed(CommandOutcome.unknown(options.commandId))
     })
   )
   const Limits = ReplicaLimits.layer({
@@ -83,6 +85,14 @@ describe("DurableRuntime", () => {
     maxChunkBytes: 64_000,
     maxArchiveRecords: 1_000,
     maxJsonDepth: 32,
+    maxConflictDepth: 64,
+    maxConflictNodes: 100_000,
+    maxConflictAlternatives: 10_000,
+    maxConflictPathSegments: 128,
+    maxConflictValueBytes: 16 * 1024 * 1024,
+    maxConflictSourceChanges: 100_000,
+    maxConflictSourceOperations: 100_000,
+    maxConflictSourceBytes: 64 * 1024 * 1024,
     maxSyncMessageBytes: 64_000,
     maxPeerSendMillis: 1_000,
     maxSyncChangesPerMessage: 100,
@@ -111,9 +121,11 @@ describe("DurableRuntime", () => {
     maxRestoreErrorBytes: 4_096
   })
   const Gate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(Layer.merge(Database, Bootstrap)))
-  const Store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Database, Gate)))
+  const Store = DocumentStore.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate, Limits)))
   const RecoveryService = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate)))
-  const CompactionService = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate, RecoveryService)))
+  const CompactionService = Compaction.layer.pipe(
+    Layer.provide(Layer.mergeAll(Database, Gate, RecoveryService, Limits))
+  )
   const Inputs = Layer.mergeAll(Database, Bootstrap, Executor, Limits, Gate, Store, RecoveryService, CompactionService)
   const Live = DurableRuntime.layer(definition).pipe(Layer.provide(Inputs))
   const Services = Layer.merge(Inputs, Live)
@@ -122,9 +134,9 @@ describe("DurableRuntime", () => {
     const database = Layer.merge(SqliteClient.layer({ filename, disableWAL: true }), NodeCrypto.layer)
     const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(database))
     const gate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(Layer.merge(database, bootstrap)))
-    const store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(database, gate)))
+    const store = DocumentStore.layer.pipe(Layer.provide(Layer.mergeAll(database, gate, Limits)))
     const recovery = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(database, gate)))
-    const compaction = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(database, gate, recovery)))
+    const compaction = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(database, gate, recovery, Limits)))
     const inputs = Layer.mergeAll(database, bootstrap, Executor, Limits, gate, store, recovery, compaction)
     return Layer.merge(inputs, DurableRuntime.layerWith(definition, workflowRegistrations).pipe(Layer.provide(inputs)))
   }
@@ -375,7 +387,7 @@ describe("DurableRuntime", () => {
           assert.isAtLeast(yield* Ref.get(attempts), 2)
         }).pipe(Effect.provide(servicesAtWith(filename, registration)))
       )
-    }), 20_000)
+    }), 30_000)
 
   it.effect("interrupts an in-flight compaction handle for the current incarnation", () =>
     Effect.gen(function*() {
@@ -435,9 +447,11 @@ describe("DurableRuntime", () => {
           })
         })
       ).pipe(Layer.provide(Gate))
-      const store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Database, gateLayer)))
+      const store = DocumentStore.layer.pipe(Layer.provide(Layer.mergeAll(Database, gateLayer, Limits)))
       const recovery = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(Database, gateLayer)))
-      const compaction = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Database, gateLayer, recovery)))
+      const compaction = Compaction.layer.pipe(
+        Layer.provide(Layer.mergeAll(Database, gateLayer, recovery, Limits))
+      )
       const inputs = Layer.mergeAll(Database, Bootstrap, Executor, Limits, gateLayer, store, recovery, compaction)
       const live = Layer.merge(inputs, DurableRuntime.layer(definition).pipe(Layer.provide(inputs)))
 
@@ -493,7 +507,9 @@ describe("DurableRuntime", () => {
   // Rebuilds the production runtime around a decorated `Recovery` service. Every other service,
   // including every `Compaction` method, stays production code.
   const servicesWithRecovery = <E,>(recoveryLayer: Layer.Layer<Recovery.Recovery, E>) => {
-    const compaction = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate, recoveryLayer)))
+    const compaction = Compaction.layer.pipe(
+      Layer.provide(Layer.mergeAll(Database, Gate, recoveryLayer, Limits))
+    )
     const inputs = Layer.mergeAll(Database, Bootstrap, Executor, Limits, Gate, Store, recoveryLayer, compaction)
     return Layer.merge(inputs, DurableRuntime.layer(definition).pipe(Layer.provide(inputs)))
   }

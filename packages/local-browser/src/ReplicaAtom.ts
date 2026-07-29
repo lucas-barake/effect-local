@@ -1,4 +1,5 @@
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
+import type * as Conflict from "@lucas-barake/effect-local/Conflict"
 import type * as Document from "@lucas-barake/effect-local/Document"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
@@ -59,6 +60,16 @@ export const documentFamily = <R, E, D extends Document.Any,>(
     )
   )
 
+export const conflictFamily = <R, E, D extends Document.Any,>(
+  runtime: Atom.AtomRuntime<Replica.Replica | R, E>,
+  document: D
+) =>
+  Atom.family((documentId: Identity.DocumentId) =>
+    runtime.atom(Replica.Replica.use((replica) => replica.inspectConflicts(document, documentId))).pipe(
+      runtime.factory.withReactivity([document.name])
+    )
+  )
+
 export const queryFamily = <R, E, Q extends Query.Any,>(
   runtime: Atom.AtomRuntime<Replica.Replica | R, E>,
   query: Q
@@ -99,6 +110,19 @@ export const mutation = <R, E, M extends Mutation.Any,>(
   >()(
     (options) => Replica.Replica.use((replica) => replica.mutate(definition, options)),
     { concurrent: true, reactivityKeys: [definition.document.name] }
+  )
+
+export const resolveConflict = <R, E, D extends Document.Any,>(
+  runtime: Atom.AtomRuntime<Replica.Replica | R, E>,
+  document: D
+) =>
+  runtime.fn<{
+    readonly commandId: Identity.CommandId
+    readonly documentId: Identity.DocumentId
+    readonly resolution: Conflict.Resolution
+  }>()(
+    (options) => Replica.Replica.use((replica) => replica.resolveConflict(document, options)),
+    { concurrent: true, reactivityKeys: [document.name] }
   )
 
 export const status = <R, E,>(runtime: Atom.AtomRuntime<Replica.Replica | R, E>) =>

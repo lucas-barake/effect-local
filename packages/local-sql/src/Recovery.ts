@@ -38,6 +38,9 @@ type RecoveredDocument<D extends Document.Any,> = {
   readonly materializedHeads: ReadonlyArray<string>
   readonly acceptedHeads: ReadonlyArray<string>
   readonly commitSequence: Identity.CommitSequence
+  readonly historyBytes: number | null
+  readonly historyChanges: number | null
+  readonly historyOperations: number | null
 }
 
 export class Recovery extends Context.Service<Recovery, {
@@ -68,6 +71,9 @@ export const make = Effect.gen(function*() {
           checkpoint_hash,
           document_id,
           document_type,
+          history_bytes,
+          history_changes,
+          history_operations,
           lineage,
           materialized_heads,
           observed_versions,
@@ -445,7 +451,10 @@ export const make = Effect.gen(function*() {
           },
           materializedHeads,
           acceptedHeads,
-          commitSequence
+          commitSequence,
+          historyBytes: row.history_bytes,
+          historyChanges: row.history_changes,
+          historyOperations: row.history_operations
         }
       }
 

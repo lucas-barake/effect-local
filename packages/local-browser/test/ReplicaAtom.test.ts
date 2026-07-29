@@ -1,4 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
+import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Projection from "@lucas-barake/effect-local/Projection"
@@ -83,6 +84,144 @@ describe("ReplicaAtom", () => {
       assert.isTrue(AsyncResult.isSuccess(value))
       if (AsyncResult.isSuccess(value)) assert.deepStrictEqual(value.value, committed)
       unmount()
+      registry.dispose()
+    }))
+
+  it.effect("refreshes document and conflict atoms after resolution", () =>
+    Effect.gen(function*() {
+      const firstDocument = yield* Deferred.make<void>()
+      const secondDocument = yield* Deferred.make<void>()
+      const firstConflicts = yield* Deferred.make<void>()
+      const secondConflicts = yield* Deferred.make<void>()
+      let documentReads = 0
+      let conflictReads = 0
+      const commandId = Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000020")
+      const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000020")
+      const resolution = Conflict.Resolution.make({
+        heads: [],
+        path: { parents: [], target: { _tag: "Key", key: "title" } },
+        choice: { _tag: "DeleteValue" }
+      })
+      const snapshot = {
+        documentId,
+        value: { title: "stored" },
+        version: 1,
+        heads: [],
+        tombstone: false,
+        projection: "Ready" as const
+      }
+      const atomRuntime = Atom.runtime(Layer.succeed(Replica.Replica, {
+        ...replica,
+        get: () =>
+          Effect.sync(() => ++documentReads).pipe(
+            Effect.tap((reads) => Deferred.succeed(reads === 1 ? firstDocument : secondDocument, undefined)),
+            Effect.as(snapshot)
+          ) as never,
+        inspectConflicts: () =>
+          Effect.sync(() => ++conflictReads).pipe(
+            Effect.tap((reads) => Deferred.succeed(reads === 1 ? firstConflicts : secondConflicts, undefined)),
+            Effect.as({ snapshot, conflicts: [] })
+          ) as never,
+        resolveConflict: () => Effect.void
+      }))
+      const registry = AtomRegistry.make()
+      const documentAtom = ReplicaAtom.documentFamily(atomRuntime, Task)(documentId)
+      const conflictsAtom = ReplicaAtom.conflictFamily(atomRuntime, Task)(documentId)
+      const resolveAtom = ReplicaAtom.resolveConflict(atomRuntime, Task)
+      const unmountDocument = registry.mount(documentAtom)
+      const unmountConflicts = registry.mount(conflictsAtom)
+      const unmountResolve = registry.mount(resolveAtom)
+      yield* Effect.all([
+        Deferred.await(firstDocument),
+        Deferred.await(firstConflicts)
+      ], { discard: true })
+
+      registry.set(resolveAtom, { commandId, documentId, resolution })
+      yield* AtomRegistry.getResult(registry, resolveAtom, { suspendOnWaiting: true })
+      yield* Effect.all([
+        Deferred.await(secondDocument),
+        Deferred.await(secondConflicts)
+      ], { discard: true })
+      assert.strictEqual(documentReads, 2)
+      assert.strictEqual(conflictReads, 2)
+
+      unmountResolve()
+      unmountConflicts()
+      unmountDocument()
+      registry.dispose()
+    }))
+
+  it.effect("does not refresh document state after a failed resolution", () =>
+    Effect.gen(function*() {
+      const documentRead = yield* Deferred.make<void>()
+      const conflictRead = yield* Deferred.make<void>()
+      const resolutionCalled = yield* Deferred.make<void>()
+      const releaseResolution = yield* Deferred.make<void>()
+      const resolutionFailed = yield* Deferred.make<void>()
+      let documentReads = 0
+      let conflictReads = 0
+      const commandId = Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000021")
+      const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000021")
+      const path = { parents: [], target: { _tag: "Key" as const, key: "title" } }
+      const resolution = Conflict.Resolution.make({
+        heads: [],
+        path,
+        choice: { _tag: "DeleteValue" }
+      })
+      const snapshot = {
+        documentId,
+        value: { title: "stored" },
+        version: 1,
+        heads: [],
+        tombstone: false,
+        projection: "Ready" as const
+      }
+      const atomRuntime = Atom.runtime(Layer.succeed(Replica.Replica, {
+        ...replica,
+        get: () =>
+          Effect.sync(() => ++documentReads).pipe(
+            Effect.tap(() => Deferred.succeed(documentRead, undefined)),
+            Effect.as(snapshot)
+          ) as never,
+        inspectConflicts: () =>
+          Effect.sync(() => ++conflictReads).pipe(
+            Effect.tap(() => Deferred.succeed(conflictRead, undefined)),
+            Effect.as({ snapshot, conflicts: [] })
+          ) as never,
+        resolveConflict: () =>
+          Deferred.succeed(resolutionCalled, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseResolution)),
+            Effect.andThen(Effect.fail(new Conflict.ConflictNotFound({ path })))
+          )
+      }))
+      const registry = AtomRegistry.make()
+      const documentAtom = ReplicaAtom.documentFamily(atomRuntime, Task)(documentId)
+      const conflictsAtom = ReplicaAtom.conflictFamily(atomRuntime, Task)(documentId)
+      const resolveAtom = ReplicaAtom.resolveConflict(atomRuntime, Task)
+      const unmountDocument = registry.mount(documentAtom)
+      const unmountConflicts = registry.mount(conflictsAtom)
+      const unmountResolve = registry.mount(resolveAtom)
+      const unsubscribe = registry.subscribe(resolveAtom, (value) => {
+        if (AsyncResult.isFailure(value)) {
+          Deferred.doneUnsafe(resolutionFailed, Effect.void)
+        }
+      })
+      yield* Effect.all([
+        Deferred.await(documentRead),
+        Deferred.await(conflictRead)
+      ], { discard: true })
+
+      registry.set(resolveAtom, { commandId, documentId, resolution })
+      yield* Deferred.await(resolutionCalled)
+      yield* Deferred.succeed(releaseResolution, undefined)
+      yield* Deferred.await(resolutionFailed)
+      assert.strictEqual(documentReads, 1)
+      assert.strictEqual(conflictReads, 1)
+
+      unsubscribe()
+      unmountResolve()
+      unmountConflicts()
+      unmountDocument()
       registry.dispose()
     }))
 

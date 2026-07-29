@@ -5,7 +5,7 @@ import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
-import type * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import type { ConfigError } from "effect/Config"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
@@ -24,6 +24,7 @@ import * as DocumentStore from "./DocumentStore.js"
 import * as DurableRuntime from "./DurableRuntime.js"
 import * as EntityReplica from "./EntityReplica.js"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as InternalConflicts from "./internal/conflicts.js"
 import type * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
 import type * as PeerSync from "./PeerSync.js"
 import * as ProjectionStore from "./ProjectionStore.js"
@@ -46,6 +47,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
   | QueryExecutor.QueryExecutor
   | ReplicaGate.ReplicaGate
   | ReplicaHealth.ReplicaHealth
+  | ReplicaLimits.ReplicaLimits
   | Crypto.Crypto
 > =>
   Layer.effect(
@@ -58,6 +60,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
       const queries = yield* QueryExecutor.QueryExecutor
       const gate = yield* ReplicaGate.ReplicaGate
       const health = yield* ReplicaHealth.ReplicaHealth
+      const limits = yield* ReplicaLimits.ReplicaLimits
       const crypto = yield* Crypto.Crypto
 
       const withPermit = <A, E, R,>(f: (permit: ReplicaGate.Permit) => Effect.Effect<A, E, R>) =>
@@ -88,6 +91,59 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
               (stored) => Effect.succeed(stored.snapshot),
               (stored) => Effect.sync(() => InternalAutomerge.free(stored.automerge))
             )
+          ),
+        inspectConflicts: (document, documentId) =>
+          withPermit(() =>
+            Effect.acquireUseRelease(
+              documents.load(document, documentId),
+              (stored) =>
+                InternalConflicts.requireSourceBudget(stored, limits).pipe(
+                  Effect.andThen(InternalConflicts.inspect(stored.automerge, limits)),
+                  Effect.map((conflicts) => ({ snapshot: stored.snapshot, conflicts }))
+                ),
+              (stored) => Effect.sync(() => InternalAutomerge.free(stored.automerge))
+            )
+          ).pipe(
+            Effect.withSpan("SqlReplica.inspectConflicts", {
+              attributes: { "document.type": document.name }
+            })
+          ),
+        resolveConflict: (document, options) =>
+          withPermit((permit) =>
+            Effect.gen(function*() {
+              const resolution = yield* InternalConflicts.encodeResolution(options.resolution, limits)
+              const requestHash = yield* CommandExecutor.resolutionRequestHash({
+                incarnation: permit.incarnation,
+                commandId: options.commandId,
+                document,
+                documentId: options.documentId,
+                resolution
+              }).pipe(Effect.provideService(Crypto.Crypto, crypto))
+              const outcome = yield* commands.resolve(document, {
+                ...options,
+                permit,
+                requestHash
+              })
+              yield* publisher.publishPending.pipe(
+                Effect.mapError((cause) =>
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.CommandOutcomeUnknown({
+                      commandId: options.commandId,
+                      cause
+                    })
+                  })
+                )
+              )
+              return yield* CommandOutcome.committedOrFail(outcome)
+            })
+          ).pipe(
+            Effect.withSpan("SqlReplica.resolveConflict", {
+              attributes: {
+                "document.type": document.name,
+                "conflict.choice": options.resolution.choice._tag,
+                "conflict.path_depth": options.resolution.path.parents.length + 1
+              }
+            })
           ),
         mutate: <M extends Mutation.Any,>(mutation: M, options: {
           readonly commandId: Identity.CommandId
@@ -138,6 +194,16 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
           withPermit((permit) => commands.lookupMutation(mutation, commandId, permit)),
         lookupCreate: (_document, commandId) => withPermit((permit) => commands.lookupCreate(commandId, permit)),
         lookupDelete: (_document, commandId) => withPermit((permit) => commands.lookupDelete(commandId, permit)),
+        lookupConflictResolution: (document, options) =>
+          withPermit((permit) => commands.lookupResolution(document, { ...options, permit })).pipe(
+            Effect.withSpan("SqlReplica.lookupConflictResolution", {
+              attributes: {
+                "document.type": document.name,
+                "conflict.choice": options.resolution.choice._tag,
+                "conflict.path_depth": options.resolution.path.parents.length + 1
+              }
+            })
+          ),
         flush: withPermit(() => publisher.publishPending).pipe(Effect.asVoid),
         status: health.status,
         exportBackup: backups.export,

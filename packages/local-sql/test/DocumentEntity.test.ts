@@ -2,6 +2,7 @@ import { NodeCrypto } from "@effect/platform-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
+import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -46,6 +47,14 @@ describe("DocumentEntity", () => {
     maxChunkBytes: 64_000,
     maxArchiveRecords: 1_000,
     maxJsonDepth: 32,
+    maxConflictDepth: 64,
+    maxConflictNodes: 100_000,
+    maxConflictAlternatives: 10_000,
+    maxConflictPathSegments: 128,
+    maxConflictValueBytes: 16 * 1024 * 1024,
+    maxConflictSourceChanges: 100_000,
+    maxConflictSourceOperations: 100_000,
+    maxConflictSourceBytes: 64 * 1024 * 1024,
     maxSyncMessageBytes: 64_000,
     maxPeerSendMillis: 1_000,
     maxSyncChangesPerMessage: 100,
@@ -362,7 +371,7 @@ describe("DocumentEntity", () => {
   })
 
   it("persists RPCs in the shared SQL transaction without server interruption", () => {
-    for (const rpc of [DocumentEntity.Create, DocumentEntity.Mutate, DocumentEntity.Delete]) {
+    for (const rpc of [DocumentEntity.Create, DocumentEntity.Mutate, DocumentEntity.Delete, DocumentEntity.Resolve]) {
       assert.strictEqual(Context.get(rpc.annotations, ClusterSchema.Persisted), true)
       assert.strictEqual(Context.get(rpc.annotations, ClusterSchema.WithTransaction), true)
       assert.isTrue(Context.get(rpc.annotations, ClusterSchema.Uninterruptible) === "client")
@@ -388,9 +397,12 @@ describe("DocumentEntity", () => {
           mutate: (_mutation, options) =>
             Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, options.payload)),
           delete: (_document, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
+          resolve: (_document, options) =>
+            Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
           lookupCreate: (id) => Effect.succeed(CommandOutcome.unknown(id)),
           lookupMutation: (_mutation, id) => Effect.succeed(CommandOutcome.unknown(id)),
-          lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id))
+          lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id)),
+          lookupResolution: (_document, options) => Effect.succeed(CommandOutcome.unknown(options.commandId))
         })
         const receivedProvenance = yield* Ref.make<
           ReadonlyArray<{
@@ -466,6 +478,29 @@ describe("DocumentEntity", () => {
             JSON.parse(new TextDecoder().decode(deleteBytes))
           ),
           CommandOutcome.durablyCommitted(deleteCommandId, undefined)
+        )
+
+        const resolutionCommandId = yield* Identity.makeCommandId
+        const resolutionBytes = yield* client.Resolve({
+          replicaIncarnation: permit.incarnation,
+          writerGeneration: permit.writerGeneration,
+          commandId: resolutionCommandId,
+          documentType: Task.name,
+          requestHash: "resolution-hash",
+          resolution: {
+            heads: [],
+            path: {
+              parents: [],
+              target: { _tag: "Key", key: "title" }
+            },
+            choice: { _tag: "DeleteValue" }
+          }
+        })
+        assert.deepStrictEqual(
+          yield* Schema.decodeUnknownEffect(
+            Schema.toCodecJson(CommandOutcome.schema(Schema.Void, Conflict.ResolutionError))
+          )(JSON.parse(new TextDecoder().decode(resolutionBytes))),
+          CommandOutcome.durablyCommitted(resolutionCommandId, undefined)
         )
 
         const message = new Uint8Array([1, 2, 3])
@@ -580,9 +615,12 @@ describe("DocumentEntity", () => {
           mutate: (_mutation, options) =>
             Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, options.payload)),
           delete: (_document, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
+          resolve: (_document, options) =>
+            Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
           lookupCreate: (id) => Effect.succeed(CommandOutcome.unknown(id)),
           lookupMutation: (_mutation, id) => Effect.succeed(CommandOutcome.unknown(id)),
-          lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id))
+          lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id)),
+          lookupResolution: (_document, options) => Effect.succeed(CommandOutcome.unknown(options.commandId))
         })
         const sync = peerSync((_document, _documentId, _session, _input) =>
           Ref.update(syncCalls, (count) => count + 1).pipe(Effect.as(syncResult))
@@ -646,9 +684,11 @@ describe("DocumentEntity", () => {
           create: (_document, _options) => Effect.die("create should not run"),
           mutate: (_mutation, _options) => Effect.die("mutate should not run"),
           delete: (_document, _options) => Effect.die("delete should not run"),
+          resolve: (_document, _options) => Effect.die("resolve should not run"),
           lookupCreate: (id) => Effect.succeed(CommandOutcome.unknown(id)),
           lookupMutation: (_mutation, id) => Effect.succeed(CommandOutcome.unknown(id)),
-          lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id))
+          lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id)),
+          lookupResolution: (_document, options) => Effect.succeed(CommandOutcome.unknown(options.commandId))
         })
         const makeClient = yield* Entity.makeTestClient(
           DocumentEntity.DocumentEntity,

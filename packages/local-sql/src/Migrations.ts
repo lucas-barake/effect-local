@@ -1,4 +1,5 @@
 import * as Automerge from "@automerge/automerge"
+import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
@@ -19,6 +20,7 @@ export const replicaHealthIndexesChecksum = "sha256:effect-local-replica-health-
 export const documentLineageChecksum = "sha256:effect-local-document-lineage-v1"
 export const historyRewriteMarkersChecksum = "sha256:effect-local-history-rewrite-markers-v1"
 export const peerRelayStateChecksum = "sha256:effect-local-peer-relay-state-v3"
+export const documentHistoryCountersChecksum = "sha256:effect-local-document-history-counters-v1"
 
 const migration = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
@@ -641,6 +643,104 @@ const peerRelayStateMigration = Effect.gen(function*() {
     VALUES (10, 'peer_relay_state', ${peerRelayStateChecksum})`
 })
 
+const documentHistoryCountersMigration = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`ALTER TABLE effect_local_documents
+    ADD COLUMN history_changes INTEGER CHECK (history_changes IS NULL OR history_changes >= 0)`
+  yield* sql`ALTER TABLE effect_local_documents
+    ADD COLUMN history_operations INTEGER CHECK (history_operations IS NULL OR history_operations >= 0)`
+  yield* sql`ALTER TABLE effect_local_documents
+    ADD COLUMN history_bytes INTEGER CHECK (history_bytes IS NULL OR history_bytes >= 0)`
+
+  const documents = yield* sql<{
+    readonly document_id: string
+    readonly document_type: string
+    readonly materialized_heads: string
+  }>`SELECT document_id, document_type, materialized_heads
+    FROM effect_local_documents AS document
+    WHERE NOT EXISTS (
+      SELECT 1 FROM effect_local_checkpoints AS checkpoint
+      WHERE checkpoint.document_id = document.document_id
+    )`
+
+  const decodeHeads = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Array(Schema.String)))
+  for (const document of documents) {
+    const size = (yield* sql<{
+      readonly change_count: number
+      readonly change_bytes: number
+    }>`SELECT
+        COUNT(*) AS change_count,
+        COALESCE(SUM(length(bytes)), 0) AS change_bytes
+      FROM effect_local_changes
+      WHERE document_id = ${document.document_id}`)[0]
+    if (
+      size === undefined ||
+      size.change_count > ReplicaLimits.maxConflictSourceChangesHardLimit ||
+      size.change_bytes > ReplicaLimits.maxConflictSourceBytesHardLimit
+    ) continue
+
+    const changes = yield* sql<{
+      readonly applied: number
+      readonly actor: string
+      readonly bytes: Uint8Array
+      readonly change_hash: string
+      readonly dependencies: string
+      readonly document_type: string
+      readonly sequence: number
+    }>`SELECT applied, actor, bytes, change_hash, dependencies, document_type, sequence
+      FROM effect_local_changes
+      WHERE document_id = ${document.document_id}
+      ORDER BY commit_sequence, sequence, change_hash`
+
+    const counters = yield* Effect.option(Effect.try({
+      try: () => {
+        let operations = 0
+        for (const change of changes) {
+          const decoded = Automerge.decodeChange(change.bytes)
+          operations += decoded.ops.length
+          if (
+            operations > ReplicaLimits.maxConflictSourceOperationsHardLimit ||
+            change.document_type !== document.document_type ||
+            decoded.hash !== change.change_hash ||
+            decoded.actor !== change.actor ||
+            decoded.seq !== change.sequence ||
+            JSON.stringify(decoded.deps) !== change.dependencies
+          ) throw new TypeError(`Invalid retained change ${change.change_hash}`)
+        }
+
+        let recovered = Automerge.init()
+        try {
+          const applied = changes.filter((change) => change.applied === 1)
+          recovered = Automerge.applyChanges(recovered, applied.map((change) => change.bytes))[0]
+          const expectedHeads = decodeHeads(document.materialized_heads)
+          const observedHeads = Automerge.getHeads(recovered)
+          if (
+            observedHeads.length !== expectedHeads.length ||
+            !Automerge.hasHeads(recovered, [...expectedHeads])
+          ) throw new TypeError(`Incomplete retained history for ${document.document_id}`)
+          return {
+            changes: changes.length,
+            operations,
+            bytes: size.change_bytes
+          }
+        } finally {
+          Automerge.free(recovered)
+        }
+      },
+      catch: (cause) => cause
+    }))
+    if (Option.isNone(counters)) continue
+    yield* sql`UPDATE effect_local_documents SET
+      history_changes = ${counters.value.changes},
+      history_operations = ${counters.value.operations},
+      history_bytes = ${counters.value.bytes}
+      WHERE document_id = ${document.document_id}`
+  }
+
+  yield* sql`INSERT INTO effect_local_migration_catalog (migration_id, name, checksum)
+    VALUES (11, 'document_history_counters', ${documentHistoryCountersChecksum})`
+})
+
 export const loader = Migrator.fromRecord({
   "1_canonical_store": migration,
   "2_peer_sync": peerSyncMigration,
@@ -651,7 +751,8 @@ export const loader = Migrator.fromRecord({
   "7_replica_health_indexes": replicaHealthIndexesMigration,
   "8_document_lineage": documentLineageMigration,
   "9_history_rewrite_markers": historyRewriteMarkersMigration,
-  "10_peer_relay_state": peerRelayStateMigration
+  "10_peer_relay_state": peerRelayStateMigration,
+  "11_document_history_counters": documentHistoryCountersMigration
 })
 
 const migrate = Migrator.make({})({ loader, table: "effect_local_migrations" })
@@ -699,6 +800,12 @@ export const run = Effect.gen(function*() {
       name: "peer_relay_state",
       checksum: peerRelayStateChecksum,
       label: "Peer relay state"
+    },
+    {
+      id: 11,
+      name: "document_history_counters",
+      checksum: documentHistoryCountersChecksum,
+      label: "Document history counters"
     }
   ] as const
   // One transaction over migrate + validation so a rejected catalog rolls back

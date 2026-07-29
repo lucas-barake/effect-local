@@ -2,6 +2,8 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Schema from "effect/Schema"
 import * as WriterProvenance from "./writerProvenance.js"
 
+const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+
 /**
  * Result schemas for the durable tables.
  *
@@ -18,6 +20,9 @@ export const DocumentRow = Schema.Struct({
   checkpoint_hash: Schema.NullOr(Schema.String),
   document_id: Schema.String,
   document_type: Schema.String,
+  history_bytes: Schema.NullOr(NonNegativeInt),
+  history_changes: Schema.NullOr(NonNegativeInt),
+  history_operations: Schema.NullOr(NonNegativeInt),
   lineage: Identity.DocumentLineage,
   materialized_heads: Schema.String,
   observed_versions: Schema.String,

@@ -53,11 +53,61 @@ describe("DocumentStore", () => {
       const persisted = yield* store.persist(Task, documentId, created, staged)
       assert.deepStrictEqual(persisted.snapshot.value, { title: "two", labels: ["local"] })
       assert.strictEqual(persisted.commitSequence, 2)
+      const sql = yield* SqlClient.SqlClient
+      const changes = yield* sql<{ readonly bytes: Uint8Array }>`
+        SELECT bytes FROM effect_local_changes
+        WHERE document_id = ${documentId} AND applied = 1
+      `
+      assert.strictEqual(persisted.historyChanges, changes.length)
+      assert.strictEqual(
+        persisted.historyOperations,
+        changes.reduce((total, change) => total + Automerge.decodeChange(change.bytes).ops.length, 0)
+      )
+      assert.strictEqual(
+        persisted.historyBytes,
+        changes.reduce((total, change) => total + change.bytes.byteLength, 0)
+      )
       const reloaded = yield* store.load(Task, documentId)
       assert.deepStrictEqual(reloaded.snapshot, persisted.snapshot)
+      assert.strictEqual(reloaded.historyChanges, persisted.historyChanges)
+      assert.strictEqual(reloaded.historyOperations, persisted.historyOperations)
+      assert.strictEqual(reloaded.historyBytes, persisted.historyBytes)
       InternalAutomerge.free(reloaded.automerge)
       InternalAutomerge.free(persisted.automerge)
       InternalAutomerge.free(staged)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Store)))
+
+  it.effect("rejects extending an unmeasured history without durable writes", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      yield* sql`UPDATE effect_local_documents SET
+        history_changes = NULL, history_operations = NULL, history_bytes = NULL
+        WHERE document_id = ${documentId}`
+      const unmeasured = yield* store.load(Task, documentId)
+      const staged = yield* store.stage(unmeasured, (draft) => {
+        draft.title = "two"
+      })
+      const before = yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count FROM effect_local_changes WHERE document_id = ${documentId}
+      `
+      const result = yield* Effect.result(store.persist(Task, documentId, unmeasured, staged))
+      assert.strictEqual(result._tag, "Failure")
+      if (result._tag === "Failure") {
+        assert.strictEqual(result.failure.reason._tag, "QuotaExceeded")
+        if (result.failure.reason._tag === "QuotaExceeded") {
+          assert.strictEqual(result.failure.reason.resource, "unmeasured conflict source history")
+        }
+      }
+      const after = yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count FROM effect_local_changes WHERE document_id = ${documentId}
+      `
+      assert.deepStrictEqual(after, before)
+      InternalAutomerge.free(staged)
+      InternalAutomerge.free(unmeasured.automerge)
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(Store)))
 

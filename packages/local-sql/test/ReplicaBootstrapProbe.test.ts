@@ -43,7 +43,7 @@ describe("ReplicaBootstrap populated probe", () => {
   // generation insert share a transaction, so there is no half-written identity - only "migrations
   // 1..k committed, no singleton". Every rung has to recover, and the ladder also walks the probe
   // across 10, 12, 13 and 18 existing tables as later migrations add them.
-  for (let count = 1; count <= 10; count++) {
+  for (let count = 1; count <= 11; count++) {
     it.effect(`still mints an identity after only ${count} migration(s) committed`, () =>
       Effect.gen(function*() {
         yield* runPartialMigrations(count)

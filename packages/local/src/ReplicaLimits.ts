@@ -3,7 +3,17 @@ import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 
 const Limit = Schema.Int.check(Schema.isGreaterThan(0))
+const boundedLimit = (maximum: number) => Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximum))
 const utf8Bytes = (value: string): number => new TextEncoder().encode(value).byteLength
+
+export const maxConflictDepthHardLimit = 128
+export const maxConflictNodesHardLimit = 100_000
+export const maxConflictAlternativesHardLimit = 10_000
+export const maxConflictPathSegmentsHardLimit = 128
+export const maxConflictValueBytesHardLimit = 16 * 1024 * 1024
+export const maxConflictSourceChangesHardLimit = 100_000
+export const maxConflictSourceOperationsHardLimit = 100_000
+export const maxConflictSourceBytesHardLimit = 64 * 1024 * 1024
 
 export const minimumRestoreErrorBytes = [
   "_tag",
@@ -24,6 +34,14 @@ export const Values = Schema.Struct({
   maxChunkBytes: Limit,
   maxArchiveRecords: Limit,
   maxJsonDepth: Limit,
+  maxConflictDepth: boundedLimit(maxConflictDepthHardLimit),
+  maxConflictNodes: boundedLimit(maxConflictNodesHardLimit),
+  maxConflictAlternatives: boundedLimit(maxConflictAlternativesHardLimit),
+  maxConflictPathSegments: boundedLimit(maxConflictPathSegmentsHardLimit),
+  maxConflictValueBytes: boundedLimit(maxConflictValueBytesHardLimit),
+  maxConflictSourceChanges: boundedLimit(maxConflictSourceChangesHardLimit),
+  maxConflictSourceOperations: boundedLimit(maxConflictSourceOperationsHardLimit),
+  maxConflictSourceBytes: boundedLimit(maxConflictSourceBytesHardLimit),
   maxSyncMessageBytes: Limit,
   maxPeerSendMillis: Limit,
   maxSyncChangesPerMessage: Limit,

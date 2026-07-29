@@ -1,5 +1,6 @@
 import * as Backup from "@lucas-barake/effect-local/Backup"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
+import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
@@ -100,6 +101,34 @@ const storageFailure = (cause: unknown) =>
 
 const isPositiveSafeInteger = (value: unknown): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value > 0
+
+const isValidConflictLimits = (
+  value: ReplicaRpc.ConflictLimits | undefined
+): value is ReplicaRpc.ConflictLimits =>
+  value !== undefined &&
+  isPositiveSafeInteger(value.maxConflictDepth) &&
+  value.maxConflictDepth <= ReplicaLimits.maxConflictDepthHardLimit &&
+  isPositiveSafeInteger(value.maxConflictNodes) &&
+  value.maxConflictNodes <= ReplicaLimits.maxConflictNodesHardLimit &&
+  isPositiveSafeInteger(value.maxConflictAlternatives) &&
+  value.maxConflictAlternatives <= ReplicaLimits.maxConflictAlternativesHardLimit &&
+  isPositiveSafeInteger(value.maxConflictPathSegments) &&
+  value.maxConflictPathSegments <= ReplicaLimits.maxConflictPathSegmentsHardLimit &&
+  isPositiveSafeInteger(value.maxConflictValueBytes) &&
+  value.maxConflictValueBytes <= ReplicaLimits.maxConflictValueBytesHardLimit
+
+const preflightResolution = (
+  resolution: Conflict.Resolution,
+  limits: Conflict.PreflightLimits
+): Conflict.PreflightIssue | undefined => {
+  const structural = resolution.choice._tag === "ReplaceValue"
+    ? { ...resolution, choice: { ...resolution.choice, value: null } }
+    : resolution
+  return Conflict.preflightUnknown(structural, limits) ??
+    (resolution.choice._tag === "ReplaceValue"
+      ? Conflict.preflightNativeValue(resolution.choice.value, limits)
+      : undefined)
+}
 
 const isNativeErrorNamed = (value: unknown, name: string): boolean => {
   if (typeof value !== "object" || value === null) return false
@@ -235,27 +264,58 @@ export const fromRpcClient = (
             reason: new ReplicaError.CommandOutcomeUnknown({ commandId, cause })
           })
         )
-      // `cause` is the dispatch failure that sent us here, not the lookup's own. A lookup that
-      // simply finds no receipt is the same ambiguity, and the useful half of the story is why the
-      // first answer went missing.
-      const lookupOrFail = (cause: unknown) =>
-        lookup.pipe(
-          boundOperation(lookupOperation),
-          Effect.catchTags({
-            RpcClientError: () => ambiguous(cause),
-            ReplicaError: (error) => error.reason._tag === "OperationTimeout" ? ambiguous(cause) : Effect.fail(error)
+      return Effect.uninterruptibleMask((restore) => {
+        // `cause` is the dispatch failure that sent us here, not the lookup's own. A lookup that
+        // simply finds no receipt is the same ambiguity, and the useful half of the story is why the
+        // first answer went missing.
+        const lookupOrFail = (cause: unknown) =>
+          restore(lookup.pipe(boundOperation(lookupOperation))).pipe(
+            Effect.catchCause((lookupCause) => {
+              if (lookupCause.reasons.some(Cause.isInterruptReason)) {
+                return Effect.failCause(lookupCause)
+              }
+              const reason = lookupCause.reasons.length === 1 ? lookupCause.reasons[0] : undefined
+              if (reason === undefined || !Cause.isFailReason(reason)) {
+                return Effect.failCause(lookupCause)
+              }
+              if (Schema.is(RpcClientError.RpcClientError)(reason.error)) return ambiguous(cause)
+              if (
+                ReplicaError.isReplicaError(reason.error) &&
+                reason.error.reason._tag === "OperationTimeout"
+              ) {
+                return ambiguous(cause)
+              }
+              return Effect.failCause(lookupCause)
+            }),
+            Effect.flatMap((outcome) => outcome._tag === "OutcomeUnknown" ? ambiguous(cause) : Effect.succeed(outcome))
+          )
+        return restore(dispatch.pipe(boundOperation(dispatchOperation))).pipe(
+          Effect.catchCause((dispatchCause) => {
+            if (dispatchCause.reasons.some(Cause.isInterruptReason)) {
+              return Effect.failCause(dispatchCause)
+            }
+            const reason = dispatchCause.reasons.length === 1 ? dispatchCause.reasons[0] : undefined
+            if (reason === undefined || !Cause.isFailReason(reason)) {
+              return Effect.failCause(dispatchCause)
+            }
+            if (Schema.is(RpcClientError.RpcClientError)(reason.error)) {
+              return lookupOrFail(reason.error)
+            }
+            if (
+              ReplicaError.isReplicaError(reason.error) &&
+              reason.error.reason._tag === "OperationTimeout"
+            ) {
+              return lookupOrFail(reason.error)
+            }
+            return Effect.failCause(dispatchCause)
           }),
-          Effect.flatMap((outcome) => outcome._tag === "OutcomeUnknown" ? ambiguous(cause) : Effect.succeed(outcome))
+          // A postcommit publication failure can make the owner report ambiguity even though the
+          // durable receipt is already visible. Look it up before reporting the outcome as unknown.
+          Effect.flatMap((outcome) =>
+            outcome._tag === "OutcomeUnknown" ? lookupOrFail(undefined) : Effect.succeed(outcome)
+          )
         )
-      return dispatch.pipe(
-        boundOperation(dispatchOperation),
-        Effect.catchTags({
-          RpcClientError: (error) => lookupOrFail(error),
-          ReplicaError: (error) => error.reason._tag === "OperationTimeout" ? lookupOrFail(error) : Effect.fail(error)
-        }),
-        // The owner can report ambiguity of its own, with no transport failure on this side.
-        Effect.flatMap((outcome) => outcome._tag === "OutcomeUnknown" ? ambiguous(undefined) : Effect.succeed(outcome))
-      )
+      }).pipe(Effect.catchTag("RpcClientError", ambiguous))
     }
     const closeSession = (sessionId: Identity.SessionId) =>
       rpc.CloseSession({ sessionId }).pipe(boundSession("CloseSession"))
@@ -298,13 +358,14 @@ export const fromRpcClient = (
         })
       }
       if (
+        !isValidConflictLimits(lease.conflictLimits) ||
         !isPositiveSafeInteger(lease.maxChunkBytes) ||
         !isPositiveSafeInteger(lease.maxRestoreCoalesceMillis) ||
         !isPositiveSafeInteger(lease.maxRestoreErrorBytes) ||
         lease.maxRestoreErrorBytes < ReplicaLimits.minimumRestoreErrorBytes
       ) {
         yield* Effect.ignore(closeSession(sessionId))
-        return yield* protocolFailure("invalid advertised restore limits")
+        return yield* protocolFailure("invalid advertised replica limits")
       }
       if (lease.definitionHash !== definition.hash) {
         yield* Effect.ignore(closeSession(sessionId))
@@ -321,7 +382,8 @@ export const fromRpcClient = (
           ...lease,
           maxChunkBytes: lease.maxChunkBytes,
           maxRestoreCoalesceMillis: lease.maxRestoreCoalesceMillis,
-          maxRestoreErrorBytes: lease.maxRestoreErrorBytes
+          maxRestoreErrorBytes: lease.maxRestoreErrorBytes,
+          conflictLimits: lease.conflictLimits
         }
       }
     })
@@ -1161,6 +1223,107 @@ export const fromRpcClient = (
               )
             )
           ),
+      inspectConflicts: (document, documentId) =>
+        withSession(
+          "InspectConflicts",
+          (session) =>
+            rpc.InspectConflicts({
+              sessionId: session.sessionId,
+              document: document.name,
+              documentId
+            }).pipe(
+              Effect.flatMap((encoded) =>
+                Wire.decodeConflict(
+                  Conflict.inspection(Schema.Json),
+                  encoded,
+                  session.lease.conflictLimits
+                )
+              ),
+              Effect.flatMap((inspection) =>
+                Wire.decode(document.schema, inspection.snapshot.value).pipe(
+                  Effect.map((value) => ({
+                    ...inspection,
+                    snapshot: { ...inspection.snapshot, value }
+                  }))
+                )
+              )
+            )
+        ).pipe(
+          Effect.catchTag("RpcClientError", (error) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: error
+                })
+              })
+            )),
+          Effect.withSpan("ReplicaClient.inspectConflicts", {
+            attributes: { "document.type": document.name }
+          })
+        ),
+      resolveConflict: (document, options) =>
+        withSession(
+          "ResolveConflict",
+          (session) => {
+            const issue = preflightResolution(options.resolution, session.lease.conflictLimits)
+            if (issue !== undefined) {
+              return Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.ProtocolMismatch({
+                    expected: "bounded conflict resolution",
+                    observed: issue._tag
+                  })
+                })
+              )
+            }
+            const outcomeSchema = CommandOutcome.schema(Schema.Void, Conflict.ResolutionError)
+            return Wire.encodeConflict(
+              Conflict.Resolution,
+              options.resolution,
+              session.lease.conflictLimits
+            ).pipe(
+              Effect.flatMap((resolution) =>
+                recoverCommand(
+                  options.commandId,
+                  "ResolveConflict",
+                  rpc.ResolveConflict({
+                    sessionId: session.sessionId,
+                    document: document.name,
+                    commandId: options.commandId,
+                    documentId: options.documentId,
+                    resolution
+                  }).pipe(
+                    Effect.flatMap((encoded) =>
+                      Wire.decodeConflict(outcomeSchema, encoded, session.lease.conflictLimits)
+                    )
+                  ),
+                  "LookupConflictResolution",
+                  rpc.LookupConflictResolution({
+                    sessionId: session.sessionId,
+                    document: document.name,
+                    commandId: options.commandId,
+                    documentId: options.documentId,
+                    resolution
+                  }).pipe(
+                    Effect.flatMap((encoded) =>
+                      Wire.decodeConflict(outcomeSchema, encoded, session.lease.conflictLimits)
+                    )
+                  )
+                )
+              ),
+              Effect.flatMap(CommandOutcome.committedOrFail)
+            )
+          },
+          { boundOperation: false }
+        ).pipe(
+          Effect.withSpan("ReplicaClient.resolveConflict", {
+            attributes: {
+              "document.type": document.name,
+              "conflict.choice": options.resolution.choice._tag,
+              "conflict.path_depth": options.resolution.path.parents.length + 1
+            }
+          })
+        ),
       mutate: (mutation, options) =>
         Wire.encode(mutation.payloadSchema, "payload" in options ? options.payload : undefined).pipe(
           Effect.flatMap((payload) =>
@@ -1264,6 +1427,56 @@ export const fromRpcClient = (
               )),
             Effect.flatMap((outcome) => Wire.decodeOutcome(Schema.Void, Schema.Never, outcome))
           ),
+      lookupConflictResolution: (document, options) =>
+        withSession(
+          "LookupConflictResolution",
+          (session) => {
+            const issue = preflightResolution(options.resolution, session.lease.conflictLimits)
+            if (issue !== undefined) {
+              return Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.ProtocolMismatch({
+                    expected: "bounded conflict resolution",
+                    observed: issue._tag
+                  })
+                })
+              )
+            }
+            const outcomeSchema = CommandOutcome.schema(Schema.Void, Conflict.ResolutionError)
+            return Wire.encodeConflict(
+              Conflict.Resolution,
+              options.resolution,
+              session.lease.conflictLimits
+            ).pipe(
+              Effect.flatMap((resolution) =>
+                rpc.LookupConflictResolution({
+                  sessionId: session.sessionId,
+                  document: document.name,
+                  commandId: options.commandId,
+                  documentId: options.documentId,
+                  resolution
+                })
+              ),
+              Effect.flatMap((encoded) => Wire.decodeConflict(outcomeSchema, encoded, session.lease.conflictLimits))
+            )
+          }
+        ).pipe(
+          Effect.catchTag("RpcClientError", (error) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: error
+                })
+              })
+            )),
+          Effect.withSpan("ReplicaClient.lookupConflictResolution", {
+            attributes: {
+              "document.type": document.name,
+              "conflict.choice": options.resolution.choice._tag,
+              "conflict.path_depth": options.resolution.path.parents.length + 1
+            }
+          })
+        ),
       flush: withSession("Flush", (session) => rpc.Flush({ sessionId: session.sessionId })).pipe(
         Effect.catchTag("RpcClientError", (error) =>
           Effect.fail(

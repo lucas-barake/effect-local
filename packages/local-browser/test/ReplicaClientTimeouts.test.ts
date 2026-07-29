@@ -1,6 +1,8 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { assert, it } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
+import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
+import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -26,6 +28,14 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
     maxChunkBytes: 128,
     maxArchiveRecords: 100,
     maxJsonDepth: 16,
+    maxConflictDepth: 16,
+    maxConflictNodes: 10_000,
+    maxConflictAlternatives: 1_000,
+    maxConflictPathSegments: 16,
+    maxConflictValueBytes: 1024 * 1024,
+    maxConflictSourceChanges: 10_000,
+    maxConflictSourceOperations: 100_000,
+    maxConflictSourceBytes: 64 * 1024 * 1024,
     maxSyncMessageBytes: 1024,
     maxPeerSendMillis: 1_000,
     maxSyncChangesPerMessage: 10,
@@ -72,6 +82,11 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
   )
 
   const timeouts = { sessionTimeout: 1_000, operationTimeout: 2_000 }
+  const resolution = Conflict.Resolution.make({
+    heads: [],
+    path: { parents: [], target: { _tag: "Key", key: "title" } },
+    choice: { _tag: "DeleteValue" }
+  })
 
   it.effect("fails a never-responding session acquire with a typed OperationTimeout", () =>
     Effect.gen(function*() {
@@ -349,6 +364,141 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
       assert.strictEqual(createCalls, 1)
       assert.strictEqual(lookupCalls, 1)
       assert.isTrue(yield* Deferred.isDone(lookupInterrupted))
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("recovers a timed out conflict resolution through lookup", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      let dispatches = 0
+      let lookups = 0
+      const delayed = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property === "ResolveConflict") {
+            return (payload: never) => {
+              dispatches++
+              return value(payload).pipe(Effect.andThen(Effect.never))
+            }
+          }
+          if (property === "LookupConflictResolution") {
+            return (payload: never) =>
+              Effect.sync(() => {
+                lookups++
+              }).pipe(Effect.andThen(value(payload)))
+          }
+          return value
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, delayed, timeouts)
+      const commandId = yield* Identity.makeCommandId
+      const fiber = yield* client.resolveConflict(Task, {
+        commandId,
+        documentId,
+        resolution
+      }).pipe(Effect.forkChild)
+      yield* TestClock.adjust(timeouts.operationTimeout)
+      yield* Fiber.join(fiber)
+      assert.strictEqual(dispatches, 1)
+      assert.strictEqual(lookups, 1)
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("reports unknown when a timed out conflict lookup also times out", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const lookupStarted = yield* Deferred.make<void>()
+      const lookupInterrupted = yield* Deferred.make<void>()
+      let dispatches = 0
+      let lookups = 0
+      const delayed = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property === "ResolveConflict") {
+            return (payload: never) => {
+              dispatches++
+              return value(payload).pipe(Effect.andThen(Effect.never))
+            }
+          }
+          if (property === "LookupConflictResolution") {
+            return () => {
+              lookups++
+              return Deferred.succeed(lookupStarted, undefined).pipe(
+                Effect.andThen(Effect.never),
+                Effect.ensuring(Deferred.succeed(lookupInterrupted, undefined))
+              )
+            }
+          }
+          return value
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, delayed, timeouts)
+      const commandId = yield* Identity.makeCommandId
+      const fiber = yield* client.resolveConflict(Task, {
+        commandId,
+        documentId,
+        resolution
+      }).pipe(Effect.forkChild)
+      yield* TestClock.adjust(timeouts.operationTimeout)
+      yield* Deferred.await(lookupStarted)
+      yield* TestClock.adjust(timeouts.operationTimeout)
+      const error = yield* Effect.flip(Fiber.join(fiber))
+      if (!ReplicaError.isReplicaError(error)) {
+        assert.fail(`Expected ReplicaError, received ${error._tag}`)
+      }
+      assert.strictEqual(error.reason._tag, "CommandOutcomeUnknown")
+      assert.strictEqual(dispatches, 1)
+      assert.strictEqual(lookups, 1)
+      assert.isTrue(yield* Deferred.isDone(lookupInterrupted))
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("supports manual conflict lookup after caller cancellation", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const committed = yield* Deferred.make<void>()
+      let lookups = 0
+      const stalled = new Proxy(rpc, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver)
+          if (property === "ResolveConflict") {
+            return (payload: never) =>
+              value(payload).pipe(
+                Effect.tap(() => Deferred.succeed(committed, undefined)),
+                Effect.andThen(Effect.never)
+              )
+          }
+          if (property === "LookupConflictResolution") {
+            return (payload: never) =>
+              Effect.sync(() => {
+                lookups++
+              }).pipe(Effect.andThen(value(payload)))
+          }
+          return value
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, stalled, {
+        ...timeouts,
+        operationTimeout: 1_000_000_000
+      })
+      const commandId = yield* Identity.makeCommandId
+      const fiber = yield* client.resolveConflict(Task, {
+        commandId,
+        documentId,
+        resolution
+      }).pipe(Effect.forkChild)
+      yield* Deferred.await(committed)
+      assert.strictEqual(lookups, 0)
+      yield* Fiber.interrupt(fiber)
+      const exit = yield* Fiber.await(fiber)
+      assert.isTrue(Exit.isFailure(exit))
+      assert.strictEqual(lookups, 0)
+      assert.deepStrictEqual(
+        yield* client.lookupConflictResolution(Task, {
+          commandId,
+          documentId,
+          resolution
+        }),
+        CommandOutcome.durablyCommitted(commandId, undefined)
+      )
+      assert.strictEqual(lookups, 1)
     })).pipe(Effect.provide(Owner)))
 
   it.effect("keeps invalidations live after one lease renewal timeout", () =>

@@ -9,6 +9,14 @@ describe("ReplicaLimits", () => {
     maxChunkBytes: 256,
     maxArchiveRecords: 100,
     maxJsonDepth: 16,
+    maxConflictDepth: 16,
+    maxConflictNodes: 1_000,
+    maxConflictAlternatives: 100,
+    maxConflictPathSegments: 16,
+    maxConflictValueBytes: 1024,
+    maxConflictSourceChanges: 1_000,
+    maxConflictSourceOperations: 1_000,
+    maxConflictSourceBytes: 4096,
     maxSyncMessageBytes: 512,
     maxPeerSendMillis: 1_000,
     maxSyncChangesPerMessage: 10,
@@ -43,6 +51,16 @@ describe("ReplicaLimits", () => {
     "maxRestorePullMillis",
     "maxRestoreCoalesceMillis",
     "maxRestoreErrorBytes"
+  ] as const
+  const conflictLimitKeys = [
+    "maxConflictDepth",
+    "maxConflictNodes",
+    "maxConflictAlternatives",
+    "maxConflictPathSegments",
+    "maxConflictValueBytes",
+    "maxConflictSourceChanges",
+    "maxConflictSourceOperations",
+    "maxConflictSourceBytes"
   ] as const
 
   it.effect("requires and provides validated owner limits", () =>
@@ -94,6 +112,51 @@ describe("ReplicaLimits", () => {
         const error = yield* Schema.decodeUnknownEffect(ReplicaLimits.Values)(input).pipe(Effect.flip)
         assert.include(error.message, "Missing key")
         assert.include(error.message, `at ["${key}"]`)
+      }
+    }))
+
+  it.effect("requires every conflict limit at the runtime schema boundary", () =>
+    Effect.gen(function*() {
+      for (const key of conflictLimitKeys) {
+        const input: Record<string, unknown> = { ...values }
+        delete input[key]
+
+        const error = yield* Schema.decodeUnknownEffect(ReplicaLimits.Values)(input).pipe(Effect.flip)
+        assert.include(error.message, "Missing key")
+        assert.include(error.message, `at ["${key}"]`)
+      }
+    }))
+
+  it.effect("accepts exact conflict ceilings and rejects values above them", () =>
+    Effect.gen(function*() {
+      const ceilings = {
+        ...values,
+        maxConflictDepth: ReplicaLimits.maxConflictDepthHardLimit,
+        maxConflictNodes: ReplicaLimits.maxConflictNodesHardLimit,
+        maxConflictAlternatives: ReplicaLimits.maxConflictAlternativesHardLimit,
+        maxConflictPathSegments: ReplicaLimits.maxConflictPathSegmentsHardLimit,
+        maxConflictValueBytes: ReplicaLimits.maxConflictValueBytesHardLimit,
+        maxConflictSourceChanges: ReplicaLimits.maxConflictSourceChangesHardLimit,
+        maxConflictSourceOperations: ReplicaLimits.maxConflictSourceOperationsHardLimit,
+        maxConflictSourceBytes: ReplicaLimits.maxConflictSourceBytesHardLimit
+      }
+      assert.strictEqual((yield* Effect.exit(ReplicaLimits.make(ceilings)))._tag, "Success")
+
+      for (const key of conflictLimitKeys) {
+        assert.strictEqual(
+          (yield* Effect.exit(ReplicaLimits.make({
+            ...ceilings,
+            [key]: ceilings[key] + 1
+          })))._tag,
+          "Failure"
+        )
+        assert.strictEqual(
+          (yield* Effect.exit(ReplicaLimits.make({
+            ...values,
+            [key]: 0
+          })))._tag,
+          "Failure"
+        )
       }
     }))
 

@@ -133,11 +133,11 @@ describe("Migrations", () => {
       `
       assert.strictEqual(indexes.length, 0)
       const recorded = yield* sql<{ readonly migration_id: number }>`
-        SELECT migration_id FROM effect_local_migrations WHERE migration_id IN (4, 5, 6, 7, 8, 9, 10)
+        SELECT migration_id FROM effect_local_migrations WHERE migration_id IN (4, 5, 6, 7, 8, 9, 10, 11)
       `
       assert.strictEqual(recorded.length, 0)
       const catalog = yield* sql<{ readonly migration_id: number }>`
-        SELECT migration_id FROM effect_local_migration_catalog WHERE migration_id IN (4, 5, 6, 7, 8, 9, 10)
+        SELECT migration_id FROM effect_local_migration_catalog WHERE migration_id IN (4, 5, 6, 7, 8, 9, 10, 11)
       `
       assert.strictEqual(catalog.length, 0)
       const receiptPrimaryKey = yield* sql<{ readonly name: string; readonly pk: number }>`
@@ -240,7 +240,8 @@ describe("Migrations", () => {
         [7, "replica_health_indexes"],
         [8, "document_lineage"],
         [9, "history_rewrite_markers"],
-        [10, "peer_relay_state"]
+        [10, "peer_relay_state"],
+        [11, "document_history_counters"]
       ])
 
       const outbox = yield* sql<{
@@ -376,7 +377,12 @@ describe("Migrations", () => {
           name: "history_rewrite_markers",
           checksum: Migrations.historyRewriteMarkersChecksum
         },
-        { migration_id: 10, name: "peer_relay_state", checksum: Migrations.peerRelayStateChecksum }
+        { migration_id: 10, name: "peer_relay_state", checksum: Migrations.peerRelayStateChecksum },
+        {
+          migration_id: 11,
+          name: "document_history_counters",
+          checksum: Migrations.documentHistoryCountersChecksum
+        }
       ])
 
       const indexes = yield* sql<{ readonly name: string }>`
@@ -405,6 +411,91 @@ describe("Migrations", () => {
         "effect_local_peer_receipts_pending_peer",
         "effect_local_projection_registry_name_status"
       ])
+    }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
+
+  it.effect("reconstructs counters only from complete raw histories without checkpoints", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrator.make({})({
+        loader: Effect.map(Migrations.loader, (migrations) => migrations.slice(0, 10)),
+        table: "effect_local_migrations"
+      })
+
+      let source = Automerge.from(
+        { value: { title: "one" }, tombstone: false },
+        { actor: "a".repeat(32) }
+      )
+      source = Automerge.change(source, (draft) => {
+        draft.value.title = "two"
+      })
+      const rawChanges = Automerge.getAllChanges(source)
+      const decoded = rawChanges.map(Automerge.decodeChange)
+      const heads = JSON.stringify(Automerge.getHeads(source))
+      const expectedOperations = decoded.reduce((total, change) => total + change.ops.length, 0)
+      const expectedBytes = rawChanges.reduce((total, bytes) => total + bytes.byteLength, 0)
+
+      for (const documentId of ["complete", "checkpoint-backed"]) {
+        yield* sql`INSERT INTO effect_local_documents (
+          document_id, document_type, schema_version, observed_versions, materialized_heads,
+          accepted_heads, tombstone, projection_status, checkpoint_hash, lineage
+        ) VALUES (${documentId}, 'Task', 1, '[1]', ${heads}, ${heads}, 0, 'Ready', NULL, '')`
+      }
+      for (let index = 0; index < rawChanges.length; index++) {
+        const change = decoded[index]!
+        yield* sql`INSERT INTO effect_local_changes (
+          change_hash, document_id, document_type, writer_schema_version,
+          writer_definition_hash, actor, sequence, dependencies, bytes, applied,
+          peer_id, accepted_at, commit_sequence
+        ) VALUES (
+          ${change.hash}, 'complete', 'Task', 1, 'definition', ${change.actor}, ${change.seq},
+          ${JSON.stringify(change.deps)}, ${rawChanges[index]!}, 1, NULL,
+          '2026-01-01T00:00:00.000Z', ${index + 1}
+        )`
+      }
+      const checkpointBytes = Automerge.save(source)
+      yield* sql`INSERT INTO effect_local_checkpoints (
+        checkpoint_hash, document_id, heads, bytes, checksum, commit_sequence,
+        verified, writer_provenance, lineage
+      ) VALUES (
+        'checkpoint', 'checkpoint-backed', ${heads}, ${checkpointBytes}, 'checksum', 2, 1, '[]', ''
+      )`
+      yield* sql`INSERT INTO effect_local_documents (
+        document_id, document_type, schema_version, observed_versions, materialized_heads,
+        accepted_heads, tombstone, projection_status, checkpoint_hash, lineage
+      ) VALUES (
+        'incomplete', 'Task', 1, '[1]', ${JSON.stringify(["f".repeat(64)])},
+        ${JSON.stringify(["f".repeat(64)])}, 0, 'Ready', NULL, ''
+      )`
+
+      assert.deepStrictEqual(yield* Migrations.run, [[11, "document_history_counters"]])
+      const counters = yield* sql<{
+        readonly document_id: string
+        readonly history_bytes: number | null
+        readonly history_changes: number | null
+        readonly history_operations: number | null
+      }>`SELECT document_id, history_bytes, history_changes, history_operations
+        FROM effect_local_documents ORDER BY document_id`
+      assert.deepStrictEqual(counters, [
+        {
+          document_id: "checkpoint-backed",
+          history_bytes: null,
+          history_changes: null,
+          history_operations: null
+        },
+        {
+          document_id: "complete",
+          history_bytes: expectedBytes,
+          history_changes: rawChanges.length,
+          history_operations: expectedOperations
+        },
+        {
+          document_id: "incomplete",
+          history_bytes: null,
+          history_changes: null,
+          history_operations: null
+        }
+      ])
+      Automerge.free(source)
     }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
 
   it.effect("enforces relay identity, payload, and usage invariants", () =>

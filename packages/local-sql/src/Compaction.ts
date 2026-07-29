@@ -3,6 +3,7 @@ import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as DateTime from "effect/DateTime"
@@ -14,6 +15,7 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as HistoryCounters from "./internal/historyCounters.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as Recovery from "./Recovery.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -207,7 +209,7 @@ const receiptPruneBatchSize = 512
 export const layer: Layer.Layer<
   Compaction,
   never,
-  Crypto.Crypto | Recovery.Recovery | ReplicaGate.ReplicaGate | SqlClient.SqlClient
+  Crypto.Crypto | Recovery.Recovery | ReplicaGate.ReplicaGate | ReplicaLimits.ReplicaLimits | SqlClient.SqlClient
 > = Layer.effect(
   Compaction,
   Effect.gen(function*() {
@@ -215,6 +217,7 @@ export const layer: Layer.Layer<
     const digest = (value: unknown) => Canonical.digest(value).pipe(Effect.provideService(Crypto.Crypto, crypto))
     const recovery = yield* Recovery.Recovery
     const gate = yield* ReplicaGate.ReplicaGate
+    const limits = yield* ReplicaLimits.ReplicaLimits
     const sql = yield* SqlClient.SqlClient
 
     const pendingCount = SqlSchema.findOneOption({
@@ -523,6 +526,9 @@ export const layer: Layer.Layer<
         documentId: Identity.DocumentId,
         documentType: Schema.String,
         heads: Heads,
+        historyBytes: Schema.Int,
+        historyChanges: Schema.Int,
+        historyOperations: Schema.Int,
         lineage: Identity.DocumentLineage,
         priorAcceptedHeads: Schema.String,
         priorCheckpointHash: Schema.NullOr(Schema.String),
@@ -535,6 +541,9 @@ export const layer: Layer.Layer<
             materialized_heads = ${request.heads},
             accepted_heads = ${request.heads},
             checkpoint_hash = ${request.checkpointHash},
+            history_bytes = ${request.historyBytes},
+            history_changes = ${request.historyChanges},
+            history_operations = ${request.historyOperations},
             tombstone = ${request.tombstone},
             projection_status = 'Blocked',
             lineage = ${request.lineage}
@@ -1180,6 +1189,13 @@ export const layer: Layer.Layer<
             })
           })
         }
+        const history = yield* Effect.try({
+          try: () => HistoryCounters.measure(rootChanges),
+          catch: (cause) =>
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+        }).pipe(Effect.flatMap((counters) => HistoryCounters.check(counters, limits)))
         const definitionHash = yield* findDefinitionHash(undefined).pipe(
           Effect.map((row) => row.definition_hash),
           Effect.catchTag("NoSuchElementError", () =>
@@ -1279,6 +1295,9 @@ export const layer: Layer.Layer<
             documentId,
             documentType: document.name,
             heads,
+            historyBytes: history.bytes,
+            historyChanges: history.changes,
+            historyOperations: history.operations,
             lineage,
             priorAcceptedHeads,
             // The one prior read in transaction. A checkpoint hash is derived from the heads, so at

@@ -2,14 +2,18 @@ import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
+import type * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Result from "effect/Result"
+import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import { vi } from "vitest"
@@ -17,11 +21,12 @@ import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as Compaction from "../src/Compaction.js"
 import * as DocumentStore from "../src/DocumentStore.js"
 import * as InternalAutomerge from "../src/internal/automerge.js"
+import * as InternalConflicts from "../src/internal/conflicts.js"
 import * as ProjectionStore from "../src/ProjectionStore.js"
 import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
-import { withGateLimits } from "./fixtures/limits.js"
+import { gateLimits, withGateLimits } from "./fixtures/limits.js"
 import { makeProbe, probeLayer, withFault } from "./helpers/sqlProbe.js"
 
 describe("CommandExecutor", () => {
@@ -69,7 +74,7 @@ describe("CommandExecutor", () => {
   const Executor = CommandExecutor.layer(definition).pipe(Layer.provide(Dependencies))
   const RecoveryService = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(Base, Gate)))
   const CompactionService = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Base, Gate, RecoveryService)))
-  const Live = Layer.mergeAll(Base, Gate, Executor, CompactionService)
+  const Live = Layer.mergeAll(Base, Gate, Store, Executor, CompactionService)
 
   it.effect("deduplicates matching requests and rejects conflicting command reuse", () =>
     Effect.scoped(Effect.gen(function*() {
@@ -250,6 +255,152 @@ describe("CommandExecutor", () => {
       assert.strictEqual(rows[0]?.commit_sequence, 1)
     })).pipe(Effect.provide(Live)))
 
+  it.effect("durably rejects invalid resolutions and replays an exact committed resolution", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const executor = yield* CommandExecutor.CommandExecutor
+      const gate = yield* ReplicaGate.ReplicaGate
+      const store = yield* DocumentStore.DocumentStore
+      const permit = yield* gate.shared
+      const documentId = yield* Identity.makeDocumentId
+      const createCommandId = yield* Identity.makeCommandId
+      const encoded = yield* Document.encode(Task, documentId, { title: "base" })
+      const createHash = yield* CommandExecutor.createRequestHash({
+        incarnation: permit.incarnation,
+        commandId: createCommandId,
+        document: Task,
+        documentId,
+        encoded
+      })
+      yield* executor.create(Task, {
+        commandId: createCommandId,
+        documentId,
+        permit,
+        requestHash: createHash,
+        value: { title: "base" }
+      })
+
+      const durable = yield* store.load(Task, documentId)
+      yield* Effect.addFinalizer(() => Effect.sync(() => InternalAutomerge.free(durable.automerge)))
+      const initialHeads = InternalAutomerge.heads(durable.automerge)
+      const left = InternalAutomerge.stage(
+        durable.automerge,
+        "00000000000000000000000000000002",
+        (draft) => draft.title = "left"
+      )
+      const right = InternalAutomerge.stage(
+        durable.automerge,
+        "00000000000000000000000000000003",
+        (draft) => draft.title = "right"
+      )
+      yield* Effect.addFinalizer(() => Effect.sync(() => InternalAutomerge.free(right)))
+      const merged = InternalAutomerge.replay(
+        left,
+        InternalAutomerge.changesSince(right, initialHeads).map((change) => change.bytes)
+      )
+      yield* Effect.addFinalizer(() => Effect.sync(() => InternalAutomerge.free(merged)))
+      const persisted = yield* store.persist(Task, documentId, durable, merged)
+      yield* Effect.addFinalizer(() => Effect.sync(() => InternalAutomerge.free(persisted.automerge)))
+      const [record] = yield* InternalConflicts.inspect(persisted.automerge, gateLimits)
+      assert.isDefined(record)
+
+      const hashResolution = (
+        commandId: Identity.CommandId,
+        resolution: Conflict.Resolution
+      ) =>
+        InternalConflicts.encodeResolution(resolution, gateLimits).pipe(
+          Effect.flatMap((encodedResolution) =>
+            CommandExecutor.resolutionRequestHash({
+              incarnation: permit.incarnation,
+              commandId,
+              document: Task,
+              documentId,
+              resolution: encodedResolution
+            })
+          )
+        )
+
+      const invalidCommandId = yield* Identity.makeCommandId
+      const invalidResolution: Conflict.Resolution = {
+        heads: persisted.materializedHeads,
+        path: record!.path,
+        choice: { _tag: "ReplaceValue", value: 42 }
+      }
+      const invalidOutcome = yield* executor.resolve(Task, {
+        commandId: invalidCommandId,
+        documentId,
+        permit,
+        requestHash: yield* hashResolution(invalidCommandId, invalidResolution),
+        resolution: invalidResolution
+      })
+      assert.strictEqual(invalidOutcome._tag, "Rejected")
+      if (invalidOutcome._tag === "Rejected") {
+        assert.strictEqual(invalidOutcome.error._tag, "ConflictResolutionSchemaError")
+      }
+      assert.deepStrictEqual(
+        yield* executor.lookupResolution(Task, {
+          commandId: invalidCommandId,
+          documentId,
+          permit,
+          resolution: invalidResolution
+        }),
+        invalidOutcome
+      )
+
+      const afterInvalid = yield* store.load(Task, documentId)
+      yield* Effect.addFinalizer(() => Effect.sync(() => InternalAutomerge.free(afterInvalid.automerge)))
+      assert.strictEqual((yield* InternalConflicts.inspect(afterInvalid.automerge, gateLimits)).length, 1)
+
+      const commandId = yield* Identity.makeCommandId
+      const resolution: Conflict.Resolution = {
+        heads: afterInvalid.materializedHeads,
+        path: record!.path,
+        choice: {
+          _tag: "SelectAlternative",
+          alternativeId: record!.alternatives[0]!.id
+        }
+      }
+      const requestHash = yield* hashResolution(commandId, resolution)
+      const outcome = yield* executor.resolve(Task, {
+        commandId,
+        documentId,
+        permit,
+        requestHash,
+        resolution
+      })
+      assert.deepStrictEqual(outcome, CommandOutcome.durablyCommitted(commandId, undefined))
+      assert.deepStrictEqual(
+        yield* executor.resolve(Task, {
+          commandId,
+          documentId,
+          permit,
+          requestHash,
+          resolution
+        }),
+        outcome
+      )
+      assert.deepStrictEqual(
+        yield* executor.lookupResolution(Task, {
+          commandId,
+          documentId,
+          permit,
+          resolution
+        }),
+        outcome
+      )
+
+      const conflictingResolution: Conflict.Resolution = {
+        ...resolution,
+        choice: { _tag: "DeleteValue" }
+      }
+      const conflicting = yield* Effect.flip(executor.lookupResolution(Task, {
+        commandId,
+        documentId,
+        permit,
+        resolution: conflictingResolution
+      }))
+      assert.strictEqual(conflicting.reason._tag, "CommandIdConflict")
+    })).pipe(Effect.provide(Live)))
+
   it.effect("frees the staged automerge document when a mutation is rejected", () =>
     Effect.scoped(Effect.gen(function*() {
       const executor = yield* CommandExecutor.CommandExecutor
@@ -296,6 +447,44 @@ describe("CommandExecutor", () => {
       // A freed document throws on any access; a leaked one is still usable.
       assert.throws(() => InternalAutomerge.heads(staged!))
     })).pipe(Effect.provide(Live)))
+
+  it.effect("tracks a staged document before observing interruption", () =>
+    Effect.gen(function*() {
+      const acquired = yield* Deferred.make<InternalAutomerge.AnyDocument>()
+      const release = yield* Deferred.make<void>()
+      const tracked = new Set<InternalAutomerge.AnyDocument>()
+      const fiber = yield* InternalAutomerge.acquireTracked(
+        Effect.sync(() =>
+          InternalAutomerge.initialize(
+            { title: "one" },
+            "00000000000000000000000000000001"
+          )
+        ).pipe(
+          Effect.flatMap((document) =>
+            Deferred.succeed(acquired, document).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.as(document)
+            )
+          )
+        ),
+        (document) => {
+          tracked.add(document)
+          return document
+        }
+      ).pipe(
+        Effect.ensuring(Effect.sync(() => {
+          for (const document of tracked) InternalAutomerge.free(document)
+        })),
+        Effect.provideService(Scheduler.MaxOpsBeforeYield, 64),
+        Effect.forkDetach
+      )
+      const staged = yield* Deferred.await(acquired)
+      yield* Effect.sync(() => fiber.interruptUnsafe())
+      yield* Deferred.succeed(release, undefined)
+      const exit = yield* Fiber.await(fiber).pipe(Effect.timeoutOption("2 seconds"))
+      assert.strictEqual(exit._tag, "Some")
+      assert.throws(() => InternalAutomerge.heads(staged))
+    }))
 
   it.effect("round trips void delete receipts", () =>
     Effect.scoped(Effect.gen(function*() {

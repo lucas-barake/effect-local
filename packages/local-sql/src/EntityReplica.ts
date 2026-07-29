@@ -1,4 +1,5 @@
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
+import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
@@ -19,6 +20,7 @@ import * as CommitPublisher from "./CommitPublisher.js"
 import * as DocumentEntity from "./DocumentEntity.js"
 import * as DocumentStore from "./DocumentStore.js"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as InternalConflicts from "./internal/conflicts.js"
 import * as QueryExecutor from "./QueryExecutor.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 import * as ReplicaHealth from "./ReplicaHealth.js"
@@ -144,6 +146,72 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               (stored) => Effect.sync(() => InternalAutomerge.free(stored.automerge))
             )
           ),
+        inspectConflicts: (document, documentId) =>
+          withPermit(() =>
+            Effect.acquireUseRelease(
+              documents.load(document, documentId),
+              (stored) =>
+                InternalConflicts.requireSourceBudget(stored, limits).pipe(
+                  Effect.andThen(InternalConflicts.inspect(stored.automerge, limits)),
+                  Effect.map((conflicts) => ({ snapshot: stored.snapshot, conflicts }))
+                ),
+              (stored) => Effect.sync(() => InternalAutomerge.free(stored.automerge))
+            )
+          ).pipe(
+            Effect.withSpan("EntityReplica.inspectConflicts", {
+              attributes: { "document.type": document.name }
+            })
+          ),
+        resolveConflict: (document, options) =>
+          withCommandPermit(options.commandId, (permit) =>
+            Effect.gen(function*() {
+              const resolution = yield* InternalConflicts.encodeResolution(options.resolution, limits)
+              const requestHash = yield* CommandExecutor.resolutionRequestHash({
+                incarnation: permit.incarnation,
+                commandId: options.commandId,
+                document,
+                documentId: options.documentId,
+                resolution
+              }).pipe(Effect.provideService(Crypto.Crypto, crypto))
+              const result = yield* entity(options.documentId).Resolve({
+                replicaIncarnation: permit.incarnation,
+                writerGeneration: permit.writerGeneration,
+                commandId: options.commandId,
+                documentType: document.name,
+                requestHash,
+                resolution: options.resolution
+              }).pipe(
+                Effect.catchTag(["MailboxFull", "AlreadyProcessingMessage", "PersistenceError"], (cause) =>
+                  Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageUnavailable({ cause })
+                    })
+                  ))
+              )
+              const outcome = yield* decode(
+                CommandOutcome.schema(Schema.Void, Conflict.ResolutionError),
+                result
+              )
+              yield* publisher.publishPending.pipe(
+                Effect.mapError((cause) =>
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.CommandOutcomeUnknown({
+                      commandId: options.commandId,
+                      cause
+                    })
+                  })
+                )
+              )
+              return yield* CommandOutcome.committedOrFail(outcome)
+            })).pipe(
+              Effect.withSpan("EntityReplica.resolveConflict", {
+                attributes: {
+                  "document.type": document.name,
+                  "conflict.choice": options.resolution.choice._tag,
+                  "conflict.path_depth": options.resolution.path.parents.length + 1
+                }
+              })
+            ),
         mutate: <M extends Mutation.Any,>(mutation: M, options: {
           readonly commandId: Identity.CommandId
           readonly documentId: Identity.DocumentId
@@ -227,6 +295,16 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           withPermit((permit) => commands.lookupMutation(mutation, commandId, permit)),
         lookupCreate: (_document, commandId) => withPermit((permit) => commands.lookupCreate(commandId, permit)),
         lookupDelete: (_document, commandId) => withPermit((permit) => commands.lookupDelete(commandId, permit)),
+        lookupConflictResolution: (document, options) =>
+          withPermit((permit) => commands.lookupResolution(document, { ...options, permit })).pipe(
+            Effect.withSpan("EntityReplica.lookupConflictResolution", {
+              attributes: {
+                "document.type": document.name,
+                "conflict.choice": options.resolution.choice._tag,
+                "conflict.path_depth": options.resolution.path.parents.length + 1
+              }
+            })
+          ),
         flush: withPermit(() => publisher.publishPending).pipe(Effect.asVoid),
         status: health.status,
         exportBackup: backups.export,

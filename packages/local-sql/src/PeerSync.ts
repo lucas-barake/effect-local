@@ -19,6 +19,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as DocumentStore from "./DocumentStore.js"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as HistoryCounters from "./internal/historyCounters.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
@@ -632,8 +633,14 @@ const make = (
         checkpointHash: Schema.NullOr(Schema.String),
         documentId: Identity.DocumentId,
         expectedAcceptedHeads: Schema.String,
+        expectedHistoryBytes: Schema.NullOr(Schema.Int),
+        expectedHistoryChanges: Schema.NullOr(Schema.Int),
+        expectedHistoryOperations: Schema.NullOr(Schema.Int),
         expectedMaterializedHeads: Schema.String,
         expectedProjectionStatus: Schema.Literals(["Ready", "Blocked", "Rebuilding"]),
+        historyBytes: Schema.NullOr(Schema.Int),
+        historyChanges: Schema.NullOr(Schema.Int),
+        historyOperations: Schema.NullOr(Schema.Int),
         materializedHeads: Schema.String,
         projectionStatus: Schema.Literals(["Ready", "Blocked", "Rebuilding"]),
         tombstone: Schema.Int
@@ -643,12 +650,18 @@ const make = (
         sql`UPDATE effect_local_documents SET
           materialized_heads = ${request.materializedHeads},
           accepted_heads = ${request.acceptedHeads},
+          history_bytes = ${request.historyBytes},
+          history_changes = ${request.historyChanges},
+          history_operations = ${request.historyOperations},
           tombstone = ${request.tombstone},
           projection_status = ${request.projectionStatus},
           checkpoint_hash = COALESCE(${request.checkpointHash}, checkpoint_hash)
           WHERE document_id = ${request.documentId}
             AND materialized_heads = ${request.expectedMaterializedHeads}
             AND accepted_heads = ${request.expectedAcceptedHeads}
+            AND history_bytes IS ${request.expectedHistoryBytes}
+            AND history_changes IS ${request.expectedHistoryChanges}
+            AND history_operations IS ${request.expectedHistoryOperations}
             AND projection_status = ${request.expectedProjectionStatus}
           RETURNING document_id`
     })
@@ -2365,6 +2378,29 @@ const make = (
                             }))
                           })
                           const committedChangeMap = yield* validateExistingChanges(committedChanges)
+                          const newChanges = changes.flatMap((change, index) =>
+                            committedChangeMap.has(change.hash)
+                              ? []
+                              : [{
+                                bytes: changeBytes[index]!,
+                                operations: change.ops.length
+                              }]
+                          )
+                          const history = newChanges.length === 0
+                            ? {
+                              bytes: durable.historyBytes,
+                              changes: durable.historyChanges,
+                              operations: durable.historyOperations
+                            }
+                            : yield* HistoryCounters.add(
+                              {
+                                bytes: durable.historyBytes,
+                                changes: durable.historyChanges,
+                                operations: durable.historyOperations
+                              },
+                              HistoryCounters.measureDecoded(newChanges),
+                              limits
+                            )
                           yield* gate.validate(permit)
                           const commitSequence = transition ? yield* nextSequence : yield* currentSequence
                           for (let index = 0; index < changes.length; index++) {
@@ -2463,8 +2499,14 @@ const make = (
                             checkpointHash: checkpoint?.checkpointHash ?? null,
                             documentId,
                             expectedAcceptedHeads: Schema.encodeSync(Heads)(durable.acceptedHeads),
+                            expectedHistoryBytes: durable.historyBytes,
+                            expectedHistoryChanges: durable.historyChanges,
+                            expectedHistoryOperations: durable.historyOperations,
                             expectedMaterializedHeads: Schema.encodeSync(Heads)(durable.materializedHeads),
                             expectedProjectionStatus: durable.snapshot.projection,
+                            historyBytes: history.bytes,
+                            historyChanges: history.changes,
+                            historyOperations: history.operations,
                             materializedHeads: Schema.encodeSync(Heads)(materializedHeads),
                             projectionStatus: transition ? "Blocked" : durable.snapshot.projection,
                             tombstone: InternalAutomerge.tombstone(staged) ? 1 : 0

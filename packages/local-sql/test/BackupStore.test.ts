@@ -84,6 +84,14 @@ describe("BackupStore", () => {
     maxChunkBytes: 64 * 1024,
     maxArchiveRecords: 1000,
     maxJsonDepth: 32,
+    maxConflictDepth: 64,
+    maxConflictNodes: 100_000,
+    maxConflictAlternatives: 10_000,
+    maxConflictPathSegments: 128,
+    maxConflictValueBytes: 16 * 1024 * 1024,
+    maxConflictSourceChanges: 100_000,
+    maxConflictSourceOperations: 100_000,
+    maxConflictSourceBytes: 64 * 1024 * 1024,
     maxSyncMessageBytes: 64 * 1024,
     maxPeerSendMillis: 1_000,
     maxSyncChangesPerMessage: 100,
@@ -117,10 +125,10 @@ describe("BackupStore", () => {
   )
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
   const Base = Layer.merge(Database, Bootstrap)
-  const Gate = ReplicaGate.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)), Layer.provide(Base))
-  const Store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Base, Gate)))
-  const Projections = ProjectionStore.layer([]).pipe(Layer.provide(Base))
   const Limits = ReplicaLimits.layer(limits)
+  const Gate = ReplicaGate.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)), Layer.provide(Base))
+  const Store = DocumentStore.layer.pipe(Layer.provide(Layer.mergeAll(Base, Gate, Limits)))
+  const Projections = ProjectionStore.layer([]).pipe(Layer.provide(Base))
   const Health = ReplicaHealth.layer(definition, ReplicaHealth.defaultOptions).pipe(
     Layer.provide(Layer.merge(Base, Gate))
   )
@@ -134,7 +142,9 @@ describe("BackupStore", () => {
   const ProjectedBootstrap = ReplicaBootstrap.layer(projectedDefinition).pipe(Layer.provide(Database))
   const ProjectedBase = Layer.merge(Database, ProjectedBootstrap)
   const ProjectedGate = ReplicaGate.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)), Layer.provide(ProjectedBase))
-  const ProjectedStore = DocumentStore.layer.pipe(Layer.provide(Layer.merge(ProjectedBase, ProjectedGate)))
+  const ProjectedStore = DocumentStore.layer.pipe(
+    Layer.provide(Layer.mergeAll(ProjectedBase, ProjectedGate, Limits))
+  )
   const ProjectedProjections = ProjectionStore.layer([TaskListSql]).pipe(
     Layer.provide(Layer.merge(ProjectedBase, TaskListSql.layer))
   )
@@ -252,7 +262,9 @@ describe("BackupStore", () => {
   const MutatedBootstrap = ReplicaBootstrap.layer(mutatedDefinition).pipe(Layer.provide(Database))
   const MutatedBase = Layer.merge(Database, MutatedBootstrap)
   const MutatedGate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(MutatedBase))
-  const MutatedStore = DocumentStore.layer.pipe(Layer.provide(Layer.merge(MutatedBase, MutatedGate)))
+  const MutatedStore = DocumentStore.layer.pipe(
+    Layer.provide(Layer.mergeAll(MutatedBase, MutatedGate, Limits))
+  )
   const MutatedProjections = ProjectionStore.layer([]).pipe(Layer.provide(MutatedBase))
   const MutatedHealth = ReplicaHealth.layer(mutatedDefinition, ReplicaHealth.defaultOptions).pipe(
     Layer.provide(Layer.merge(MutatedBase, MutatedGate))
@@ -309,6 +321,9 @@ describe("BackupStore", () => {
       const restored = yield* store.load(Task, documentId)
       assert.strictEqual(restored.snapshot.value.title, "before")
       assert.strictEqual(restored.snapshot.projection, "Ready")
+      assert.strictEqual(restored.historyChanges, created.historyChanges)
+      assert.strictEqual(restored.historyOperations, created.historyOperations)
+      assert.strictEqual(restored.historyBytes, created.historyBytes)
       assert.deepStrictEqual(
         yield* sql<{
           readonly writer_definition_hash: string
@@ -362,6 +377,9 @@ describe("BackupStore", () => {
       ))
       const restored = yield* store.load(Task, documentId)
       assert.strictEqual(restored.snapshot.value.title, "two")
+      assert.isNull(restored.historyChanges)
+      assert.isNull(restored.historyOperations)
+      assert.isNull(restored.historyBytes)
 
       InternalAutomerge.free(restored.automerge)
       InternalAutomerge.free(persisted.automerge)
@@ -433,6 +451,51 @@ describe("BackupStore", () => {
    */
   const archiveLinesOf = (chunks: ReadonlyArray<Uint8Array>) =>
     new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n").map((line) => JSON.parse(line))
+
+  it.effect("recomputes complete raw history counters instead of trusting archive values", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "measured" })
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      const lines = archiveLinesOf(chunks)
+      const document = lines.find((line) => line.kind === "Document")!
+      document.value.history_changes = 0
+      document.value.history_operations = 0
+      document.value.history_bytes = 0
+      document.checksum = yield* Canonical.digest(document.value)
+      const end = lines.at(-1)!
+      end.value.recordsChecksum = yield* Canonical.digest(lines.slice(1, -1).map((line) => line.checksum))
+      end.checksum = yield* Canonical.digest(end.value)
+      const manifest = lines[0]!
+      for (let attempt = 0; attempt < 8; attempt++) {
+        manifest.checksum = yield* Canonical.digest(manifest.value)
+        const encoded = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+        if (manifest.value.declaredBytes === encoded.byteLength) break
+        manifest.value.declaredBytes = encoded.byteLength
+      }
+      manifest.checksum = yield* Canonical.digest(manifest.value)
+      const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+
+      yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.make(archive),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      })
+
+      const restored = yield* store.load(Task, documentId)
+      assert.strictEqual(restored.historyChanges, created.historyChanges)
+      assert.strictEqual(restored.historyOperations, created.historyOperations)
+      assert.strictEqual(restored.historyBytes, created.historyBytes)
+      assert.notStrictEqual(restored.historyChanges, 0)
+      assert.notStrictEqual(restored.historyOperations, 0)
+      assert.notStrictEqual(restored.historyBytes, 0)
+      InternalAutomerge.free(restored.automerge)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Live)))
 
   it.effect("preserves a rewritten document's lineage across export and restore", () =>
     Effect.gen(function*() {

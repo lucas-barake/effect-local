@@ -7,6 +7,14 @@ export const gateLimits: ReplicaLimits.Values = {
   maxChunkBytes: 64 * 1024,
   maxArchiveRecords: 10_000,
   maxJsonDepth: 64,
+  maxConflictDepth: 64,
+  maxConflictNodes: 100_000,
+  maxConflictAlternatives: 10_000,
+  maxConflictPathSegments: 128,
+  maxConflictValueBytes: 16 * 1024 * 1024,
+  maxConflictSourceChanges: 100_000,
+  maxConflictSourceOperations: 100_000,
+  maxConflictSourceBytes: 64 * 1024 * 1024,
   maxSyncMessageBytes: 1024 * 1024,
   maxPeerSendMillis: 10_000,
   maxSyncChangesPerMessage: 1000,
@@ -39,5 +47,5 @@ const gateLimitsLayer = ReplicaLimits.layer(gateLimits)
 
 export const withGateLimits = <ROut, E, RIn,>(
   self: Layer.Layer<ROut, E, RIn>
-): Layer.Layer<ROut, E | Schema.SchemaError, Exclude<RIn, ReplicaLimits.ReplicaLimits>> =>
-  self.pipe(Layer.provide(gateLimitsLayer))
+): Layer.Layer<ROut | ReplicaLimits.ReplicaLimits, E | Schema.SchemaError, Exclude<RIn, ReplicaLimits.ReplicaLimits>> =>
+  self.pipe(Layer.provideMerge(gateLimitsLayer))

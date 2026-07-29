@@ -1,6 +1,7 @@
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as Backup from "@lucas-barake/effect-local/Backup"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
+import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import type * as Document from "@lucas-barake/effect-local/Document"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import type * as Query from "@lucas-barake/effect-local/Query"
@@ -70,6 +71,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
             protocolVersion: ReplicaRpc.protocolVersion,
             definitionHash: definition.hash,
             ownerEpoch,
+            conflictLimits: sessions.conflictLimits,
             maxChunkBytes: sessions.maxChunkBytes,
             maxRestoreCoalesceMillis: sessions.maxRestoreCoalesceMillis,
             maxRestoreErrorBytes: sessions.maxRestoreErrorBytes
@@ -109,6 +111,100 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
                 Effect.flatMap((snapshot) =>
                   Wire.encode(definition.schema, snapshot.value).pipe(
                     Effect.map((value) => ({ ...snapshot, value }))
+                  )
+                )
+              )
+            )
+          )
+        ),
+      InspectConflicts: ({ document, documentId, sessionId }, { client }) =>
+        sessions.run(
+          sessionId,
+          client.id,
+          lookup(documents, "document", document).pipe(
+            Effect.flatMap((definition) =>
+              replica.inspectConflicts(definition, documentId).pipe(
+                Effect.flatMap((inspection) =>
+                  Wire.encode(definition.schema, inspection.snapshot.value).pipe(
+                    Effect.flatMap((value) => {
+                      const encoded = {
+                        ...inspection,
+                        snapshot: { ...inspection.snapshot, value }
+                      }
+                      const issue = Conflict.preflightUnknown(value, sessions.conflictLimits)
+                      if (issue !== undefined) {
+                        return Effect.fail(
+                          new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.ProtocolMismatch({
+                              expected: "bounded conflict inspection",
+                              observed: issue._tag
+                            })
+                          })
+                        )
+                      }
+                      for (const record of inspection.conflicts) {
+                        for (const alternative of record.alternatives) {
+                          const alternativeIssue = Conflict.preflightNativeValue(
+                            alternative.value,
+                            sessions.conflictLimits
+                          )
+                          if (alternativeIssue !== undefined) {
+                            return Effect.fail(
+                              new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.ProtocolMismatch({
+                                  expected: "bounded conflict inspection",
+                                  observed: alternativeIssue._tag
+                                })
+                              })
+                            )
+                          }
+                        }
+                      }
+                      return Wire.encodeConflict(
+                        Conflict.inspection(Schema.Json),
+                        encoded,
+                        sessions.conflictLimits
+                      )
+                    })
+                  )
+                ),
+                Effect.withSpan("ReplicaOwner.inspectConflicts", {
+                  attributes: { "document.type": definition.name }
+                })
+              )
+            )
+          )
+        ),
+      ResolveConflict: ({ commandId, document, documentId, resolution, sessionId }, { client }) =>
+        sessions.run(
+          sessionId,
+          client.id,
+          lookup(documents, "document", document).pipe(
+            Effect.flatMap((definition) =>
+              Wire.decodeConflict(Conflict.Resolution, resolution, sessions.conflictLimits).pipe(
+                Effect.flatMap((decoded) =>
+                  CommandOutcome.toOutcome(
+                    commandId,
+                    replica.resolveConflict(definition, {
+                      commandId,
+                      documentId,
+                      resolution: decoded
+                    })
+                  ).pipe(
+                    Effect.flatMap((outcome) =>
+                      Wire.encodeConflict(
+                        CommandOutcome.schema(Schema.Void, Conflict.ResolutionError),
+                        outcome,
+                        sessions.conflictLimits
+                      )
+                    ),
+                    Effect.withSpan("ReplicaOwner.resolveConflict", {
+                      attributes: {
+                        "document.type": definition.name,
+                        "conflict.choice": decoded.choice._tag,
+                        "conflict.path_depth": decoded.path.parents.length + 1
+                      }
+                    })
                   )
                 )
               )
@@ -198,6 +294,42 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
             Effect.flatMap((definition) =>
               replica.lookupDelete(definition, commandId).pipe(
                 Effect.flatMap((outcome) => Wire.encodeOutcome(Schema.Void, Schema.Never, outcome))
+              )
+            )
+          )
+        ),
+      LookupConflictResolution: (
+        { commandId, document, documentId, resolution, sessionId },
+        { client }
+      ) =>
+        sessions.run(
+          sessionId,
+          client.id,
+          lookup(documents, "document", document).pipe(
+            Effect.flatMap((definition) =>
+              Wire.decodeConflict(Conflict.Resolution, resolution, sessions.conflictLimits).pipe(
+                Effect.flatMap((decoded) =>
+                  replica.lookupConflictResolution(definition, {
+                    commandId,
+                    documentId,
+                    resolution: decoded
+                  }).pipe(
+                    Effect.flatMap((outcome) =>
+                      Wire.encodeConflict(
+                        CommandOutcome.schema(Schema.Void, Conflict.ResolutionError),
+                        outcome,
+                        sessions.conflictLimits
+                      )
+                    ),
+                    Effect.withSpan("ReplicaOwner.lookupConflictResolution", {
+                      attributes: {
+                        "document.type": definition.name,
+                        "conflict.choice": decoded.choice._tag,
+                        "conflict.path_depth": decoded.path.parents.length + 1
+                      }
+                    })
+                  )
+                )
               )
             )
           )

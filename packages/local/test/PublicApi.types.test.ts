@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { Document, DocumentSet, Identity, Mutation, PeerTransport, Query, SchemaDescriptor } from "../src/index.js"
+import type { CommandOutcome, Conflict, Replica } from "../src/index.js"
 import type * as ReplicaError from "../src/ReplicaError.js"
 
 type Equal<A, B,> = (<T,>() => T extends A ? 1 : 2) extends <T,>() => T extends B ? 1 : 2 ? true : false
@@ -89,6 +90,70 @@ describe("public API types", () => {
   it("exports the schema descriptor contract", () => {
     const descriptor: SchemaDescriptor.Descriptor = SchemaDescriptor.make(Schema.String)
     assert.isDefined(descriptor)
+  })
+
+  it("preserves conflict schemas and replica operation inference", () => {
+    const nativeValue: Equal<Conflict.Value, typeof Conflict.Value.Type> = true
+    const encodedValue: Equal<Conflict.EncodedValue, Conflict.PortableValue> = true
+    const resolution: Equal<Conflict.Resolution, typeof Conflict.Resolution.Type> = true
+    const path: Equal<Conflict.Path, typeof Conflict.Path.Type> = true
+    const choice: Equal<Conflict.Choice, typeof Conflict.Choice.Type> = true
+    const inspectionError: Equal<Conflict.InspectionError, typeof Conflict.InspectionError.Type> = true
+    const resolutionError: Equal<Conflict.ResolutionError, typeof Conflict.ResolutionError.Type> = true
+
+    const assertReplicaTypes = (
+      replica: Replica.Replica["Service"],
+      documentId: Identity.DocumentId,
+      commandId: Identity.CommandId,
+      conflictResolution: Conflict.Resolution
+    ): void => {
+      const inspected = replica.inspectConflicts(Task, documentId)
+      const resolved = replica.resolveConflict(Task, {
+        commandId,
+        documentId,
+        resolution: conflictResolution
+      })
+      const lookedUp = replica.lookupConflictResolution(Task, {
+        commandId,
+        documentId,
+        resolution: conflictResolution
+      })
+      const inspectSuccess: Equal<
+        Effect.Success<typeof inspected>,
+        Conflict.Inspection<{ readonly title: string }>
+      > = true
+      const inspectError: Equal<
+        Effect.Error<typeof inspected>,
+        Conflict.InspectionError | ReplicaError.ReplicaError
+      > = true
+      const resolveSuccess: Equal<Effect.Success<typeof resolved>, void> = true
+      const resolveError: Equal<
+        Effect.Error<typeof resolved>,
+        Conflict.ResolutionError | ReplicaError.ReplicaError
+      > = true
+      const lookupSuccess: Equal<
+        Effect.Success<typeof lookedUp>,
+        CommandOutcome.CommandOutcome<void, Conflict.ResolutionError>
+      > = true
+      const lookupError: Equal<Effect.Error<typeof lookedUp>, ReplicaError.ReplicaError> = true
+      void [
+        inspectSuccess,
+        inspectError,
+        resolveSuccess,
+        resolveError,
+        lookupSuccess,
+        lookupError
+      ]
+    }
+    void assertReplicaTypes
+
+    assert.isTrue(nativeValue)
+    assert.isTrue(encodedValue)
+    assert.isTrue(resolution)
+    assert.isTrue(path)
+    assert.isTrue(choice)
+    assert.isTrue(inspectionError)
+    assert.isTrue(resolutionError)
   })
 
   it("requires acknowledged durable relay delivery", () => {

@@ -1,10 +1,12 @@
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
+import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
@@ -17,6 +19,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as DocumentStore from "./DocumentStore.js"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as InternalConflicts from "./internal/conflicts.js"
 import * as ProjectionStore from "./ProjectionStore.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
@@ -121,6 +124,23 @@ export const deleteRequestHash = (options: {
     version: options.document.version
   })
 
+export const resolutionRequestHash = (options: {
+  readonly incarnation: Identity.ReplicaIncarnation
+  readonly commandId: Identity.CommandId
+  readonly document: Document.Any
+  readonly documentId: Identity.DocumentId
+  readonly resolution: InternalConflicts.EncodedResolution
+}) =>
+  Canonical.digest({
+    incarnation: options.incarnation,
+    commandId: options.commandId,
+    document: options.document.name,
+    documentId: options.documentId,
+    operation: "resolve",
+    resolution: options.resolution,
+    version: options.document.version
+  })
+
 export class CommandExecutor extends Context.Service<CommandExecutor, {
   readonly create: <D extends Document.Any,>(
     document: D,
@@ -154,6 +174,19 @@ export class CommandExecutor extends Context.Service<CommandExecutor, {
       readonly requestHash: string
     }
   ) => Effect.Effect<CommandOutcome.CommandOutcome<void>, ReplicaError.ReplicaError>
+  readonly resolve: <D extends Document.Any,>(
+    document: D,
+    options: {
+      readonly commandId: Identity.CommandId
+      readonly documentId: Identity.DocumentId
+      readonly permit: ReplicaGate.Permit
+      readonly requestHash: string
+      readonly resolution: Conflict.Resolution
+    }
+  ) => Effect.Effect<
+    CommandOutcome.CommandOutcome<void, Conflict.ResolutionError>,
+    ReplicaError.ReplicaError
+  >
   readonly lookupCreate: (
     commandId: Identity.CommandId,
     permit: ReplicaGate.Permit
@@ -170,6 +203,18 @@ export class CommandExecutor extends Context.Service<CommandExecutor, {
     commandId: Identity.CommandId,
     permit: ReplicaGate.Permit
   ) => Effect.Effect<CommandOutcome.CommandOutcome<void>, ReplicaError.ReplicaError>
+  readonly lookupResolution: <D extends Document.Any,>(
+    document: D,
+    options: {
+      readonly commandId: Identity.CommandId
+      readonly documentId: Identity.DocumentId
+      readonly permit: ReplicaGate.Permit
+      readonly resolution: Conflict.Resolution
+    }
+  ) => Effect.Effect<
+    CommandOutcome.CommandOutcome<void, Conflict.ResolutionError>,
+    ReplicaError.ReplicaError
+  >
 }>()("@lucas-barake/effect-local-sql/CommandExecutor") {}
 
 export type MutationHandlers<D extends ReplicaDefinition.Any,> = Context.Service.Identifier<
@@ -183,6 +228,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
   | Crypto.Crypto
   | ProjectionStore.ProjectionStore
   | ReplicaGate.ReplicaGate
+  | ReplicaLimits.ReplicaLimits
   | SqlClient.SqlClient
   | MutationHandlers<D>
 > =>
@@ -193,6 +239,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
       const crypto = yield* Crypto.Crypto
       const projections = yield* ProjectionStore.ProjectionStore
       const gate = yield* ReplicaGate.ReplicaGate
+      const limits = yield* ReplicaLimits.ReplicaLimits
       const sql = yield* SqlClient.SqlClient
       const handlerContext = yield* Effect.context<MutationHandlers<D>>()
       const handlers = new Map<string, Mutation.Handler<any, any, any, any>>()
@@ -265,8 +312,23 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
         receipt: ReceiptRow
       ) => decodeResult(CommandOutcome.schema(success, error), receipt.result)
 
+      const encodeResolution = (resolution: Conflict.Resolution) =>
+        Schema.encodeEffect(Conflict.Resolution)(resolution).pipe(
+          Effect.mapError((cause) =>
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+          )
+        )
+
       const operationLabel = (mutationName: string) =>
-        mutationName === "$create" ? "create" : mutationName === "$delete" ? "delete" : mutationName
+        mutationName === "$create"
+          ? "create"
+          : mutationName === "$delete"
+          ? "delete"
+          : mutationName === "$resolve"
+          ? "resolve"
+          : mutationName
 
       const requireOperation = (
         commandId: Identity.CommandId,
@@ -386,13 +448,14 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 (typeof mutation)["successSchema"]["Type"],
                 (typeof mutation)["errorSchema"]["Type"]
               >
-              const staged = track(
-                yield* store.stage(durable, (draft) => {
+              const staged = yield* InternalAutomerge.acquireTracked(
+                store.stage(durable, (draft) => {
                   const result = handler({ draft, payload: options.payload, current: durable.snapshot.value })
                   handlerResult = SchemaAST.isNever(mutation.errorSchema.ast)
                     ? Result.succeed(result)
                     : result
-                })
+                }),
+                track
               )
               if (Result.isFailure(handlerResult)) {
                 const outcome = CommandOutcome.rejected(options.commandId, handlerResult.failure)
@@ -470,7 +533,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
               const durable = yield* store.load(document, options.documentId).pipe(
                 Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
               )
-              const staged = track(yield* store.tombstone(durable))
+              const staged = yield* InternalAutomerge.acquireTracked(store.tombstone(durable), track)
               const persisted = yield* store.persist(document, options.documentId, durable, staged).pipe(
                 Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
               )
@@ -499,6 +562,136 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 })
               ))
           ),
+        resolve: (document, options) =>
+          sql.withTransaction(withDocuments((track) =>
+            Effect.gen(function*() {
+              yield* gate.validate(options.permit)
+              const encodedResolution = yield* encodeResolution(options.resolution)
+              const expectedHash = yield* resolutionRequestHash({
+                incarnation: options.permit.incarnation,
+                commandId: options.commandId,
+                document,
+                documentId: options.documentId,
+                resolution: encodedResolution
+              }).pipe(Effect.provideService(Crypto.Crypto, crypto))
+              if (expectedHash !== options.requestHash) {
+                return yield* new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.CommandIdConflict({ commandId: options.commandId })
+                })
+              }
+              const existing = yield* lookup(options.commandId, options.permit)
+              if (Option.isSome(existing)) {
+                if (existing.value.request_hash !== expectedHash) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.CommandIdConflict({ commandId: options.commandId })
+                  })
+                }
+                yield* requireOperation(options.commandId, existing.value, "$resolve")
+                return yield* decodeReceipt(Schema.Void, Conflict.ResolutionError, existing.value)
+              }
+
+              const durable = yield* store.load(document, options.documentId).pipe(
+                Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
+              )
+              const reject = (error: Conflict.ResolutionError) =>
+                Effect.gen(function*() {
+                  const outcome = CommandOutcome.rejected(options.commandId, error)
+                  const result = yield* encodeResult(
+                    CommandOutcome.schema(Schema.Void, Conflict.ResolutionError),
+                    outcome
+                  )
+                  yield* persistReceipt({
+                    commandId: options.commandId,
+                    commitSequence: durable.commitSequence,
+                    documentId: options.documentId,
+                    heads: durable.materializedHeads,
+                    mutationName: "$resolve",
+                    permit: options.permit,
+                    requestHash: expectedHash,
+                    result
+                  })
+                  return outcome
+                })
+
+              yield* InternalConflicts.requireSourceBudget(durable, limits)
+              if (!Conflict.sameHeads(options.resolution.heads, durable.materializedHeads)) {
+                return yield* reject(
+                  new Conflict.StaleConflictResolution({
+                    expectedHeads: options.resolution.heads,
+                    observedHeads: durable.materializedHeads
+                  })
+                )
+              }
+              const preparedResult = yield* InternalConflicts.prepareResolution(
+                durable.automerge,
+                options.resolution,
+                limits
+              ).pipe(Effect.result)
+              if (Result.isFailure(preparedResult)) {
+                if (preparedResult.failure._tag === "ReplicaError") return yield* preparedResult.failure
+                return yield* reject(preparedResult.failure)
+              }
+              const prepared = preparedResult.success
+              const actor = InternalAutomerge.actorId(
+                options.permit.replicaId,
+                options.permit.writerGeneration,
+                options.documentId
+              )
+              const validationResult = yield* Effect.acquireUseRelease(
+                Effect.sync(() =>
+                  InternalAutomerge.stage(durable.automerge, actor, (draft) =>
+                    InternalConflicts.applyResolution(draft, prepared, { promoteParents: true }))
+                ),
+                (validation) =>
+                  Schema.decodeUnknownEffect(document.schema)(InternalAutomerge.value(validation)).pipe(
+                    Effect.mapError((cause) =>
+                      new Conflict.ConflictResolutionSchemaError({
+                        path: options.resolution.path,
+                        cause
+                      })
+                    )
+                  ),
+                (validation) =>
+                  Effect.sync(() =>
+                    InternalAutomerge.free(validation)
+                  )
+              ).pipe(Effect.result)
+              if (Result.isFailure(validationResult)) return yield* reject(validationResult.failure)
+
+              const staged = yield* InternalAutomerge.acquireTracked(
+                store.stage(durable, (draft) =>
+                  InternalConflicts.applyResolution(draft, prepared, { promoteParents: false })),
+                track
+              )
+              const persisted = yield* store.persist(document, options.documentId, durable, staged).pipe(
+                Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
+              )
+              yield* projections.replaceDocument(document, persisted.snapshot, persisted.commitSequence)
+              const outcome = CommandOutcome.durablyCommitted(options.commandId, undefined)
+              const result = yield* encodeResult(
+                CommandOutcome.schema(Schema.Void, Conflict.ResolutionError),
+                outcome
+              )
+              yield* persistReceipt({
+                commandId: options.commandId,
+                commitSequence: persisted.commitSequence,
+                documentId: options.documentId,
+                heads: persisted.materializedHeads,
+                mutationName: "$resolve",
+                permit: options.permit,
+                requestHash: expectedHash,
+                result
+              })
+              return outcome
+            })
+          )).pipe(
+            Effect.catchTag("SqlError", (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({ cause })
+                })
+              ))
+          ),
         lookupCreate: (commandId, permit) =>
           lookup(commandId, permit).pipe(Effect.flatMap((receipt) =>
             Option.isNone(receipt)
@@ -522,7 +715,30 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
               : requireOperation(commandId, receipt.value, "$delete").pipe(
                 Effect.andThen(decodeReceipt(Schema.Void, Schema.Never, receipt.value))
               )
-          ))
+          )),
+        lookupResolution: (document, options) =>
+          Effect.gen(function*() {
+            yield* gate.validate(options.permit)
+            const encodedResolution = yield* encodeResolution(options.resolution)
+            const expectedHash = yield* resolutionRequestHash({
+              incarnation: options.permit.incarnation,
+              commandId: options.commandId,
+              document,
+              documentId: options.documentId,
+              resolution: encodedResolution
+            }).pipe(Effect.provideService(Crypto.Crypto, crypto))
+            const receipt = yield* lookup(options.commandId, options.permit)
+            if (Option.isNone(receipt)) {
+              return CommandOutcome.unknown(options.commandId)
+            }
+            if (receipt.value.request_hash !== expectedHash) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.CommandIdConflict({ commandId: options.commandId })
+              })
+            }
+            yield* requireOperation(options.commandId, receipt.value, "$resolve")
+            return yield* decodeReceipt(Schema.Void, Conflict.ResolutionError, receipt.value)
+          })
       })
     })
   )
