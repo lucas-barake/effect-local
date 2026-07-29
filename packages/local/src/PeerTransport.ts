@@ -17,6 +17,18 @@ export interface Capabilities {
   readonly lineageAware?: boolean
 }
 
+export interface RelayPrincipal {
+  readonly tenantId: string
+  readonly subjectId: string
+  readonly peerId: Identity.PeerId
+}
+
+export interface RelayEndpoint {
+  readonly expectedLocal: RelayPrincipal
+  readonly remote: RelayPrincipal
+  readonly relayPeerId: Identity.PeerId
+}
+
 export type PermanentRejectReason = "ProtocolInvalid" | "ApplicationRejected"
 
 export interface RelayDeliveryIdentity {
@@ -43,6 +55,7 @@ export interface AcknowledgedDelivery {
 export interface Connection {
   readonly peerId: Identity.PeerId
   readonly relayPeerId: Identity.PeerId
+  readonly relayEndpoint?: RelayEndpoint
   readonly capabilities: Capabilities
   readonly receive: Stream.Stream<AcknowledgedDelivery, ReplicaError.ReplicaError>
   readonly send: (message: Uint8Array) => Effect.Effect<void, ReplicaError.ReplicaError>

@@ -733,7 +733,44 @@ The distinction that matters:
 | `CommandOutcomeUnknown`                             | Look up the same command ID with the matching `lookup*` method |
 | Lookup answers `OutcomeUnknown`                     | Application policy decides; a new attempt is a NEW command ID  |
 | Lookup answers `Rejected` / `DurablyCommittedLocal` | The recorded answer is final                                   |
-| Deliberate new operation                            | Mint a fresh command ID with `Identity.makeCommandId`          |
+
+`DurablyCommittedLocal` proves only that the command and its canonical changes committed in local SQLite.
+Use `Replica.lookupCommandDelivery(commandId)` when application behavior also depends on relay custody.
+Use `Replica.commandDeliveryChanges(commandId)` for a long lived stream that emits the current snapshot first
+and then distinct durable changes.
+
+```ts
+const delivery = yield * replica.lookupCommandDelivery(commandId)
+
+if (
+  CommandDelivery.isRelayCustodyAccepted(
+    delivery,
+    relayPeerId,
+    remotePeerId
+  )
+) {
+  // Every local change produced by this command has durable relay custody
+  // for this exact relay and remote peer.
+}
+```
+
+The result separates command evidence from transport evidence:
+
+| Result                               | Meaning                                                                                 |
+| ------------------------------------ | --------------------------------------------------------------------------------------- |
+| `UnknownCommand`                     | No receipt exists for this command in the current replica incarnation                   |
+| `UntrackedCommand`                   | A receipt exists, but it predates command delivery tracking                             |
+| `NoChangesToDeliver`                 | The command committed without producing an Automerge change                             |
+| `TrackedCommand` with no destination | Local changes exist, but no relay message containing them has been admitted locally yet |
+| `PendingRelayCustody`                | The sender outbox retains the exact relay message and retry deadline                    |
+| `RelayCustodyAccepted`               | The relay acknowledged durable custody for the counted command changes                  |
+| `RelayCustodyUnconfirmedAtDeadline`  | The sender retry deadline passed without confirmation for the remaining command changes |
+
+Expiry is evidence that confirmation was not obtained by the deadline. It is not proof that relay custody
+failed. A valid late acknowledgement upgrades the same durable record to `RelayCustodyAccepted`. The summary is
+scoped to an exact relay peer and remote peer. It does not claim that the destination replica applied or observed
+the changes.
+| Deliberate new operation | Mint a fresh command ID with `Identity.makeCommandId` |
 
 ## Durable Node composition
 
@@ -1063,8 +1100,10 @@ const syncTask = (peerId: Identity.PeerId, documentId: Identity.DocumentId) =>
 
 The session exposes `peerId`, `connectionEpoch`, `markDirty`, `flush`, `observedByPeer(documentId)`, and
 `durableConfirmation(documentId)`. `observedByPeer` reports Automerge sync state only: the peer has all current
-local changes. It does not prove remote storage durability, which is why `durableConfirmation` currently
-returns only `false`.
+local changes. For a relay connection, `durableConfirmation` reports whether relay custody has been accepted for
+every current local change in that document for the exact connected endpoint. Direct connections still return
+`false`. Command scoped applications should prefer `lookupCommandDelivery`, since document confirmation combines
+all current local changes and is not tied to one command.
 
 One socket carries every session. `RpcPeerTransport.layer` takes an already built `PeerRpc.RpcClient` and never
 opens a connection of its own, and the relay tracks each `Open` by its own session id independently of which
@@ -1733,7 +1772,8 @@ Guarantees:
 Limitations:
 
 - Presence is expiring best effort state. It is never durable and never authorizes anything.
-- `durableConfirmation` returns only `false`; `observedByPeer` is Automerge sync state, not remote durability.
+- Relay custody confirmation proves storage by the configured relay. It does not prove destination application,
+  destination observation, or end user visibility. Direct peer sessions have no durable confirmation signal.
 - Browser storage starts as best effort and can be evicted or cleared. Request `navigator.storage.persist()`,
   report the result, and ship backup controls.
 - One mutation targets one document. There is no replicated transaction across documents; model one aggregate

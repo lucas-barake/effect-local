@@ -9,6 +9,7 @@ import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as CommandDeliveryStore from "./CommandDeliveryStore.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as PeerRelayOutboxLimits from "./PeerRelayOutboxLimits.js"
 import * as PeerSyncEnvelope from "./PeerSyncEnvelope.js"
@@ -106,8 +107,7 @@ const Row = Schema.Struct({
   encoded_size: PositiveInt,
   created_at: IsoDate,
   retry_deadline: IsoDate,
-  next_attempt_at: IsoDate,
-  custody_state: Schema.Literals(["Pending", "InFlight"])
+  next_attempt_at: IsoDate
 })
 
 const RowMetadata = Schema.Struct({
@@ -123,16 +123,6 @@ const UsageRow = Schema.Struct({
 })
 const HorizonRow = Schema.Struct({ horizon_millis: Schema.NullOr(Schema.Number) })
 const replayRowBatchSize = 500
-
-const protocolMismatch = (expected: string, observed: string) =>
-  new ReplicaError.ReplicaError({
-    reason: new ReplicaError.ProtocolMismatch({ expected, observed })
-  })
-
-const quotaExceeded = (resource: string, limit: number) =>
-  new ReplicaError.ReplicaError({
-    reason: new ReplicaError.QuotaExceeded({ resource, limit })
-  })
 
 const parseIso = (value: string): number | null => {
   const millis = Date.parse(value)
@@ -167,11 +157,19 @@ const make = Effect.gen(function*() {
   const crypto = yield* Crypto.Crypto
   const replicaLimits = yield* ReplicaLimits.ReplicaLimits
   const gate = yield* ReplicaGate.ReplicaGate
+  const deliveries = yield* CommandDeliveryStore.CommandDeliveryStore
   const limits = yield* PeerRelayOutboxLimits.PeerRelayOutboxLimits
 
   const decodeEndpoint = (input: Endpoint) =>
     Schema.decodeUnknownEffect(EndpointSchema)(input).pipe(
-      Effect.mapError(() => protocolMismatch("valid relay endpoint", "invalid relay endpoint"))
+      Effect.mapError(() =>
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.ProtocolMismatch({
+            expected: "valid relay endpoint",
+            observed: "invalid relay endpoint"
+          })
+        })
+      )
     )
 
   const findSource = SqlSchema.findAll({
@@ -241,7 +239,6 @@ const make = Effect.gen(function*() {
           AND remote_tenant_id = ${request.remoteTenantId}
           AND remote_subject_id = ${request.remoteSubjectId}
           AND remote_peer_id = ${request.remotePeerId}
-          AND custody_state = 'Pending'
           AND next_attempt_at <= ${request.now}
           AND retry_deadline > ${request.now}
         ORDER BY next_attempt_at, row_id
@@ -261,6 +258,21 @@ const make = Effect.gen(function*() {
         WHERE replica_id = ${request.replicaId}
           AND replica_incarnation = ${request.replicaIncarnation}
           AND ${sql.in("row_id", request.rowIds)}`
+  })
+
+  const findRecordedRelayMessageIds = SqlSchema.findAll({
+    Request: Schema.Struct({
+      replicaIncarnation: Identity.ReplicaIncarnation,
+      relayMessageIds: Schema.Array(Identity.RelayMessageId).check(Schema.isMinLength(1))
+    }),
+    Result: Schema.Struct({
+      relay_message_id: Identity.RelayMessageId
+    }),
+    execute: (request) =>
+      sql`SELECT relay_message_id
+        FROM effect_local_peer_relay_delivery_messages
+        WHERE replica_incarnation = ${request.replicaIncarnation}
+          AND ${sql.in("relay_message_id", request.relayMessageIds)}`
   })
 
   const insertRow = SqlSchema.findAll({
@@ -298,7 +310,7 @@ const make = Effect.gen(function*() {
         relay_message_id, outer_envelope_digest, protocol_version, payload_version,
         sender_connection_epoch, sender_sequence, document_id, document_type,
         writer_provenance, message_hash, payload, encoded_size,
-        created_at, retry_deadline, next_attempt_at, custody_state
+        created_at, retry_deadline, next_attempt_at
       ) VALUES (
         ${request.replicaId}, ${request.replicaIncarnation}, ${request.writerGeneration},
         ${request.expectedLocalTenantId}, ${request.expectedLocalSubjectId}, ${request.expectedLocalPeerId},
@@ -308,7 +320,7 @@ const make = Effect.gen(function*() {
         ${request.senderConnectionEpoch}, ${request.senderSequence}, ${request.documentId},
         ${request.documentType}, ${request.writerProvenance}, ${request.messageHash},
         ${request.payload}, ${request.encodedSize}, ${request.createdAt}, ${request.retryDeadline},
-        ${request.nextAttemptAt}, 'Pending'
+        ${request.nextAttemptAt}
       ) RETURNING row_id`
   })
 
@@ -551,7 +563,14 @@ const make = Effect.gen(function*() {
       Effect.flatMap((permit) =>
         permit.incarnation === expected
           ? Effect.void
-          : Effect.fail(protocolMismatch("current replica incarnation", "stale replica incarnation"))
+          : Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: "current replica incarnation",
+                observed: "stale replica incarnation"
+              })
+            })
+          )
       )
     )
 
@@ -563,17 +582,31 @@ const make = Effect.gen(function*() {
         input.retryHorizonMillis <= 0 ||
         input.retryHorizonMillis > limits.maxRetryHorizonMillis
       ) {
-        return yield* Effect.fail(
-          protocolMismatch(
-            `retry horizon from 1 through ${limits.maxRetryHorizonMillis}`,
-            "invalid retry horizon"
-          )
-        )
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.ProtocolMismatch({
+            expected: `retry horizon from 1 through ${limits.maxRetryHorizonMillis}`,
+            observed: "invalid retry horizon"
+          })
+        })
       }
       const permit = yield* gate.shared
       const syncEnvelope = yield* PeerSyncEnvelope.decodeSyncEnvelope(input.payload, replicaLimits).pipe(
         Effect.provideService(Crypto.Crypto, crypto)
       )
+      const changeHashes = yield* Effect.try({
+        try: () =>
+          WriterProvenance.validateExact(
+            WriterProvenance.syncMessageChangeHashes(syncEnvelope.message),
+            syncEnvelope.writerProvenance
+          ).map((entry) => entry.changeHash),
+        catch: (cause) =>
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: "writer provenance for every actual Automerge sync change",
+              observed: String(cause)
+            })
+          })
+      })
       const relayMessageId = yield* Identity.makeRelayMessageId.pipe(
         Effect.provideService(Crypto.Crypto, crypto),
         Effect.catchTag("PlatformError", (cause) =>
@@ -643,10 +676,28 @@ const make = Effect.gen(function*() {
             existingRetryDeadline === null ||
             existingRetryDeadline - existingCreatedAt !== input.retryHorizonMillis
           ) {
-            return yield* Effect.fail(
-              protocolMismatch("stable relay source operation", "conflicting relay source operation")
-            )
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: "stable relay source operation",
+                observed: "conflicting relay source operation"
+              })
+            })
           }
+          yield* deliveries.recordMessage({
+            replicaId: permit.replicaId,
+            replicaIncarnation: permit.incarnation,
+            expectedLocal: endpoint.expectedLocal,
+            remote: endpoint.remote,
+            relayPeerId: endpoint.relayPeerId,
+            relayMessageId: entry.relayMessageId,
+            outerEnvelopeDigest: entry.outerEnvelopeDigest,
+            senderConnectionEpoch: entry.senderConnectionEpoch,
+            senderSequence: entry.senderSequence,
+            documentId: entry.document.documentId,
+            createdAt: entry.createdAt,
+            retryDeadline: entry.retryDeadline,
+            changeHashes
+          })
           yield* gate.validate(permit)
           return entry
         }
@@ -660,9 +711,12 @@ const make = Effect.gen(function*() {
           maxBytes: limits.maxEncodedBytesPerRemote
         })
         if (remoteUsage.length !== 1) {
-          return yield* Effect.fail(
-            quotaExceeded("relay outbox remote quota", limits.maxMessagesPerRemote)
-          )
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.QuotaExceeded({
+              resource: "relay outbox remote quota",
+              limit: limits.maxMessagesPerRemote
+            })
+          })
         }
         const replicaUsage = yield* reserveReplica({
           replicaIncarnation: permit.incarnation,
@@ -671,9 +725,12 @@ const make = Effect.gen(function*() {
           maxBytes: limits.maxEncodedBytesPerReplica
         })
         if (replicaUsage.length !== 1) {
-          return yield* Effect.fail(
-            quotaExceeded("relay outbox replica quota", limits.maxMessagesPerReplica)
-          )
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.QuotaExceeded({
+              resource: "relay outbox replica quota",
+              limit: limits.maxMessagesPerReplica
+            })
+          })
         }
         const inserted = yield* insertRow({
           replicaIncarnation: permit.incarnation,
@@ -707,6 +764,21 @@ const make = Effect.gen(function*() {
             })
           })
         }
+        yield* deliveries.recordMessage({
+          replicaId: permit.replicaId,
+          replicaIncarnation: permit.incarnation,
+          expectedLocal: endpoint.expectedLocal,
+          remote: endpoint.remote,
+          relayPeerId: endpoint.relayPeerId,
+          relayMessageId,
+          outerEnvelopeDigest,
+          senderConnectionEpoch: syncEnvelope.connectionEpoch,
+          senderSequence: syncEnvelope.sequence,
+          documentId: syncEnvelope.documentId,
+          createdAt,
+          retryDeadline,
+          changeHashes
+        })
         yield* gate.validate(permit)
         return {
           rowId: inserted[0]!.row_id,
@@ -755,12 +827,12 @@ const make = Effect.gen(function*() {
         input.maximum <= 0 ||
         input.maximum > limits.maxMessagesPerRemote
       ) {
-        return yield* Effect.fail(
-          protocolMismatch(
-            `replay maximum from 1 through ${limits.maxMessagesPerRemote}`,
-            "invalid replay maximum"
-          )
-        )
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.ProtocolMismatch({
+            expected: `replay maximum from 1 through ${limits.maxMessagesPerRemote}`,
+            observed: "invalid replay maximum"
+          })
+        })
       }
       const permit = yield* gate.shared
       const now = new Date(yield* Clock.currentTimeMillis).toISOString()
@@ -790,6 +862,16 @@ const make = Effect.gen(function*() {
           )
         }
         const rowsById = new Map(rows.map((row) => [row.row_id, row]))
+        const recordedRelayMessageIds = new Set<Identity.RelayMessageId>()
+        for (let offset = 0; offset < rows.length; offset += replayRowBatchSize) {
+          const recorded = yield* findRecordedRelayMessageIds({
+            replicaIncarnation: permit.incarnation,
+            relayMessageIds: rows
+              .slice(offset, offset + replayRowBatchSize)
+              .map((row) => row.relay_message_id)
+          })
+          for (const row of recorded) recordedRelayMessageIds.add(row.relay_message_id)
+        }
         const entries: Array<Entry> = []
         for (const item of metadata) {
           if (
@@ -814,6 +896,20 @@ const make = Effect.gen(function*() {
             })
           }
           const entry = yield* validateRow(row, permit)
+          const syncEnvelope = yield* PeerSyncEnvelope.decodeSyncEnvelope(entry.payload, replicaLimits).pipe(
+            Effect.provideService(Crypto.Crypto, crypto)
+          )
+          const changeHashes = yield* Effect.try({
+            try: () =>
+              WriterProvenance.validateExact(
+                WriterProvenance.syncMessageChangeHashes(syncEnvelope.message),
+                syncEnvelope.writerProvenance
+              ).map((provenance) => provenance.changeHash),
+            catch: (cause) =>
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause })
+              })
+          })
           if (
             entry.expectedLocal.tenantId !== endpoint.expectedLocal.tenantId ||
             entry.expectedLocal.subjectId !== endpoint.expectedLocal.subjectId ||
@@ -823,6 +919,23 @@ const make = Effect.gen(function*() {
               reason: new ReplicaError.StorageCorrupt({
                 cause: new Error("Relay outbox local endpoint mismatch")
               })
+            })
+          }
+          if (!recordedRelayMessageIds.has(entry.relayMessageId)) {
+            yield* deliveries.recordMessage({
+              replicaId: entry.replicaId,
+              replicaIncarnation: entry.replicaIncarnation,
+              expectedLocal: entry.expectedLocal,
+              remote: entry.remote,
+              relayPeerId: entry.relayPeerId,
+              relayMessageId: entry.relayMessageId,
+              outerEnvelopeDigest: entry.outerEnvelopeDigest,
+              senderConnectionEpoch: entry.senderConnectionEpoch,
+              senderSequence: entry.senderSequence,
+              documentId: entry.document.documentId,
+              createdAt: entry.createdAt,
+              retryDeadline: entry.retryDeadline,
+              changeHashes
             })
           }
           entries.push(entry)
@@ -896,6 +1009,7 @@ const make = Effect.gen(function*() {
   const markCustody = (input: CustodyInput) =>
     Effect.scoped(Effect.gen(function*() {
       const permit = yield* gate.shared
+      const acceptedAt = new Date(yield* Clock.currentTimeMillis).toISOString()
       yield* sql.withTransaction(Effect.gen(function*() {
         const rows = yield* findRow({
           replicaId: permit.replicaId,
@@ -903,6 +1017,12 @@ const make = Effect.gen(function*() {
           relayMessageId: input.relayMessageId
         })
         if (rows.length === 0) {
+          yield* deliveries.markAccepted(
+            permit.incarnation,
+            input.relayMessageId,
+            input.outerEnvelopeDigest,
+            acceptedAt
+          )
           yield* gate.validate(permit)
           return
         }
@@ -916,10 +1036,19 @@ const make = Effect.gen(function*() {
         const row = rows[0]!
         yield* validateRow(row, permit)
         if (row.outer_envelope_digest !== input.outerEnvelopeDigest) {
-          return yield* Effect.fail(
-            protocolMismatch("matching relay outer envelope digest", "conflicting custody digest")
-          )
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: "matching relay outer envelope digest",
+              observed: "conflicting custody digest"
+            })
+          })
         }
+        yield* deliveries.markAccepted(
+          permit.incarnation,
+          input.relayMessageId,
+          input.outerEnvelopeDigest,
+          acceptedAt
+        )
         yield* decrementUsage(row)
         yield* sql`DELETE FROM effect_local_peer_relay_outbox
           WHERE row_id = ${row.row_id}
@@ -962,7 +1091,41 @@ const make = Effect.gen(function*() {
       })
       const rows = yield* query(undefined)
       for (const row of rows) {
-        yield* validateRow(row, permit)
+        const entry = yield* validateRow(row, permit)
+        const syncEnvelope = yield* PeerSyncEnvelope.decodeSyncEnvelope(entry.payload, replicaLimits).pipe(
+          Effect.provideService(Crypto.Crypto, crypto)
+        )
+        const changeHashes = yield* Effect.try({
+          try: () =>
+            WriterProvenance.validateExact(
+              WriterProvenance.syncMessageChangeHashes(syncEnvelope.message),
+              syncEnvelope.writerProvenance
+            ).map((provenance) => provenance.changeHash),
+          catch: (cause) =>
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause })
+            })
+        })
+        yield* deliveries.recordMessage({
+          replicaId: entry.replicaId,
+          replicaIncarnation: entry.replicaIncarnation,
+          expectedLocal: entry.expectedLocal,
+          remote: entry.remote,
+          relayPeerId: entry.relayPeerId,
+          relayMessageId: entry.relayMessageId,
+          outerEnvelopeDigest: entry.outerEnvelopeDigest,
+          senderConnectionEpoch: entry.senderConnectionEpoch,
+          senderSequence: entry.senderSequence,
+          documentId: entry.document.documentId,
+          createdAt: entry.createdAt,
+          retryDeadline: entry.retryDeadline,
+          changeHashes
+        })
+        yield* deliveries.markUnconfirmed(
+          permit.incarnation,
+          row.relay_message_id,
+          now
+        )
         yield* decrementUsage(row)
         yield* sql`DELETE FROM effect_local_peer_relay_outbox
           WHERE row_id = ${row.row_id}
@@ -1055,4 +1218,6 @@ export const layerSql: Layer.Layer<
   PeerRelayOutbox,
   never,
   Requirements
-> = Layer.effect(PeerRelayOutbox, make)
+> = Layer.effect(PeerRelayOutbox, make).pipe(
+  Layer.provide(CommandDeliveryStore.layer)
+)

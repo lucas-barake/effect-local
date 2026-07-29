@@ -30,6 +30,8 @@ describe("Migrations", () => {
         "effect_local_peer_receipts_pending_peer",
         "effect_local_peer_receipts_relay_expiry",
         "effect_local_peer_receipts_relay_identity",
+        "effect_local_peer_relay_delivery_changes_hash",
+        "effect_local_peer_relay_delivery_messages_document",
         "effect_local_peer_relay_outbox_due_endpoint",
         "effect_local_peer_relay_outbox_retry_deadline"
       ])
@@ -240,7 +242,8 @@ describe("Migrations", () => {
         [7, "replica_health_indexes"],
         [8, "document_lineage"],
         [9, "history_rewrite_markers"],
-        [10, "peer_relay_state"]
+        [10, "peer_relay_state"],
+        [11, "command_delivery"]
       ])
 
       const outbox = yield* sql<{
@@ -376,7 +379,8 @@ describe("Migrations", () => {
           name: "history_rewrite_markers",
           checksum: Migrations.historyRewriteMarkersChecksum
         },
-        { migration_id: 10, name: "peer_relay_state", checksum: Migrations.peerRelayStateChecksum }
+        { migration_id: 10, name: "peer_relay_state", checksum: Migrations.peerRelayStateChecksum },
+        { migration_id: 11, name: "command_delivery", checksum: Migrations.commandDeliveryChecksum }
       ])
 
       const indexes = yield* sql<{ readonly name: string }>`
@@ -488,7 +492,7 @@ describe("Migrations", () => {
           relay_message_id, outer_envelope_digest, protocol_version, payload_version,
           sender_connection_epoch, sender_sequence, document_id, document_type,
           writer_provenance, message_hash, payload, encoded_size,
-          created_at, retry_deadline, next_attempt_at, custody_state
+          created_at, retry_deadline, next_attempt_at
         ) VALUES (
           'rep_00000000-0000-4000-8000-000000000011', 0, ${writerGeneration},
           'tenant-1', 'subject-local', 'peer-local',
@@ -498,7 +502,7 @@ describe("Migrations", () => {
           'doc_00000000-0000-4000-8000-000000000001', 'Task',
           '[]', ${"e".repeat(64)}, ${payload}, ${payload.byteLength},
           '2026-01-01T00:00:00.000Z', '2026-01-08T00:00:00.000Z',
-          '2026-01-01T00:00:00.000Z', 'Pending'
+          '2026-01-01T00:00:00.000Z'
         )`
       yield* insertRelayOutbox("relay-outbox-1", 1)
       assert.strictEqual(

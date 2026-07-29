@@ -2,6 +2,7 @@ import * as Context from "effect/Context"
 import type * as Effect from "effect/Effect"
 import type * as Stream from "effect/Stream"
 import type * as Backup from "./Backup.js"
+import type * as CommandDelivery from "./CommandDelivery.js"
 import type * as CommandOutcome from "./CommandOutcome.js"
 import type * as Document from "./Document.js"
 import type * as Identity from "./Identity.js"
@@ -60,6 +61,12 @@ export class Replica extends Context.Service<Replica, {
     document: D,
     commandId: Identity.CommandId
   ) => Effect.Effect<CommandOutcome.CommandOutcome<void>, ReplicaError.ReplicaError>
+  readonly lookupCommandDelivery: (
+    commandId: Identity.CommandId
+  ) => Effect.Effect<CommandDelivery.CommandDelivery, ReplicaError.ReplicaError>
+  readonly commandDeliveryChanges: (
+    commandId: Identity.CommandId
+  ) => Stream.Stream<CommandDelivery.CommandDelivery, ReplicaError.ReplicaError>
   readonly flush: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly status: Stream.Stream<ReplicaStatus.ReplicaStatus, ReplicaError.ReplicaError>
   readonly exportBackup: (options: Backup.ExportOptions) => Stream.Stream<Uint8Array, ReplicaError.ReplicaError>

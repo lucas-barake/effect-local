@@ -17,6 +17,8 @@ import type * as Migrator from "effect/unstable/sql/Migrator"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as BackupStore from "./BackupStore.js"
+import * as CommandDeliveryPublisher from "./CommandDeliveryPublisher.js"
+import * as CommandDeliveryStore from "./CommandDeliveryStore.js"
 import * as CommandExecutor from "./CommandExecutor.js"
 import * as CommitPublisher from "./CommitPublisher.js"
 import * as Compaction from "./Compaction.js"
@@ -43,6 +45,8 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
   never,
   | BackupStore.BackupStore
   | CommandExecutor.CommandExecutor
+  | CommandDeliveryPublisher.CommandDeliveryPublisher
+  | CommandDeliveryStore.CommandDeliveryStore
   | CommitPublisher.CommitPublisher
   | DocumentStore.DocumentStore
   | QueryExecutor.QueryExecutor
@@ -55,6 +59,8 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
     Effect.gen(function*() {
       const backups = yield* BackupStore.BackupStore
       const commands = yield* CommandExecutor.CommandExecutor
+      const deliveryPublisher = yield* CommandDeliveryPublisher.CommandDeliveryPublisher
+      const deliveries = yield* CommandDeliveryStore.CommandDeliveryStore
       const publisher = yield* CommitPublisher.CommitPublisher
       const documents = yield* DocumentStore.DocumentStore
       const queries = yield* QueryExecutor.QueryExecutor
@@ -80,6 +86,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
               }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               const outcome = yield* commands.create(document, { ...options, documentId, permit, requestHash })
               yield* publisher.publishPending
+              yield* deliveryPublisher.publishPending.pipe(Effect.catchTag("ReplicaError", () => Effect.void))
               return yield* CommandOutcome.committedOrFail(outcome)
             })
           ),
@@ -118,6 +125,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
               }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               const outcome = yield* commands.mutate(mutation, { ...options, payload, permit, requestHash })
               yield* publisher.publishPending
+              yield* deliveryPublisher.publishPending.pipe(Effect.catchTag("ReplicaError", () => Effect.void))
               return yield* CommandOutcome.committedOrFail(outcome)
             })
           ),
@@ -132,6 +140,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
               }).pipe(Effect.provideService(Crypto.Crypto, crypto))
               const outcome = yield* commands.delete(document, { ...options, permit, requestHash })
               yield* publisher.publishPending
+              yield* deliveryPublisher.publishPending.pipe(Effect.catchTag("ReplicaError", () => Effect.void))
               return yield* CommandOutcome.committedOrFail(outcome)
             })
           ),
@@ -140,12 +149,19 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
           withPermit((permit) => commands.lookupMutation(mutation, commandId, permit)),
         lookupCreate: (_document, commandId) => withPermit((permit) => commands.lookupCreate(commandId, permit)),
         lookupDelete: (_document, commandId) => withPermit((permit) => commands.lookupDelete(commandId, permit)),
-        flush: withPermit(() => publisher.publishPending).pipe(Effect.asVoid),
+        lookupCommandDelivery: (commandId) => deliveries.lookup(commandId),
+        commandDeliveryChanges: (commandId) => deliveryPublisher.changes(commandId),
+        flush: withPermit(() =>
+          Effect.all([publisher.publishPending, deliveryPublisher.publishPending], { discard: true })
+        ),
         status: health.status,
         exportBackup: backups.export,
         restoreBackup: (options) =>
           backups.restore(options).pipe(
-            Effect.ensuring(publisher.invalidate(ReplicaDefinition.invalidationKeys(definition)))
+            Effect.ensuring(Effect.all([
+              publisher.invalidate(ReplicaDefinition.invalidationKeys(definition)),
+              deliveryPublisher.refresh.pipe(Effect.catch(() => Effect.void))
+            ], { discard: true }))
           ),
         exportDocument: (document, documentId) =>
           withPermit(() =>
@@ -208,8 +224,18 @@ const makeBase = <
     Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
   )
   const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
-  const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
-  return { backups, compaction, connections: PeerConnectionStatus.layer }
+  const deliveryStore = CommandDeliveryStore.layer.pipe(Layer.provideMerge(gate))
+  const deliveryPublisher = CommandDeliveryPublisher.layer.pipe(Layer.provideMerge(deliveryStore))
+  const backups = BackupStore.layer(definition).pipe(
+    Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
+  )
+  const infrastructure = Layer.mergeAll(
+    backups,
+    compaction,
+    deliveryStore,
+    deliveryPublisher
+  )
+  return { infrastructure, connections: PeerConnectionStatus.layer }
 }
 
 export const layer = <D extends ReplicaDefinition.Any, const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
@@ -217,6 +243,7 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
 ): Layer.Layer<
   | CommitPublisher.CommitPublisher
+  | CommandDeliveryPublisher.CommandDeliveryPublisher
   | PeerConnectionStatus.PeerConnectionStatus
   | PeerConnectionStatus.Reporter
   | PeerSync.PeerSync
@@ -235,9 +262,9 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   | Crypto.Crypto
   | SqlClient.SqlClient
 > => {
-  const { backups, compaction, connections } = makeBase(definition, options)
+  const { connections, infrastructure } = makeBase(definition, options)
   const durable = DurableRuntime.layer(definition).pipe(
-    Layer.provideMerge(Layer.merge(backups, compaction))
+    Layer.provideMerge(infrastructure)
   )
   return Layer.mergeAll(
     EntityReplica.layer(definition).pipe(Layer.provideMerge(durable)),
@@ -258,6 +285,7 @@ export const layerRelay = <
   options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
 ): Layer.Layer<
   | CommitPublisher.CommitPublisher
+  | CommandDeliveryPublisher.CommandDeliveryPublisher
   | PeerConnectionStatus.PeerConnectionStatus
   | PeerConnectionStatus.Reporter
   | PeerSync.PeerSync
@@ -276,9 +304,9 @@ export const layerRelay = <
   | Crypto.Crypto
   | SqlClient.SqlClient
 > => {
-  const { backups, compaction, connections } = makeBase(definition, options)
+  const { connections, infrastructure } = makeBase(definition, options)
   const durable = DurableRuntime.layerRelay(definition).pipe(
-    Layer.provideMerge(Layer.merge(backups, compaction))
+    Layer.provideMerge(infrastructure)
   )
   return Layer.merge(
     EntityReplica.layer(definition).pipe(Layer.provideMerge(durable)),

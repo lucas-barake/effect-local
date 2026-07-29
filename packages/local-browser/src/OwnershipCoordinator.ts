@@ -2,6 +2,7 @@ import * as BrowserCrypto from "@effect/platform-browser/BrowserCrypto"
 import * as BrowserWorker from "@effect/platform-browser/BrowserWorker"
 import * as BrowserWorkerRunner from "@effect/platform-browser/BrowserWorkerRunner"
 import * as OpfsWorker from "@effect/sql-sqlite-wasm/OpfsWorker"
+import type * as CommandDeliveryPublisher from "@lucas-barake/effect-local-sql/CommandDeliveryPublisher"
 import type * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import type * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import type * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
@@ -40,6 +41,7 @@ export type EngineServices =
   | CommitPublisher.CommitPublisher
   | PeerConnectionStatus.PeerConnectionStatus
   | RelayConnectionStatus.RelayConnectionStatus
+  | CommandDeliveryPublisher.CommandDeliveryPublisher
   | Crypto.Crypto
   | SqlClient.SqlClient
 

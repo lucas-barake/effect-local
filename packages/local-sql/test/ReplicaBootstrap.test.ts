@@ -39,7 +39,7 @@ describe("ReplicaBootstrap", () => {
     Effect.gen(function*() {
       const first = yield* ReplicaBootstrap.make(definition)
       const sql = yield* SqlClient.SqlClient
-      yield* sql`UPDATE effect_local_metadata SET storage_format_version = 2 WHERE singleton = 1`
+      yield* sql`UPDATE effect_local_metadata SET storage_format_version = 3 WHERE singleton = 1`
       // a build that refuses to open the replica must not have migrated it on the way to refusing:
       // a stale catalog turns any migration attempt into a MigrationError instead of this failure
       yield* sql`DELETE FROM effect_local_migration_catalog WHERE migration_id = 6`
@@ -50,8 +50,8 @@ describe("ReplicaBootstrap", () => {
       if (result.failure._tag !== "ReplicaError") return
       assert.strictEqual(result.failure.reason._tag, "UnsupportedStorageFormatVersion")
       if (result.failure.reason._tag !== "UnsupportedStorageFormatVersion") return
-      assert.strictEqual(result.failure.reason.observedVersion, 2)
-      assert.strictEqual(result.failure.reason.supportedVersion, 1)
+      assert.strictEqual(result.failure.reason.observedVersion, 3)
+      assert.strictEqual(result.failure.reason.supportedVersion, 2)
       // the rejected open must leave the replica exactly as the previous build left it
       const metadata = yield* sql<{ readonly definition_hash: string; readonly writer_generation: number }>`
         SELECT definition_hash, writer_generation FROM effect_local_metadata WHERE singleton = 1
@@ -83,7 +83,7 @@ describe("ReplicaBootstrap", () => {
       assert.strictEqual(result.failure.reason._tag, "UnsupportedStorageFormatVersion")
       if (result.failure.reason._tag !== "UnsupportedStorageFormatVersion") return
       assert.strictEqual(result.failure.reason.observedVersion, 0)
-      assert.strictEqual(result.failure.reason.supportedVersion, 1)
+      assert.strictEqual(result.failure.reason.supportedVersion, 2)
     }).pipe(
       Effect.provide(Layer.merge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer))
     ))
@@ -104,7 +104,7 @@ describe("ReplicaBootstrap", () => {
       const metadata = yield* sql<{ readonly storage_format_version: number }>`
         SELECT storage_format_version FROM effect_local_metadata WHERE singleton = 1
       `
-      assert.deepStrictEqual(metadata, [{ storage_format_version: 1 }])
+      assert.deepStrictEqual(metadata, [{ storage_format_version: 2 }])
     }).pipe(
       Effect.provide(Layer.merge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer))
     ))

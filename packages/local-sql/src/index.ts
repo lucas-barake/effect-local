@@ -1,4 +1,6 @@
 export * as BackupStore from "./BackupStore.js"
+export * as CommandDeliveryPublisher from "./CommandDeliveryPublisher.js"
+export * as CommandDeliveryStore from "./CommandDeliveryStore.js"
 export * as CommandExecutor from "./CommandExecutor.js"
 export * as CommitPublisher from "./CommitPublisher.js"
 export * as Compaction from "./Compaction.js"

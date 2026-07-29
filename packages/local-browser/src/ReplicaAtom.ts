@@ -17,6 +17,7 @@ import * as Stream from "effect/Stream"
 import { Atom } from "effect/unstable/reactivity"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as ReplicaClient from "./ReplicaClient.js"
+import * as ReplicaRpc from "./ReplicaRpc.js"
 
 export const layerReactivity = Layer.effectDiscard(Effect.gen(function*() {
   const replica = yield* ReplicaClient.ReplicaClient
@@ -58,6 +59,17 @@ export const documentFamily = <R, E, D extends Document.Any,>(
   Atom.family((documentId: Identity.DocumentId) =>
     runtime.atom(Replica.Replica.use((replica) => replica.get(document, documentId))).pipe(
       runtime.factory.withReactivity([document.name])
+    )
+  )
+
+export const commandDeliveryFamily = <R, E,>(
+  runtime: Atom.AtomRuntime<Replica.Replica | R, E>
+) =>
+  Atom.family((commandId: Identity.CommandId) =>
+    runtime.atom(
+      Replica.Replica.use((replica) => replica.lookupCommandDelivery(commandId))
+    ).pipe(
+      runtime.factory.withReactivity([ReplicaRpc.commandDeliveryInvalidationKey])
     )
   )
 

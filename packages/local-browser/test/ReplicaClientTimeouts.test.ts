@@ -20,7 +20,7 @@ import * as ReplicaClient from "../src/ReplicaClient.js"
 import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
-import { definition, documentId, replica, Task } from "./fixtures.js"
+import { definition, DeliveryPublisher, documentId, replica, Task } from "./fixtures.js"
 
 it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
   const limits = {
@@ -56,17 +56,20 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
     maxRestoreErrorBytes: 4_096
   } satisfies ReplicaLimits.Values
   const Sessions = SessionManager.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)))
-  const Publisher = Layer.succeed(
-    CommitPublisher.CommitPublisher,
-    CommitPublisher.CommitPublisher.of({
-      publishPending: Effect.succeed(0),
-      invalidate: () => Effect.void,
-      subscribe: Effect.succeed({
-        watermark: Identity.CommitSequence.make(0),
-        refreshGeneration: 0,
-        events: Stream.never
+  const Publisher = Layer.merge(
+    Layer.succeed(
+      CommitPublisher.CommitPublisher,
+      CommitPublisher.CommitPublisher.of({
+        publishPending: Effect.succeed(0),
+        invalidate: () => Effect.void,
+        subscribe: Effect.succeed({
+          watermark: Identity.CommitSequence.make(0),
+          refreshGeneration: 0,
+          events: Stream.never
+        })
       })
-    })
+    ),
+    DeliveryPublisher
   )
   const Owner = ReplicaOwner.layerHandlers(definition).pipe(
     Layer.provide(PeerConnectionStatus.layer),

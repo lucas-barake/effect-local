@@ -5,6 +5,9 @@ SQLite persistence, Automerge history, Effect Cluster command execution, and Eff
 Durable relay support adds the stable sender outbox, sender scoped recipient receipts, quota usage, maintenance, and
 restore fencing used by store and forward. These frontend and replica stores remain SQLite. The backend relay custody
 store is supplied separately by `@lucas-barake/effect-local-rpc`.
+The command delivery ledger links local command receipts to exact Automerge changes and retained relay message
+identity. `Replica.lookupCommandDelivery` and `Replica.commandDeliveryChanges` expose pending custody, accepted
+custody, and unconfirmed sender deadline expiry without retaining payload bytes after terminalization.
 Relay infrastructure keeps Automerge bytes opaque. Relay enabled `PeerSync` owns the one semantic decode and its
 existing change, dependency, and operation limits.
 Relay SQLite commits are not atomic with an external policy authority. The RPC server local gate decides whether

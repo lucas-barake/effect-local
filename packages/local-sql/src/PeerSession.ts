@@ -8,6 +8,7 @@ import * as Clock from "effect/Clock"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
@@ -15,6 +16,7 @@ import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
+import * as CommandDeliveryStore from "./CommandDeliveryStore.js"
 import * as CommitPublisher from "./CommitPublisher.js"
 import * as DocumentEntity from "./DocumentEntity.js"
 import * as PeerConnectionStatus from "./PeerConnectionStatus.js"
@@ -34,7 +36,9 @@ export interface PeerSession {
   readonly markDirty: (documentId: Identity.DocumentId) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly flush: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly observedByPeer: (documentId: Identity.DocumentId) => Effect.Effect<boolean>
-  readonly durableConfirmation: (documentId: Identity.DocumentId) => Effect.Effect<false>
+  readonly durableConfirmation: (
+    documentId: Identity.DocumentId
+  ) => Effect.Effect<boolean, ReplicaError.ReplicaError>
 }
 
 export interface SupervisedPeerSession extends PeerSession {
@@ -93,6 +97,7 @@ const makeWithTerminal = (
 > => {
   let cleanupOnError: Effect.Effect<void> = Effect.void
   return Effect.gen(function*() {
+    const deliveries = yield* Effect.serviceOption(CommandDeliveryStore.CommandDeliveryStore)
     const gate = yield* ReplicaGate.ReplicaGate
     const publisher = yield* CommitPublisher.CommitPublisher
     const limits = yield* ReplicaLimits.ReplicaLimits
@@ -730,7 +735,11 @@ const makeWithTerminal = (
       flush: guardedFlush,
       observedByPeer: (documentId) =>
         Ref.get(observed).pipe(Effect.map((values) => values.get(documentId)?.value ?? false)),
-      durableConfirmation: () => Effect.succeed(false),
+      durableConfirmation: (documentId) =>
+        Option.match(deliveries, {
+          onNone: () => Effect.succeed(false),
+          onSome: (store) => store.documentConfirmed(documentId, connection.relayEndpoint)
+        }),
       awaitDisconnect: Deferred.await(terminalFailure)
     }
     return { session: sessionValue, disconnect, failTerminal }

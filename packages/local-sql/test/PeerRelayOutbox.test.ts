@@ -17,6 +17,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import * as CommandDeliveryStore from "../src/CommandDeliveryStore.js"
 import * as PeerRelayOutbox from "../src/PeerRelayOutbox.js"
 import * as PeerRelayOutboxLimits from "../src/PeerRelayOutboxLimits.js"
 import * as PeerSyncEnvelope from "../src/PeerSyncEnvelope.js"
@@ -113,8 +114,9 @@ describe("PeerRelayOutbox", () => {
       ReplicaLimitLayer,
       PeerRelayOutboxLimits.layer(limits)
     )
+    const DeliveryStore = CommandDeliveryStore.layer.pipe(Layer.provide(Infrastructure))
     const Outbox = PeerRelayOutbox.layerSql.pipe(Layer.provide(Infrastructure))
-    return Layer.merge(Infrastructure, Outbox)
+    return Layer.mergeAll(Infrastructure, DeliveryStore, Outbox)
   }
 
   const insertDocument = Effect.gen(function*() {
@@ -154,6 +156,33 @@ describe("PeerRelayOutbox", () => {
       Automerge.free(source)
       Automerge.free(remote)
       return yield* PeerSyncEnvelope.encodeSyncEnvelope(envelope)
+    })
+
+  const trackCommand = (
+    commandId: Identity.CommandId,
+    payload: Uint8Array
+  ) =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const gate = yield* ReplicaGate.ReplicaGate
+      const permit = yield* gate.current
+      const envelope = yield* PeerSyncEnvelope.decodeSyncEnvelope(payload, replicaLimits)
+      yield* sql`INSERT INTO effect_local_command_receipts (
+        replica_incarnation, command_id, request_hash, mutation_name, result,
+        document_id, heads, commit_sequence
+      ) VALUES (
+        ${permit.incarnation}, ${commandId}, ${`request-${commandId}`}, '$create',
+        ${new TextEncoder().encode(commandId)}, ${documentId}, '[]', 1
+      )`
+      yield* sql`INSERT INTO effect_local_command_delivery_sources (
+        replica_incarnation, command_id, document_id
+      ) VALUES (${permit.incarnation}, ${commandId}, ${documentId})`
+      for (const provenance of envelope.writerProvenance) {
+        yield* sql`INSERT INTO effect_local_command_delivery_changes (
+          replica_incarnation, command_id, change_hash
+        ) VALUES (${permit.incarnation}, ${commandId}, ${provenance.changeHash})`
+      }
+      return envelope.writerProvenance.length
     })
 
   it.effect("reuses one stable admission after time advances without incrementing quota", () =>
@@ -198,6 +227,79 @@ describe("PeerRelayOutbox", () => {
         remote: { messageCount: 1, encodedBytes: payload.byteLength },
         replica: { messageCount: 1, encodedBytes: payload.byteLength }
       })
+    }).pipe(Effect.provide(layer(":memory:"))))
+
+  it.effect("reports relay custody for the exact command changes", () =>
+    Effect.gen(function*() {
+      yield* insertDocument
+      const outbox = yield* PeerRelayOutbox.PeerRelayOutbox
+      const deliveries = yield* CommandDeliveryStore.CommandDeliveryStore
+      const commandId = Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000021")
+      const payload = yield* makePayload(21)
+      const localChangeCount = yield* trackCommand(commandId, payload)
+      const entry = yield* outbox.admit({
+        ...endpoint,
+        payload,
+        retryHorizonMillis: 30_000
+      })
+
+      const pending = yield* deliveries.lookup(commandId)
+      assert.strictEqual(pending._tag, "TrackedCommand")
+      if (pending._tag !== "TrackedCommand") return
+      assert.strictEqual(pending.localChangeCount, localChangeCount)
+      assert.strictEqual(pending.destinations.length, 1)
+      assert.strictEqual(pending.destinations[0]?.state._tag, "PendingRelayCustody")
+
+      yield* outbox.markCustody({
+        relayMessageId: entry.relayMessageId,
+        outerEnvelopeDigest: entry.outerEnvelopeDigest
+      })
+      const accepted = yield* deliveries.lookup(commandId)
+      assert.strictEqual(accepted._tag, "TrackedCommand")
+      if (accepted._tag !== "TrackedCommand") return
+      assert.strictEqual(accepted.destinations[0]?.state._tag, "RelayCustodyAccepted")
+      assert.strictEqual(
+        accepted.destinations[0]?.state.acceptedChangeCount,
+        localChangeCount
+      )
+    }).pipe(Effect.provide(layer(":memory:"))))
+
+  it.effect("lets a late relay ack replace an expired unconfirmed state", () =>
+    Effect.gen(function*() {
+      yield* insertDocument
+      const outbox = yield* PeerRelayOutbox.PeerRelayOutbox
+      const deliveries = yield* CommandDeliveryStore.CommandDeliveryStore
+      const commandId = Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000022")
+      const payload = yield* makePayload(22)
+      const localChangeCount = yield* trackCommand(commandId, payload)
+      const entry = yield* outbox.admit({
+        ...endpoint,
+        payload,
+        retryHorizonMillis: 1_000
+      })
+
+      yield* TestClock.adjust("1 second")
+      assert.strictEqual(yield* outbox.pruneExpired, 1)
+      const expired = yield* deliveries.lookup(commandId)
+      assert.strictEqual(expired._tag, "TrackedCommand")
+      if (expired._tag !== "TrackedCommand") return
+      assert.strictEqual(
+        expired.destinations[0]?.state._tag,
+        "RelayCustodyUnconfirmedAtDeadline"
+      )
+
+      yield* outbox.markCustody({
+        relayMessageId: entry.relayMessageId,
+        outerEnvelopeDigest: entry.outerEnvelopeDigest
+      })
+      const accepted = yield* deliveries.lookup(commandId)
+      assert.strictEqual(accepted._tag, "TrackedCommand")
+      if (accepted._tag !== "TrackedCommand") return
+      assert.strictEqual(accepted.destinations[0]?.state._tag, "RelayCustodyAccepted")
+      assert.strictEqual(
+        accepted.destinations[0]?.state.acceptedChangeCount,
+        localChangeCount
+      )
     }).pipe(Effect.provide(layer(":memory:"))))
 
   it.effect("rejects source collisions and concurrent quota growth without changing usage", () =>
@@ -311,7 +413,7 @@ describe("PeerRelayOutbox", () => {
       )
 
       assert.strictEqual(entries.length, 8)
-      assert.isAtMost(queryCount, 2)
+      assert.isAtMost(queryCount, 3)
     }).pipe(Effect.provide(layer(":memory:", {
       ...outboxLimits,
       maxMessagesPerRemote: 8,

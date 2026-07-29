@@ -569,6 +569,14 @@ export const layer = (
                     return {
                       peerId: handshake.remotePeerId,
                       relayPeerId: options.expectedRelayPeerId,
+                      relayEndpoint: {
+                        expectedLocal: options.expectedLocal,
+                        remote: {
+                          tenantId: options.expectedLocal.tenantId,
+                          ...options.remote
+                        },
+                        relayPeerId: options.expectedRelayPeerId
+                      },
                       capabilities: { lineageAware: true },
                       receive: acknowledged,
                       send,

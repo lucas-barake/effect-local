@@ -259,6 +259,38 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
             Effect.asVoid
           )
 
+      const persistDeliverySource = (options: {
+        readonly commandId: Identity.CommandId
+        readonly documentId: Identity.DocumentId
+        readonly changeHashes: ReadonlyArray<string>
+        readonly permit: ReplicaGate.Permit
+      }) =>
+        Effect.gen(function*() {
+          yield* sql`INSERT INTO effect_local_command_delivery_sources (
+            replica_incarnation, command_id, document_id
+          ) VALUES (
+            ${options.permit.incarnation}, ${options.commandId}, ${options.documentId}
+          )`
+          for (const changeHash of options.changeHashes) {
+            yield* sql`INSERT INTO effect_local_command_delivery_changes (
+              replica_incarnation, command_id, change_hash
+            ) VALUES (
+              ${options.permit.incarnation}, ${options.commandId}, ${changeHash}
+            )`
+          }
+          yield* sql`INSERT INTO effect_local_command_delivery_events (
+            replica_incarnation, command_id, document_id, published
+          ) VALUES (
+            ${options.permit.incarnation}, ${options.commandId}, ${options.documentId}, 0
+          )`
+        }).pipe(
+          Effect.mapError((cause) =>
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause })
+            })
+          )
+        )
+
       const decodeReceipt = <A extends Document.WireSchema, E extends Document.WireSchema,>(
         success: A,
         error: E,
@@ -327,6 +359,12 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 permit: options.permit,
                 requestHash: expectedHash,
                 result
+              })
+              yield* persistDeliverySource({
+                commandId: options.commandId,
+                documentId: options.documentId,
+                changeHashes: InternalAutomerge.changesSince(stored.automerge, []).map((change) => change.hash),
+                permit: options.permit
               })
               return outcome
             })
@@ -410,8 +448,17 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                   requestHash: expectedHash,
                   result
                 })
+                yield* persistDeliverySource({
+                  commandId: options.commandId,
+                  documentId: options.documentId,
+                  changeHashes: [],
+                  permit: options.permit
+                })
                 return outcome
               }
+              const changeHashes = InternalAutomerge.changesSince(staged, durable.materializedHeads).map(
+                (change) => change.hash
+              )
               const persisted = yield* store.persist(mutation.document, options.documentId, durable, staged).pipe(
                 Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
               )
@@ -430,6 +477,12 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 permit: options.permit,
                 requestHash: expectedHash,
                 result
+              })
+              yield* persistDeliverySource({
+                commandId: options.commandId,
+                documentId: options.documentId,
+                changeHashes,
+                permit: options.permit
               })
               return outcome
             })
@@ -471,6 +524,9 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
               )
               const staged = track(yield* store.tombstone(durable))
+              const changeHashes = InternalAutomerge.changesSince(staged, durable.materializedHeads).map(
+                (change) => change.hash
+              )
               const persisted = yield* store.persist(document, options.documentId, durable, staged).pipe(
                 Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
               )
@@ -486,6 +542,12 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 permit: options.permit,
                 requestHash: expectedHash,
                 result
+              })
+              yield* persistDeliverySource({
+                commandId: options.commandId,
+                documentId: options.documentId,
+                changeHashes,
+                permit: options.permit
               })
               return outcome
             })
