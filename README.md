@@ -122,6 +122,12 @@ export const TaskRow = Schema.Struct({
   updatedAt: Schema.Number
 })
 
+export class ListTasksError extends Schema.TaggedErrorClass<ListTasksError>(
+  "@lucas-barake/effect-local/examples/ListTasksError"
+)("ListTasksError", {
+  reason: Schema.Literals(["StorageUnavailable", "StorageCorrupt"])
+}) {}
+
 export const TaskList = Projection.make("TaskList", {
   document: TaskDocument,
   version: 1,
@@ -138,6 +144,7 @@ export const TaskList = Projection.make("TaskList", {
 export const ListTasks = Query.make("ListTasks", {
   payload: { search: Schema.String },
   success: Schema.Array(TaskRow),
+  error: ListTasksError,
   dependsOn: [TaskList]
 })
 
@@ -151,7 +158,8 @@ export const definition = ReplicaDefinition.make({
 ```
 
 Bind the projection to a SQLite table and implement the handlers. Mutation handlers mutate a draft or return
-their declared error. Query handlers are ordinary Effects and may use `SqlClient`.
+their declared error. Query handlers are ordinary Effects and may use `SqlClient`; map its infrastructure
+failures to a portable declared error rather than turning them into defects.
 
 ```ts
 // domain.ts (continued)
@@ -214,7 +222,14 @@ export const DomainLive = Layer.mergeAll(
     draft.updatedAt = Date.now()
     return undefined
   }),
-  ListTasks.toLayer((payload) => ListTasksSql(payload).pipe(Effect.orDie))
+  ListTasks.toLayer((payload) =>
+    ListTasksSql(payload).pipe(
+      Effect.catchTags({
+        SqlError: () => Effect.fail(new ListTasksError({ reason: "StorageUnavailable" })),
+        SchemaError: () => Effect.fail(new ListTasksError({ reason: "StorageCorrupt" }))
+      })
+    )
+  )
 )
 ```
 
@@ -736,10 +751,11 @@ Choose the constructor by assembly level:
 | `layer` / `layerRelay`   | Lower level composition that receives projection binding services from another Layer  |
 | `layerFromServices`      | Framework assembly from already constructed durable services. Provides only `Replica` |
 
-Every constructor provides `Replica`, `CommitPublisher`, `PeerSync`, `ReplicaEvolution`, `ReplicaGate`, the
-compaction and history rewrite workflow services, and Effect Cluster `Sharding` over the same SQL storage. The
-relay variants additionally require `PeerRelayReceiptLimits`. Building the Layer runs bootstrap and the startup
-evolution pass, so a returned `Replica` always opens onto migrated documents and ready projections.
+The four durable constructors provide `Replica`, `CommitPublisher`, `PeerSync`, `ReplicaEvolution`, `ReplicaGate`,
+the compaction and history rewrite workflow services, and Effect Cluster `Sharding` over the same SQL storage. The
+relay variants additionally require `PeerRelayReceiptLimits`. Building one of those Layers runs bootstrap and the
+startup evolution pass, so its `Replica` opens onto migrated documents and ready projections. `layerFromServices`
+only assembles `Replica` from services the caller has already constructed.
 
 An optional `health` option tunes `ReplicaHealth` (`{ sampleInterval: Duration.Input }`, default
 `"1 second"`), which backs the `Replica.status` stream. The SQL composition reports:

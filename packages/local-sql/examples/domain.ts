@@ -46,6 +46,12 @@ export const TaskRow = Schema.Struct({
   updatedAt: Schema.Number
 })
 
+export class ListTasksError extends Schema.TaggedErrorClass<ListTasksError>(
+  "@lucas-barake/effect-local/examples/ListTasksError"
+)("ListTasksError", {
+  reason: Schema.Literals(["StorageUnavailable", "StorageCorrupt"])
+}) {}
+
 export const TaskList = Projection.make("TaskList", {
   document: TaskDocument,
   version: 1,
@@ -62,6 +68,7 @@ export const TaskList = Projection.make("TaskList", {
 export const ListTasks = Query.make("ListTasks", {
   payload: { search: Schema.String },
   success: Schema.Array(TaskRow),
+  error: ListTasksError,
   dependsOn: [TaskList]
 })
 
@@ -128,7 +135,14 @@ export const DomainLive = Layer.mergeAll(
     draft.updatedAt = Date.now()
     return undefined
   }),
-  ListTasks.toLayer((payload) => ListTasksSql(payload).pipe(Effect.orDie))
+  ListTasks.toLayer((payload) =>
+    ListTasksSql(payload).pipe(
+      Effect.catchTags({
+        SqlError: () => Effect.fail(new ListTasksError({ reason: "StorageUnavailable" })),
+        SchemaError: () => Effect.fail(new ListTasksError({ reason: "StorageCorrupt" }))
+      })
+    )
+  )
 )
 
 export const limits: ReplicaLimits.Values = {
