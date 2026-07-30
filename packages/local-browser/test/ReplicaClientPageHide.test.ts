@@ -124,7 +124,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient pagehide", (it) => {
     const activeReplica: Replica.Replica["Service"] = {
       ...replica,
       commandDeliveryChanges: (commandId) =>
-        Stream.make(CommandDelivery.unknown(commandId)).pipe(Stream.concat(Stream.never))
+        Stream.make(CommandDelivery.UnknownCommand.make({ commandId })).pipe(Stream.concat(Stream.never))
     }
     const ActiveOwner = ReplicaOwner.layerHandlers(definition).pipe(
       Layer.provide(PeerConnectionStatus.layer),

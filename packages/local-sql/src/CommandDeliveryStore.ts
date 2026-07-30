@@ -378,7 +378,7 @@ export const layer: Layer.Layer<
           replicaIncarnation: permit.incarnation,
           commandId
         })
-        if (receiptRows.length === 0) return CommandDelivery.unknown(commandId)
+        if (receiptRows.length === 0) return CommandDelivery.UnknownCommand.make({ commandId })
         if (receiptRows.length !== 1) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
@@ -387,7 +387,9 @@ export const layer: Layer.Layer<
           })
         }
         const receipt = receiptRows[0]!
-        if (receipt.tracked !== 1) return CommandDelivery.untracked(commandId, receipt.document_id)
+        if (receipt.tracked !== 1) {
+          return CommandDelivery.UntrackedCommand.make({ commandId, documentId: receipt.document_id })
+        }
         const sourceRows = yield* findSourceCount({
           replicaIncarnation: permit.incarnation,
           commandId
@@ -400,7 +402,9 @@ export const layer: Layer.Layer<
           })
         }
         const source = sourceRows[0]!
-        if (source.change_count === 0) return CommandDelivery.noChanges(commandId, receipt.document_id)
+        if (source.change_count === 0) {
+          return CommandDelivery.NoChangesToDeliver.make({ commandId, documentId: receipt.document_id })
+        }
         const rows = yield* findDeliveryAggregates({
           replicaIncarnation: permit.incarnation,
           commandId

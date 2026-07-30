@@ -61,8 +61,8 @@ describe("ReplicaAtom", () => {
       const release = yield* Deferred.make<void>()
       const commandId = Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000011")
       const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000011")
-      const first = CommandDelivery.unknown(commandId)
-      const second = CommandDelivery.noChanges(commandId, documentId)
+      const first = CommandDelivery.UnknownCommand.make({ commandId })
+      const second = CommandDelivery.NoChangesToDeliver.make({ commandId, documentId })
       const atomRuntime = Atom.runtime(Layer.succeed(Replica.Replica, {
         ...replica,
         lookupCommandDelivery: () => Effect.die("command delivery atoms must use the targeted stream"),

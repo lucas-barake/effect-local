@@ -76,29 +76,6 @@ export const CommandDelivery = Schema.Union([
 ])
 export type CommandDelivery = typeof CommandDelivery.Type
 
-export const unknown = (commandId: Identity.CommandId): UnknownCommand => ({
-  _tag: "UnknownCommand",
-  commandId
-})
-
-export const untracked = (
-  commandId: Identity.CommandId,
-  documentId: Identity.DocumentId
-): UntrackedCommand => ({
-  _tag: "UntrackedCommand",
-  commandId,
-  documentId
-})
-
-export const noChanges = (
-  commandId: Identity.CommandId,
-  documentId: Identity.DocumentId
-): NoChangesToDeliver => ({
-  _tag: "NoChangesToDeliver",
-  commandId,
-  documentId
-})
-
 export const isRelayCustodyAccepted = (
   delivery: CommandDelivery,
   relayPeerId: Identity.PeerId,
