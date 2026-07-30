@@ -832,6 +832,12 @@ including command receipt lookups. Restore uses one end to end deadline across t
 invalidation, and backup export streams are intentionally unbounded. The owner side session lease is 60 seconds
 (`SessionManager.leaseDurationMillis`) and the client renews it automatically.
 
+Each mounted remote peer connection Atom holds one global queued RPC admission, one stream permit, and one in
+flight permit for its session. Size `maxStreamsPerSession` for the invalidation stream, an optional replica
+status stream, and all mounted peer status streams. Size `maxInFlightPerSession` for those streams plus the
+unary operations that must run concurrently. Size `maxQueuedRpc` for all active unary and stream RPCs across
+sessions. Backup restore uses the separate `maxRestoresPerSession` and `maxActiveRestores` limits.
+
 The SharedWorker entry delegates to the coordinator:
 
 ```ts
@@ -883,10 +889,13 @@ import { Atom } from "effect/unstable/reactivity"
 import { ListTasks, RenameTask, TaskDocument, TaskList } from "./domain.js"
 import { runtime } from "./replica-client.js"
 
+declare const serverPeerId: Identity.PeerId
+
 export const tasks = ReplicaAtom.queryFamily(runtime, ListTasks)
 export const task = ReplicaAtom.documentFamily(runtime, TaskDocument)
 export const renameTask = ReplicaAtom.mutation(runtime, RenameTask)
 export const replicaStatus = ReplicaAtom.status(runtime)
+export const serverConnection = ReplicaAtom.peerConnectionStatus(runtime, serverPeerId)
 
 const allTasks = tasks({ search: "" })
 ```
@@ -896,6 +905,10 @@ const allTasks = tasks({ search: "" })
 - `documentFamily(runtime, document)` invalidates on the document key.
 - `mutation(runtime, mutation)` is a `runtime.fn` that invalidates the mutation's document key.
 - `status(runtime)` wraps the status stream and resubscribes only after a session replacement.
+- `peerConnectionStatus(runtime, peerId)` reports the actual peer session as `Disconnected`, `Connecting`, or
+  `Connected`. It does not read `navigator.onLine`.
+- `relayConnectionStatus(runtime)` reports whether the device can reach its relay. Distinct from peer status,
+  and branded so the two cannot be swapped.
 
 For commands with custom invalidation needs, use `runtime.fn` directly with `reactivityKeys`:
 
@@ -1052,6 +1065,92 @@ The session exposes `peerId`, `connectionEpoch`, `markDirty`, `flush`, `observed
 `durableConfirmation(documentId)`. `observedByPeer` reports Automerge sync state only: the peer has all current
 local changes. It does not prove remote storage durability, which is why `durableConfirmation` currently
 returns only `false`.
+
+One socket carries every session. `RpcPeerTransport.layer` takes an already built `PeerRpc.RpcClient` and never
+opens a connection of its own, and the relay tracks each `Open` by its own session id independently of which
+connection it arrived on, so N peers is N sessions over one client rather than N sockets. The ceiling is
+`maxSessionsPerSubject` (default 4), counted by the relay per tenant and subject, so opening more connections
+does not raise it. Build the client and its socket once for the device and layer the sessions over it.
+
+Connection status is a separate, per peer current state:
+
+```ts
+import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as Stream from "effect/Stream"
+
+const observeServer = PeerConnectionStatus.PeerConnectionStatus.pipe(
+  Effect.flatMap((connections) =>
+    Stream.runForEach(connections.status(serverPeerId), (status) => Effect.logInfo(status._tag))
+  )
+)
+```
+
+The standard `SqlReplica` Layers provide `PeerConnectionStatus` and its internal `Reporter`. This works in
+Node, Expo, React Native, and other runtimes without DOM APIs. A custom runtime that constructs
+`PeerSession` directly provides `PeerConnectionStatus.layer` to both the session and its observers.
+`layer` is a value, not a constructor, so referencing it more than once in one graph still resolves to a
+single owner and the Reporter and the reader cannot drift onto separate instances.
+
+The states have deliberately narrow meanings:
+
+- `Disconnected` means no live session attempt exists for that peer.
+- `Connecting` begins before `PeerTransport.connect`.
+- `Connected` means the expected transport peer is validated, `PeerSync.open` succeeded, and receive
+  supervision is live. It does not mean caught up, fully flushed, or durably stored by the peer.
+- On a relay topology, `Connected` also does not mean the remote device is online. Reaching it needs only
+  this client's socket to the relay and a relay side handshake: the peer id in that handshake is the value
+  this client asked for, every entity call the relay makes is against this client's own inbox, and delivery
+  is store and forward, so a message is accepted for a device that has been offline for days. Use it to mean
+  "this device has a working session for that peer", never "the other device is there".
+- A terminal receive, send, protocol, or scoped cleanup transition reports `Disconnected` before transport
+  cleanup can block.
+
+Overlapping sessions aggregate by peer. Any live connected attempt keeps the peer `Connected`. Otherwise any
+opening attempt keeps it `Connecting`. Releasing the last attempt returns it to `Disconnected`. A new
+`PeerSession` scope is a new connection epoch. The status service never schedules reconnects.
+
+Browser pages receive the same service through the owner RPC connection, and
+`ReplicaAtom.peerConnectionStatus(runtime, peerId)` is a read only Atom over it. Losing the page to owner RPC
+connection fails that observation with `StorageUnavailable`. It does not invent a peer `Disconnected` value.
+`navigator.onLine` only describes a browser hint. Replica health, synchronization progress, and peer
+connectivity remain separate signals.
+
+### Relay connection status
+
+Whether this device can reach its relay, which is a different question from whether any one peer session is
+live. Every peer session runs over one socket, so a relay drop takes them all quiet at the same instant, and
+per peer status alone renders that as several peers vanishing rather than as one link failing.
+
+```ts
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
+
+const RelayLink = Layer.effect(RelayClient)(PeerRpc.makeRpcClient).pipe(
+  // Not `RpcClient.layerProtocolSocket`. This one builds the protocol and the status reader together.
+  Layer.provideMerge(RelayConnectionStatus.layerProtocolSocket()),
+  Layer.provide(BrowserSocket.layerWebSocket(relayUrl)),
+  Layer.provide(RpcSerialization.layerJson)
+)
+```
+
+The protocol and the reader come from one Layer on purpose. Effect reads the underlying
+`RpcClient.ConnectionHooks` with `Effect.serviceOption`, so it never appears in the protocol layer's
+requirements, and provided apart there are three compositions of which two are silently wrong: `Layer.provide`
+hides the reader from everything above it, and `Layer.merge` never shows the hooks to the protocol, which
+compiles and then reports a permanent `Disconnected`. Building them together removes the choice.
+
+- `NotConfigured` means no relay is part of this topology. `SqlReplica.layer` answers this directly, so a
+  direct mode replica needs no extra wiring. `SqlReplica.layerRelay` deliberately leaves the requirement open,
+  which is what makes forgetting to compose the socket a compile error rather than a permanent lie.
+- `Disconnected` is the state before the first connection and after the owning Layer closes.
+- `Connecting` carries `attempts`. The client retries without bound, so a device with no network stays here
+  rather than reaching `Disconnected`, and the count is what separates a dropped packet from an outage. Treat
+  one attempt as reconnecting and a growing count as offline. It resets on every open.
+- `Connected` means the socket is open. It says nothing about any peer, for the store and forward reason
+  above.
+
+`RelayConnectionStatus.Status` and `PeerConnectionStatus.Status` are branded, so neither can be passed where
+the other belongs. `ReplicaAtom.relayConnectionStatus(runtime)` is the read only Atom, and browser pages
+receive it through the owner RPC exactly as they do peer status.
 
 Semantics to build on:
 
@@ -1529,6 +1628,12 @@ rest are advanced assembly for custom runtimes.
   `service` and `layer`.
 - `PeerSession`: `make`, `makeSupervised`, `makeLive`, `makeTestClient`; types `SelectedDocument`, `PeerSession`,
   `SupervisedPeerSession`. See [Peer synchronization](#peer-synchronization).
+- `PeerConnectionStatus`: `layer`, `Disconnected`, `Connecting`, `Connected`, `Status`, the `disconnected`,
+  `connecting` and `connected` constructors, the read only `PeerConnectionStatus` service, and the session
+  lifecycle `Reporter`.
+- `RelayConnectionStatus`: `layerProtocolSocket`, `layerNotConfigured`, `NotConfigured`, `Disconnected`,
+  `Connecting`, `Connected`, `Status`, the `notConfigured`, `disconnected`, `connecting` and `connected`
+  constructors, and the read only `RelayConnectionStatus` service.
 - `ReplicaWorkflow`: `CompactionWorkflow`, `HistoryRewriteWorkflow`, `CompactReplica`, `RewriteDocumentHistory`,
   `OperationId`, `layerRegistration`, `layerRuntime`, `layerHistoryRewriteRegistration`,
   `layerHistoryRewriteRuntime`; types `Execution`, `DocumentExecution`.
@@ -1559,7 +1664,9 @@ and `Presence`.
 - `OwnershipCoordinator`: `layerTab`, `layerSharedWorker`, `runSharedWorker`, `runDatabaseWorker`; the
   `OwnershipCoordinator` service; types `SharedWorkerOptions`, `TabOptions`, `DatabaseWorkerOptions`,
   `EngineServices`.
-- `ReplicaAtom`: `documentFamily`, `queryFamily`, `mutation`, `status`, `layerReactivity`. See
+- `ReplicaAtom`: `documentFamily`, `queryFamily`, `mutation`, `status`, `peerConnectionStatus`,
+  `relayConnectionStatus`,
+  `layerReactivity`. See
   [Reactive state](#reactive-state).
 - `Presence`: `make`; types `Presence`, `Entry`.
 - `PeerSession`: compatibility reexport of the SQL package session API. New code should import

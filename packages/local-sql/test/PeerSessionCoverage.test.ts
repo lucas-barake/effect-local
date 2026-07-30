@@ -11,6 +11,7 @@ import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as CommitPublisher from "../src/CommitPublisher.js"
+import * as PeerConnectionStatus from "../src/PeerConnectionStatus.js"
 import * as PeerSession from "../src/PeerSession.js"
 import * as PeerSync from "../src/PeerSync.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
@@ -119,6 +120,7 @@ it.layer(NodeCrypto.layer)("PeerSession coverage", (it) => {
   ) =>
     effect.pipe(
       Effect.provideService(PeerTransport.PeerTransport, transport),
+      Effect.provide(PeerConnectionStatus.layer),
       Effect.provideService(PeerSync.PeerSync, sync),
       Effect.provideService(ReplicaGate.ReplicaGate, gate),
       Effect.provideService(CommitPublisher.CommitPublisher, publisher),

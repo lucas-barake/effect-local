@@ -24,11 +24,13 @@ import * as DocumentStore from "./DocumentStore.js"
 import * as DurableRuntime from "./DurableRuntime.js"
 import * as EntityReplica from "./EntityReplica.js"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as PeerConnectionStatus from "./PeerConnectionStatus.js"
 import type * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
 import type * as PeerSync from "./PeerSync.js"
 import * as ProjectionStore from "./ProjectionStore.js"
 import * as QueryExecutor from "./QueryExecutor.js"
 import * as Recovery from "./Recovery.js"
+import * as RelayConnectionStatus from "./RelayConnectionStatus.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
 import * as ReplicaEvolution from "./ReplicaEvolution.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -207,7 +209,7 @@ const makeBase = <
   )
   const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
   const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
-  return { backups, compaction }
+  return { backups, compaction, connections: PeerConnectionStatus.layer }
 }
 
 export const layer = <D extends ReplicaDefinition.Any, const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
@@ -215,7 +217,10 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
 ): Layer.Layer<
   | CommitPublisher.CommitPublisher
+  | PeerConnectionStatus.PeerConnectionStatus
+  | PeerConnectionStatus.Reporter
   | PeerSync.PeerSync
+  | RelayConnectionStatus.RelayConnectionStatus
   | Replica.Replica
   | ReplicaEvolution.ReplicaEvolution
   | ReplicaGate.ReplicaGate
@@ -230,11 +235,19 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   | Crypto.Crypto
   | SqlClient.SqlClient
 > => {
-  const { backups, compaction } = makeBase(definition, options)
+  const { backups, compaction, connections } = makeBase(definition, options)
   const durable = DurableRuntime.layer(definition).pipe(
     Layer.provideMerge(Layer.merge(backups, compaction))
   )
-  return EntityReplica.layer(definition).pipe(Layer.provideMerge(durable))
+  return Layer.mergeAll(
+    EntityReplica.layer(definition).pipe(Layer.provideMerge(durable)),
+    connections,
+    // A direct replica has no relay, and that is a fact rather than a missing dependency, so it is
+    // answered here instead of being pushed onto every consumer. `layerRelay` deliberately does not
+    // provide it: a relay replica has to compose `RelayConnectionStatus.layerProtocolSocket` with
+    // its socket, and leaving the requirement open is what makes forgetting that a compile error.
+    RelayConnectionStatus.layerNotConfigured
+  )
 }
 
 export const layerRelay = <
@@ -245,6 +258,8 @@ export const layerRelay = <
   options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
 ): Layer.Layer<
   | CommitPublisher.CommitPublisher
+  | PeerConnectionStatus.PeerConnectionStatus
+  | PeerConnectionStatus.Reporter
   | PeerSync.PeerSync
   | Replica.Replica
   | ReplicaEvolution.ReplicaEvolution
@@ -261,11 +276,14 @@ export const layerRelay = <
   | Crypto.Crypto
   | SqlClient.SqlClient
 > => {
-  const { backups, compaction } = makeBase(definition, options)
+  const { backups, compaction, connections } = makeBase(definition, options)
   const durable = DurableRuntime.layerRelay(definition).pipe(
     Layer.provideMerge(Layer.merge(backups, compaction))
   )
-  return EntityReplica.layer(definition).pipe(Layer.provideMerge(durable))
+  return Layer.merge(
+    EntityReplica.layer(definition).pipe(Layer.provideMerge(durable)),
+    connections
+  )
 }
 
 /**

@@ -2,6 +2,8 @@ import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, it } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
+import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
@@ -17,6 +19,7 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Queue from "effect/Queue"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
@@ -80,9 +83,30 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     })
   )
   const Owner = ReplicaOwner.layerHandlers(definition).pipe(
+    Layer.provide(PeerConnectionStatus.layer),
+    Layer.provide(RelayConnectionStatus.layerNotConfigured),
     Layer.provideMerge(Sessions),
     Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, replica)))
   )
+
+  it.effect("keeps the peer connection status stream open across a full round trip", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const peerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-0000000000c1")
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
+      const seen = yield* Queue.unbounded<PeerConnectionStatus.Status>()
+      const fiber = yield* Stream.runForEach(
+        client.peerConnectionStatus.status(peerId),
+        (status) => Queue.offer(seen, status)
+      ).pipe(Effect.forkChild)
+
+      assert.deepStrictEqual(yield* Queue.take(seen), PeerConnectionStatus.disconnected)
+      // A full client to owner and back cycle, so the poll below is ordered by an observable event
+      // rather than by whichever fiber the queue handoff happened to schedule first.
+      yield* client.get(Task, documentId)
+
+      assert.isUndefined(fiber.pollUnsafe())
+    })).pipe(Effect.provide(Owner)))
 
   const disconnected = () =>
     new RpcClientError.RpcClientError({
@@ -190,6 +214,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       query: (_query, ...payload) => Effect.fail(new ReadError({ filter: String(payload[0]) })) as never
     }
     const RejectedOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, rejected)))
     )
@@ -343,6 +369,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       })
     )
     const EventOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(Events, Layer.succeed(Replica.Replica, replica)))
     )
@@ -382,6 +410,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       })
     )
     const EventOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(Events, Layer.succeed(Replica.Replica, replica)))
     )
@@ -829,6 +859,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           }) as never
       }
       const RejectedOwner = ReplicaOwner.layerHandlers(definition).pipe(
+        Layer.provide(PeerConnectionStatus.layer),
+        Layer.provide(RelayConnectionStatus.layerNotConfigured),
         Layer.provideMerge(Sessions),
         Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, rejected)))
       )
@@ -943,6 +975,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
   it.effect("transfers backup bytes through the owner", () => {
     let restored: ReadonlyArray<Uint8Array> = []
     const BackupOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(
         Publisher,
@@ -1003,6 +1037,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     const maxBytes = 1_024
     const applications: Array<ReadonlyArray<Uint8Array>> = []
     const BoundaryOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(
         Publisher,
@@ -1054,6 +1090,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
 
   it.effect("returns the encoded Finish success when TerminalReady is lost", () => {
     const ResultOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(
         Publisher,
@@ -1134,6 +1172,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
   for (const [index, scenario] of lostTerminalCauseScenarios.entries()) {
     it.effect(scenario.name, () => {
       const ResultOwner = ReplicaOwner.layerHandlers(definition).pipe(
+        Layer.provide(PeerConnectionStatus.layer),
+        Layer.provide(RelayConnectionStatus.layerNotConfigured),
         Layer.provideMerge(Sessions),
         Layer.provide(Layer.merge(
           Publisher,
@@ -1186,6 +1226,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
 
   it.effect("does not accept a Finish RpcClientError when TerminalReady is lost", () => {
     const ResultOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(
         Publisher,
@@ -1350,6 +1392,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
             )
         })
         const FailingOwner = ReplicaOwner.layerHandlers(failureDefinition).pipe(
+          Layer.provide(PeerConnectionStatus.layer),
+          Layer.provide(RelayConnectionStatus.layerNotConfigured),
           Layer.provideMerge(FailureSessions),
           Layer.provide(Layer.merge(
             Layer.succeed(CommitPublisher.CommitPublisher, publisher),
@@ -1437,6 +1481,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           })
       })
       const ProductionOwner = ReplicaOwner.layerHandlers(backupDefinition).pipe(
+        Layer.provide(PeerConnectionStatus.layer),
+        Layer.provide(RelayConnectionStatus.layerNotConfigured),
         Layer.provideMerge(BackupSessions),
         Layer.provide(Layer.merge(
           Layer.succeed(CommitPublisher.CommitPublisher, publisher),
@@ -1528,6 +1574,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           })
       })
       const ProductionOwner = ReplicaOwner.layerHandlers(backupDefinition).pipe(
+        Layer.provide(PeerConnectionStatus.layer),
+        Layer.provide(RelayConnectionStatus.layerNotConfigured),
         Layer.provideMerge(BackupSessions),
         Layer.provide(Layer.merge(
           Layer.succeed(CommitPublisher.CommitPublisher, publisher),
@@ -1605,6 +1653,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     let restoreCalls = 0
     let sourceSubscriptions = 0
     const CountingOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(
         Publisher,
@@ -1666,6 +1716,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     let imports = 0
     let importCalls = 0
     const CountingOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(
         Publisher,
@@ -1715,6 +1767,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     let imports = 0
     let importCalls = 0
     const CountingOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(
         Publisher,
@@ -1759,6 +1813,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     let applications = 0
     let restoreCalls = 0
     const CountingOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(
         Publisher,
@@ -1885,6 +1941,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     let applications = 0
     let restoreCalls = 0
     const CountingOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(
         Publisher,
@@ -1942,6 +2000,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     let applications = 0
     let restoreCalls = 0
     const CountingOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(
         Publisher,
@@ -1996,6 +2056,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     let applications = 0
     let restoreCalls = 0
     const CountingOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(
         Publisher,
@@ -2121,6 +2183,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     it.effect(scenario.name, () => {
       let beginCalls = 0
       const ExpiringOwner = ReplicaOwner.layerHandlers(definition).pipe(
+        Layer.provide(PeerConnectionStatus.layer),
+        Layer.provide(RelayConnectionStatus.layerNotConfigured),
         Layer.provideMerge(Sessions),
         Layer.provide(Layer.merge(
           Publisher,

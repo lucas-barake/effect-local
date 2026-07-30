@@ -11,6 +11,7 @@ import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
+import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -31,6 +32,7 @@ import * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
 import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as CommitPublisher from "../src/CommitPublisher.js"
 import * as DocumentEntity from "../src/DocumentEntity.js"
+import * as PeerConnectionStatus from "../src/PeerConnectionStatus.js"
 import * as PeerRelayReceiptLimits from "../src/PeerRelayReceiptLimits.js"
 import * as PeerSession from "../src/PeerSession.js"
 import * as PeerSync from "../src/PeerSync.js"
@@ -262,6 +264,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
         layer: Layer.mergeAll(
           Layer.succeed(CommitPublisher.CommitPublisher, publisher),
           Layer.succeed(PeerTransport.PeerTransport, transport),
+          PeerConnectionStatus.layer,
           Layer.succeed(PeerSync.PeerSync, sync),
           Layer.succeed(ReplicaGate.ReplicaGate, gate),
           Layer.succeed(ReplicaLimits.ReplicaLimits, limits),
@@ -429,6 +432,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
           () => Effect.die("unexpected entity request")
         ).pipe(
           Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),
           Effect.provideService(ReplicaGate.ReplicaGate, gate),
           Effect.provideService(
@@ -527,6 +531,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
             } as never)
         ).pipe(
           Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),
           Effect.provideService(ReplicaGate.ReplicaGate, gate),
           Effect.provideService(
@@ -659,6 +664,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
         ).pipe(
           Effect.provideService(Crypto.Crypto, instrumentedCrypto),
           Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),
           Effect.provideService(ReplicaGate.ReplicaGate, gate),
           Effect.provideService(
@@ -827,6 +833,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
           entity
         ).pipe(
           Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),
           Effect.provideService(ReplicaGate.ReplicaGate, scopedGate),
           Effect.provideService(
@@ -1010,6 +1017,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
           entity
         ).pipe(
           Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),
           Effect.provideService(ReplicaGate.ReplicaGate, gate),
           Effect.provideService(
@@ -1137,6 +1145,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
           () => Effect.die("unexpected inbound entity request")
         ).pipe(
           Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),
           Effect.provideService(ReplicaGate.ReplicaGate, gate),
           Effect.provideService(
@@ -1223,6 +1232,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
           () => Effect.die("unexpected inbound entity request")
         ).pipe(
           Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),
           Effect.provideService(ReplicaGate.ReplicaGate, gate),
           Effect.provideService(
@@ -1306,6 +1316,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
           entity
         ).pipe(
           Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),
           Effect.provideService(ReplicaGate.ReplicaGate, gate),
           Effect.provideService(
@@ -1499,6 +1510,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
               )
           ).pipe(
             Effect.provideService(PeerTransport.PeerTransport, transport),
+            Effect.provide(PeerConnectionStatus.layer),
             Effect.provideService(PeerSync.PeerSync, sync),
             Effect.provideService(ReplicaGate.ReplicaGate, gate),
             Effect.provideService(
@@ -1581,6 +1593,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
             )
           ),
           Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),
           Effect.provideService(ReplicaGate.ReplicaGate, scopedGate),
           Effect.provideService(
@@ -1667,6 +1680,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
       yield* Effect.scoped(
         PeerSession.makeTestClient({ peerId, documents: [] }, () => Effect.die("unexpected entity request")).pipe(
           Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),
           Effect.provideService(ReplicaGate.ReplicaGate, scopedGate),
           Effect.provideService(
@@ -1727,6 +1741,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
           () => Effect.die("unexpected entity request")
         ).pipe(
           Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),
           Effect.provideService(ReplicaGate.ReplicaGate, gate),
           Effect.provideService(
@@ -1799,6 +1814,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
           () => Effect.die("unexpected entity request")
         ).pipe(
           Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),
           Effect.provideService(ReplicaGate.ReplicaGate, gate),
           Effect.provideService(
@@ -1892,6 +1908,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
             ).pipe(
               Effect.provideService(Scope.Scope, scope),
               Effect.provideService(PeerTransport.PeerTransport, transport),
+              Effect.provide(PeerConnectionStatus.layer),
               Effect.provideService(PeerSync.PeerSync, sync),
               Effect.provideService(ReplicaGate.ReplicaGate, gate),
               Effect.provideService(
@@ -2004,6 +2021,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
         () => Effect.die("entity should not be called")
       )).pipe(
         Effect.provideService(PeerTransport.PeerTransport, transport),
+        Effect.provide(PeerConnectionStatus.layer),
         Effect.provideService(PeerSync.PeerSync, sync),
         Effect.provideService(ReplicaGate.ReplicaGate, scopedGate),
         Effect.provideService(
@@ -2116,6 +2134,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
             ).pipe(
               Effect.provideService(Scope.Scope, scope),
               Effect.provideService(PeerTransport.PeerTransport, transport),
+              Effect.provide(PeerConnectionStatus.layer),
               Effect.provideService(PeerSync.PeerSync, sync),
               Effect.provideService(ReplicaGate.ReplicaGate, gate),
               Effect.provideService(
@@ -2239,6 +2258,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
             ).pipe(
               Effect.provideService(Scope.Scope, scope),
               Effect.provideService(PeerTransport.PeerTransport, transport),
+              Effect.provide(PeerConnectionStatus.layer),
               Effect.provideService(PeerSync.PeerSync, sync),
               Effect.provideService(ReplicaGate.ReplicaGate, scopedGate),
               Effect.provideService(
@@ -2348,6 +2368,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
               ).pipe(
                 Effect.provideService(Scope.Scope, scope),
                 Effect.provideService(PeerTransport.PeerTransport, transport),
+                Effect.provide(PeerConnectionStatus.layer),
                 Effect.provideService(PeerSync.PeerSync, sync),
                 Effect.provideService(ReplicaGate.ReplicaGate, gate),
                 Effect.provideService(
@@ -2651,6 +2672,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
           ])
         }).pipe(
           Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),
           Effect.provideService(ReplicaGate.ReplicaGate, relayGate),
           Effect.provideService(CommitPublisher.CommitPublisher, publisher),
@@ -2769,6 +2791,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
         }).pipe(
           Effect.provideService(Crypto.Crypto, failingCrypto),
           Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),
           Effect.provideService(ReplicaGate.ReplicaGate, gate),
           Effect.provideService(
@@ -2875,6 +2898,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
         () => Effect.die("unexpected inbound entity request")
       ).pipe(
         Effect.provideService(PeerTransport.PeerTransport, transport),
+        Effect.provide(PeerConnectionStatus.layer),
         Effect.provideService(PeerSync.PeerSync, sync),
         Effect.provideService(ReplicaGate.ReplicaGate, gate),
         Effect.provideService(
@@ -3300,6 +3324,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
         ).pipe(
           Effect.provideService(Crypto.Crypto, recordingCrypto),
           Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),
           Effect.provideService(ReplicaGate.ReplicaGate, gate),
           Effect.provideService(
@@ -3403,6 +3428,7 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
       })
       yield* PeerSession.makeTestClient({ peerId, documents: [{ document: Task, documentId }] }, entity).pipe(
         Effect.provideService(PeerTransport.PeerTransport, transport),
+        Effect.provide(PeerConnectionStatus.layer),
         Effect.provideService(PeerSync.PeerSync, sync),
         Effect.provideService(ReplicaGate.ReplicaGate, gate),
         Effect.provideService(
@@ -3443,5 +3469,119 @@ it.layer(Layer.merge(NodeCrypto.layer, PeerRelayReceiptLimits.layerDefaults))("P
       assert.isTrue(Option.isSome(yield* Deferred.poll(claimRan)))
     }).pipe(Effect.provide(TestGate))
   }, 20_000)
+
+  const openSync = PeerSync.PeerSync.of({
+    withDocumentInvalidation: (_documentId, effect) => effect,
+    invalidateDocument: () => Effect.void,
+    open: (id) =>
+      Effect.succeed({ peerId: id, connectionEpoch: "local-epoch", replicaIncarnation: permit.incarnation }),
+    reset: () => Effect.void,
+    generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
+    receive: () => Effect.die("unexpected receive"),
+    enqueue: (_session, reply) =>
+      Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
+    pending: () => Effect.succeed([]),
+    markSent: () => Effect.succeed(true)
+  })
+
+  const quietPublisher = CommitPublisher.CommitPublisher.of({
+    publishPending: Effect.succeed(0),
+    invalidate: () => Effect.void,
+    subscribe: Effect.succeed({
+      watermark: Identity.CommitSequence.make(0),
+      refreshGeneration: 0,
+      events: Stream.never
+    })
+  })
+
+  // The transport is asked for one peer and answers about another. Nothing downstream re-checks, so
+  // without this guard the session would sync one peer's documents against a different device.
+  it.effect("refuses a transport connection that answers for a different peer", () =>
+    Effect.gen(function*() {
+      const documentId = yield* Identity.makeDocumentId
+      const peerId = yield* Identity.makePeerId
+      const impostor = yield* Identity.makePeerId
+      const transport = PeerTransport.PeerTransport.of({
+        capabilities: {},
+        connect: () =>
+          Effect.succeed({
+            peerId: impostor,
+            relayPeerId: testRelayPeerId,
+            capabilities: {},
+            receive: Stream.never,
+            send: () => Effect.void,
+            close: Effect.void
+          })
+      })
+      const exit = yield* Effect.exit(Effect.scoped(
+        PeerSession.makeTestClient(
+          { peerId, documents: [{ document: Task, documentId }] },
+          () => Effect.die("unexpected entity request")
+        ).pipe(
+          Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
+          Effect.provideService(PeerSync.PeerSync, openSync),
+          Effect.provideService(ReplicaGate.ReplicaGate, gate),
+          Effect.provideService(CommitPublisher.CommitPublisher, quietPublisher),
+          Effect.provideService(ReplicaLimits.ReplicaLimits, limits)
+        )
+      ))
+      assert.isTrue(Exit.isFailure(exit))
+      if (Exit.isFailure(exit)) {
+        const failure = Cause.findErrorOption(exit.cause)
+        assert.strictEqual(failure._tag, "Some")
+        if (failure._tag === "Some") {
+          assert.strictEqual(failure.value.reason._tag, "ProtocolMismatch")
+        }
+      }
+    }).pipe(Effect.provide(NodeCrypto.layer)))
+
+  // The whole point of the status service is that a UI stops claiming a peer is there. Nothing else
+  // asserts the retraction: the node suite stayed green with the reporter neutered entirely.
+  it.effect("retracts the peer status when the session scope closes", () =>
+    Effect.gen(function*() {
+      const documentId = yield* Identity.makeDocumentId
+      const peerId = yield* Identity.makePeerId
+      const transport = PeerTransport.PeerTransport.of({
+        capabilities: {},
+        connect: () =>
+          Effect.succeed({
+            peerId,
+            relayPeerId: testRelayPeerId,
+            capabilities: {},
+            receive: Stream.never,
+            send: () => Effect.void,
+            close: Effect.void
+          })
+      })
+      const context = yield* Layer.build(PeerConnectionStatus.layer)
+      const reader = Context.get(context, PeerConnectionStatus.PeerConnectionStatus)
+      const seen = yield* Queue.unbounded<PeerConnectionStatus.Status>()
+      yield* Effect.addFinalizer(() => Queue.shutdown(seen))
+      yield* Stream.runForEach(reader.status(peerId), (status) => Queue.offer(seen, status))
+        .pipe(Effect.forkChild)
+      assert.deepStrictEqual(yield* Queue.take(seen), PeerConnectionStatus.disconnected)
+
+      const sessionScope = yield* Scope.make()
+      yield* Scope.provide(
+        PeerSession.makeTestClient(
+          { peerId, documents: [{ document: Task, documentId }] },
+          () => Effect.die("unexpected entity request")
+        ),
+        sessionScope
+      ).pipe(
+        Effect.provideService(PeerTransport.PeerTransport, transport),
+        Effect.provideService(PeerSync.PeerSync, openSync),
+        Effect.provideService(ReplicaGate.ReplicaGate, gate),
+        Effect.provideService(CommitPublisher.CommitPublisher, quietPublisher),
+        Effect.provideService(ReplicaLimits.ReplicaLimits, limits),
+        Effect.provideContext(context)
+      )
+      assert.deepStrictEqual(yield* Queue.take(seen), PeerConnectionStatus.connecting)
+      assert.deepStrictEqual(yield* Queue.take(seen), PeerConnectionStatus.connected)
+
+      yield* Scope.close(sessionScope, Exit.void)
+      assert.deepStrictEqual(yield* Queue.take(seen), PeerConnectionStatus.disconnected)
+    }).pipe(Effect.scoped, Effect.provide(NodeCrypto.layer)))
 })
 import * as Automerge from "@automerge/automerge"

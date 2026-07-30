@@ -1,4 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
+import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Projection from "@lucas-barake/effect-local/Projection"
@@ -17,7 +18,7 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as ReplicaAtom from "../src/ReplicaAtom.js"
 import * as ReplicaClient from "../src/ReplicaClient.js"
 import type * as ReplicaRpc from "../src/ReplicaRpc.js"
-import { Rename, replica, Task } from "./fixtures.js"
+import { peerConnectionStatus, relayConnectionStatus, Rename, replica, Task } from "./fixtures.js"
 
 describe("ReplicaAtom", () => {
   it.effect("reads documents through documentFamily", () =>
@@ -127,6 +128,54 @@ describe("ReplicaAtom", () => {
       registry.dispose()
     }))
 
+  it.effect("streams peer connection status through a runtime atom", () =>
+    Effect.gen(function*() {
+      const published = yield* Queue.unbounded<PeerConnectionStatus.Status>()
+      yield* Effect.addFinalizer(() => Queue.shutdown(published))
+      const advance = yield* Deferred.make<void>()
+      const requested = yield* Deferred.make<Identity.PeerId>()
+      const peerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001")
+      const atomRuntime = Atom.runtime(
+        Layer.succeed(PeerConnectionStatus.PeerConnectionStatus, {
+          status: (received) =>
+            Stream.make(PeerConnectionStatus.connecting).pipe(
+              Stream.tap(() => Deferred.succeed(requested, received)),
+              Stream.concat(
+                Stream.fromEffect(
+                  Deferred.await(advance).pipe(
+                    Effect.as(PeerConnectionStatus.connected)
+                  )
+                )
+              )
+            )
+        })
+      )
+      const registry = AtomRegistry.make()
+      const atom = ReplicaAtom.peerConnectionStatus(atomRuntime, peerId)
+      const unmount = registry.subscribe(atom, (result) => {
+        if (!AsyncResult.isSuccess(result)) return
+        Queue.offerUnsafe(published, result.value)
+      }, { immediate: true })
+      assert.deepStrictEqual(yield* Queue.take(published), PeerConnectionStatus.connecting)
+      // Nothing pulls the stream until the atom mounts, so this has to come after the first take.
+      // It is the only thing proving the peerId the atom was built with reaches the service.
+      assert.strictEqual(yield* Deferred.await(requested), peerId)
+      const connecting = registry.get(atom)
+      assert.isTrue(AsyncResult.isSuccess(connecting))
+      if (AsyncResult.isSuccess(connecting)) {
+        assert.deepStrictEqual(connecting.value, PeerConnectionStatus.connecting)
+      }
+      yield* Deferred.succeed(advance, undefined)
+      assert.deepStrictEqual(yield* Queue.take(published), PeerConnectionStatus.connected)
+      const connected = registry.get(atom)
+      assert.isTrue(AsyncResult.isSuccess(connected))
+      if (AsyncResult.isSuccess(connected)) {
+        assert.deepStrictEqual(connected.value, PeerConnectionStatus.connected)
+      }
+      unmount()
+      registry.dispose()
+    }))
+
   it.effect("refreshes query atoms when a dependency document is invalidated", () =>
     Effect.gen(function*() {
       const Task = Document.make("ReactiveTask", {
@@ -199,6 +248,8 @@ describe("ReplicaAtom", () => {
       const client: ReplicaClient.ReplicaClient["Service"] = {
         ...replica,
         ownerEpoch: "owner",
+        peerConnectionStatus,
+        relayConnectionStatus,
         invalidations: Stream.fromQueue(events).pipe(
           Stream.tap(() => Deferred.succeed(consumed, undefined))
         ),
@@ -241,6 +292,8 @@ describe("ReplicaAtom", () => {
       const client = (ownerEpoch: string, key: string): ReplicaClient.ReplicaClient["Service"] => ({
         ...replica,
         ownerEpoch,
+        peerConnectionStatus,
+        relayConnectionStatus,
         invalidations: Stream.make({
           _tag: "Invalidation" as const,
           ownerEpoch,
@@ -275,6 +328,8 @@ describe("ReplicaAtom", () => {
       const client: ReplicaClient.ReplicaClient["Service"] = {
         ...replica,
         ownerEpoch: "owner",
+        peerConnectionStatus,
+        relayConnectionStatus,
         invalidations: Stream.unwrap(Effect.sync(() => {
           subscriptions++
           return subscriptions < 4
@@ -319,6 +374,8 @@ describe("ReplicaAtom", () => {
       const client: ReplicaClient.ReplicaClient["Service"] = {
         ...replica,
         ownerEpoch: "owner",
+        peerConnectionStatus,
+        relayConnectionStatus,
         invalidations: Stream.unwrap(Effect.sync(() => {
           subscriptions++
           return subscriptions < 2
