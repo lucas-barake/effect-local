@@ -157,6 +157,65 @@ describe("ReplicaBootstrap", () => {
       Effect.provide(Layer.merge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer))
     ))
 
+  it.effect("upgrades a format one replica that already ran the command delivery migration", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrator.make({})({
+        loader: Effect.map(Migrations.loader, (migrations) => migrations.slice(0, 11)),
+        table: "effect_local_migrations"
+      })
+      yield* sql`INSERT INTO effect_local_metadata (
+        singleton, storage_format_version, replica_id, replica_incarnation,
+        writer_generation, definition_hash, commit_sequence
+      ) VALUES (
+        1, 1, 'rep_00000000-0000-4000-8000-000000000001', 0, 1, ${definition.hash}, 0
+      )`
+      yield* sql`INSERT INTO effect_local_writer_generations (generation, claimed_at)
+        VALUES (1, '2026-01-01T00:00:00.000Z')`
+
+      const state = yield* ReplicaBootstrap.make(definition)
+      assert.strictEqual(state.writerGeneration, 3)
+      const migrated = yield* sql<{
+        readonly storage_format_version: number
+        readonly writer_generation: number
+      }>`SELECT storage_format_version, writer_generation
+        FROM effect_local_metadata WHERE singleton = 1
+      `
+      assert.deepStrictEqual(migrated, [{ storage_format_version: 2, writer_generation: 3 }])
+      assert.deepStrictEqual(
+        yield* sql`SELECT migration_id FROM effect_local_migrations WHERE migration_id = 12`,
+        [{ migration_id: 12 }]
+      )
+    }).pipe(
+      Effect.provide(Layer.merge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer))
+    ))
+
+  it.effect("upgrades a format one replica left before the peer relay state migration", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrator.make({})({
+        loader: Effect.map(Migrations.loader, (migrations) => migrations.slice(0, 9)),
+        table: "effect_local_migrations"
+      })
+      yield* sql`INSERT INTO effect_local_metadata (
+        singleton, storage_format_version, replica_id, replica_incarnation,
+        writer_generation, definition_hash, commit_sequence
+      ) VALUES (
+        1, 1, 'rep_00000000-0000-4000-8000-000000000001', 0, 1, ${definition.hash}, 0
+      )`
+      yield* sql`INSERT INTO effect_local_writer_generations (generation, claimed_at)
+        VALUES (1, '2026-01-01T00:00:00.000Z')`
+
+      const state = yield* ReplicaBootstrap.make(definition)
+      assert.strictEqual(state.writerGeneration, 3)
+      const migrated = yield* sql<{ readonly storage_format_version: number }>`
+        SELECT storage_format_version FROM effect_local_metadata WHERE singleton = 1
+      `
+      assert.deepStrictEqual(migrated, [{ storage_format_version: 2 }])
+    }).pipe(
+      Effect.provide(Layer.merge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer))
+    ))
+
   it.effect("reports a corrupt storage format version as corrupt storage without migrating", () =>
     Effect.gen(function*() {
       yield* ReplicaBootstrap.make(definition)

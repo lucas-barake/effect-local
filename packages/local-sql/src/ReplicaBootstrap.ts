@@ -110,11 +110,10 @@ export const make = (definition: ReplicaDefinition.Any) =>
         const migratorTable = yield* findMigratorTable(undefined)
         if (migratorTable.length > 0) {
           const latest = yield* findLatestMigration(undefined)
-          if (
-            latest._tag === "Some" &&
-            latest.value.migration_id === 10 &&
-            latest.value.name === "peer_relay_state"
-          ) return
+          // Format 1 is upgradeable exactly while 12_document_history_counters, the only migration
+          // that writes format 2, has not run. A fully migrated database claiming format 1 is
+          // tampered or downgraded and is still refused.
+          if (latest._tag === "Some" && latest.value.migration_id < 12) return
         }
       }
       return yield* new ReplicaError.ReplicaError({
