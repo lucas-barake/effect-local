@@ -137,11 +137,11 @@ describe("ReplicaAtom", () => {
       const atomRuntime = Atom.runtime(
         Layer.succeed(PeerConnectionStatus.PeerConnectionStatus, {
           status: () =>
-            Stream.make({ _tag: "Connecting" } as PeerConnectionStatus.Status).pipe(
+            Stream.make(PeerConnectionStatus.connecting).pipe(
               Stream.concat(
                 Stream.fromEffect(
                   Deferred.await(advance).pipe(
-                    Effect.as<PeerConnectionStatus.Status>({ _tag: "Connected" })
+                    Effect.as(PeerConnectionStatus.connected)
                   )
                 )
               )
@@ -154,18 +154,18 @@ describe("ReplicaAtom", () => {
         if (!AsyncResult.isSuccess(result)) return
         Queue.offerUnsafe(published, result.value)
       }, { immediate: true })
-      assert.deepStrictEqual(yield* Queue.take(published), { _tag: "Connecting" })
+      assert.deepStrictEqual(yield* Queue.take(published), PeerConnectionStatus.connecting)
       const connecting = registry.get(atom)
       assert.isTrue(AsyncResult.isSuccess(connecting))
       if (AsyncResult.isSuccess(connecting)) {
-        assert.deepStrictEqual(connecting.value, { _tag: "Connecting" })
+        assert.deepStrictEqual(connecting.value, PeerConnectionStatus.connecting)
       }
       yield* Deferred.succeed(advance, undefined)
-      assert.deepStrictEqual(yield* Queue.take(published), { _tag: "Connected" })
+      assert.deepStrictEqual(yield* Queue.take(published), PeerConnectionStatus.connected)
       const connected = registry.get(atom)
       assert.isTrue(AsyncResult.isSuccess(connected))
       if (AsyncResult.isSuccess(connected)) {
-        assert.deepStrictEqual(connected.value, { _tag: "Connected" })
+        assert.deepStrictEqual(connected.value, PeerConnectionStatus.connected)
       }
       unmount()
       registry.dispose()

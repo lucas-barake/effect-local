@@ -9,22 +9,32 @@ import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
+import * as InternalConnectionStatus from "./internal/connectionStatus.js"
 
-export const Disconnected = Schema.TaggedStruct("Disconnected", {})
+export const Disconnected = InternalConnectionStatus.Disconnected
 export type Disconnected = typeof Disconnected.Type
 
-export const Connecting = Schema.TaggedStruct("Connecting", {})
+export const Connecting = InternalConnectionStatus.Connecting
 export type Connecting = typeof Connecting.Type
 
-export const Connected = Schema.TaggedStruct("Connected", {})
+export const Connected = InternalConnectionStatus.Connected
 export type Connected = typeof Connected.Type
 
-export const Status = Schema.Union([Disconnected, Connecting, Connected])
+/**
+ * Branded so a peer status cannot stand in for a relay status, in either direction. They answer
+ * different questions about different links, and with a shared socket every peer goes quiet at once
+ * when the relay drops, which is exactly when a UI is most likely to bind the wrong one. The brand
+ * is type level only, so the encoded wire form is unchanged.
+ */
+export const Status = Schema.Union([Disconnected, Connecting, Connected]).pipe(
+  Schema.brand("@lucas-barake/effect-local-sql/PeerConnectionStatus")
+)
 export type Status = typeof Status.Type
 
-const disconnected: Status = { _tag: "Disconnected" }
-const connecting: Status = { _tag: "Connecting" }
-const connected: Status = { _tag: "Connected" }
+/** Branding rejects bare object literals, so every value is built through these. */
+export const disconnected: Status = Status.make({ _tag: "Disconnected" })
+export const connecting: Status = Status.make({ _tag: "Connecting" })
+export const connected: Status = Status.make({ _tag: "Connected" })
 
 export interface Attempt {
   readonly connected: Effect.Effect<void>

@@ -1,4 +1,4 @@
-import type * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
@@ -81,5 +81,5 @@ export const replica: Replica.Replica["Service"] = {
  * nothing new to say, so an Atom observing it would park on the last value forever.
  */
 export const peerConnectionStatus: PeerConnectionStatus.PeerConnectionStatus["Service"] = {
-  status: () => Stream.make({ _tag: "Disconnected" as const }).pipe(Stream.concat(Stream.never))
+  status: () => Stream.make(PeerConnectionStatus.disconnected).pipe(Stream.concat(Stream.never))
 }

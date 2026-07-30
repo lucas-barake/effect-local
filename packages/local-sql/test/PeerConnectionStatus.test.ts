@@ -22,14 +22,14 @@ describe("PeerConnectionStatus", () => {
       const service = yield* PeerConnectionStatus.PeerConnectionStatus
       const reporter = yield* PeerConnectionStatus.Reporter
 
-      assert.deepStrictEqual(yield* current(service), { _tag: "Disconnected" })
+      assert.deepStrictEqual(yield* current(service), PeerConnectionStatus.disconnected)
       yield* Effect.scoped(Effect.gen(function*() {
         const attempt = yield* reporter.connecting(peerId)
-        assert.deepStrictEqual(yield* current(service), { _tag: "Connecting" })
+        assert.deepStrictEqual(yield* current(service), PeerConnectionStatus.connecting)
         yield* attempt.connected
-        assert.deepStrictEqual(yield* current(service), { _tag: "Connected" })
+        assert.deepStrictEqual(yield* current(service), PeerConnectionStatus.connected)
       }))
-      assert.deepStrictEqual(yield* current(service), { _tag: "Disconnected" })
+      assert.deepStrictEqual(yield* current(service), PeerConnectionStatus.disconnected)
     }).pipe(Effect.provide(PeerConnectionStatus.layer)))
 
   it.effect("keeps a peer connected while another attempt is opening", () =>
@@ -41,11 +41,11 @@ describe("PeerConnectionStatus", () => {
         yield* connected.connected
         yield* Effect.scoped(Effect.gen(function*() {
           yield* reporter.connecting(peerId)
-          assert.deepStrictEqual(yield* current(service), { _tag: "Connected" })
+          assert.deepStrictEqual(yield* current(service), PeerConnectionStatus.connected)
         }))
-        assert.deepStrictEqual(yield* current(service), { _tag: "Connected" })
+        assert.deepStrictEqual(yield* current(service), PeerConnectionStatus.connected)
       }))
-      assert.deepStrictEqual(yield* current(service), { _tag: "Disconnected" })
+      assert.deepStrictEqual(yield* current(service), PeerConnectionStatus.disconnected)
     }).pipe(Effect.provide(PeerConnectionStatus.layer)))
 
   // A live subscriber has to be told the peer is gone and then be released. If the stream were
@@ -60,7 +60,7 @@ describe("PeerConnectionStatus", () => {
       const fiber = yield* Stream.runForEach(service.status(peerId), (status) => Queue.offer(seen, status))
         .pipe(Effect.forkChild)
 
-      assert.deepStrictEqual(yield* Queue.take(seen), { _tag: "Disconnected" })
+      assert.deepStrictEqual(yield* Queue.take(seen), PeerConnectionStatus.disconnected)
       yield* Scope.close(scope, Exit.void)
 
       yield* Fiber.join(fiber)
@@ -81,7 +81,7 @@ describe("PeerConnectionStatus", () => {
 
       yield* Effect.scoped(Effect.gen(function*() {
         yield* reporter.connecting(peerId)
-        assert.deepStrictEqual(yield* current(reader), { _tag: "Connecting" })
+        assert.deepStrictEqual(yield* current(reader), PeerConnectionStatus.connecting)
       }))
 
       yield* Scope.close(scope, Exit.void)

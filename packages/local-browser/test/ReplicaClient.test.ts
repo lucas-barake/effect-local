@@ -98,7 +98,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         (status) => Queue.offer(seen, status)
       ).pipe(Effect.forkChild)
 
-      assert.deepStrictEqual(yield* Queue.take(seen), { _tag: "Disconnected" })
+      assert.deepStrictEqual(yield* Queue.take(seen), PeerConnectionStatus.disconnected)
       // A full client to owner and back cycle, so the poll below is ordered by an observable event
       // rather than by whichever fiber the queue handoff happened to schedule first.
       yield* client.get(Task, documentId)
