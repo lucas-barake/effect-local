@@ -60,8 +60,11 @@ test("keeps local writes available while browser networking is offline", async (
   await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
   await page.evaluate(() => navigator.serviceWorker.ready)
   await expect.poll(() => page.evaluate(() => navigator.serviceWorker.controller !== null)).toBe(true)
+  // No assertion on the status text here or after coming back online. This app is a direct replica
+  // with no peer and no relay, so nothing it renders is derived from network state, and the same
+  // string shows whether or not the context is offline. The contract worth protecting is below: a
+  // write lands while offline and survives a reload with no network.
   await context.setOffline(true)
-  await expect(page.getByText("Local replica ready")).toBeVisible()
 
   const title = `Offline ${crypto.randomUUID()}`
   const titleInput = page.getByLabel("New task title")
@@ -76,7 +79,6 @@ test("keeps local writes available while browser networking is offline", async (
   await expect(page.getByText(title, { exact: true })).toBeVisible()
 
   await context.setOffline(false)
-  await expect(page.getByText("Local replica ready")).toBeVisible()
   await expect(page.getByText(title, { exact: true })).toBeVisible()
 })
 

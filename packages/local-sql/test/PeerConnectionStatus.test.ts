@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
@@ -79,6 +80,59 @@ describe("PeerConnectionStatus", () => {
       // repeat of the seed that `changesWith` would swallow.
       assert.deepStrictEqual(yield* Queue.poll(seen), Option.some(PeerConnectionStatus.disconnected))
       yield* Scope.close(attemptScope, Exit.void)
+    }).pipe(Effect.scoped))
+
+  // A second tab is a second subscriber. At `capacity: 1` the sliding PubSub keeps one shared
+  // subscriber counter and one value slot, so a subscriber that falls behind consumes the slot twice
+  // and the other one is stranded on a stale value until the next transition. `Connected` is a steady
+  // state that can last a whole session, so that tab would report the wrong thing indefinitely.
+  it.effect("delivers every transition to a subscriber that fell behind", () =>
+    Effect.gen(function*() {
+      const scope = yield* Scope.make()
+      const context = yield* Scope.provide(Layer.build(PeerConnectionStatus.layer), scope)
+      const service = Context.get(context, PeerConnectionStatus.PeerConnectionStatus)
+      const reporter = Context.get(context, PeerConnectionStatus.Reporter)
+
+      const collect = (queue: Queue.Queue<PeerConnectionStatus.Status>, hold: Deferred.Deferred<void>) => {
+        let first = true
+        return Stream.runForEach(service.status(peerId), (status) =>
+          Effect.gen(function*() {
+            yield* Queue.offer(queue, status)
+            if (first) {
+              first = false
+              yield* Deferred.await(hold)
+            }
+          })).pipe(Effect.forkChild)
+      }
+
+      const seenA = yield* Queue.unbounded<PeerConnectionStatus.Status>()
+      const seenB = yield* Queue.unbounded<PeerConnectionStatus.Status>()
+      yield* Effect.addFinalizer(() => Queue.shutdown(seenA))
+      yield* Effect.addFinalizer(() => Queue.shutdown(seenB))
+      const holdA = yield* Deferred.make<void>()
+      const holdB = yield* Deferred.make<void>()
+      yield* collect(seenA, holdA)
+      yield* collect(seenB, holdB)
+
+      // Both park on the seeded value, so the transitions below land while neither is polling.
+      assert.deepStrictEqual(yield* Queue.take(seenA), PeerConnectionStatus.disconnected)
+      assert.deepStrictEqual(yield* Queue.take(seenB), PeerConnectionStatus.disconnected)
+
+      const attemptScope = yield* Scope.make()
+      const attempt = yield* Scope.provide(reporter.connecting(peerId), attemptScope)
+      yield* attempt.connected
+
+      yield* Deferred.succeed(holdA, undefined)
+      yield* Deferred.succeed(holdB, undefined)
+
+      // Each has to arrive at Connected. Neither may be left behind because the other drained first.
+      assert.deepStrictEqual(yield* Queue.take(seenA), PeerConnectionStatus.connecting)
+      assert.deepStrictEqual(yield* Queue.take(seenA), PeerConnectionStatus.connected)
+      assert.deepStrictEqual(yield* Queue.take(seenB), PeerConnectionStatus.connecting)
+      assert.deepStrictEqual(yield* Queue.take(seenB), PeerConnectionStatus.connected)
+
+      yield* Scope.close(attemptScope, Exit.void)
+      yield* Scope.close(scope, Exit.void)
     }).pipe(Effect.scoped))
 
   // The Reporter and the reader are two projections of one owner, so they have to come from one

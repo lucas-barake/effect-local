@@ -89,8 +89,15 @@ export const layer: Layer.Layer<PeerConnectionStatus | Reporter> = Layer.effectC
       closed: false
     })
     const writes = yield* Semaphore.make(1)
+    // Capacity 2, not 1. `PubSub.sliding` picks `BoundedPubSubSingle` at capacity 1, which keeps one
+    // shared subscriber counter and one value slot, so a subscriber that falls behind can consume
+    // the slot twice and strand another subscriber on a stale value until the next transition. With
+    // `Connected` being a steady state that can last a whole session, that leaves a second tab
+    // reporting the wrong thing indefinitely. Any capacity above 1 selects a ring buffer with per
+    // entry subscriber counts. Latest wins is unaffected: the buffer still drops the oldest, the
+    // replay window is still 1, and the reader still dedupes.
     const statuses = yield* Effect.acquireRelease(
-      PubSub.sliding<ReadonlyMap<Identity.PeerId, Status>>({ capacity: 1, replay: 1 }),
+      PubSub.sliding<ReadonlyMap<Identity.PeerId, Status>>({ capacity: 2, replay: 1 }),
       (pubsub) =>
         writes.withPermit(
           Effect.gen(function*() {

@@ -85,8 +85,15 @@ const makeOwner = Effect.gen(function*() {
   // without the lock it can lose an update against a hook that is mid flight, leaving the Ref and
   // the published value permanently disagreeing so the next real change dedupes itself away.
   const writes = yield* Semaphore.make(1)
+  // Capacity 2, not 1. `PubSub.sliding` picks `BoundedPubSubSingle` at capacity 1, which keeps one
+  // shared subscriber counter and one value slot, so a subscriber that falls behind can consume
+  // the slot twice and strand another subscriber on a stale value until the next transition. With
+  // `Connected` being a steady state that can last a whole session, that leaves a second tab
+  // reporting the wrong thing indefinitely. Any capacity above 1 selects a ring buffer with per
+  // entry subscriber counts. Latest wins is unaffected: the buffer still drops the oldest, the
+  // replay window is still 1, and the reader still dedupes.
   const statuses = yield* Effect.acquireRelease(
-    PubSub.sliding<Status>({ capacity: 1, replay: 1 }),
+    PubSub.sliding<Status>({ capacity: 2, replay: 1 }),
     (pubsub) =>
       writes.withPermit(
         Effect.gen(function*() {
@@ -131,7 +138,19 @@ const makeOwner = Effect.gen(function*() {
     )
   })
 
-  return { hooks, reader } as const
+  /**
+   * Retires the owner without shutting the PubSub down.
+   *
+   * The socket fiber is forked into the same Layer scope after the PubSub is acquired, so on close
+   * it is interrupted first and its `Effect.ensuring(onDisconnect)` fires while the owner is still
+   * accepting writes. Without this, a clean shutdown publishes one last `Connecting` claiming the
+   * client is still retrying something that has already been torn down.
+   */
+  const retire = writes.withPermit(
+    Ref.update(state, (current) => ({ ...current, closed: true }))
+  ).pipe(Effect.uninterruptible)
+
+  return { hooks, reader, retire } as const
 })
 
 /**
@@ -161,6 +180,9 @@ export const layerProtocolSocket = (options?: {
       const protocol = yield* RpcClient.makeProtocolSocket(options).pipe(
         Effect.provideService(RpcClient.ConnectionHooks, owner.hooks)
       )
+      // Registered after the socket is forked, so LIFO runs it first and the hooks are already
+      // retired by the time the socket fiber is interrupted.
+      yield* Effect.addFinalizer(() => owner.retire)
       return Context.make(RpcClient.Protocol, protocol).pipe(
         Context.add(RelayConnectionStatus, owner.reader)
       )
