@@ -253,6 +253,17 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
         const start = Effect.gen(function*() {
           const runtime = yield* Effect.sync(() => options.engine(databasePort))
           const engineScope = yield* Scope.make()
+          // A candidate that detaches mid start has this fiber interrupted, and the engine it
+          // already built is reachable from nowhere else: it never became an `EngineStarted` event,
+          // so `disposeEngine` can never see it.
+          const discardEngine = (exit: Exit.Exit<unknown, unknown>) =>
+            Scope.close(engineScope, exit).pipe(
+              Effect.ignore,
+              Effect.andThen(
+                runtime.disposeEffect.pipe(Effect.timeout(engineDisposeTimeoutMillis), Effect.ignore)
+              ),
+              Effect.andThen(Effect.sync(() => databasePort.close()))
+            )
           const started = yield* Effect.exit(
             Effect.gen(function*() {
               yield* provideRuntime(runtime, healthProbe).pipe(
@@ -270,11 +281,9 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
               const snapshot: EngineSnapshot = { runtime, scope: engineScope, ownerId, info }
               return snapshot
             })
-          )
+          ).pipe(Effect.onInterrupt(() => discardEngine(Exit.interrupt())))
           if (Exit.isFailure(started)) {
-            yield* Scope.close(engineScope, started).pipe(Effect.ignore)
-            yield* runtime.disposeEffect.pipe(Effect.timeout(engineDisposeTimeoutMillis), Effect.ignore)
-            yield* Effect.sync(() => databasePort.close())
+            yield* discardEngine(started)
           }
           return started
         })
