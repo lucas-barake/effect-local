@@ -1,5 +1,6 @@
 import * as CommandDelivery from "@lucas-barake/effect-local/CommandDelivery"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import type * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
@@ -8,7 +9,7 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as WriterProvenance from "./internal/writerProvenance.js"
-import type * as PeerSyncEnvelope from "./PeerSyncEnvelope.js"
+import * as PeerSyncEnvelope from "./PeerSyncEnvelope.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
 const IsoDate = Schema.DateTimeUtcFromString
@@ -123,12 +124,6 @@ const StoredMessageRow = Schema.Struct({
   retry_deadline: Schema.String
 })
 
-const RelayPeerPrincipal = Schema.Struct({
-  tenantId: Schema.String,
-  subjectId: Schema.String,
-  peerId: Identity.PeerId
-})
-
 const MessageRequest = Schema.Struct({
   replicaId: Identity.ReplicaId,
   replicaIncarnation: Identity.ReplicaIncarnation,
@@ -140,8 +135,8 @@ const MessageRequest = Schema.Struct({
   createdAt: Schema.String,
   retryDeadline: Schema.String,
   changeHashes: Schema.Array(WriterProvenance.ChangeHash),
-  expectedLocal: RelayPeerPrincipal,
-  remote: RelayPeerPrincipal,
+  expectedLocal: PeerSyncEnvelope.RelayPeerPrincipal,
+  remote: PeerSyncEnvelope.RelayPeerPrincipal,
   relayPeerId: Identity.PeerId
 })
 
@@ -176,13 +171,7 @@ const DeliveryChangeInsert = Schema.Struct({
   change_hash: WriterProvenance.ChangeHash
 })
 
-export interface Endpoint {
-  readonly expectedLocal: PeerSyncEnvelope.RelayPeerPrincipal
-  readonly remote: PeerSyncEnvelope.RelayPeerPrincipal
-  readonly relayPeerId: Identity.PeerId
-}
-
-export interface MessageInput extends Endpoint {
+export interface MessageInput extends PeerTransport.RelayEndpoint {
   readonly replicaId: Identity.ReplicaId
   readonly replicaIncarnation: Identity.ReplicaIncarnation
   readonly relayMessageId: Identity.RelayMessageId
@@ -231,7 +220,7 @@ export class CommandDeliveryStore extends Context.Service<CommandDeliveryStore, 
   ) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly documentConfirmed: (
     documentId: Identity.DocumentId,
-    endpoint: Endpoint | undefined
+    endpoint: PeerTransport.RelayEndpoint | undefined
   ) => Effect.Effect<boolean, ReplicaError.ReplicaError>
   readonly pendingEvents: Effect.Effect<ReadonlyArray<Event>, ReplicaError.ReplicaError>
   readonly markEventsPublished: (
@@ -796,7 +785,7 @@ export const layer: Layer.Layer<
 
     const documentConfirmed = (
       documentId: Identity.DocumentId,
-      endpoint: Endpoint | undefined
+      endpoint: PeerTransport.RelayEndpoint | undefined
     ) =>
       endpoint === undefined
         ? Effect.succeed(false)

@@ -553,6 +553,18 @@ export const fromRpcClient = (
       ownerEpoch,
       keys: [...allInvalidationKeys]
     })
+    // Commit and delivery events advance independent watermarks, but the monotonic cursor
+    // mechanics are shared: adopt a first or gapped sequence as a refresh, emit the exact
+    // next sequence, and drop anything already seen.
+    const advanceWatermark = (
+      observed: number | undefined,
+      sequence: number
+    ): { readonly next: number; readonly emit: "skip" | "event" | "refresh" } =>
+      observed === undefined || sequence > observed + 1
+        ? { next: sequence, emit: "refresh" }
+        : sequence === observed + 1
+        ? { next: sequence, emit: "event" }
+        : { next: observed, emit: "skip" }
     const invalidationMessages: Stream.Stream<
       ReplicaRpc.InvalidationMessage,
       ReplicaError.ReplicaError
@@ -663,29 +675,17 @@ export const fromRpcClient = (
             }, [event]]
           }
           if (event._tag === "Invalidation") {
-            if (state.watermark === undefined) {
-              return [{ ...state, watermark: event.sequence }, [fullRefresh(event.ownerEpoch)]]
-            }
-            if (event.sequence <= state.watermark) return [state, []]
-            if (event.sequence === state.watermark + 1) {
-              return [{ ...state, watermark: event.sequence }, [event]]
-            }
-            return [{ ...state, watermark: event.sequence }, [fullRefresh(event.ownerEpoch)]]
+            const advanced = advanceWatermark(state.watermark, event.sequence)
+            return [
+              { ...state, watermark: Identity.CommitSequence.make(advanced.next) },
+              advanced.emit === "skip" ? [] : advanced.emit === "event" ? [event] : [fullRefresh(event.ownerEpoch)]
+            ]
           }
-          if (state.deliveryWatermark === undefined) {
-            return [{
-              ...state,
-              deliveryWatermark: event.sequence
-            }, [fullRefresh(event.ownerEpoch)]]
-          }
-          if (event.sequence <= state.deliveryWatermark) return [state, []]
-          if (event.sequence === state.deliveryWatermark + 1) {
-            return [{ ...state, deliveryWatermark: event.sequence }, [event]]
-          }
-          return [{
-            ...state,
-            deliveryWatermark: event.sequence
-          }, [fullRefresh(event.ownerEpoch)]]
+          const advanced = advanceWatermark(state.deliveryWatermark, event.sequence)
+          return [
+            { ...state, deliveryWatermark: advanced.next },
+            advanced.emit === "skip" ? [] : advanced.emit === "event" ? [event] : [fullRefresh(event.ownerEpoch)]
+          ]
         }
       ),
       Stream.interruptWhen(Deferred.await(sessionFailure)),
