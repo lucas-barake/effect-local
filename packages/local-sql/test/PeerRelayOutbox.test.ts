@@ -8,6 +8,7 @@ import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Crypto from "effect/Crypto"
 import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -185,6 +186,66 @@ describe("PeerRelayOutbox", () => {
       }
       return envelope.writerProvenance.length
     })
+
+  it.effect("derives provenance change hashes once per admitted message across replays", () => {
+    const counter = { digests: 0 }
+    const Database = Layer.merge(
+      SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+      NodeCrypto.layer
+    )
+    const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
+    const Base = Layer.merge(Database, Bootstrap)
+    const ReplicaLimitLayer = ReplicaLimits.layer(replicaLimits)
+    const Gate = ReplicaGate.layer.pipe(
+      Layer.provide(ReplicaLimitLayer),
+      Layer.provide(Base)
+    )
+    const CountingCrypto = Layer.effect(
+      Crypto.Crypto,
+      Effect.gen(function*() {
+        const crypto = yield* Crypto.Crypto
+        return Crypto.Crypto.of({
+          ...crypto,
+          digest: (algorithm, data) =>
+            Effect.andThen(
+              Effect.sync(() => {
+                counter.digests++
+              }),
+              crypto.digest(algorithm, data)
+            )
+        })
+      })
+    ).pipe(Layer.provide(NodeCrypto.layer))
+    const Infrastructure = Layer.mergeAll(
+      Base,
+      Gate,
+      ReplicaLimitLayer,
+      PeerRelayOutboxLimits.layer(outboxLimits),
+      CountingCrypto
+    )
+    const DeliveryStore = CommandDeliveryStore.layer.pipe(Layer.provide(Infrastructure))
+    const Outbox = PeerRelayOutbox.layerSql.pipe(Layer.provide(Infrastructure))
+    const testLayer = Layer.mergeAll(Infrastructure, DeliveryStore, Outbox)
+
+    return Effect.gen(function*() {
+      yield* insertDocument
+      const outbox = yield* PeerRelayOutbox.PeerRelayOutbox
+      const payload = yield* makePayload(41)
+      const entry = yield* outbox.admit({ ...endpoint, payload, retryHorizonMillis: 30_000 })
+      assert.strictEqual(entry._tag, "PendingRelayCustody")
+      counter.digests = 0
+      const first = yield* outbox.dueForEndpoint({ ...endpoint, maximum: 2 })
+      assert.strictEqual(first.length, 1)
+      const firstRoundDigests = counter.digests
+      counter.digests = 0
+      const second = yield* outbox.dueForEndpoint({ ...endpoint, maximum: 2 })
+      assert.strictEqual(second.length, 1)
+      // validateRow re-verifies the stored payload digest on every round. The payload decode
+      // and message hash verification behind provenance derivation runs once per message.
+      assert.strictEqual(firstRoundDigests, 2)
+      assert.strictEqual(counter.digests, 2)
+    }).pipe(Effect.provide(testLayer))
+  })
 
   it.effect("reuses one stable admission after time advances without incrementing quota", () =>
     Effect.gen(function*() {

@@ -159,23 +159,6 @@ const RetainedSourceRow = Schema.Struct({
   relay_custody_accepted_at: Schema.NullOr(IsoDate),
   sender_custody_unconfirmed_at: Schema.NullOr(IsoDate)
 })
-const ReplayDeliveryMessageRow = Schema.Struct({
-  replica_id: Identity.ReplicaId,
-  expected_local_tenant_id: Schema.String,
-  expected_local_subject_id: Schema.String,
-  expected_local_peer_id: Identity.PeerId,
-  remote_tenant_id: Schema.String,
-  remote_subject_id: Schema.String,
-  remote_peer_id: Identity.PeerId,
-  relay_peer_id: Identity.PeerId,
-  relay_message_id: Identity.RelayMessageId,
-  outer_envelope_digest: RelayDigest,
-  sender_connection_epoch: Schema.String,
-  sender_sequence: NonNegativeInt,
-  document_id: Identity.DocumentId,
-  created_at: IsoDate,
-  retry_deadline: IsoDate
-})
 const ReplayDeliveryChangeRow = Schema.Struct({
   relay_message_id: Identity.RelayMessageId,
   change_hash: WriterProvenance.ChangeHash
@@ -217,6 +200,67 @@ const make = Effect.gen(function*() {
   const gate = yield* ReplicaGate.ReplicaGate
   const deliveries = yield* CommandDeliveryStore.CommandDeliveryStore
   const limits = yield* PeerRelayOutboxLimits.PeerRelayOutboxLimits
+
+  // A pending row is immutable and validateRow pins its payload to outer_envelope_digest on
+  // every read, so the provenance change hashes of one admitted message never change. Deriving
+  // them decodes the whole payload and verifies the message hash, which reconnect replays
+  // would otherwise pay per round for every pending row. Terminal paths evict their entry.
+  const provenanceCache = new Map<Identity.RelayMessageId, {
+    readonly outerEnvelopeDigest: string
+    readonly changeHashes: ReadonlyArray<string>
+  }>()
+
+  const provenanceChangeHashes = (
+    relayMessageId: Identity.RelayMessageId,
+    outerEnvelopeDigest: string,
+    payload: Uint8Array
+  ): Effect.Effect<ReadonlyArray<string>, ReplicaError.ReplicaError> =>
+    Effect.suspend(() => {
+      const cached = provenanceCache.get(relayMessageId)
+      if (cached !== undefined && cached.outerEnvelopeDigest === outerEnvelopeDigest) {
+        return Effect.succeed(cached.changeHashes)
+      }
+      return PeerSyncEnvelope.decodeSyncEnvelope(payload, replicaLimits).pipe(
+        Effect.provideService(Crypto.Crypto, crypto),
+        Effect.flatMap((syncEnvelope) =>
+          Effect.try({
+            try: () =>
+              WriterProvenance.validateExact(
+                WriterProvenance.syncMessageChangeHashes(syncEnvelope.message),
+                syncEnvelope.writerProvenance
+              ).map((provenance) => provenance.changeHash),
+            catch: (cause) =>
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause })
+              })
+          })
+        ),
+        Effect.map((changeHashes) => {
+          provenanceCache.set(relayMessageId, { outerEnvelopeDigest, changeHashes })
+          return changeHashes
+        })
+      )
+    })
+
+  const recordEntryDelivery = (
+    entry: Entry,
+    changeHashes: ReadonlyArray<string>
+  ): Effect.Effect<void, ReplicaError.ReplicaError> =>
+    deliveries.recordMessage({
+      replicaId: entry.replicaId,
+      replicaIncarnation: entry.replicaIncarnation,
+      expectedLocal: entry.expectedLocal,
+      remote: entry.remote,
+      relayPeerId: entry.relayPeerId,
+      relayMessageId: entry.relayMessageId,
+      outerEnvelopeDigest: entry.outerEnvelopeDigest,
+      senderConnectionEpoch: entry.senderConnectionEpoch,
+      senderSequence: entry.senderSequence,
+      documentId: entry.document.documentId,
+      createdAt: entry.createdAt,
+      retryDeadline: entry.retryDeadline,
+      changeHashes
+    })
 
   const decodeEndpoint = (input: Endpoint) =>
     Schema.decodeUnknownEffect(EndpointSchema)(input).pipe(
@@ -366,7 +410,7 @@ const make = Effect.gen(function*() {
       replicaIncarnation: Identity.ReplicaIncarnation,
       relayMessageIds: Schema.Array(Identity.RelayMessageId).check(Schema.isMinLength(1))
     }),
-    Result: ReplayDeliveryMessageRow,
+    Result: RetainedSourceRow,
     execute: (request) =>
       sql`SELECT
         replica_id,
@@ -383,7 +427,9 @@ const make = Effect.gen(function*() {
         sender_sequence,
         document_id,
         created_at,
-        retry_deadline
+        retry_deadline,
+        relay_custody_accepted_at,
+        sender_custody_unconfirmed_at
       FROM effect_local_peer_relay_delivery_messages
       WHERE replica_incarnation = ${request.replicaIncarnation}
         AND ${sql.in("relay_message_id", request.relayMessageIds)}
@@ -737,6 +783,26 @@ const make = Effect.gen(function*() {
             })
           })
       })
+      const makeOuterEnvelope = (
+        relayMessageId: Identity.RelayMessageId
+      ): PeerSyncEnvelope.RelayOuterEnvelope => ({
+        domain: PeerSyncEnvelope.relayOuterEnvelopeDomain,
+        version: PeerSyncEnvelope.relayOuterEnvelopeVersion,
+        expectedLocal: endpoint.expectedLocal,
+        remote: endpoint.remote,
+        relayPeerId: endpoint.relayPeerId,
+        relayMessageId,
+        protocolVersion: PeerSyncEnvelope.relayProtocolVersion,
+        payloadVersion: PeerSyncEnvelope.syncEnvelopeVersion,
+        senderReplicaIncarnation: permit.incarnation,
+        senderConnectionEpoch: syncEnvelope.connectionEpoch,
+        senderSequence: syncEnvelope.sequence,
+        document: PeerSyncEnvelope.syncEnvelopeDocument(syncEnvelope),
+        lineage: syncEnvelope.lineage,
+        writerProvenance: syncEnvelope.writerProvenance,
+        messageHash: syncEnvelope.messageHash,
+        payload: input.payload
+      })
       const nowMillis = yield* Clock.currentTimeMillis
       const createdAt = new Date(nowMillis).toISOString()
       const retryDeadline = new Date(nowMillis + input.retryHorizonMillis).toISOString()
@@ -761,25 +827,9 @@ const make = Effect.gen(function*() {
         }
         if (existing.length === 1) {
           const entry = yield* validateRow(existing[0]!, permit)
-          const existingEnvelope: PeerSyncEnvelope.RelayOuterEnvelope = {
-            domain: PeerSyncEnvelope.relayOuterEnvelopeDomain,
-            version: PeerSyncEnvelope.relayOuterEnvelopeVersion,
-            expectedLocal: endpoint.expectedLocal,
-            remote: endpoint.remote,
-            relayPeerId: endpoint.relayPeerId,
-            relayMessageId: entry.relayMessageId,
-            protocolVersion: PeerSyncEnvelope.relayProtocolVersion,
-            payloadVersion: PeerSyncEnvelope.syncEnvelopeVersion,
-            senderReplicaIncarnation: permit.incarnation,
-            senderConnectionEpoch: syncEnvelope.connectionEpoch,
-            senderSequence: syncEnvelope.sequence,
-            document: PeerSyncEnvelope.syncEnvelopeDocument(syncEnvelope),
-            lineage: syncEnvelope.lineage,
-            writerProvenance: syncEnvelope.writerProvenance,
-            messageHash: syncEnvelope.messageHash,
-            payload: input.payload
-          }
-          const existingDigest = yield* PeerSyncEnvelope.digestRelayOuterEnvelope(existingEnvelope).pipe(
+          const existingDigest = yield* PeerSyncEnvelope.digestRelayOuterEnvelope(
+            makeOuterEnvelope(entry.relayMessageId)
+          ).pipe(
             Effect.provideService(Crypto.Crypto, crypto)
           )
           const existingCreatedAt = parseIso(entry.createdAt)
@@ -825,25 +875,9 @@ const make = Effect.gen(function*() {
         }
         if (retained.length === 1) {
           const row = retained[0]!
-          const retainedEnvelope: PeerSyncEnvelope.RelayOuterEnvelope = {
-            domain: PeerSyncEnvelope.relayOuterEnvelopeDomain,
-            version: PeerSyncEnvelope.relayOuterEnvelopeVersion,
-            expectedLocal: endpoint.expectedLocal,
-            remote: endpoint.remote,
-            relayPeerId: endpoint.relayPeerId,
-            relayMessageId: row.relay_message_id,
-            protocolVersion: PeerSyncEnvelope.relayProtocolVersion,
-            payloadVersion: PeerSyncEnvelope.syncEnvelopeVersion,
-            senderReplicaIncarnation: permit.incarnation,
-            senderConnectionEpoch: syncEnvelope.connectionEpoch,
-            senderSequence: syncEnvelope.sequence,
-            document: PeerSyncEnvelope.syncEnvelopeDocument(syncEnvelope),
-            lineage: syncEnvelope.lineage,
-            writerProvenance: syncEnvelope.writerProvenance,
-            messageHash: syncEnvelope.messageHash,
-            payload: input.payload
-          }
-          const retainedDigest = yield* PeerSyncEnvelope.digestRelayOuterEnvelope(retainedEnvelope).pipe(
+          const retainedDigest = yield* PeerSyncEnvelope.digestRelayOuterEnvelope(
+            makeOuterEnvelope(row.relay_message_id)
+          ).pipe(
             Effect.provideService(Crypto.Crypto, crypto)
           )
           const retainedCreatedAt = parseIso(row.created_at)
@@ -915,25 +949,9 @@ const make = Effect.gen(function*() {
               })
             ))
         )
-        const outerEnvelope: PeerSyncEnvelope.RelayOuterEnvelope = {
-          domain: PeerSyncEnvelope.relayOuterEnvelopeDomain,
-          version: PeerSyncEnvelope.relayOuterEnvelopeVersion,
-          expectedLocal: endpoint.expectedLocal,
-          remote: endpoint.remote,
-          relayPeerId: endpoint.relayPeerId,
-          relayMessageId,
-          protocolVersion: PeerSyncEnvelope.relayProtocolVersion,
-          payloadVersion: PeerSyncEnvelope.syncEnvelopeVersion,
-          senderReplicaIncarnation: permit.incarnation,
-          senderConnectionEpoch: syncEnvelope.connectionEpoch,
-          senderSequence: syncEnvelope.sequence,
-          document: PeerSyncEnvelope.syncEnvelopeDocument(syncEnvelope),
-          lineage: syncEnvelope.lineage,
-          writerProvenance: syncEnvelope.writerProvenance,
-          messageHash: syncEnvelope.messageHash,
-          payload: input.payload
-        }
-        const outerEnvelopeDigest = yield* PeerSyncEnvelope.digestRelayOuterEnvelope(outerEnvelope).pipe(
+        const outerEnvelopeDigest = yield* PeerSyncEnvelope.digestRelayOuterEnvelope(
+          makeOuterEnvelope(relayMessageId)
+        ).pipe(
           Effect.provideService(Crypto.Crypto, crypto)
         )
         const remoteUsage = yield* reserveRemote({
@@ -1015,6 +1033,7 @@ const make = Effect.gen(function*() {
           changeHashes
         })
         yield* gate.validate(permit)
+        provenanceCache.set(relayMessageId, { outerEnvelopeDigest, changeHashes })
         return {
           _tag: "PendingRelayCustody" as const,
           rowId: inserted[0]!.row_id,
@@ -1099,7 +1118,7 @@ const make = Effect.gen(function*() {
         }
         const rowsById = new Map(rows.map((row) => [row.row_id, row]))
         const replayDeliveries = new Map<Identity.RelayMessageId, {
-          readonly message: typeof ReplayDeliveryMessageRow.Type
+          readonly message: typeof RetainedSourceRow.Type
           readonly changeHashes: Array<string>
           readonly changeHashSet: Set<string>
         }>()
@@ -1173,20 +1192,11 @@ const make = Effect.gen(function*() {
             })
           }
           const entry = yield* validateRow(row, permit)
-          const syncEnvelope = yield* PeerSyncEnvelope.decodeSyncEnvelope(entry.payload, replicaLimits).pipe(
-            Effect.provideService(Crypto.Crypto, crypto)
+          const changeHashes = yield* provenanceChangeHashes(
+            entry.relayMessageId,
+            entry.outerEnvelopeDigest,
+            entry.payload
           )
-          const changeHashes = yield* Effect.try({
-            try: () =>
-              WriterProvenance.validateExact(
-                WriterProvenance.syncMessageChangeHashes(syncEnvelope.message),
-                syncEnvelope.writerProvenance
-              ).map((provenance) => provenance.changeHash),
-            catch: (cause) =>
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.StorageCorrupt({ cause })
-              })
-          })
           const stored = replayDeliveries.get(entry.relayMessageId)
           const storedMessage = stored?.message
           const expectedChangeHashes = [...changeHashes].toSorted()
@@ -1312,6 +1322,7 @@ const make = Effect.gen(function*() {
             input.outerEnvelopeDigest,
             acceptedAt
           )
+          provenanceCache.delete(input.relayMessageId)
           yield* gate.validate(permit)
           return
         }
@@ -1332,35 +1343,12 @@ const make = Effect.gen(function*() {
             })
           })
         }
-        const syncEnvelope = yield* PeerSyncEnvelope.decodeSyncEnvelope(entry.payload, replicaLimits).pipe(
-          Effect.provideService(Crypto.Crypto, crypto)
+        const changeHashes = yield* provenanceChangeHashes(
+          entry.relayMessageId,
+          entry.outerEnvelopeDigest,
+          entry.payload
         )
-        const changeHashes = yield* Effect.try({
-          try: () =>
-            WriterProvenance.validateExact(
-              WriterProvenance.syncMessageChangeHashes(syncEnvelope.message),
-              syncEnvelope.writerProvenance
-            ).map((provenance) => provenance.changeHash),
-          catch: (cause) =>
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.StorageCorrupt({ cause })
-            })
-        })
-        yield* deliveries.recordMessage({
-          replicaId: entry.replicaId,
-          replicaIncarnation: entry.replicaIncarnation,
-          expectedLocal: entry.expectedLocal,
-          remote: entry.remote,
-          relayPeerId: entry.relayPeerId,
-          relayMessageId: entry.relayMessageId,
-          outerEnvelopeDigest: entry.outerEnvelopeDigest,
-          senderConnectionEpoch: entry.senderConnectionEpoch,
-          senderSequence: entry.senderSequence,
-          documentId: entry.document.documentId,
-          createdAt: entry.createdAt,
-          retryDeadline: entry.retryDeadline,
-          changeHashes
-        })
+        yield* recordEntryDelivery(entry, changeHashes)
         yield* deliveries.markAccepted(
           permit.incarnation,
           input.relayMessageId,
@@ -1374,6 +1362,7 @@ const make = Effect.gen(function*() {
             AND replica_incarnation = ${permit.incarnation}
             AND relay_message_id = ${input.relayMessageId}
             AND outer_envelope_digest = ${input.outerEnvelopeDigest}`
+        provenanceCache.delete(input.relayMessageId)
         yield* gate.validate(permit)
       })).pipe(Effect.catchTags({
         SqlError: (cause) =>
@@ -1410,35 +1399,12 @@ const make = Effect.gen(function*() {
       const rows = yield* query(undefined)
       for (const row of rows) {
         const entry = yield* validateRow(row, permit)
-        const syncEnvelope = yield* PeerSyncEnvelope.decodeSyncEnvelope(entry.payload, replicaLimits).pipe(
-          Effect.provideService(Crypto.Crypto, crypto)
+        const changeHashes = yield* provenanceChangeHashes(
+          entry.relayMessageId,
+          entry.outerEnvelopeDigest,
+          entry.payload
         )
-        const changeHashes = yield* Effect.try({
-          try: () =>
-            WriterProvenance.validateExact(
-              WriterProvenance.syncMessageChangeHashes(syncEnvelope.message),
-              syncEnvelope.writerProvenance
-            ).map((provenance) => provenance.changeHash),
-          catch: (cause) =>
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.StorageCorrupt({ cause })
-            })
-        })
-        yield* deliveries.recordMessage({
-          replicaId: entry.replicaId,
-          replicaIncarnation: entry.replicaIncarnation,
-          expectedLocal: entry.expectedLocal,
-          remote: entry.remote,
-          relayPeerId: entry.relayPeerId,
-          relayMessageId: entry.relayMessageId,
-          outerEnvelopeDigest: entry.outerEnvelopeDigest,
-          senderConnectionEpoch: entry.senderConnectionEpoch,
-          senderSequence: entry.senderSequence,
-          documentId: entry.document.documentId,
-          createdAt: entry.createdAt,
-          retryDeadline: entry.retryDeadline,
-          changeHashes
-        })
+        yield* recordEntryDelivery(entry, changeHashes)
         yield* deliveries.markUnconfirmed(
           permit.incarnation,
           row.relay_message_id,
@@ -1449,6 +1415,7 @@ const make = Effect.gen(function*() {
           WHERE row_id = ${row.row_id}
             AND replica_id = ${permit.replicaId}
             AND replica_incarnation = ${permit.incarnation}`
+        provenanceCache.delete(row.relay_message_id)
       }
       yield* gate.validate(permit)
       return rows.length
