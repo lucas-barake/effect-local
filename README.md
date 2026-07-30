@@ -874,8 +874,10 @@ invalidation, and backup export streams are intentionally unbounded. The owner s
 (`SessionManager.leaseDurationMillis`) and the client renews it automatically.
 
 Each mounted remote peer connection Atom holds one global queued RPC admission, one stream permit, and one in
-flight permit for its session. Size `maxStreamsPerSession` for the invalidation stream, an optional replica
-status stream, and all mounted peer status streams. Size `maxInFlightPerSession` for those streams plus the
+flight permit for its session. Each mounted `ReplicaAtom.commandDeliveryFamily` Atom holds one more stream permit
+and one more in flight permit for as long as it stays mounted. Size `maxStreamsPerSession` for the invalidation
+stream, an optional replica status stream, all mounted peer status streams, and all mounted command delivery
+streams. Size `maxInFlightPerSession` for those streams plus the
 unary operations that must run concurrently. Size `maxQueuedRpc` for all active unary and stream RPCs across
 sessions. Backup restore uses the separate `maxRestoresPerSession` and `maxActiveRestores` limits.
 
