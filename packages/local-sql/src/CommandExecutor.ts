@@ -892,6 +892,12 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                       requestHash: expectedHash,
                       result
                     })
+                    yield* persistDeliverySource({
+                      commandId: options.commandId,
+                      documentId: options.documentId,
+                      changeHashes: [],
+                      permit: options.permit
+                    })
                     return outcome
                   })
 
@@ -950,6 +956,9 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                   ),
                   track
                 )
+                const resolvedChangeHashes = InternalAutomerge.changesSince(staged, durable.materializedHeads).map(
+                  (change) => change.hash
+                )
                 const persisted = yield* store.persist(document, options.documentId, durable, staged).pipe(
                   Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
                 )
@@ -968,6 +977,12 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                   permit: options.permit,
                   requestHash: expectedHash,
                   result
+                })
+                yield* persistDeliverySource({
+                  commandId: options.commandId,
+                  documentId: options.documentId,
+                  changeHashes: resolvedChangeHashes,
+                  permit: options.permit
                 })
                 return outcome
               })

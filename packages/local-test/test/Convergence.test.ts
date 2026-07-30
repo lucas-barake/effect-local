@@ -323,6 +323,11 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
       })
       assert.strictEqual(outcome._tag, "DurablyCommittedLocal")
       assert.strictEqual(outcome.commandId, commandId)
+      const delivery = yield* left.replica.lookupCommandDelivery(commandId)
+      assert.strictEqual(delivery._tag, "TrackedCommand")
+      if (delivery._tag === "TrackedCommand") {
+        assert.isAbove(delivery.localChangeCount, 0)
+      }
       yield* drain(documentId, left, right, true)
       const leftInspection = yield* left.replica.inspectConflicts(Message, documentId)
       const rightInspection = yield* right.replica.inspectConflicts(Message, documentId)
@@ -419,6 +424,8 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
         assert.strictEqual(staleOutcome.error._tag, "StaleConflictResolution")
         assert.deepStrictEqual(staleOutcome.error, staleError)
       }
+      const staleDelivery = yield* left.replica.lookupCommandDelivery(staleCommandId)
+      assert.strictEqual(staleDelivery._tag, "NoChangesToDeliver")
 
       const freshResolution = selectMessage(
         yield* left.replica.inspectConflicts(Message, documentId),

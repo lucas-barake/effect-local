@@ -150,6 +150,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
                   })
                 )
               )
+              yield* deliveryPublisher.publishPending.pipe(Effect.catchTag("ReplicaError", () => Effect.void))
               return undefined
             })
           ).pipe(

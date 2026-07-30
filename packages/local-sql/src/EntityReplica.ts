@@ -210,6 +210,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   })
                 )
               )
+              yield* deliveryPublisher.publishPending.pipe(Effect.catchTag("ReplicaError", () => Effect.void))
               return undefined
             })).pipe(
               Effect.withSpan("EntityReplica.resolveConflict", {
