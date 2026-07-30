@@ -259,8 +259,8 @@ is removed.
 
 Applications can query `Replica.lookupCommandDelivery(commandId)` or subscribe with
 `Replica.commandDeliveryChanges(commandId)`. Browser replicas expose the same methods through the owner worker, and
-`ReplicaAtom.commandDeliveryFamily(commandId)` invalidates from one global delivery key without exposing command IDs
-through the invalidation channel.
+`ReplicaAtom.commandDeliveryFamily(commandId)` reads one command's stream directly rather than through a reactivity
+key. The owner's invalidation channel carries a single global delivery key, so command IDs never cross it.
 
 One `TrackedCommand` groups evidence by exact relay peer and remote peer. Its destination state is one of:
 

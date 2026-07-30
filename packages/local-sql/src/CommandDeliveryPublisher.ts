@@ -11,8 +11,6 @@ import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as CommandDeliveryStore from "./CommandDeliveryStore.js"
 
-const pendingEventBatchSize = 512
-
 export interface Options {
   readonly eventCapacity: number
   readonly publishInterval: Duration.Input
@@ -155,7 +153,7 @@ export const layer = (options: Options): Layer.Layer<
         let published: number
         do {
           published = yield* publishPending
-        } while (published === pendingEventBatchSize)
+        } while (published === CommandDeliveryStore.pendingEventBatchSize)
       })
 
       yield* Effect.sleep(publishIntervalMillis).pipe(

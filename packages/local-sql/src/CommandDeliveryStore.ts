@@ -13,6 +13,9 @@ import * as ReplicaGate from "./ReplicaGate.js"
 
 const IsoDate = Schema.DateTimeUtcFromString
 
+/** Bounds one `pendingEvents` read, and so the batch size the publisher drains until it is short. */
+export const pendingEventBatchSize = 512
+
 const ReceiptRow = Schema.Struct({
   document_id: Identity.DocumentId,
   tracked: Schema.Int
@@ -855,7 +858,7 @@ export const layer: Layer.Layer<
         FROM effect_local_command_delivery_events
         WHERE published = 0
         ORDER BY event_sequence
-        LIMIT 512`
+        LIMIT ${pendingEventBatchSize}`
     })(undefined).pipe(
       Effect.map((rows) =>
         rows.map((row) => ({

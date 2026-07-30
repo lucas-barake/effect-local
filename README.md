@@ -733,6 +733,7 @@ The distinction that matters:
 | `CommandOutcomeUnknown`                             | Look up the same command ID with the matching `lookup*` method |
 | Lookup answers `OutcomeUnknown`                     | Application policy decides; a new attempt is a NEW command ID  |
 | Lookup answers `Rejected` / `DurablyCommittedLocal` | The recorded answer is final                                   |
+| Deliberate new operation                            | Mint a fresh command ID with `Identity.makeCommandId`          |
 
 `DurablyCommittedLocal` proves only that the command and its canonical changes committed in local SQLite.
 Use `Replica.lookupCommandDelivery(commandId)` when application behavior also depends on relay custody.
@@ -770,7 +771,6 @@ Expiry is evidence that confirmation was not obtained by the deadline. It is not
 failed. A valid late acknowledgement upgrades the same durable record to `RelayCustodyAccepted`. The summary is
 scoped to an exact relay peer and remote peer. It does not claim that the destination replica applied or observed
 the changes.
-| Deliberate new operation | Mint a fresh command ID with `Identity.makeCommandId` |
 
 ## Durable Node composition
 

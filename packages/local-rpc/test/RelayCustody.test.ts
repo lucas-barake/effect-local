@@ -502,6 +502,7 @@ describe("relay custody against a real relay", () => {
           assert.strictEqual(head.envelope.document.documentType, Task.name)
           assert.isAbove(head.envelope.payload.byteLength, 0)
 
+          // A count on the recipient's inbox alone would not catch a message filed back to its sender.
           const localHeads = yield* backend.store
             .pendingHeads(yield* inboxKeyOf(localPrincipal, backend.crypto), { limit: 10 })
             .pipe(Effect.orDie)
