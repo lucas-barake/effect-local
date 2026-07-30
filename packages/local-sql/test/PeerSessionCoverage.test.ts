@@ -24,7 +24,7 @@ const deliveryStore = CommandDeliveryStore.CommandDeliveryStore.of({
   recordMessage: () => Effect.die("unexpected command delivery message"),
   markAccepted: () => Effect.die("unexpected command delivery acceptance"),
   markUnconfirmed: () => Effect.die("unexpected command delivery deadline"),
-  documentConfirmed: () => Effect.succeed(false),
+  documentConfirmed: () => Effect.die("unexpected document confirmation"),
   pendingEvents: Effect.die("unexpected command delivery events"),
   markEventsPublished: () => Effect.die("unexpected command delivery publication"),
   cursor: Effect.die("unexpected command delivery cursor")

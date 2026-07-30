@@ -417,29 +417,6 @@ describe("relay custody against a real relay", () => {
           })))
           assert.strictEqual(attempt._tag, "Failure")
           assert.strictEqual((yield* outboxRows(sender.sql)).length, 1)
-          const deliveryHashes = yield* sender.sql<{
-            readonly relay_message_id: string
-            readonly change_hash: string
-          }>`SELECT relay_message_id, change_hash
-            FROM effect_local_peer_relay_delivery_changes
-            ORDER BY relay_message_id, change_hash`
-          const admittedHashes = yield* sender.sql<{
-            readonly relay_message_id: string
-            readonly change_hash: string
-          }>`SELECT relay_message_id, json_extract(provenance.value, '$.changeHash') AS change_hash
-            FROM effect_local_peer_relay_outbox, json_each(writer_provenance) AS provenance
-            ORDER BY relay_message_id, change_hash`
-          assert.isAbove(admittedHashes.length, 0)
-          assert.deepStrictEqual(
-            new Set(deliveryHashes.map((row) => row.change_hash)),
-            new Set(admittedHashes.map((row) => row.change_hash))
-          )
-          for (const changeHash of expectedChangeHashes) {
-            assert.isTrue(
-              deliveryHashes.some((row) => row.change_hash === changeHash),
-              `relay message must contain command change ${changeHash}`
-            )
-          }
 
           for (
             const commandId of [

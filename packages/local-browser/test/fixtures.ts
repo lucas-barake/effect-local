@@ -105,6 +105,8 @@ export const DeliveryPublisher = Layer.succeed(
       refreshEpoch: 0,
       events: Stream.never
     }),
-    changes: replica.commandDeliveryChanges
+    // The owner's delivery handler reads the replica directly, so reaching the publisher here
+    // would mean the wiring changed underneath these tests.
+    changes: () => Stream.die("unexpected command delivery subscription")
   })
 )

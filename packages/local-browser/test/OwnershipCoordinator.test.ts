@@ -458,52 +458,6 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
       )
     }))
 
-  it.effect("reprovisions immediately when the starting candidate detaches", () =>
-    Effect.gen(function*() {
-      const started: Array<StartedEngine> = []
-      const firstStartEntered = yield* Deferred.make<void>()
-      const releaseFirstStart = yield* Deferred.make<void>()
-      const engine = makeEngineFactory(
-        started,
-        ":memory:",
-        (attempt) =>
-          attempt === 1
-            ? Deferred.succeed(firstStartEntered, undefined).pipe(
-              Effect.andThen(Deferred.await(releaseFirstStart))
-            )
-            : Effect.void
-      )
-      const Coordinator = OwnershipCoordinator.layerSharedWorker({
-        name: "effect-local-ownership-starting-detach-test",
-        definition,
-        engine,
-        info: ownerInfo,
-        provisionTimeout: "500 millis",
-        engineStartTimeout: "5 seconds",
-        engineDisposeTimeout: "100 millis",
-        healthCheck: { interval: "100 millis", timeout: "500 millis" }
-      })
-
-      yield* Effect.gen(function*() {
-        const provider = yield* attachTab
-        yield* acceptNextProvision(provider)
-        yield* Deferred.await(firstStartEntered)
-
-        const secondary = yield* attachTab
-        postToOwner(provider, { _tag: "Detach" })
-
-        const provisioned = yield* Effect.raceFirst(
-          takeFrame(secondary, "Provision").pipe(Effect.as(true)),
-          Effect.sleep("100 millis").pipe(Effect.as(false))
-        ).pipe(Effect.forkChild)
-        yield* TestClock.adjust("100 millis")
-        assert.isTrue(yield* Fiber.join(provisioned))
-      }).pipe(
-        Effect.provide(Coordinator),
-        Effect.scoped
-      )
-    }))
-
   it.effect("releases the engine when the starting candidate detaches", () =>
     Effect.gen(function*() {
       const started: Array<StartedEngine> = []
@@ -540,6 +494,8 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
         const secondary = yield* attachTab
         postToOwner(provider, { _tag: "Detach" })
 
+        // Joining the frame is also the reprovision assertion: without the detach handling the
+        // secondary is never provisioned and this never completes.
         const provisioned = yield* takeFrame(secondary, "Provision").pipe(Effect.forkChild)
         yield* TestClock.adjust("100 millis")
         yield* Fiber.join(provisioned)
