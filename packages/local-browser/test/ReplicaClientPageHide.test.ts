@@ -139,11 +139,19 @@ it.layer(NodeCrypto.layer)("ReplicaClient pagehide", (it) => {
       yield* Effect.scoped(Effect.gen(function*() {
         const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
         const closed = yield* Deferred.make<void>()
+        let hidden = false
+        let opensAfterHide = 0
         const observedRpc = new Proxy(rpc, {
           get(target, property, receiver) {
             const value = Reflect.get(target, property, receiver)
             if (property === "CloseSession") {
               return (payload: never) => value(payload).pipe(Effect.ensuring(Deferred.succeed(closed, undefined)))
+            }
+            if (property === "OpenSession") {
+              return (payload: never) => {
+                if (hidden) opensAfterHide++
+                return value(payload)
+              }
             }
             return value
           }
@@ -158,12 +166,16 @@ it.layer(NodeCrypto.layer)("ReplicaClient pagehide", (it) => {
         )
         yield* Deferred.await(observed)
         target.dispatchEvent(new Event("pagehide"))
+        hidden = true
         yield* Deferred.await(closed)
         yield* Fiber.join(stream)
         assert.strictEqual(yield* sessions.activeCount, 0)
         yield* TestClock.adjust(SessionManager.leaseDurationMillis / 2 + 1)
         yield* Effect.yieldNow
         assert.strictEqual(yield* sessions.activeCount, 0)
+        // A reopened session must call OpenSession through the same RPC boundary. Asserting on
+        // the boundary proves the negative regardless of how many fiber turns a reopen needs.
+        assert.strictEqual(opensAfterHide, 0)
       }))
     }).pipe(Effect.provide(ActiveOwner))
   })

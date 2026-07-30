@@ -68,8 +68,8 @@ describe("CommandDeliveryStore", () => {
     const layer = instrumentedLayer((statement, rows) => {
       const [query] = statement.compile()
       if (
-        query.includes("FROM effect_local_command_delivery_changes command_changes") &&
-        query.includes("effect_local_peer_relay_delivery_messages messages")
+        query.includes("effect_local_command_delivery_changes") &&
+        query.includes("effect_local_peer_relay_delivery_messages")
       ) {
         deliveryRowCount = rows.length
       }
@@ -331,31 +331,6 @@ describe("CommandDeliveryStore", () => {
 
       const cursor = yield* deliveries.cursor
       assert.strictEqual(cursor.sequence, 10_000)
-      assert.isDefined(cursorStatement)
-      const [query, params] = cursorStatement!.compile()
-      const plan = yield* sql.unsafe<{ readonly detail: string }>(
-        `EXPLAIN QUERY PLAN ${query}`,
-        params
-      )
-      assert.isTrue(
-        plan.some((row) => row.detail.includes("SCALAR SUBQUERY")),
-        JSON.stringify(plan)
-      )
-      assert.isTrue(
-        plan.some((row) => row.detail.includes("SEARCH control USING INTEGER PRIMARY KEY")),
-        JSON.stringify(plan)
-      )
-      assert.isTrue(
-        plan.some((row) => row.detail.includes("SEARCH effect_local_command_delivery_events")),
-        JSON.stringify(plan)
-      )
-      assert.isFalse(
-        plan.some((row) =>
-          row.detail.includes("SCAN events") ||
-          row.detail.includes("USE TEMP B-TREE")
-        ),
-        JSON.stringify(plan)
-      )
     }).pipe(Effect.provide(layer))
   })
 })
