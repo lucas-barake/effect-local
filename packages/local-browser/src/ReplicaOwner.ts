@@ -11,7 +11,6 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
-import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { RpcServer } from "effect/unstable/rpc"
@@ -44,7 +43,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
     const sessions = yield* SessionManager.SessionManager
     const restoreTransport = yield* RestoreTransport.RestoreTransport
     const commits = yield* CommitPublisher.CommitPublisher
-    const peerConnections = yield* Effect.serviceOption(PeerConnectionStatus.PeerConnectionStatus)
+    const peerConnections = yield* PeerConnectionStatus.PeerConnectionStatus
     const crypto = yield* Crypto.Crypto
     const ownerEpoch = yield* crypto.randomUUIDv4.pipe(
       Effect.mapError((cause) =>
@@ -248,10 +247,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
         sessions.stream(
           sessionId,
           client.id,
-          (Option.isSome(peerConnections)
-            ? peerConnections.value.status(peerId)
-            : Stream.make({ _tag: "Disconnected" } as PeerConnectionStatus.Status))
-            .pipe(Stream.withSpan("ReplicaOwner.peerConnectionStatus"))
+          peerConnections.status(peerId).pipe(Stream.withSpan("ReplicaOwner.peerConnectionStatus"))
         ),
       ExportBackup: ({ maxBytes, sessionId }, { client }) =>
         sessions.stream(

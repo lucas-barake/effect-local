@@ -37,7 +37,7 @@ export class ReplicaClient extends Context.Service<
   Replica.Replica["Service"] & {
     readonly ownerEpoch: string
     readonly invalidations: Stream.Stream<ReplicaRpc.Invalidation, ReplicaError.ReplicaError>
-    readonly peerConnectionStatus?: PeerConnectionStatus.PeerConnectionStatus["Service"] | undefined
+    readonly peerConnectionStatus: PeerConnectionStatus.PeerConnectionStatus["Service"]
   }
 >()(
   "@lucas-barake/effect-local-browser/ReplicaClient"

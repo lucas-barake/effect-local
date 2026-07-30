@@ -18,7 +18,7 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as ReplicaAtom from "../src/ReplicaAtom.js"
 import * as ReplicaClient from "../src/ReplicaClient.js"
 import type * as ReplicaRpc from "../src/ReplicaRpc.js"
-import { Rename, replica, Task } from "./fixtures.js"
+import { peerConnectionStatus, Rename, replica, Task } from "./fixtures.js"
 
 describe("ReplicaAtom", () => {
   it.effect("reads documents through documentFamily", () =>
@@ -243,6 +243,7 @@ describe("ReplicaAtom", () => {
       const client: ReplicaClient.ReplicaClient["Service"] = {
         ...replica,
         ownerEpoch: "owner",
+        peerConnectionStatus,
         invalidations: Stream.fromQueue(events).pipe(
           Stream.tap(() => Deferred.succeed(consumed, undefined))
         ),
@@ -285,6 +286,7 @@ describe("ReplicaAtom", () => {
       const client = (ownerEpoch: string, key: string): ReplicaClient.ReplicaClient["Service"] => ({
         ...replica,
         ownerEpoch,
+        peerConnectionStatus,
         invalidations: Stream.make({
           _tag: "Invalidation" as const,
           ownerEpoch,
@@ -319,6 +321,7 @@ describe("ReplicaAtom", () => {
       const client: ReplicaClient.ReplicaClient["Service"] = {
         ...replica,
         ownerEpoch: "owner",
+        peerConnectionStatus,
         invalidations: Stream.unwrap(Effect.sync(() => {
           subscriptions++
           return subscriptions < 4
@@ -363,6 +366,7 @@ describe("ReplicaAtom", () => {
       const client: ReplicaClient.ReplicaClient["Service"] = {
         ...replica,
         ownerEpoch: "owner",
+        peerConnectionStatus,
         invalidations: Stream.unwrap(Effect.sync(() => {
           subscriptions++
           return subscriptions < 2

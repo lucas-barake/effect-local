@@ -4,35 +4,28 @@ import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefin
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
-import * as Stream from "effect/Stream"
 import { RpcClient } from "effect/unstable/rpc"
 import * as ReplicaAtom from "./ReplicaAtom.js"
 import * as ReplicaClient from "./ReplicaClient.js"
 
 type WorkerOptions = Parameters<typeof RpcClient.layerProtocolWorker>[0]
 
-const clientServices = () =>
-  Layer.effectContext(
-    ReplicaClient.ReplicaClient.pipe(
-      Effect.map((client) =>
-        Context.make(Replica.Replica, client).pipe(
-          Context.add(
-            PeerConnectionStatus.PeerConnectionStatus,
-            client.peerConnectionStatus ?? PeerConnectionStatus.PeerConnectionStatus.of({
-              status: () => Stream.make({ _tag: "Disconnected" } as PeerConnectionStatus.Status)
-            })
-          )
-        )
+const clientServices = Layer.effectContext(
+  ReplicaClient.ReplicaClient.pipe(
+    Effect.map((client) =>
+      Context.make(Replica.Replica, client).pipe(
+        Context.add(PeerConnectionStatus.PeerConnectionStatus, client.peerConnectionStatus)
       )
     )
   )
+)
 
 export const layerWith = (
   definition: ReplicaDefinition.Any,
   options: WorkerOptions,
   clientOptions?: ReplicaClient.Options
 ) =>
-  clientServices().pipe(
+  clientServices.pipe(
     Layer.provide(ReplicaClient.layer(definition, clientOptions)),
     Layer.provide(RpcClient.layerProtocolWorker(options))
   )
@@ -46,7 +39,7 @@ export const layerWithReactivityOptions = (
   clientOptions?: ReplicaClient.Options
 ) =>
   Layer.merge(
-    clientServices(),
+    clientServices,
     ReplicaAtom.layerReactivity
   ).pipe(
     Layer.provide(ReplicaClient.layer(definition, clientOptions)),

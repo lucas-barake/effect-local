@@ -12,6 +12,7 @@ import type * as WorkerError from "effect/unstable/workers/WorkerError"
 import * as BrowserReplica from "../src/BrowserReplica.js"
 import * as BrowserSqlite from "../src/BrowserSqlite.js"
 import type * as ReplicaClient from "../src/ReplicaClient.js"
+import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import { definition } from "./fixtures.js"
 
 describe("public browser API types", () => {
@@ -22,6 +23,19 @@ describe("public browser API types", () => {
       Crypto.Crypto | Worker.WorkerPlatform | Worker.Spawner
     > = BrowserReplica.layer(definition)
     assert.isDefined(layer)
+  })
+
+  // The owner used to take this service with `Effect.serviceOption` and fall back to a one shot
+  // `Disconnected` stream, so a graph that never provided it compiled and then reported every peer
+  // as offline forever. Pinning the requirement here is what keeps that from coming back: the
+  // annotation stops compiling the moment the dependency goes soft again.
+  it("keeps peer connection status a requirement of the owner handlers", () => {
+    type OwnerRequirements = ReturnType<typeof ReplicaOwner.layerHandlers> extends
+      Layer.Layer<infer _Out, infer _E, infer Requirements> ? Requirements : never
+
+    const required: OwnerRequirements = undefined as unknown as PeerConnectionStatus.PeerConnectionStatus
+    assert.isDefined(ReplicaOwner.layerHandlers(definition))
+    assert.isUndefined(required)
   })
 
   it("exposes client options through every browser replica constructor", () => {

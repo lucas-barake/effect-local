@@ -1,3 +1,4 @@
+import type * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
@@ -73,4 +74,12 @@ export const replica: Replica.Replica["Service"] = {
       value: { title: "stored" }
     }) as never,
   importDocument: () => Effect.succeed(documentId)
+}
+
+/**
+ * Never completes. A status stream that ends looks exactly like one that is still open and has
+ * nothing new to say, so an Atom observing it would park on the last value forever.
+ */
+export const peerConnectionStatus: PeerConnectionStatus.PeerConnectionStatus["Service"] = {
+  status: () => Stream.make({ _tag: "Disconnected" as const }).pipe(Stream.concat(Stream.never))
 }

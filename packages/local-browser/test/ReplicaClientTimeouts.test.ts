@@ -1,6 +1,7 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { assert, it } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
+import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -67,6 +68,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
     })
   )
   const Owner = ReplicaOwner.layerHandlers(definition).pipe(
+    Layer.provide(PeerConnectionStatus.layer),
     Layer.provideMerge(Sessions),
     Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, replica)))
   )
