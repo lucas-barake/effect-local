@@ -796,7 +796,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 _tag: "InvalidationsReady" as const,
                 ownerEpoch,
                 watermark: Identity.CommitSequence.make(0),
-                refreshGeneration: 0
+                refreshGeneration: 0,
+                deliveryWatermark: 0,
+                deliveryRefreshEpoch: 0
               })
               return subscriptions < 5
                 ? ready.pipe(Stream.concat(Stream.fail(disconnected())))
