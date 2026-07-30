@@ -67,7 +67,9 @@ const destinationState = (
     return {
       _tag: "PendingRelayCustody",
       acceptedChangeCount: row.accepted_change_count,
-      pendingChangeCount: row.pending_change_count,
+      // Every change without accepted custody still waits, whether it rides a pending message,
+      // only crossed its sender deadline, or has no message yet.
+      pendingChangeCount: localChangeCount - row.accepted_change_count,
       firstPendingAt: row.first_pending_at,
       retryDeadline: row.pending_retry_deadline
     }

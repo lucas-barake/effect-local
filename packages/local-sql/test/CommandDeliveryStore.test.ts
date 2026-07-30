@@ -232,14 +232,85 @@ describe("CommandDeliveryStore", () => {
     }).pipe(Effect.provide(layer))
   })
 
-  it.effect("uses the rowid max optimization for the publisher cursor", () => {
-    let cursorStatement: Statement.Statement<object> | undefined
-    const layer = instrumentedLayer((statement) => {
-      const [query] = statement.compile()
-      if (query.includes("effect_local_command_delivery_control control")) {
-        cursorStatement = statement
-      }
-    })
+  it.effect("counts every non accepted change as pending when coverage mixes message states", () => {
+    const layer = instrumentedLayer(() => {})
+
+    return Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const gate = yield* ReplicaGate.ReplicaGate
+      const deliveries = yield* CommandDeliveryStore.CommandDeliveryStore
+      const permit = yield* gate.current
+      const commandId = Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000004")
+      const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000004")
+      const acceptedChange = "a".repeat(64)
+      const pendingChange = "b".repeat(64)
+      const uncarriedChange = "c".repeat(64)
+      const message = (suffix: string, senderSequence: number, acceptedAt: string | null) => ({
+        replica_id: permit.replicaId,
+        replica_incarnation: permit.incarnation,
+        expected_local_tenant_id: "tenant",
+        expected_local_subject_id: "sender",
+        expected_local_peer_id: "peer_00000000-0000-4000-8000-000000000001",
+        remote_tenant_id: "tenant",
+        remote_subject_id: "receiver",
+        remote_peer_id: "peer_00000000-0000-4000-8000-000000000002",
+        relay_peer_id: "peer_00000000-0000-4000-8000-000000000003",
+        relay_message_id: `rly_00000000-0000-4000-8000-${suffix}`,
+        outer_envelope_digest: "d".repeat(64),
+        sender_connection_epoch: "mixed-coverage",
+        sender_sequence: senderSequence,
+        document_id: documentId,
+        created_at: "2026-01-01T00:00:00.000Z",
+        retry_deadline: "2026-01-02T00:00:00.000Z",
+        relay_custody_accepted_at: acceptedAt,
+        sender_custody_unconfirmed_at: null
+      })
+
+      yield* sql`INSERT INTO effect_local_command_receipts (
+        replica_incarnation, command_id, request_hash, mutation_name, result,
+        document_id, heads, commit_sequence
+      ) VALUES (
+        ${permit.incarnation}, ${commandId}, 'request', 'Create', ${new Uint8Array()},
+        ${documentId}, '[]', 1
+      )`
+      yield* sql`INSERT INTO effect_local_command_delivery_sources (
+        replica_incarnation, command_id, document_id
+      ) VALUES (${permit.incarnation}, ${commandId}, ${documentId})`
+      yield* sql`INSERT INTO effect_local_command_delivery_changes ${
+        sql.insert([acceptedChange, pendingChange, uncarriedChange].map((change_hash) => ({
+          replica_incarnation: permit.incarnation,
+          command_id: commandId,
+          change_hash
+        })))
+      }`
+      yield* sql`INSERT INTO effect_local_peer_relay_delivery_messages ${
+        sql.insert([
+          message("000000000011", 0, "2026-01-01T00:00:01.000Z"),
+          message("000000000012", 1, null)
+        ])
+      }`
+      yield* sql`INSERT INTO effect_local_peer_relay_delivery_changes (
+        replica_incarnation, relay_message_id, change_hash
+      ) VALUES
+        (${permit.incarnation}, 'rly_00000000-0000-4000-8000-000000000011', ${acceptedChange}),
+        (${permit.incarnation}, 'rly_00000000-0000-4000-8000-000000000012', ${pendingChange})`
+
+      const delivery = yield* deliveries.lookup(commandId)
+      assert.strictEqual(delivery._tag, "TrackedCommand")
+      if (delivery._tag !== "TrackedCommand") return
+      assert.strictEqual(delivery.localChangeCount, 3)
+      assert.strictEqual(delivery.destinations.length, 1)
+      const state = delivery.destinations[0]?.state
+      assert.strictEqual(state?._tag, "PendingRelayCustody")
+      if (state?._tag !== "PendingRelayCustody") return
+      assert.strictEqual(state.acceptedChangeCount, 1)
+      // One change waits on a pending message and one has no message yet. Both await custody.
+      assert.strictEqual(state.pendingChangeCount, 2)
+    }).pipe(Effect.provide(layer))
+  })
+
+  it.effect("reads the publisher cursor over a large event backlog", () => {
+    const layer = instrumentedLayer(() => {})
 
     return Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
