@@ -580,7 +580,8 @@ export const layer = (
                         expectedLocal: options.expectedLocal,
                         remote: {
                           tenantId: options.expectedLocal.tenantId,
-                          ...options.remote
+                          subjectId: options.remote.subjectId,
+                          peerId: options.remote.peerId
                         },
                         relayPeerId: options.expectedRelayPeerId
                       },
