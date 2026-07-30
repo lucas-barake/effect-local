@@ -1079,8 +1079,9 @@ const observeServer = PeerConnectionStatus.PeerConnectionStatus.pipe(
 
 The standard `SqlReplica` Layers provide `PeerConnectionStatus` and its internal `Reporter`. This works in
 Node, Expo, React Native, and other runtimes without DOM APIs. A custom runtime that constructs
-`PeerSession` directly must call `PeerConnectionStatus.layer()` once for that replica graph and provide the
-returned Layer to both the session and its observers.
+`PeerSession` directly provides `PeerConnectionStatus.layer` to both the session and its observers.
+`layer` is a value, not a constructor, so referencing it more than once in one graph still resolves to a
+single owner and the Reporter and the reader cannot drift onto separate instances.
 
 The states have deliberately narrow meanings:
 

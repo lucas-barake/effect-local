@@ -55,15 +55,6 @@ interface State {
   readonly closed: boolean
 }
 
-interface OwnerService {
-  readonly reader: PeerConnectionStatus["Service"]
-  readonly reporter: Reporter["Service"]
-}
-
-class Owner extends Context.Service<Owner, OwnerService>()(
-  "@lucas-barake/effect-local-sql/PeerConnectionStatus/Owner"
-) {}
-
 const derive = (attempts: ReadonlyMap<number, AttemptState>): Status => {
   for (const state of attempts.values()) {
     if (state === "Connected") return connected
@@ -73,122 +64,122 @@ const derive = (attempts: ReadonlyMap<number, AttemptState>): Status => {
 
 const sameStatus = (left: Status, right: Status) => left._tag === right._tag
 
-export const layer = (): Layer.Layer<PeerConnectionStatus | Reporter> => {
-  const owner = Layer.effect(
-    Owner,
-    Effect.gen(function*() {
-      const state = yield* Ref.make<State>({
-        nextAttemptId: 0,
-        attempts: new Map(),
-        statuses: new Map(),
-        closed: false
-      })
-      const writes = yield* Semaphore.make(1)
-      const statuses = yield* Effect.acquireRelease(
-        PubSub.sliding<ReadonlyMap<Identity.PeerId, Status>>({ capacity: 1, replay: 1 }),
-        (pubsub) =>
-          writes.withPermit(
-            Effect.gen(function*() {
-              yield* Ref.update(state, (current) => ({ ...current, closed: true }))
-              yield* PubSub.shutdown(pubsub)
-            })
-          ).pipe(Effect.uninterruptible)
-      )
-      yield* PubSub.publish(statuses, new Map())
-
-      const updateAttempt = (
-        peerId: Identity.PeerId,
-        attemptId: number,
-        update: (current: AttemptState | undefined) => AttemptState | undefined
-      ) =>
-        writes.withPermit(
-          Effect.gen(function*() {
-            const current = yield* Ref.get(state)
-            if (current.closed) return
-            const currentPeer = current.attempts.get(peerId) ?? new Map()
-            const previousAttempt = currentPeer.get(attemptId)
-            const nextAttempt = update(previousAttempt)
-            if (nextAttempt === previousAttempt) return
-
-            const nextPeer = new Map(currentPeer)
-            if (nextAttempt === undefined) nextPeer.delete(attemptId)
-            else nextPeer.set(attemptId, nextAttempt)
-
-            const nextAttempts = new Map(current.attempts)
-            if (nextPeer.size === 0) nextAttempts.delete(peerId)
-            else nextAttempts.set(peerId, nextPeer)
-
-            const nextStatus = derive(nextPeer)
-            const previousStatus = current.statuses.get(peerId) ?? disconnected
-            const nextStatuses = new Map(current.statuses)
-            if (nextStatus._tag === "Disconnected") nextStatuses.delete(peerId)
-            else nextStatuses.set(peerId, nextStatus)
-
-            if (!sameStatus(previousStatus, nextStatus)) {
-              yield* PubSub.publish(statuses, nextStatuses)
-            }
-            yield* Ref.set(state, {
-              ...current,
-              attempts: nextAttempts,
-              statuses: nextStatuses
-            })
-          })
-        ).pipe(Effect.uninterruptible)
-
-      const begin = (peerId: Identity.PeerId) =>
-        writes.withPermit(
-          Effect.gen(function*() {
-            const current = yield* Ref.get(state)
-            const attemptId = current.nextAttemptId
-            if (current.closed) {
-              return {
-                connected: Effect.void,
-                disconnected: Effect.void
-              } satisfies Attempt
-            }
-            const currentPeer = current.attempts.get(peerId) ?? new Map()
-            const nextPeer = new Map(currentPeer).set(attemptId, "Connecting" as const)
-            const nextAttempts = new Map(current.attempts).set(peerId, nextPeer)
-            const nextStatuses = new Map(current.statuses)
-            const previousStatus = current.statuses.get(peerId) ?? disconnected
-            const nextStatus = derive(nextPeer)
-            nextStatuses.set(peerId, nextStatus)
-            if (!sameStatus(previousStatus, nextStatus)) {
-              yield* PubSub.publish(statuses, nextStatuses)
-            }
-            yield* Ref.set(state, {
-              nextAttemptId: attemptId + 1,
-              attempts: nextAttempts,
-              statuses: nextStatuses,
-              closed: false
-            })
-            return {
-              connected: updateAttempt(
-                peerId,
-                attemptId,
-                (value) => value === "Connecting" ? "Connected" : value
-              ),
-              disconnected: updateAttempt(peerId, attemptId, () => undefined)
-            } satisfies Attempt
-          })
-        ).pipe(Effect.uninterruptible)
-
-      const reader = PeerConnectionStatus.of({
-        status: (peerId) =>
-          Stream.fromPubSub(statuses).pipe(
-            Stream.map((current) => current.get(peerId) ?? disconnected),
-            Stream.concat(Stream.make(disconnected)),
-            Stream.changesWith(sameStatus)
-          )
-      })
-      const reporter = Reporter.of({
-        connecting: (peerId) => Effect.acquireRelease(begin(peerId), (attempt) => attempt.disconnected)
-      })
-      return Owner.of({ reader, reporter })
+/**
+ * A value rather than a constructor, because the reader and the Reporter are two projections of one
+ * owner and Layer memoization is by reference. A `layer()` that minted a fresh Layer per call let a
+ * caller compose a second owner alongside the one `SqlReplica` already builds, after which the
+ * Reporter wrote into one owner while the reader observed the other and every peer read as
+ * permanently `Disconnected`.
+ */
+export const layer: Layer.Layer<PeerConnectionStatus | Reporter> = Layer.effectContext(
+  Effect.gen(function*() {
+    const state = yield* Ref.make<State>({
+      nextAttemptId: 0,
+      attempts: new Map(),
+      statuses: new Map(),
+      closed: false
     })
-  )
-  return Layer.merge(
-    Layer.effect(PeerConnectionStatus, Owner.pipe(Effect.map((service) => service.reader))),
-    Layer.effect(Reporter, Owner.pipe(Effect.map((service) => service.reporter)))
-  ).pipe(Layer.provide(owner))
-}
+    const writes = yield* Semaphore.make(1)
+    const statuses = yield* Effect.acquireRelease(
+      PubSub.sliding<ReadonlyMap<Identity.PeerId, Status>>({ capacity: 1, replay: 1 }),
+      (pubsub) =>
+        writes.withPermit(
+          Effect.gen(function*() {
+            yield* Ref.update(state, (current) => ({ ...current, closed: true }))
+            yield* PubSub.shutdown(pubsub)
+          })
+        ).pipe(Effect.uninterruptible)
+    )
+    yield* PubSub.publish(statuses, new Map())
+
+    const updateAttempt = (
+      peerId: Identity.PeerId,
+      attemptId: number,
+      update: (current: AttemptState | undefined) => AttemptState | undefined
+    ) =>
+      writes.withPermit(
+        Effect.gen(function*() {
+          const current = yield* Ref.get(state)
+          if (current.closed) return
+          const currentPeer = current.attempts.get(peerId) ?? new Map()
+          const previousAttempt = currentPeer.get(attemptId)
+          const nextAttempt = update(previousAttempt)
+          if (nextAttempt === previousAttempt) return
+
+          const nextPeer = new Map(currentPeer)
+          if (nextAttempt === undefined) nextPeer.delete(attemptId)
+          else nextPeer.set(attemptId, nextAttempt)
+
+          const nextAttempts = new Map(current.attempts)
+          if (nextPeer.size === 0) nextAttempts.delete(peerId)
+          else nextAttempts.set(peerId, nextPeer)
+
+          const nextStatus = derive(nextPeer)
+          const previousStatus = current.statuses.get(peerId) ?? disconnected
+          const nextStatuses = new Map(current.statuses)
+          if (nextStatus._tag === "Disconnected") nextStatuses.delete(peerId)
+          else nextStatuses.set(peerId, nextStatus)
+
+          if (!sameStatus(previousStatus, nextStatus)) {
+            yield* PubSub.publish(statuses, nextStatuses)
+          }
+          yield* Ref.set(state, {
+            ...current,
+            attempts: nextAttempts,
+            statuses: nextStatuses
+          })
+        })
+      ).pipe(Effect.uninterruptible)
+
+    const begin = (peerId: Identity.PeerId) =>
+      writes.withPermit(
+        Effect.gen(function*() {
+          const current = yield* Ref.get(state)
+          const attemptId = current.nextAttemptId
+          if (current.closed) {
+            return {
+              connected: Effect.void,
+              disconnected: Effect.void
+            } satisfies Attempt
+          }
+          const currentPeer = current.attempts.get(peerId) ?? new Map()
+          const nextPeer = new Map(currentPeer).set(attemptId, "Connecting" as const)
+          const nextAttempts = new Map(current.attempts).set(peerId, nextPeer)
+          const nextStatuses = new Map(current.statuses)
+          const previousStatus = current.statuses.get(peerId) ?? disconnected
+          const nextStatus = derive(nextPeer)
+          nextStatuses.set(peerId, nextStatus)
+          if (!sameStatus(previousStatus, nextStatus)) {
+            yield* PubSub.publish(statuses, nextStatuses)
+          }
+          yield* Ref.set(state, {
+            nextAttemptId: attemptId + 1,
+            attempts: nextAttempts,
+            statuses: nextStatuses,
+            closed: false
+          })
+          return {
+            connected: updateAttempt(
+              peerId,
+              attemptId,
+              (value) => value === "Connecting" ? "Connected" : value
+            ),
+            disconnected: updateAttempt(peerId, attemptId, () => undefined)
+          } satisfies Attempt
+        })
+      ).pipe(Effect.uninterruptible)
+
+    const reader = PeerConnectionStatus.of({
+      status: (peerId) =>
+        Stream.fromPubSub(statuses).pipe(
+          Stream.map((current) => current.get(peerId) ?? disconnected),
+          Stream.concat(Stream.make(disconnected)),
+          Stream.changesWith(sameStatus)
+        )
+    })
+    const reporter = Reporter.of({
+      connecting: (peerId) => Effect.acquireRelease(begin(peerId), (attempt) => attempt.disconnected)
+    })
+    return Context.make(PeerConnectionStatus, reader).pipe(Context.add(Reporter, reporter))
+  })
+)

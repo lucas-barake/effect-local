@@ -1,7 +1,13 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
+import * as Fiber from "effect/Fiber"
+import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
+import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as PeerConnectionStatus from "../src/PeerConnectionStatus.js"
 
@@ -24,7 +30,7 @@ describe("PeerConnectionStatus", () => {
         assert.deepStrictEqual(yield* current(service), { _tag: "Connected" })
       }))
       assert.deepStrictEqual(yield* current(service), { _tag: "Disconnected" })
-    }).pipe(Effect.provide(PeerConnectionStatus.layer())))
+    }).pipe(Effect.provide(PeerConnectionStatus.layer)))
 
   it.effect("keeps a peer connected while another attempt is opening", () =>
     Effect.gen(function*() {
@@ -40,5 +46,44 @@ describe("PeerConnectionStatus", () => {
         assert.deepStrictEqual(yield* current(service), { _tag: "Connected" })
       }))
       assert.deepStrictEqual(yield* current(service), { _tag: "Disconnected" })
-    }).pipe(Effect.provide(PeerConnectionStatus.layer())))
+    }).pipe(Effect.provide(PeerConnectionStatus.layer)))
+
+  // A live subscriber has to be told the peer is gone and then be released. If the stream were
+  // interrupted instead, a browser Atom observing it over the owner RPC would see a defect rather
+  // than a final status, and if it never ended the fiber would leak past its own Layer.
+  it.effect("delivers a terminal status and ends cleanly when the Layer scope closes", () =>
+    Effect.gen(function*() {
+      const scope = yield* Scope.make()
+      const context = yield* Scope.provide(Layer.build(PeerConnectionStatus.layer), scope)
+      const service = Context.get(context, PeerConnectionStatus.PeerConnectionStatus)
+      const seen = yield* Queue.unbounded<PeerConnectionStatus.Status>()
+      const fiber = yield* Stream.runForEach(service.status(peerId), (status) => Queue.offer(seen, status))
+        .pipe(Effect.forkChild)
+
+      assert.deepStrictEqual(yield* Queue.take(seen), { _tag: "Disconnected" })
+      yield* Scope.close(scope, Exit.void)
+
+      yield* Fiber.join(fiber)
+    }))
+
+  // The Reporter and the reader are two projections of one owner, so they have to come from one
+  // build. `Layer.merge` cannot expose this: it ends in `Context.mergeAll`, which is last write wins
+  // per key, so both projections would come from the second build and agree by accident. Only an
+  // explicit memo map puts one projection from each build in the same test.
+  it.effect("resolves one owner when the Layer is referenced twice under one memo map", () =>
+    Effect.gen(function*() {
+      const memoMap = yield* Layer.makeMemoMap
+      const scope = yield* Scope.make()
+      const first = yield* Layer.buildWithMemoMap(PeerConnectionStatus.layer, memoMap, scope)
+      const second = yield* Layer.buildWithMemoMap(PeerConnectionStatus.layer, memoMap, scope)
+      const reporter = Context.get(first, PeerConnectionStatus.Reporter)
+      const reader = Context.get(second, PeerConnectionStatus.PeerConnectionStatus)
+
+      yield* Effect.scoped(Effect.gen(function*() {
+        yield* reporter.connecting(peerId)
+        assert.deepStrictEqual(yield* current(reader), { _tag: "Connecting" })
+      }))
+
+      yield* Scope.close(scope, Exit.void)
+    }))
 })

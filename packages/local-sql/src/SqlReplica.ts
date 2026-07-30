@@ -208,7 +208,7 @@ const makeBase = <
   )
   const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
   const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
-  return { backups, compaction, connections: PeerConnectionStatus.layer() }
+  return { backups, compaction, connections: PeerConnectionStatus.layer }
 }
 
 export const layer = <D extends ReplicaDefinition.Any, const Bindings extends ReadonlyArray<SqlProjection.Any>,>(

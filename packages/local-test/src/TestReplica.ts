@@ -121,7 +121,7 @@ export const layerWithSyncAndLimits = <
       Layer.provideMerge(sync),
       Layer.provide([Layer.empty, ...options.projections.map((binding) => binding.layer)])
     ),
-    PeerConnectionStatus.layer()
+    PeerConnectionStatus.layer
   )
 }
 
