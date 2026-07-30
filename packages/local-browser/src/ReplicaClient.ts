@@ -434,6 +434,7 @@ export const fromRpcClient = (
       sessions.semaphore.withPermit(
         Effect.uninterruptibleMask((restore) =>
           Effect.suspend(() => {
+            if (Deferred.isDoneUnsafe(pageHidden)) return restore(Effect.interrupt)
             const current = sessions.value
             if (current.sessionId !== stale.sessionId) return Effect.succeed(current)
             return restore(replacement).pipe(
@@ -572,47 +573,49 @@ export const fromRpcClient = (
               }))
               : Stream.fail(error))
         )
-      }))
+      })).pipe(Stream.interruptWhen(Deferred.await(pageHidden)))
     const retrySchedule = Schedule.spaced("1 second")
     const sessionFailure = yield* Deferred.make<never, ReplicaError.ReplicaError>()
-    yield* Effect.gen(function*() {
-      const current = yield* SubscriptionRef.get(sessions)
-      yield* Effect.sleep(current.lease.leaseMillis / 2)
-      const session = yield* SubscriptionRef.get(sessions)
-      const renewed = yield* rpc.RenewSession({ sessionId: session.sessionId }).pipe(
-        boundSession("RenewSession"),
-        Effect.catchTag("RpcClientError", (error) =>
-          Effect.fail(
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.StorageUnavailable({
-                cause: error
+    yield* Effect.raceFirst(
+      Effect.gen(function*() {
+        const current = yield* SubscriptionRef.get(sessions)
+        yield* Effect.sleep(current.lease.leaseMillis / 2)
+        const session = yield* SubscriptionRef.get(sessions)
+        const renewed = yield* rpc.RenewSession({ sessionId: session.sessionId }).pipe(
+          boundSession("RenewSession"),
+          Effect.catchTag("RpcClientError", (error) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: error
+                })
               })
-            })
-          )),
-        Effect.retry({
-          schedule: retrySchedule,
-          while: (error) => isTransient(error) || error.reason._tag === "OperationTimeout"
-        }),
-        Effect.catchReason(
-          "ReplicaError",
-          "ProtocolMismatch",
-          (reason, error) =>
-            reason.expected === "active session"
-              ? reopen(session).pipe(Effect.as(undefined))
-              : Effect.fail(error)
+            )),
+          Effect.retry({
+            schedule: retrySchedule,
+            while: (error) => isTransient(error) || error.reason._tag === "OperationTimeout"
+          }),
+          Effect.catchReason(
+            "ReplicaError",
+            "ProtocolMismatch",
+            (reason, error) =>
+              reason.expected === "active session"
+                ? reopen(session).pipe(Effect.as(undefined))
+                : Effect.fail(error)
+          )
         )
-      )
-      if (renewed !== undefined && renewed.leaseMillis !== session.lease.leaseMillis) {
-        yield* SubscriptionRef.updateSome(
-          sessions,
-          (current) =>
-            current.sessionId === session.sessionId
-              ? Option.some({ ...session, lease: { ...session.lease, ...renewed } })
-              : Option.none()
-        )
-      }
-    }).pipe(
-      Effect.forever,
+        if (renewed !== undefined && renewed.leaseMillis !== session.lease.leaseMillis) {
+          yield* SubscriptionRef.updateSome(
+            sessions,
+            (current) =>
+              current.sessionId === session.sessionId
+                ? Option.some({ ...session, lease: { ...session.lease, ...renewed } })
+                : Option.none()
+          )
+        }
+      }).pipe(Effect.forever),
+      Deferred.await(pageHidden)
+    ).pipe(
       Effect.tapError((error) => Deferred.fail(sessionFailure, error)),
       Effect.tapCause(Effect.logError),
       Effect.ignore,
