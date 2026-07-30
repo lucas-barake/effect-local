@@ -162,20 +162,33 @@ import * as PeerRpc from "@lucas-barake/effect-local-rpc/PeerRpc"
 import * as RpcPeerTransport from "@lucas-barake/effect-local-rpc/RpcPeerTransport"
 import { RpcClient, RpcSerialization } from "effect/unstable/rpc"
 
-// Provide the transport to the whole effect that USES the session, not to `makeRpcClient` alone.
-const relaySession = Effect.gen(function*() {
-  const client = yield* PeerRpc.makeRpcClient
-  const session = yield* RpcPeerTransport.makeSession(client, relayOptions)
-  yield* useTheSession(session)
-}).pipe(
-  Effect.provide(RpcClient.layerProtocolSocket()),
-  Effect.provide(BrowserSocket.layerWebSocket(relayUrl)),
-  Effect.provide(RpcSerialization.layerJson),
-  Effect.provide(PeerAuthentication.layerClient),
-  Effect.provideService(PeerCredentials.PeerCredentials, credentials),
-  Effect.scoped
+// One socket for the device. The transport is provided around the work that USES the sessions, not
+// around `makeRpcClient` alone.
+const RelayLink = Layer.effect(RelayClient)(PeerRpc.makeRpcClient).pipe(
+  // Not `RpcClient.layerProtocolSocket`: this builds the protocol and the relay status reader
+  // together, which is the only composition that cannot be wired up wrong.
+  Layer.provideMerge(RelayConnectionStatus.layerProtocolSocket()),
+  Layer.provide(BrowserSocket.layerWebSocket(relayUrl)),
+  Layer.provide(RpcSerialization.layerJson),
+  Layer.provide(PeerAuthentication.layerClient),
+  Layer.provide(Layer.succeed(PeerCredentials.PeerCredentials)(credentials))
 )
+
+// Sessions are layered over that one client. Opening a session is what registers a peer connection
+// attempt, so it stays here rather than moving up with the socket.
+const relaySession = (documents: ReadonlyArray<PeerSession.SelectedDocument>) =>
+  Effect.gen(function*() {
+    const client = yield* RelayClient
+    const session = yield* RpcPeerTransport.makeSession(client, relayOptions(documents))
+    yield* useTheSession(session)
+  })
 ```
+
+One socket carries as many sessions as you need. The relay multiplexes them: each `Open` gets its own
+session id, and the server tracks them independently of which connection they arrived on. A socket
+per session pays for a TCP and WebSocket handshake per document set and buys nothing. The limit that
+actually applies is `maxSessionsPerSubject` (default 4), which the relay counts per tenant and
+subject regardless of how many connections carry them.
 
 The scoping above is load bearing and the mistake it avoids is silent. A `Layer` provided to
 `makeRpcClient` alone lives exactly as long as that constructor: the socket and its pump are built,
@@ -188,6 +201,12 @@ constructor.
 `Ref` or `Deferred` backed implementation that the page refreshes is a valid shape. Supplying it inside a SharedWorker
 is the part with no answer in this package: `SharedWorkerGlobalScope` has no `localStorage` and no cookie jar, so the
 token has to travel from the page across the existing `MessagePort`, and `ReplicaRpc` has no slot for it today.
+
+Whether the socket itself is up is reported by `RelayConnectionStatus`, built by the same
+`layerProtocolSocket` above. It is deliberately separate from `PeerConnectionStatus`: the relay link
+is one socket shared by every peer session, so when it drops they all go quiet at once, and per peer
+status alone would render that as several peers vanishing rather than as one link failing. The two
+`Status` types are branded so neither can be passed where the other belongs.
 
 Reconnect is likewise the application's. `SupervisedPeerSession.awaitDisconnect` reports the disconnect and
 `RpcPeerTransport.isRetryable` classifies whether the failure is worth retrying, but the schedule is a deployment
