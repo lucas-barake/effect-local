@@ -1,5 +1,6 @@
 export * as Backup from "./Backup.js"
 export * as Canonical from "./Canonical.js"
+export * as CommandDelivery from "./CommandDelivery.js"
 export * as CommandOutcome from "./CommandOutcome.js"
 export * as Commit from "./Commit.js"
 export * as Conflict from "./Conflict.js"

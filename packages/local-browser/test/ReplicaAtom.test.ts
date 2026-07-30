@@ -1,4 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
+import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as CommandDelivery from "@lucas-barake/effect-local/CommandDelivery"
 import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -19,7 +21,7 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as ReplicaAtom from "../src/ReplicaAtom.js"
 import * as ReplicaClient from "../src/ReplicaClient.js"
 import type * as ReplicaRpc from "../src/ReplicaRpc.js"
-import { Rename, replica, Task } from "./fixtures.js"
+import { peerConnectionStatus, relayConnectionStatus, Rename, replica, Task } from "./fixtures.js"
 
 describe("ReplicaAtom", () => {
   it.effect("reads documents through documentFamily", () =>
@@ -49,6 +51,57 @@ describe("ReplicaAtom", () => {
       const value = registry.get(atom)
       assert.isTrue(AsyncResult.isSuccess(value))
       if (AsyncResult.isSuccess(value)) assert.deepStrictEqual(value.value, snapshot)
+      unmount()
+      registry.dispose()
+    }))
+
+  it.effect("streams only the requested command delivery through commandDeliveryFamily", () =>
+    Effect.gen(function*() {
+      const requested = yield* Deferred.make<Identity.CommandId>()
+      const firstConsumed = yield* Deferred.make<void>()
+      const secondConsumed = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const commandId = Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000011")
+      const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000011")
+      const first = CommandDelivery.UnknownCommand.make({ commandId })
+      const second = CommandDelivery.NoChangesToDeliver.make({ commandId, documentId })
+      const atomRuntime = Atom.runtime(Layer.succeed(Replica.Replica, {
+        ...replica,
+        lookupCommandDelivery: () => Effect.die("command delivery atoms must use the targeted stream"),
+        commandDeliveryChanges: (received) =>
+          Stream.unwrap(
+            Deferred.succeed(requested, received).pipe(
+              Effect.as(
+                Stream.make(first).pipe(
+                  Stream.tap(() => Deferred.succeed(firstConsumed, undefined)),
+                  Stream.concat(
+                    Stream.fromEffect(
+                      Deferred.await(release).pipe(
+                        Effect.as(second),
+                        Effect.tap(() => Deferred.succeed(secondConsumed, undefined))
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+      }))
+      const registry = AtomRegistry.make()
+      const atom = ReplicaAtom.commandDeliveryFamily(atomRuntime)(commandId)
+      const unmount = registry.mount(atom)
+      assert.strictEqual(yield* Deferred.await(requested), commandId)
+      yield* Deferred.await(firstConsumed)
+      yield* Effect.yieldNow
+      const firstValue = registry.get(atom)
+      assert.isTrue(AsyncResult.isSuccess(firstValue))
+      if (AsyncResult.isSuccess(firstValue)) assert.deepStrictEqual(firstValue.value, first)
+      yield* Deferred.succeed(release, undefined)
+      yield* Deferred.await(secondConsumed)
+      yield* Effect.yieldNow
+      const secondValue = registry.get(atom)
+      assert.isTrue(AsyncResult.isSuccess(secondValue))
+      if (AsyncResult.isSuccess(secondValue)) assert.deepStrictEqual(secondValue.value, second)
       unmount()
       registry.dispose()
     }))
@@ -431,6 +484,54 @@ describe("ReplicaAtom", () => {
       registry.dispose()
     }))
 
+  it.effect("streams peer connection status through a runtime atom", () =>
+    Effect.gen(function*() {
+      const published = yield* Queue.unbounded<PeerConnectionStatus.Status>()
+      yield* Effect.addFinalizer(() => Queue.shutdown(published))
+      const advance = yield* Deferred.make<void>()
+      const requested = yield* Deferred.make<Identity.PeerId>()
+      const peerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001")
+      const atomRuntime = Atom.runtime(
+        Layer.succeed(PeerConnectionStatus.PeerConnectionStatus, {
+          status: (received) =>
+            Stream.make(PeerConnectionStatus.connecting).pipe(
+              Stream.tap(() => Deferred.succeed(requested, received)),
+              Stream.concat(
+                Stream.fromEffect(
+                  Deferred.await(advance).pipe(
+                    Effect.as(PeerConnectionStatus.connected)
+                  )
+                )
+              )
+            )
+        })
+      )
+      const registry = AtomRegistry.make()
+      const atom = ReplicaAtom.peerConnectionStatus(atomRuntime, peerId)
+      const unmount = registry.subscribe(atom, (result) => {
+        if (!AsyncResult.isSuccess(result)) return
+        Queue.offerUnsafe(published, result.value)
+      }, { immediate: true })
+      assert.deepStrictEqual(yield* Queue.take(published), PeerConnectionStatus.connecting)
+      // Nothing pulls the stream until the atom mounts, so this has to come after the first take.
+      // It is the only thing proving the peerId the atom was built with reaches the service.
+      assert.strictEqual(yield* Deferred.await(requested), peerId)
+      const connecting = registry.get(atom)
+      assert.isTrue(AsyncResult.isSuccess(connecting))
+      if (AsyncResult.isSuccess(connecting)) {
+        assert.deepStrictEqual(connecting.value, PeerConnectionStatus.connecting)
+      }
+      yield* Deferred.succeed(advance, undefined)
+      assert.deepStrictEqual(yield* Queue.take(published), PeerConnectionStatus.connected)
+      const connected = registry.get(atom)
+      assert.isTrue(AsyncResult.isSuccess(connected))
+      if (AsyncResult.isSuccess(connected)) {
+        assert.deepStrictEqual(connected.value, PeerConnectionStatus.connected)
+      }
+      unmount()
+      registry.dispose()
+    }))
+
   it.effect("refreshes query atoms when a dependency document is invalidated", () =>
     Effect.gen(function*() {
       const Task = Document.make("ReactiveTask", {
@@ -503,6 +604,8 @@ describe("ReplicaAtom", () => {
       const client: ReplicaClient.ReplicaClient["Service"] = {
         ...replica,
         ownerEpoch: "owner",
+        peerConnectionStatus,
+        relayConnectionStatus,
         invalidations: Stream.fromQueue(events).pipe(
           Stream.tap(() => Deferred.succeed(consumed, undefined))
         ),
@@ -545,6 +648,8 @@ describe("ReplicaAtom", () => {
       const client = (ownerEpoch: string, key: string): ReplicaClient.ReplicaClient["Service"] => ({
         ...replica,
         ownerEpoch,
+        peerConnectionStatus,
+        relayConnectionStatus,
         invalidations: Stream.make({
           _tag: "Invalidation" as const,
           ownerEpoch,
@@ -579,6 +684,8 @@ describe("ReplicaAtom", () => {
       const client: ReplicaClient.ReplicaClient["Service"] = {
         ...replica,
         ownerEpoch: "owner",
+        peerConnectionStatus,
+        relayConnectionStatus,
         invalidations: Stream.unwrap(Effect.sync(() => {
           subscriptions++
           return subscriptions < 4
@@ -623,6 +730,8 @@ describe("ReplicaAtom", () => {
       const client: ReplicaClient.ReplicaClient["Service"] = {
         ...replica,
         ownerEpoch: "owner",
+        peerConnectionStatus,
+        relayConnectionStatus,
         invalidations: Stream.unwrap(Effect.sync(() => {
           subscriptions++
           return subscriptions < 2

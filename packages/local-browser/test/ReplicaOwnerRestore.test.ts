@@ -1,6 +1,8 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { assert, it } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
+import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
@@ -20,7 +22,7 @@ import type * as RestoreProtocol from "../src/internal/restoreProtocol.js"
 import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
-import { definition, replica } from "./fixtures.js"
+import { definition, DeliveryPublisher, replica } from "./fixtures.js"
 
 it.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
   const limits = {
@@ -64,20 +66,25 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
     maxRestoreErrorBytes: 4_096
   } satisfies ReplicaLimits.Values
   const Sessions = SessionManager.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)))
-  const Publisher = Layer.succeed(
-    CommitPublisher.CommitPublisher,
-    CommitPublisher.CommitPublisher.of({
-      publishPending: Effect.succeed(0),
-      invalidate: () => Effect.void,
-      subscribe: Effect.succeed({
-        watermark: Identity.CommitSequence.make(0),
-        refreshGeneration: 0,
-        events: Stream.never
+  const Publisher = Layer.merge(
+    Layer.succeed(
+      CommitPublisher.CommitPublisher,
+      CommitPublisher.CommitPublisher.of({
+        publishPending: Effect.succeed(0),
+        invalidate: () => Effect.void,
+        subscribe: Effect.succeed({
+          watermark: Identity.CommitSequence.make(0),
+          refreshGeneration: 0,
+          events: Stream.never
+        })
       })
-    })
+    ),
+    DeliveryPublisher
   )
   const ownerLayer = (replicaService: Replica.Replica["Service"] = replica) =>
     ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(
         Publisher,

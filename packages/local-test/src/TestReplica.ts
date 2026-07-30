@@ -1,6 +1,8 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
+import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as PeerSync from "@lucas-barake/effect-local-sql/PeerSync"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as ReplicaHealth from "@lucas-barake/effect-local-sql/ReplicaHealth"
 import type * as SqlProjection from "@lucas-barake/effect-local-sql/SqlProjection"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
@@ -103,9 +105,15 @@ export const layerWithSyncAndLimits = <
     projections: options.projections
   })
   const sync = PeerSync.layer.pipe(Layer.provideMerge(services))
-  return SqlReplica.layerFromServices(definition).pipe(
-    Layer.provideMerge(sync),
-    Layer.provideMerge(infrastructure)
+  return Layer.mergeAll(
+    SqlReplica.layerFromServices(definition).pipe(
+      Layer.provideMerge(sync),
+      Layer.provideMerge(infrastructure)
+    ),
+    PeerConnectionStatus.layer,
+    // Direct mode, so there is no relay to report on. `layerFromServices` hand assembles the stack
+    // and never reaches the constructors that answer this, so it is answered here.
+    RelayConnectionStatus.layerNotConfigured
   )
 }
 

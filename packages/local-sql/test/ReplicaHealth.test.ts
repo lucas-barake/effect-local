@@ -419,7 +419,7 @@ describe("ReplicaHealth", () => {
             Effect.andThen(status._tag === "Ready" ? Deferred.await(release) : Effect.void)
           )
         ),
-        Effect.forkChild
+        Effect.forkChild({ startImmediately: true })
       )
       assert.deepStrictEqual(yield* Queue.take(seen), { _tag: "Ready", pendingCommands: 0 })
       yield* Effect.scoped(Effect.gen(function*() {

@@ -137,7 +137,11 @@ describe("ReplicaBootstrap populated probe", () => {
 
       const declared = new Set<string>(tables)
       const probed = new Set(populatedTables)
-      const excluded = new Set(["effect_local_metadata", "effect_local_migration_catalog"])
+      const excluded = new Set([
+        "effect_local_metadata",
+        "effect_local_migration_catalog",
+        "effect_local_command_delivery_control"
+      ])
 
       assert.deepStrictEqual(owned.filter((name) => !declared.has(name)), [])
       assert.deepStrictEqual(owned.filter((name) => !excluded.has(name) && !probed.has(name)), [])

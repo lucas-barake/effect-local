@@ -1,3 +1,5 @@
+import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as Backup from "@lucas-barake/effect-local/Backup"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Conflict from "@lucas-barake/effect-local/Conflict"
@@ -36,6 +38,8 @@ export class ReplicaClient extends Context.Service<
   ReplicaClient,
   Replica.Replica["Service"] & {
     readonly ownerEpoch: string
+    readonly peerConnectionStatus: PeerConnectionStatus.PeerConnectionStatus["Service"]
+    readonly relayConnectionStatus: RelayConnectionStatus.RelayConnectionStatus["Service"]
     readonly invalidations: Stream.Stream<ReplicaRpc.Invalidation, ReplicaError.ReplicaError>
   }
 >()(
@@ -394,8 +398,10 @@ export const fromRpcClient = (
           Effect.flatMap((session) => Effect.ignore(closeSession(session.sessionId)))
         )
     )
+    // Hoisted out of the branch below so long lived streams can observe it even when this client
+    // never installs the listener: a stream that outlives the page must still stop.
+    const pageHidden = yield* Deferred.make<void>()
     if (options?.closeSessionOnPageHide !== false && typeof globalThis.addEventListener === "function") {
-      const pageHidden = yield* Deferred.make<void>()
       yield* Effect.acquireRelease(
         Effect.sync(() => {
           const onPageHide = () => {
@@ -612,7 +618,10 @@ export const fromRpcClient = (
       Effect.ignore,
       Effect.forkScoped
     )
-    const allInvalidationKeys = ReplicaDefinition.invalidationKeys(definition)
+    const allInvalidationKeys = [
+      ...ReplicaDefinition.invalidationKeys(definition),
+      ReplicaRpc.commandDeliveryInvalidationKey
+    ]
     const fullRefresh = (ownerEpoch: string): ReplicaRpc.Invalidation => ({
       _tag: "FullRefreshRequired",
       ownerEpoch,
@@ -647,6 +656,15 @@ export const fromRpcClient = (
               : Stream.fail(error)
         )
       )
+    const advanceWatermark = (
+      observed: number | undefined,
+      sequence: number
+    ): { readonly next: number; readonly emit: "skip" | "event" | "refresh" } =>
+      observed === undefined || sequence > observed + 1
+        ? { next: sequence, emit: "refresh" }
+        : sequence === observed + 1
+        ? { next: sequence, emit: "event" }
+        : { next: observed, emit: "skip" }
     const invalidationMessages: Stream.Stream<
       ReplicaRpc.InvalidationMessage,
       ReplicaError.ReplicaError
@@ -669,10 +687,14 @@ export const fromRpcClient = (
           readonly ownerEpoch: string
           readonly watermark: Identity.CommitSequence | undefined
           readonly refreshGeneration: number | undefined
+          readonly deliveryWatermark: number | undefined
+          readonly deliveryRefreshEpoch: number | undefined
         } => ({
           ownerEpoch: initialSession.lease.ownerEpoch,
           watermark: undefined,
-          refreshGeneration: undefined
+          refreshGeneration: undefined,
+          deliveryWatermark: undefined,
+          deliveryRefreshEpoch: undefined
         }),
         (state, event) => {
           if (event.ownerEpoch !== state.ownerEpoch) {
@@ -681,39 +703,65 @@ export const fromRpcClient = (
                 {
                   ownerEpoch: event.ownerEpoch,
                   watermark: event.watermark,
-                  refreshGeneration: event.refreshGeneration
+                  refreshGeneration: event.refreshGeneration,
+                  deliveryWatermark: event.deliveryWatermark,
+                  deliveryRefreshEpoch: event.deliveryRefreshEpoch
                 },
                 [fullRefresh(event.ownerEpoch)]
               ]
             }
-            if (event._tag === "FullRefreshRequired") {
-              return [{ ownerEpoch: event.ownerEpoch, watermark: undefined, refreshGeneration: undefined }, [event]]
-            }
             return [
-              { ownerEpoch: event.ownerEpoch, watermark: event.sequence, refreshGeneration: undefined },
+              {
+                ownerEpoch: event.ownerEpoch,
+                watermark: undefined,
+                refreshGeneration: undefined,
+                deliveryWatermark: undefined,
+                deliveryRefreshEpoch: undefined
+              },
               [fullRefresh(event.ownerEpoch)]
             ]
           }
           if (event._tag === "InvalidationsReady") {
-            const refresh = state.watermark === undefined
+            const commitRefresh = state.watermark === undefined
               ? event.watermark > 0 || event.refreshGeneration > 0
               : event.watermark !== state.watermark || event.refreshGeneration !== state.refreshGeneration
+            const deliveryRefresh = state.deliveryWatermark === undefined
+              ? event.deliveryWatermark > 0 || event.deliveryRefreshEpoch > 0
+              : event.deliveryWatermark !== state.deliveryWatermark ||
+                event.deliveryRefreshEpoch !== state.deliveryRefreshEpoch
             return [
-              { ...state, watermark: event.watermark, refreshGeneration: event.refreshGeneration },
-              refresh ? [fullRefresh(event.ownerEpoch)] : []
+              {
+                ...state,
+                watermark: event.watermark,
+                refreshGeneration: event.refreshGeneration,
+                deliveryWatermark: event.deliveryWatermark,
+                deliveryRefreshEpoch: event.deliveryRefreshEpoch
+              },
+              commitRefresh || deliveryRefresh ? [fullRefresh(event.ownerEpoch)] : []
             ]
           }
           if (event._tag === "FullRefreshRequired") {
             return [{ ...state, watermark: undefined, refreshGeneration: undefined }, [event]]
           }
-          if (state.watermark === undefined) {
-            return [{ ...state, watermark: event.sequence }, [fullRefresh(event.ownerEpoch)]]
+          if (event._tag === "DeliveryFullRefreshRequired") {
+            return [{
+              ...state,
+              deliveryWatermark: undefined,
+              deliveryRefreshEpoch: undefined
+            }, [event]]
           }
-          if (event.sequence <= state.watermark) return [state, []]
-          if (event.sequence === state.watermark + 1) {
-            return [{ ...state, watermark: event.sequence }, [event]]
+          if (event._tag === "Invalidation") {
+            const advanced = advanceWatermark(state.watermark, event.sequence)
+            return [
+              { ...state, watermark: Identity.CommitSequence.make(advanced.next) },
+              advanced.emit === "skip" ? [] : advanced.emit === "event" ? [event] : [fullRefresh(event.ownerEpoch)]
+            ]
           }
-          return [{ ...state, watermark: event.sequence }, [fullRefresh(event.ownerEpoch)]]
+          const advanced = advanceWatermark(state.deliveryWatermark, event.sequence)
+          return [
+            { ...state, deliveryWatermark: advanced.next },
+            advanced.emit === "skip" ? [] : advanced.emit === "event" ? [event] : [fullRefresh(event.ownerEpoch)]
+          ]
         }
       ),
       Stream.interruptWhen(Deferred.await(sessionFailure)),
@@ -1194,6 +1242,49 @@ export const fromRpcClient = (
       get ownerEpoch() {
         return SubscriptionRef.getUnsafe(sessions).lease.ownerEpoch
       },
+      peerConnectionStatus: PeerConnectionStatus.PeerConnectionStatus.of({
+        status: (peerId) =>
+          withSessionStream((session) =>
+            rpc.PeerConnectionStatus({
+              sessionId: session.sessionId,
+              peerId
+            })
+          ).pipe(
+            Stream.catchTag("RpcClientError", (error) =>
+              Stream.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause: error
+                  })
+                })
+              ))
+          )
+      }),
+      relayConnectionStatus: RelayConnectionStatus.RelayConnectionStatus.of({
+        // Both refs, as `status` does and unlike `peerConnectionStatus`. This stream is long lived
+        // and emits before a lease can lapse, which is the case the pending-mismatch ref exists for:
+        // without it a post-emission mismatch fails the stream immediately instead of being carried
+        // to the resubscribe that `ReplicaAtom` is waiting to perform.
+        status: Stream.unwrap(
+          Effect.gen(function*() {
+            const emitted = yield* Ref.make(false)
+            const pendingMismatch = yield* Ref.make<Option.Option<PendingStreamMismatch>>(Option.none())
+            return withSessionStream(
+              (session) => rpc.RelayConnectionStatus({ sessionId: session.sessionId }),
+              reopen,
+              emitted,
+              pendingMismatch
+            ).pipe(
+              Stream.catchTag("RpcClientError", (error) =>
+                Stream.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageUnavailable({ cause: error })
+                  })
+                ))
+            )
+          })
+        )
+      }),
       invalidations,
       create: (document, options) =>
         Wire.encode(document.schema, options.value).pipe(
@@ -1468,6 +1559,28 @@ export const fromRpcClient = (
               "conflict.path_depth": options.resolution.path.parents.length + 1
             }
           })
+        ),
+      lookupCommandDelivery: (commandId) =>
+        withSession(
+          "LookupCommandDelivery",
+          (session) => rpc.LookupCommandDelivery({ sessionId: session.sessionId, commandId })
+        ).pipe(
+          Effect.catchTag("RpcClientError", (error) => Effect.fail(storageFailure(error)))
+        ),
+      commandDeliveryChanges: (commandId) =>
+        withSessionStream(
+          (session) => rpc.CommandDeliveryChanges({ sessionId: session.sessionId, commandId })
+        ).pipe(
+          Stream.catchTag("RpcClientError", (error) => Stream.fail(storageFailure(error))),
+          Stream.retry(
+            Schedule.spaced("1 second").pipe(
+              Schedule.setInputType<ReplicaError.ReplicaError>(),
+              Schedule.while(({ input }) => isTransient(input) || isActiveSessionMismatch(input))
+            )
+          ),
+          Stream.changes,
+          // The retry above would otherwise reopen a session the page has already closed.
+          Stream.interruptWhen(Deferred.await(pageHidden))
         ),
       flush: withSession("Flush", (session) => rpc.Flush({ sessionId: session.sessionId })).pipe(
         Effect.catchTag("RpcClientError", (error) =>

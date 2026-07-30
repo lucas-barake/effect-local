@@ -1,3 +1,7 @@
+import * as CommandDeliveryPublisher from "@lucas-barake/effect-local-sql/CommandDeliveryPublisher"
+import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
+import * as CommandDelivery from "@lucas-barake/effect-local/CommandDelivery"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
@@ -7,6 +11,7 @@ import * as Query from "@lucas-barake/effect-local/Query"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as Effect from "effect/Effect"
+import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 
@@ -77,6 +82,8 @@ export const replica: Replica.Replica["Service"] = {
   lookupDelete: (_document, commandId) => Effect.succeed(CommandOutcome.durablyCommitted(commandId, undefined)),
   lookupConflictResolution: (_document, { commandId }) =>
     Effect.succeed(CommandOutcome.durablyCommitted(commandId, undefined)),
+  lookupCommandDelivery: (commandId) => Effect.succeed(CommandDelivery.UnknownCommand.make({ commandId })),
+  commandDeliveryChanges: (commandId) => Stream.make(CommandDelivery.UnknownCommand.make({ commandId })),
   flush: Effect.void,
   status: Stream.make({ _tag: "Ready" as const, pendingCommands: 0 }),
   exportBackup: () => Stream.make(Uint8Array.of(1, 2, 3)),
@@ -89,3 +96,32 @@ export const replica: Replica.Replica["Service"] = {
     }) as never,
   importDocument: () => Effect.succeed(documentId)
 }
+
+/**
+ * Never completes. A status stream that ends looks exactly like one that is still open and has
+ * nothing new to say, so an Atom observing it would park on the last value forever.
+ */
+export const peerConnectionStatus: PeerConnectionStatus.PeerConnectionStatus["Service"] = {
+  status: () => Stream.make(PeerConnectionStatus.disconnected).pipe(Stream.concat(Stream.never))
+}
+
+/** No relay in these fixtures' topology, so `NotConfigured` rather than a `Disconnected` that would imply one. */
+export const relayConnectionStatus: RelayConnectionStatus.RelayConnectionStatus["Service"] = {
+  status: Stream.make(RelayConnectionStatus.notConfigured).pipe(Stream.concat(Stream.never))
+}
+
+export const DeliveryPublisher = Layer.succeed(
+  CommandDeliveryPublisher.CommandDeliveryPublisher,
+  CommandDeliveryPublisher.CommandDeliveryPublisher.of({
+    publishPending: Effect.succeed(0),
+    refresh: Effect.void,
+    subscribe: Effect.succeed({
+      sequence: 0,
+      refreshEpoch: 0,
+      events: Stream.never
+    }),
+    // The owner's delivery handler reads the replica directly, so reaching the publisher here
+    // would mean the wiring changed underneath these tests.
+    changes: () => Stream.die("unexpected command delivery subscription")
+  })
+)

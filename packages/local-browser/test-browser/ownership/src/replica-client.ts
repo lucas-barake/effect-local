@@ -32,11 +32,15 @@ const OwnershipLive = OwnershipCoordinator.layerTab({
   name: "effect-local-tasks",
   sharedWorker: () =>
     new SharedWorker(new URL("./replica.shared-worker.ts", import.meta.url), {
+      // Vite otherwise prepends a static environment import before the entry can buffer `connect`.
+      /* @vite-ignore */
       name: "effect-local-tasks",
       type: "module"
     }),
   databaseWorker: () =>
     new Worker(new URL("./opfs.worker.ts", import.meta.url), {
+      // Vite otherwise prepends a static environment import before the entry can buffer its port.
+      /* @vite-ignore */
       name: "effect-local-tasks-opfs",
       type: "module"
     }),
@@ -122,7 +126,7 @@ export const deleteTask = runtime.fn<{ readonly documentId: Identity.DocumentId 
   { concurrent: true, reactivityKeys: [TaskList.name] }
 )
 
-export const connectionStatus = ReplicaAtom.status(runtime)
+export const replicaStatus = ReplicaAtom.status(runtime)
 
 export const exportBackup = runtime.fn<void>()(
   () => Replica.Replica.use((replica) => Stream.mkUint8Array(replica.exportBackup({ maxBytes: 32 * 1024 * 1024 }))),

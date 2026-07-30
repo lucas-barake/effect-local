@@ -15,8 +15,10 @@ import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
+import * as CommandDeliveryStore from "./CommandDeliveryStore.js"
 import * as CommitPublisher from "./CommitPublisher.js"
 import * as DocumentEntity from "./DocumentEntity.js"
+import * as PeerConnectionStatus from "./PeerConnectionStatus.js"
 import * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
 import * as PeerSync from "./PeerSync.js"
 import * as PeerSyncEnvelope from "./PeerSyncEnvelope.js"
@@ -33,7 +35,9 @@ export interface PeerSession {
   readonly markDirty: (documentId: Identity.DocumentId) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly flush: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly observedByPeer: (documentId: Identity.DocumentId) => Effect.Effect<boolean>
-  readonly durableConfirmation: (documentId: Identity.DocumentId) => Effect.Effect<false>
+  readonly durableConfirmation: (
+    documentId: Identity.DocumentId
+  ) => Effect.Effect<boolean, ReplicaError.ReplicaError>
 }
 
 export interface SupervisedPeerSession extends PeerSession {
@@ -47,22 +51,27 @@ class RelayProtocolInvalid extends Schema.TaggedErrorClass<RelayProtocolInvalid>
 const key = (documentType: string, documentId: Identity.DocumentId) => `${documentType}:${documentId}`
 
 const supervise = (
-  terminalFailure: Deferred.Deferred<never, ReplicaError.ReplicaError>,
+  failTerminal: (error: ReplicaError.ReplicaError) => Effect.Effect<void>,
   effect: Effect.Effect<void, ReplicaError.ReplicaError>
 ) =>
   effect.pipe(
-    Effect.tapError((error) => Deferred.fail(terminalFailure, error)),
+    Effect.tapError(failTerminal),
     Effect.catchCauseIf(
       (cause) => !Cause.hasInterruptsOnly(cause),
       (cause) =>
-        Deferred.fail(
-          terminalFailure,
+        failTerminal(
           new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageUnavailable({ cause })
           })
-        ).pipe(Effect.asVoid)
+        )
     )
   )
+
+interface OpenedSession {
+  readonly session: SupervisedPeerSession
+  readonly disconnect: Effect.Effect<void>
+  readonly failTerminal: (error: ReplicaError.ReplicaError) => Effect.Effect<void>
+}
 
 const makeWithTerminal = (
   options: {
@@ -74,17 +83,21 @@ const makeWithTerminal = (
   ) => Effect.Effect<ReturnType<Effect.Success<typeof DocumentEntity.DocumentEntity.client>>>,
   terminalFailure: Deferred.Deferred<never, ReplicaError.ReplicaError>
 ): Effect.Effect<
-  SupervisedPeerSession,
+  OpenedSession,
   ReplicaError.ReplicaError,
   | Scope.Scope
+  | CommandDeliveryStore.CommandDeliveryStore
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
+  | PeerConnectionStatus.Reporter
   | PeerTransport.PeerTransport
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
   | ReplicaLimits.ReplicaLimits
-> =>
-  Effect.gen(function*() {
+> => {
+  let cleanupOnError: Effect.Effect<void> = Effect.void
+  return Effect.gen(function*() {
+    const deliveries = yield* CommandDeliveryStore.CommandDeliveryStore
     const gate = yield* ReplicaGate.ReplicaGate
     const publisher = yield* CommitPublisher.CommitPublisher
     const limits = yield* ReplicaLimits.ReplicaLimits
@@ -114,13 +127,54 @@ const makeWithTerminal = (
         })
       })
     }
+    // An ordinary dependency, not `Effect.serviceOption`. This is the only writer of peer connection
+    // status, so a graph that provides the reader to its observers and builds the session outside
+    // that context would compile and then report every peer as `Disconnected` forever, with nothing
+    // to indicate the wiring was wrong. That is the same failure the reader side already refuses.
+    const reporter = yield* PeerConnectionStatus.Reporter
+    const attempt = yield* reporter.connecting(options.peerId).pipe(
+      Effect.tap((attempt) =>
+        Effect.sync(() => {
+          cleanupOnError = attempt.disconnected
+        })
+      ),
+      Effect.uninterruptible
+    )
+    const transitionGate = yield* Semaphore.make(1)
+    const admissionOpen = yield* Ref.make(true)
+    const lifetime = yield* Effect.scope
+    const disconnect = transitionGate.withPermit(
+      Ref.set(admissionOpen, false).pipe(Effect.andThen(attempt.disconnected))
+    )
+    const reportConnected = transitionGate.withPermit(
+      Effect.gen(function*() {
+        if (!(yield* Ref.get(admissionOpen)) || (yield* Deferred.isDone(terminalFailure))) return
+        yield* attempt.connected
+      })
+    )
     const { connection, session } = yield* Effect.acquireUseRelease(
       Scope.make(),
       (scope) =>
         Effect.gen(function*() {
           const permit = yield* gate.shared.pipe(Effect.provideService(Scope.Scope, scope))
           const connection = yield* transport.connect({ replicaId: permit.replicaId, peerId: options.peerId })
+          if (connection.peerId !== options.peerId) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: options.peerId,
+                observed: connection.peerId
+              })
+            })
+          }
           const session = yield* sync.open(connection.peerId)
+          if (session.peerId !== connection.peerId) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: connection.peerId,
+                observed: session.peerId
+              })
+            })
+          }
           if (session.replicaIncarnation !== permit.incarnation) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.ProtocolMismatch({
@@ -150,6 +204,16 @@ const makeWithTerminal = (
     const flushRequests = yield* Queue.dropping<void>(1)
     const scheduled = yield* Ref.make(new Map<number, PeerSync.Outbound>())
     const syncLocks = new Map(options.documents.map((entry) => [entry.documentId, Semaphore.makeUnsafe(1)]))
+    const failTerminal = (error: ReplicaError.ReplicaError) =>
+      transitionGate.withPermit(Effect.gen(function*() {
+        if (yield* Deferred.isDone(terminalFailure)) return
+        yield* Ref.set(admissionOpen, false)
+        yield* attempt.disconnected
+        yield* sendLock.withPermit(connection.close).pipe(
+          Effect.forkIn(lifetime, { startImmediately: true, uninterruptible: true })
+        )
+        yield* Deferred.fail(terminalFailure, error)
+      }))
 
     const selectedById = (documentId: Identity.DocumentId) => {
       const entry = options.documents.find((candidate) => candidate.documentId === documentId)
@@ -360,9 +424,17 @@ const makeWithTerminal = (
       if ((yield* Ref.get(scheduled)).size > 0) yield* drainOutbox(new Map())
     }))
     const guardTerminal = (effect: Effect.Effect<void, ReplicaError.ReplicaError>) =>
-      Effect.raceFirst(Deferred.await(terminalFailure), effect).pipe(
-        Effect.andThen(Deferred.isDone(terminalFailure)),
-        Effect.flatMap((failed) => failed ? Deferred.await(terminalFailure) : Effect.void)
+      transitionGate.withPermit(Ref.get(admissionOpen)).pipe(
+        Effect.flatMap((admitted) =>
+          admitted
+            ? Effect.raceFirst(Deferred.await(terminalFailure), effect).pipe(
+              Effect.andThen(Deferred.isDone(terminalFailure)),
+              Effect.flatMap((failed) => failed ? Deferred.await(terminalFailure) : Effect.void)
+            )
+            : Deferred.isDone(terminalFailure).pipe(
+              Effect.flatMap((failed) => failed ? Deferred.await(terminalFailure) : Effect.void)
+            )
+        )
       )
     const guardedFlush = guardTerminal(flush)
 
@@ -571,7 +643,7 @@ const makeWithTerminal = (
         )
       )
     yield* Effect.addFinalizer(() =>
-      Effect.gen(function*() {
+      disconnect.pipe(Effect.andThen(Effect.gen(function*() {
         const boundEpoch = yield* Ref.get(remoteEpoch)
         yield* sync.reset(session).pipe(
           Effect.ensuring(
@@ -584,13 +656,13 @@ const makeWithTerminal = (
               }).pipe(Effect.orDie)
           )
         )
-      }).pipe(
+      }))).pipe(
         Effect.ensuring(connection.close),
         Effect.orDie
       )
     )
     yield* supervise(
-      terminalFailure,
+      failTerminal,
       Stream.runForEach(connection.receive, receiveAcknowledged).pipe(
         Effect.andThen(
           Effect.fail(
@@ -604,14 +676,16 @@ const makeWithTerminal = (
       )
     ).pipe(
       Effect.ensuring(
-        Ref.set(active, false).pipe(
+        disconnect.pipe(
+          Effect.andThen(Ref.set(active, false)),
           Effect.andThen(sendLock.withPermit(connection.close))
         )
       ),
       Effect.forkScoped
     )
     yield* Effect.addFinalizer(() =>
-      Ref.set(active, false).pipe(
+      disconnect.pipe(
+        Effect.andThen(Ref.set(active, false)),
         Effect.andThen(Deferred.succeed(teardown, undefined)),
         Effect.andThen(flushLock.withPermit(Effect.void))
       )
@@ -619,25 +693,26 @@ const makeWithTerminal = (
     yield* Deferred.await(terminalFailure).pipe(
       Effect.exit,
       Effect.andThen(
-        Ref.set(active, false).pipe(
+        disconnect.pipe(
+          Effect.andThen(Ref.set(active, false)),
           Effect.andThen(Deferred.succeed(teardown, undefined)),
           Effect.andThen(sendLock.withPermit(connection.close))
         )
       ),
       Effect.forkScoped({ startImmediately: true })
     )
+    yield* reportConnected
     yield* Ref.set(dirty, new Map(options.documents.map((entry) => [entry.documentId, 0])))
     yield* guardedFlush
     yield* supervise(
-      terminalFailure,
+      failTerminal,
       Stream.fromQueue(flushRequests).pipe(
         Stream.runForEach(() => guardedFlush)
       )
     ).pipe(
       Effect.forkScoped({ startImmediately: true })
     )
-
-    return {
+    const sessionValue: SupervisedPeerSession = {
       peerId: connection.peerId,
       connectionEpoch: session.connectionEpoch,
       markDirty: (documentId) =>
@@ -654,16 +729,21 @@ const makeWithTerminal = (
                 revision: (value?.revision ?? 0) + 1
               })
             })),
-            Effect.tapError((error) => Deferred.fail(terminalFailure, error))
+            Effect.tapError(failTerminal)
           )
         ),
       flush: guardedFlush,
       observedByPeer: (documentId) =>
         Ref.get(observed).pipe(Effect.map((values) => values.get(documentId)?.value ?? false)),
-      durableConfirmation: () => Effect.succeed(false),
+      durableConfirmation: (documentId) => deliveries.documentConfirmed(documentId, connection.relayEndpoint),
       awaitDisconnect: Deferred.await(terminalFailure)
     }
-  })
+    return { session: sessionValue, disconnect, failTerminal }
+  }).pipe(
+    Effect.onError(() => cleanupOnError),
+    Effect.withSpan("PeerSession.connect")
+  )
+}
 
 export const makeTestClient = (
   options: {
@@ -677,15 +757,18 @@ export const makeTestClient = (
   PeerSession,
   ReplicaError.ReplicaError,
   | Scope.Scope
+  | CommandDeliveryStore.CommandDeliveryStore
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
+  | PeerConnectionStatus.Reporter
   | PeerTransport.PeerTransport
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
   | ReplicaLimits.ReplicaLimits
 > =>
   Deferred.make<never, ReplicaError.ReplicaError>().pipe(
-    Effect.flatMap((terminalFailure) => makeWithTerminal(options, entity, terminalFailure))
+    Effect.flatMap((terminalFailure) => makeWithTerminal(options, entity, terminalFailure)),
+    Effect.map((opened) => opened.session)
   )
 
 export const makeSupervised = (options: {
@@ -695,8 +778,10 @@ export const makeSupervised = (options: {
   SupervisedPeerSession,
   ReplicaError.ReplicaError,
   | Scope.Scope
+  | CommandDeliveryStore.CommandDeliveryStore
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
+  | PeerConnectionStatus.Reporter
   | PeerTransport.PeerTransport
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
@@ -706,11 +791,12 @@ export const makeSupervised = (options: {
   Effect.gen(function*() {
     const entity = yield* DocumentEntity.DocumentEntity.client
     const terminalFailure = yield* Deferred.make<never, ReplicaError.ReplicaError>()
-    return yield* makeWithTerminal(
+    const opened = yield* makeWithTerminal(
       options,
       (documentId) => Effect.succeed(entity(documentId)),
       terminalFailure
     )
+    return opened.session
   })
 
 export const make = (options: {
@@ -720,8 +806,10 @@ export const make = (options: {
   PeerSession,
   ReplicaError.ReplicaError,
   | Scope.Scope
+  | CommandDeliveryStore.CommandDeliveryStore
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
+  | PeerConnectionStatus.Reporter
   | PeerTransport.PeerTransport
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
@@ -736,8 +824,10 @@ export const makeLive = (options: {
   SupervisedPeerSession,
   ReplicaError.ReplicaError,
   | Scope.Scope
+  | CommandDeliveryStore.CommandDeliveryStore
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
+  | PeerConnectionStatus.Reporter
   | PeerTransport.PeerTransport
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
@@ -749,11 +839,12 @@ export const makeLive = (options: {
     const subscription = yield* publisher.subscribe
     const entity = yield* DocumentEntity.DocumentEntity.client
     const terminalFailure = yield* Deferred.make<never, ReplicaError.ReplicaError>()
-    const session = yield* makeWithTerminal(
+    const opened = yield* makeWithTerminal(
       options,
       (documentId) => Effect.succeed(entity(documentId)),
       terminalFailure
     )
+    const session = opened.session
     const selected = new Set(options.documents.map((entry) => entry.documentId))
     const subscriptionEnded = new ReplicaError.ReplicaError({
       reason: new ReplicaError.StorageUnavailable({
@@ -772,7 +863,7 @@ export const makeLive = (options: {
     }).pipe(
       Effect.andThen(Effect.fail(subscriptionEnded))
     )
-    yield* supervise(terminalFailure, Effect.raceFirst(Deferred.await(terminalFailure), consume)).pipe(
+    yield* supervise(opened.failTerminal, Effect.raceFirst(Deferred.await(terminalFailure), consume)).pipe(
       Effect.forkScoped({ startImmediately: true })
     )
     return session

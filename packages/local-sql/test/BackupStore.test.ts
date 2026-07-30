@@ -159,14 +159,14 @@ describe("BackupStore", () => {
         remote_subject_id, remote_peer_id, relay_peer_id, relay_message_id,
         outer_envelope_digest, protocol_version, payload_version, sender_connection_epoch,
         sender_sequence, document_id, document_type, writer_provenance, message_hash,
-        payload, encoded_size, created_at, retry_deadline, next_attempt_at, custody_state
+        payload, encoded_size, created_at, retry_deadline, next_attempt_at
       ) VALUES (
         ${current.replicaId}, ${current.incarnation}, ${current.writerGeneration},
         'tenant', 'local', ${senderPeerId},
         'tenant', 'remote', ${remotePeerId}, ${senderPeerId}, ${relayMessageId},
         ${"b".repeat(64)}, 1, 1, 'sender-epoch', 0, ${documentId}, ${Task.name}, '[]',
         ${"a".repeat(64)}, ${Uint8Array.of(1)}, 1, '2026-07-25T00:00:00.000Z',
-        '2026-08-01T00:00:00.000Z', '2026-07-25T00:00:00.000Z', 'Pending'
+        '2026-08-01T00:00:00.000Z', '2026-07-25T00:00:00.000Z'
       )`
       yield* sql`INSERT INTO effect_local_peer_relay_outbox_remote_usage (
         replica_incarnation, remote_tenant_id, remote_subject_id, remote_peer_id,

@@ -27,6 +27,141 @@ const ownerInfo = (page: Page) =>
     }
   }, { timeout: ownershipTransitionTimeout }).not.toBeUndefined()
 
+const installDatabaseBootstrapProbe = (
+  page: Page,
+  mode: "hold" | "reject"
+) =>
+  page.addInitScript((mode) => {
+    if (
+      mode === "hold" &&
+      sessionStorage.getItem("effectLocalDatabaseBootstrapReleased") !== null
+    ) return
+    const NativeWorker = globalThis.Worker
+    const state: {
+      error?: string
+      startPosted: boolean
+      url?: string
+      worker?: Worker
+    } = { startPosted: false }
+    Object.defineProperty(globalThis, "__effectLocalDatabaseBootstrap", { value: state })
+    globalThis.Worker = new Proxy(NativeWorker, {
+      construct(target, [scriptURL, options]) {
+        const url = new URL(String(scriptURL), globalThis.location.href)
+        if (!url.pathname.endsWith("/opfs.worker.ts")) {
+          return Reflect.construct(target, [scriptURL, options])
+        }
+        url.searchParams.set(
+          mode === "hold" ? "effectLocalTestHoldImport" : "effectLocalTestRejectImport",
+          "true"
+        )
+        state.url = url.href
+        const worker = Reflect.construct(target, [url, options]) as Worker
+        worker.addEventListener("error", (event) => {
+          state.error = event.message
+        })
+        const postMessage = worker.postMessage
+        Object.defineProperty(worker, "postMessage", {
+          value(message: unknown, transferOrOptions?: unknown) {
+            if (
+              typeof message === "object" &&
+              message !== null &&
+              "_tag" in message &&
+              message._tag === "DatabaseWorkerStart"
+            ) {
+              state.startPosted = true
+            }
+            Reflect.apply(
+              postMessage,
+              worker,
+              transferOrOptions === undefined ? [message] : [message, transferOrOptions]
+            )
+          }
+        })
+        state.worker = worker
+        return worker
+      }
+    })
+  }, mode)
+
+const waitForDatabaseBootstrap = (page: Page) =>
+  expect.poll(async () => {
+    try {
+      return await page.evaluate(() => {
+        const state = globalThis as typeof globalThis & {
+          readonly __effectLocalDatabaseBootstrap?: {
+            readonly startPosted: boolean
+            readonly url?: string
+          }
+        }
+        return state.__effectLocalDatabaseBootstrap
+      })
+    } catch (error) {
+      if (String(error).includes("Execution context was destroyed")) return undefined
+      throw error
+    }
+  }).toMatchObject({
+    startPosted: true,
+    url: expect.stringContaining("type=ignore")
+  })
+
+const releaseDatabaseBootstrap = (page: Page, persist: boolean) =>
+  page.evaluate((persist) => {
+    const state = globalThis as typeof globalThis & {
+      readonly __effectLocalDatabaseBootstrap: {
+        readonly worker: Worker
+      }
+    }
+    if (persist) sessionStorage.setItem("effectLocalDatabaseBootstrapReleased", "true")
+    state.__effectLocalDatabaseBootstrap.worker.postMessage("effectLocalTestReleaseImport")
+  }, persist)
+
+test("buffers database startup while its coordinator module loads", async ({ page }) => {
+  await installDatabaseBootstrapProbe(page, "hold")
+  await page.goto("/")
+  await waitForDatabaseBootstrap(page)
+  await releaseDatabaseBootstrap(page, true)
+
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  const title = `Buffered database start ${crypto.randomUUID()}`
+  await page.getByLabel("New task title").fill(title)
+  await page.getByRole("button", { name: "Add task" }).click()
+  await expect(page.getByText(title, { exact: true })).toBeVisible()
+  await page.reload()
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText(title, { exact: true })).toBeVisible()
+})
+
+test("terminates the database worker when its coordinator module fails to load", async ({ context, page }) => {
+  await installDatabaseBootstrapProbe(page, "reject")
+  await page.goto("/")
+  await waitForDatabaseBootstrap(page)
+
+  const browser = context.browser()
+  expect(browser).not.toBeNull()
+  const cdp = await browser!.newBrowserCDPSession()
+  const workerUrl = await page.evaluate(() =>
+    (globalThis as typeof globalThis & {
+      readonly __effectLocalDatabaseBootstrap: { readonly url: string }
+    }).__effectLocalDatabaseBootstrap.url
+  )
+  const beforeRelease = await cdp.send("Target.getTargets")
+  expect(beforeRelease.targetInfos.some((target) => target.type === "worker" && target.url === workerUrl)).toBe(true)
+
+  await releaseDatabaseBootstrap(page, false)
+  await expect.poll(() =>
+    page.evaluate(() =>
+      (globalThis as typeof globalThis & {
+        readonly __effectLocalDatabaseBootstrap: { readonly error?: string }
+      }).__effectLocalDatabaseBootstrap.error
+    )
+  ).toContain("effect-local test coordinator import failure")
+  await expect.poll(async () => {
+    const targets = await cdp.send("Target.getTargets")
+    return targets.targetInfos.some((target) => target.type === "worker" && target.url === workerUrl)
+  }).toBe(false)
+  await cdp.detach()
+})
+
 test("creates, updates, completes, deletes, and reloads local tasks", async ({ page }) => {
   await page.goto("/")
   await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
@@ -62,8 +197,11 @@ test("keeps local writes available while browser networking is offline", async (
   await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await page.evaluate(() => navigator.serviceWorker.ready)
   await expect.poll(() => page.evaluate(() => navigator.serviceWorker.controller !== null)).toBe(true)
+  // No assertion on the status text here or after coming back online. This app is a direct replica
+  // with no peer and no relay, so nothing it renders is derived from network state, and the same
+  // string shows whether or not the context is offline. The contract worth protecting is below: a
+  // write lands while offline and survives a reload with no network.
   await context.setOffline(true)
-  await expect(page.getByText("Offline, saved locally")).toBeVisible()
 
   const title = `Offline ${crypto.randomUUID()}`
   const titleInput = page.getByLabel("New task title")
@@ -78,7 +216,6 @@ test("keeps local writes available while browser networking is offline", async (
   await expect(page.getByText(title, { exact: true })).toBeVisible()
 
   await context.setOffline(false)
-  await expect(page.getByText("Local replica ready")).toBeVisible()
   await expect(page.getByText(title, { exact: true })).toBeVisible()
 })
 
@@ -392,7 +529,7 @@ test("expires a stalled provisioning candidate before assigning a healthy provid
         readonly rpcPort: MessagePort
       }
     }
-    const replica = new SharedWorker("/src/replica.shared-worker.ts?worker_file&type=module", {
+    const replica = new SharedWorker("/src/replica.shared-worker.ts?worker_file&type=ignore", {
       name: "effect-local-tasks",
       type: "module"
     })

@@ -864,6 +864,14 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 yield* sql`DELETE FROM effect_local_peer_relay_outbox`
                 yield* sql`DELETE FROM effect_local_peer_relay_outbox_remote_usage`
                 yield* sql`DELETE FROM effect_local_peer_relay_outbox_replica_usage`
+                yield* sql`DELETE FROM effect_local_command_delivery_events`
+                yield* sql`DELETE FROM effect_local_peer_relay_delivery_changes`
+                yield* sql`DELETE FROM effect_local_peer_relay_delivery_messages`
+                yield* sql`DELETE FROM effect_local_command_delivery_changes`
+                yield* sql`DELETE FROM effect_local_command_delivery_sources`
+                yield* sql`UPDATE effect_local_command_delivery_control
+                  SET refresh_epoch = refresh_epoch + 1
+                  WHERE singleton = 1`
                 yield* sql`INSERT INTO effect_local_peer_relay_receipt_delete_tokens (receipt_row_id)
                   SELECT row_id
                   FROM effect_local_peer_receipts

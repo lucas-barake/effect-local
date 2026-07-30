@@ -1,4 +1,4 @@
-import { useAtomMount, useAtomSet } from "@effect/atom-react"
+import { useAtomMount, useAtomSet, useAtomValue } from "@effect/atom-react"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import { useEffect } from "react"
 import * as Device from "./device.ts"
@@ -24,6 +24,8 @@ declare global {
 
 export const App = () => {
   useAtomMount(Device.sessionAtom)
+  const connectionStatus = useAtomValue(Device.peerConnectionStatus)
+  const relayStatus = useAtomValue(Device.relayConnectionStatus)
 
   const createTask = useAtomSet(Device.createTask, { mode: "promise" })
   const adoptTask = useAtomSet(Device.syncDocument)
@@ -45,6 +47,21 @@ export const App = () => {
     }
     document.body.dataset.ready = "true"
   }, [createTask, adoptTask, addLabel, readTask, exportBackup, restoreBackup, push])
+
+  useEffect(() => {
+    document.body.dataset.connectionStatus = connectionStatus._tag === "Success"
+      ? connectionStatus.value._tag
+      : connectionStatus._tag
+  }, [connectionStatus])
+
+  // Separate from the peer status above, and deliberately so: every peer session runs over this one
+  // socket, so a relay drop takes them all quiet at once and per peer status alone would read as
+  // several peers vanishing rather than as one link failing.
+  useEffect(() => {
+    document.body.dataset.relayStatus = relayStatus._tag === "Success"
+      ? relayStatus.value._tag
+      : relayStatus._tag
+  }, [relayStatus])
 
   return null
 }

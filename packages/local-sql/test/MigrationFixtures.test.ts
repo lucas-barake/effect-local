@@ -23,7 +23,8 @@ const expectations = {
       [8, "document_lineage"],
       [9, "history_rewrite_markers"],
       [10, "peer_relay_state"],
-      [11, "document_history_counters"]
+      [11, "command_delivery"],
+      [12, "document_history_counters"]
     ],
     outbox: "none"
   },
@@ -37,7 +38,8 @@ const expectations = {
       [8, "document_lineage"],
       [9, "history_rewrite_markers"],
       [10, "peer_relay_state"],
-      [11, "document_history_counters"]
+      [11, "command_delivery"],
+      [12, "document_history_counters"]
     ],
     outbox: "backfilled"
   },
@@ -50,7 +52,8 @@ const expectations = {
       [8, "document_lineage"],
       [9, "history_rewrite_markers"],
       [10, "peer_relay_state"],
-      [11, "document_history_counters"]
+      [11, "command_delivery"],
+      [12, "document_history_counters"]
     ],
     outbox: { frozen: "2020-01-01T00:00:00.000Z" }
   }
@@ -139,7 +142,8 @@ const assertMigrationHistory = Effect.gen(function*() {
     { migration_id: 8, name: "document_lineage" },
     { migration_id: 9, name: "history_rewrite_markers" },
     { migration_id: 10, name: "peer_relay_state" },
-    { migration_id: 11, name: "document_history_counters" }
+    { migration_id: 11, name: "command_delivery" },
+    { migration_id: 12, name: "document_history_counters" }
   ])
 
   const catalog = yield* SqlSchema.findAll({
@@ -162,8 +166,9 @@ const assertMigrationHistory = Effect.gen(function*() {
       checksum: Migrations.historyRewriteMarkersChecksum
     },
     { migration_id: 10, name: "peer_relay_state", checksum: Migrations.peerRelayStateChecksum },
+    { migration_id: 11, name: "command_delivery", checksum: Migrations.commandDeliveryChecksum },
     {
-      migration_id: 11,
+      migration_id: 12,
       name: "document_history_counters",
       checksum: Migrations.documentHistoryCountersChecksum
     }

@@ -68,7 +68,6 @@ export interface Received {
   readonly acceptedHeads: ReadonlyArray<string>
   readonly commitSequence: Identity.CommitSequence
   readonly observedByPeer: boolean
-  readonly durableConfirmation: false
   readonly duplicate: boolean
 }
 
@@ -216,7 +215,6 @@ const receivedFromReceipt = (documentId: Identity.DocumentId, receipt: typeof Re
   acceptedHeads: receipt.accepted_heads,
   commitSequence: Identity.CommitSequence.make(receipt.commit_sequence),
   observedByPeer: false,
-  durableConfirmation: false,
   duplicate: true
 })
 
@@ -2604,7 +2602,6 @@ const make = (
                         acceptedHeads,
                         commitSequence: result.commitSequence,
                         observedByPeer: Automerge.hasOurChanges(staged, generated[0]),
-                        durableConfirmation: false as const,
                         duplicate: false
                       }
                     }),

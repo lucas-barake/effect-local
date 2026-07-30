@@ -47,11 +47,6 @@ export const maximumSyncEnvelopeBytes = (
 
 const SyncEnvelopeJson = Schema.fromJsonString(Schema.toCodecJson(SyncEnvelope))
 
-const protocolMismatch = (expected: string, observed: string): ReplicaError.ReplicaError =>
-  new ReplicaError.ReplicaError({
-    reason: new ReplicaError.ProtocolMismatch({ expected, observed })
-  })
-
 export const encodeSyncEnvelope = (
   envelope: SyncEnvelope
 ): Effect.Effect<Uint8Array, ReplicaError.ReplicaError> =>
@@ -60,7 +55,18 @@ export const encodeSyncEnvelope = (
     writerProvenance: WriterProvenance.canonicalize(envelope.writerProvenance)
   }).pipe(
     Effect.map((value) => new TextEncoder().encode(value)),
-    Effect.mapError(() => protocolMismatch("encodable sync envelope", "invalid sync envelope"))
+    Effect.catchTag(
+      "SchemaError",
+      () =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: "encodable sync envelope",
+              observed: "invalid sync envelope"
+            })
+          })
+        )
+    )
   )
 
 export const validateSyncEnvelope = (
@@ -69,20 +75,29 @@ export const validateSyncEnvelope = (
 ): Effect.Effect<SyncEnvelope, ReplicaError.ReplicaError, Crypto.Crypto> =>
   Effect.gen(function*() {
     if (envelope.message.byteLength > limits.maxSyncMessageBytes) {
-      return yield* protocolMismatch(
-        `sync message at most ${limits.maxSyncMessageBytes} bytes`,
-        "oversized sync message"
-      )
+      return yield* new ReplicaError.ReplicaError({
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: `sync message at most ${limits.maxSyncMessageBytes} bytes`,
+          observed: "oversized sync message"
+        })
+      })
     }
     if (envelope.writerProvenance.length > limits.maxSyncChangesPerMessage) {
-      return yield* protocolMismatch(
-        `at most ${limits.maxSyncChangesPerMessage} writer provenance entries`,
-        "excess writer provenance"
-      )
+      return yield* new ReplicaError.ReplicaError({
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: `at most ${limits.maxSyncChangesPerMessage} writer provenance entries`,
+          observed: "excess writer provenance"
+        })
+      })
     }
     const messageHash = yield* Canonical.digest(envelope.message)
     if (messageHash !== envelope.messageHash) {
-      return yield* protocolMismatch("matching sync message hash", "conflicting sync message hash")
+      return yield* new ReplicaError.ReplicaError({
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: "matching sync message hash",
+          observed: "conflicting sync message hash"
+        })
+      })
     }
     return {
       ...envelope,
@@ -100,11 +115,27 @@ export const decodeSyncEnvelope = (
   )
   if (bytes.byteLength > maximumBytes) {
     return Effect.fail(
-      protocolMismatch(`sync envelope at most ${maximumBytes} bytes`, "oversized sync envelope")
+      new ReplicaError.ReplicaError({
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: `sync envelope at most ${maximumBytes} bytes`,
+          observed: "oversized sync envelope"
+        })
+      })
     )
   }
   return Schema.decodeUnknownEffect(SyncEnvelopeJson)(new TextDecoder().decode(bytes)).pipe(
-    Effect.mapError(() => protocolMismatch("sync envelope", "invalid sync envelope")),
+    Effect.catchTag(
+      "SchemaError",
+      () =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: "sync envelope",
+              observed: "invalid sync envelope"
+            })
+          })
+        )
+    ),
     Effect.flatMap((envelope) => validateSyncEnvelope(envelope, limits))
   )
 }
@@ -165,14 +196,36 @@ export const encodeRelayOuterEnvelope = (
 ): Effect.Effect<Uint8Array, ReplicaError.ReplicaError> =>
   Schema.encodeEffect(RelayOuterEnvelope)(canonicalizeRelayOuterEnvelope(envelope)).pipe(
     Effect.map((encoded) => new TextEncoder().encode(Canonical.stringify(encoded))),
-    Effect.mapError(() => protocolMismatch("encodable relay outer envelope", "invalid relay outer envelope"))
+    Effect.catchTag(
+      "SchemaError",
+      () =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: "encodable relay outer envelope",
+              observed: "invalid relay outer envelope"
+            })
+          })
+        )
+    )
   )
 
 export const digestRelayOuterEnvelope = (
   envelope: RelayOuterEnvelope
 ): Effect.Effect<string, ReplicaError.ReplicaError, Crypto.Crypto> =>
   Schema.encodeEffect(RelayOuterEnvelope)(canonicalizeRelayOuterEnvelope(envelope)).pipe(
-    Effect.mapError(() => protocolMismatch("encodable relay outer envelope", "invalid relay outer envelope")),
+    Effect.catchTag(
+      "SchemaError",
+      () =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: "encodable relay outer envelope",
+              observed: "invalid relay outer envelope"
+            })
+          })
+        )
+    ),
     Effect.flatMap(Canonical.digest)
   )
 

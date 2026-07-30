@@ -162,20 +162,33 @@ import * as PeerRpc from "@lucas-barake/effect-local-rpc/PeerRpc"
 import * as RpcPeerTransport from "@lucas-barake/effect-local-rpc/RpcPeerTransport"
 import { RpcClient, RpcSerialization } from "effect/unstable/rpc"
 
-// Provide the transport to the whole effect that USES the session, not to `makeRpcClient` alone.
-const relaySession = Effect.gen(function*() {
-  const client = yield* PeerRpc.makeRpcClient
-  const session = yield* RpcPeerTransport.makeSession(client, relayOptions)
-  yield* useTheSession(session)
-}).pipe(
-  Effect.provide(RpcClient.layerProtocolSocket()),
-  Effect.provide(BrowserSocket.layerWebSocket(relayUrl)),
-  Effect.provide(RpcSerialization.layerJson),
-  Effect.provide(PeerAuthentication.layerClient),
-  Effect.provideService(PeerCredentials.PeerCredentials, credentials),
-  Effect.scoped
+// One socket for the device. The transport is provided around the work that USES the sessions, not
+// around `makeRpcClient` alone.
+const RelayLink = Layer.effect(RelayClient)(PeerRpc.makeRpcClient).pipe(
+  // Not `RpcClient.layerProtocolSocket`: this builds the protocol and the relay status reader
+  // together, which is the only composition that cannot be wired up wrong.
+  Layer.provideMerge(RelayConnectionStatus.layerProtocolSocket()),
+  Layer.provide(BrowserSocket.layerWebSocket(relayUrl)),
+  Layer.provide(RpcSerialization.layerJson),
+  Layer.provide(PeerAuthentication.layerClient),
+  Layer.provide(Layer.succeed(PeerCredentials.PeerCredentials)(credentials))
 )
+
+// Sessions are layered over that one client. Opening a session is what registers a peer connection
+// attempt, so it stays here rather than moving up with the socket.
+const relaySession = (documents: ReadonlyArray<PeerSession.SelectedDocument>) =>
+  Effect.gen(function*() {
+    const client = yield* RelayClient
+    const session = yield* RpcPeerTransport.makeSession(client, relayOptions(documents))
+    yield* useTheSession(session)
+  })
 ```
+
+One socket carries as many sessions as you need. The relay multiplexes them: each `Open` gets its own
+session id, and the server tracks them independently of which connection they arrived on. A socket
+per session pays for a TCP and WebSocket handshake per document set and buys nothing. The limit that
+actually applies is `maxSessionsPerSubject` (default 4), which the relay counts per tenant and
+subject regardless of how many connections carry them.
 
 The scoping above is load bearing and the mistake it avoids is silent. A `Layer` provided to
 `makeRpcClient` alone lives exactly as long as that constructor: the socket and its pump are built,
@@ -188,6 +201,12 @@ constructor.
 `Ref` or `Deferred` backed implementation that the page refreshes is a valid shape. Supplying it inside a SharedWorker
 is the part with no answer in this package: `SharedWorkerGlobalScope` has no `localStorage` and no cookie jar, so the
 token has to travel from the page across the existing `MessagePort`, and `ReplicaRpc` has no slot for it today.
+
+Whether the socket itself is up is reported by `RelayConnectionStatus`, built by the same
+`layerProtocolSocket` above. It is deliberately separate from `PeerConnectionStatus`: the relay link
+is one socket shared by every peer session, so when it drops they all go quiet at once, and per peer
+status alone would render that as several peers vanishing rather than as one link failing. The two
+`Status` types are branded so neither can be passed where the other belongs.
 
 Reconnect is likewise the application's. `SupervisedPeerSession.awaitDisconnect` reports the disconnect and
 `RpcPeerTransport.isRetryable` classifies whether the failure is worth retrying, but the schedule is a deployment
@@ -227,8 +246,36 @@ what is in flight lives only in memory, so an abandoned attempt simply leaves th
 5. Any generated reply is durably enqueued for the local peer session.
 
 This boundary proves durable recipient processing for replay suppression. It does not change
-`PeerSession.durableConfirmation()`, which remains `false`. It also does not prove that another peer observed the
-change.
+the sender's command delivery record. Sender custody confirmation happens earlier, when `Push` returns after the
+relay SQL authority commits the envelope. Recipient acknowledgement still does not prove that another peer observed
+the change.
+
+## Client visible custody
+
+The sender keeps command delivery evidence independently from the temporary relay outbox payload. A command receipt
+records the exact Automerge change hashes produced by that command. Relay admission records which of those hashes are
+carried by one stable relay message. Relay acknowledgement then marks that message as accepted before the payload row
+is removed.
+
+Applications can query `Replica.lookupCommandDelivery(commandId)` or subscribe with
+`Replica.commandDeliveryChanges(commandId)`. Browser replicas expose the same methods through the owner worker, and
+`ReplicaAtom.commandDeliveryFamily(commandId)` reads one command's stream directly rather than through a reactivity
+key, so one custody change never refetches other mounted command atoms. The owner's invalidation channel carries a
+single global delivery key, so command IDs never cross it.
+
+One `TrackedCommand` groups evidence by exact relay peer and remote peer. Its destination state is one of:
+
+1. `PendingRelayCustody`, while at least one message remains in the sender outbox.
+2. `RelayCustodyAccepted`, when accepted messages cover every local change made by the command.
+3. `RelayCustodyUnconfirmedAtDeadline`, when the sender removed expired payloads before complete confirmation.
+
+Expiry means confirmation was not obtained by the configured deadline. It does not prove the relay failed to store
+the message. A valid late acknowledgement still upgrades the durable record to `RelayCustodyAccepted`.
+
+`PeerSession.durableConfirmation(documentId)` uses the same durable evidence for relay connections, but its scope is
+the whole document. It returns `true` only when accepted relay messages cover every current local change for the exact
+connected endpoint. Direct connections return `false`. `observedByPeer(documentId)` remains an in memory Automerge
+sync observation and has different semantics.
 
 A stable protocol violation uses `Reject` with `ProtocolInvalid`. Application code can use
 `ApplicationRejected` through the acknowledged delivery contract. A permanent rejection becomes a retained dead

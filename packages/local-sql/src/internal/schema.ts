@@ -20,7 +20,13 @@ export const tables = [
   "effect_local_peer_relay_receipt_usage",
   "effect_local_peer_relay_outbox",
   "effect_local_peer_relay_outbox_remote_usage",
-  "effect_local_peer_relay_outbox_replica_usage"
+  "effect_local_peer_relay_outbox_replica_usage",
+  "effect_local_command_delivery_sources",
+  "effect_local_command_delivery_changes",
+  "effect_local_peer_relay_delivery_messages",
+  "effect_local_peer_relay_delivery_changes",
+  "effect_local_command_delivery_events",
+  "effect_local_command_delivery_control"
 ] as const
 
 /**
@@ -28,11 +34,15 @@ export const tables = [
  * database carrying no metadata singleton is a fresh one or a corrupt one.
  *
  * Deliberately not every table in `tables`. `effect_local_metadata` is the row being looked for, and
- * `effect_local_migration_catalog` gains a row from every migration, so a probe counting either would
- * report a brand new database as populated and no replica could ever be created. The migrator's own
- * `effect_local_migrations` is excluded for the same reason, and is not in `tables` at all because
- * the migrator owns it rather than this schema.
+ * `effect_local_migration_catalog` gains a row from every migration, and the command delivery control
+ * table has a required singleton. A probe counting any of them would report a brand new database as
+ * populated and no replica could ever be created. The migrator's own `effect_local_migrations` is
+ * excluded for the same reason, and is not in `tables` at all because the migrator owns it rather
+ * than this schema.
  */
 export const populatedTables: ReadonlyArray<string> = tables.filter(
-  (table) => table !== "effect_local_metadata" && table !== "effect_local_migration_catalog"
+  (table) =>
+    table !== "effect_local_metadata" &&
+    table !== "effect_local_migration_catalog" &&
+    table !== "effect_local_command_delivery_control"
 )

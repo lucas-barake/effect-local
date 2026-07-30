@@ -1,6 +1,8 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { assert, it } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
+import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
@@ -11,6 +13,7 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Queue from "effect/Queue"
 import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
 import * as HttpClientError from "effect/unstable/http/HttpClientError"
@@ -21,7 +24,7 @@ import * as ReplicaClient from "../src/ReplicaClient.js"
 import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
-import { definition, documentId, replica, Task } from "./fixtures.js"
+import { definition, DeliveryPublisher, documentId, replica, Task } from "./fixtures.js"
 
 it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
   const limits = {
@@ -65,19 +68,24 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
     maxRestoreErrorBytes: 4_096
   } satisfies ReplicaLimits.Values
   const Sessions = SessionManager.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)))
-  const Publisher = Layer.succeed(
-    CommitPublisher.CommitPublisher,
-    CommitPublisher.CommitPublisher.of({
-      publishPending: Effect.succeed(0),
-      invalidate: () => Effect.void,
-      subscribe: Effect.succeed({
-        watermark: Identity.CommitSequence.make(0),
-        refreshGeneration: 0,
-        events: Stream.never
+  const Publisher = Layer.merge(
+    Layer.succeed(
+      CommitPublisher.CommitPublisher,
+      CommitPublisher.CommitPublisher.of({
+        publishPending: Effect.succeed(0),
+        invalidate: () => Effect.void,
+        subscribe: Effect.succeed({
+          watermark: Identity.CommitSequence.make(0),
+          refreshGeneration: 0,
+          events: Stream.never
+        })
       })
-    })
+    ),
+    DeliveryPublisher
   )
   const Owner = ReplicaOwner.layerHandlers(definition).pipe(
+    Layer.provide(PeerConnectionStatus.layer),
+    Layer.provide(RelayConnectionStatus.layerNotConfigured),
     Layer.provideMerge(Sessions),
     Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, replica)))
   )
@@ -97,6 +105,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
       let statusCalls = 0
       let activeStatus = 0
       let concurrentStatus = 0
+      const attempts = yield* Queue.unbounded<number>()
       const reconnecting = new Proxy(rpc, {
         get(target, property, receiver) {
           if (property !== "Status") return Reflect.get(target, property, receiver)
@@ -106,19 +115,27 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
               activeStatus++
               concurrentStatus = Math.max(concurrentStatus, activeStatus)
               const attempt = statusCalls
-              return (attempt === 1
-                ? Stream.make(ready).pipe(Stream.concat(Stream.fail(disconnected())))
-                : Stream.make(ready).pipe(Stream.concat(Stream.never))).pipe(
-                  Stream.ensuring(Effect.sync(() => {
-                    activeStatus--
-                  }))
+              return Stream.unwrap(
+                Queue.offer(attempts, attempt).pipe(
+                  Effect.as(
+                    (attempt === 1
+                      ? Stream.make(ready).pipe(Stream.concat(Stream.fail(disconnected())))
+                      : Stream.make(ready).pipe(Stream.concat(Stream.never))).pipe(
+                        Stream.ensuring(Effect.sync(() => {
+                          activeStatus--
+                        }))
+                      )
+                  )
                 )
+              )
             }))
         }
       })
       const client = yield* ReplicaClient.fromRpcClient(definition, reconnecting)
       const fiber = yield* client.status.pipe(Stream.take(3), Stream.runCollect, Effect.forkChild)
+      assert.strictEqual(yield* Queue.take(attempts), 1)
       yield* TestClock.adjust("1 second")
+      assert.strictEqual(yield* Queue.take(attempts), 2)
       const collected = Array.from(yield* Fiber.join(fiber))
       assert.deepStrictEqual(collected, [
         ready,
@@ -143,6 +160,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
       let openSessions = 0
       let statusCalls = 0
       let activeStatus = 0
+      const attempts = yield* Queue.unbounded<number>()
       const reconnecting = new Proxy(rpc, {
         get(target, property, receiver) {
           const value = Reflect.get(target, property, receiver)
@@ -168,29 +186,38 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
                 : attempt === 3
                 ? Stream.fail(queued)
                 : Stream.make(ready).pipe(Stream.concat(Stream.never))
-              return stream.pipe(
-                Stream.ensuring(Effect.sync(() => {
-                  activeStatus--
-                }))
+              return Stream.unwrap(
+                Queue.offer(attempts, attempt).pipe(
+                  Effect.as(
+                    stream.pipe(
+                      Stream.ensuring(Effect.sync(() => {
+                        activeStatus--
+                      }))
+                    )
+                  )
+                )
               )
             }))
         }
       })
       const client = yield* ReplicaClient.fromRpcClient(definition, reconnecting)
       const fiber = yield* client.status.pipe(Stream.take(4), Stream.runCollect, Effect.forkChild)
-      yield* Effect.yieldNow
+      assert.strictEqual(yield* Queue.take(attempts), 1)
       assert.strictEqual(statusCalls, 1)
       yield* TestClock.adjust("999 millis")
       assert.strictEqual(statusCalls, 1)
       yield* TestClock.adjust("1 millis")
+      assert.strictEqual(yield* Queue.take(attempts), 2)
       assert.strictEqual(statusCalls, 2)
       yield* TestClock.adjust("999 millis")
       assert.strictEqual(statusCalls, 2)
       yield* TestClock.adjust("1 millis")
+      assert.strictEqual(yield* Queue.take(attempts), 3)
       assert.strictEqual(statusCalls, 3)
       yield* TestClock.adjust("999 millis")
       assert.strictEqual(statusCalls, 3)
       yield* TestClock.adjust("1 millis")
+      assert.strictEqual(yield* Queue.take(attempts), 4)
       const collected = Array.from(yield* Fiber.join(fiber))
       assert.deepStrictEqual(collected, [
         { _tag: "Degraded", reason: "StorageUnavailable" },
@@ -343,6 +370,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
       const ready = { _tag: "Ready" as const, pendingCommands: 0 }
       let openSessions = 0
       let statusCalls = 0
+      const attempts = yield* Queue.unbounded<number>()
       const replacing = new Proxy(rpc, {
         get(target, property, receiver) {
           const value = Reflect.get(target, property, receiver)
@@ -355,12 +383,21 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
           if (property === "Status") {
             return () => {
               statusCalls++
-              if (statusCalls === 1) return Stream.fail(protocolMismatch("initial mismatch"))
-              if (statusCalls === 2) {
-                return Stream.make(ready).pipe(Stream.concat(Stream.fail(disconnected())))
-              }
-              return Stream.fail(
-                protocolMismatch(statusCalls === 3 ? "mismatch after recovery" : "replacement incorrectly resumed")
+              const attempt = statusCalls
+              const stream: Stream.Stream<
+                ReplicaStatus.ReplicaStatus,
+                ReplicaError.ReplicaError | RpcClientError.RpcClientError
+              > = attempt === 1
+                ? Stream.fail(protocolMismatch("initial mismatch"))
+                : attempt === 2
+                ? Stream.make(ready).pipe(Stream.concat(Stream.fail(disconnected())))
+                : Stream.fail(
+                  protocolMismatch(attempt === 3 ? "mismatch after recovery" : "replacement incorrectly resumed")
+                )
+              return Stream.unwrap(
+                Queue.offer(attempts, attempt).pipe(
+                  Effect.as(stream)
+                )
               )
             }
           }
@@ -374,7 +411,10 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
         Effect.flip,
         Effect.forkChild
       )
+      assert.strictEqual(yield* Queue.take(attempts), 1)
+      assert.strictEqual(yield* Queue.take(attempts), 2)
       yield* TestClock.adjust("1 second")
+      assert.strictEqual(yield* Queue.take(attempts), 3)
       const error = yield* Fiber.join(fiber)
       assert.deepStrictEqual(collected, [
         ready,
@@ -746,7 +786,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
                 _tag: "InvalidationsReady" as const,
                 ownerEpoch,
                 watermark: Identity.CommitSequence.make(0),
-                refreshGeneration: 0
+                refreshGeneration: 0,
+                deliveryWatermark: 0,
+                deliveryRefreshEpoch: 0
               },
               {
                 _tag: "Invalidation" as const,
@@ -989,7 +1031,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
         {
           _tag: "FullRefreshRequired",
           ownerEpoch: client.ownerEpoch,
-          keys: ReplicaDefinition.invalidationKeys(definition)
+          keys: [...ReplicaDefinition.invalidationKeys(definition), ReplicaRpc.commandDeliveryInvalidationKey]
         }
       ])
       assert.strictEqual(error.reason._tag, "QuotaExceeded")
@@ -1014,7 +1056,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
                 _tag: "InvalidationsReady" as const,
                 ownerEpoch,
                 watermark: Identity.CommitSequence.make(0),
-                refreshGeneration: 0
+                refreshGeneration: 0,
+                deliveryWatermark: 0,
+                deliveryRefreshEpoch: 0
               }).pipe(Stream.concat(Stream.never))
           }
           return Reflect.get(target, property, receiver)
@@ -1033,7 +1077,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
         {
           _tag: "FullRefreshRequired",
           ownerEpoch: client.ownerEpoch,
-          keys: ReplicaDefinition.invalidationKeys(definition)
+          keys: [...ReplicaDefinition.invalidationKeys(definition), ReplicaRpc.commandDeliveryInvalidationKey]
         }
       ])
       assert.strictEqual(error.reason._tag, "QuotaExceeded")

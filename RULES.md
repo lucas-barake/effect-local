@@ -84,6 +84,8 @@ Read this file before any work. Treat these rules as required for every package.
 - Keep internal modules under `src/internal`. Export only deliberate consumer APIs from package entry points.
 - Avoid redundant wrappers, aliases, and abstractions when an Effect primitive already expresses the contract.
 - Do not export aliases of Schema codec constructors such as `export const decodeFoo = Schema.decodeUnknownSync(Foo)` or `export const encodeFoo = Schema.encodeSync(Foo)`. Call the codec directly at each use site so the schema and the operation stay visible at the boundary.
+- Do not hand write a constructor function for a schema that exists as a value. Every schema carries `.make`, which applies constructor defaults and type side checks, and `Schema.tag` makes `_tag` optional in construction, so `Foo.make({ id })` supersedes `export const foo = (id) => ({ _tag: "Foo", id })`. A hand written constructor skips the schema's own checks, states the tag a second time where it can drift from the schema, and hides which schema the value belongs to. Use `makeOption` or `makeEffect` when a construction failure must stay a value rather than a thrown defect.
+- The exception is a type whose schema is built per call by a generic function, such as `CommandOutcome`, where the exported types are interfaces and no schema value exists to construct from. There a plain constructor is the only option.
 - Reuse established helpers and schemas before introducing another representation of the same concept.
 
 ## Tests And Changesets

@@ -1,3 +1,6 @@
+import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
+import * as CommandDelivery from "@lucas-barake/effect-local/CommandDelivery"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -35,8 +38,16 @@ const DocumentIdOutcome = CommandOutcome.schema(Identity.DocumentId, Schema.Neve
  * most needs to be told to reload would instead lose its replica to a cause it cannot discriminate
  * on. The version has to survive decoding for a handler to refuse it with a typed
  * `ReplicaError.ProtocolMismatch`.
+ *
+ * It stays at 1 until the first release. Skew is only possible between two deployments a consumer
+ * actually installed, and no version of these packages has been published, so every change to this
+ * group before then belongs to the same unreleased version 1. `PeerSyncEnvelope.relayProtocolVersion`
+ * is 1 for the same reason. Bump this on the first change that ships after release.
  */
-export const protocolVersion = 3
+export const protocolVersion = 1
+export const commandDeliveryInvalidationKey = "@lucas-barake/effect-local/command-delivery"
+const DeliveryEventSequence = Schema.Int.check(Schema.isGreaterThan(0))
+const DeliveryCursor = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 const SessionLease = Schema.Struct({ leaseMillis: Schema.Int })
 export const ConflictLimits = Schema.Struct({
   maxConflictDepth: Schema.Int,
@@ -89,6 +100,15 @@ export const Invalidation = Schema.Union([
   Schema.TaggedStruct("FullRefreshRequired", {
     ownerEpoch: Schema.String,
     keys: Schema.Array(Schema.String)
+  }),
+  Schema.TaggedStruct("DeliveryInvalidation", {
+    ownerEpoch: Schema.String,
+    sequence: DeliveryEventSequence,
+    keys: Schema.Array(Schema.String)
+  }),
+  Schema.TaggedStruct("DeliveryFullRefreshRequired", {
+    ownerEpoch: Schema.String,
+    keys: Schema.Array(Schema.String)
   })
 ])
 export type Invalidation = typeof Invalidation.Type
@@ -97,7 +117,9 @@ export const InvalidationMessage = Schema.Union([
   Schema.TaggedStruct("InvalidationsReady", {
     ownerEpoch: Schema.String,
     watermark: Identity.CommitSequence,
-    refreshGeneration: Schema.Int
+    refreshGeneration: Schema.Int,
+    deliveryWatermark: DeliveryCursor,
+    deliveryRefreshEpoch: DeliveryCursor
   }),
   Invalidation
 ])
@@ -213,6 +235,17 @@ export const group = RpcGroup.make(
     success: Schema.String,
     error: ReplicaError.ReplicaError
   }),
+  Rpc.make("LookupCommandDelivery", {
+    payload: { sessionId: Identity.SessionId, commandId: Identity.CommandId },
+    success: CommandDelivery.CommandDelivery,
+    error: ReplicaError.ReplicaError
+  }),
+  Rpc.make("CommandDeliveryChanges", {
+    payload: { sessionId: Identity.SessionId, commandId: Identity.CommandId },
+    success: CommandDelivery.CommandDelivery,
+    error: ReplicaError.ReplicaError,
+    stream: true
+  }),
   Rpc.make("Flush", { payload: { sessionId: Identity.SessionId }, error: ReplicaError.ReplicaError }),
   Rpc.make("Invalidations", {
     payload: { sessionId: Identity.SessionId, ownerEpoch: Schema.String },
@@ -223,6 +256,20 @@ export const group = RpcGroup.make(
   Rpc.make("Status", {
     payload: { sessionId: Identity.SessionId },
     success: ReplicaStatus.ReplicaStatus,
+    error: ReplicaError.ReplicaError,
+    stream: true
+  }),
+  Rpc.make("PeerConnectionStatus", {
+    payload: { sessionId: Identity.SessionId, peerId: Identity.PeerId },
+    success: PeerConnectionStatus.Status,
+    error: ReplicaError.ReplicaError,
+    stream: true
+  }),
+  // No peerId: this is the one socket every peer session runs over, so it is a property of the
+  // replica rather than of any peer.
+  Rpc.make("RelayConnectionStatus", {
+    payload: { sessionId: Identity.SessionId },
+    success: RelayConnectionStatus.Status,
     error: ReplicaError.ReplicaError,
     stream: true
   }),

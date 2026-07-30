@@ -13,16 +13,15 @@ import {
   Trash2,
   Upload,
   Wifi,
-  WifiOff,
   X
 } from "lucide-react"
 import { type ChangeEvent, type FormEvent, useEffect, useMemo, useRef, useState } from "react"
 import {
-  connectionStatus,
   createTask,
   deleteTask,
   exportBackup,
   renameTask,
+  replicaStatus,
   restoreBackup,
   setTaskCompleted,
   tasks
@@ -134,7 +133,6 @@ export const App = () => {
   const [filter, setFilter] = useState<(typeof filters)[number]>("all")
   const [search, setSearch] = useState("")
   const [title, setTitle] = useState("")
-  const [online, setOnline] = useState(navigator.onLine)
   const [message, setMessage] = useState("")
   const [notice, setNotice] = useState("")
   const [pending, setPending] = useState(0)
@@ -143,23 +141,13 @@ export const App = () => {
   const queryAtom = useMemo(() => tasks({ filter, search }), [filter, search])
   const result = useAtomValue(queryAtom)
   const refresh = useAtomRefresh(queryAtom)
-  const replicaStatus = useAtomValue(connectionStatus)
+  const currentReplicaStatus = useAtomValue(replicaStatus)
   const runCreate = useAtomSet(createTask, { mode: "promise" })
   const runRename = useAtomSet(renameTask, { mode: "promise" })
   const runCompleted = useAtomSet(setTaskCompleted, { mode: "promise" })
   const runDelete = useAtomSet(deleteTask, { mode: "promise" })
   const runExport = useAtomSet(exportBackup, { mode: "promise" })
   const runRestore = useAtomSet(restoreBackup, { mode: "promise" })
-
-  useEffect(() => {
-    const update = () => setOnline(navigator.onLine)
-    window.addEventListener("online", update)
-    window.addEventListener("offline", update)
-    return () => {
-      window.removeEventListener("online", update)
-      window.removeEventListener("offline", update)
-    }
-  }, [])
 
   useEffect(() => {
     let active = true
@@ -236,12 +224,10 @@ export const App = () => {
 
   const rows = result._tag === "Success" ? result.value : []
   const activeCount = rows.filter((task) => !task.completed).length
-  const statusText = !online
-    ? "Offline, saved locally"
-    : replicaStatus._tag === "Success" && replicaStatus.value._tag === "Ready"
+  const statusText = currentReplicaStatus._tag === "Success" && currentReplicaStatus.value._tag === "Ready"
     ? "Local replica ready"
-    : replicaStatus._tag === "Success" && replicaStatus.value._tag === "Degraded"
-    ? `Local replica degraded: ${replicaStatus.value.reason}`
+    : currentReplicaStatus._tag === "Success" && currentReplicaStatus.value._tag === "Degraded"
+    ? `Local replica degraded: ${currentReplicaStatus.value.reason}`
     : "Starting local replica"
 
   return (
@@ -257,8 +243,8 @@ export const App = () => {
           </div>
         </div>
         <div className="header-meta">
-          <div className={`connection${online ? "" : " offline"}`} aria-live="polite">
-            {online ? <Wifi aria-hidden="true" size={16} /> : <WifiOff aria-hidden="true" size={16} />}
+          <div className="connection" aria-live="polite">
+            <Wifi aria-hidden="true" size={16} />
             <span>{statusText}</span>
             {pending > 0 && <span className="saving">Saving</span>}
           </div>
