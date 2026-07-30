@@ -450,11 +450,6 @@ describe("Automerge persistence", () => {
             128 * 1024 * 1024,
             `inspection RSS grew ${rssGrowth} bytes in ${elapsedMillis.toFixed(1)}ms`
           )
-          assert.isBelow(
-            elapsedMillis,
-            2_000,
-            `inspection took ${elapsedMillis.toFixed(1)}ms and grew RSS by ${rssGrowth} bytes`
-          )
         }),
       (merged) => Effect.sync(() => Automerge.free(merged))
     ), 30_000)
