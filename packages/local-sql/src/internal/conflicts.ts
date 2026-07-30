@@ -395,25 +395,6 @@ const copyContainer = (
   return { value: output }
 }
 
-const parentSegment = (
-  property: string | number,
-  alternative: Conflict.AlternativeId | undefined
-): Conflict.ParentSegment =>
-  typeof property === "number"
-    ? {
-      _tag: "Index",
-      index: property,
-      ...(alternative === undefined ? {} : { alternative })
-    }
-    : {
-      _tag: "Key",
-      key: property,
-      ...(alternative === undefined ? {} : { alternative })
-    }
-
-const targetSegment = (property: string | number): Conflict.TargetSegment =>
-  typeof property === "number" ? { _tag: "Index", index: property } : { _tag: "Key", key: property }
-
 const addParentSegmentJsonBytes = (
   budget: Conflict.JsonByteBudget,
   segment: Conflict.ParentSegment
@@ -538,7 +519,12 @@ const inspectContainer = (
     if (values.length > 1) {
       if (!consumeAlternatives(budget, values.length)) return
       const ids = values.map((value) => Conflict.AlternativeId.make(alternativeId(value)))
-      const path: Conflict.Path = { parents, target: targetSegment(property) }
+      const path: Conflict.Path = {
+        parents,
+        target: typeof property === "number"
+          ? Conflict.TargetSegment.cases.Index.make({ index: property })
+          : Conflict.TargetSegment.cases.Key.make({ key: property })
+      }
       if (values.some(isComposite)) {
         conflicts = conflictsAt(container, property)
         if (conflicts === undefined) {
@@ -577,10 +563,22 @@ const inspectContainer = (
         budget.failure = unsupportedValue(parents.length + 1, value[0])
         return
       }
+      const alternative = id === visibleId ? undefined : id
       inspectContainer(
         backend,
         child as Container,
-        [...parents, parentSegment(property, id === visibleId ? undefined : id)],
+        [
+          ...parents,
+          typeof property === "number"
+            ? Conflict.ParentSegment.cases.Index.make({
+              index: property,
+              ...(alternative === undefined ? {} : { alternative })
+            })
+            : Conflict.ParentSegment.cases.Key.make({
+              key: property,
+              ...(alternative === undefined ? {} : { alternative })
+            })
+        ],
         budget,
         records
       )
