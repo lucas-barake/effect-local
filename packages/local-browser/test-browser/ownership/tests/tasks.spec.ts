@@ -212,7 +212,7 @@ test("keeps local writes available while browser networking is offline", async (
 
   await page.reload()
   await ownerInfo(page)
-  await expect(page.getByText("Offline, saved locally")).toBeVisible({ timeout: ownershipTransitionTimeout })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await expect(page.getByText(title, { exact: true })).toBeVisible()
 
   await context.setOffline(false)
