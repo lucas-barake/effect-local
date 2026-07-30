@@ -102,13 +102,6 @@ const protocolFailure = (observed: string) =>
 const isActiveSessionMismatch = (error: ReplicaError.ReplicaError): boolean =>
   error.reason._tag === "ProtocolMismatch" && error.reason.expected === "active session"
 
-const storageFailure = (cause: unknown) =>
-  new ReplicaError.ReplicaError({
-    reason: new ReplicaError.StorageUnavailable({
-      cause
-    })
-  })
-
 const isPositiveSafeInteger = (value: unknown): value is number =>
   typeof value === "number" && Number.isSafeInteger(value) && value > 0
 
@@ -217,14 +210,16 @@ export const fromRpcClient = (
   Effect.gen(function*() {
     const sessionTimeout = Duration.fromInputUnsafe(options?.sessionTimeout ?? defaultSessionTimeout)
     const operationTimeout = Duration.fromInputUnsafe(options?.operationTimeout ?? defaultOperationTimeout)
-    const timeoutMillis = (duration: Duration.Duration) => {
+    const reportedTimeoutMillis = (duration: Duration.Duration) => {
       const millis = Duration.toMillis(duration)
       if (millis <= 0 || Number.isNaN(millis)) return 0
       if (millis >= Number.MAX_SAFE_INTEGER) return Number.MAX_SAFE_INTEGER
       return Math.trunc(millis)
     }
+    const sessionReportedTimeoutMillis = reportedTimeoutMillis(sessionTimeout)
+    const operationReportedTimeoutMillis = reportedTimeoutMillis(operationTimeout)
     const boundBy =
-      (operation: string, duration: Duration.Duration) =>
+      (operation: string, duration: Duration.Duration, reportedMillis: number) =>
       <A, E, R,>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E | ReplicaError.ReplicaError, R> =>
         Effect.acquireUseRelease(
           Effect.forkChild(Effect.interruptible(effect), { startImmediately: true }),
@@ -238,7 +233,7 @@ export const fromRpcClient = (
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.OperationTimeout({
                         operation,
-                        timeoutMillis: timeoutMillis(duration)
+                        timeoutMillis: reportedMillis
                       })
                     })
                   )
@@ -246,8 +241,8 @@ export const fromRpcClient = (
             ),
           Fiber.interrupt
         )
-    const boundSession = (operation: string) => boundBy(operation, sessionTimeout)
-    const boundOperation = (operation: string) => boundBy(operation, operationTimeout)
+    const boundSession = (operation: string) => boundBy(operation, sessionTimeout, sessionReportedTimeoutMillis)
+    const boundOperation = (operation: string) => boundBy(operation, operationTimeout, operationReportedTimeoutMillis)
     /**
      * Dispatches a command and, if the answer is lost in transit, asks the owner what happened to
      * the id rather than reissuing it.
@@ -858,7 +853,10 @@ export const fromRpcClient = (
               }
               return Effect.try({
                 try: () => port.postMessage(encoded, transfer === undefined ? [] : [...transfer]),
-                catch: storageFailure
+                catch: (cause) =>
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageUnavailable({ cause })
+                  })
               })
             })
           const postReleasedAck = (frame: RestoreProtocol.Released) => {
@@ -924,10 +922,22 @@ export const fromRpcClient = (
             acceptOwnerFrame(decoded.value)
           }
           function onMessageError() {
-            failClosed(storageFailure(new Error("restore channel message decoding failed")))
+            failClosed(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: new Error("restore channel message decoding failed")
+                })
+              })
+            )
           }
           function onClose() {
-            failClosed(storageFailure(new Error("restore channel peer closed")))
+            failClosed(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: new Error("restore channel peer closed")
+                })
+              })
+            )
           }
 
           const cleanup = Effect.uninterruptible(
@@ -1568,13 +1578,23 @@ export const fromRpcClient = (
           "LookupCommandDelivery",
           (session) => rpc.LookupCommandDelivery({ sessionId: session.sessionId, commandId })
         ).pipe(
-          Effect.catchTag("RpcClientError", (error) => Effect.fail(storageFailure(error)))
+          Effect.catchTag("RpcClientError", (error) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({ cause: error })
+              })
+            ))
         ),
       commandDeliveryChanges: (commandId) =>
         withSessionStream(
           (session) => rpc.CommandDeliveryChanges({ sessionId: session.sessionId, commandId })
         ).pipe(
-          Stream.catchTag("RpcClientError", (error) => Stream.fail(storageFailure(error))),
+          Stream.catchTag("RpcClientError", (error) =>
+            Stream.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({ cause: error })
+              })
+            )),
           Stream.retry(
             Schedule.spaced("1 second").pipe(
               Schedule.setInputType<ReplicaError.ReplicaError>(),
@@ -1642,7 +1662,7 @@ export const fromRpcClient = (
           const startedAt = yield* Clock.currentTimeMillis
           const deadline = Math.min(
             Number.MAX_SAFE_INTEGER,
-            startedAt + timeoutMillis(operationTimeout)
+            startedAt + operationReportedTimeoutMillis
           )
           const maxBytes = yield* Backup.validateMaxBytes(options.maxBytes)
           let acceptedTerminal:
@@ -1655,7 +1675,7 @@ export const fromRpcClient = (
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.OperationTimeout({
                 operation: "RestoreBackup",
-                timeoutMillis: timeoutMillis(operationTimeout)
+                timeoutMillis: operationReportedTimeoutMillis
               })
             })
           const withinDeadline = <E, R,>(
@@ -1720,7 +1740,9 @@ export const fromRpcClient = (
                     isDataCloneError(cause.reasons[0].defect)
                   ) {
                     return Effect.fail(
-                      storageFailure(cause.reasons[0].defect)
+                      new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.StorageUnavailable({ cause: cause.reasons[0].defect })
+                      })
                     )
                   }
                   return Effect.failCause(cause)
@@ -1766,7 +1788,9 @@ export const fromRpcClient = (
                                   })
                                 }
                                 return new RestoreBackupError({
-                                  error: storageFailure(error)
+                                  error: new ReplicaError.ReplicaError({
+                                    reason: new ReplicaError.StorageUnavailable({ cause: error })
+                                  })
                                 })
                               })
                             )
