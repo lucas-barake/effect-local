@@ -33,11 +33,60 @@ const DeliveryAggregateRow = Schema.Struct({
   accepted_change_count: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   pending_change_count: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   accepted_at: Schema.NullOr(IsoDate),
+  first_message_at: IsoDate,
+  last_retry_deadline: IsoDate,
   first_pending_at: Schema.NullOr(IsoDate),
   pending_retry_deadline: Schema.NullOr(IsoDate),
   unconfirmed_at: Schema.NullOr(IsoDate),
   unconfirmed_retry_deadline: Schema.NullOr(IsoDate)
 })
+
+const destinationState = (
+  row: typeof DeliveryAggregateRow.Type,
+  localChangeCount: number
+): CommandDelivery.DestinationState => {
+  if (row.accepted_change_count === localChangeCount && row.accepted_at !== null) {
+    return {
+      _tag: "RelayCustodyAccepted",
+      acceptedChangeCount: row.accepted_change_count,
+      acceptedAt: row.accepted_at,
+      ...(row.unconfirmed_at === null
+        ? {}
+        : { senderCustodyUnconfirmedAt: row.unconfirmed_at })
+    }
+  }
+  if (
+    row.pending_change_count > 0 &&
+    row.first_pending_at !== null &&
+    row.pending_retry_deadline !== null
+  ) {
+    return {
+      _tag: "PendingRelayCustody",
+      acceptedChangeCount: row.accepted_change_count,
+      pendingChangeCount: row.pending_change_count,
+      firstPendingAt: row.first_pending_at,
+      retryDeadline: row.pending_retry_deadline
+    }
+  }
+  if (row.unconfirmed_at !== null && row.unconfirmed_retry_deadline !== null) {
+    return {
+      _tag: "RelayCustodyUnconfirmedAtDeadline",
+      acceptedChangeCount: row.accepted_change_count,
+      unconfirmedChangeCount: localChangeCount - row.accepted_change_count,
+      deadline: row.unconfirmed_retry_deadline,
+      observedAt: row.unconfirmed_at
+    }
+  }
+  // A change carried by no message yet is still waiting for custody, not past a deadline it never
+  // had, so this destination's own message window dates the wait.
+  return {
+    _tag: "PendingRelayCustody",
+    acceptedChangeCount: row.accepted_change_count,
+    pendingChangeCount: localChangeCount - row.accepted_change_count,
+    firstPendingAt: row.first_message_at,
+    retryDeadline: row.last_retry_deadline
+  }
+}
 
 const EventRow = Schema.Struct({
   event_sequence: Schema.Int.check(Schema.isGreaterThan(0)),
@@ -254,6 +303,8 @@ export const layer: Layer.Layer<
             WHEN messages.relay_custody_accepted_at IS NOT NULL
             THEN messages.relay_custody_accepted_at
           END) AS accepted_at,
+          MIN(messages.created_at) AS first_message_at,
+          MAX(messages.retry_deadline) AS last_retry_deadline,
           MIN(CASE
             WHEN messages.relay_custody_accepted_at IS NULL
               AND messages.sender_custody_unconfirmed_at IS NULL
@@ -359,46 +410,11 @@ export const layer: Layer.Layer<
           commandId
         })
         const localChangeCount = source.change_count
-        const destinations = rows.map((row): CommandDelivery.Destination => {
-          if (row.accepted_change_count === localChangeCount) {
-            return {
-              relayPeerId: row.relay_peer_id,
-              remotePeerId: row.remote_peer_id,
-              state: {
-                _tag: "RelayCustodyAccepted",
-                acceptedChangeCount: row.accepted_change_count,
-                acceptedAt: row.accepted_at!,
-                ...(row.unconfirmed_at === null
-                  ? {}
-                  : { senderCustodyUnconfirmedAt: row.unconfirmed_at })
-              }
-            }
-          }
-          if (row.pending_change_count > 0) {
-            return {
-              relayPeerId: row.relay_peer_id,
-              remotePeerId: row.remote_peer_id,
-              state: {
-                _tag: "PendingRelayCustody",
-                acceptedChangeCount: row.accepted_change_count,
-                pendingChangeCount: row.pending_change_count,
-                firstPendingAt: row.first_pending_at!,
-                retryDeadline: row.pending_retry_deadline!
-              }
-            }
-          }
-          return {
-            relayPeerId: row.relay_peer_id,
-            remotePeerId: row.remote_peer_id,
-            state: {
-              _tag: "RelayCustodyUnconfirmedAtDeadline",
-              acceptedChangeCount: row.accepted_change_count,
-              unconfirmedChangeCount: localChangeCount - row.accepted_change_count,
-              deadline: row.unconfirmed_retry_deadline!,
-              observedAt: row.unconfirmed_at!
-            }
-          }
-        })
+        const destinations = rows.map((row): CommandDelivery.Destination => ({
+          relayPeerId: row.relay_peer_id,
+          remotePeerId: row.remote_peer_id,
+          state: destinationState(row, localChangeCount)
+        }))
         yield* gate.validate(permit)
         return {
           _tag: "TrackedCommand",
