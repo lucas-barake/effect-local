@@ -35,8 +35,13 @@ const DocumentIdOutcome = CommandOutcome.schema(Identity.DocumentId, Schema.Neve
  * most needs to be told to reload would instead lose its replica to a cause it cannot discriminate
  * on. The version has to survive decoding for a handler to refuse it with a typed
  * `ReplicaError.ProtocolMismatch`.
+ *
+ * It stays at 1 until the first release. Skew is only possible between two deployments a consumer
+ * actually installed, and no version of these packages has been published, so every change to this
+ * group before then belongs to the same unreleased version 1. `PeerSyncEnvelope.relayProtocolVersion`
+ * is 1 for the same reason. Bump this on the first change that ships after release.
  */
-export const protocolVersion = 2
+export const protocolVersion = 1
 const SessionLease = Schema.Struct({ leaseMillis: Schema.Int })
 export const SessionHandshake = Schema.Struct({
   leaseMillis: Schema.Int,
