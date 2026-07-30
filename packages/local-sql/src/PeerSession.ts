@@ -8,7 +8,6 @@ import * as Clock from "effect/Clock"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
-import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
@@ -86,6 +85,7 @@ const makeWithTerminal = (
   | Scope.Scope
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
+  | PeerConnectionStatus.Reporter
   | PeerTransport.PeerTransport
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
@@ -122,15 +122,12 @@ const makeWithTerminal = (
         })
       })
     }
-    const reporter = yield* Effect.serviceOption(PeerConnectionStatus.Reporter)
-    const attempt = yield* (
-      Option.isSome(reporter)
-        ? reporter.value.connecting(options.peerId)
-        : Effect.succeed({
-          connected: Effect.void,
-          disconnected: Effect.void
-        })
-    ).pipe(
+    // An ordinary dependency, not `Effect.serviceOption`. This is the only writer of peer connection
+    // status, so a graph that provides the reader to its observers and builds the session outside
+    // that context would compile and then report every peer as `Disconnected` forever, with nothing
+    // to indicate the wiring was wrong. That is the same failure the reader side already refuses.
+    const reporter = yield* PeerConnectionStatus.Reporter
+    const attempt = yield* reporter.connecting(options.peerId).pipe(
       Effect.tap((attempt) =>
         Effect.sync(() => {
           cleanupOnError = attempt.disconnected
@@ -757,6 +754,7 @@ export const makeTestClient = (
   | Scope.Scope
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
+  | PeerConnectionStatus.Reporter
   | PeerTransport.PeerTransport
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
@@ -776,6 +774,7 @@ export const makeSupervised = (options: {
   | Scope.Scope
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
+  | PeerConnectionStatus.Reporter
   | PeerTransport.PeerTransport
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
@@ -802,6 +801,7 @@ export const make = (options: {
   | Scope.Scope
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
+  | PeerConnectionStatus.Reporter
   | PeerTransport.PeerTransport
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
@@ -818,6 +818,7 @@ export const makeLive = (options: {
   | Scope.Scope
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
+  | PeerConnectionStatus.Reporter
   | PeerTransport.PeerTransport
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
