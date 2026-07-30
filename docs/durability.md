@@ -164,6 +164,16 @@ after any commit. A delivery attempt can be abandoned while its message is still
 and per attempt claim tokens make retries and stale acknowledgements safe, while retained recipient receipts make
 duplicate application idempotent during the negotiated window.
 
+The sender also retains a command delivery ledger after an outbox payload is removed. Each locally committed command
+is linked to its exact Automerge change hashes. Relay messages are linked to the exact hashes they contain. Relay
+custody acknowledgement and sender deadline expiry update that ledger and emit durable delivery invalidations.
+Applications read it with `Replica.lookupCommandDelivery` or subscribe with `Replica.commandDeliveryChanges`.
+
+An expired sender row records `RelayCustodyUnconfirmedAtDeadline`. It does not record failure because a response may
+have been lost after the relay commit. A matching late acknowledgement changes the durable state to
+`RelayCustodyAccepted`. Restore clears command delivery evidence with the old replica incarnation and advances a
+refresh epoch so active subscribers reload their snapshots.
+
 Relay FIFO ordering is scoped to one exact directed peer channel, which includes the sender's connection epoch. One
 in flight head blocks later rows in that channel. Unrelated channels do not share that ordering fence.
 

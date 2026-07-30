@@ -735,6 +735,43 @@ The distinction that matters:
 | Lookup answers `Rejected` / `DurablyCommittedLocal` | The recorded answer is final                                   |
 | Deliberate new operation                            | Mint a fresh command ID with `Identity.makeCommandId`          |
 
+`DurablyCommittedLocal` proves only that the command and its canonical changes committed in local SQLite.
+Use `Replica.lookupCommandDelivery(commandId)` when application behavior also depends on relay custody.
+Use `Replica.commandDeliveryChanges(commandId)` for a long lived stream that emits the current snapshot first
+and then distinct durable changes.
+
+```ts
+const delivery = yield * replica.lookupCommandDelivery(commandId)
+
+if (
+  CommandDelivery.isRelayCustodyAccepted(
+    delivery,
+    relayPeerId,
+    remotePeerId
+  )
+) {
+  // Every local change produced by this command has durable relay custody
+  // for this exact relay and remote peer.
+}
+```
+
+The result separates command evidence from transport evidence:
+
+| Result                               | Meaning                                                                                 |
+| ------------------------------------ | --------------------------------------------------------------------------------------- |
+| `UnknownCommand`                     | No receipt exists for this command in the current replica incarnation                   |
+| `UntrackedCommand`                   | A receipt exists, but it predates command delivery tracking                             |
+| `NoChangesToDeliver`                 | The command committed without producing an Automerge change                             |
+| `TrackedCommand` with no destination | Local changes exist, but no relay message containing them has been admitted locally yet |
+| `PendingRelayCustody`                | The sender outbox retains the exact relay message and retry deadline                    |
+| `RelayCustodyAccepted`               | The relay acknowledged durable custody for the counted command changes                  |
+| `RelayCustodyUnconfirmedAtDeadline`  | The sender retry deadline passed without confirmation for the remaining command changes |
+
+Expiry is evidence that confirmation was not obtained by the deadline. It is not proof that relay custody
+failed. A valid late acknowledgement upgrades the same durable record to `RelayCustodyAccepted`. The summary is
+scoped to an exact relay peer and remote peer. It does not claim that the destination replica applied or observed
+the changes.
+
 ## Durable Node composition
 
 `SqlReplica.layerWithBindings(definition, { projections })` is the standard constructor, shown in the
@@ -796,11 +833,15 @@ const OwnershipLive = OwnershipCoordinator.layerTab({
   name: "effect-local-tasks",
   sharedWorker: () =>
     new SharedWorker(new URL("./replica.shared-worker.ts", import.meta.url), {
+      // Vite otherwise prepends a static environment import before the entry can buffer `connect`.
+      /* @vite-ignore */
       name: "effect-local-tasks",
       type: "module"
     }),
   databaseWorker: () =>
     new Worker(new URL("./opfs.worker.ts", import.meta.url), {
+      // Vite otherwise prepends a static environment import before the entry can buffer its port.
+      /* @vite-ignore */
       name: "effect-local-tasks-opfs",
       type: "module"
     })
@@ -833,8 +874,10 @@ invalidation, and backup export streams are intentionally unbounded. The owner s
 (`SessionManager.leaseDurationMillis`) and the client renews it automatically.
 
 Each mounted remote peer connection Atom holds one global queued RPC admission, one stream permit, and one in
-flight permit for its session. Size `maxStreamsPerSession` for the invalidation stream, an optional replica
-status stream, and all mounted peer status streams. Size `maxInFlightPerSession` for those streams plus the
+flight permit for its session. Each mounted `ReplicaAtom.commandDeliveryFamily` Atom holds one more stream permit
+and one more in flight permit for as long as it stays mounted. Size `maxStreamsPerSession` for the invalidation
+stream, an optional replica status stream, all mounted peer status streams, and all mounted command delivery
+streams. Size `maxInFlightPerSession` for those streams plus the
 unary operations that must run concurrently. Size `maxQueuedRpc` for all active unary and stream RPCs across
 sessions. Backup restore uses the separate `maxRestoresPerSession` and `maxActiveRestores` limits.
 
@@ -842,10 +885,57 @@ The SharedWorker entry delegates to the coordinator:
 
 ```ts
 // replica.shared-worker.ts
-import * as OwnershipCoordinator from "@lucas-barake/effect-local-browser/OwnershipCoordinator"
+const pending: Array<MessagePort> = []
+let coordinatorImportFailure: { readonly message: string; readonly name: string } | undefined
+const bufferConnection = (event: Event) => {
+  if (!("ports" in event)) return
+  const ports: unknown = event.ports
+  if (typeof ports !== "object" || ports === null) return
+  const port = Reflect.get(ports, 0)
+  if (!(port instanceof MessagePort)) return
+  if (coordinatorImportFailure === undefined) {
+    pending.push(port)
+    return
+  }
+  try {
+    port.postMessage({
+      _tag: "OwnerError",
+      message: coordinatorImportFailure.message,
+      reason: { _tag: "RuntimeLoadFailure", ...coordinatorImportFailure }
+    })
+  } catch {
+  } finally {
+    port.close()
+  }
+}
 
-OwnershipCoordinator.runSharedWorker(() =>
-  import("./replica.shared-worker-runtime.ts").then((module) => module.options)
+globalThis.addEventListener("connect", bufferConnection)
+void import("@lucas-barake/effect-local-browser/OwnershipCoordinator").then(
+  (OwnershipCoordinator) => {
+    globalThis.removeEventListener("connect", bufferConnection)
+    OwnershipCoordinator.runSharedWorker(
+      () => import("./replica.shared-worker-runtime.ts").then((module) => module.options),
+      pending.splice(0)
+    )
+  },
+  (cause) => {
+    coordinatorImportFailure = cause instanceof Error
+      ? { message: cause.message, name: cause.name }
+      : { message: String(cause), name: "UnknownError" }
+    for (const port of pending.splice(0)) {
+      try {
+        port.postMessage({
+          _tag: "OwnerError",
+          message: coordinatorImportFailure.message,
+          reason: { _tag: "RuntimeLoadFailure", ...coordinatorImportFailure }
+        })
+      } catch {
+      } finally {
+        port.close()
+      }
+    }
+    globalThis.reportError(cause)
+  }
 )
 ```
 
@@ -853,16 +943,40 @@ The runtime module builds the engine over the transferred database port and hand
 `OwnershipCoordinator.SharedWorkerOptions` back: `name`, `definition`, and `engine`, a function from
 `MessagePort` to a `ManagedRuntime` containing `SqlReplica.layerWithBindings`, `SessionManager.layer`, the
 domain Layers, `ReplicaLimits`, `BrowserCrypto.layer`, and `BrowserSqlite.layerMessagePort(databasePort)`.
-Connects arriving while the engine module loads are buffered; a load failure is reported to every tab.
+The zero dependency entry buffer is installed before the coordinator dependency graph loads. It hands early
+connections to `runSharedWorker`, which installs its listener synchronously before loading the engine module.
+The buffer is transferred and cleared after a successful handoff. If either import fails, every current and
+future connection receives an owner error instead of waiting indefinitely.
 
 The database worker entry holds a Web Lock for the database lifetime, so a replacement provider waits for the
 lock instead of opening OPFS concurrently with a slow prior owner:
 
 ```ts
 // opfs.worker.ts
-import * as OwnershipCoordinator from "@lucas-barake/effect-local-browser/OwnershipCoordinator"
+const pending: Array<MessageEvent<unknown>> = []
+const bufferMessage = (event: MessageEvent<unknown>) => {
+  pending.push(event)
+}
 
-OwnershipCoordinator.runDatabaseWorker({ name: "effect-local-tasks" })
+globalThis.addEventListener("message", bufferMessage)
+void import("@lucas-barake/effect-local-browser/OwnershipCoordinator").then(
+  (OwnershipCoordinator) => {
+    globalThis.removeEventListener("message", bufferMessage)
+    const initialMessage = pending.shift()
+    for (const event of pending.splice(0)) {
+      for (const port of event.ports) port.close()
+    }
+    OwnershipCoordinator.runDatabaseWorker({ name: "effect-local-tasks" }, initialMessage)
+  },
+  (cause) => {
+    globalThis.removeEventListener("message", bufferMessage)
+    for (const event of pending.splice(0)) {
+      for (const port of event.ports) port.close()
+    }
+    globalThis.reportError(cause)
+    globalThis.close()
+  }
+)
 ```
 
 The complete checked application is
@@ -1063,8 +1177,10 @@ const syncTask = (peerId: Identity.PeerId, documentId: Identity.DocumentId) =>
 
 The session exposes `peerId`, `connectionEpoch`, `markDirty`, `flush`, `observedByPeer(documentId)`, and
 `durableConfirmation(documentId)`. `observedByPeer` reports Automerge sync state only: the peer has all current
-local changes. It does not prove remote storage durability, which is why `durableConfirmation` currently
-returns only `false`.
+local changes. For a relay connection, `durableConfirmation` reports whether relay custody has been accepted for
+every current local change in that document for the exact connected endpoint. Direct connections still return
+`false`. Command scoped applications should prefer `lookupCommandDelivery`, since document confirmation combines
+all current local changes and is not tied to one command.
 
 One socket carries every session. `RpcPeerTransport.layer` takes an already built `PeerRpc.RpcClient` and never
 opens a connection of its own, and the relay tracks each `Open` by its own session id independently of which
@@ -1733,7 +1849,8 @@ Guarantees:
 Limitations:
 
 - Presence is expiring best effort state. It is never durable and never authorizes anything.
-- `durableConfirmation` returns only `false`; `observedByPeer` is Automerge sync state, not remote durability.
+- Relay custody confirmation proves storage by the configured relay. It does not prove destination application,
+  destination observation, or end user visibility. Direct peer sessions have no durable confirmation signal.
 - Browser storage starts as best effort and can be evicted or cleared. Request `navigator.storage.persist()`,
   report the result, and ship backup controls.
 - One mutation targets one document. There is no replicated transaction across documents; model one aggregate

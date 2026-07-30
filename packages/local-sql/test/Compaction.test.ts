@@ -765,7 +765,7 @@ describe("Compaction", () => {
         relay_message_id, outer_envelope_digest, protocol_version, payload_version,
         sender_connection_epoch, sender_sequence, document_id, document_type,
         writer_provenance, message_hash, payload, encoded_size, created_at,
-        retry_deadline, next_attempt_at, custody_state
+        retry_deadline, next_attempt_at
       ) VALUES (
         ${permit.replicaId}, ${permit.incarnation}, ${permit.writerGeneration},
         ${"tenant-a"}, ${"subject-local"}, ${"peer-local"},
@@ -774,7 +774,7 @@ describe("Compaction", () => {
         ${"epoch-1"}, ${0}, ${documentId}, ${Task.name},
         ${"[]"}, ${"b".repeat(64)}, ${payload}, ${payload.byteLength},
         ${"2020-01-01T00:00:00.000Z"}, ${"2999-01-01T00:00:00.000Z"},
-        ${"2020-01-01T00:00:00.000Z"}, ${"Pending"}
+        ${"2020-01-01T00:00:00.000Z"}
       )`
 
       const error = yield* Effect.flip(compaction.rewriteHistory(Task, documentId, operationId))

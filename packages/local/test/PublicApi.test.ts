@@ -6,6 +6,7 @@ describe("public API", () => {
     assert.deepStrictEqual(Object.keys(Local).toSorted(), [
       "Backup",
       "Canonical",
+      "CommandDelivery",
       "CommandOutcome",
       "Commit",
       "Document",

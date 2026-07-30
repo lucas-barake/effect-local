@@ -15,6 +15,7 @@ import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
+import * as CommandDeliveryStore from "./CommandDeliveryStore.js"
 import * as CommitPublisher from "./CommitPublisher.js"
 import * as DocumentEntity from "./DocumentEntity.js"
 import * as PeerConnectionStatus from "./PeerConnectionStatus.js"
@@ -34,7 +35,9 @@ export interface PeerSession {
   readonly markDirty: (documentId: Identity.DocumentId) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly flush: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly observedByPeer: (documentId: Identity.DocumentId) => Effect.Effect<boolean>
-  readonly durableConfirmation: (documentId: Identity.DocumentId) => Effect.Effect<false>
+  readonly durableConfirmation: (
+    documentId: Identity.DocumentId
+  ) => Effect.Effect<boolean, ReplicaError.ReplicaError>
 }
 
 export interface SupervisedPeerSession extends PeerSession {
@@ -83,6 +86,7 @@ const makeWithTerminal = (
   OpenedSession,
   ReplicaError.ReplicaError,
   | Scope.Scope
+  | CommandDeliveryStore.CommandDeliveryStore
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
   | PeerConnectionStatus.Reporter
@@ -93,6 +97,7 @@ const makeWithTerminal = (
 > => {
   let cleanupOnError: Effect.Effect<void> = Effect.void
   return Effect.gen(function*() {
+    const deliveries = yield* CommandDeliveryStore.CommandDeliveryStore
     const gate = yield* ReplicaGate.ReplicaGate
     const publisher = yield* CommitPublisher.CommitPublisher
     const limits = yield* ReplicaLimits.ReplicaLimits
@@ -730,7 +735,7 @@ const makeWithTerminal = (
       flush: guardedFlush,
       observedByPeer: (documentId) =>
         Ref.get(observed).pipe(Effect.map((values) => values.get(documentId)?.value ?? false)),
-      durableConfirmation: () => Effect.succeed(false),
+      durableConfirmation: (documentId) => deliveries.documentConfirmed(documentId, connection.relayEndpoint),
       awaitDisconnect: Deferred.await(terminalFailure)
     }
     return { session: sessionValue, disconnect, failTerminal }
@@ -752,6 +757,7 @@ export const makeTestClient = (
   PeerSession,
   ReplicaError.ReplicaError,
   | Scope.Scope
+  | CommandDeliveryStore.CommandDeliveryStore
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
   | PeerConnectionStatus.Reporter
@@ -772,6 +778,7 @@ export const makeSupervised = (options: {
   SupervisedPeerSession,
   ReplicaError.ReplicaError,
   | Scope.Scope
+  | CommandDeliveryStore.CommandDeliveryStore
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
   | PeerConnectionStatus.Reporter
@@ -799,6 +806,7 @@ export const make = (options: {
   PeerSession,
   ReplicaError.ReplicaError,
   | Scope.Scope
+  | CommandDeliveryStore.CommandDeliveryStore
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
   | PeerConnectionStatus.Reporter
@@ -816,6 +824,7 @@ export const makeLive = (options: {
   SupervisedPeerSession,
   ReplicaError.ReplicaError,
   | Scope.Scope
+  | CommandDeliveryStore.CommandDeliveryStore
   | CommitPublisher.CommitPublisher
   | Crypto.Crypto
   | PeerConnectionStatus.Reporter

@@ -6,17 +6,34 @@ import * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
+import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
+import * as CommandDeliveryStore from "../src/CommandDeliveryStore.js"
 import * as CommitPublisher from "../src/CommitPublisher.js"
 import * as PeerConnectionStatus from "../src/PeerConnectionStatus.js"
 import * as PeerSession from "../src/PeerSession.js"
 import * as PeerSync from "../src/PeerSync.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
 
-it.layer(NodeCrypto.layer)("PeerSession coverage", (it) => {
+const deliveryStore = CommandDeliveryStore.CommandDeliveryStore.of({
+  lookup: () => Effect.die("unexpected command delivery lookup"),
+  snapshotWithCursor: () => Effect.die("unexpected command delivery snapshot"),
+  recordMessage: () => Effect.die("unexpected command delivery message"),
+  markAccepted: () => Effect.die("unexpected command delivery acceptance"),
+  markUnconfirmed: () => Effect.die("unexpected command delivery deadline"),
+  documentConfirmed: () => Effect.die("unexpected document confirmation"),
+  pendingEvents: Effect.die("unexpected command delivery events"),
+  markEventsPublished: () => Effect.die("unexpected command delivery publication"),
+  cursor: Effect.die("unexpected command delivery cursor")
+})
+
+it.layer(Layer.merge(
+  NodeCrypto.layer,
+  Layer.succeed(CommandDeliveryStore.CommandDeliveryStore, deliveryStore)
+))("PeerSession coverage", (it) => {
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
   const limits = {
     maxBackupBytes: 1_000_000,

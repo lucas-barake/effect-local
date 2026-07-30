@@ -8,12 +8,15 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
 import * as RcMap from "effect/RcMap"
 import * as Schema from "effect/Schema"
 import * as Semaphore from "effect/Semaphore"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
 import * as BackupStore from "./BackupStore.js"
+import * as CommandDeliveryPublisher from "./CommandDeliveryPublisher.js"
+import * as CommandDeliveryStore from "./CommandDeliveryStore.js"
 import * as CommandExecutor from "./CommandExecutor.js"
 import * as CommitPublisher from "./CommitPublisher.js"
 import * as DocumentEntity from "./DocumentEntity.js"
@@ -52,6 +55,8 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
   Replica.Replica,
   never,
   | BackupStore.BackupStore
+  | CommandDeliveryPublisher.CommandDeliveryPublisher
+  | CommandDeliveryStore.CommandDeliveryStore
   | CommitPublisher.CommitPublisher
   | CommandExecutor.CommandExecutor
   | DocumentStore.DocumentStore
@@ -66,6 +71,8 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
     Replica.Replica,
     Effect.gen(function*() {
       const backups = yield* BackupStore.BackupStore
+      const deliveryPublisher = yield* CommandDeliveryPublisher.CommandDeliveryPublisher
+      const deliveries = yield* CommandDeliveryStore.CommandDeliveryStore
       const commands = yield* CommandExecutor.CommandExecutor
       const publisher = yield* CommitPublisher.CommitPublisher
       const documents = yield* DocumentStore.DocumentStore
@@ -132,6 +139,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   ))
               )
               yield* publisher.publishPending
+              yield* deliveryPublisher.publishPending.pipe(Effect.catchTag("ReplicaError", () => Effect.void))
               return yield* CommandOutcome.committedOrFail(
                 yield* decode(CommandOutcome.schema(Identity.DocumentId, Schema.Never), result)
               )
@@ -188,6 +196,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   ))
               )
               yield* publisher.publishPending
+              yield* deliveryPublisher.publishPending.pipe(Effect.catchTag("ReplicaError", () => Effect.void))
               return yield* CommandOutcome.committedOrFail(
                 yield* decode(CommandOutcome.schema(mutation.successSchema, mutation.errorSchema), result)
               )
@@ -218,6 +227,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   ))
               )
               yield* publisher.publishPending
+              yield* deliveryPublisher.publishPending.pipe(Effect.catchTag("ReplicaError", () => Effect.void))
               return yield* CommandOutcome.committedOrFail(
                 yield* decode(CommandOutcome.schema(Schema.Void, Schema.Never), result)
               )
@@ -227,12 +237,23 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           withPermit((permit) => commands.lookupMutation(mutation, commandId, permit)),
         lookupCreate: (_document, commandId) => withPermit((permit) => commands.lookupCreate(commandId, permit)),
         lookupDelete: (_document, commandId) => withPermit((permit) => commands.lookupDelete(commandId, permit)),
-        flush: withPermit(() => publisher.publishPending).pipe(Effect.asVoid),
+        lookupCommandDelivery: (commandId) => deliveries.lookup(commandId),
+        commandDeliveryChanges: (commandId) => deliveryPublisher.changes(commandId),
+        flush: withPermit(() =>
+          Effect.all([publisher.publishPending, deliveryPublisher.publishPending], { discard: true })
+        ),
         status: health.status,
         exportBackup: backups.export,
         restoreBackup: (options) =>
-          backups.restore(options).pipe(
-            Effect.ensuring(publisher.invalidate(ReplicaDefinition.invalidationKeys(definition)))
+          Effect.uninterruptibleMask((interruptible) =>
+            Effect.gen(function*() {
+              const restored = yield* Effect.exit(interruptible(backups.restore(options)))
+              const refreshed = yield* Effect.exit(Effect.all([
+                publisher.invalidate(ReplicaDefinition.invalidationKeys(definition)),
+                deliveryPublisher.refresh
+              ], { discard: true }))
+              return yield* Exit.asVoidAll([restored, refreshed])
+            })
           ),
         exportDocument: (document, documentId) =>
           withPermit(() =>

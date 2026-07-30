@@ -1,5 +1,6 @@
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
+import * as CommandDelivery from "@lucas-barake/effect-local/CommandDelivery"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -43,6 +44,9 @@ const DocumentIdOutcome = CommandOutcome.schema(Identity.DocumentId, Schema.Neve
  * is 1 for the same reason. Bump this on the first change that ships after release.
  */
 export const protocolVersion = 1
+export const commandDeliveryInvalidationKey = "@lucas-barake/effect-local/command-delivery"
+const DeliveryEventSequence = Schema.Int.check(Schema.isGreaterThan(0))
+const DeliveryCursor = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 const SessionLease = Schema.Struct({ leaseMillis: Schema.Int })
 export const SessionHandshake = Schema.Struct({
   leaseMillis: Schema.Int,
@@ -86,6 +90,15 @@ export const Invalidation = Schema.Union([
   Schema.TaggedStruct("FullRefreshRequired", {
     ownerEpoch: Schema.String,
     keys: Schema.Array(Schema.String)
+  }),
+  Schema.TaggedStruct("DeliveryInvalidation", {
+    ownerEpoch: Schema.String,
+    sequence: DeliveryEventSequence,
+    keys: Schema.Array(Schema.String)
+  }),
+  Schema.TaggedStruct("DeliveryFullRefreshRequired", {
+    ownerEpoch: Schema.String,
+    keys: Schema.Array(Schema.String)
   })
 ])
 export type Invalidation = typeof Invalidation.Type
@@ -94,7 +107,9 @@ export const InvalidationMessage = Schema.Union([
   Schema.TaggedStruct("InvalidationsReady", {
     ownerEpoch: Schema.String,
     watermark: Identity.CommitSequence,
-    refreshGeneration: Schema.Int
+    refreshGeneration: Schema.Int,
+    deliveryWatermark: DeliveryCursor,
+    deliveryRefreshEpoch: DeliveryCursor
   }),
   Invalidation
 ])
@@ -182,6 +197,17 @@ export const group = RpcGroup.make(
     payload: { sessionId: Identity.SessionId, document: Schema.String, commandId: Identity.CommandId },
     success: JsonOutcome,
     error: ReplicaError.ReplicaError
+  }),
+  Rpc.make("LookupCommandDelivery", {
+    payload: { sessionId: Identity.SessionId, commandId: Identity.CommandId },
+    success: CommandDelivery.CommandDelivery,
+    error: ReplicaError.ReplicaError
+  }),
+  Rpc.make("CommandDeliveryChanges", {
+    payload: { sessionId: Identity.SessionId, commandId: Identity.CommandId },
+    success: CommandDelivery.CommandDelivery,
+    error: ReplicaError.ReplicaError,
+    stream: true
   }),
   Rpc.make("Flush", { payload: { sessionId: Identity.SessionId }, error: ReplicaError.ReplicaError }),
   Rpc.make("Invalidations", {

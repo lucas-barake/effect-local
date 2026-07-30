@@ -124,7 +124,6 @@ export const ApplySyncResult = Schema.Struct({
   acceptedHeads: Schema.Array(Schema.String),
   commitSequence: Identity.CommitSequence,
   observedByPeer: Schema.Boolean,
-  durableConfirmation: Schema.Literal(false),
   duplicate: Schema.Boolean
 })
 

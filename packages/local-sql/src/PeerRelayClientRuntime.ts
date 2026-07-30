@@ -48,11 +48,6 @@ export class PeerRelayClientRuntime extends Context.Service<PeerRelayClientRunti
   readonly awaitFatal: Effect.Effect<never, ReplicaError.ReplicaError>
 }>()("@lucas-barake/effect-local-sql/PeerRelayClientRuntime") {}
 
-const protocolMismatch = (expected: string, observed: string) =>
-  new ReplicaError.ReplicaError({
-    reason: new ReplicaError.ProtocolMismatch({ expected, observed })
-  })
-
 const unexpectedExit = (
   name: string,
   exit: Exit.Exit<never, ReplicaError.ReplicaError>
@@ -70,7 +65,12 @@ export const makeScoped = Effect.gen(function*() {
   const pruneRelayReceipts = sync.pruneRelayReceipts
   if (pruneRelayReceipts === undefined) {
     return yield* Effect.fail(
-      protocolMismatch("relay enabled PeerSync", "direct PeerSync")
+      new ReplicaError.ReplicaError({
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: "relay enabled PeerSync",
+          observed: "direct PeerSync"
+        })
+      })
     )
   }
   const state = yield* Ref.make<RuntimeState>({ _tag: "Running" })
@@ -159,10 +159,12 @@ export const makeScoped = Effect.gen(function*() {
         input.retryHorizonMillis > outboxLimits.maxRetryHorizonMillis
       ) {
         return yield* Effect.fail(
-          protocolMismatch(
-            `retry horizon from 1 through ${outboxLimits.maxRetryHorizonMillis}`,
-            "invalid retry horizon"
-          )
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: `retry horizon from 1 through ${outboxLimits.maxRetryHorizonMillis}`,
+              observed: "invalid retry horizon"
+            })
+          })
         )
       }
       if (
@@ -171,16 +173,23 @@ export const makeScoped = Effect.gen(function*() {
         input.replayBatchSize > outboxLimits.maxMessagesPerRemote
       ) {
         return yield* Effect.fail(
-          protocolMismatch(
-            `replay batch from 1 through ${outboxLimits.maxMessagesPerRemote}`,
-            "invalid replay batch"
-          )
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: `replay batch from 1 through ${outboxLimits.maxMessagesPerRemote}`,
+              observed: "invalid replay batch"
+            })
+          })
         )
       }
       const permit = yield* gate.current
       if (permit.incarnation !== input.replicaIncarnation) {
         return yield* Effect.fail(
-          protocolMismatch("current replica incarnation", "stale replica incarnation")
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: "current replica incarnation",
+              observed: "stale replica incarnation"
+            })
+          })
         )
       }
     }))

@@ -61,6 +61,17 @@ export const documentFamily = <R, E, D extends Document.Any,>(
     )
   )
 
+export const commandDeliveryFamily = <R, E,>(
+  runtime: Atom.AtomRuntime<Replica.Replica | R, E>
+) =>
+  Atom.family((commandId: Identity.CommandId) =>
+    runtime.atom(
+      Stream.unwrap(
+        Replica.Replica.use((replica) => Effect.succeed(replica.commandDeliveryChanges(commandId)))
+      )
+    )
+  )
+
 export const queryFamily = <R, E, Q extends Query.Any,>(
   runtime: Atom.AtomRuntime<Replica.Replica | R, E>,
   query: Q

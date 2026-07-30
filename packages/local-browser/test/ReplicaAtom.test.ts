@@ -1,5 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as CommandDelivery from "@lucas-barake/effect-local/CommandDelivery"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Projection from "@lucas-barake/effect-local/Projection"
@@ -48,6 +49,57 @@ describe("ReplicaAtom", () => {
       const value = registry.get(atom)
       assert.isTrue(AsyncResult.isSuccess(value))
       if (AsyncResult.isSuccess(value)) assert.deepStrictEqual(value.value, snapshot)
+      unmount()
+      registry.dispose()
+    }))
+
+  it.effect("streams only the requested command delivery through commandDeliveryFamily", () =>
+    Effect.gen(function*() {
+      const requested = yield* Deferred.make<Identity.CommandId>()
+      const firstConsumed = yield* Deferred.make<void>()
+      const secondConsumed = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const commandId = Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000011")
+      const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000011")
+      const first = CommandDelivery.UnknownCommand.make({ commandId })
+      const second = CommandDelivery.NoChangesToDeliver.make({ commandId, documentId })
+      const atomRuntime = Atom.runtime(Layer.succeed(Replica.Replica, {
+        ...replica,
+        lookupCommandDelivery: () => Effect.die("command delivery atoms must use the targeted stream"),
+        commandDeliveryChanges: (received) =>
+          Stream.unwrap(
+            Deferred.succeed(requested, received).pipe(
+              Effect.as(
+                Stream.make(first).pipe(
+                  Stream.tap(() => Deferred.succeed(firstConsumed, undefined)),
+                  Stream.concat(
+                    Stream.fromEffect(
+                      Deferred.await(release).pipe(
+                        Effect.as(second),
+                        Effect.tap(() => Deferred.succeed(secondConsumed, undefined))
+                      )
+                    )
+                  )
+                )
+              )
+            )
+          )
+      }))
+      const registry = AtomRegistry.make()
+      const atom = ReplicaAtom.commandDeliveryFamily(atomRuntime)(commandId)
+      const unmount = registry.mount(atom)
+      assert.strictEqual(yield* Deferred.await(requested), commandId)
+      yield* Deferred.await(firstConsumed)
+      yield* Effect.yieldNow
+      const firstValue = registry.get(atom)
+      assert.isTrue(AsyncResult.isSuccess(firstValue))
+      if (AsyncResult.isSuccess(firstValue)) assert.deepStrictEqual(firstValue.value, first)
+      yield* Deferred.succeed(release, undefined)
+      yield* Deferred.await(secondConsumed)
+      yield* Effect.yieldNow
+      const secondValue = registry.get(atom)
+      assert.isTrue(AsyncResult.isSuccess(secondValue))
+      if (AsyncResult.isSuccess(secondValue)) assert.deepStrictEqual(secondValue.value, second)
       unmount()
       registry.dispose()
     }))

@@ -3,18 +3,22 @@ import { assert, it } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
+import * as CommandDelivery from "@lucas-barake/effect-local/CommandDelivery"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Stream from "effect/Stream"
+import { TestClock } from "effect/testing"
 import { RpcTest } from "effect/unstable/rpc"
 import * as ReplicaClient from "../src/ReplicaClient.js"
 import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
-import { definition, replica } from "./fixtures.js"
+import { definition, DeliveryPublisher, replica } from "./fixtures.js"
 
 const limits = {
   maxBackupBytes: 1024,
@@ -50,17 +54,20 @@ const limits = {
 } satisfies ReplicaLimits.Values
 
 const Sessions = SessionManager.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)))
-const Publisher = Layer.succeed(
-  CommitPublisher.CommitPublisher,
-  CommitPublisher.CommitPublisher.of({
-    publishPending: Effect.succeed(0),
-    invalidate: () => Effect.void,
-    subscribe: Effect.succeed({
-      watermark: Identity.CommitSequence.make(0),
-      refreshGeneration: 0,
-      events: Stream.never
+const Publisher = Layer.merge(
+  Layer.succeed(
+    CommitPublisher.CommitPublisher,
+    CommitPublisher.CommitPublisher.of({
+      publishPending: Effect.succeed(0),
+      invalidate: () => Effect.void,
+      subscribe: Effect.succeed({
+        watermark: Identity.CommitSequence.make(0),
+        refreshGeneration: 0,
+        events: Stream.never
+      })
     })
-  })
+  ),
+  DeliveryPublisher
 )
 const Owner = ReplicaOwner.layerHandlers(definition).pipe(
   Layer.provide(PeerConnectionStatus.layer),
@@ -87,15 +94,6 @@ const withPageEvents = (target: EventTarget) =>
       })
   )
 
-const waitFor = (condition: Effect.Effect<boolean>) =>
-  Effect.gen(function*() {
-    for (let attempt = 0; attempt < 1000; attempt++) {
-      if (yield* condition) return
-      yield* Effect.yieldNow
-    }
-    assert.fail("condition was not met")
-  })
-
 it.layer(NodeCrypto.layer)("ReplicaClient pagehide", (it) => {
   it.effect("closes the owner session when the page hides", () =>
     Effect.gen(function*() {
@@ -104,12 +102,83 @@ it.layer(NodeCrypto.layer)("ReplicaClient pagehide", (it) => {
       yield* withPageEvents(target)
       yield* Effect.scoped(Effect.gen(function*() {
         const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-        yield* ReplicaClient.fromRpcClient(definition, rpc)
+        const closed = yield* Deferred.make<void>()
+        const observed = new Proxy(rpc, {
+          get(target, property, receiver) {
+            const value = Reflect.get(target, property, receiver)
+            if (property === "CloseSession") {
+              return (payload: never) => value(payload).pipe(Effect.ensuring(Deferred.succeed(closed, undefined)))
+            }
+            return value
+          }
+        })
+        yield* ReplicaClient.fromRpcClient(definition, observed)
         assert.strictEqual(yield* sessions.activeCount, 1)
         target.dispatchEvent(new Event("pagehide"))
-        yield* waitFor(sessions.activeCount.pipe(Effect.map((count) => count === 0)))
+        yield* Deferred.await(closed)
+        assert.strictEqual(yield* sessions.activeCount, 0)
       }))
     }).pipe(Effect.provide(Owner)))
+
+  it.effect("does not reopen a delivery stream after the page hides", () => {
+    const activeReplica: Replica.Replica["Service"] = {
+      ...replica,
+      commandDeliveryChanges: (commandId) =>
+        Stream.make(CommandDelivery.UnknownCommand.make({ commandId })).pipe(Stream.concat(Stream.never))
+    }
+    const ActiveOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
+      Layer.provideMerge(Sessions),
+      Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, activeReplica)))
+    )
+    return Effect.gen(function*() {
+      const sessions = yield* SessionManager.SessionManager
+      const target = new EventTarget()
+      yield* withPageEvents(target)
+      yield* Effect.scoped(Effect.gen(function*() {
+        const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+        const closed = yield* Deferred.make<void>()
+        let hidden = false
+        let opensAfterHide = 0
+        const observedRpc = new Proxy(rpc, {
+          get(target, property, receiver) {
+            const value = Reflect.get(target, property, receiver)
+            if (property === "CloseSession") {
+              return (payload: never) => value(payload).pipe(Effect.ensuring(Deferred.succeed(closed, undefined)))
+            }
+            if (property === "OpenSession") {
+              return (payload: never) => {
+                if (hidden) opensAfterHide++
+                return value(payload)
+              }
+            }
+            return value
+          }
+        })
+        const client = yield* ReplicaClient.fromRpcClient(definition, observedRpc)
+        const observed = yield* Deferred.make<void>()
+        const commandId = yield* Identity.makeCommandId
+        const stream = yield* client.commandDeliveryChanges(commandId).pipe(
+          Stream.tap(() => Deferred.succeed(observed, undefined)),
+          Stream.runDrain,
+          Effect.forkChild
+        )
+        yield* Deferred.await(observed)
+        target.dispatchEvent(new Event("pagehide"))
+        hidden = true
+        yield* Deferred.await(closed)
+        yield* Fiber.join(stream)
+        assert.strictEqual(yield* sessions.activeCount, 0)
+        yield* TestClock.adjust(SessionManager.leaseDurationMillis / 2 + 1)
+        yield* Effect.yieldNow
+        assert.strictEqual(yield* sessions.activeCount, 0)
+        // A reopened session must call OpenSession through the same RPC boundary. Asserting on
+        // the boundary proves the negative regardless of how many fiber turns a reopen needs.
+        assert.strictEqual(opensAfterHide, 0)
+      }))
+    }).pipe(Effect.provide(ActiveOwner))
+  })
 
   it.effect("keeps the owner session when pagehide closing is disabled", () =>
     Effect.gen(function*() {

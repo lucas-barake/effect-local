@@ -1,3 +1,4 @@
+import * as CommandDeliveryPublisher from "@lucas-barake/effect-local-sql/CommandDeliveryPublisher"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
@@ -46,6 +47,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
     const commits = yield* CommitPublisher.CommitPublisher
     const peerConnections = yield* PeerConnectionStatus.PeerConnectionStatus
     const relayConnection = yield* RelayConnectionStatus.RelayConnectionStatus
+    const deliveries = yield* CommandDeliveryPublisher.CommandDeliveryPublisher
     const crypto = yield* Crypto.Crypto
     const ownerEpoch = yield* crypto.randomUUIDv4.pipe(
       Effect.mapError((cause) =>
@@ -206,30 +208,66 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
             )
           )
         ),
+      LookupCommandDelivery: ({ commandId, sessionId }, { client }) =>
+        sessions.run(
+          sessionId,
+          client.id,
+          replica.lookupCommandDelivery(commandId)
+        ),
+      CommandDeliveryChanges: ({ commandId, sessionId }, { client }) =>
+        sessions.stream(
+          sessionId,
+          client.id,
+          replica.commandDeliveryChanges(commandId)
+        ),
       Flush: ({ sessionId }, { client }) => sessions.run(sessionId, client.id, replica.flush),
       Invalidations: ({ ownerEpoch: requestedEpoch, sessionId }, { client }) =>
         requestedEpoch === ownerEpoch
           ? sessions.stream(
             sessionId,
             client.id,
-            commits.subscribe.pipe(
-              Effect.map((subscription) =>
+            Effect.all([commits.subscribe, deliveries.subscribe]).pipe(
+              Effect.map(([commitSubscription, deliverySubscription]) =>
                 Stream.make({
                   _tag: "InvalidationsReady",
                   ownerEpoch,
-                  watermark: subscription.watermark,
-                  refreshGeneration: subscription.refreshGeneration
+                  watermark: commitSubscription.watermark,
+                  refreshGeneration: commitSubscription.refreshGeneration,
+                  deliveryWatermark: deliverySubscription.sequence,
+                  deliveryRefreshEpoch: deliverySubscription.refreshEpoch
                 }).pipe(
-                  Stream.concat(subscription.events.pipe(Stream.map((event): ReplicaRpc.InvalidationMessage =>
-                    event._tag === "Commit"
-                      ? {
-                        _tag: "Invalidation",
-                        ownerEpoch,
-                        sequence: event.commitSequence,
-                        keys: event.keys
-                      }
-                      : { _tag: "FullRefreshRequired", ownerEpoch, keys: allInvalidationKeys }
-                  )))
+                  Stream.concat(
+                    Stream.merge(
+                      commitSubscription.events.pipe(
+                        Stream.map((event): ReplicaRpc.InvalidationMessage =>
+                          event._tag === "Commit"
+                            ? {
+                              _tag: "Invalidation",
+                              ownerEpoch,
+                              sequence: event.commitSequence,
+                              keys: event.keys
+                            }
+                            : { _tag: "FullRefreshRequired", ownerEpoch, keys: allInvalidationKeys }
+                        )
+                      ),
+                      deliverySubscription.events.pipe(
+                        Stream.map((event): ReplicaRpc.InvalidationMessage =>
+                          event._tag === "Delivery"
+                            ? {
+                              _tag: "DeliveryInvalidation",
+                              ownerEpoch,
+                              sequence: event.sequence,
+                              keys: [ReplicaRpc.commandDeliveryInvalidationKey]
+                            }
+                            : {
+                              _tag: "DeliveryFullRefreshRequired",
+                              ownerEpoch,
+                              keys: [ReplicaRpc.commandDeliveryInvalidationKey]
+                            }
+                        )
+                      )
+                    )
+                  )
                 )
               ),
               Stream.unwrap,

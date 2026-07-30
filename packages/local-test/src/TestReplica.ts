@@ -1,6 +1,8 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import * as BackupStore from "@lucas-barake/effect-local-sql/BackupStore"
+import * as CommandDeliveryPublisher from "@lucas-barake/effect-local-sql/CommandDeliveryPublisher"
+import * as CommandDeliveryStore from "@lucas-barake/effect-local-sql/CommandDeliveryStore"
 import * as CommandExecutor from "@lucas-barake/effect-local-sql/CommandExecutor"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as DocumentStore from "@lucas-barake/effect-local-sql/DocumentStore"
@@ -115,11 +117,17 @@ export const layerWithSyncAndLimits = <
     Layer.provideMerge([commands, Reactivity.layer])
   )
   const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
-  const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
+  const deliveryStore = CommandDeliveryStore.layer.pipe(Layer.provideMerge(gate))
+  const deliveryPublisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
+    Layer.provideMerge(deliveryStore)
+  )
+  const backups = BackupStore.layer(definition).pipe(
+    Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
+  )
   const sync = PeerSync.layer.pipe(Layer.provideMerge(backups))
   return Layer.mergeAll(
     SqlReplica.layerFromServices(definition).pipe(
-      Layer.provideMerge(sync),
+      Layer.provideMerge(Layer.mergeAll(sync, deliveryStore, deliveryPublisher)),
       Layer.provide([Layer.empty, ...options.projections.map((binding) => binding.layer)])
     ),
     PeerConnectionStatus.layer,

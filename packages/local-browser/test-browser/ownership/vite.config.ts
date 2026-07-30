@@ -16,13 +16,19 @@ const runtimeGate = () => {
     readonly next: () => void
     readonly response: ServerResponse
   }
+  type Gate = {
+    mode: "failed" | "held" | "released"
+    waiting: Array<WaitingResponse>
+  }
 
-  let mode: "failed" | "held" | "released" = "released"
-  let waiting: Array<WaitingResponse> = []
+  const gates: Record<"coordinator" | "runtime", Gate> = {
+    coordinator: { mode: "released", waiting: [] },
+    runtime: { mode: "released", waiting: [] }
+  }
 
-  const release = (failed: boolean) => {
-    const current = waiting
-    waiting = []
+  const release = (gate: Gate, failed: boolean) => {
+    const current = gate.waiting
+    gate.waiting = []
     for (const item of current) {
       if (!failed) {
         item.next()
@@ -38,40 +44,40 @@ const runtimeGate = () => {
     configurePreviewServer(server: PreviewServer) {
       server.middlewares.use((request, response, next) => {
         const pathname = new URL(request.url ?? "/", "http://localhost").pathname
-        if (pathname === "/__effect-local-runtime/hold") {
-          mode = "held"
+        const control = /^\/__effect-local-(coordinator|runtime)\/(fail|hold|release|waiting)$/.exec(pathname)
+        if (control !== null) {
+          const gate = gates[control[1] as "coordinator" | "runtime"]
+          const operation = control[2]!
+          if (operation === "waiting") {
+            response.statusCode = 200
+            response.end(String(gate.waiting.length))
+            return
+          }
+          gate.mode = operation === "hold" ? "held" : operation === "fail" ? "failed" : "released"
+          if (operation !== "hold") release(gate, operation === "fail")
           response.statusCode = 204
           response.end()
           return
         }
-        if (pathname === "/__effect-local-runtime/release") {
-          mode = "released"
-          release(false)
-          response.statusCode = 204
-          response.end()
-          return
-        }
-        if (pathname === "/__effect-local-runtime/fail") {
-          mode = "failed"
-          release(true)
-          response.statusCode = 204
-          response.end()
-          return
-        }
-        if (!pathname.includes("replica.shared-worker-runtime-")) {
+        const gate = pathname.includes("OwnershipCoordinator-")
+          ? gates.coordinator
+          : pathname.includes("replica.shared-worker-runtime-")
+          ? gates.runtime
+          : undefined
+        if (gate === undefined) {
           next()
           return
         }
-        if (mode === "released") {
+        if (gate.mode === "released") {
           next()
           return
         }
-        if (mode === "failed") {
+        if (gate.mode === "failed") {
           response.statusCode = 503
           response.end("ownership runtime unavailable")
           return
         }
-        waiting.push({ next, response })
+        gate.waiting.push({ next, response })
       })
     }
   }

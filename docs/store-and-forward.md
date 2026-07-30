@@ -246,8 +246,36 @@ what is in flight lives only in memory, so an abandoned attempt simply leaves th
 5. Any generated reply is durably enqueued for the local peer session.
 
 This boundary proves durable recipient processing for replay suppression. It does not change
-`PeerSession.durableConfirmation()`, which remains `false`. It also does not prove that another peer observed the
-change.
+the sender's command delivery record. Sender custody confirmation happens earlier, when `Push` returns after the
+relay SQL authority commits the envelope. Recipient acknowledgement still does not prove that another peer observed
+the change.
+
+## Client visible custody
+
+The sender keeps command delivery evidence independently from the temporary relay outbox payload. A command receipt
+records the exact Automerge change hashes produced by that command. Relay admission records which of those hashes are
+carried by one stable relay message. Relay acknowledgement then marks that message as accepted before the payload row
+is removed.
+
+Applications can query `Replica.lookupCommandDelivery(commandId)` or subscribe with
+`Replica.commandDeliveryChanges(commandId)`. Browser replicas expose the same methods through the owner worker, and
+`ReplicaAtom.commandDeliveryFamily(commandId)` reads one command's stream directly rather than through a reactivity
+key, so one custody change never refetches other mounted command atoms. The owner's invalidation channel carries a
+single global delivery key, so command IDs never cross it.
+
+One `TrackedCommand` groups evidence by exact relay peer and remote peer. Its destination state is one of:
+
+1. `PendingRelayCustody`, while at least one message remains in the sender outbox.
+2. `RelayCustodyAccepted`, when accepted messages cover every local change made by the command.
+3. `RelayCustodyUnconfirmedAtDeadline`, when the sender removed expired payloads before complete confirmation.
+
+Expiry means confirmation was not obtained by the configured deadline. It does not prove the relay failed to store
+the message. A valid late acknowledgement still upgrades the durable record to `RelayCustodyAccepted`.
+
+`PeerSession.durableConfirmation(documentId)` uses the same durable evidence for relay connections, but its scope is
+the whole document. It returns `true` only when accepted relay messages cover every current local change for the exact
+connected endpoint. Direct connections return `false`. `observedByPeer(documentId)` remains an in memory Automerge
+sync observation and has different semantics.
 
 A stable protocol violation uses `Reject` with `ProtocolInvalid`. Application code can use
 `ApplicationRejected` through the acknowledged delivery contract. A permanent rejection becomes a retained dead

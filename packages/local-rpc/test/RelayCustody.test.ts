@@ -5,6 +5,7 @@ import * as DocumentStore from "@lucas-barake/effect-local-sql/DocumentStore"
 import * as PeerRelayClientRuntime from "@lucas-barake/effect-local-sql/PeerRelayClientRuntime"
 import * as PeerRelayOutboxLimits from "@lucas-barake/effect-local-sql/PeerRelayOutboxLimits"
 import * as PeerRelayReceiptLimits from "@lucas-barake/effect-local-sql/PeerRelayReceiptLimits"
+import * as PeerSyncEnvelope from "@lucas-barake/effect-local-sql/PeerSyncEnvelope"
 import * as ReplicaGate from "@lucas-barake/effect-local-sql/ReplicaGate"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as TestReplica from "@lucas-barake/effect-local-test/TestReplica"
@@ -345,29 +346,132 @@ const seedPair = Effect.gen(function*() {
 })
 
 describe("relay custody against a real relay", () => {
-  it.effect("transfers custody of a real client change into the recipient's relay inbox", () =>
+  it.effect("reports exact public command custody and complete document confirmation", () =>
     Effect.scoped(
       Effect.gen(function*() {
         const backend = yield* relayBackend
         const client = yield* backend.clientFor("local")
-        const { documentId, sender } = yield* seedPair
+        const recipientClient = yield* backend.clientFor("remote")
+        const { documentId, recipient, sender } = yield* seedPair
+        const firstMutationCommandId = yield* Identity.makeCommandId
+        const secondMutationCommandId = yield* Identity.makeCommandId
+        yield* sender.replica.mutate(AddLabel, {
+          commandId: firstMutationCommandId,
+          documentId,
+          payload: "first"
+        })
+        yield* sender.replica.mutate(AddLabel, {
+          commandId: secondMutationCommandId,
+          documentId,
+          payload: "second"
+        })
         yield* TestClock.adjust(5000)
 
-        // Nested scope. Closing the session before the relay backend scope keeps teardown clean.
         yield* Effect.scoped(Effect.gen(function*() {
-          const session = yield* RpcPeerTransport.makeSession(
-            client,
-            transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
-          ).pipe(Effect.provideContext(sender.context))
-          assert.strictEqual(session.peerId, remotePeerId)
-          yield* session.markDirty(documentId)
-          yield* session.flush
+          const options = transportOptions(
+            localPrincipal,
+            remotePrincipal,
+            sender.incarnation,
+            documentId
+          )
+          const commandHashes = yield* sender.sql<{
+            readonly command_id: string
+            readonly change_hash: string
+          }>`SELECT command_id, change_hash
+            FROM effect_local_command_delivery_changes
+            WHERE command_id IN (${firstMutationCommandId}, ${secondMutationCommandId})
+            ORDER BY command_id, change_hash`
+          assert.strictEqual(commandHashes.length, 2)
+          const expectedChangeHashes = new Set(commandHashes.map((row) => row.change_hash))
+          const unavailable: PeerRpc.RpcClient = {
+            ...client,
+            Push: ((request) =>
+              PeerSyncEnvelope.decodeSyncEnvelope(request.payload, replicaLimits).pipe(
+                Effect.provideService(Crypto.Crypto, backend.crypto),
+                Effect.orDie,
+                Effect.flatMap((envelope) =>
+                  envelope.writerProvenance.some((entry) => expectedChangeHashes.has(entry.changeHash))
+                    ? Effect.fail<PeerRpcError.PeerRpcError>(new PeerRpcError.ServerUnavailable())
+                    : client.Push(request)
+                )
+              )) as PeerRpc.RpcClient["Push"]
+          }
+          const attempt = yield* Effect.exit(Effect.scoped(Effect.gen(function*() {
+            yield* RpcPeerTransport.makeSession(
+              recipientClient,
+              transportOptions(
+                remotePrincipal,
+                localPrincipal,
+                recipient.incarnation,
+                documentId
+              )
+            ).pipe(Effect.provideContext(recipient.context))
+            const session = yield* RpcPeerTransport.makeSession(unavailable, options).pipe(
+              Effect.provideContext(sender.context)
+            )
+            assert.isFalse(yield* session.durableConfirmation(documentId))
+            yield* session.markDirty(documentId)
+            yield* session.flush
+            yield* TestClock.adjust(5000)
+            yield* session.awaitDisconnect
+          })))
+          assert.strictEqual(attempt._tag, "Failure")
+          assert.strictEqual((yield* outboxRows(sender.sql)).length, 1)
+
+          for (
+            const commandId of [
+              firstMutationCommandId,
+              secondMutationCommandId
+            ]
+          ) {
+            const delivery = yield* sender.replica.lookupCommandDelivery(commandId)
+            assert.strictEqual(delivery._tag, "TrackedCommand")
+            if (delivery._tag !== "TrackedCommand") continue
+            assert.strictEqual(delivery.localChangeCount, 1)
+            assert.strictEqual(delivery.destinations.length, 1)
+            const destination = delivery.destinations[0]!
+            assert.strictEqual(destination.relayPeerId, relayPeerId)
+            assert.strictEqual(destination.remotePeerId, remotePeerId)
+            assert.strictEqual(destination.state._tag, "PendingRelayCustody")
+            if (destination.state._tag === "PendingRelayCustody") {
+              assert.strictEqual(destination.state.acceptedChangeCount, 0)
+              assert.strictEqual(destination.state.pendingChangeCount, 1)
+            }
+          }
+
+          const session = yield* RpcPeerTransport.makeSession(client, options).pipe(
+            Effect.provideContext(sender.context)
+          )
+          assert.isTrue(yield* session.durableConfirmation(documentId))
+
+          for (
+            const commandId of [
+              firstMutationCommandId,
+              secondMutationCommandId
+            ]
+          ) {
+            const delivery = yield* sender.replica.lookupCommandDelivery(commandId)
+            assert.strictEqual(delivery._tag, "TrackedCommand")
+            if (delivery._tag !== "TrackedCommand") continue
+            assert.strictEqual(delivery.localChangeCount, 1)
+            assert.strictEqual(delivery.destinations.length, 1)
+            const destination = delivery.destinations[0]!
+            assert.strictEqual(destination.relayPeerId, relayPeerId)
+            assert.strictEqual(destination.remotePeerId, remotePeerId)
+            assert.strictEqual(destination.state._tag, "RelayCustodyAccepted")
+            if (destination.state._tag === "RelayCustodyAccepted") {
+              assert.strictEqual(destination.state.acceptedChangeCount, 1)
+            }
+          }
 
           const heads = yield* backend.store
             .pendingHeads(yield* inboxKeyOf(remotePrincipal, backend.crypto), { limit: 10 })
             .pipe(Effect.orDie)
-          assert.strictEqual(heads.length, 1)
-          const head = heads[0]!
+          const head = heads.find((candidate) =>
+            candidate.envelope.writerProvenance.some((entry) => expectedChangeHashes.has(entry.changeHash))
+          )
+          assert.isDefined(head)
+          if (head === undefined) return
           assert.strictEqual(head.envelope.sender.peerId, localPeerId)
           assert.strictEqual(head.envelope.recipient.peerId, remotePeerId)
           assert.strictEqual(head.envelope.sender.replicaIncarnation, sender.incarnation)
@@ -376,11 +480,13 @@ describe("relay custody against a real relay", () => {
           assert.isAbove(head.envelope.payload.byteLength, 0)
 
           // A count on the recipient's inbox alone would not catch a message filed back to its sender.
-          assert.deepStrictEqual(
-            yield* backend.store
-              .pendingHeads(yield* inboxKeyOf(localPrincipal, backend.crypto), { limit: 10 })
-              .pipe(Effect.orDie),
-            []
+          const localHeads = yield* backend.store
+            .pendingHeads(yield* inboxKeyOf(localPrincipal, backend.crypto), { limit: 10 })
+            .pipe(Effect.orDie)
+          assert.isFalse(
+            localHeads.some((candidate) =>
+              candidate.envelope.writerProvenance.some((entry) => expectedChangeHashes.has(entry.changeHash))
+            )
           )
 
           assert.strictEqual((yield* outboxRows(sender.sql)).length, 0)

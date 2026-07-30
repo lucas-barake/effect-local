@@ -34,7 +34,17 @@ import * as ReplicaClient from "../src/ReplicaClient.js"
 import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
-import { definition, documentId, Read, ReadError, Rename, RenameError, replica, Task } from "./fixtures.js"
+import {
+  definition,
+  DeliveryPublisher,
+  documentId,
+  Read,
+  ReadError,
+  Rename,
+  RenameError,
+  replica,
+  Task
+} from "./fixtures.js"
 
 it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
   const limits = {
@@ -70,17 +80,20 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     maxRestoreErrorBytes: 4_096
   } satisfies ReplicaLimits.Values
   const Sessions = SessionManager.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)))
-  const Publisher = Layer.succeed(
-    CommitPublisher.CommitPublisher,
-    CommitPublisher.CommitPublisher.of({
-      publishPending: Effect.succeed(0),
-      invalidate: () => Effect.void,
-      subscribe: Effect.succeed({
-        watermark: Identity.CommitSequence.make(0),
-        refreshGeneration: 0,
-        events: Stream.never
+  const Publisher = Layer.merge(
+    Layer.succeed(
+      CommitPublisher.CommitPublisher,
+      CommitPublisher.CommitPublisher.of({
+        publishPending: Effect.succeed(0),
+        invalidate: () => Effect.void,
+        subscribe: Effect.succeed({
+          watermark: Identity.CommitSequence.make(0),
+          refreshGeneration: 0,
+          events: Stream.never
+        })
       })
-    })
+    ),
+    DeliveryPublisher
   )
   const Owner = ReplicaOwner.layerHandlers(definition).pipe(
     Layer.provide(PeerConnectionStatus.layer),
@@ -207,6 +220,88 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     }).pipe(
       Effect.provide(Owner)
     ))
+
+  it.effect("round trips command delivery lookup and changes", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
+      const commandId = yield* Identity.makeCommandId
+      assert.strictEqual(
+        (yield* client.lookupCommandDelivery(commandId))._tag,
+        "UnknownCommand"
+      )
+      const observed = Array.from(
+        yield* client.commandDeliveryChanges(commandId).pipe(
+          Stream.take(1),
+          Stream.runCollect
+        )
+      )
+      assert.strictEqual(observed.length, 1)
+      assert.strictEqual(observed[0]?._tag, "UnknownCommand")
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("rejects negative delivery cursors at the RPC boundary", () =>
+    Effect.gen(function*() {
+      const delivery = yield* Effect.exit(
+        Schema.decodeUnknownEffect(ReplicaRpc.InvalidationMessage)({
+          _tag: "DeliveryInvalidation",
+          ownerEpoch: "owner",
+          sequence: -1,
+          keys: []
+        })
+      )
+      const ready = yield* Effect.exit(
+        Schema.decodeUnknownEffect(ReplicaRpc.InvalidationMessage)({
+          _tag: "InvalidationsReady",
+          ownerEpoch: "owner",
+          watermark: 0,
+          refreshGeneration: 0,
+          deliveryWatermark: -1,
+          deliveryRefreshEpoch: -1
+        })
+      )
+      assert.strictEqual(delivery._tag, "Failure")
+      assert.strictEqual(ready._tag, "Failure")
+    }))
+
+  it.effect("retries a command delivery stream after transient ownership transport loss", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const transportFailed = yield* Deferred.make<void>()
+      let subscriptions = 0
+      const reconnecting = new Proxy(rpc, {
+        get(target, property, receiver) {
+          if (property !== "CommandDeliveryChanges") return Reflect.get(target, property, receiver)
+          return (payload: never) =>
+            Stream.unwrap(Effect.sync(() => {
+              subscriptions++
+              return subscriptions === 1
+                ? Stream.fromEffect(
+                  Deferred.succeed(transportFailed, undefined).pipe(
+                    Effect.andThen(Effect.fail(
+                      new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.StorageUnavailable({
+                          cause: transientDisconnected()
+                        })
+                      })
+                    ))
+                  )
+                )
+                : target.CommandDeliveryChanges(payload).pipe(Stream.take(1))
+            }))
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, reconnecting)
+      const commandId = yield* Identity.makeCommandId
+      const completed = yield* client.commandDeliveryChanges(commandId).pipe(
+        Stream.runDrain,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Deferred.await(transportFailed)
+      yield* TestClock.adjust("1 second")
+      yield* Fiber.join(completed)
+      assert.strictEqual(subscriptions, 2)
+    })).pipe(Effect.provide(Owner)))
 
   it.effect("round trips tagged query errors through the wire", () => {
     const rejected: Replica.Replica["Service"] = {
@@ -372,12 +467,12 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       Layer.provide(PeerConnectionStatus.layer),
       Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
-      Layer.provide(Layer.merge(Events, Layer.succeed(Replica.Replica, replica)))
+      Layer.provide(Layer.mergeAll(Events, DeliveryPublisher, Layer.succeed(Replica.Replica, replica)))
     )
     return Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
-      assert.deepStrictEqual(Array.from(yield* Stream.runCollect(client.invalidations)), [{
+      assert.deepStrictEqual(Array.from(yield* client.invalidations.pipe(Stream.take(1), Stream.runCollect)), [{
         _tag: "Invalidation",
         ownerEpoch: client.ownerEpoch,
         sequence: Identity.CommitSequence.make(1),
@@ -413,15 +508,15 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       Layer.provide(PeerConnectionStatus.layer),
       Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
-      Layer.provide(Layer.merge(Events, Layer.succeed(Replica.Replica, replica)))
+      Layer.provide(Layer.mergeAll(Events, DeliveryPublisher, Layer.succeed(Replica.Replica, replica)))
     )
     return Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       const first = yield* ReplicaClient.fromRpcClient(definition, rpc)
       const second = yield* ReplicaClient.fromRpcClient(definition, rpc)
       const events = yield* Effect.all([
-        Stream.runCollect(first.invalidations),
-        Stream.runCollect(second.invalidations)
+        first.invalidations.pipe(Stream.take(1), Stream.runCollect),
+        second.invalidations.pipe(Stream.take(1), Stream.runCollect)
       ], { concurrency: "unbounded" })
       assert.strictEqual(subscriptions, 2)
       assert.notDeepEqual(Array.from(events[0]), Array.from(events[1]))
@@ -443,13 +538,17 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                   _tag: "InvalidationsReady" as const,
                   ownerEpoch,
                   watermark: Identity.CommitSequence.make(0),
-                  refreshGeneration: 0
+                  refreshGeneration: 0,
+                  deliveryWatermark: 0,
+                  deliveryRefreshEpoch: 0
                 }).pipe(Stream.concat(Stream.fail(disconnected())))
                 : Stream.make({
                   _tag: "InvalidationsReady" as const,
                   ownerEpoch,
                   watermark: Identity.CommitSequence.make(2),
-                  refreshGeneration: 0
+                  refreshGeneration: 0,
+                  deliveryWatermark: 0,
+                  deliveryRefreshEpoch: 0
                 })
             }))
         }
@@ -460,7 +559,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.deepStrictEqual(Array.from(yield* Fiber.join(fiber)), [{
         _tag: "FullRefreshRequired",
         ownerEpoch: client.ownerEpoch,
-        keys: [Task.name]
+        keys: [Task.name, ReplicaRpc.commandDeliveryInvalidationKey]
       }])
       assert.strictEqual(subscriptions, 2)
     })).pipe(Effect.provide(Owner)))
@@ -476,7 +575,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
               _tag: "InvalidationsReady" as const,
               ownerEpoch,
               watermark: Identity.CommitSequence.make(0),
-              refreshGeneration: 1
+              refreshGeneration: 1,
+              deliveryWatermark: 0,
+              deliveryRefreshEpoch: 0
             })
         }
       })
@@ -484,7 +585,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.deepStrictEqual(Array.from(yield* Stream.runCollect(client.invalidations)), [{
         _tag: "FullRefreshRequired",
         ownerEpoch: client.ownerEpoch,
-        keys: [Task.name]
+        keys: [Task.name, ReplicaRpc.commandDeliveryInvalidationKey]
       }])
     })).pipe(Effect.provide(Owner)))
 
@@ -499,7 +600,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
               _tag: "InvalidationsReady" as const,
               ownerEpoch,
               watermark: Identity.CommitSequence.make(1),
-              refreshGeneration: 0
+              refreshGeneration: 0,
+              deliveryWatermark: 0,
+              deliveryRefreshEpoch: 0
             })
         }
       })
@@ -507,7 +610,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.deepStrictEqual(Array.from(yield* Stream.runCollect(client.invalidations)), [{
         _tag: "FullRefreshRequired",
         ownerEpoch: client.ownerEpoch,
-        keys: [Task.name]
+        keys: [Task.name, ReplicaRpc.commandDeliveryInvalidationKey]
       }])
     })).pipe(Effect.provide(Owner)))
 
@@ -525,7 +628,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 _tag: "InvalidationsReady" as const,
                 ownerEpoch,
                 watermark: Identity.CommitSequence.make(0),
-                refreshGeneration: 0
+                refreshGeneration: 0,
+                deliveryWatermark: 0,
+                deliveryRefreshEpoch: 0
               })
               return subscriptions < 5
                 ? ready.pipe(Stream.concat(Stream.fail(disconnected())))
@@ -609,7 +714,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 _tag: "InvalidationsReady" as const,
                 ownerEpoch,
                 watermark: Identity.CommitSequence.make(0),
-                refreshGeneration: 0
+                refreshGeneration: 0,
+                deliveryWatermark: 0,
+                deliveryRefreshEpoch: 0
               }).pipe(
                 Stream.tap(() => Deferred.succeed(invalidationsStarted, undefined)),
                 Stream.concat(
@@ -645,7 +752,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.deepStrictEqual(Array.from(yield* Fiber.join(invalidation)), [{
         _tag: "FullRefreshRequired",
         ownerEpoch: client.ownerEpoch,
-        keys: [Task.name]
+        keys: [Task.name, ReplicaRpc.commandDeliveryInvalidationKey]
       }])
       assert.strictEqual(yield* sessions.activeCount, 1)
     })).pipe(Effect.provide(Owner)))
@@ -780,7 +887,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.deepStrictEqual(Array.from(yield* Stream.runCollect(client.invalidations)), [{
         _tag: "FullRefreshRequired",
         ownerEpoch: client.ownerEpoch,
-        keys: [Task.name]
+        keys: [Task.name, ReplicaRpc.commandDeliveryInvalidationKey]
       }])
     })).pipe(Effect.provide(Owner)))
 
@@ -796,7 +903,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 _tag: "InvalidationsReady" as const,
                 ownerEpoch,
                 watermark: Identity.CommitSequence.make(5),
-                refreshGeneration: 0
+                refreshGeneration: 0,
+                deliveryWatermark: 0,
+                deliveryRefreshEpoch: 0
               },
               {
                 _tag: "FullRefreshRequired" as const,
@@ -823,7 +932,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         {
           _tag: "FullRefreshRequired",
           ownerEpoch: client.ownerEpoch,
-          keys: [Task.name]
+          keys: [Task.name, ReplicaRpc.commandDeliveryInvalidationKey]
         },
         {
           _tag: "FullRefreshRequired",
@@ -833,7 +942,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         {
           _tag: "FullRefreshRequired",
           ownerEpoch: client.ownerEpoch,
-          keys: [Task.name]
+          keys: [Task.name, ReplicaRpc.commandDeliveryInvalidationKey]
         },
         {
           _tag: "Invalidation",
@@ -1395,8 +1504,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           Layer.provide(PeerConnectionStatus.layer),
           Layer.provide(RelayConnectionStatus.layerNotConfigured),
           Layer.provideMerge(FailureSessions),
-          Layer.provide(Layer.merge(
+          Layer.provide(Layer.mergeAll(
             Layer.succeed(CommitPublisher.CommitPublisher, publisher),
+            DeliveryPublisher,
             Layer.succeed(Replica.Replica, decoratedReplica)
           ))
         )
@@ -1484,8 +1594,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         Layer.provide(PeerConnectionStatus.layer),
         Layer.provide(RelayConnectionStatus.layerNotConfigured),
         Layer.provideMerge(BackupSessions),
-        Layer.provide(Layer.merge(
+        Layer.provide(Layer.mergeAll(
           Layer.succeed(CommitPublisher.CommitPublisher, publisher),
+          DeliveryPublisher,
           Layer.succeed(Replica.Replica, observedReplica)
         ))
       )
@@ -1577,8 +1688,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         Layer.provide(PeerConnectionStatus.layer),
         Layer.provide(RelayConnectionStatus.layerNotConfigured),
         Layer.provideMerge(BackupSessions),
-        Layer.provide(Layer.merge(
+        Layer.provide(Layer.mergeAll(
           Layer.succeed(CommitPublisher.CommitPublisher, publisher),
+          DeliveryPublisher,
           Layer.succeed(Replica.Replica, observedReplica)
         ))
       )

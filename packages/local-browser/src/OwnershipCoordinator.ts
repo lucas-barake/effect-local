@@ -2,6 +2,7 @@ import * as BrowserCrypto from "@effect/platform-browser/BrowserCrypto"
 import * as BrowserWorker from "@effect/platform-browser/BrowserWorker"
 import * as BrowserWorkerRunner from "@effect/platform-browser/BrowserWorkerRunner"
 import * as OpfsWorker from "@effect/sql-sqlite-wasm/OpfsWorker"
+import type * as CommandDeliveryPublisher from "@lucas-barake/effect-local-sql/CommandDeliveryPublisher"
 import type * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import type * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import type * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
@@ -13,6 +14,7 @@ import * as Crypto from "effect/Crypto"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as ManagedRuntime from "effect/ManagedRuntime"
 import * as Option from "effect/Option"
@@ -40,6 +42,7 @@ export type EngineServices =
   | CommitPublisher.CommitPublisher
   | PeerConnectionStatus.PeerConnectionStatus
   | RelayConnectionStatus.RelayConnectionStatus
+  | CommandDeliveryPublisher.CommandDeliveryPublisher
   | Crypto.Crypto
   | SqlClient.SqlClient
 
@@ -108,11 +111,17 @@ interface Provisioning {
   readonly candidate: MessagePort
 }
 
+interface Starting {
+  readonly epoch: number
+  readonly candidate: MessagePort
+  readonly fiber: Fiber.Fiber<boolean>
+}
+
 interface CoordinatorState {
   readonly clients: Map<MessagePort, Client>
   engine: Option.Option<LiveEngine>
   provisioning: Option.Option<Provisioning>
-  starting: boolean
+  starting: Option.Option<Starting>
   disposing: boolean
   epoch: number
   readonly tried: Set<MessagePort>
@@ -183,7 +192,7 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
         clients: new Map(),
         engine: Option.none(),
         provisioning: Option.none(),
-        starting: false,
+        starting: Option.none(),
         disposing: false,
         epoch: 0,
         tried: new Set()
@@ -244,6 +253,17 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
         const start = Effect.gen(function*() {
           const runtime = yield* Effect.sync(() => options.engine(databasePort))
           const engineScope = yield* Scope.make()
+          // A candidate that detaches mid start has this fiber interrupted, and the engine it
+          // already built is reachable from nowhere else: it never became an `EngineStarted` event,
+          // so `disposeEngine` can never see it.
+          const discardEngine = (exit: Exit.Exit<unknown, unknown>) =>
+            Scope.close(engineScope, exit).pipe(
+              Effect.ignore,
+              Effect.andThen(
+                runtime.disposeEffect.pipe(Effect.timeout(engineDisposeTimeoutMillis), Effect.ignore)
+              ),
+              Effect.andThen(Effect.sync(() => databasePort.close()))
+            )
           const started = yield* Effect.exit(
             Effect.gen(function*() {
               yield* provideRuntime(runtime, healthProbe).pipe(
@@ -261,25 +281,22 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
               const snapshot: EngineSnapshot = { runtime, scope: engineScope, ownerId, info }
               return snapshot
             })
-          )
+          ).pipe(Effect.onInterrupt(() => discardEngine(Exit.interrupt())))
           if (Exit.isFailure(started)) {
-            yield* Scope.close(engineScope, started).pipe(Effect.ignore)
-            yield* runtime.disposeEffect.pipe(Effect.timeout(engineDisposeTimeoutMillis), Effect.ignore)
-            yield* Effect.sync(() => databasePort.close())
+            yield* discardEngine(started)
           }
           return started
         })
         return start.pipe(
           Effect.flatMap((exit) => Queue.offer(events, { _tag: "EngineStarted", epoch, nonce, candidate, exit })),
-          Effect.forkIn(layerScope),
-          Effect.asVoid
+          Effect.forkIn(layerScope)
         )
       }
 
       const kickProvisioning: Effect.Effect<void> = Effect.suspend(() => {
         const current = Ref.getUnsafe(state)
         if (
-          Option.isSome(current.engine) || Option.isSome(current.provisioning) || current.starting ||
+          Option.isSome(current.engine) || Option.isSome(current.provisioning) || Option.isSome(current.starting) ||
           current.disposing
         ) {
           return Effect.void
@@ -419,9 +436,19 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                     current.engine.value.provider === event.controlPort
                   const wasCandidate = Option.isSome(current.provisioning) &&
                     current.provisioning.value.candidate === event.controlPort
+                  const starting = Option.getOrUndefined(current.starting)
                   if (wasCandidate) current.provisioning = Option.none()
                   if (wasProvider) {
                     return resetEngine("the database provider detached")
+                  }
+                  if (starting?.candidate === event.controlPort) {
+                    current.starting = Option.none()
+                    current.epoch += 1
+                    return Fiber.interrupt(starting.fiber).pipe(
+                      Effect.forkIn(layerScope),
+                      Effect.andThen(kickProvisioning),
+                      Effect.asVoid
+                    )
                   }
                   return wasCandidate ? kickProvisioning : Effect.void
                 }
@@ -436,9 +463,16 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                   }
                   const nonce = current.provisioning.value.nonce
                   current.provisioning = Option.none()
-                  current.starting = true
                   current.epoch += 1
-                  return startEngine(current.epoch, nonce, event.controlPort, frame.databasePort)
+                  const epoch = current.epoch
+                  return startEngine(epoch, nonce, event.controlPort, frame.databasePort).pipe(
+                    Effect.tap((fiber) =>
+                      Effect.sync(() => {
+                        current.starting = Option.some({ epoch, candidate: event.controlPort, fiber })
+                      })
+                    ),
+                    Effect.asVoid
+                  )
                 }
               }
             }
@@ -459,8 +493,10 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
               )
             }
             case "EngineStarted": {
-              current.starting = false
-              if (event.epoch !== current.epoch || Option.isSome(current.engine)) {
+              const isCurrentStart = Option.isSome(current.starting) &&
+                current.starting.value.epoch === event.epoch &&
+                current.starting.value.candidate === event.candidate
+              if (!isCurrentStart || event.epoch !== current.epoch || Option.isSome(current.engine)) {
                 if (Exit.isSuccess(event.exit)) {
                   return disposeEngine(event.exit.value, Exit.void).pipe(
                     Effect.forkIn(layerScope),
@@ -469,6 +505,7 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                 }
                 return Effect.void
               }
+              current.starting = Option.none()
               if (Exit.isFailure(event.exit)) {
                 current.tried.add(event.candidate)
                 // Same drop as a provisioning timeout: the candidate could not produce a healthy
@@ -612,11 +649,14 @@ const firstConnectPort = (event: Event): MessagePort | undefined => {
  * buffered until the coordinator is ready, so tabs connecting while the options module is still
  * loading are attached in order once it arrives. When the load fails, every buffered and future
  * connection is answered with an `OwnerError` frame whose reason is tagged `RuntimeLoadFailure`.
+ * Entries that dynamically import this module can pass ports captured before that import as
+ * `initialPorts`.
  */
 export const runSharedWorker = <E, A = unknown, E2 = never,>(
-  load: () => Promise<SharedWorkerOptions<E, A, E2>>
+  load: () => Promise<SharedWorkerOptions<E, A, E2>>,
+  initialPorts: ReadonlyArray<MessagePort> = []
 ): void => {
-  const pending: Array<MessagePort> = []
+  const pending = [...initialPorts]
   let coordinator: OwnershipCoordinator["Service"] | undefined
   let startupFailure: { readonly message: string; readonly name: string } | undefined
   const flush = () => {
@@ -952,16 +992,21 @@ export interface DatabaseWorkerOptions {
  * Entry point of the durable database worker. The first message must be a Schema decodable
  * `DatabaseWorkerStart` frame carrying the database port. The worker then holds a Web Lock for the
  * database lifetime and runs the SQLite OPFS loop, so a replacement provider waits for the lock
- * instead of opening OPFS concurrently with a slow prior owner.
+ * instead of opening OPFS concurrently with a slow prior owner. An entry that dynamically imports
+ * this module can pass the message captured before that import as `initialMessage`.
  */
-export const runDatabaseWorker = (options: DatabaseWorkerOptions): void => {
+export const runDatabaseWorker = (
+  options: DatabaseWorkerOptions,
+  initialMessage?: MessageEvent<unknown>
+): void => {
   const dbName = options.dbName ?? `${options.name}.sqlite`
   const lockName = options.lockName ?? `${options.name}-opfs`
-  globalThis.addEventListener("message", (event: MessageEvent<unknown>) => {
+  const start = (event: MessageEvent<unknown>) => {
     let frame: OwnershipProtocol.DatabaseWorkerStart
     try {
       frame = Schema.decodeUnknownSync(OwnershipProtocol.DatabaseWorkerStart)(event.data)
     } catch (cause) {
+      for (const port of event.ports) port.close()
       globalThis.reportError(cause)
       return
     }
@@ -971,5 +1016,10 @@ export const runDatabaseWorker = (options: DatabaseWorkerOptions): void => {
         Effect.tapCause(Effect.logError)
       )
     )
-  }, { once: true })
+  }
+  if (initialMessage !== undefined) {
+    start(initialMessage)
+    return
+  }
+  globalThis.addEventListener("message", start, { once: true })
 }

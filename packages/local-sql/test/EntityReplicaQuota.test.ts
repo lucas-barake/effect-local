@@ -16,6 +16,8 @@ import * as Schema from "effect/Schema"
 import { TestClock } from "effect/testing"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as BackupStore from "../src/BackupStore.js"
+import * as CommandDeliveryPublisher from "../src/CommandDeliveryPublisher.js"
+import * as CommandDeliveryStore from "../src/CommandDeliveryStore.js"
 import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as CommitPublisher from "../src/CommitPublisher.js"
 import * as Compaction from "../src/Compaction.js"
@@ -86,9 +88,15 @@ describe("EntityReplica in-flight command limit", () => {
       Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
     )
     const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
-    const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
+    const deliveryStore = CommandDeliveryStore.layer.pipe(Layer.provideMerge(gate))
+    const deliveryPublisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
+      Layer.provideMerge(deliveryStore)
+    )
+    const backups = BackupStore.layer(definition).pipe(
+      Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
+    )
     const durable = DurableRuntime.layer(definition).pipe(
-      Layer.provideMerge(Layer.merge(backups, compaction))
+      Layer.provideMerge(Layer.mergeAll(backups, compaction, deliveryStore, deliveryPublisher))
     )
     return EntityReplica.layer(definition).pipe(Layer.provideMerge(durable))
   }

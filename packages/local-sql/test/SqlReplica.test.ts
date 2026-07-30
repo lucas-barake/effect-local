@@ -26,6 +26,8 @@ import { TestClock } from "effect/testing"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as BackupStore from "../src/BackupStore.js"
+import * as CommandDeliveryPublisher from "../src/CommandDeliveryPublisher.js"
+import * as CommandDeliveryStore from "../src/CommandDeliveryStore.js"
 import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as CommitPublisher from "../src/CommitPublisher.js"
 import * as DocumentStore from "../src/DocumentStore.js"
@@ -162,6 +164,26 @@ describe("SqlReplica", () => {
     )
   })
 
+  it("validates command delivery publisher options through every public constructor", () => {
+    const options = {
+      projections: [],
+      deliveryPublisher: {
+        eventCapacity: 0,
+        publishInterval: "1 second"
+      }
+    } as const
+    for (
+      const build of [
+        () => SqlReplica.layer(definition, options),
+        () => SqlReplica.layerRelay(definition, options),
+        () => SqlReplica.layerWithBindings(definition, options),
+        () => SqlReplica.layerRelayWithBindings(definition, options)
+      ]
+    ) {
+      assert.throws(build, /positive integer/)
+    }
+  })
+
   // The reason `layerRelayWithBindings` exists. A deployment with projections that reaches for the
   // only bindings constructor there was got a direct `PeerSync`, and found out at the point it
   // built a service it did not think it was choosing.
@@ -237,9 +259,20 @@ describe("SqlReplica", () => {
     Effect.gen(function*() {
       const replica = yield* Replica.Replica
       assert.ok(yield* ReplicaWorkflow.CompactionWorkflow)
+      const unknownCommandId = yield* Identity.makeCommandId
+      assert.strictEqual(
+        (yield* replica.lookupCommandDelivery(unknownCommandId))._tag,
+        "UnknownCommand"
+      )
       const createCommandId = yield* Identity.makeCommandId
       const created = yield* replica.create(Task, { commandId: createCommandId, value: { title: "one" } })
       const documentId = created
+      const createdDelivery = yield* replica.lookupCommandDelivery(createCommandId)
+      assert.strictEqual(createdDelivery._tag, "TrackedCommand")
+      if (createdDelivery._tag === "TrackedCommand") {
+        assert.isAbove(createdDelivery.localChangeCount, 0)
+        assert.deepStrictEqual(createdDelivery.destinations, [])
+      }
       assert.deepStrictEqual(
         yield* replica.create(Task, { commandId: createCommandId, value: { title: "one" } }),
         created
@@ -261,11 +294,20 @@ describe("SqlReplica", () => {
         yield* replica.mutate(Rename, { commandId: mutationCommandId, documentId, payload: "two" }),
         undefined
       )
+      const mutationDelivery = yield* replica.lookupCommandDelivery(mutationCommandId)
+      assert.strictEqual(mutationDelivery._tag, "TrackedCommand")
+      if (mutationDelivery._tag === "TrackedCommand") {
+        assert.isAbove(mutationDelivery.localChangeCount, 0)
+      }
       assert.deepStrictEqual((yield* replica.get(Task, documentId)).value, { title: "two" })
       const noopCommandId = yield* Identity.makeCommandId
       assert.deepStrictEqual(
         yield* replica.mutate(Noop, { commandId: noopCommandId, documentId }),
         undefined
+      )
+      assert.strictEqual(
+        (yield* replica.lookupCommandDelivery(noopCommandId))._tag,
+        "NoChangesToDeliver"
       )
       assert.deepStrictEqual((yield* replica.get(Task, documentId)).value, { title: "two" })
       assert.deepStrictEqual(
@@ -274,6 +316,11 @@ describe("SqlReplica", () => {
       )
       const deleteCommandId = yield* Identity.makeCommandId
       yield* replica.delete(Task, { commandId: deleteCommandId, documentId })
+      const deleteDelivery = yield* replica.lookupCommandDelivery(deleteCommandId)
+      assert.strictEqual(deleteDelivery._tag, "TrackedCommand")
+      if (deleteDelivery._tag === "TrackedCommand") {
+        assert.isAbove(deleteDelivery.localChangeCount, 0)
+      }
       assert.isTrue((yield* replica.get(Task, documentId)).tombstone)
       assert.deepStrictEqual(
         yield* replica.lookupDelete(Task, deleteCommandId),
@@ -311,6 +358,67 @@ describe("SqlReplica", () => {
         (SELECT COUNT(*) FROM effect_local_command_receipts) AS receipts`
       assert.deepStrictEqual(rows[0], { changes: 6, clusterMessages: 8, documents: 4, receipts: 7 })
     }).pipe(Effect.provide(Live), Effect.provide(Database), TestClock.withLive))
+
+  it.effect("rolls a command back when delivery source persistence fails", () =>
+    Effect.gen(function*() {
+      const replica = yield* Replica.Replica
+      const sql = yield* SqlClient.SqlClient
+      const commandId = yield* Identity.makeCommandId
+      yield* sql`CREATE TRIGGER fail_command_delivery_source
+        BEFORE INSERT ON effect_local_command_delivery_sources
+        BEGIN
+          SELECT RAISE(ABORT, 'forced command delivery source failure');
+        END`
+
+      const result = yield* Effect.exit(
+        replica.create(Task, { commandId, value: { title: "must roll back" } })
+      )
+      assert.strictEqual(result._tag, "Failure")
+      assert.strictEqual(
+        (yield* replica.lookupCommandDelivery(commandId))._tag,
+        "UnknownCommand"
+      )
+      const rows = yield* sql`SELECT
+        (SELECT COUNT(*) FROM effect_local_documents) AS documents,
+        (SELECT COUNT(*) FROM effect_local_changes) AS changes,
+        (SELECT COUNT(*) FROM effect_local_command_receipts) AS receipts,
+        (SELECT COUNT(*) FROM effect_local_command_delivery_sources) AS sources,
+        (SELECT COUNT(*) FROM effect_local_command_delivery_changes) AS delivery_changes,
+        (SELECT COUNT(*) FROM effect_local_command_delivery_events) AS delivery_events`
+      assert.deepStrictEqual(rows, [{
+        documents: 0,
+        changes: 0,
+        receipts: 0,
+        sources: 0,
+        delivery_changes: 0,
+        delivery_events: 0
+      }])
+    }).pipe(Effect.provide(Live), Effect.provide(Database), TestClock.withLive))
+
+  it.effect("refreshes command delivery subscribers after restore clears custody evidence", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const commandId = yield* Identity.makeCommandId
+        yield* replica.create(Task, { commandId, value: { title: "backed up" } })
+        const backup = yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+        const pull = yield* replica.commandDeliveryChanges(commandId).pipe(Stream.toPull)
+
+        const before = yield* pull
+        assert.strictEqual(before[0]?._tag, "TrackedCommand")
+
+        yield* replica.restoreBackup({
+          expectedDefinitionHash: definition.hash,
+          installationId: yield* Identity.makeBackupInstallationId,
+          maxBytes: limits.maxBackupBytes,
+          mode: "replace",
+          source: Stream.fromIterable(backup)
+        })
+
+        const after = yield* pull
+        assert.strictEqual(after[0]?._tag, "UnknownCommand")
+      }).pipe(Effect.provide(Live), Effect.provide(Database), TestClock.withLive)
+    ))
 
   it.effect("provides nonempty projection bindings", () =>
     Effect.gen(function*() {
@@ -419,8 +527,16 @@ describe("SqlReplica", () => {
         Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
       )
       const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
-      const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
-      const direct = SqlReplica.layerFromServices(definition).pipe(Layer.provideMerge(backups))
+      const deliveryStore = CommandDeliveryStore.layer.pipe(Layer.provideMerge(gate))
+      const deliveryPublisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
+        Layer.provideMerge(deliveryStore)
+      )
+      const backups = BackupStore.layer(definition).pipe(
+        Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
+      )
+      const direct = SqlReplica.layerFromServices(definition).pipe(
+        Layer.provideMerge(Layer.mergeAll(backups, deliveryStore, deliveryPublisher))
+      )
       const services = Layer.merge(direct, Reactivity.layer).pipe(Layer.provide(Handler))
 
       yield* Effect.gen(function*() {
@@ -533,8 +649,16 @@ describe("SqlReplica", () => {
         Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
       )
       const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
-      const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
-      const direct = SqlReplica.layerFromServices(definition).pipe(Layer.provideMerge(backups))
+      const deliveryStore = CommandDeliveryStore.layer.pipe(Layer.provideMerge(gate))
+      const deliveryPublisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
+        Layer.provideMerge(deliveryStore)
+      )
+      const backups = BackupStore.layer(definition).pipe(
+        Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
+      )
+      const direct = SqlReplica.layerFromServices(definition).pipe(
+        Layer.provideMerge(Layer.mergeAll(backups, deliveryStore, deliveryPublisher))
+      )
       const services = Layer.merge(direct, Reactivity.layer).pipe(Layer.provide(Handler))
 
       yield* Effect.gen(function*() {
@@ -590,8 +714,16 @@ describe("SqlReplica", () => {
       Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
     )
     const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
-    const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
-    const direct = SqlReplica.layerFromServices(definition).pipe(Layer.provideMerge(backups))
+    const deliveryStore = CommandDeliveryStore.layer.pipe(Layer.provideMerge(gate))
+    const deliveryPublisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
+      Layer.provideMerge(deliveryStore)
+    )
+    const backups = BackupStore.layer(definition).pipe(
+      Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
+    )
+    const direct = SqlReplica.layerFromServices(definition).pipe(
+      Layer.provideMerge(Layer.mergeAll(backups, deliveryStore, deliveryPublisher))
+    )
     return Layer.merge(direct, Reactivity.layer).pipe(Layer.provide(Handler))
   })
 
