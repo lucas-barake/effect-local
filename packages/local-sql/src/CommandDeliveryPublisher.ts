@@ -17,7 +17,9 @@ export interface Options {
 }
 
 export const defaultOptions: Options = {
-  eventCapacity: 256,
+  // One drain publishes up to pendingEventBatchSize events at once, so a smaller sliding
+  // buffer would deterministically evict the oldest events of a full batch.
+  eventCapacity: 512,
   publishInterval: "1 second"
 }
 

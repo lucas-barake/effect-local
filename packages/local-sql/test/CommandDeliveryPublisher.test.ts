@@ -10,6 +10,7 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
+import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlConnection from "effect/unstable/sql/SqlConnection"
@@ -76,6 +77,31 @@ describe("CommandDeliveryPublisher", () => {
     )
     return Layer.mergeAll(database, bootstrap, gate, store, publisher)
   })()
+
+  it.effect("delivers a full pending batch to a subscriber without evicting the oldest events", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const gate = yield* ReplicaGate.ReplicaGate
+      const publisher = yield* CommandDeliveryPublisher.CommandDeliveryPublisher
+      const permit = yield* gate.current
+      const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000002")
+      const events = Array.from({ length: 512 }, () => ({
+        replica_incarnation: permit.incarnation,
+        command_id: null,
+        document_id: documentId,
+        published: 0
+      }))
+      for (let offset = 0; offset < events.length; offset += 100) {
+        yield* sql`INSERT INTO effect_local_command_delivery_events ${sql.insert(events.slice(offset, offset + 100))}`
+      }
+
+      const first = yield* Effect.scoped(Effect.gen(function*() {
+        const subscription = yield* publisher.subscribe
+        yield* publisher.publishPending
+        return yield* Stream.runHead(subscription.events)
+      }))
+      assert.strictEqual(Option.getOrNull(first)?.sequence, 1)
+    }).pipe(Effect.provide(layer)))
 
   it.effect("drains a full event batch before waiting for the next poll", () =>
     Effect.gen(function*() {
