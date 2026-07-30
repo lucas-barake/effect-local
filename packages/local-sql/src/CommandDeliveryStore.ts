@@ -37,6 +37,7 @@ const DeliveryAggregateRow = Schema.Struct({
   last_retry_deadline: IsoDate,
   first_pending_at: Schema.NullOr(IsoDate),
   pending_retry_deadline: Schema.NullOr(IsoDate),
+  any_unconfirmed_at: Schema.NullOr(IsoDate),
   unconfirmed_at: Schema.NullOr(IsoDate),
   unconfirmed_retry_deadline: Schema.NullOr(IsoDate)
 })
@@ -50,9 +51,9 @@ const destinationState = (
       _tag: "RelayCustodyAccepted",
       acceptedChangeCount: row.accepted_change_count,
       acceptedAt: row.accepted_at,
-      ...(row.unconfirmed_at === null
+      ...(row.any_unconfirmed_at === null
         ? {}
-        : { senderCustodyUnconfirmedAt: row.unconfirmed_at })
+        : { senderCustodyUnconfirmedAt: row.any_unconfirmed_at })
     }
   }
   if (
@@ -315,6 +316,7 @@ export const layer: Layer.Layer<
               AND messages.sender_custody_unconfirmed_at IS NULL
             THEN messages.retry_deadline
           END) AS pending_retry_deadline,
+          MAX(messages.sender_custody_unconfirmed_at) AS any_unconfirmed_at,
           MAX(CASE
             WHEN messages.relay_custody_accepted_at IS NULL
               AND messages.sender_custody_unconfirmed_at IS NOT NULL

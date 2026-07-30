@@ -353,11 +353,11 @@ describe("PeerRelayOutbox", () => {
       const accepted = yield* deliveries.lookup(commandId)
       assert.strictEqual(accepted._tag, "TrackedCommand")
       if (accepted._tag !== "TrackedCommand") return
-      assert.strictEqual(accepted.destinations[0]?.state._tag, "RelayCustodyAccepted")
-      assert.strictEqual(
-        accepted.destinations[0]?.state.acceptedChangeCount,
-        localChangeCount
-      )
+      const state = accepted.destinations[0]?.state
+      assert.strictEqual(state?._tag, "RelayCustodyAccepted")
+      if (state?._tag !== "RelayCustodyAccepted") return
+      assert.strictEqual(state.acceptedChangeCount, localChangeCount)
+      assert.isDefined(state.senderCustodyUnconfirmedAt)
     }).pipe(Effect.provide(layer(":memory:"))))
 
   it.effect("completes a retried source after relay custody was already accepted", () =>
