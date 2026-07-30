@@ -12,6 +12,7 @@ describe("public API", () => {
         "PeerRelayOutboxLimits",
         "PeerRelayReceiptLimits",
         "PeerConnectionStatus",
+        "RelayConnectionStatus",
         "PeerSyncEnvelope"
       ]
     ) {

@@ -1,4 +1,5 @@
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
@@ -82,4 +83,9 @@ export const replica: Replica.Replica["Service"] = {
  */
 export const peerConnectionStatus: PeerConnectionStatus.PeerConnectionStatus["Service"] = {
   status: () => Stream.make(PeerConnectionStatus.disconnected).pipe(Stream.concat(Stream.never))
+}
+
+/** No relay in these fixtures' topology, so `NotConfigured` rather than a `Disconnected` that would imply one. */
+export const relayConnectionStatus: RelayConnectionStatus.RelayConnectionStatus["Service"] = {
+  status: Stream.make(RelayConnectionStatus.notConfigured).pipe(Stream.concat(Stream.never))
 }

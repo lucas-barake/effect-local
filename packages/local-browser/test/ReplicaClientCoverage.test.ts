@@ -2,6 +2,7 @@ import { NodeCrypto } from "@effect/platform-node"
 import { assert, it } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -71,6 +72,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
   )
   const Owner = ReplicaOwner.layerHandlers(definition).pipe(
     Layer.provide(PeerConnectionStatus.layer),
+    Layer.provide(RelayConnectionStatus.layerNotConfigured),
     Layer.provideMerge(Sessions),
     Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, replica)))
   )

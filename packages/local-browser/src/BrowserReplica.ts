@@ -1,4 +1,5 @@
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as Context from "effect/Context"
@@ -10,15 +11,22 @@ import * as ReplicaClient from "./ReplicaClient.js"
 
 type WorkerOptions = Parameters<typeof RpcClient.layerProtocolWorker>[0]
 
+/**
+ * `Layer.fresh`, because this republishes whichever `ReplicaClient` its own graph provides, and
+ * Layer memoization is by reference. Two replica graphs under one memo map - one `Atom.runtime`
+ * memo map is shared app wide - would otherwise both resolve to the first graph's build, and the
+ * second replica's `Replica` and `PeerConnectionStatus` would silently answer for the first one.
+ */
 const clientServices = Layer.effectContext(
   ReplicaClient.ReplicaClient.pipe(
     Effect.map((client) =>
       Context.make(Replica.Replica, client).pipe(
-        Context.add(PeerConnectionStatus.PeerConnectionStatus, client.peerConnectionStatus)
+        Context.add(PeerConnectionStatus.PeerConnectionStatus, client.peerConnectionStatus),
+        Context.add(RelayConnectionStatus.RelayConnectionStatus, client.relayConnectionStatus)
       )
     )
   )
-)
+).pipe(Layer.fresh)
 
 export const layerWith = (
   definition: ReplicaDefinition.Any,

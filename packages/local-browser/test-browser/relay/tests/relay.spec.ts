@@ -22,7 +22,15 @@ const readLabels = (page: Page, documentId: string) =>
 test("carries a change between two browsers through a real relay", async ({ browser }) => {
   const alpha = await openDevice(browser, "alpha")
   const beta = await openDevice(browser, "beta")
-  await expect.poll(() => alpha.locator("body").getAttribute("data-connection-status")).toBe("Disconnected")
+  await expect.poll(() => alpha.locator("body").getAttribute("data-connection-status"), { timeout: 30_000 }).toBe(
+    "Disconnected"
+  )
+  // The socket is device scoped, so the relay link is up before any peer session exists. This is
+  // also the only place the connect half of `RpcClient.ConnectionHooks` is exercised against a
+  // socket that genuinely opens.
+  await expect.poll(() => alpha.locator("body").getAttribute("data-relay-status"), { timeout: 30_000 }).toBe(
+    "Connected"
+  )
 
   // A document created independently on both devices would be two lineages; this syncs two copies
   // of one.

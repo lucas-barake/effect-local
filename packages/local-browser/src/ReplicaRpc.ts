@@ -1,4 +1,5 @@
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -198,6 +199,14 @@ export const group = RpcGroup.make(
   Rpc.make("PeerConnectionStatus", {
     payload: { sessionId: Identity.SessionId, peerId: Identity.PeerId },
     success: PeerConnectionStatus.Status,
+    error: ReplicaError.ReplicaError,
+    stream: true
+  }),
+  // No peerId: this is the one socket every peer session runs over, so it is a property of the
+  // replica rather than of any peer.
+  Rpc.make("RelayConnectionStatus", {
+    payload: { sessionId: Identity.SessionId },
+    success: RelayConnectionStatus.Status,
     error: ReplicaError.ReplicaError,
     stream: true
   }),

@@ -1,6 +1,7 @@
 import type * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import { assert, describe, it } from "@effect/vitest"
 import type * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import type * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Crypto from "effect/Crypto"
@@ -18,7 +19,7 @@ import { definition } from "./fixtures.js"
 describe("public browser API types", () => {
   it("keeps worker creation as a layer requirement", () => {
     const layer: Layer.Layer<
-      Replica.Replica | PeerConnectionStatus.PeerConnectionStatus,
+      Replica.Replica | PeerConnectionStatus.PeerConnectionStatus | RelayConnectionStatus.RelayConnectionStatus,
       ReplicaError.ReplicaError | WorkerError.WorkerError,
       Crypto.Crypto | Worker.WorkerPlatform | Worker.Spawner
     > = BrowserReplica.layer(definition)
@@ -29,13 +30,15 @@ describe("public browser API types", () => {
   // `Disconnected` stream, so a graph that never provided it compiled and then reported every peer
   // as offline forever. Pinning the requirement here is what keeps that from coming back: the
   // annotation stops compiling the moment the dependency goes soft again.
-  it("keeps peer connection status a requirement of the owner handlers", () => {
+  it("keeps both connection status readers requirements of the owner handlers", () => {
     type OwnerRequirements = ReturnType<typeof ReplicaOwner.layerHandlers> extends
       Layer.Layer<infer _Out, infer _E, infer Requirements> ? Requirements : never
 
-    const required: OwnerRequirements = undefined as unknown as PeerConnectionStatus.PeerConnectionStatus
+    const peer: OwnerRequirements = undefined as unknown as PeerConnectionStatus.PeerConnectionStatus
+    const relay: OwnerRequirements = undefined as unknown as RelayConnectionStatus.RelayConnectionStatus
     assert.isDefined(ReplicaOwner.layerHandlers(definition))
-    assert.isUndefined(required)
+    assert.isUndefined(peer)
+    assert.isUndefined(relay)
   })
 
   it("exposes client options through every browser replica constructor", () => {

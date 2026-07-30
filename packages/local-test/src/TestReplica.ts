@@ -9,6 +9,7 @@ import * as PeerSync from "@lucas-barake/effect-local-sql/PeerSync"
 import * as ProjectionStore from "@lucas-barake/effect-local-sql/ProjectionStore"
 import * as QueryExecutor from "@lucas-barake/effect-local-sql/QueryExecutor"
 import * as Recovery from "@lucas-barake/effect-local-sql/Recovery"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as ReplicaBootstrap from "@lucas-barake/effect-local-sql/ReplicaBootstrap"
 import * as ReplicaEvolution from "@lucas-barake/effect-local-sql/ReplicaEvolution"
 import * as ReplicaGate from "@lucas-barake/effect-local-sql/ReplicaGate"
@@ -116,12 +117,15 @@ export const layerWithSyncAndLimits = <
   const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
   const backups = BackupStore.layer(definition).pipe(Layer.provideMerge(publisher))
   const sync = PeerSync.layer.pipe(Layer.provideMerge(backups))
-  return Layer.merge(
+  return Layer.mergeAll(
     SqlReplica.layerFromServices(definition).pipe(
       Layer.provideMerge(sync),
       Layer.provide([Layer.empty, ...options.projections.map((binding) => binding.layer)])
     ),
-    PeerConnectionStatus.layer
+    PeerConnectionStatus.layer,
+    // Direct mode, so there is no relay to report on. `layerFromServices` hand assembles the stack
+    // and never reaches the constructors that answer this, so it is answered here.
+    RelayConnectionStatus.layerNotConfigured
   )
 }
 

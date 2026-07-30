@@ -1,4 +1,5 @@
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as Backup from "@lucas-barake/effect-local/Backup"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -38,6 +39,7 @@ export class ReplicaClient extends Context.Service<
     readonly ownerEpoch: string
     readonly invalidations: Stream.Stream<ReplicaRpc.Invalidation, ReplicaError.ReplicaError>
     readonly peerConnectionStatus: PeerConnectionStatus.PeerConnectionStatus["Service"]
+    readonly relayConnectionStatus: RelayConnectionStatus.RelayConnectionStatus["Service"]
   }
 >()(
   "@lucas-barake/effect-local-browser/ReplicaClient"
@@ -1293,6 +1295,31 @@ export const fromRpcClient = (
                 })
               ))
           )
+      }),
+      relayConnectionStatus: RelayConnectionStatus.RelayConnectionStatus.of({
+        // Both refs, as `status` does and unlike `peerConnectionStatus`. This stream is long lived
+        // and emits before a lease can lapse, which is the case the pending-mismatch ref exists for:
+        // without it a post-emission mismatch fails the stream immediately instead of being carried
+        // to the resubscribe that `ReplicaAtom` is waiting to perform.
+        status: Stream.unwrap(
+          Effect.gen(function*() {
+            const emitted = yield* Ref.make(false)
+            const pendingMismatch = yield* Ref.make<Option.Option<PendingStreamMismatch>>(Option.none())
+            return withSessionStream(
+              (session) => rpc.RelayConnectionStatus({ sessionId: session.sessionId }),
+              reopen,
+              emitted,
+              pendingMismatch
+            ).pipe(
+              Stream.catchTag("RpcClientError", (error) =>
+                Stream.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageUnavailable({ cause: error })
+                  })
+                ))
+            )
+          })
+        )
       }),
       status: Stream.unwrap(
         Effect.gen(function*() {

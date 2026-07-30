@@ -4,6 +4,7 @@ import * as BrowserWorkerRunner from "@effect/platform-browser/BrowserWorkerRunn
 import * as OpfsWorker from "@effect/sql-sqlite-wasm/OpfsWorker"
 import type * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import type * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import type * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as Cause from "effect/Cause"
@@ -38,6 +39,7 @@ export type EngineServices =
   | SessionManager.SessionManager
   | CommitPublisher.CommitPublisher
   | PeerConnectionStatus.PeerConnectionStatus
+  | RelayConnectionStatus.RelayConnectionStatus
   | Crypto.Crypto
   | SqlClient.SqlClient
 

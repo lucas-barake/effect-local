@@ -30,6 +30,7 @@ import type * as PeerSync from "./PeerSync.js"
 import * as ProjectionStore from "./ProjectionStore.js"
 import * as QueryExecutor from "./QueryExecutor.js"
 import * as Recovery from "./Recovery.js"
+import * as RelayConnectionStatus from "./RelayConnectionStatus.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
 import * as ReplicaEvolution from "./ReplicaEvolution.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -219,6 +220,7 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   | PeerConnectionStatus.PeerConnectionStatus
   | PeerConnectionStatus.Reporter
   | PeerSync.PeerSync
+  | RelayConnectionStatus.RelayConnectionStatus
   | Replica.Replica
   | ReplicaEvolution.ReplicaEvolution
   | ReplicaGate.ReplicaGate
@@ -237,9 +239,14 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   const durable = DurableRuntime.layer(definition).pipe(
     Layer.provideMerge(Layer.merge(backups, compaction))
   )
-  return Layer.merge(
+  return Layer.mergeAll(
     EntityReplica.layer(definition).pipe(Layer.provideMerge(durable)),
-    connections
+    connections,
+    // A direct replica has no relay, and that is a fact rather than a missing dependency, so it is
+    // answered here instead of being pushed onto every consumer. `layerRelay` deliberately does not
+    // provide it: a relay replica has to compose `RelayConnectionStatus.layerProtocolSocket` with
+    // its socket, and leaving the requirement open is what makes forgetting that a compile error.
+    RelayConnectionStatus.layerNotConfigured
   )
 }
 

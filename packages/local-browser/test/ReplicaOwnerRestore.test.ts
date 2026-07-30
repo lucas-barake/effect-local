@@ -2,6 +2,7 @@ import { NodeCrypto } from "@effect/platform-node"
 import { assert, it } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
@@ -72,6 +73,7 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
   const ownerLayer = (replicaService: Replica.Replica["Service"] = replica) =>
     ReplicaOwner.layerHandlers(definition).pipe(
       Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
       Layer.provide(Layer.merge(
         Publisher,

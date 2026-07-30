@@ -10,6 +10,7 @@ import * as PeerRelayClientRuntime from "@lucas-barake/effect-local-sql/PeerRela
 import * as PeerRelayOutboxLimits from "@lucas-barake/effect-local-sql/PeerRelayOutboxLimits"
 import * as PeerRelayReceiptLimits from "@lucas-barake/effect-local-sql/PeerRelayReceiptLimits"
 import type * as PeerSession from "@lucas-barake/effect-local-sql/PeerSession"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as ReplicaGate from "@lucas-barake/effect-local-sql/ReplicaGate"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -22,7 +23,6 @@ import * as Layer from "effect/Layer"
 import * as Redacted from "effect/Redacted"
 import * as Stream from "effect/Stream"
 import { Atom } from "effect/unstable/reactivity"
-import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import { AddLabel, definition, DomainLive, limits, TaskDocument } from "./domain.ts"
 import { deviceByName, type DeviceIdentity, devices } from "./identities.ts"
@@ -56,11 +56,48 @@ const ReplicaLive = SqlReplica.layerRelayWithBindings(definition, { projections:
   Layer.orDie
 )
 
-const DeviceLive = PeerRelayClientRuntime.layerSql.pipe(Layer.provideMerge(ReplicaLive), Layer.orDie)
+class RelayClient extends Context.Service<RelayClient, PeerRpc.RpcClient>()(
+  "relay-fixture/RelayClient"
+) {}
+
+/**
+ * One socket for the device, not one per session.
+ *
+ * The relay multiplexes sessions over a single connection, so a socket per session pays for a TCP
+ * and WebSocket handshake per document set and gains nothing. The cap that matters is
+ * `maxSessionsPerSubject`, which the relay counts per tenant and subject regardless of how many
+ * connections carry them.
+ *
+ * `RelayConnectionStatus.layerProtocolSocket` rather than the plain Effect one, because
+ * the status reader has to come from the same build as the protocol it is reporting on.
+ *
+ * The socket still has to outlive any session built over it. Providing these around the session
+ * constructor alone built the socket and its pump, handed back a client, then released both when
+ * the constructor returned, leaving every request waiting on a transport that was gone.
+ */
+const RelayLink = Layer.effect(RelayClient)(PeerRpc.makeRpcClient).pipe(
+  Layer.provideMerge(RelayConnectionStatus.layerProtocolSocket()),
+  Layer.provide(BrowserSocket.layerWebSocket(relayUrl)),
+  Layer.provide(RpcSerialization.layerJson),
+  Layer.provide(PeerAuthentication.layerClient),
+  Layer.provide(
+    Layer.succeed(PeerCredentials.PeerCredentials)({
+      get: Effect.succeed(Redacted.make(identity.token))
+    })
+  )
+)
+
+const DeviceLive = PeerRelayClientRuntime.layerSql.pipe(
+  Layer.provideMerge(ReplicaLive),
+  Layer.provideMerge(RelayLink),
+  Layer.orDie
+)
 
 const runtime = Atom.runtime(DeviceLive)
 
 export const peerConnectionStatus = ReplicaAtom.peerConnectionStatus(runtime, remote.principal.peerId)
+
+export const relayConnectionStatus = ReplicaAtom.relayConnectionStatus(runtime)
 
 /**
  * The documents this device syncs with its peer, as a stable key.
@@ -182,28 +219,18 @@ class RelaySession extends Context.Service<RelaySession, PeerSession.SupervisedP
 ) {}
 
 /**
- * The transport layers wrap the whole session, not just `makeRpcClient`. Providing them around the
- * constructor alone builds the socket and its pump, hands back a client, then releases both when
- * the constructor returns, leaving every request waiting forever on a transport that is gone.
+ * `makeSession` stays here rather than moving up with the socket. Opening a session is what
+ * registers the peer attempt, so hoisting it would report a peer as connecting before the page has
+ * asked to sync anything.
  */
 const layerSession = (documentIds: ReadonlyArray<Identity.DocumentId>) =>
   Layer.effect(RelaySession)(
     Effect.gen(function*() {
       const gate = yield* ReplicaGate.ReplicaGate
       const incarnation = (yield* gate.current).incarnation
-      const client = yield* PeerRpc.makeRpcClient
+      const client = yield* RelayClient
       return yield* RpcPeerTransport.makeSession(client, transportOptions(identity, documentIds, incarnation))
     })
-  ).pipe(
-    Layer.provide(RpcClient.layerProtocolSocket()),
-    Layer.provide(BrowserSocket.layerWebSocket(relayUrl)),
-    Layer.provide(RpcSerialization.layerJson),
-    Layer.provide(PeerAuthentication.layerClient),
-    Layer.provide(
-      Layer.succeed(PeerCredentials.PeerCredentials)({
-        get: Effect.succeed(Redacted.make(identity.token))
-      })
-    )
   )
 
 /**

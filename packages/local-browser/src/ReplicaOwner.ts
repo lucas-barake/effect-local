@@ -1,5 +1,6 @@
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as Backup from "@lucas-barake/effect-local/Backup"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import type * as Document from "@lucas-barake/effect-local/Document"
@@ -44,6 +45,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
     const restoreTransport = yield* RestoreTransport.RestoreTransport
     const commits = yield* CommitPublisher.CommitPublisher
     const peerConnections = yield* PeerConnectionStatus.PeerConnectionStatus
+    const relayConnection = yield* RelayConnectionStatus.RelayConnectionStatus
     const crypto = yield* Crypto.Crypto
     const ownerEpoch = yield* crypto.randomUUIDv4.pipe(
       Effect.mapError((cause) =>
@@ -248,6 +250,12 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           sessionId,
           client.id,
           peerConnections.status(peerId).pipe(Stream.withSpan("ReplicaOwner.peerConnectionStatus"))
+        ),
+      RelayConnectionStatus: ({ sessionId }, { client }) =>
+        sessions.stream(
+          sessionId,
+          client.id,
+          relayConnection.status.pipe(Stream.withSpan("ReplicaOwner.relayConnectionStatus"))
         ),
       ExportBackup: ({ maxBytes, sessionId }, { client }) =>
         sessions.stream(

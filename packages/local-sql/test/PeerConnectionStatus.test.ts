@@ -53,18 +53,33 @@ describe("PeerConnectionStatus", () => {
   // than a final status, and if it never ended the fiber would leak past its own Layer.
   it.effect("delivers a terminal status and ends cleanly when the Layer scope closes", () =>
     Effect.gen(function*() {
-      const scope = yield* Scope.make()
-      const context = yield* Scope.provide(Layer.build(PeerConnectionStatus.layer), scope)
+      // Two scopes, and the split is load-bearing. If the attempt's own finalizer ran first it would
+      // publish `Disconnected` itself, the terminal value would dedupe away, and the concat that
+      // produces it would go untested.
+      const layerScope = yield* Scope.make()
+      const attemptScope = yield* Scope.make()
+      const context = yield* Scope.provide(Layer.build(PeerConnectionStatus.layer), layerScope)
       const service = Context.get(context, PeerConnectionStatus.PeerConnectionStatus)
+      const reporter = Context.get(context, PeerConnectionStatus.Reporter)
       const seen = yield* Queue.unbounded<PeerConnectionStatus.Status>()
+      yield* Effect.addFinalizer(() => Queue.shutdown(seen))
       const fiber = yield* Stream.runForEach(service.status(peerId), (status) => Queue.offer(seen, status))
         .pipe(Effect.forkChild)
 
       assert.deepStrictEqual(yield* Queue.take(seen), PeerConnectionStatus.disconnected)
-      yield* Scope.close(scope, Exit.void)
+      const attempt = yield* Scope.provide(reporter.connecting(peerId), attemptScope)
+      yield* attempt.connected
+      assert.deepStrictEqual(yield* Queue.take(seen), PeerConnectionStatus.connecting)
+      assert.deepStrictEqual(yield* Queue.take(seen), PeerConnectionStatus.connected)
+
+      yield* Scope.close(layerScope, Exit.void)
 
       yield* Fiber.join(fiber)
-    }))
+      // The peer was Connected, so a terminal Disconnected is a real transition rather than a
+      // repeat of the seed that `changesWith` would swallow.
+      assert.deepStrictEqual(yield* Queue.poll(seen), Option.some(PeerConnectionStatus.disconnected))
+      yield* Scope.close(attemptScope, Exit.void)
+    }).pipe(Effect.scoped))
 
   // The Reporter and the reader are two projections of one owner, so they have to come from one
   // build. `Layer.merge` cannot expose this: it ends in `Context.mergeAll`, which is last write wins

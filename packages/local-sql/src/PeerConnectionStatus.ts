@@ -9,15 +9,14 @@ import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
-import * as InternalConnectionStatus from "./internal/connectionStatus.js"
 
-export const Disconnected = InternalConnectionStatus.Disconnected
+export const Disconnected = Schema.TaggedStruct("Disconnected", {})
 export type Disconnected = typeof Disconnected.Type
 
-export const Connecting = InternalConnectionStatus.Connecting
+export const Connecting = Schema.TaggedStruct("Connecting", {})
 export type Connecting = typeof Connecting.Type
 
-export const Connected = InternalConnectionStatus.Connected
+export const Connected = Schema.TaggedStruct("Connected", {})
 export type Connected = typeof Connected.Type
 
 /**
