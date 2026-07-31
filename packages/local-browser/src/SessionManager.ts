@@ -42,6 +42,13 @@ export class SessionManager extends Context.Service<SessionManager, {
   readonly maxRestorePullMillis: number
   readonly maxRestoreCoalesceMillis: number
   readonly maxRestoreErrorBytes: number
+  readonly conflictLimits: {
+    readonly maxConflictDepth: number
+    readonly maxConflictNodes: number
+    readonly maxConflictAlternatives: number
+    readonly maxConflictPathSegments: number
+    readonly maxConflictValueBytes: number
+  }
   readonly open: (sessionId: Identity.SessionId, clientId: number) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly renew: (sessionId: Identity.SessionId, clientId: number) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly close: (sessionId: Identity.SessionId, clientId: number) => Effect.Effect<void, ReplicaError.ReplicaError>
@@ -367,6 +374,13 @@ export const layer = Layer.effect(
       maxRestorePullMillis: limits.maxRestorePullMillis,
       maxRestoreCoalesceMillis: limits.maxRestoreCoalesceMillis,
       maxRestoreErrorBytes: limits.maxRestoreErrorBytes,
+      conflictLimits: {
+        maxConflictDepth: limits.maxConflictDepth,
+        maxConflictNodes: limits.maxConflictNodes,
+        maxConflictAlternatives: limits.maxConflictAlternatives,
+        maxConflictPathSegments: limits.maxConflictPathSegments,
+        maxConflictValueBytes: limits.maxConflictValueBytes
+      },
       open: Effect.fnUntraced(function*(sessionId, clientId) {
         const now = yield* Clock.currentTimeMillis
         const inFlight = yield* Semaphore.make(limits.maxInFlightPerSession)

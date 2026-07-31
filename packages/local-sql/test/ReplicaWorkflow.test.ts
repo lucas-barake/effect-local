@@ -72,6 +72,14 @@ describe("ReplicaWorkflow", () => {
     maxChunkBytes: 64_000,
     maxArchiveRecords: 1_000,
     maxJsonDepth: 32,
+    maxConflictDepth: 64,
+    maxConflictNodes: 100_000,
+    maxConflictAlternatives: 10_000,
+    maxConflictPathSegments: 128,
+    maxConflictValueBytes: 16 * 1024 * 1024,
+    maxConflictSourceChanges: 100_000,
+    maxConflictSourceOperations: 100_000,
+    maxConflictSourceBytes: 64 * 1024 * 1024,
     maxSyncMessageBytes: 64_000,
     maxPeerSendMillis: 1_000,
     maxSyncChangesPerMessage: 100,
@@ -100,9 +108,11 @@ describe("ReplicaWorkflow", () => {
     maxRestoreErrorBytes: 4_096
   })
   const Gate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(Layer.merge(Database, Bootstrap)))
-  const Store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Database, Gate)))
+  const Store = DocumentStore.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate, Limits)))
   const RecoveryService = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate)))
-  const CompactionService = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate, RecoveryService)))
+  const CompactionService = Compaction.layer.pipe(
+    Layer.provide(Layer.mergeAll(Database, Gate, RecoveryService, Limits))
+  )
   const Inputs = Layer.mergeAll(Database, Bootstrap, Limits, Gate, Store, RecoveryService, CompactionService)
   /** The same expression `DurableRuntime` builds the workflow branch's engine from. */
   const Cluster = ClusterWorkflowEngine.layer.pipe(Layer.provideMerge(ClusterStorage.layer))

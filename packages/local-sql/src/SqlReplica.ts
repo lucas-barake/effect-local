@@ -5,7 +5,7 @@ import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
-import type * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import type { ConfigError } from "effect/Config"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
@@ -15,7 +15,7 @@ import * as Schema from "effect/Schema"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import type * as Migrator from "effect/unstable/sql/Migrator"
-import type * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as BackupStore from "./BackupStore.js"
 import * as CommandDeliveryPublisher from "./CommandDeliveryPublisher.js"
@@ -27,6 +27,7 @@ import * as DocumentStore from "./DocumentStore.js"
 import * as DurableRuntime from "./DurableRuntime.js"
 import * as EntityReplica from "./EntityReplica.js"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as InternalConflicts from "./internal/conflicts.js"
 import * as PeerConnectionStatus from "./PeerConnectionStatus.js"
 import type * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
 import type * as PeerSync from "./PeerSync.js"
@@ -59,6 +60,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
   | QueryExecutor.QueryExecutor
   | ReplicaGate.ReplicaGate
   | ReplicaHealth.ReplicaHealth
+  | ReplicaLimits.ReplicaLimits
   | Crypto.Crypto
 > =>
   Layer.effect(
@@ -73,6 +75,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
       const queries = yield* QueryExecutor.QueryExecutor
       const gate = yield* ReplicaGate.ReplicaGate
       const health = yield* ReplicaHealth.ReplicaHealth
+      const limits = yield* ReplicaLimits.ReplicaLimits
       const crypto = yield* Crypto.Crypto
 
       const withPermit = <A, E, R,>(f: (permit: ReplicaGate.Permit) => Effect.Effect<A, E, R>) =>
@@ -104,6 +107,60 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
               (stored) => Effect.succeed(stored.snapshot),
               (stored) => Effect.sync(() => InternalAutomerge.free(stored.automerge))
             )
+          ),
+        inspectConflicts: (document, documentId) =>
+          withPermit(() =>
+            Effect.acquireUseRelease(
+              documents.loadConflictSource(document, documentId),
+              (source) =>
+                InternalConflicts.inspect(source.stored.automerge, limits).pipe(
+                  Effect.map((conflicts) => ({ snapshot: source.stored.snapshot, conflicts }))
+                ),
+              (source) => Effect.sync(() => InternalAutomerge.free(source.stored.automerge))
+            )
+          ).pipe(
+            Effect.withSpan("SqlReplica.inspectConflicts", {
+              attributes: { "document.type": document.name }
+            })
+          ),
+        resolveConflict: (document, options) =>
+          withPermit((permit) =>
+            Effect.gen(function*() {
+              const resolution = yield* InternalConflicts.encodeResolutionCanonical(options.resolution)
+              const requestHash = yield* CommandExecutor.resolutionRequestHash({
+                incarnation: permit.incarnation,
+                commandId: options.commandId,
+                document,
+                documentId: options.documentId,
+                resolution
+              }).pipe(Effect.provideService(Crypto.Crypto, crypto))
+              const outcome = yield* commands.resolve(document, {
+                ...options,
+                permit,
+                requestHash
+              })
+              yield* CommandOutcome.committedOrFail(outcome)
+              yield* publisher.publishPending.pipe(
+                Effect.mapError((cause) =>
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.CommandOutcomeUnknown({
+                      commandId: options.commandId,
+                      cause
+                    })
+                  })
+                )
+              )
+              yield* deliveryPublisher.publishPending.pipe(Effect.catchTag("ReplicaError", () => Effect.void))
+              return undefined
+            })
+          ).pipe(
+            Effect.withSpan("SqlReplica.resolveConflict", {
+              attributes: {
+                "document.type": document.name,
+                "conflict.choice": options.resolution.choice._tag,
+                "conflict.path_depth": options.resolution.path.parents.length + 1
+              }
+            })
           ),
         mutate: <M extends Mutation.Any,>(mutation: M, options: {
           readonly commandId: Identity.CommandId
@@ -156,6 +213,16 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
           withPermit((permit) => commands.lookupMutation(mutation, commandId, permit)),
         lookupCreate: (_document, commandId) => withPermit((permit) => commands.lookupCreate(commandId, permit)),
         lookupDelete: (_document, commandId) => withPermit((permit) => commands.lookupDelete(commandId, permit)),
+        lookupConflictResolution: (document, options) =>
+          withPermit((permit) => commands.lookupResolution(document, { ...options, permit })).pipe(
+            Effect.withSpan("SqlReplica.lookupConflictResolution", {
+              attributes: {
+                "document.type": document.name,
+                "conflict.choice": options.resolution.choice._tag,
+                "conflict.path_depth": options.resolution.path.parents.length + 1
+              }
+            })
+          ),
         lookupCommandDelivery: (commandId) => deliveries.lookup(commandId),
         commandDeliveryChanges: (commandId) => deliveryPublisher.changes(commandId),
         flush: withPermit(() =>
@@ -205,7 +272,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
     })
   )
 
-const makeBase = <
+export const servicesLayer = <
   D extends ReplicaDefinition.Any,
   const Bindings extends ReadonlyArray<SqlProjection.Any>,
 >(
@@ -244,13 +311,16 @@ const makeBase = <
   const backups = BackupStore.layer(definition).pipe(
     Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
   )
+  // Retain the client so service-level consumers observe the same database instance as the graph.
+  const sql = Layer.effect(SqlClient.SqlClient, SqlClient.SqlClient)
   const infrastructure = Layer.mergeAll(
     backups,
     compaction,
     deliveryStore,
-    deliveryPublisher
+    deliveryPublisher,
+    sql
   )
-  return { infrastructure, connections: PeerConnectionStatus.layer }
+  return infrastructure
 }
 
 export const layer = <D extends ReplicaDefinition.Any, const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
@@ -278,13 +348,12 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   | Crypto.Crypto
   | SqlClient.SqlClient
 > => {
-  const { connections, infrastructure } = makeBase(definition, options)
   const durable = DurableRuntime.layer(definition).pipe(
-    Layer.provideMerge(infrastructure)
+    Layer.provideMerge(servicesLayer(definition, options))
   )
   return Layer.mergeAll(
     EntityReplica.layer(definition).pipe(Layer.provideMerge(durable)),
-    connections,
+    PeerConnectionStatus.layer,
     // A direct replica has no relay, and that is a fact rather than a missing dependency, so it is
     // answered here instead of being pushed onto every consumer. `layerRelay` deliberately does not
     // provide it: a relay replica has to compose `RelayConnectionStatus.layerProtocolSocket` with
@@ -321,13 +390,12 @@ export const layerRelay = <
   | Crypto.Crypto
   | SqlClient.SqlClient
 > => {
-  const { connections, infrastructure } = makeBase(definition, options)
   const durable = DurableRuntime.layerRelay(definition).pipe(
-    Layer.provideMerge(infrastructure)
+    Layer.provideMerge(servicesLayer(definition, options))
   )
   return Layer.merge(
     EntityReplica.layer(definition).pipe(Layer.provideMerge(durable)),
-    connections
+    PeerConnectionStatus.layer
   )
 }
 
@@ -339,6 +407,14 @@ export const layerRelay = <
  */
 const bindingLayers = (projections: ReadonlyArray<SqlProjection.Any>) =>
   Layer.mergeAll(Layer.empty, ...projections.map((binding) => binding.layer))
+
+export const servicesLayerWithBindings = <
+  D extends ReplicaDefinition.Any,
+  const Bindings extends ReadonlyArray<SqlProjection.Any>,
+>(
+  definition: D,
+  options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
+) => servicesLayer(definition, options).pipe(Layer.provide(bindingLayers(options.projections)))
 
 export const layerWithBindings = <
   D extends ReplicaDefinition.Any,

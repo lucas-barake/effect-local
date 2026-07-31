@@ -1,6 +1,7 @@
 import * as Automerge from "@automerge/automerge"
 import * as Backup from "@lucas-barake/effect-local/Backup"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
+import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -19,6 +20,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as InternalAutomerge from "./internal/automerge.js"
 import * as ClusterStorage from "./internal/clusterStorage.js"
+import * as HistoryCounters from "./internal/historyCounters.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as ProjectionStore from "./ProjectionStore.js"
 import * as Recovery from "./Recovery.js"
@@ -46,7 +48,10 @@ const DocumentRecord = Schema.Struct({
   tombstone: Schema.Int,
   projection_status: Schema.String,
   checkpoint_hash: Schema.NullOr(Schema.String),
-  lineage: Identity.DocumentLineage
+  lineage: Identity.DocumentLineage,
+  history_changes: Schema.optionalKey(Schema.Unknown),
+  history_operations: Schema.optionalKey(Schema.Unknown),
+  history_bytes: Schema.optionalKey(Schema.Unknown)
 })
 
 const ChangeRecord = Schema.Struct({
@@ -227,7 +232,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             (SELECT COALESCE(SUM(
               length(document_id) + length(document_type) + length(observed_versions) +
               length(materialized_heads) + length(accepted_heads) + length(projection_status) +
-              length(COALESCE(checkpoint_hash, '')) + length(lineage)
+              length(COALESCE(checkpoint_hash, '')) + length(lineage) +
+              length(COALESCE(CAST(history_changes AS TEXT), '')) +
+              length(COALESCE(CAST(history_operations AS TEXT), '')) +
+              length(COALESCE(CAST(history_bytes AS TEXT), ''))
             ), 0) FROM effect_local_documents) +
             (SELECT COALESCE(SUM(
               length(change_hash) + length(document_id) + length(document_type) +
@@ -623,12 +631,16 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   try: () => {
                     const changeHashes = WriterProvenance.changeHashes(document)
                     const stored = changeProvenanceByDocument.get(record.value.document_id) ?? []
+                    const storedDocument = documentById.get(record.value.document_id)
+                    if (storedDocument === undefined) {
+                      throw new TypeError(`Checkpoint references unknown document ${record.value.document_id}`)
+                    }
                     const provenance = record.value.writer_provenance ??
                       WriterProvenance.backfill(
                         changeHashes,
                         stored,
                         {
-                          writerSchemaVersion: documentById.get(record.value.document_id)!.schema_version,
+                          writerSchemaVersion: storedDocument.schema_version,
                           writerDefinitionHash: manifest.definitionHash
                         }
                       )
@@ -647,6 +659,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               (document) => Effect.sync(() => InternalAutomerge.free(document))
             )
           })
+          const metadataByChange = new Map<string, {
+            readonly dependencies: ReadonlyArray<string>
+            readonly operations: number
+          }>()
           for (const record of decoded) {
             switch (record.kind) {
               case "Document": {
@@ -664,7 +680,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               }
               case "Change": {
                 const decodedChange = yield* Effect.try({
-                  try: () => InternalAutomerge.decode(record.value.bytes),
+                  try: () => Automerge.decodeChange(record.value.bytes),
                   catch: (cause) =>
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.BackupInvalid({
@@ -677,8 +693,8 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   (record.value.applied !== 0 && record.value.applied !== 1) ||
                   decodedChange.hash !== record.value.change_hash ||
                   decodedChange.actor !== record.value.actor ||
-                  decodedChange.sequence !== record.value.sequence ||
-                  Schema.encodeSync(JsonString)(decodedChange.dependencies) !== record.value.dependencies
+                  decodedChange.seq !== record.value.sequence ||
+                  Schema.encodeSync(JsonString)(decodedChange.deps) !== record.value.dependencies
                 ) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.BackupInvalid({
@@ -686,6 +702,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                     })
                   })
                 }
+                metadataByChange.set(record.value.change_hash, {
+                  dependencies: decodedChange.deps,
+                  operations: decodedChange.ops.length
+                })
                 break
               }
               case "Checkpoint": {
@@ -738,6 +758,66 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 break
               }
             }
+          }
+          const checkpointDocuments = new Set(
+            decoded.flatMap((record) => record.kind === "Checkpoint" ? [record.value.document_id] : [])
+          )
+          const changesByDocument = new Map<string, Array<typeof StoredChangeRecord.Type>>()
+          for (const record of decoded) {
+            if (record.kind !== "Change") continue
+            const changes = changesByDocument.get(record.value.document_id)
+            if (changes === undefined) changesByDocument.set(record.value.document_id, [record.value])
+            else changes.push(record.value)
+          }
+          const historyByDocument = new Map<string, HistoryCounters.HistoryCounters | null>()
+          for (const document of documentById.values()) {
+            const changes = changesByDocument.get(document.document_id) ?? []
+            const complete = yield* Effect.try({
+              try: () => {
+                const appliedHashes = new Set(
+                  changes.flatMap((change) => change.applied === 1 ? [change.change_hash] : [])
+                )
+                const dependencies = new Set<string>()
+                for (const change of changes) {
+                  if (change.applied !== 1) continue
+                  for (const dependency of metadataByChange.get(change.change_hash)!.dependencies) {
+                    if (!appliedHashes.has(dependency)) return false
+                    dependencies.add(dependency)
+                  }
+                }
+                const observedHeads = [...appliedHashes]
+                  .filter((hash) => !dependencies.has(hash))
+                  .toSorted(Conflict.compareCodeUnits)
+                const expectedHeads = Schema.decodeSync(
+                  Schema.fromJsonString(Schema.Array(Schema.String))
+                )(document.materialized_heads).toSorted(Conflict.compareCodeUnits)
+                return observedHeads.length === expectedHeads.length &&
+                  observedHeads.every((head, index) => head === expectedHeads[index])
+              },
+              catch: (cause) =>
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.BackupInvalid({ cause })
+                })
+            }).pipe(Effect.catch(() => Effect.succeed(false)))
+            if (!complete) {
+              if (checkpointDocuments.has(document.document_id)) {
+                historyByDocument.set(document.document_id, null)
+                continue
+              }
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.BackupInvalid({
+                  cause: new Error(`Incomplete retained history for ${document.document_id}`)
+                })
+              })
+            }
+            const counters = yield* HistoryCounters.check(
+              HistoryCounters.measureDecoded(changes.map((change) => ({
+                bytes: change.bytes,
+                operations: metadataByChange.get(change.change_hash)!.operations
+              }))),
+              limits
+            )
+            historyByDocument.set(document.document_id, counters)
           }
           const nextReplicaId = options.mode === "clone"
             ? yield* Identity.makeReplicaId.pipe(
@@ -813,7 +893,15 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 yield* projections.clear
                 yield* sql`DELETE FROM effect_local_documents`
                 const documents = decoded.flatMap((record) =>
-                  record.kind === "Document" ? [{ ...record.value, projection_status: "Ready" }] : []
+                  record.kind === "Document"
+                    ? [{
+                      ...record.value,
+                      projection_status: "Ready",
+                      history_changes: historyByDocument.get(record.value.document_id)?.changes ?? null,
+                      history_operations: historyByDocument.get(record.value.document_id)?.operations ?? null,
+                      history_bytes: historyByDocument.get(record.value.document_id)?.bytes ?? null
+                    }]
+                    : []
                 )
                 const changes = decoded.flatMap((record) => record.kind === "Change" ? [record.value] : [])
                 const checkpoints = decoded.flatMap((record) =>

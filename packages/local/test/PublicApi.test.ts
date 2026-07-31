@@ -9,6 +9,7 @@ describe("public API", () => {
       "CommandDelivery",
       "CommandOutcome",
       "Commit",
+      "Conflict",
       "Document",
       "DocumentSet",
       "Identity",

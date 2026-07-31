@@ -1,4 +1,6 @@
 import * as Automerge from "@automerge/automerge"
+import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
@@ -20,6 +22,7 @@ export const documentLineageChecksum = "sha256:effect-local-document-lineage-v1"
 export const historyRewriteMarkersChecksum = "sha256:effect-local-history-rewrite-markers-v1"
 export const peerRelayStateChecksum = "sha256:effect-local-peer-relay-state-v3"
 export const commandDeliveryChecksum = "sha256:effect-local-command-delivery-v1"
+export const documentHistoryCountersChecksum = "sha256:effect-local-document-history-counters-v1"
 
 const migration = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
@@ -642,6 +645,267 @@ const peerRelayStateMigration = Effect.gen(function*() {
     VALUES (10, 'peer_relay_state', ${peerRelayStateChecksum})`
 })
 
+const documentHistoryCountersMigration = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+  const DocumentPageRow = Schema.Struct({
+    document_id: Schema.String,
+    document_type: Schema.String,
+    materialized_heads: Schema.String,
+    page_rowid: Schema.Int
+  })
+  const RawDocumentPageRow = Schema.Struct({
+    document_id: Schema.Unknown,
+    document_type: Schema.Unknown,
+    materialized_heads: Schema.Unknown,
+    page_rowid: Schema.Int
+  })
+  const HistoryAggregateRow = Schema.Struct({
+    change_bytes: NonNegativeInt,
+    change_count: NonNegativeInt,
+    document_id: Schema.String
+  })
+  const RetainedChangeRow = Schema.Struct({
+    applied: Schema.Int,
+    actor: Schema.String,
+    bytes: Schema.Uint8Array,
+    change_hash: WriterProvenance.ChangeHash,
+    dependencies: Schema.String,
+    document_id: Schema.String,
+    document_type: Schema.String,
+    sequence: Schema.Int
+  })
+  const RawRetainedChangeRow = Schema.Struct({
+    applied: Schema.Unknown,
+    actor: Schema.Unknown,
+    bytes: Schema.Unknown,
+    change_hash: Schema.Unknown,
+    dependencies: Schema.Unknown,
+    document_id: Schema.String,
+    document_type: Schema.Unknown,
+    sequence: Schema.Unknown
+  })
+  const findDocumentPage = SqlSchema.findAll({
+    Request: Schema.Struct({
+      after: Schema.NullOr(Schema.Int),
+      limit: Schema.Int
+    }),
+    Result: RawDocumentPageRow,
+    execute: ({ after, limit }) =>
+      after === null
+        ? sql`SELECT rowid AS page_rowid, document_id, document_type, materialized_heads
+          FROM effect_local_documents
+          ORDER BY rowid
+          LIMIT ${limit}`
+        : sql`SELECT rowid AS page_rowid, document_id, document_type, materialized_heads
+          FROM effect_local_documents
+          WHERE rowid > ${after}
+          ORDER BY rowid
+          LIMIT ${limit}`
+  })
+  const findHistoryAggregates = SqlSchema.findAll({
+    Request: Schema.Array(Schema.String),
+    Result: HistoryAggregateRow,
+    execute: (documentIds) =>
+      sql`SELECT
+          document_id,
+          COUNT(change_hash) AS change_count,
+          COALESCE(SUM(length(bytes)), 0) AS change_bytes
+        FROM effect_local_changes
+        WHERE ${sql.in("document_id", documentIds)}
+        GROUP BY document_id`
+  })
+  const findRetainedChanges = SqlSchema.findAll({
+    Request: Schema.Array(Schema.String),
+    Result: RawRetainedChangeRow,
+    execute: (documentIds) =>
+      sql`SELECT applied, actor, bytes, change_hash, dependencies, document_id, document_type, sequence
+        FROM effect_local_changes
+        WHERE ${sql.in("document_id", documentIds)}
+        ORDER BY document_id, commit_sequence, sequence, change_hash`
+  })
+  const decodeDocumentPageRow = Schema.decodeUnknownEffect(DocumentPageRow)
+  const decodeRetainedChanges = Schema.decodeUnknownEffect(Schema.mutable(Schema.Array(RetainedChangeRow)))
+  const transitionStorageFormat = SqlSchema.findOneOption({
+    Request: Schema.Void,
+    Result: Schema.Struct({ writer_generation: Identity.WriterGeneration }),
+    execute: () =>
+      sql`UPDATE effect_local_metadata SET
+          storage_format_version = 2,
+          writer_generation = writer_generation + 1
+        WHERE singleton = 1 AND storage_format_version = 1
+        RETURNING writer_generation`
+  })
+  yield* sql`ALTER TABLE effect_local_documents
+    ADD COLUMN history_changes INTEGER CHECK (history_changes IS NULL OR history_changes >= 0)`
+  yield* sql`ALTER TABLE effect_local_documents
+    ADD COLUMN history_operations INTEGER CHECK (history_operations IS NULL OR history_operations >= 0)`
+  yield* sql`ALTER TABLE effect_local_documents
+    ADD COLUMN history_bytes INTEGER CHECK (history_bytes IS NULL OR history_bytes >= 0)`
+  yield* sql`CREATE TEMP TABLE effect_local_history_counter_backfill (
+    document_id TEXT PRIMARY KEY,
+    history_changes INTEGER NOT NULL,
+    history_operations INTEGER NOT NULL,
+    history_bytes INTEGER NOT NULL
+  )`
+
+  const pageSize = 64
+  const decodeHeads = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Array(Schema.String)))
+  type DocumentPageEntry = typeof DocumentPageRow.Type & {
+    readonly change_bytes: number
+    readonly change_count: number
+  }
+  let after: number | null = null
+  while (true) {
+    const page: Array<typeof RawDocumentPageRow.Type> = yield* findDocumentPage({ after, limit: pageSize })
+    if (page.length === 0) break
+    after = page.at(-1)!.page_rowid
+    const decodedPage: Array<typeof DocumentPageRow.Type> = []
+    for (const document of page) {
+      const decoded = yield* Effect.option(decodeDocumentPageRow(document))
+      if (Option.isSome(decoded)) decodedPage.push(decoded.value)
+    }
+    const aggregates = decodedPage.length === 0
+      ? []
+      : yield* findHistoryAggregates(decodedPage.map((document) => document.document_id))
+    const aggregateByDocument = new Map(aggregates.map((aggregate) => [aggregate.document_id, aggregate]))
+    const documents: Array<DocumentPageEntry> = decodedPage.map((document) => {
+      const aggregate = aggregateByDocument.get(document.document_id)
+      return {
+        change_bytes: aggregate?.change_bytes ?? 0,
+        change_count: aggregate?.change_count ?? 0,
+        document_id: document.document_id,
+        document_type: document.document_type,
+        materialized_heads: document.materialized_heads,
+        page_rowid: document.page_rowid
+      }
+    })
+
+    const eligible: Array<DocumentPageEntry> = documents.filter((document) =>
+      document.change_count <= ReplicaLimits.maxConflictSourceChangesHardLimit &&
+      document.change_bytes <= ReplicaLimits.maxConflictSourceBytesHardLimit
+    )
+    const batches: Array<Array<DocumentPageEntry>> = []
+    let batch: Array<DocumentPageEntry> = []
+    let batchChanges = 0
+    let batchBytes = 0
+    for (const document of eligible) {
+      if (
+        batch.length > 0 &&
+        (
+          batchChanges + document.change_count > ReplicaLimits.maxConflictSourceChangesHardLimit ||
+          batchBytes + document.change_bytes > ReplicaLimits.maxConflictSourceBytesHardLimit
+        )
+      ) {
+        batches.push(batch)
+        batch = []
+        batchChanges = 0
+        batchBytes = 0
+      }
+      batch.push(document)
+      batchChanges += document.change_count
+      batchBytes += document.change_bytes
+    }
+    if (batch.length > 0) batches.push(batch)
+
+    for (const documentBatch of batches) {
+      const changes = yield* findRetainedChanges(documentBatch.map((document) => document.document_id))
+      const changesByDocument = new Map<string, Array<typeof RawRetainedChangeRow.Type>>()
+      for (const change of changes) {
+        const current = changesByDocument.get(change.document_id)
+        if (current === undefined) changesByDocument.set(change.document_id, [change])
+        else current.push(change)
+      }
+      const backfilled: Array<{
+        readonly document_id: string
+        readonly history_bytes: number
+        readonly history_changes: number
+        readonly history_operations: number
+      }> = []
+      for (const document of documentBatch) {
+        const rawRetained = changesByDocument.get(document.document_id) ?? []
+        const counters = yield* Effect.option(Effect.gen(function*() {
+          const retained = yield* decodeRetainedChanges(rawRetained)
+          return yield* Effect.try({
+            try: () => {
+              let operations = 0
+              for (const change of retained) {
+                const decoded = Automerge.decodeChange(change.bytes)
+                operations += decoded.ops.length
+                if (
+                  operations > ReplicaLimits.maxConflictSourceOperationsHardLimit ||
+                  (change.applied !== 0 && change.applied !== 1) ||
+                  change.document_type !== document.document_type ||
+                  decoded.hash !== change.change_hash ||
+                  decoded.actor !== change.actor ||
+                  decoded.seq !== change.sequence ||
+                  JSON.stringify(decoded.deps) !== change.dependencies
+                ) throw new TypeError(`Invalid retained change ${change.change_hash}`)
+              }
+
+              let recovered = Automerge.init()
+              try {
+                const applied = retained.filter((change) => change.applied === 1)
+                if (applied.length > 0) {
+                  recovered = Automerge.applyChanges(recovered, applied.map((change) => change.bytes))[0]
+                }
+                const expectedHeads = decodeHeads(document.materialized_heads)
+                const observedHeads = Automerge.getHeads(recovered)
+                if (
+                  observedHeads.length !== expectedHeads.length ||
+                  !Automerge.hasHeads(recovered, [...expectedHeads])
+                ) throw new TypeError(`Incomplete retained history for ${document.document_id}`)
+                return {
+                  document_id: document.document_id,
+                  history_bytes: document.change_bytes,
+                  history_changes: retained.length,
+                  history_operations: operations
+                }
+              } finally {
+                Automerge.free(recovered)
+              }
+            },
+            catch: (cause) => cause
+          })
+        }))
+        if (Option.isSome(counters)) backfilled.push(counters.value)
+      }
+      if (backfilled.length > 0) {
+        yield* sql`INSERT INTO effect_local_history_counter_backfill ${sql.insert(backfilled)}`
+      }
+      yield* Effect.yieldNow
+    }
+    yield* sql`UPDATE effect_local_documents SET
+      history_changes = (
+        SELECT history_changes FROM effect_local_history_counter_backfill AS backfill
+        WHERE backfill.document_id = effect_local_documents.document_id
+      ),
+      history_operations = (
+        SELECT history_operations FROM effect_local_history_counter_backfill AS backfill
+        WHERE backfill.document_id = effect_local_documents.document_id
+      ),
+      history_bytes = (
+        SELECT history_bytes FROM effect_local_history_counter_backfill AS backfill
+        WHERE backfill.document_id = effect_local_documents.document_id
+      )
+      WHERE document_id IN (SELECT document_id FROM effect_local_history_counter_backfill)`
+    yield* sql`DELETE FROM effect_local_history_counter_backfill`
+    if (page.length < pageSize) break
+  }
+
+  yield* sql`DROP TABLE effect_local_history_counter_backfill`
+  const transition = yield* transitionStorageFormat(undefined)
+  if (Option.isSome(transition)) {
+    yield* sql`INSERT INTO effect_local_writer_generations (generation, claimed_at)
+      VALUES (
+        ${transition.value.writer_generation},
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      )`
+  }
+  yield* sql`INSERT INTO effect_local_migration_catalog (migration_id, name, checksum)
+    VALUES (12, 'document_history_counters', ${documentHistoryCountersChecksum})`
+})
+
 const commandDeliveryMigration = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
   yield* sql`CREATE TABLE effect_local_command_delivery_sources (
@@ -836,7 +1100,8 @@ export const loader = Migrator.fromRecord({
   "8_document_lineage": documentLineageMigration,
   "9_history_rewrite_markers": historyRewriteMarkersMigration,
   "10_peer_relay_state": peerRelayStateMigration,
-  "11_command_delivery": commandDeliveryMigration
+  "11_command_delivery": commandDeliveryMigration,
+  "12_document_history_counters": documentHistoryCountersMigration
 })
 
 const migrate = Migrator.make({})({ loader, table: "effect_local_migrations" })
@@ -890,6 +1155,12 @@ export const run = Effect.gen(function*() {
       name: "command_delivery",
       checksum: commandDeliveryChecksum,
       label: "Command delivery"
+    },
+    {
+      id: 12,
+      name: "document_history_counters",
+      checksum: documentHistoryCountersChecksum,
+      label: "Document history counters"
     }
   ] as const
   // One transaction over migrate + validation so a rejected catalog rolls back

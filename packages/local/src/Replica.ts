@@ -4,6 +4,7 @@ import type * as Stream from "effect/Stream"
 import type * as Backup from "./Backup.js"
 import type * as CommandDelivery from "./CommandDelivery.js"
 import type * as CommandOutcome from "./CommandOutcome.js"
+import type * as Conflict from "./Conflict.js"
 import type * as Document from "./Document.js"
 import type * as Identity from "./Identity.js"
 import type * as Mutation from "./Mutation.js"
@@ -24,6 +25,21 @@ export class Replica extends Context.Service<Replica, {
     document: D,
     documentId: Identity.DocumentId
   ) => Effect.Effect<Snapshot.FromDocument<D>, ReplicaError.ReplicaError>
+  readonly inspectConflicts: <D extends Document.Any,>(
+    document: D,
+    documentId: Identity.DocumentId
+  ) => Effect.Effect<
+    Conflict.Inspection<D["schema"]["Type"]>,
+    Conflict.InspectionError | ReplicaError.ReplicaError
+  >
+  readonly resolveConflict: <D extends Document.Any,>(
+    document: D,
+    options: {
+      readonly commandId: Identity.CommandId
+      readonly documentId: Identity.DocumentId
+      readonly resolution: Conflict.Resolution
+    }
+  ) => Effect.Effect<void, Conflict.ResolutionError | ReplicaError.ReplicaError>
   readonly mutate: <M extends Mutation.Any,>(
     mutation: M,
     options: {
@@ -61,6 +77,17 @@ export class Replica extends Context.Service<Replica, {
     document: D,
     commandId: Identity.CommandId
   ) => Effect.Effect<CommandOutcome.CommandOutcome<void>, ReplicaError.ReplicaError>
+  readonly lookupConflictResolution: <D extends Document.Any,>(
+    document: D,
+    options: {
+      readonly commandId: Identity.CommandId
+      readonly documentId: Identity.DocumentId
+      readonly resolution: Conflict.Resolution
+    }
+  ) => Effect.Effect<
+    CommandOutcome.CommandOutcome<void, Conflict.ResolutionError>,
+    ReplicaError.ReplicaError
+  >
   readonly lookupCommandDelivery: (
     commandId: Identity.CommandId
   ) => Effect.Effect<CommandDelivery.CommandDelivery, ReplicaError.ReplicaError>

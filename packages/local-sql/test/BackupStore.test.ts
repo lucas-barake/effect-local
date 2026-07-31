@@ -24,11 +24,9 @@ import * as DocumentStore from "../src/DocumentStore.js"
 import * as InternalAutomerge from "../src/internal/automerge.js"
 import * as ClusterStorage from "../src/internal/clusterStorage.js"
 import * as ProjectionStore from "../src/ProjectionStore.js"
-import * as Recovery from "../src/Recovery.js"
-import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
-import * as ReplicaHealth from "../src/ReplicaHealth.js"
 import * as SqlProjection from "../src/SqlProjection.js"
+import * as SqlReplica from "../src/SqlReplica.js"
 
 describe("BackupStore", () => {
   const concatenate = (chunks: ReadonlyArray<Uint8Array>) => {
@@ -84,6 +82,14 @@ describe("BackupStore", () => {
     maxChunkBytes: 64 * 1024,
     maxArchiveRecords: 1000,
     maxJsonDepth: 32,
+    maxConflictDepth: 64,
+    maxConflictNodes: 100_000,
+    maxConflictAlternatives: 10_000,
+    maxConflictPathSegments: 128,
+    maxConflictValueBytes: 16 * 1024 * 1024,
+    maxConflictSourceChanges: 100_000,
+    maxConflictSourceOperations: 100_000,
+    maxConflictSourceBytes: 64 * 1024 * 1024,
     maxSyncMessageBytes: 64 * 1024,
     maxPeerSendMillis: 1_000,
     maxSyncChangesPerMessage: 100,
@@ -115,42 +121,14 @@ describe("BackupStore", () => {
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
     NodeCrypto.layer
   )
-  const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
-  const Base = Layer.merge(Database, Bootstrap)
-  const Gate = ReplicaGate.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)), Layer.provide(Base))
-  const Store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Base, Gate)))
-  const Projections = ProjectionStore.layer([]).pipe(Layer.provide(Base))
   const Limits = ReplicaLimits.layer(limits)
-  const Health = ReplicaHealth.layer(definition, ReplicaHealth.defaultOptions).pipe(
-    Layer.provide(Layer.merge(Base, Gate))
+  const Live = SqlReplica.servicesLayerWithBindings(definition, { projections: [] }).pipe(
+    Layer.provideMerge(Layer.mergeAll(Database, Limits))
   )
-  const Backup = BackupStore.layer(definition).pipe(
-    Layer.provide(Layer.mergeAll(Base, Gate, Limits, Projections, Health))
-  )
-  const Live = Layer.mergeAll(Base, Gate, Store, Limits, Projections, Backup)
-  const RecoveryService = Recovery.layer.pipe(Layer.provide(Live))
-  const CompactionService = Compaction.layer.pipe(Layer.provide(Layer.merge(Live, RecoveryService)))
-  const CompactedLive = Layer.mergeAll(Live, RecoveryService, CompactionService)
-  const ProjectedBootstrap = ReplicaBootstrap.layer(projectedDefinition).pipe(Layer.provide(Database))
-  const ProjectedBase = Layer.merge(Database, ProjectedBootstrap)
-  const ProjectedGate = ReplicaGate.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)), Layer.provide(ProjectedBase))
-  const ProjectedStore = DocumentStore.layer.pipe(Layer.provide(Layer.merge(ProjectedBase, ProjectedGate)))
-  const ProjectedProjections = ProjectionStore.layer([TaskListSql]).pipe(
-    Layer.provide(Layer.merge(ProjectedBase, TaskListSql.layer))
-  )
-  const ProjectedHealth = ReplicaHealth.layer(projectedDefinition, ReplicaHealth.defaultOptions).pipe(
-    Layer.provide(Layer.merge(ProjectedBase, ProjectedGate))
-  )
-  const ProjectedBackup = BackupStore.layer(projectedDefinition).pipe(
-    Layer.provide(Layer.mergeAll(ProjectedBase, ProjectedGate, Limits, ProjectedProjections, ProjectedHealth))
-  )
-  const ProjectedLive = Layer.mergeAll(
-    ProjectedBase,
-    ProjectedGate,
-    ProjectedStore,
-    ProjectedProjections,
-    Limits,
-    ProjectedBackup
+  const ProjectedLive = SqlReplica.servicesLayerWithBindings(projectedDefinition, {
+    projections: [TaskListSql]
+  }).pipe(
+    Layer.provideMerge(Layer.mergeAll(Database, Limits))
   )
   const seedRelayState = (documentId: Identity.DocumentId) =>
     Effect.gen(function*() {
@@ -198,46 +176,16 @@ describe("BackupStore", () => {
         replica_incarnation, message_count, encoded_bytes
       ) VALUES (${current.incarnation}, 1, 1)`
     })
-  const ProjectedRecovery = Recovery.layer.pipe(Layer.provide(ProjectedLive))
-  const ProjectedCompaction = Compaction.layer.pipe(
-    Layer.provide(Layer.merge(ProjectedLive, ProjectedRecovery))
-  )
-  const ProjectedExecutor = CommandExecutor.layer(projectedDefinition).pipe(Layer.provide(ProjectedLive))
-  const ProjectedBatchLive = Layer.mergeAll(
-    ProjectedLive,
-    ProjectedRecovery,
-    ProjectedCompaction,
-    ProjectedExecutor
-  )
-  const Executor = CommandExecutor.layer(definition).pipe(Layer.provide(Live))
-  const BatchLive = Layer.mergeAll(Live, Executor)
-  const CompactedBatchLive = Layer.mergeAll(CompactedLive, Executor)
-  // `BackupStore.layer` reads `ReplicaLimits` once while it builds, so a smaller archive budget has to
-  // come from its own stack rather than `Effect.provideService`. Two `ReplicaLimits` layers in one graph
-  // shadow each other, so this stack never merges with `Live` or `CompactedLive`; it only reuses the
-  // layers below `ReplicaLimits` (`Base`, `Gate`, `Store`, `Projections`), which do not read limits.
   const smallArchiveRecords = 8
   const SmallLimits = ReplicaLimits.layer({ ...limits, maxArchiveRecords: smallArchiveRecords })
-  const SmallInfrastructure = Layer.mergeAll(Base, Gate, Store, Projections, SmallLimits, Health)
-  const SmallBackup = BackupStore.layer(definition).pipe(Layer.provide(SmallInfrastructure))
-  const SmallRecovery = Recovery.layer.pipe(Layer.provide(SmallInfrastructure))
-  const SmallCompaction = Compaction.layer.pipe(Layer.provide(Layer.merge(SmallInfrastructure, SmallRecovery)))
-  const SmallExecutor = CommandExecutor.layer(definition).pipe(Layer.provide(SmallInfrastructure))
-  const SmallBatchLive = Layer.mergeAll(
-    SmallInfrastructure,
-    SmallBackup,
-    SmallRecovery,
-    SmallCompaction,
-    SmallExecutor
+  const SmallLive = SqlReplica.servicesLayerWithBindings(definition, { projections: [] }).pipe(
+    Layer.provideMerge(Layer.mergeAll(Database, SmallLimits))
   )
   const CommitRename = Mutation.make("CommitRename", {
     document: Task,
     payload: Schema.String,
     success: Schema.String
   })
-  // A replica that advances its commit sequence through mutations needs its own definition, because
-  // `definition` declares none. A second definition also means a second bootstrap, so this stack
-  // rebuilds every layer below it rather than reusing the ones bound to `definition`.
   const mutatedDefinition = ReplicaDefinition.make({
     name: "mutated-backup-tasks",
     documents: DocumentSet.make(Task),
@@ -249,36 +197,8 @@ describe("BackupStore", () => {
     draft.title = payload
     return payload
   })
-  const MutatedBootstrap = ReplicaBootstrap.layer(mutatedDefinition).pipe(Layer.provide(Database))
-  const MutatedBase = Layer.merge(Database, MutatedBootstrap)
-  const MutatedGate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(MutatedBase))
-  const MutatedStore = DocumentStore.layer.pipe(Layer.provide(Layer.merge(MutatedBase, MutatedGate)))
-  const MutatedProjections = ProjectionStore.layer([]).pipe(Layer.provide(MutatedBase))
-  const MutatedHealth = ReplicaHealth.layer(mutatedDefinition, ReplicaHealth.defaultOptions).pipe(
-    Layer.provide(Layer.merge(MutatedBase, MutatedGate))
-  )
-  const MutatedInfrastructure = Layer.mergeAll(
-    MutatedBase,
-    MutatedGate,
-    MutatedStore,
-    MutatedProjections,
-    Limits,
-    MutatedHealth
-  )
-  const MutatedBackup = BackupStore.layer(mutatedDefinition).pipe(Layer.provide(MutatedInfrastructure))
-  const MutatedRecovery = Recovery.layer.pipe(Layer.provide(MutatedInfrastructure))
-  const MutatedCompaction = Compaction.layer.pipe(
-    Layer.provide(Layer.merge(MutatedInfrastructure, MutatedRecovery))
-  )
-  const MutatedExecutor = CommandExecutor.layer(mutatedDefinition).pipe(
-    Layer.provide(Layer.merge(MutatedInfrastructure, MutatedHandlers))
-  )
-  const MutatedBatchLive = Layer.mergeAll(
-    MutatedInfrastructure,
-    MutatedBackup,
-    MutatedRecovery,
-    MutatedCompaction,
-    MutatedExecutor
+  const MutatedLive = SqlReplica.servicesLayerWithBindings(mutatedDefinition, { projections: [] }).pipe(
+    Layer.provideMerge(Layer.mergeAll(Database, Limits, MutatedHandlers))
   )
 
   it.effect("exports and restores canonical history as projection ready when no projections are registered", () =>
@@ -309,6 +229,9 @@ describe("BackupStore", () => {
       const restored = yield* store.load(Task, documentId)
       assert.strictEqual(restored.snapshot.value.title, "before")
       assert.strictEqual(restored.snapshot.projection, "Ready")
+      assert.strictEqual(restored.historyChanges, created.historyChanges)
+      assert.strictEqual(restored.historyOperations, created.historyOperations)
+      assert.strictEqual(restored.historyBytes, created.historyBytes)
       assert.deepStrictEqual(
         yield* sql<{
           readonly writer_definition_hash: string
@@ -362,12 +285,15 @@ describe("BackupStore", () => {
       ))
       const restored = yield* store.load(Task, documentId)
       assert.strictEqual(restored.snapshot.value.title, "two")
+      assert.isNull(restored.historyChanges)
+      assert.isNull(restored.historyOperations)
+      assert.isNull(restored.historyBytes)
 
       InternalAutomerge.free(restored.automerge)
       InternalAutomerge.free(persisted.automerge)
       InternalAutomerge.free(staged)
       InternalAutomerge.free(created.automerge)
-    }).pipe(Effect.provide(CompactedLive)))
+    }).pipe(Effect.provide(Live)))
 
   it.effect("restores legacy format one checkpoints without explicit writer provenance", () =>
     Effect.gen(function*() {
@@ -423,7 +349,7 @@ describe("BackupStore", () => {
       }])
       InternalAutomerge.free(restored.automerge)
       InternalAutomerge.free(created.automerge)
-    }).pipe(Effect.provide(CompactedLive)))
+    }).pipe(Effect.provide(Live)))
 
   /**
    * The archive lines of a completed export, parsed. Every lineage assertion below reads the
@@ -433,6 +359,124 @@ describe("BackupStore", () => {
    */
   const archiveLinesOf = (chunks: ReadonlyArray<Uint8Array>) =>
     new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n").map((line) => JSON.parse(line))
+
+  it.effect("recomputes complete checkpoint backed history instead of trusting archive counters", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "measured" })
+      yield* compaction.compact(Task, documentId)
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      const lines = archiveLinesOf(chunks)
+      const document = lines.find((line) => line.kind === "Document")!
+      document.value.history_changes = null
+      document.value.history_operations = "malformed"
+      delete document.value.history_bytes
+      document.checksum = yield* Canonical.digest(document.value)
+      const end = lines.at(-1)!
+      end.value.recordsChecksum = yield* Canonical.digest(lines.slice(1, -1).map((line) => line.checksum))
+      end.checksum = yield* Canonical.digest(end.value)
+      const manifest = lines[0]!
+      for (let attempt = 0; attempt < 8; attempt++) {
+        manifest.checksum = yield* Canonical.digest(manifest.value)
+        const encoded = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+        if (manifest.value.declaredBytes === encoded.byteLength) break
+        manifest.value.declaredBytes = encoded.byteLength
+      }
+      manifest.checksum = yield* Canonical.digest(manifest.value)
+      const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+
+      yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.make(archive),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      })
+
+      const restored = yield* store.load(Task, documentId)
+      assert.strictEqual(restored.historyChanges, created.historyChanges)
+      assert.strictEqual(restored.historyOperations, created.historyOperations)
+      assert.strictEqual(restored.historyBytes, created.historyBytes)
+      const staged = yield* store.stage(restored, (draft) => {
+        draft.title = "persisted"
+      })
+      const persisted = yield* store.persist(Task, documentId, restored, staged)
+      assert.strictEqual(persisted.snapshot.value.title, "persisted")
+      InternalAutomerge.free(persisted.automerge)
+      InternalAutomerge.free(staged)
+      InternalAutomerge.free(restored.automerge)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Live)))
+
+  it.effect("keeps checkpoint backed history unmeasured when a retained dependency is missing", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const sql = yield* SqlClient.SqlClient
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one" })
+      const staged = yield* store.stage(created, (draft) => {
+        draft.title = "two"
+      })
+      const persisted = yield* store.persist(Task, documentId, created, staged)
+      yield* compaction.compact(Task, documentId)
+      yield* sql`DELETE FROM effect_local_changes
+        WHERE document_id = ${documentId}
+          AND change_hash != ${persisted.materializedHeads[0]}`
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+
+      yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.fromIterable(chunks),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      })
+
+      const restored = yield* store.load(Task, documentId)
+      assert.strictEqual(restored.snapshot.value.title, "two")
+      assert.isNull(restored.historyChanges)
+      assert.isNull(restored.historyOperations)
+      assert.isNull(restored.historyBytes)
+      InternalAutomerge.free(restored.automerge)
+      InternalAutomerge.free(persisted.automerge)
+      InternalAutomerge.free(staged)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Live)))
+
+  it.effect("rejects an extra disconnected applied head", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const sql = yield* SqlClient.SqlClient
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const disconnectedId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "connected" })
+      yield* compaction.compact(Task, documentId)
+      const disconnected = yield* store.create(Task, disconnectedId, { title: "disconnected" })
+      yield* sql`UPDATE effect_local_changes
+        SET document_id = ${documentId}
+        WHERE document_id = ${disconnectedId}`
+      yield* sql`DELETE FROM effect_local_documents WHERE document_id = ${disconnectedId}`
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+
+      const error = yield* Effect.flip(backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.fromIterable(chunks),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      }))
+
+      assert.strictEqual(error.reason._tag, "BackupInvalid")
+      InternalAutomerge.free(disconnected.automerge)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Live)))
 
   it.effect("preserves a rewritten document's lineage across export and restore", () =>
     Effect.gen(function*() {
@@ -478,7 +522,7 @@ describe("BackupStore", () => {
       const restored = yield* store.load(Task, documentId)
       assert.strictEqual(restored.snapshot.value.title, "rewritten")
       InternalAutomerge.free(restored.automerge)
-    }).pipe(Effect.provide(CompactedLive)))
+    }).pipe(Effect.provide(Live)))
 
   it.effect("rejects checkpoint and change provenance conflicts during restore", () =>
     Effect.gen(function*() {
@@ -512,7 +556,7 @@ describe("BackupStore", () => {
       assert.strictEqual(preserved.snapshot.value.title, "preserved")
       InternalAutomerge.free(preserved.automerge)
       InternalAutomerge.free(created.automerge)
-    }).pipe(Effect.provide(CompactedLive)))
+    }).pipe(Effect.provide(Live)))
 
   it.effect("rebuilds registered projections from restored canonical documents", () =>
     Effect.gen(function*() {
@@ -632,7 +676,7 @@ describe("BackupStore", () => {
         yield* executor.lookupCreate(representativeCommand, currentPermit),
         CommandOutcome.unknown(representativeCommand)
       )
-    })).pipe(Effect.provide(ProjectedBatchLive)))
+    })).pipe(Effect.provide(ProjectedLive)))
 
   it.effect("retires cluster request and reply state during restore", () =>
     Effect.gen(function*() {
@@ -867,7 +911,7 @@ describe("BackupStore", () => {
       assert.deepStrictEqual(permitAfterRetry, permitBeforeRetry)
       assert.strictEqual(replayed, firstLineage)
       assert.deepStrictEqual(checkpointAfterReplay, checkpointBeforeRetry)
-    }).pipe(Effect.provide(CompactedLive)))
+    }).pipe(Effect.provide(Live)))
 
   it.effect("rejects an installation id reused for a different restore request", () =>
     Effect.gen(function*() {
@@ -1135,7 +1179,7 @@ describe("BackupStore", () => {
       const documentId = yield* Identity.makeDocumentId
       let seed = 7
       const characters: Array<string> = []
-      for (let index = 0; index < 60_000; index++) {
+      for (let index = 0; index < 40_000; index++) {
         seed = (seed * 48271) % 2147483647
         characters.push(String.fromCharCode(0xc0 + (seed % 0x300)))
       }
@@ -1146,6 +1190,9 @@ describe("BackupStore", () => {
       for (const chunk of chunks) {
         assert.isAtMost(chunk.byteLength, limits.maxChunkBytes)
       }
+      const changeRecord = new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n")
+        .find((line) => JSON.parse(line).kind === "Change")!
+      assert.isAbove(new TextEncoder().encode(changeRecord).byteLength, limits.maxChunkBytes)
       yield* backups.restore({
         installationId: yield* Identity.makeBackupInstallationId,
         source: Stream.fromIterable(chunks),
@@ -1327,7 +1374,7 @@ describe("BackupStore", () => {
         assert.deepStrictEqual(outcome, CommandOutcome.durablyCommitted(commandId, documentId))
         const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
         return { chunks, commandId, incarnation: permit.incarnation }
-      }).pipe(Effect.provide(BatchLive))
+      }).pipe(Effect.provide(Live))
 
       yield* Effect.gen(function*() {
         const backups = yield* BackupStore.BackupStore
@@ -1346,7 +1393,7 @@ describe("BackupStore", () => {
           CommandOutcome.unknown(archive.commandId)
         )
         assert.isAbove(permit.incarnation, archive.incarnation)
-      }).pipe(Effect.provide(BatchLive))
+      }).pipe(Effect.provide(Live))
     }))
 
   it.effect("rejects archived receipts recorded above the manifest incarnation", () =>
@@ -1414,7 +1461,7 @@ describe("BackupStore", () => {
         SELECT replica_incarnation FROM effect_local_command_receipts
       `
       assert.deepStrictEqual(receipts, [{ replica_incarnation: permit.incarnation }])
-    }).pipe(Effect.provide(BatchLive)))
+    }).pipe(Effect.provide(Live)))
 
   it.effect("uses the Crypto service captured by the BackupStore layer for clone restores", () =>
     Effect.gen(function*() {
@@ -1428,7 +1475,7 @@ describe("BackupStore", () => {
         maxBytes: limits.maxBackupBytes,
         expectedDefinitionHash: definition.hash
       })
-    }).pipe(Effect.provide(Backup)))
+    }).pipe(Effect.provide(Live)))
 
   it.effect("prunes every receipt restored from an archive at a superseded incarnation", () =>
     Effect.gen(function*() {
@@ -1523,7 +1570,7 @@ describe("BackupStore", () => {
         }>`SELECT command_id, replica_incarnation FROM effect_local_command_receipts`,
         [{ command_id: commandId, replica_incarnation: restoredPermit.incarnation }]
       )
-    }).pipe(Effect.provide(CompactedBatchLive)))
+    }).pipe(Effect.provide(Live)))
 
   it.effect("stops counting superseded receipts toward the archive record limit", () =>
     Effect.gen(function*() {
@@ -1613,13 +1660,13 @@ describe("BackupStore", () => {
 
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
       assert.isAbove(chunks.length, 0)
-    }).pipe(Effect.provide(SmallBatchLive)))
+    }).pipe(Effect.provide(SmallLive)))
 
   // `restore` recomputes the metadata watermark as the maximum `commit_sequence` over every archived
   // record, receipts included, and every restored receipt is superseded the moment the restore raises
   // the incarnation. The first prune therefore empties the table, and the next archive has to recover
   // the same watermark without it. Each replica gets its own `:memory:` database because `Effect.provide`
-  // builds `MutatedBatchLive` once per call.
+  // builds `MutatedLive` once per call.
   it.effect("preserves the commit sequence watermark across a restore, a receipt prune, and a re-export", () =>
     Effect.gen(function*() {
       const source = yield* Effect.gen(function*() {
@@ -1676,7 +1723,7 @@ describe("BackupStore", () => {
         assert.isAbove(commitSequence, 0)
         const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
         return { chunks, commitSequence }
-      }).pipe(Effect.provide(MutatedBatchLive))
+      }).pipe(Effect.provide(MutatedLive))
 
       const republished = yield* Effect.gen(function*() {
         const backups = yield* BackupStore.BackupStore
@@ -1701,7 +1748,7 @@ describe("BackupStore", () => {
           []
         )
         return yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
-      }).pipe(Effect.provide(MutatedBatchLive))
+      }).pipe(Effect.provide(MutatedLive))
 
       yield* Effect.gen(function*() {
         const backups = yield* BackupStore.BackupStore
@@ -1719,7 +1766,7 @@ describe("BackupStore", () => {
           `,
           [{ commit_sequence: source.commitSequence }]
         )
-      }).pipe(Effect.provide(MutatedBatchLive))
+      }).pipe(Effect.provide(MutatedLive))
     }))
 
   it.effect("reports an unknown outcome for a stale permit once superseded receipts are pruned", () =>
@@ -1770,5 +1817,5 @@ describe("BackupStore", () => {
         yield* executor.lookupCreate(commandId, archivedPermit),
         CommandOutcome.unknown(commandId)
       )
-    }).pipe(Effect.provide(CompactedBatchLive)))
+    }).pipe(Effect.provide(Live)))
 })

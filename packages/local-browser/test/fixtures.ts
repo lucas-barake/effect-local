@@ -60,6 +60,19 @@ export const replica: Replica.Replica["Service"] = {
       tombstone: false,
       projection: "Ready"
     }) as never,
+  inspectConflicts: (_document, requestedId) =>
+    Effect.succeed({
+      snapshot: {
+        documentId: requestedId,
+        value: { title: "stored" },
+        version: 1,
+        heads: [],
+        tombstone: false,
+        projection: "Ready"
+      },
+      conflicts: []
+    }) as never,
+  resolveConflict: () => Effect.void,
   mutate: () => Effect.succeed("renamed") as never,
   delete: () => Effect.void,
   query: (_query, ...payload) => Effect.succeed([{ title: String(payload[0]) }]) as never,
@@ -67,6 +80,8 @@ export const replica: Replica.Replica["Service"] = {
     Effect.succeed(CommandOutcome.durablyCommitted(commandId, "renamed")) as never,
   lookupCreate: (_document, commandId) => Effect.succeed(CommandOutcome.durablyCommitted(commandId, documentId)),
   lookupDelete: (_document, commandId) => Effect.succeed(CommandOutcome.durablyCommitted(commandId, undefined)),
+  lookupConflictResolution: (_document, { commandId }) =>
+    Effect.succeed(CommandOutcome.durablyCommitted(commandId, undefined)),
   lookupCommandDelivery: (commandId) => Effect.succeed(CommandDelivery.UnknownCommand.make({ commandId })),
   commandDeliveryChanges: (commandId) => Stream.make(CommandDelivery.UnknownCommand.make({ commandId })),
   flush: Effect.void,

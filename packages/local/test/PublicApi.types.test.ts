@@ -1,11 +1,62 @@
+import type * as Automerge from "@automerge/automerge"
 import { assert, describe, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { Document, DocumentSet, Identity, Mutation, PeerTransport, Query, SchemaDescriptor } from "../src/index.js"
+import type { CommandOutcome, Conflict, Replica } from "../src/index.js"
 import type * as ReplicaError from "../src/ReplicaError.js"
 
 type Equal<A, B,> = (<T,>() => T extends A ? 1 : 2) extends <T,>() => T extends B ? 1 : 2 ? true : false
+
+type ExpectedInspectionError =
+  | Conflict.UnsupportedConflictValue
+  | Conflict.UnsupportedConflictKey
+
+type ExpectedResolutionError =
+  | ExpectedInspectionError
+  | Conflict.StaleConflictResolution
+  | Conflict.ConflictPathNotFound
+  | Conflict.ConflictPathTypeMismatch
+  | Conflict.ConflictNotFound
+  | Conflict.ConflictAlternativeNotFound
+  | Conflict.CompositeAlternativeRequiresReplacement
+  | Conflict.ConflictResolutionSchemaError
+
+type ExpectedPath = {
+  readonly parents: ReadonlyArray<
+    | {
+      readonly _tag: "Key"
+      readonly key: string
+      readonly alternative?: Conflict.AlternativeId
+    }
+    | {
+      readonly _tag: "Index"
+      readonly index: number
+      readonly alternative?: Conflict.AlternativeId
+    }
+  >
+  readonly target:
+    | { readonly _tag: "Key"; readonly key: string }
+    | { readonly _tag: "Index"; readonly index: number }
+}
+
+type ExpectedChoice =
+  | {
+    readonly _tag: "SelectAlternative"
+    readonly alternativeId: Conflict.AlternativeId
+  }
+  | {
+    readonly _tag: "ReplaceValue"
+    readonly value: Automerge.AutomergeValue
+  }
+  | { readonly _tag: "DeleteValue" }
+
+type ExpectedResolution = {
+  readonly heads: ReadonlyArray<string>
+  readonly path: ExpectedPath
+  readonly choice: ExpectedChoice
+}
 
 describe("public API types", () => {
   class ReadError extends Schema.TaggedErrorClass<ReadError>()("ReadError", {}) {}
@@ -89,6 +140,70 @@ describe("public API types", () => {
   it("exports the schema descriptor contract", () => {
     const descriptor: SchemaDescriptor.Descriptor = SchemaDescriptor.make(Schema.String)
     assert.isDefined(descriptor)
+  })
+
+  it("preserves conflict schemas and replica operation inference", () => {
+    const nativeValue: Equal<Conflict.Value, Automerge.AutomergeValue> = true
+    const encodedValue: Equal<Conflict.EncodedValue, Conflict.PortableValue> = true
+    const resolution: Equal<Conflict.Resolution, ExpectedResolution> = true
+    const path: Equal<Conflict.Path, ExpectedPath> = true
+    const choice: Equal<Conflict.Choice, ExpectedChoice> = true
+    const inspectionError: Equal<Conflict.InspectionError, ExpectedInspectionError> = true
+    const resolutionError: Equal<Conflict.ResolutionError, ExpectedResolutionError> = true
+
+    const assertReplicaTypes = (
+      replica: Replica.Replica["Service"],
+      documentId: Identity.DocumentId,
+      commandId: Identity.CommandId,
+      conflictResolution: Conflict.Resolution
+    ): void => {
+      const inspected = replica.inspectConflicts(Task, documentId)
+      const resolved = replica.resolveConflict(Task, {
+        commandId,
+        documentId,
+        resolution: conflictResolution
+      })
+      const lookedUp = replica.lookupConflictResolution(Task, {
+        commandId,
+        documentId,
+        resolution: conflictResolution
+      })
+      const inspectSuccess: Equal<
+        Effect.Success<typeof inspected>,
+        Conflict.Inspection<{ readonly title: string }>
+      > = true
+      const inspectError: Equal<
+        Effect.Error<typeof inspected>,
+        ExpectedInspectionError | ReplicaError.ReplicaError
+      > = true
+      const resolveSuccess: Equal<Effect.Success<typeof resolved>, void> = true
+      const resolveError: Equal<
+        Effect.Error<typeof resolved>,
+        ExpectedResolutionError | ReplicaError.ReplicaError
+      > = true
+      const lookupSuccess: Equal<
+        Effect.Success<typeof lookedUp>,
+        CommandOutcome.CommandOutcome<void, ExpectedResolutionError>
+      > = true
+      const lookupError: Equal<Effect.Error<typeof lookedUp>, ReplicaError.ReplicaError> = true
+      void [
+        inspectSuccess,
+        inspectError,
+        resolveSuccess,
+        resolveError,
+        lookupSuccess,
+        lookupError
+      ]
+    }
+    void assertReplicaTypes
+
+    assert.isTrue(nativeValue)
+    assert.isTrue(encodedValue)
+    assert.isTrue(resolution)
+    assert.isTrue(path)
+    assert.isTrue(choice)
+    assert.isTrue(inspectionError)
+    assert.isTrue(resolutionError)
   })
 
   it("requires acknowledged durable relay delivery", () => {

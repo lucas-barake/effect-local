@@ -78,26 +78,31 @@ export const layer: Layer.Layer<CommitPublisher, never, Reactivity.Reactivity | 
           Effect.uninterruptible
         )
       )
-    const publishPending = lock.withPermit(Effect.gen(function*() {
-      const rows = yield* findPending(undefined)
-      for (const row of rows) {
-        yield* reactivity.invalidate(row.invalidation_keys)
-        yield* PubSub.publish(events, {
-          _tag: "Commit",
-          commitSequence: row.commit_sequence,
-          documentId: row.document_id,
-          keys: row.invalidation_keys,
-          refreshGeneration: yield* Ref.get(refreshGeneration)
-        })
-        yield* sql.withTransaction(Effect.gen(function*() {
-          yield* sql`UPDATE effect_local_commit_outbox SET published = 1
-              WHERE commit_sequence = ${row.commit_sequence}`
-          yield* sql`DELETE FROM effect_local_commit_outbox
-              WHERE published = 1 AND commit_sequence < ${row.commit_sequence}`
-        }))
-      }
-      return rows.length
-    })).pipe(
+    const publishPending = Effect.serviceOption(sql.transactionService).pipe(
+      Effect.flatMap(Option.match({
+        onNone: () =>
+          lock.withPermit(Effect.gen(function*() {
+            const rows = yield* findPending(undefined)
+            for (const row of rows) {
+              yield* reactivity.invalidate(row.invalidation_keys)
+              yield* PubSub.publish(events, {
+                _tag: "Commit",
+                commitSequence: row.commit_sequence,
+                documentId: row.document_id,
+                keys: row.invalidation_keys,
+                refreshGeneration: yield* Ref.get(refreshGeneration)
+              })
+              yield* sql.withTransaction(Effect.gen(function*() {
+                yield* sql`UPDATE effect_local_commit_outbox SET published = 1
+                    WHERE commit_sequence = ${row.commit_sequence}`
+                yield* sql`DELETE FROM effect_local_commit_outbox
+                    WHERE published = 1 AND commit_sequence < ${row.commit_sequence}`
+              }))
+            }
+            return rows.length
+          })),
+        onSome: () => Effect.succeed(0)
+      })),
       Effect.catchTags({
         SqlError: (cause) =>
           Effect.fail(

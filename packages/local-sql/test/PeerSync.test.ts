@@ -6,6 +6,7 @@ import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
@@ -32,6 +33,7 @@ import * as PeerSync from "../src/PeerSync.js"
 import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
+import * as SqlReplica from "../src/SqlReplica.js"
 
 describe("PeerSync", () => {
   const Task = Document.make("Task", {
@@ -50,6 +52,14 @@ describe("PeerSync", () => {
     maxChunkBytes: 64_000,
     maxArchiveRecords: 1_000,
     maxJsonDepth: 64,
+    maxConflictDepth: 64,
+    maxConflictNodes: 100_000,
+    maxConflictAlternatives: 10_000,
+    maxConflictPathSegments: 128,
+    maxConflictValueBytes: 16 * 1024 * 1024,
+    maxConflictSourceChanges: 100_000,
+    maxConflictSourceOperations: 100_000,
+    maxConflictSourceBytes: 64 * 1024 * 1024,
     maxSyncMessageBytes: 64_000,
     maxPeerSendMillis: 1_000,
     maxSyncChangesPerMessage: 100,
@@ -120,6 +130,17 @@ describe("PeerSync", () => {
   const StrictServices = Layer.merge(StrictInfrastructure, StrictStoreService)
   const StrictSyncService = PeerSync.layer.pipe(Layer.provide(StrictServices))
   const StrictLayer = Layer.merge(StrictServices, StrictSyncService)
+  const sourceLayer = (
+    sourceLimits: ReplicaLimits.Values,
+    filename = ":memory:"
+  ) =>
+    SqlReplica.layerWithBindings(definition, { projections: [] }).pipe(
+      Layer.provideMerge([
+        SqliteClient.layer({ filename, disableWAL: true }),
+        NodeCrypto.layer,
+        ReplicaLimits.layer(sourceLimits)
+      ])
+    )
   const EdgeLimits = ReplicaLimits.layer({
     ...limits,
     maxPendingDependencyEdgesPerDocument: 100,
@@ -194,6 +215,149 @@ describe("PeerSync", () => {
       writerDefinitionHash
     }))
   }
+
+  const durableFootprint = (documentId: Identity.DocumentId) =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      return yield* sql<{
+        readonly accepted_heads: string
+        readonly applied_changes: number
+        readonly checkpoint_hash: string | null
+        readonly checkpoints: number
+        readonly commit_outbox: number
+        readonly commit_sequence: number
+        readonly history_bytes: number | null
+        readonly history_changes: number | null
+        readonly history_operations: number | null
+        readonly materialized_heads: string
+        readonly peer_changes: number
+        readonly peer_outbox: number
+        readonly pending_changes: number
+        readonly receipts: number
+      }>`SELECT
+        document.accepted_heads,
+        document.checkpoint_hash,
+        document.history_bytes,
+        document.history_changes,
+        document.history_operations,
+        document.materialized_heads,
+        metadata.commit_sequence,
+        (SELECT COUNT(*) FROM effect_local_changes
+          WHERE document_id = ${documentId} AND applied = 1) AS applied_changes,
+        (SELECT COUNT(*) FROM effect_local_changes
+          WHERE document_id = ${documentId} AND applied = 0) AS pending_changes,
+        (SELECT COUNT(*) FROM effect_local_changes
+          WHERE document_id = ${documentId} AND peer_id IS NOT NULL) AS peer_changes,
+        (SELECT COUNT(*) FROM effect_local_checkpoints
+          WHERE document_id = ${documentId}) AS checkpoints,
+        (SELECT COUNT(*) FROM effect_local_commit_outbox
+          WHERE document_id = ${documentId}) AS commit_outbox,
+        (SELECT COUNT(*) FROM effect_local_peer_receipts
+          WHERE document_id = ${documentId}) AS receipts,
+        (SELECT COUNT(*) FROM effect_local_peer_outbox
+          WHERE document_id = ${documentId}) AS peer_outbox
+      FROM effect_local_documents AS document
+      CROSS JOIN effect_local_metadata AS metadata
+      WHERE document.document_id = ${documentId}`
+    })
+
+  type CounterState = "measured" | "unmeasured" | "mixed" | "mismatched"
+
+  const seedSourceReceive = (filename: string, counterState: CounterState = "measured") =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const sql = yield* SqlClient.SqlClient
+        const documentId = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "one", labels: [] }
+        })
+        const rows = yield* sql<{ readonly bytes: Uint8Array }>`SELECT bytes
+          FROM effect_local_changes
+          WHERE document_id = ${documentId} AND applied = 1
+          ORDER BY commit_sequence, actor, sequence`
+        const empty = InternalAutomerge.empty<{ title: string; labels: Array<string> }>("1".repeat(32))
+        let durable = InternalAutomerge.replay(empty, rows.map((row) => row.bytes))
+        const durableHeads = InternalAutomerge.heads(durable)
+        let remote = Automerge.change(
+          Automerge.clone(durable, { actor: "2".repeat(32) }),
+          (draft) => {
+            draft.value.title = "remote"
+          }
+        )
+        const remoteChanges = Automerge.getChangesSince(remote, [...durableHeads])
+        assert.strictEqual(remoteChanges.length, 1)
+        const decoded = Automerge.decodeChange(remoteChanges[0]!)
+        let durableState = Automerge.initSyncState()
+        let remoteState = Automerge.initSyncState()
+        let targetInput:
+          | {
+            readonly message: Uint8Array
+            readonly writerProvenance: ReturnType<typeof provenanceFor>
+          }
+          | undefined
+        let quiesced = false
+        for (let round = 0; round < 10; round++) {
+          const [nextDurableState, durableMessage] = Automerge.generateSyncMessage(durable, durableState)
+          const [nextRemoteState, remoteMessage] = Automerge.generateSyncMessage(remote, remoteState)
+          durableState = nextDurableState
+          remoteState = nextRemoteState
+          if (durableMessage !== null) {
+            ;[remote, remoteState] = Automerge.receiveSyncMessage(remote, remoteState, durableMessage)
+          }
+          if (remoteMessage !== null) {
+            const writerProvenance = provenanceFor(remoteMessage, Task.version, definition.hash)
+            if (writerProvenance.some((entry) => entry.changeHash === decoded.hash)) {
+              targetInput = { message: remoteMessage, writerProvenance }
+            }
+            ;[durable, durableState] = Automerge.receiveSyncMessage(durable, durableState, remoteMessage)
+          }
+          if (durableMessage === null && remoteMessage === null) {
+            quiesced = true
+            break
+          }
+        }
+        assert.isTrue(quiesced)
+        assert.isDefined(targetInput)
+        const counters = yield* sql<{
+          readonly history_bytes: number
+          readonly history_changes: number
+          readonly history_operations: number
+        }>`SELECT history_bytes, history_changes, history_operations
+          FROM effect_local_documents WHERE document_id = ${documentId}`
+        const current = counters[0]!
+        const boundary = {
+          bytes: current.history_bytes + remoteChanges[0]!.byteLength,
+          changes: current.history_changes + 1,
+          operations: current.history_operations + decoded.ops.length
+        }
+        if (counterState === "unmeasured") {
+          yield* sql`UPDATE effect_local_documents SET
+            history_bytes = NULL,
+            history_changes = NULL,
+            history_operations = NULL
+            WHERE document_id = ${documentId}`
+        } else if (counterState === "mixed") {
+          yield* sql`UPDATE effect_local_documents SET history_operations = NULL
+            WHERE document_id = ${documentId}`
+        } else if (counterState === "mismatched") {
+          yield* sql`UPDATE effect_local_documents SET
+            history_operations = history_operations + 1
+            WHERE document_id = ${documentId}`
+        }
+        InternalAutomerge.free(remote)
+        InternalAutomerge.free(durable)
+        return {
+          boundary,
+          documentId,
+          input: {
+            lineage: Identity.genesisLineage,
+            message: targetInput!.message,
+            writerProvenance: targetInput!.writerProvenance
+          }
+        }
+      }).pipe(Effect.provide(sourceLayer(limits, filename)))
+    )
 
   it.effect("does not issue a stale session during an exclusive claim", () =>
     Effect.gen(function*() {
@@ -548,6 +712,25 @@ describe("PeerSync", () => {
       }
       const reloaded = yield* store.load(Task, documentId)
       assert.deepStrictEqual(reloaded.snapshot.value, { title: "remote", labels: ["synced"] })
+      const appliedChanges = yield* sql<{ readonly bytes: Uint8Array }>`
+        SELECT bytes FROM effect_local_changes
+        WHERE document_id = ${documentId} AND applied = 1
+      `
+      assert.strictEqual(reloaded.historyChanges, appliedChanges.length)
+      assert.strictEqual(
+        reloaded.historyOperations,
+        appliedChanges.reduce((total, change) => total + Automerge.decodeChange(change.bytes).ops.length, 0)
+      )
+      assert.strictEqual(
+        reloaded.historyBytes,
+        appliedChanges.reduce((total, change) => total + change.bytes.byteLength, 0)
+      )
+      const historyBytes = reloaded.historyBytes
+      const historyChanges = reloaded.historyChanges
+      const historyOperations = reloaded.historyOperations
+      assert.isNotNull(historyBytes)
+      assert.isNotNull(historyChanges)
+      assert.isNotNull(historyOperations)
       const duplicate = yield* sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: session.connectionEpoch,
         receiveSequence: 0,
@@ -559,10 +742,210 @@ describe("PeerSync", () => {
       assert.deepStrictEqual(duplicate.reply?.message, received.reply?.message)
       const rows = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM effect_local_peer_receipts`
       assert.strictEqual(rows[0]?.count, 2)
+      const afterDuplicate = yield* sql<{
+        readonly history_bytes: number
+        readonly history_changes: number
+        readonly history_operations: number
+      }>`SELECT history_bytes, history_changes, history_operations
+        FROM effect_local_documents WHERE document_id = ${documentId}`
+      assert.deepStrictEqual(afterDuplicate, [{
+        history_bytes: historyBytes,
+        history_changes: historyChanges,
+        history_operations: historyOperations
+      }])
       InternalAutomerge.free(reloaded.automerge)
       InternalAutomerge.free(remote)
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(TestLayer)))
+
+  it.effect("rejects cumulative source changes, operations and bytes atomically and recovers", () =>
+    Effect.gen(function*() {
+      for (
+        const quota of [
+          {
+            key: "maxConflictSourceChanges",
+            resource: "conflict source changes",
+            value: (boundary: { readonly changes: number }) => boundary.changes
+          },
+          {
+            key: "maxConflictSourceOperations",
+            resource: "conflict source operations",
+            value: (boundary: { readonly operations: number }) => boundary.operations
+          },
+          {
+            key: "maxConflictSourceBytes",
+            resource: "conflict source bytes",
+            value: (boundary: { readonly bytes: number }) => boundary.bytes
+          }
+        ] as const
+      ) {
+        const filename = join(
+          tmpdir(),
+          `effect-local-peer-source-${quota.key}-${globalThis.crypto.randomUUID()}.sqlite`
+        )
+        yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(filename, { force: true })))
+        const seeded = yield* seedSourceReceive(filename)
+        const limit = quota.value(seeded.boundary) - 1
+        const rejectingLimits = { ...limits, [quota.key]: limit }
+        yield* Effect.scoped(
+          Effect.gen(function*() {
+            const sync = yield* PeerSync.PeerSync
+            const before = yield* durableFootprint(seeded.documentId)
+            const session = yield* sync.open(yield* Identity.makePeerId)
+            const result = yield* Effect.result(sync.receive(Task, seeded.documentId, session, {
+              ...seeded.input,
+              remoteConnectionEpoch: session.connectionEpoch,
+              receiveSequence: 0
+            }))
+            assert.isTrue(Result.isFailure(result))
+            if (Result.isFailure(result)) {
+              assert.strictEqual(result.failure.reason._tag, "QuotaExceeded")
+              if (result.failure.reason._tag === "QuotaExceeded") {
+                assert.strictEqual(result.failure.reason.resource, quota.resource)
+                assert.strictEqual(result.failure.reason.limit, limit)
+              }
+            }
+            assert.deepStrictEqual(yield* durableFootprint(seeded.documentId), before)
+          }).pipe(Effect.provide(sourceLayer(rejectingLimits, filename)))
+        )
+        yield* Effect.scoped(
+          Effect.gen(function*() {
+            const replica = yield* Replica.Replica
+            const sync = yield* PeerSync.PeerSync
+            const session = yield* sync.open(yield* Identity.makePeerId)
+            const received = yield* sync.receive(Task, seeded.documentId, session, {
+              ...seeded.input,
+              remoteConnectionEpoch: session.connectionEpoch,
+              receiveSequence: 0
+            })
+            assert.isFalse(received.duplicate)
+            assert.strictEqual((yield* replica.get(Task, seeded.documentId)).value.title, "remote")
+          }).pipe(Effect.provide(sourceLayer(limits, filename)))
+        )
+      }
+    }))
+
+  it.effect("accepts a peer change exactly at every cumulative source boundary", () =>
+    Effect.gen(function*() {
+      const filename = join(tmpdir(), `effect-local-peer-source-boundary-${globalThis.crypto.randomUUID()}.sqlite`)
+      yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(filename, { force: true })))
+      const seeded = yield* seedSourceReceive(filename)
+      const boundaryLimits = {
+        ...limits,
+        maxConflictSourceBytes: seeded.boundary.bytes,
+        maxConflictSourceChanges: seeded.boundary.changes,
+        maxConflictSourceOperations: seeded.boundary.operations
+      }
+      yield* Effect.scoped(
+        Effect.gen(function*() {
+          const sync = yield* PeerSync.PeerSync
+          const session = yield* sync.open(yield* Identity.makePeerId)
+          const received = yield* sync.receive(Task, seeded.documentId, session, {
+            ...seeded.input,
+            remoteConnectionEpoch: session.connectionEpoch,
+            receiveSequence: 0
+          })
+          assert.isFalse(received.duplicate)
+          const footprint = yield* durableFootprint(seeded.documentId)
+          assert.strictEqual(footprint[0]?.history_bytes, seeded.boundary.bytes)
+          assert.strictEqual(footprint[0]?.history_changes, seeded.boundary.changes)
+          assert.strictEqual(footprint[0]?.history_operations, seeded.boundary.operations)
+        }).pipe(Effect.provide(sourceLayer(boundaryLimits, filename)))
+      )
+    }))
+
+  it.effect("rejects unmeasured and corrupt history counters without durable effects", () =>
+    Effect.gen(function*() {
+      for (
+        const counterCase of [
+          {
+            expected: "QuotaExceeded",
+            state: "unmeasured",
+            resource: "unmeasured conflict source history"
+          },
+          { expected: "StorageCorrupt", state: "mixed" },
+          { expected: "StorageCorrupt", state: "mismatched" }
+        ] as const
+      ) {
+        const filename = join(
+          tmpdir(),
+          `effect-local-peer-source-${counterCase.state}-${globalThis.crypto.randomUUID()}.sqlite`
+        )
+        yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(filename, { force: true })))
+        const seeded = yield* seedSourceReceive(filename, counterCase.state)
+        yield* Effect.scoped(
+          Effect.gen(function*() {
+            const sync = yield* PeerSync.PeerSync
+            const before = yield* durableFootprint(seeded.documentId)
+            const session = yield* sync.open(yield* Identity.makePeerId)
+            const result = yield* Effect.result(sync.receive(Task, seeded.documentId, session, {
+              ...seeded.input,
+              remoteConnectionEpoch: session.connectionEpoch,
+              receiveSequence: 0
+            }))
+            assert.isTrue(Result.isFailure(result))
+            if (Result.isFailure(result)) {
+              assert.strictEqual(result.failure.reason._tag, counterCase.expected)
+              if (
+                counterCase.expected === "QuotaExceeded" &&
+                result.failure.reason._tag === "QuotaExceeded"
+              ) {
+                assert.strictEqual(result.failure.reason.resource, counterCase.resource)
+              }
+            }
+            assert.deepStrictEqual(yield* durableFootprint(seeded.documentId), before)
+          }).pipe(Effect.provide(sourceLayer(limits, filename)))
+        )
+      }
+    }))
+
+  it.effect("interrupts a blocked receive without durable effects and accepts a retry", () =>
+    Effect.gen(function*() {
+      const filename = join(tmpdir(), `effect-local-peer-source-interrupt-${globalThis.crypto.randomUUID()}.sqlite`)
+      yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(filename, { force: true })))
+      const seeded = yield* seedSourceReceive(filename)
+      yield* Effect.scoped(
+        Effect.gen(function*() {
+          const replica = yield* Replica.Replica
+          const sync = yield* PeerSync.PeerSync
+          const sql = yield* SqlClient.SqlClient
+          const session = yield* sync.open(yield* Identity.makePeerId)
+          const input = {
+            ...seeded.input,
+            remoteConnectionEpoch: session.connectionEpoch,
+            receiveSequence: 0
+          }
+          const before = yield* durableFootprint(seeded.documentId)
+          const locked = yield* Deferred.make<void>()
+          const release = yield* Deferred.make<void>()
+          const blocker = yield* sql.withTransaction(
+            Deferred.succeed(locked, undefined).pipe(
+              Effect.andThen(Deferred.await(release))
+            )
+          ).pipe(Effect.forkChild({ startImmediately: true }))
+          yield* Deferred.await(locked)
+          const receiving = yield* sync.receive(Task, seeded.documentId, session, input).pipe(
+            Effect.forkChild({ startImmediately: true })
+          )
+          assert.isUndefined(receiving.pollUnsafe())
+          const interrupting = yield* Fiber.interrupt(receiving).pipe(
+            Effect.forkChild({ startImmediately: true })
+          )
+          yield* Effect.yieldNow
+          yield* Deferred.succeed(release, undefined)
+          yield* Fiber.join(blocker)
+          yield* Fiber.join(interrupting)
+          const interrupted = yield* Fiber.await(receiving)
+          assert.strictEqual(interrupted._tag, "Failure")
+          if (interrupted._tag === "Failure") {
+            assert.isTrue(Cause.hasInterruptsOnly(interrupted.cause))
+          }
+          assert.deepStrictEqual(yield* durableFootprint(seeded.documentId), before)
+          assert.isFalse((yield* sync.receive(Task, seeded.documentId, session, input)).duplicate)
+          assert.strictEqual((yield* replica.get(Task, seeded.documentId)).value.title, "remote")
+        }).pipe(Effect.provide(sourceLayer(limits, filename)))
+      )
+    }))
 
   it.effect("persists the wire declared writer provenance for an inbound change, not the receiver's own", () =>
     Effect.gen(function*() {

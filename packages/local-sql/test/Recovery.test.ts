@@ -191,6 +191,80 @@ describe("Recovery", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(Services)))
 
+  it.effect("rejects partially null durable history counters as storage corruption", () =>
+    Effect.gen(function*() {
+      const recovery = yield* Recovery.Recovery
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one" })
+      yield* sql`UPDATE effect_local_documents SET history_operations = NULL
+        WHERE document_id = ${documentId}`
+
+      const result = yield* Effect.result(recovery.recover(Task, documentId))
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure.reason._tag, "StorageCorrupt")
+      } else {
+        InternalAutomerge.free(result.success.automerge)
+      }
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("rejects numeric history counters that do not match complete retained history", () =>
+    Effect.gen(function*() {
+      const recovery = yield* Recovery.Recovery
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one" })
+      yield* sql`UPDATE effect_local_documents SET history_operations = history_operations + 1
+        WHERE document_id = ${documentId}`
+
+      const result = yield* Effect.result(recovery.recover(Task, documentId))
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure.reason._tag, "StorageCorrupt")
+      } else {
+        InternalAutomerge.free(result.success.automerge)
+      }
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Services)))
+
+  it.effect("recovers complete retained history without a checkpoint", () =>
+    Effect.gen(function*() {
+      const recovery = yield* Recovery.Recovery
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one" })
+      const staged = yield* store.stage(created, (draft) => {
+        draft.title = "two"
+      })
+      const persisted = yield* store.persist(Task, documentId, created, staged)
+      const recovered = yield* recovery.recover(Task, documentId)
+
+      assert.deepStrictEqual(
+        yield* sql`SELECT checkpoint_hash FROM effect_local_checkpoints WHERE document_id = ${documentId}`,
+        []
+      )
+      assert.deepStrictEqual(recovered.snapshot.value, { title: "two" })
+      assert.deepStrictEqual(recovered.snapshot.heads, persisted.materializedHeads)
+      assert.deepStrictEqual(recovered.materializedHeads, persisted.materializedHeads)
+      assert.deepStrictEqual(recovered.acceptedHeads, persisted.acceptedHeads)
+      assert.strictEqual(recovered.historyChanges, persisted.historyChanges)
+      assert.strictEqual(recovered.historyOperations, persisted.historyOperations)
+      assert.strictEqual(recovered.historyBytes, persisted.historyBytes)
+      assert.deepStrictEqual(
+        yield* sql`SELECT reason FROM effect_local_quarantine WHERE document_id = ${documentId}`,
+        []
+      )
+      InternalAutomerge.free(recovered.automerge)
+      InternalAutomerge.free(persisted.automerge)
+      InternalAutomerge.free(staged)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(Services)))
+
   // The absent row and an undecodable one are different faults and must not collapse. This one is
   // replica-wide: reporting it as `StorageCorrupt` tells `ReplicaEvolution` to quarantine the one
   // document it happened to be reading, and `BackupStore` to call the operator's backup invalid.

@@ -71,6 +71,14 @@ it.layer(Layer.mergeAll(
     maxChunkBytes: 64_000,
     maxArchiveRecords: 1_000,
     maxJsonDepth: 32,
+    maxConflictDepth: 64,
+    maxConflictNodes: 100_000,
+    maxConflictAlternatives: 10_000,
+    maxConflictPathSegments: 128,
+    maxConflictValueBytes: 16 * 1024 * 1024,
+    maxConflictSourceChanges: 100_000,
+    maxConflictSourceOperations: 100_000,
+    maxConflictSourceBytes: 64 * 1024 * 1024,
     maxSyncMessageBytes: 64_000,
     maxPeerSendMillis: 1_000,
     maxSyncChangesPerMessage: 100,
@@ -119,9 +127,11 @@ it.layer(Layer.mergeAll(
       Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, options.documentId)),
     mutate: (_mutation, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, options.payload)),
     delete: (_document, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
+    resolve: (_document, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
     lookupCreate: (id) => Effect.succeed(CommandOutcome.unknown(id)),
     lookupMutation: (_mutation, id) => Effect.succeed(CommandOutcome.unknown(id)),
-    lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id))
+    lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id)),
+    lookupResolution: (_document, options) => Effect.succeed(CommandOutcome.unknown(options.commandId))
   })
   const result = {
     reply: null,

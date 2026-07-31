@@ -360,7 +360,7 @@ Commands are the only way in.
 | Document instance   | One `DocumentId` with its Automerge state and causal history. Model one aggregate per document                         |
 | Snapshot            | The decoded read result for one instance: identity, version, heads, tombstone, projection state, value                 |
 | Heads               | The frontier change hashes identifying a point in Automerge history                                                    |
-| Command             | One create, mutate, or delete request carrying a caller supplied command ID for idempotency                            |
+| Command             | One create, mutate, delete, or conflict resolution request carrying a caller supplied command ID for idempotency       |
 | Command outcome     | What a lookup answers: `DurablyCommittedLocal`, `Rejected`, or `OutcomeUnknown`                                        |
 | Projection          | A deterministic mapping from canonical snapshots to a rebuildable SQL read model                                       |
 | Local commit        | The SQLite transaction that commits canonical changes, projections, the command receipt, and the stored reply together |
@@ -608,6 +608,18 @@ export class Replica extends Context.Service<Replica, {
     document: D,
     documentId: Identity.DocumentId
   ) => Effect.Effect<Snapshot.FromDocument<D>, ReplicaError.ReplicaError>
+  readonly inspectConflicts: <D extends Document.Any,>(
+    document: D,
+    documentId: Identity.DocumentId
+  ) => Effect.Effect<Conflict.Inspection<D["schema"]["Type"]>, Conflict.InspectionError | ReplicaError.ReplicaError>
+  readonly resolveConflict: <D extends Document.Any,>(
+    document: D,
+    options: {
+      readonly commandId: Identity.CommandId
+      readonly documentId: Identity.DocumentId
+      readonly resolution: Conflict.Resolution
+    }
+  ) => Effect.Effect<void, Conflict.ResolutionError | ReplicaError.ReplicaError>
   readonly mutate: <M extends Mutation.Any,>(
     mutation: M,
     options: { readonly commandId: Identity.CommandId; readonly documentId: Identity.DocumentId } & PayloadOf<M>
@@ -632,6 +644,14 @@ export class Replica extends Context.Service<Replica, {
     document: D,
     commandId: Identity.CommandId
   ) => Effect.Effect<CommandOutcome<void>, ReplicaError.ReplicaError>
+  readonly lookupConflictResolution: <D extends Document.Any,>(
+    document: D,
+    options: {
+      readonly commandId: Identity.CommandId
+      readonly documentId: Identity.DocumentId
+      readonly resolution: Conflict.Resolution
+    }
+  ) => Effect.Effect<CommandOutcome<void, Conflict.ResolutionError>, ReplicaError.ReplicaError>
   readonly flush: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly status: Stream.Stream<ReplicaStatus.ReplicaStatus, ReplicaError.ReplicaError>
   readonly exportBackup: (options: Backup.ExportOptions) => Stream.Stream<Uint8Array, ReplicaError.ReplicaError>
@@ -664,6 +684,82 @@ Behavior notes:
   should observe the latest commits.
 - `status` is a long lived latest wins stream. Consume it with a bounded operator such as `Stream.take` or
   `Stream.runHead`, never `Stream.runCollect`.
+
+### Conflict inspection and durable resolution
+
+Automerge keeps concurrent register assignments so replicas can converge without choosing a product policy.
+`inspectConflicts` exposes those retained alternatives without exposing a mutable Automerge handle. It returns
+the ordinary decoded snapshot and a canonical list of conflict records. Each record names the visible
+alternative, every retained alternative, and a structured key and index path.
+
+The `visible` identifier is Automerge's deterministic materialized winner, not an application recommendation.
+Alternative identifiers are opaque. Do not parse or synthesize them. Parent path segments can carry an
+alternative identifier when a conflict lives inside a losing map or list branch.
+
+The representation boundary is deliberate:
+
+- `inspection.snapshot.value` is decoded by the document schema and has the application type.
+- Conflict paths and alternatives describe the document schema's encoded native CRDT value. The
+  `Conflict.Value` codec preserves Text, `ImmutableString`, dates, bytes, counters, maps, and lists. Its portable
+  JSON representation is tagged so those native types do not collapse at an RPC or receipt boundary.
+- A `ReplaceValue` choice also takes an encoded native CRDT value, not the decoded application value. Encode
+  application input through the document schema before constructing a replacement.
+
+Resolve against the exact frontier that was inspected. A scalar alternative can be selected directly:
+
+```ts
+const inspection = yield * replica.inspectConflicts(EditedMessage, documentId)
+const conflict = inspection.conflicts[0]
+
+if (conflict !== undefined) {
+  const resolution = {
+    heads: inspection.snapshot.heads,
+    path: conflict.path,
+    choice: {
+      _tag: "SelectAlternative",
+      alternativeId: conflict.alternatives[0]!.id
+    }
+  } as const
+
+  const commandId = yield * Identity.makeCommandId
+  yield * replica.resolveConflict(EditedMessage, { commandId, documentId, resolution })
+}
+```
+
+Selection is intentionally scalar only. Selecting a map or list alternative would require copying that object.
+The copy receives a fresh Automerge object identity and can hide concurrent descendant edits that were not
+visible in the reviewed branch. The engine rejects it with `CompositeAlternativeRequiresReplacement`. An
+application can choose `ReplaceValue` explicitly after reviewing that tradeoff.
+
+A resolution is a normal durable command. It commits the Automerge change, projections, outbox entry, and
+receipt in one local transaction. A changed frontier rejects with `StaleConflictResolution`. Reinspect, present
+the new alternatives, and use a fresh command ID. This guard is conservative. A concurrent change to an
+unrelated field also makes the inspected frontier stale. Two replicas can resolve the same conflict
+concurrently. After synchronization their resolution assignments can form a new conflict, so resolution is not
+global finality. Inspect again after later synchronization.
+
+`DeleteValue` follows Automerge observed remove semantics. A concurrent assignment that the delete did not
+observe survives, so assignment wins against that delete. Concurrent deletes do not create a value alternative.
+
+If `resolveConflict` reports `CommandOutcomeUnknown`, do not issue a blind retry. Call
+`lookupConflictResolution` with the same document, command ID, and complete resolution descriptor. The complete
+descriptor is required because it is part of the durable request identity. `CommandOutcome.committedOrFail`
+then projects the recorded outcome back into the command channels.
+
+Edited text needs an explicit data model choice. An ordinary schema string is encoded as Automerge Text. It is
+suited to character sequence coediting, and concurrent passages can interleave. If each complete message edit
+must remain an intact reviewable revision, encode the application `string` as
+`Automerge.ImmutableString`. The compile checked
+[`edited-messages.ts`](packages/local-sql/examples/edited-messages.ts) defines that codec and shows inspection,
+stale reinspection, scalar selection, and ambiguous outcome lookup. Showing only Automerge's deterministic
+winner, or discarding retained alternatives, is also a product policy and must be deliberate.
+
+History rewrite is not a resolution API. It creates new lineage and permanently discards every losing
+alternative.
+
+Inspection is subject to configured traversal and source history limits. Checkpoint backed imported history
+that cannot be measured remains readable, but cannot be inspected or extended until an operator rewrites its
+history. That rewrite restores measured bounds by creating new lineage and discarding prior alternatives.
 
 ### Command outcomes and idempotency
 
@@ -1017,7 +1113,9 @@ const allTasks = tasks({ search: "" })
 - `queryFamily(runtime, query)` canonicalizes the schema encoded payload for stable family identity and
   invalidates on every declared projection and source document key.
 - `documentFamily(runtime, document)` invalidates on the document key.
+- `conflictFamily(runtime, document)` inspects retained alternatives and invalidates on the same document key.
 - `mutation(runtime, mutation)` is a `runtime.fn` that invalidates the mutation's document key.
+- `resolveConflict(runtime, document)` is a `runtime.fn` that invalidates the owning document after commit.
 - `status(runtime)` wraps the status stream and resubscribes only after a session replacement.
 - `peerConnectionStatus(runtime, peerId)` reports the actual peer session as `Disconnected`, `Connecting`, or
   `Connected`. It does not read `navigator.onLine`.
@@ -1601,24 +1699,44 @@ not production capacity planning.
 ## Error reference
 
 Failures beside the operations that produce them are documented in each section above. This is the consolidated
-reference. Four kinds of failure exist:
+reference. Five kinds of failure exist:
 
 1. **Declared domain errors.** Defined per mutation and query with `Schema.TaggedErrorClass`. They arrive
    unwrapped in the error channel and are caught by tag: `Effect.catchTag("TitleEmpty", ...)`.
-2. **`ReplicaError`.** The engine's one tagged error, `{ _tag: "ReplicaError", reason }`. Discriminate the
+2. **Conflict operation errors.** Inspection can reject an unsupported stored value or key. Resolution can
+   durably reject a stale frontier, invalid path or alternative, composite selection, or resulting schema.
+   They arrive unwrapped and are caught by their own tags.
+3. **`ReplicaError`.** The engine's one tagged error, `{ _tag: "ReplicaError", reason }`. Discriminate the
    reason with `Effect.catchReason("ReplicaError", "<ReasonTag>", ...)` or match on `error.reason._tag`.
    `ReplicaError.isReplicaError` narrows a mixed channel.
-3. **RPC errors.** `PeerRpcError` variants on the relay protocol, mapped locally to `ReplicaError` by
+4. **RPC errors.** `PeerRpcError` variants on the relay protocol, mapped locally to `ReplicaError` by
    `RpcPeerTransport`; see [RPC failures and retry](#rpc-failures-and-retry). Browser page RPC failures are
    `ReplicaError`, plus `ReplicaQueryError` carrying a query's declared error as JSON.
-4. **Defects and interruption.** Defects are programming errors and stay defects. Interruption is preserved
+5. **Defects and interruption.** Defects are programming errors and stay defects. Interruption is preserved
    everywhere; scope close is cleanup, not persistence.
+
+### Conflict operation errors
+
+| Error                                     | Meaning                                                                                         |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `UnsupportedConflictValue`                | Stored or supplied CRDT data cannot be represented by the bounded portable conflict value model |
+| `UnsupportedConflictKey`                  | A stored or supplied key is unsafe at the Automerge proxy boundary                              |
+| `StaleConflictResolution`                 | The document heads differ from the inspected frontier                                           |
+| `ConflictPathNotFound`                    | A key, index, or selected parent alternative no longer exists                                   |
+| `ConflictPathTypeMismatch`                | A path expected a map or list but reached another value kind                                    |
+| `ConflictNotFound`                        | The terminal path no longer has a retained conflict                                             |
+| `ConflictAlternativeNotFound`             | The selected alternative is not part of the current conflict                                    |
+| `CompositeAlternativeRequiresReplacement` | Direct selection targeted a map or list alternative                                             |
+| `ConflictResolutionSchemaError`           | The resolved encoded document does not satisfy its registered document schema                   |
+
+Inspection boundary errors are not commands and do not write receipts. State dependent resolution errors are
+durable `Rejected` outcomes. Resource bounds and document loading failures remain `ReplicaError`.
 
 ### `ReplicaError` reasons
 
 | Reason                            | Fields                                              | Raised when                                                                                | Handling                                                           |
 | --------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
-| `DocumentNotFound`                | `documentId`                                        | `get`, `mutate`, or `delete` targets a missing document                                    | Terminal                                                           |
+| `DocumentNotFound`                | `documentId`                                        | A document operation targets a missing document                                            | Terminal                                                           |
 | `DocumentDecodeError`             | `documentId`, `cause`                               | Stored or supplied value fails schema decode, or a migration step throws                   | Terminal; fix data or schema                                       |
 | `DocumentEncodeError`             | `documentId`, `cause`                               | A supplied value fails schema encode                                                       | Terminal                                                           |
 | `UnsupportedDocumentVersion`      | `documentId`, `observedVersion`, `supportedVersion` | A stored version has no covering migration chain                                           | Terminal; register the migration or upgrade the build              |
@@ -1629,7 +1747,7 @@ reference. Four kinds of failure exist:
 | `CanonicalEncodeError`            | `cause`                                             | Canonical JSON encoding failed                                                             | Terminal                                                           |
 | `StorageCorrupt`                  | `cause`                                             | One document's stored bytes or metadata fail validation                                    | Terminal for that document; recovery quarantines it                |
 | `ReplicaMetadataMissing`          | `operation`                                         | The replica's metadata singleton row is gone; the replica has no identity                  | Replica wide and fatal                                             |
-| `QuotaExceeded`                   | `resource`, `limit`                                 | A configured limit was breached (pending bytes, gate queue, restore admission)             | Shed load; retry only after capacity frees                         |
+| `QuotaExceeded`                   | `resource`, `limit`                                 | A configured bound was breached, including conflict traversal or source history            | Shed load; retry only after capacity frees                         |
 | `MigrationFailed`                 | `migration`, `cause`                                | A library storage migration failed                                                         | Terminal                                                           |
 | `BackupInvalid`                   | `cause`                                             | An archive or portable document fails validation                                           | Terminal                                                           |
 | `BackupTooLarge`                  | `limit`, `observed`                                 | An archive exceeds `maxBytes`                                                              | Terminal; raise the bound or split the data                        |
@@ -1641,7 +1759,7 @@ reference. Four kinds of failure exist:
 | `UnsupportedStorageFormatVersion` | `observedVersion`, `supportedVersion`               | The on disk format belongs to another library build                                        | Terminal; run a matching build or re-seed                          |
 | `CheckpointSuperseded`            | `documentIds`, `attempts`                           | Checkpoint publication lost the install race on every attempt                              | Partial compaction; retry with a new operation ID                  |
 | `DocumentLineageChanged`          | `documentId`, `localLineage`, `remoteLineage`       | A peer holds a superseded document lineage                                                 | Terminal for that document; repair by archive restore              |
-| `CommandOutcomeUnknown`           | `commandId`, `cause`                                | The command may or may not have committed                                                  | Never retry; look the command ID up                                |
+| `CommandOutcomeUnknown`           | `commandId`, `cause`                                | The command may or may not have committed                                                  | Never retry; use the matching complete lookup                      |
 
 Fields named `cause` use `Schema.Defect()` and carry the original failure. They stay inside the local process;
 the external peer RPC never exposes them.
@@ -1668,13 +1786,13 @@ replica.mutate(RenameTask, { commandId, documentId, payload }).pipe(
 
 ### Retry taxonomy
 
-| Action                       | When                                                                                        |
-| ---------------------------- | ------------------------------------------------------------------------------------------- |
-| Retry the same command ID    | Only after `StorageUnavailable` style transport loss, when the request bytes are identical  |
-| Look up an ambiguous outcome | After `CommandOutcomeUnknown`, with the same definition and command ID                      |
-| Start a new logical command  | New intent, or application policy after an `OutcomeUnknown` lookup. Fresh command ID        |
-| Retry a transport connection | `RpcPeerTransport.isRetryable` (`StorageUnavailable` only), with a rebuilt connection scope |
-| Never retry                  | Domain rejections, policy and protocol mismatches, fencing, quota, malformed peer traffic   |
+| Action                       | When                                                                                                                        |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Retry the same command ID    | Only after `StorageUnavailable` style transport loss, when the request bytes are identical                                  |
+| Look up an ambiguous outcome | After `CommandOutcomeUnknown`, with the original request identity. Conflict resolution lookup needs its complete descriptor |
+| Start a new logical command  | New intent, or application policy after an `OutcomeUnknown` lookup. Fresh command ID                                        |
+| Retry a transport connection | `RpcPeerTransport.isRetryable` (`StorageUnavailable` only), with a rebuilt connection scope                                 |
+| Never retry                  | Domain rejections, policy and protocol mismatches, fencing, quota, malformed peer traffic                                   |
 
 ### Browser protocol errors
 
@@ -1704,6 +1822,10 @@ Domain model and the application capability.
 
 - `Document`: `make`, `migration`, `decode`, `encode`, `decodeStored`, `isAutomergeValue`, `supportsStoredVersion`;
   types `Document`, `Any`, `Migration`, `WireSchema`, `AutomergeEncoded`, `DocumentSchema`.
+- `Conflict`: `AlternativeId`, `Head`, `Heads`, `ParentSegment`, `TargetSegment`, `Path`, `Value`, `Choice`,
+  `Resolution`, `Alternative`, `Record`, `Records`, `inspection`, every conflict operation error,
+  `InspectionError`, `ResolutionError`, and `sameHeads`. Advanced boundary helpers are `isSupportedKey`,
+  `hardPreflightLimits`, `preflightNativeValue`, `preflightPortableValue`, and `preflightUnknown`.
 - `DocumentSet`: `make`, `get`; type `DocumentSet`.
 - `Mutation`: `make`; per definition `payloadSchema`, `successSchema`, `errorSchema`, `of`, `toLayer`; types
   `Mutation`, `Any`, `Handler`, `HandlerOptions`, `HandlerService`, `Draft`, `DraftValue`, `HandlerResult`.
@@ -1780,8 +1902,8 @@ and `Presence`.
 - `OwnershipCoordinator`: `layerTab`, `layerSharedWorker`, `runSharedWorker`, `runDatabaseWorker`; the
   `OwnershipCoordinator` service; types `SharedWorkerOptions`, `TabOptions`, `DatabaseWorkerOptions`,
   `EngineServices`.
-- `ReplicaAtom`: `documentFamily`, `queryFamily`, `mutation`, `status`, `peerConnectionStatus`,
-  `relayConnectionStatus`,
+- `ReplicaAtom`: `documentFamily`, `conflictFamily`, `commandDeliveryFamily`, `queryFamily`, `mutation`,
+  `resolveConflict`, `status`, `peerConnectionStatus`, `relayConnectionStatus`,
   `layerReactivity`. See
   [Reactive state](#reactive-state).
 - `Presence`: `make`; types `Presence`, `Entry`.
@@ -1840,6 +1962,8 @@ Guarantees:
 - Projections are rebuildable from canonical snapshots. A blocked projection blocks its queries, never serves
   partial state.
 - Replicas converge after receiving the same valid Automerge change set.
+- Conflict inspection exposes retained alternatives at one exact document frontier. Resolution is a durable
+  ordinary replica command with the same persistence, projection, synchronization, and lookup guarantees.
 - Restore is exclusive, fenced, staged, schema checked, and projection rebuilding. A failed install leaves the
   previous incarnation untouched.
 - Relay delivery is at least once within configured retry, expiry, retention, authorization, and capacity
@@ -1859,6 +1983,9 @@ Limitations:
 - History rewrite destroys prior changes, checkpoints, provenance, and peer state for the document, and the
   rewritten document never resynchronizes with a peer holding the superseded lineage.
 - Cross lineage synchronization is refused, never merged.
+- Resolution is not global finality. Concurrent resolvers can produce a new conflict after synchronization.
+- Composite replacement creates fresh Automerge object identity and can hide unreviewed descendant edits.
+- Delete observes only its causal past. A concurrent assignment survives according to add wins semantics.
 - The RPC package provides no managed backend, discovery, account system, credential issuer, tenant registry,
   TLS, HTTP server, or end to end encryption.
 - A replica database must not be opened by a build older than the one that wrote its workflow records: a record

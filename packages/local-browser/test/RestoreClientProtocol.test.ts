@@ -22,6 +22,14 @@ const installationId = Identity.BackupInstallationId.make("bak_43c8d2f4-58ce-4c9
 const nonce = RestoreProtocol.RestoreNonce.make("rst_43c8d2f4-58ce-4c9a-9155-9d21019f5e9d")
 const sequence = RestoreProtocol.RestoreSequence.make
 
+const conflictLimits: ReplicaRpc.ConflictLimits = {
+  maxConflictDepth: 16,
+  maxConflictNodes: 10_000,
+  maxConflictAlternatives: 1_000,
+  maxConflictPathSegments: 16,
+  maxConflictValueBytes: 1024 * 1024
+}
+
 const rpcClient = (
   begin: () => Effect.Effect<{
     readonly nonce: RestoreProtocol.RestoreNonce
@@ -38,6 +46,7 @@ const rpcClient = (
         protocolVersion: ReplicaRpc.protocolVersion,
         definitionHash: definition.hash,
         ownerEpoch: "owner",
+        conflictLimits,
         maxChunkBytes,
         maxRestoreCoalesceMillis: 25,
         maxRestoreErrorBytes
@@ -1595,6 +1604,7 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
               protocolVersion: ReplicaRpc.protocolVersion,
               definitionHash: definition.hash,
               ownerEpoch: "owner",
+              conflictLimits,
               ...advertised,
               maxRestoreErrorBytes: 4_096
             }),
@@ -1643,6 +1653,7 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
               protocolVersion: ReplicaRpc.protocolVersion,
               definitionHash: definition.hash,
               ownerEpoch: "owner",
+              conflictLimits,
               maxChunkBytes: 4,
               maxRestoreCoalesceMillis: 25,
               ...(maxRestoreErrorBytes === undefined ? {} : { maxRestoreErrorBytes })

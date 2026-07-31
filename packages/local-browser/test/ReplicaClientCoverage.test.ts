@@ -5,6 +5,7 @@ import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnec
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
@@ -31,6 +32,14 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
     maxChunkBytes: 128,
     maxArchiveRecords: 100,
     maxJsonDepth: 16,
+    maxConflictDepth: 16,
+    maxConflictNodes: 10_000,
+    maxConflictAlternatives: 1_000,
+    maxConflictPathSegments: 16,
+    maxConflictValueBytes: 1024 * 1024,
+    maxConflictSourceChanges: 10_000,
+    maxConflictSourceOperations: 100_000,
+    maxConflictSourceBytes: 64 * 1024 * 1024,
     maxSyncMessageBytes: 1024,
     maxPeerSendMillis: 1_000,
     maxSyncChangesPerMessage: 10,
@@ -1022,7 +1031,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
         {
           _tag: "FullRefreshRequired",
           ownerEpoch: client.ownerEpoch,
-          keys: [Task.name, ReplicaRpc.commandDeliveryInvalidationKey]
+          keys: [...ReplicaDefinition.invalidationKeys(definition), ReplicaRpc.commandDeliveryInvalidationKey]
         }
       ])
       assert.strictEqual(error.reason._tag, "QuotaExceeded")
@@ -1068,7 +1077,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
         {
           _tag: "FullRefreshRequired",
           ownerEpoch: client.ownerEpoch,
-          keys: [Task.name, ReplicaRpc.commandDeliveryInvalidationKey]
+          keys: [...ReplicaDefinition.invalidationKeys(definition), ReplicaRpc.commandDeliveryInvalidationKey]
         }
       ])
       assert.strictEqual(error.reason._tag, "QuotaExceeded")

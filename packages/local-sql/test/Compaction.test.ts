@@ -122,10 +122,11 @@ describe("Compaction", () => {
       const sql = yield* SqlClient.SqlClient
       return yield* sql<{
         readonly applied: number
+        readonly bytes: Uint8Array
         readonly change_hash: string
         readonly commit_sequence: number
         readonly peer_id: string | null
-      }>`SELECT applied, change_hash, commit_sequence, peer_id
+      }>`SELECT applied, bytes, change_hash, commit_sequence, peer_id
         FROM effect_local_changes WHERE document_id = ${documentId}`
     })
 
@@ -133,10 +134,13 @@ describe("Compaction", () => {
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
       const rows = yield* sql<{
+        readonly history_bytes: number | null
+        readonly history_changes: number | null
+        readonly history_operations: number | null
         readonly lineage: string
         readonly projection_status: string
         readonly tombstone: number
-      }>`SELECT lineage, projection_status, tombstone
+      }>`SELECT history_bytes, history_changes, history_operations, lineage, projection_status, tombstone
         FROM effect_local_documents WHERE document_id = ${documentId}`
       return rows[0]!
     })
@@ -333,6 +337,9 @@ describe("Compaction", () => {
       assert.deepStrictEqual(rows.map((row) => row.change_hash), persisted.materializedHeads)
       const recovered = yield* recovery.recover(Task, documentId)
       assert.deepStrictEqual(recovered.snapshot.value, { title: "two", labels: [] })
+      assert.strictEqual(recovered.historyChanges, persisted.historyChanges)
+      assert.strictEqual(recovered.historyOperations, persisted.historyOperations)
+      assert.strictEqual(recovered.historyBytes, persisted.historyBytes)
       assert.isTrue(Automerge.hasHeads(recovered.automerge, [...firstHeads]))
       assert.strictEqual(Automerge.getChangesSince(recovered.automerge, [...firstHeads]).length, 1)
       InternalAutomerge.free(recovered.automerge)
@@ -578,7 +585,7 @@ describe("Compaction", () => {
         [{
           commit_sequence: rewritten.commit_sequence,
           document_id: documentId as string,
-          invalidation_keys: JSON.stringify([Task.name]),
+          invalidation_keys: JSON.stringify(ReplicaDefinition.documentCommitKeys(Task.name, documentId)),
           published: 0
         }]
       )
@@ -593,6 +600,9 @@ describe("Compaction", () => {
       const row = yield* documentRowOf(documentId)
       assert.strictEqual(row.lineage, lineage)
       assert.notStrictEqual(row.lineage, "")
+      assert.strictEqual(row.history_changes, 1)
+      assert.strictEqual(row.history_operations, Automerge.decodeChange(changes[0]!.bytes).ops.length)
+      assert.strictEqual(row.history_bytes, changes[0]!.bytes.byteLength)
 
       const reloaded = yield* store.load(Task, documentId)
       assert.deepStrictEqual(reloaded.snapshot.value, value)

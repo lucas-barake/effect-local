@@ -30,6 +30,14 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
     maxChunkBytes: 128,
     maxArchiveRecords: 100,
     maxJsonDepth: 16,
+    maxConflictDepth: 16,
+    maxConflictNodes: 10_000,
+    maxConflictAlternatives: 1_000,
+    maxConflictPathSegments: 16,
+    maxConflictValueBytes: 1024 * 1024,
+    maxConflictSourceChanges: 10_000,
+    maxConflictSourceOperations: 100_000,
+    maxConflictSourceBytes: 64 * 1024 * 1024,
     maxSyncMessageBytes: 1024,
     maxPeerSendMillis: 1_000,
     maxSyncChangesPerMessage: 10,
@@ -97,7 +105,7 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
   const unary = <A, E, R,>(effect: Effect.Effect<A | Deferred.Deferred<A, E>, E, R>) =>
     Effect.flatMap(effect, (value) => Deferred.isDeferred<A, E>(value) ? Deferred.await(value) : Effect.succeed(value))
 
-  it.effect("advertises the configured restore transport limits", () =>
+  it.effect("advertises the configured restore and conflict limits", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       const sessionId = yield* Identity.makeSessionId
@@ -110,6 +118,13 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
       assert.strictEqual(handshake.maxChunkBytes, limits.maxChunkBytes)
       assert.strictEqual(handshake.maxRestoreCoalesceMillis, limits.maxRestoreCoalesceMillis)
       assert.strictEqual(handshake.maxRestoreErrorBytes, limits.maxRestoreErrorBytes)
+      assert.deepStrictEqual(handshake.conflictLimits, {
+        maxConflictDepth: limits.maxConflictDepth,
+        maxConflictNodes: limits.maxConflictNodes,
+        maxConflictAlternatives: limits.maxConflictAlternatives,
+        maxConflictPathSegments: limits.maxConflictPathSegments,
+        maxConflictValueBytes: limits.maxConflictValueBytes
+      })
     })).pipe(Effect.provide(ownerLayer())))
 
   it.effect("validates legacy ownership before rejecting without reading chunks", () =>

@@ -2,6 +2,7 @@ import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnec
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as CommandDelivery from "@lucas-barake/effect-local/CommandDelivery"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
+import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
@@ -48,11 +49,20 @@ export const commandDeliveryInvalidationKey = "@lucas-barake/effect-local/comman
 const DeliveryEventSequence = Schema.Int.check(Schema.isGreaterThan(0))
 const DeliveryCursor = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 const SessionLease = Schema.Struct({ leaseMillis: Schema.Int })
+export const ConflictLimits = Schema.Struct({
+  maxConflictDepth: Schema.Int,
+  maxConflictNodes: Schema.Int,
+  maxConflictAlternatives: Schema.Int,
+  maxConflictPathSegments: Schema.Int,
+  maxConflictValueBytes: Schema.Int
+})
+export type ConflictLimits = typeof ConflictLimits.Type
 export const SessionHandshake = Schema.Struct({
   leaseMillis: Schema.Int,
   protocolVersion: Schema.Int,
   definitionHash: Schema.String,
   ownerEpoch: Schema.String,
+  conflictLimits: Schema.optional(ConflictLimits),
   maxChunkBytes: Schema.optional(Schema.Int),
   maxRestoreCoalesceMillis: Schema.optional(Schema.Int),
   maxRestoreErrorBytes: Schema.optional(Schema.Int)
@@ -157,6 +167,22 @@ export const group = RpcGroup.make(
     success: Snapshot,
     error: ReplicaError.ReplicaError
   }),
+  Rpc.make("InspectConflicts", {
+    payload: { sessionId: Identity.SessionId, document: Schema.String, documentId: Identity.DocumentId },
+    success: Schema.String,
+    error: Schema.Union([Conflict.InspectionError, ReplicaError.ReplicaError])
+  }),
+  Rpc.make("ResolveConflict", {
+    payload: {
+      sessionId: Identity.SessionId,
+      document: Schema.String,
+      commandId: Identity.CommandId,
+      documentId: Identity.DocumentId,
+      resolution: Schema.String
+    },
+    success: Schema.String,
+    error: ReplicaError.ReplicaError
+  }),
   Rpc.make("Mutate", {
     payload: {
       sessionId: Identity.SessionId,
@@ -196,6 +222,17 @@ export const group = RpcGroup.make(
   Rpc.make("LookupDelete", {
     payload: { sessionId: Identity.SessionId, document: Schema.String, commandId: Identity.CommandId },
     success: JsonOutcome,
+    error: ReplicaError.ReplicaError
+  }),
+  Rpc.make("LookupConflictResolution", {
+    payload: {
+      sessionId: Identity.SessionId,
+      document: Schema.String,
+      commandId: Identity.CommandId,
+      documentId: Identity.DocumentId,
+      resolution: Schema.String
+    },
+    success: Schema.String,
     error: ReplicaError.ReplicaError
   }),
   Rpc.make("LookupCommandDelivery", {

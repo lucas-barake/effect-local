@@ -1,4 +1,4 @@
-export const storageFormatVersion = 1
+export const storageFormatVersion = 2
 
 export const tables = [
   "effect_local_metadata",

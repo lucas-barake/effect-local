@@ -1,14 +1,16 @@
 import { NodeCrypto } from "@effect/platform-node"
+import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
+import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
-import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
@@ -16,13 +18,21 @@ import * as Layer from "effect/Layer"
 import * as PrimaryKey from "effect/PrimaryKey"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
-import * as ClusterSchema from "effect/unstable/cluster/ClusterSchema"
+import { TestClock } from "effect/testing"
 import * as Entity from "effect/unstable/cluster/Entity"
+import * as RunnerHealth from "effect/unstable/cluster/RunnerHealth"
+import * as Runners from "effect/unstable/cluster/Runners"
+import * as Sharding from "effect/unstable/cluster/Sharding"
 import * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
+import * as SqlMessageStorage from "effect/unstable/cluster/SqlMessageStorage"
+import * as SqlRunnerStorage from "effect/unstable/cluster/SqlRunnerStorage"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as DocumentEntity from "../src/DocumentEntity.js"
+import * as ClusterStorage from "../src/internal/clusterStorage.js"
 import * as PeerSync from "../src/PeerSync.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
+import * as SqlReplica from "../src/SqlReplica.js"
 
 describe("DocumentEntity", () => {
   const Task = Document.make("Task", {
@@ -46,6 +56,14 @@ describe("DocumentEntity", () => {
     maxChunkBytes: 64_000,
     maxArchiveRecords: 1_000,
     maxJsonDepth: 32,
+    maxConflictDepth: 64,
+    maxConflictNodes: 100_000,
+    maxConflictAlternatives: 10_000,
+    maxConflictPathSegments: 128,
+    maxConflictValueBytes: 16 * 1024 * 1024,
+    maxConflictSourceChanges: 100_000,
+    maxConflictSourceOperations: 100_000,
+    maxConflictSourceBytes: 64 * 1024 * 1024,
     maxSyncMessageBytes: 64_000,
     maxPeerSendMillis: 1_000,
     maxSyncChangesPerMessage: 100,
@@ -79,7 +97,8 @@ describe("DocumentEntity", () => {
       entityMailboxCapacity: limits.maxQueuedRpc,
       entityTerminationTimeout: 0,
       entityMessagePollInterval: 5_000,
-      sendRetryInterval: 100
+      sendRetryInterval: 100,
+      refreshAssignmentsInterval: 0
     }),
     NodeCrypto.layer
   )
@@ -361,16 +380,107 @@ describe("DocumentEntity", () => {
     )
   })
 
-  it("persists RPCs in the shared SQL transaction without server interruption", () => {
-    for (const rpc of [DocumentEntity.Create, DocumentEntity.Mutate, DocumentEntity.Delete]) {
-      assert.strictEqual(Context.get(rpc.annotations, ClusterSchema.Persisted), true)
-      assert.strictEqual(Context.get(rpc.annotations, ClusterSchema.WithTransaction), true)
-      assert.isTrue(Context.get(rpc.annotations, ClusterSchema.Uninterruptible) === "client")
-    }
-    assert.strictEqual(Context.get(DocumentEntity.ApplySync.annotations, ClusterSchema.Persisted), true)
-    assert.strictEqual(Context.get(DocumentEntity.ApplySync.annotations, ClusterSchema.WithTransaction), true)
-    assert.strictEqual(Context.get(DocumentEntity.ApplySync.annotations, ClusterSchema.Uninterruptible), true)
-  })
+  it.effect("replays a committed command and rolls back a failed command with its durable reply", () =>
+    Effect.gen(function*() {
+      const database = Layer.merge(
+        SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+        NodeCrypto.layer
+      )
+      const inputs = Layer.mergeAll(
+        database,
+        ReplicaLimits.layer(limits),
+        Rename.toLayer(({ draft, payload }) => {
+          draft.title = payload
+          return payload
+        })
+      )
+      const services = SqlReplica.servicesLayerWithBindings(definition, { projections: [] })
+      const peerSync = PeerSync.layer.pipe(Layer.provideMerge(services))
+      const cluster = Sharding.layer.pipe(
+        Layer.provideMerge(Runners.layerNoop),
+        Layer.provideMerge(SqlMessageStorage.layerWith({ prefix: ClusterStorage.messagePrefix })),
+        Layer.provide([
+          Layer.orDie(SqlRunnerStorage.layerWith({ prefix: ClusterStorage.runnerPrefix })),
+          RunnerHealth.layerNoop
+        ]),
+        Layer.provide(TestShardingConfig)
+      )
+      const live = DocumentEntity.layer(definition).pipe(
+        Layer.provideMerge(peerSync),
+        Layer.provideMerge(cluster),
+        Layer.provideMerge(inputs)
+      )
+
+      yield* Effect.gen(function*() {
+        yield* TestClock.adjust(1)
+        const sql = yield* SqlClient.SqlClient
+        const gate = yield* ReplicaGate.ReplicaGate
+        const permit = yield* gate.current
+        const documentId = yield* Identity.makeDocumentId
+        const commandId = yield* Identity.makeCommandId
+        const failedCommandId = yield* Identity.makeCommandId
+        const makeClient = yield* DocumentEntity.DocumentEntity.client
+        const client = makeClient(documentId)
+        const value = { title: "first" }
+        const requestHash = yield* CommandExecutor.createRequestHash({
+          incarnation: permit.incarnation,
+          commandId,
+          document: Task,
+          documentId,
+          encoded: yield* Document.encode(Task, documentId, value)
+        })
+        const request = {
+          replicaIncarnation: permit.incarnation,
+          writerGeneration: permit.writerGeneration,
+          commandId,
+          documentType: Task.name,
+          payload: new TextEncoder().encode(JSON.stringify(value)),
+          requestHash
+        }
+
+        const first = yield* client.Create(request)
+        const replayed = yield* client.Create(request)
+        assert.deepStrictEqual(replayed, first)
+        assert.deepStrictEqual(
+          yield* Schema.decodeUnknownEffect(
+            Schema.toCodecJson(CommandOutcome.schema(Identity.DocumentId, Schema.Never))
+          )(JSON.parse(new TextDecoder().decode(replayed))),
+          CommandOutcome.durablyCommitted(commandId, documentId)
+        )
+
+        const failed = yield* Effect.flip(client.Create({
+          ...request,
+          commandId: failedCommandId,
+          payload: new TextEncoder().encode("{"),
+          requestHash: "failed-create-hash"
+        }))
+        if (!ReplicaError.isReplicaError(failed)) {
+          assert.fail(`Expected ReplicaError, got ${failed._tag}`)
+        }
+        assert.strictEqual(failed.reason._tag, "ProtocolMismatch")
+
+        const durableRows = yield* sql<{
+          readonly documents: number
+          readonly receipts: number
+        }>`SELECT
+          (SELECT COUNT(*) FROM effect_local_documents) AS documents,
+          (SELECT COUNT(*) FROM effect_local_command_receipts) AS receipts`
+        assert.deepStrictEqual(durableRows[0], { documents: 1, receipts: 1 })
+        const clusterRows = yield* sql<{
+          readonly processed: number
+          readonly replies: number
+        }>`SELECT m.processed AS processed,
+            (SELECT COUNT(*) FROM ${sql(`${ClusterStorage.messagePrefix}_replies`)} r
+              WHERE r.request_id = m.request_id) AS replies
+          FROM ${sql(`${ClusterStorage.messagePrefix}_messages`)} m
+          WHERE m.kind = 0
+          ORDER BY m.rowid`
+        assert.deepStrictEqual(clusterRows, [
+          { processed: 1, replies: 1 },
+          { processed: 0, replies: 0 }
+        ])
+      }).pipe(Effect.scoped, Effect.provide(live))
+    }))
 
   it.effect("decodes commands and encodes their outcomes", () =>
     Effect.scoped(
@@ -388,9 +498,12 @@ describe("DocumentEntity", () => {
           mutate: (_mutation, options) =>
             Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, options.payload)),
           delete: (_document, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
+          resolve: (_document, options) =>
+            Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
           lookupCreate: (id) => Effect.succeed(CommandOutcome.unknown(id)),
           lookupMutation: (_mutation, id) => Effect.succeed(CommandOutcome.unknown(id)),
-          lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id))
+          lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id)),
+          lookupResolution: (_document, options) => Effect.succeed(CommandOutcome.unknown(options.commandId))
         })
         const receivedProvenance = yield* Ref.make<
           ReadonlyArray<{
@@ -466,6 +579,29 @@ describe("DocumentEntity", () => {
             JSON.parse(new TextDecoder().decode(deleteBytes))
           ),
           CommandOutcome.durablyCommitted(deleteCommandId, undefined)
+        )
+
+        const resolutionCommandId = yield* Identity.makeCommandId
+        const resolutionBytes = yield* client.Resolve({
+          replicaIncarnation: permit.incarnation,
+          writerGeneration: permit.writerGeneration,
+          commandId: resolutionCommandId,
+          documentType: Task.name,
+          requestHash: "resolution-hash",
+          resolution: {
+            heads: [],
+            path: {
+              parents: [],
+              target: { _tag: "Key", key: "title" }
+            },
+            choice: { _tag: "DeleteValue" }
+          }
+        })
+        assert.deepStrictEqual(
+          yield* Schema.decodeUnknownEffect(
+            Schema.toCodecJson(CommandOutcome.schema(Schema.Void, Conflict.ResolutionError))
+          )(JSON.parse(new TextDecoder().decode(resolutionBytes))),
+          CommandOutcome.durablyCommitted(resolutionCommandId, undefined)
         )
 
         const message = new Uint8Array([1, 2, 3])
@@ -580,9 +716,12 @@ describe("DocumentEntity", () => {
           mutate: (_mutation, options) =>
             Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, options.payload)),
           delete: (_document, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
+          resolve: (_document, options) =>
+            Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
           lookupCreate: (id) => Effect.succeed(CommandOutcome.unknown(id)),
           lookupMutation: (_mutation, id) => Effect.succeed(CommandOutcome.unknown(id)),
-          lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id))
+          lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id)),
+          lookupResolution: (_document, options) => Effect.succeed(CommandOutcome.unknown(options.commandId))
         })
         const sync = peerSync((_document, _documentId, _session, _input) =>
           Ref.update(syncCalls, (count) => count + 1).pipe(Effect.as(syncResult))
@@ -646,9 +785,11 @@ describe("DocumentEntity", () => {
           create: (_document, _options) => Effect.die("create should not run"),
           mutate: (_mutation, _options) => Effect.die("mutate should not run"),
           delete: (_document, _options) => Effect.die("delete should not run"),
+          resolve: (_document, _options) => Effect.die("resolve should not run"),
           lookupCreate: (id) => Effect.succeed(CommandOutcome.unknown(id)),
           lookupMutation: (_mutation, id) => Effect.succeed(CommandOutcome.unknown(id)),
-          lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id))
+          lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id)),
+          lookupResolution: (_document, options) => Effect.succeed(CommandOutcome.unknown(options.commandId))
         })
         const makeClient = yield* Entity.makeTestClient(
           DocumentEntity.DocumentEntity,

@@ -3,12 +3,30 @@ import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as ReplicaLimits from "../src/ReplicaLimits.js"
 
+const assertSchemaFailure = <A,>(
+  effect: Effect.Effect<A, Schema.SchemaError>,
+  message?: string
+) =>
+  Effect.gen(function*() {
+    const error = yield* Effect.flip(effect)
+    assert.isTrue(Schema.isSchemaError(error), message)
+    return error
+  })
+
 describe("ReplicaLimits", () => {
   const values: ReplicaLimits.Values = {
     maxBackupBytes: 1024,
     maxChunkBytes: 256,
     maxArchiveRecords: 100,
     maxJsonDepth: 16,
+    maxConflictDepth: 16,
+    maxConflictNodes: 1_000,
+    maxConflictAlternatives: 100,
+    maxConflictPathSegments: 16,
+    maxConflictValueBytes: 1024,
+    maxConflictSourceChanges: 1_000,
+    maxConflictSourceOperations: 1_000,
+    maxConflictSourceBytes: 4096,
     maxSyncMessageBytes: 512,
     maxPeerSendMillis: 1_000,
     maxSyncChangesPerMessage: 10,
@@ -44,6 +62,16 @@ describe("ReplicaLimits", () => {
     "maxRestoreCoalesceMillis",
     "maxRestoreErrorBytes"
   ] as const
+  const conflictLimitKeys = [
+    "maxConflictDepth",
+    "maxConflictNodes",
+    "maxConflictAlternatives",
+    "maxConflictPathSegments",
+    "maxConflictValueBytes",
+    "maxConflictSourceChanges",
+    "maxConflictSourceOperations",
+    "maxConflictSourceBytes"
+  ] as const
 
   it.effect("requires and provides validated owner limits", () =>
     Effect.gen(function*() {
@@ -75,13 +103,14 @@ describe("ReplicaLimits", () => {
       assert.strictEqual((yield* Effect.exit(ReplicaLimits.make(upperBoundaries)))._tag, "Success")
 
       for (const key of restoreLimitKeys) {
-        assert.strictEqual(
-          (yield* Effect.exit(ReplicaLimits.make({
+        const error = yield* assertSchemaFailure(
+          ReplicaLimits.make({
             ...lowerBoundaries,
             [key]: lowerBoundaries[key] + 0.5
-          })))._tag,
-          "Failure"
+          }),
+          key
         )
+        assert.include(error.message, `["${key}"]`)
       }
     }))
 
@@ -92,63 +121,85 @@ describe("ReplicaLimits", () => {
         delete input[key]
 
         const error = yield* Schema.decodeUnknownEffect(ReplicaLimits.Values)(input).pipe(Effect.flip)
+        assert.isTrue(Schema.isSchemaError(error), key)
         assert.include(error.message, "Missing key")
         assert.include(error.message, `at ["${key}"]`)
       }
     }))
 
+  it.effect("requires every conflict limit at the runtime schema boundary", () =>
+    Effect.gen(function*() {
+      for (const key of conflictLimitKeys) {
+        const input: Record<string, unknown> = { ...values }
+        delete input[key]
+
+        const error = yield* Schema.decodeUnknownEffect(ReplicaLimits.Values)(input).pipe(Effect.flip)
+        assert.isTrue(Schema.isSchemaError(error), key)
+        assert.include(error.message, "Missing key")
+        assert.include(error.message, `at ["${key}"]`)
+      }
+    }))
+
+  it.effect("accepts exact conflict ceilings and rejects values above them", () =>
+    Effect.gen(function*() {
+      const ceilings = {
+        ...values,
+        maxConflictDepth: ReplicaLimits.maxConflictDepthHardLimit,
+        maxConflictNodes: ReplicaLimits.maxConflictNodesHardLimit,
+        maxConflictAlternatives: ReplicaLimits.maxConflictAlternativesHardLimit,
+        maxConflictPathSegments: ReplicaLimits.maxConflictPathSegmentsHardLimit,
+        maxConflictValueBytes: ReplicaLimits.maxConflictValueBytesHardLimit,
+        maxConflictSourceChanges: ReplicaLimits.maxConflictSourceChangesHardLimit,
+        maxConflictSourceOperations: ReplicaLimits.maxConflictSourceOperationsHardLimit,
+        maxConflictSourceBytes: ReplicaLimits.maxConflictSourceBytesHardLimit
+      }
+      assert.strictEqual((yield* Effect.exit(ReplicaLimits.make(ceilings)))._tag, "Success")
+
+      for (const key of conflictLimitKeys) {
+        const above = yield* assertSchemaFailure(
+          ReplicaLimits.make({
+            ...ceilings,
+            [key]: ceilings[key] + 1
+          }),
+          key
+        )
+        assert.include(above.message, `["${key}"]`)
+        const zero = yield* assertSchemaFailure(
+          ReplicaLimits.make({
+            ...values,
+            [key]: 0
+          }),
+          key
+        )
+        assert.include(zero.message, `["${key}"]`)
+      }
+    }))
+
   it.effect("rejects nonpositive and unsafe limits", () =>
     Effect.gen(function*() {
-      assert.strictEqual((yield* Effect.exit(ReplicaLimits.make({ ...values, maxSessions: 0 })))._tag, "Failure")
-      assert.strictEqual((yield* Effect.exit(ReplicaLimits.make({ ...values, maxQueuedPermits: 0 })))._tag, "Failure")
-      assert.strictEqual(
-        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxBackupBytes: Number.MAX_VALUE })))._tag,
-        "Failure"
-      )
-      assert.strictEqual(
-        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxActiveRestores: 0 })))._tag,
-        "Failure"
-      )
-      assert.strictEqual(
-        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestoresPerSession: 0 })))._tag,
-        "Failure"
-      )
-      assert.strictEqual(
-        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestoreMillis: 0 })))._tag,
-        "Failure"
-      )
-      assert.strictEqual(
-        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestorePullMillis: 0 })))._tag,
-        "Failure"
-      )
-      assert.strictEqual(
-        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestoreCoalesceMillis: 0 })))._tag,
-        "Failure"
-      )
-      assert.strictEqual(
-        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxActiveRestores: Number.MAX_VALUE })))._tag,
-        "Failure"
-      )
-      assert.strictEqual(
-        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestoresPerSession: Number.MAX_VALUE })))._tag,
-        "Failure"
-      )
-      assert.strictEqual(
-        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestoreMillis: Number.MAX_VALUE })))._tag,
-        "Failure"
-      )
-      assert.strictEqual(
-        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestorePullMillis: Number.MAX_VALUE })))._tag,
-        "Failure"
-      )
-      assert.strictEqual(
-        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestoreCoalesceMillis: Number.MAX_VALUE })))._tag,
-        "Failure"
-      )
-      assert.strictEqual(
-        (yield* Effect.exit(ReplicaLimits.make({ ...values, maxRestoreErrorBytes: Number.MAX_VALUE })))._tag,
-        "Failure"
-      )
+      const invalid = [
+        ["maxSessions", 0],
+        ["maxQueuedPermits", 0],
+        ["maxBackupBytes", Number.MAX_VALUE],
+        ["maxActiveRestores", 0],
+        ["maxRestoresPerSession", 0],
+        ["maxRestoreMillis", 0],
+        ["maxRestorePullMillis", 0],
+        ["maxRestoreCoalesceMillis", 0],
+        ["maxActiveRestores", Number.MAX_VALUE],
+        ["maxRestoresPerSession", Number.MAX_VALUE],
+        ["maxRestoreMillis", Number.MAX_VALUE],
+        ["maxRestorePullMillis", Number.MAX_VALUE],
+        ["maxRestoreCoalesceMillis", Number.MAX_VALUE],
+        ["maxRestoreErrorBytes", Number.MAX_VALUE]
+      ] as const
+      for (const [key, value] of invalid) {
+        const error = yield* assertSchemaFailure(
+          ReplicaLimits.make({ ...values, [key]: value }),
+          key
+        )
+        assert.include(error.message, `["${key}"]`)
+      }
     }))
 
   it.effect("requires enough restore error bytes to preserve every wire error shape", () =>
@@ -161,30 +212,30 @@ describe("ReplicaLimits", () => {
         })))._tag,
         "Success"
       )
-      assert.strictEqual(
-        (yield* Effect.exit(ReplicaLimits.make({
+      const error = yield* assertSchemaFailure(
+        ReplicaLimits.make({
           ...values,
           maxRestoreErrorBytes: ReplicaLimits.minimumRestoreErrorBytes - 1
-        })))._tag,
-        "Failure"
+        })
       )
+      assert.include(error.message, `["maxRestoreErrorBytes"]`)
     }))
 
   it.effect("requires restore coalescing to be shorter than the pull deadline", () =>
     Effect.gen(function*() {
-      assert.strictEqual(
-        (yield* Effect.exit(ReplicaLimits.make({
+      const equal = yield* assertSchemaFailure(
+        ReplicaLimits.make({
           ...values,
           maxRestoreCoalesceMillis: values.maxRestorePullMillis
-        })))._tag,
-        "Failure"
+        })
       )
-      assert.strictEqual(
-        (yield* Effect.exit(ReplicaLimits.make({
+      assert.include(equal.message, "maxRestoreCoalesceMillis being less than maxRestorePullMillis")
+      const greater = yield* assertSchemaFailure(
+        ReplicaLimits.make({
           ...values,
           maxRestoreCoalesceMillis: values.maxRestorePullMillis + 1
-        })))._tag,
-        "Failure"
+        })
       )
+      assert.include(greater.message, "maxRestoreCoalesceMillis being less than maxRestorePullMillis")
     }))
 })

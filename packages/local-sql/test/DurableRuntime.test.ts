@@ -73,9 +73,11 @@ describe("DurableRuntime", () => {
         Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, options.documentId)),
       mutate: (_mutation, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
       delete: (_document, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
+      resolve: (_document, options) => Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined)),
       lookupCreate: (id) => Effect.succeed(CommandOutcome.unknown(id)),
       lookupMutation: (_mutation, id) => Effect.succeed(CommandOutcome.unknown(id)),
-      lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id))
+      lookupDelete: (id) => Effect.succeed(CommandOutcome.unknown(id)),
+      lookupResolution: (_document, options) => Effect.succeed(CommandOutcome.unknown(options.commandId))
     })
   )
   const Limits = ReplicaLimits.layer({
@@ -83,6 +85,14 @@ describe("DurableRuntime", () => {
     maxChunkBytes: 64_000,
     maxArchiveRecords: 1_000,
     maxJsonDepth: 32,
+    maxConflictDepth: 64,
+    maxConflictNodes: 100_000,
+    maxConflictAlternatives: 10_000,
+    maxConflictPathSegments: 128,
+    maxConflictValueBytes: 16 * 1024 * 1024,
+    maxConflictSourceChanges: 100_000,
+    maxConflictSourceOperations: 100_000,
+    maxConflictSourceBytes: 64 * 1024 * 1024,
     maxSyncMessageBytes: 64_000,
     maxPeerSendMillis: 1_000,
     maxSyncChangesPerMessage: 100,
@@ -111,9 +121,11 @@ describe("DurableRuntime", () => {
     maxRestoreErrorBytes: 4_096
   })
   const Gate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(Layer.merge(Database, Bootstrap)))
-  const Store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Database, Gate)))
+  const Store = DocumentStore.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate, Limits)))
   const RecoveryService = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate)))
-  const CompactionService = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate, RecoveryService)))
+  const CompactionService = Compaction.layer.pipe(
+    Layer.provide(Layer.mergeAll(Database, Gate, RecoveryService, Limits))
+  )
   const Inputs = Layer.mergeAll(Database, Bootstrap, Executor, Limits, Gate, Store, RecoveryService, CompactionService)
   const Live = DurableRuntime.layer(definition).pipe(Layer.provide(Inputs))
   const Services = Layer.merge(Inputs, Live)
@@ -122,9 +134,9 @@ describe("DurableRuntime", () => {
     const database = Layer.merge(SqliteClient.layer({ filename, disableWAL: true }), NodeCrypto.layer)
     const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(database))
     const gate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(Layer.merge(database, bootstrap)))
-    const store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(database, gate)))
+    const store = DocumentStore.layer.pipe(Layer.provide(Layer.mergeAll(database, gate, Limits)))
     const recovery = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(database, gate)))
-    const compaction = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(database, gate, recovery)))
+    const compaction = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(database, gate, recovery, Limits)))
     const inputs = Layer.mergeAll(database, bootstrap, Executor, Limits, gate, store, recovery, compaction)
     return Layer.merge(inputs, DurableRuntime.layerWith(definition, workflowRegistrations).pipe(Layer.provide(inputs)))
   }
@@ -329,14 +341,52 @@ describe("DurableRuntime", () => {
       const filename = join(tmpdir(), `effect-local-workflow-${globalThis.crypto.randomUUID()}.sqlite`)
       yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(filename, { force: true })))
       const attempts = yield* Ref.make(0)
+      const firstSuspended = yield* Deferred.make<void>()
+      const restartedSuspended = yield* Deferred.make<void>()
+      const completed = yield* Deferred.make<void>()
       const registration = RestartWorkflow.toLayer(Effect.fn(function*() {
-        yield* Ref.update(attempts, (value) => value + 1)
+        const attempt = yield* Ref.updateAndGet(attempts, (value) => value + 1)
         yield* DurableClock.sleep({
           name: "RestartDelay",
           duration: "1 hour",
           inMemoryThreshold: 0
-        })
+        }).pipe(
+          Effect.ensuring(
+            attempt === 1
+              ? Deferred.succeed(firstSuspended, undefined).pipe(Effect.asVoid)
+              : attempt === 2
+              ? Deferred.succeed(restartedSuspended, undefined).pipe(Effect.asVoid)
+              : Effect.void
+          )
+        )
+        yield* Deferred.succeed(completed, undefined)
       }))
+      // Entity assignment and mailbox polling only advance under TestClock. The one hour durable
+      // clock cannot fire inside the drive budget, so driving toward a suspension can never resume
+      // the workflow early. Scope two fires the clock deliberately with a one hour adjustment.
+      const driveUntil = (
+        sharding: Sharding.Sharding["Service"],
+        signal: Deferred.Deferred<void>
+      ) =>
+        Effect.gen(function*() {
+          for (let round = 0; round < 12; round++) {
+            yield* sharding.pollStorage
+            if (yield* Deferred.isDone(signal)) return
+            yield* TestClock.adjust(5_000)
+          }
+          assert.fail("workflow did not reach the expected state within 12 storage polls")
+        })
+      const awaitResult = (
+        executionId: string,
+        expected: "Suspended" | "Complete"
+      ) =>
+        Effect.gen(function*() {
+          while (true) {
+            const result = yield* RestartWorkflow.poll(executionId)
+            if (Option.isSome(result) && result.value._tag === expected) return result.value
+            yield* Effect.yieldNow
+          }
+        })
       const executionId = yield* Effect.scoped(
         Effect.gen(function*() {
           const sharding = yield* Sharding.Sharding
@@ -344,13 +394,9 @@ describe("DurableRuntime", () => {
             { operationId: "restart-interrupted" },
             { discard: true }
           )
-          for (let round = 0; round < 4; round++) {
-            yield* sharding.pollStorage
-            yield* TestClock.adjust(5_000)
-          }
-          const suspended = yield* RestartWorkflow.poll(executionId)
-          assert.isTrue(Option.isSome(suspended))
-          if (Option.isSome(suspended)) assert.strictEqual(suspended.value._tag, "Suspended")
+          yield* driveUntil(sharding, firstSuspended)
+          const suspended = yield* awaitResult(executionId, "Suspended")
+          assert.strictEqual(suspended._tag, "Suspended")
           assert.strictEqual(yield* Ref.get(attempts), 1)
           return executionId
         }).pipe(Effect.provide(servicesAtWith(filename, registration)))
@@ -360,22 +406,16 @@ describe("DurableRuntime", () => {
         Effect.gen(function*() {
           const sharding = yield* Sharding.Sharding
           yield* RestartWorkflow.resume(executionId)
-          yield* sharding.pollStorage
+          yield* driveUntil(sharding, restartedSuspended)
           yield* TestClock.adjust("1 hour")
-          for (let round = 0; round < 4; round++) {
-            yield* sharding.pollStorage
-            yield* TestClock.adjust(5_000)
-          }
-          const reconciled = yield* RestartWorkflow.poll(executionId)
-          assert.isTrue(Option.isSome(reconciled))
-          if (Option.isSome(reconciled)) {
-            assert.strictEqual(reconciled.value._tag, "Complete")
-            if (reconciled.value._tag === "Complete") assert.isTrue(Exit.isSuccess(reconciled.value.exit))
-          }
-          assert.isAtLeast(yield* Ref.get(attempts), 2)
+          yield* driveUntil(sharding, completed)
+          const reconciled = yield* awaitResult(executionId, "Complete")
+          assert.strictEqual(reconciled._tag, "Complete")
+          if (reconciled._tag === "Complete") assert.isTrue(Exit.isSuccess(reconciled.exit))
+          assert.strictEqual(yield* Ref.get(attempts), 3)
         }).pipe(Effect.provide(servicesAtWith(filename, registration)))
       )
-    }), 20_000)
+    }), 30_000)
 
   it.effect("interrupts an in-flight compaction handle for the current incarnation", () =>
     Effect.gen(function*() {
@@ -435,9 +475,11 @@ describe("DurableRuntime", () => {
           })
         })
       ).pipe(Layer.provide(Gate))
-      const store = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Database, gateLayer)))
+      const store = DocumentStore.layer.pipe(Layer.provide(Layer.mergeAll(Database, gateLayer, Limits)))
       const recovery = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(Database, gateLayer)))
-      const compaction = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Database, gateLayer, recovery)))
+      const compaction = Compaction.layer.pipe(
+        Layer.provide(Layer.mergeAll(Database, gateLayer, recovery, Limits))
+      )
       const inputs = Layer.mergeAll(Database, Bootstrap, Executor, Limits, gateLayer, store, recovery, compaction)
       const live = Layer.merge(inputs, DurableRuntime.layer(definition).pipe(Layer.provide(inputs)))
 
@@ -493,7 +535,9 @@ describe("DurableRuntime", () => {
   // Rebuilds the production runtime around a decorated `Recovery` service. Every other service,
   // including every `Compaction` method, stays production code.
   const servicesWithRecovery = <E,>(recoveryLayer: Layer.Layer<Recovery.Recovery, E>) => {
-    const compaction = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Database, Gate, recoveryLayer)))
+    const compaction = Compaction.layer.pipe(
+      Layer.provide(Layer.mergeAll(Database, Gate, recoveryLayer, Limits))
+    )
     const inputs = Layer.mergeAll(Database, Bootstrap, Executor, Limits, Gate, Store, recoveryLayer, compaction)
     return Layer.merge(inputs, DurableRuntime.layer(definition).pipe(Layer.provide(inputs)))
   }

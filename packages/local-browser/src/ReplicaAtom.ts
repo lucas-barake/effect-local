@@ -1,11 +1,13 @@
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
+import type * as Conflict from "@lucas-barake/effect-local/Conflict"
 import type * as Document from "@lucas-barake/effect-local/Document"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import type * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
@@ -57,7 +59,23 @@ export const documentFamily = <R, E, D extends Document.Any,>(
 ) =>
   Atom.family((documentId: Identity.DocumentId) =>
     runtime.atom(Replica.Replica.use((replica) => replica.get(document, documentId))).pipe(
-      runtime.factory.withReactivity([document.name])
+      runtime.factory.withReactivity([
+        ReplicaDefinition.documentInstanceKey(document.name, documentId),
+        ReplicaDefinition.documentTypeRefreshKey(document.name)
+      ])
+    )
+  )
+
+export const conflictFamily = <R, E, D extends Document.Any,>(
+  runtime: Atom.AtomRuntime<Replica.Replica | R, E>,
+  document: D
+) =>
+  Atom.family((documentId: Identity.DocumentId) =>
+    runtime.atom(Replica.Replica.use((replica) => replica.inspectConflicts(document, documentId))).pipe(
+      runtime.factory.withReactivity([
+        ReplicaDefinition.documentInstanceKey(document.name, documentId),
+        ReplicaDefinition.documentTypeRefreshKey(document.name)
+      ])
     )
   )
 
@@ -110,8 +128,27 @@ export const mutation = <R, E, M extends Mutation.Any,>(
       readonly documentId: Identity.DocumentId
     } & ([M["payloadSchema"]["Type"]] extends [void] ? object : { readonly payload: M["payloadSchema"]["Type"] })
   >()(
-    (options) => Replica.Replica.use((replica) => replica.mutate(definition, options)),
-    { concurrent: true, reactivityKeys: [definition.document.name] }
+    (options) =>
+      Replica.Replica.use((replica) => replica.mutate(definition, options)).pipe(
+        Reactivity.mutation(ReplicaDefinition.documentCommitKeys(definition.document.name, options.documentId))
+      ),
+    { concurrent: true }
+  )
+
+export const resolveConflict = <R, E, D extends Document.Any,>(
+  runtime: Atom.AtomRuntime<Replica.Replica | R, E>,
+  document: D
+) =>
+  runtime.fn<{
+    readonly commandId: Identity.CommandId
+    readonly documentId: Identity.DocumentId
+    readonly resolution: Conflict.Resolution
+  }>()(
+    (options) =>
+      Replica.Replica.use((replica) => replica.resolveConflict(document, options)).pipe(
+        Reactivity.mutation(ReplicaDefinition.documentCommitKeys(document.name, options.documentId))
+      ),
+    { concurrent: true }
   )
 
 export const status = <R, E,>(runtime: Atom.AtomRuntime<Replica.Replica | R, E>) =>

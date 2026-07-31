@@ -17,6 +17,14 @@ it.layer(NodeCrypto.layer)("SessionManager", (it) => {
     maxChunkBytes: 128,
     maxArchiveRecords: 100,
     maxJsonDepth: 16,
+    maxConflictDepth: 16,
+    maxConflictNodes: 10_000,
+    maxConflictAlternatives: 1_000,
+    maxConflictPathSegments: 16,
+    maxConflictValueBytes: 1024 * 1024,
+    maxConflictSourceChanges: 10_000,
+    maxConflictSourceOperations: 100_000,
+    maxConflictSourceBytes: 64 * 1024 * 1024,
     maxSyncMessageBytes: 1024,
     maxPeerSendMillis: 1_000,
     maxSyncChangesPerMessage: 10,
@@ -67,7 +75,7 @@ it.layer(NodeCrypto.layer)("SessionManager", (it) => {
       if (error.reason._tag === "QuotaExceeded") assert.strictEqual(error.reason.limit, limits.maxSessions)
     }).pipe(Effect.provide(SessionManager.layer), Effect.provideService(ReplicaLimits.ReplicaLimits, limits)))
 
-  it.effect("exposes the validated restore transport limits", () =>
+  it.effect("exposes the validated restore and conflict limits", () =>
     Effect.gen(function*() {
       const sessions = yield* SessionManager.SessionManager
       assert.strictEqual(sessions.maxChunkBytes, limits.maxChunkBytes)
@@ -77,6 +85,13 @@ it.layer(NodeCrypto.layer)("SessionManager", (it) => {
       assert.strictEqual(sessions.maxRestorePullMillis, limits.maxRestorePullMillis)
       assert.strictEqual(sessions.maxRestoreCoalesceMillis, limits.maxRestoreCoalesceMillis)
       assert.strictEqual(sessions.maxRestoreErrorBytes, limits.maxRestoreErrorBytes)
+      assert.deepStrictEqual(sessions.conflictLimits, {
+        maxConflictDepth: limits.maxConflictDepth,
+        maxConflictNodes: limits.maxConflictNodes,
+        maxConflictAlternatives: limits.maxConflictAlternatives,
+        maxConflictPathSegments: limits.maxConflictPathSegments,
+        maxConflictValueBytes: limits.maxConflictValueBytes
+      })
     }).pipe(Effect.provide(SessionManager.layer), Effect.provideService(ReplicaLimits.ReplicaLimits, limits)))
 
   it.effect("acquires restore admission independently and releases it idempotently", () =>

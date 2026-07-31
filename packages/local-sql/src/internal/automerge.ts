@@ -1,6 +1,7 @@
 import * as Automerge from "@automerge/automerge"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
+import * as Effect from "effect/Effect"
 
 export interface Root<E,> {
   value: E
@@ -9,11 +10,21 @@ export interface Root<E,> {
 
 export type AnyDocument = Automerge.Doc<Root<any>>
 
+export const acquireTracked = <
+  D extends AnyDocument,
+  E,
+  R,
+>(
+  acquire: Effect.Effect<D, E, R>,
+  track: (document: D) => D
+): Effect.Effect<D, E, R> => Effect.uninterruptible(acquire.pipe(Effect.map(track)))
+
 export interface Change {
   readonly hash: string
   readonly actor: string
   readonly sequence: number
   readonly dependencies: ReadonlyArray<string>
+  readonly operations: number
   readonly bytes: Uint8Array
 }
 
@@ -24,6 +35,7 @@ export const decode = (bytes: Uint8Array): Change => {
     actor: decoded.actor,
     sequence: decoded.seq,
     dependencies: decoded.deps,
+    operations: decoded.ops.length,
     bytes
   }
 }
@@ -81,19 +93,32 @@ export const reroot = <E,>(value: E, tombstone: boolean, actor: string): Automer
     draft.tombstone = tombstone
   })
 
+const changeClone = <E,>(
+  durable: Automerge.Doc<Root<E>>,
+  actor: string,
+  change: Automerge.ChangeFn<Root<E>>
+): Automerge.Doc<Root<E>> => {
+  const cloned = Automerge.clone(durable, { actor })
+  try {
+    return Automerge.change(cloned, change)
+  } catch (cause) {
+    Automerge.free(cloned)
+    throw cause
+  }
+}
+
 export const stage = <E,>(
   durable: Automerge.Doc<Root<E>>,
   actor: string,
   change: (draft: Mutation.DraftValue<E>) => void
-): Automerge.Doc<Root<E>> =>
-  Automerge.change(Automerge.clone(durable, { actor }), (draft) => change(draft.value as Mutation.DraftValue<E>))
+): Automerge.Doc<Root<E>> => changeClone(durable, actor, (draft) => change(draft.value as Mutation.DraftValue<E>))
 
 export const stageValue = <E,>(
   durable: Automerge.Doc<Root<E>>,
   actor: string,
   value: E
 ): Automerge.Doc<Root<E>> =>
-  Automerge.change(Automerge.clone(durable, { actor }), (draft) => {
+  changeClone(durable, actor, (draft) => {
     draft.value = value
   })
 
@@ -101,7 +126,7 @@ export const stageTombstone = <E,>(
   durable: Automerge.Doc<Root<E>>,
   actor: string
 ): Automerge.Doc<Root<E>> =>
-  Automerge.change(Automerge.clone(durable, { actor }), (draft) => {
+  changeClone(durable, actor, (draft) => {
     draft.tombstone = true
   })
 

@@ -234,4 +234,37 @@ describe("ProjectionStore", () => {
       const rows = yield* sql<{ readonly label: string }>`SELECT label FROM task_labels_v1`
       assert.deepStrictEqual(rows, [{ label: "preserved" }])
     }).pipe(Effect.provide(Live)))
+
+  it.effect("preserves document commit keys when appending projection invalidations", () =>
+    Effect.gen(function*() {
+      const store = yield* ProjectionStore.ProjectionStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const commitSequence = Identity.CommitSequence.make(1)
+      yield* sql`INSERT INTO effect_local_documents (
+        document_id, document_type, schema_version, observed_versions,
+        materialized_heads, accepted_heads, tombstone, projection_status, checkpoint_hash
+      ) VALUES (${documentId}, 'Task', 1, '[1]', '["first"]', '["first"]', 0, 'Ready', NULL)`
+      yield* sql`UPDATE effect_local_metadata SET commit_sequence = ${commitSequence} WHERE singleton = 1`
+      yield* sql`INSERT INTO effect_local_commit_outbox (
+        commit_sequence, document_id, invalidation_keys, published
+      ) VALUES (${commitSequence}, ${documentId}, '["Task"]', 0)`
+
+      yield* store.replaceDocument(Task, {
+        documentId,
+        value: { labels: ["one"] },
+        version: 1,
+        heads: ["first"],
+        tombstone: false,
+        projection: "Ready"
+      }, commitSequence)
+
+      const rows = yield* sql<{ readonly invalidation_keys: string }>`
+        SELECT invalidation_keys FROM effect_local_commit_outbox
+        WHERE commit_sequence = ${commitSequence} AND document_id = ${documentId}`
+      assert.deepStrictEqual(JSON.parse(rows[0]!.invalidation_keys), [
+        ...ReplicaDefinition.documentCommitKeys(Task.name, documentId),
+        Labels.name
+      ])
+    }).pipe(Effect.provide(Live)))
 })

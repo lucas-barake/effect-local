@@ -72,6 +72,53 @@ Relay custody uses the injected `RelayInboxStore`, owned by one cluster entity p
 may serve one database, but the relay does not add cross region routing or peer discovery. See
 [Store and forward](store-and-forward.md) for the exact contract and composition.
 
-Automerge provides merge infrastructure, not collaboration UX. The public snapshot exposes the decoded value and head
-frontier. History traversal, conflict inspection, review, sharing, and conflict resolution interfaces remain
-application responsibilities.
+## Conflicts and resolution
+
+Automerge convergence does not choose an application policy for concurrent register assignments.
+`Replica.inspectConflicts` returns the decoded document snapshot together with the retained alternatives at its
+exact head frontier. Conflict paths are structured key and index segments. Intermediate segments can identify a
+specific conflicted composite branch. Alternative identifiers are opaque Automerge operation identifiers and
+must not be parsed or synthesized.
+
+The snapshot and alternatives cross different representation boundaries. `inspection.snapshot.value` is
+decoded through the registered document schema. Conflict alternatives expose the document schema's encoded
+native CRDT value. The `Conflict.Value` codec preserves Text, `ImmutableString`, dates, bytes, counters, maps,
+and lists through a tagged portable JSON representation. A replacement value uses that same native encoded
+model.
+
+Inspection is bounded by configured traversal limits and verified cumulative source history counters. A legacy
+or checkpoint backed import whose complete raw history cannot be measured remains readable, but conflict
+inspection and further local or peer changes fail with `ReplicaError` / `QuotaExceeded`. Operator driven history
+rewrite makes the source measurable again by creating new lineage. It also permanently discards losing
+alternatives, so it is not a transparent way to recover conflict review.
+
+`Replica.resolveConflict` is a durable local command. It requires the exact heads returned by inspection and
+commits through the normal document, projection, outbox, and command receipt transaction. A changed frontier
+returns the durable `StaleConflictResolution` rejection. The application must inspect again, review the new
+state, and issue a new command ID. The frontier guard is conservative, so a concurrent change to an unrelated
+field also makes the resolution stale. If the command outcome is ambiguous,
+`lookupConflictResolution` requires the original document, command ID, and complete resolution descriptor.
+This prevents a lookup from returning a receipt for different intent.
+
+Selecting an alternative is supported for scalar values. Direct selection of a map or list is rejected because
+copying a composite gives it new Automerge object identity. That replacement can hide concurrent descendant
+edits in another branch. An application can use `ReplaceValue` only after making that loss of identity and
+visibility an explicit product decision.
+
+Resolution is not a synchronization barrier or global finality. Two partitioned replicas can resolve the same
+conflict concurrently. Their fresh resolution assignments converge to a new conflict when both change sets
+arrive. Applications that need a resolved view must inspect again after later synchronization.
+
+`DeleteValue` follows Automerge observed remove semantics. It removes assignments in the resolver's causal
+past. A concurrent assignment survives, which gives assignment add wins behavior against that delete.
+Concurrent deletes do not add a value alternative.
+
+Ordinary schema strings encode as Automerge Text for character sequence coediting. Concurrent passages can
+interleave. Edited messages that must preserve each complete revision for later review should encode their
+application `string` as `Automerge.ImmutableString`. See the
+[conflict workflow](../README.md#conflict-inspection-and-durable-resolution) and the compile checked
+[`edited-messages.ts`](../packages/local-sql/examples/edited-messages.ts).
+
+History traversal, review presentation, sharing, and the final product policy remain application
+responsibilities. History rewrite is not conflict resolution. It changes lineage and permanently removes losing
+alternatives.

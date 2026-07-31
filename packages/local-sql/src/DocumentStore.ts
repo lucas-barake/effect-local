@@ -2,7 +2,9 @@ import type * as Automerge from "@automerge/automerge"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
+import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import type * as Snapshot from "@lucas-barake/effect-local/Snapshot"
 import * as Context from "effect/Context"
 import type * as Crypto from "effect/Crypto"
@@ -14,6 +16,7 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as InternalAutomerge from "./internal/automerge.js"
+import * as HistoryCounters from "./internal/historyCounters.js"
 import * as Rows from "./internal/rows.js"
 import * as Recovery from "./Recovery.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -38,6 +41,32 @@ export interface Stored<D extends Document.Any,> {
   readonly materializedHeads: ReadonlyArray<string>
   readonly acceptedHeads: ReadonlyArray<string>
   readonly commitSequence: Identity.CommitSequence
+  readonly historyBytes: number | null
+  readonly historyChanges: number | null
+  readonly historyOperations: number | null
+}
+
+export type ConflictSource<D extends Document.Any,> =
+  | {
+    readonly _tag: "Loaded"
+    readonly stored: Stored<D>
+  }
+  | {
+    readonly _tag: "Stale"
+    readonly materializedHeads: ReadonlyArray<string>
+    readonly commitSequence: Identity.CommitSequence
+  }
+
+export interface LoadConflictSource {
+  <D extends Document.Any,>(
+    document: D,
+    documentId: Identity.DocumentId
+  ): Effect.Effect<Extract<ConflictSource<D>, { readonly _tag: "Loaded" }>, ReplicaError.ReplicaError>
+  <D extends Document.Any,>(
+    document: D,
+    documentId: Identity.DocumentId,
+    expectedHeads: ReadonlyArray<string>
+  ): Effect.Effect<ConflictSource<D>, ReplicaError.ReplicaError>
 }
 
 export class DocumentStore extends Context.Service<DocumentStore, {
@@ -50,6 +79,7 @@ export class DocumentStore extends Context.Service<DocumentStore, {
     document: D,
     documentId: Identity.DocumentId
   ) => Effect.Effect<Stored<D>, ReplicaError.ReplicaError>
+  readonly loadConflictSource: LoadConflictSource
   readonly stage: <D extends Document.Any,>(
     stored: Stored<D>,
     change: (draft: Mutation.Draft<D>) => void
@@ -72,12 +102,13 @@ export class DocumentStore extends Context.Service<DocumentStore, {
 export const layer: Layer.Layer<
   DocumentStore,
   never,
-  Crypto.Crypto | SqlClient.SqlClient | ReplicaGate.ReplicaGate
+  Crypto.Crypto | ReplicaLimits.ReplicaLimits | SqlClient.SqlClient | ReplicaGate.ReplicaGate
 > = Layer.effect(
   DocumentStore,
   Effect.gen(function*() {
     const sql = yield* SqlClient.SqlClient
     const gate = yield* ReplicaGate.ReplicaGate
+    const limits = yield* ReplicaLimits.ReplicaLimits
     const recovery = yield* Recovery.make
     const findDefinitionHash = SqlSchema.findOne({
       Request: Schema.Void,
@@ -131,11 +162,12 @@ export const layer: Layer.Layer<
     // Read on its own instead of as a scalar subquery inside `findPersistedDocument`. As a subquery an
     // absent singleton yielded SQL NULL, which the non-nullable row schema turned into a `SchemaError`
     // and then a per-document `StorageCorrupt`.
-    const metadataCommitSequence = SqlSchema.findOne({
+    const findMetadataCommitSequence = SqlSchema.findOne({
       Request: Schema.Void,
       Result: Schema.Struct({ commit_sequence: Identity.CommitSequence }),
       execute: () => sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`
-    })(undefined).pipe(
+    })
+    const metadataCommitSequence = findMetadataCommitSequence(undefined).pipe(
       Effect.map((row) => row.commit_sequence),
       Effect.catchTag("NoSuchElementError", () =>
         Effect.fail(
@@ -165,10 +197,62 @@ export const layer: Layer.Layer<
       execute: (documentId) =>
         sql`SELECT
             accepted_heads, checkpoint_hash,
-            document_id, document_type, lineage, materialized_heads, observed_versions,
+            document_id, document_type, history_bytes, history_changes, history_operations,
+            lineage, materialized_heads, observed_versions,
             projection_status, schema_version, tombstone
           FROM effect_local_documents WHERE document_id = ${documentId}`
     })
+    const loadConflictSource = (<D extends Document.Any,>(
+      document: D,
+      documentId: Identity.DocumentId,
+      expectedHeads?: ReadonlyArray<string>
+    ): Effect.Effect<ConflictSource<D>, ReplicaError.ReplicaError> =>
+      Effect.suspend(() => {
+        let acquired: Stored<D> | undefined
+        return gate.current.pipe(
+          Effect.flatMap((permit) =>
+            sql.withTransaction(Effect.gen(function*() {
+              const stored = yield* recovery.recoverWithPermit(document, documentId, permit)
+              acquired = stored
+              yield* HistoryCounters.add(
+                {
+                  bytes: stored.historyBytes,
+                  changes: stored.historyChanges,
+                  operations: stored.historyOperations
+                },
+                { bytes: 0, changes: 0, operations: 0 },
+                limits
+              )
+              if (
+                expectedHeads !== undefined &&
+                !Equal.equals([...expectedHeads].toSorted(), [...stored.materializedHeads].toSorted())
+              ) {
+                InternalAutomerge.free(stored.automerge)
+                acquired = undefined
+                return {
+                  _tag: "Stale" as const,
+                  materializedHeads: stored.materializedHeads,
+                  commitSequence: stored.commitSequence
+                }
+              }
+              return { _tag: "Loaded" as const, stored }
+            }))
+          ),
+          Effect.catchTags({
+            SqlError: (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({ cause })
+                })
+              )
+          }),
+          Effect.onError(() =>
+            Effect.sync(() => {
+              if (acquired !== undefined) InternalAutomerge.free(acquired.automerge)
+            })
+          )
+        )
+      })) as LoadConflictSource
 
     /**
      * Re-reads what the current `persist` just wrote and checks it round tripped.
@@ -185,6 +269,7 @@ export const layer: Layer.Layer<
       readonly document: D
       readonly documentId: Identity.DocumentId
       readonly heads: ReadonlyArray<string>
+      readonly history: HistoryCounters.HistoryCounters
       readonly sequence: Identity.CommitSequence
       readonly tombstone: boolean
     }) =>
@@ -231,7 +316,10 @@ export const layer: Layer.Layer<
               storedSequence !== options.sequence ||
               (row.tombstone === 1) !== options.tombstone ||
               !Equal.equals(Schema.decodeUnknownSync(Heads)(row.materialized_heads), options.heads) ||
-              !Equal.equals(Schema.decodeUnknownSync(Heads)(row.accepted_heads), options.heads)
+              !Equal.equals(Schema.decodeUnknownSync(Heads)(row.accepted_heads), options.heads) ||
+              row.history_bytes !== options.history.bytes ||
+              row.history_changes !== options.history.changes ||
+              row.history_operations !== options.history.operations
             ) throw new TypeError(`Invalid stored document: ${options.documentId}`)
             // Sourced from the row rather than carried over from `durable`: the
             // recovery this replaces reported the status the document had at
@@ -259,6 +347,15 @@ export const layer: Layer.Layer<
         return sql.withTransaction(Effect.gen(function*() {
           const changes = InternalAutomerge.changesSince(staged, durable.materializedHeads)
           if (changes.length === 0) return durable
+          const history = yield* HistoryCounters.add(
+            {
+              bytes: durable.historyBytes,
+              changes: durable.historyChanges,
+              operations: durable.historyOperations
+            },
+            HistoryCounters.measureDecoded(changes),
+            limits
+          )
           const encoded = InternalAutomerge.value(staged)
           const value = yield* Document.decode(document, documentId, encoded)
           yield* requireAutomergeValue(documentId, encoded)
@@ -288,13 +385,24 @@ export const layer: Layer.Layer<
             schema_version = ${document.version},
             observed_versions = ${Schema.encodeSync(Versions)([document.version])},
             materialized_heads = ${Schema.encodeSync(Heads)(heads)},
-            accepted_heads = ${Schema.encodeSync(Heads)(heads)}
+            accepted_heads = ${Schema.encodeSync(Heads)(heads)},
+            history_bytes = ${history.bytes},
+            history_changes = ${history.changes},
+            history_operations = ${history.operations}
             , tombstone = ${tombstone ? 1 : 0}
             WHERE document_id = ${documentId}
-              AND materialized_heads = ${Schema.encodeSync(Heads)(durable.materializedHeads)}`
+              AND materialized_heads = ${Schema.encodeSync(Heads)(durable.materializedHeads)}
+              AND history_bytes = ${durable.historyBytes}
+              AND history_changes = ${durable.historyChanges}
+              AND history_operations = ${durable.historyOperations}`
           yield* sql`INSERT INTO effect_local_commit_outbox (
             commit_sequence, document_id, invalidation_keys, published
-          ) VALUES (${sequence}, ${documentId}, ${Schema.encodeSync(Heads)([document.name])}, 0)`
+          ) VALUES (
+            ${sequence},
+            ${documentId},
+            ${Schema.encodeSync(Heads)(ReplicaDefinition.documentCommitKeys(document.name, documentId))},
+            0
+          )`
 
           // The permit is sampled after the writes because that is where the
           // trailing recovery used to sample it. `materialize` holds no gate
@@ -307,6 +415,7 @@ export const layer: Layer.Layer<
             document,
             documentId,
             heads,
+            history,
             sequence,
             tombstone
           })
@@ -340,7 +449,10 @@ export const layer: Layer.Layer<
             },
             materializedHeads: heads,
             acceptedHeads: heads,
-            commitSequence: sequence
+            commitSequence: sequence,
+            historyBytes: history.bytes,
+            historyChanges: history.changes,
+            historyOperations: history.operations
           }
         })).pipe(
           Effect.catchTags({
@@ -422,17 +534,24 @@ export const layer: Layer.Layer<
           })
           return yield* Effect.gen(function*() {
             const heads = InternalAutomerge.heads(automerge)
+            const changes = InternalAutomerge.changesSince(automerge, [])
+            const history = yield* HistoryCounters.check(
+              HistoryCounters.measureDecoded(changes),
+              limits
+            )
             const sequence = yield* nextSequence
             const acceptedAt = DateTime.formatIso(yield* DateTime.now)
             const definitionHash = yield* currentDefinitionHash
             yield* sql`INSERT INTO effect_local_documents (
               document_id, document_type, schema_version, observed_versions,
-              materialized_heads, accepted_heads, tombstone, projection_status, checkpoint_hash
+              materialized_heads, accepted_heads, tombstone, projection_status, checkpoint_hash,
+              history_changes, history_operations, history_bytes
             ) VALUES (
               ${documentId}, ${document.name}, ${document.version}, ${Schema.encodeSync(Versions)([document.version])},
-              ${Schema.encodeSync(Heads)(heads)}, ${Schema.encodeSync(Heads)(heads)}, 0, 'Ready', NULL
+              ${Schema.encodeSync(Heads)(heads)}, ${Schema.encodeSync(Heads)(heads)}, 0, 'Ready', NULL,
+              ${history.changes}, ${history.operations}, ${history.bytes}
             )`
-            for (const change of InternalAutomerge.changesSince(automerge, [])) {
+            for (const change of changes) {
               yield* sql`INSERT INTO effect_local_changes (
                 change_hash, document_id, document_type, writer_schema_version, writer_definition_hash,
                 actor, sequence, dependencies, bytes, applied, peer_id, accepted_at, commit_sequence
@@ -446,7 +565,12 @@ export const layer: Layer.Layer<
             }
             yield* sql`INSERT INTO effect_local_commit_outbox (
               commit_sequence, document_id, invalidation_keys, published
-            ) VALUES (${sequence}, ${documentId}, ${Schema.encodeSync(Heads)([document.name])}, 0)`
+            ) VALUES (
+              ${sequence},
+              ${documentId},
+              ${Schema.encodeSync(Heads)(ReplicaDefinition.documentCommitKeys(document.name, documentId))},
+              0
+            )`
             return yield* recovery.recover(document, documentId)
           }).pipe(
             Effect.ensuring(Effect.sync(() => InternalAutomerge.free(automerge)))
@@ -461,6 +585,7 @@ export const layer: Layer.Layer<
               })
             ))
         ),
+      loadConflictSource,
       load: recovery.recover,
       stage: (stored, change) =>
         gate.current.pipe(Effect.map((epoch) =>

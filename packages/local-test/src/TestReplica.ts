@@ -1,33 +1,28 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
-import * as BackupStore from "@lucas-barake/effect-local-sql/BackupStore"
-import * as CommandDeliveryPublisher from "@lucas-barake/effect-local-sql/CommandDeliveryPublisher"
-import * as CommandDeliveryStore from "@lucas-barake/effect-local-sql/CommandDeliveryStore"
-import * as CommandExecutor from "@lucas-barake/effect-local-sql/CommandExecutor"
-import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
-import * as DocumentStore from "@lucas-barake/effect-local-sql/DocumentStore"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as PeerSync from "@lucas-barake/effect-local-sql/PeerSync"
-import * as ProjectionStore from "@lucas-barake/effect-local-sql/ProjectionStore"
-import * as QueryExecutor from "@lucas-barake/effect-local-sql/QueryExecutor"
-import * as Recovery from "@lucas-barake/effect-local-sql/Recovery"
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
-import * as ReplicaBootstrap from "@lucas-barake/effect-local-sql/ReplicaBootstrap"
-import * as ReplicaEvolution from "@lucas-barake/effect-local-sql/ReplicaEvolution"
-import * as ReplicaGate from "@lucas-barake/effect-local-sql/ReplicaGate"
 import * as ReplicaHealth from "@lucas-barake/effect-local-sql/ReplicaHealth"
 import type * as SqlProjection from "@lucas-barake/effect-local-sql/SqlProjection"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Layer from "effect/Layer"
-import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 
 export const defaultLimits: ReplicaLimits.Values = {
   maxBackupBytes: 16 * 1024 * 1024,
   maxChunkBytes: 64 * 1024,
   maxArchiveRecords: 10_000,
   maxJsonDepth: 64,
+  maxConflictDepth: 128,
+  maxConflictNodes: 100_000,
+  maxConflictAlternatives: 10_000,
+  maxConflictPathSegments: 128,
+  maxConflictValueBytes: 16 * 1024 * 1024,
+  maxConflictSourceChanges: 100_000,
+  maxConflictSourceOperations: 100_000,
+  maxConflictSourceBytes: 64 * 1024 * 1024,
   maxSyncMessageBytes: 1024 * 1024,
   maxPeerSendMillis: 10_000,
   maxSyncChangesPerMessage: 1000,
@@ -94,41 +89,26 @@ export const layerWithSyncAndLimits = <
 >(
   definition: D,
   options: {
+    readonly database?: SqliteClient.SqliteClientConfig
     readonly health?: ReplicaHealth.Options
     readonly projections: Bindings
     readonly limits: ReplicaLimits.Values
   }
 ) => {
-  const bootstrap = ReplicaBootstrap.layer(definition).pipe(
-    Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))
+  const infrastructure = Layer.mergeAll(
+    SqliteClient.layer(options.database ?? { filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer,
+    ReplicaLimits.layer(options.limits)
   )
-  const gate = ReplicaGate.layer.pipe(
-    Layer.provideMerge([bootstrap, ReplicaLimits.layer(options.limits), NodeCrypto.layer])
-  )
-  const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
-  const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
-  const projections = ProjectionStore.layer(options.projections).pipe(Layer.provideMerge(store))
-  const evolution = ReplicaEvolution.layer(definition).pipe(Layer.provideMerge(projections))
-  const health = ReplicaHealth.layer(definition, options.health ?? ReplicaHealth.defaultOptions).pipe(
-    Layer.provideMerge(evolution)
-  )
-  const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(health))
-  const queries = QueryExecutor.layer(definition).pipe(
-    Layer.provideMerge([commands, Reactivity.layer])
-  )
-  const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
-  const deliveryStore = CommandDeliveryStore.layer.pipe(Layer.provideMerge(gate))
-  const deliveryPublisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
-    Layer.provideMerge(deliveryStore)
-  )
-  const backups = BackupStore.layer(definition).pipe(
-    Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
-  )
-  const sync = PeerSync.layer.pipe(Layer.provideMerge(backups))
+  const services = SqlReplica.servicesLayerWithBindings(definition, {
+    health: options.health ?? ReplicaHealth.defaultOptions,
+    projections: options.projections
+  })
+  const sync = PeerSync.layer.pipe(Layer.provideMerge(services))
   return Layer.mergeAll(
     SqlReplica.layerFromServices(definition).pipe(
-      Layer.provideMerge(Layer.mergeAll(sync, deliveryStore, deliveryPublisher)),
-      Layer.provide([Layer.empty, ...options.projections.map((binding) => binding.layer)])
+      Layer.provideMerge(sync),
+      Layer.provideMerge(infrastructure)
     ),
     PeerConnectionStatus.layer,
     // Direct mode, so there is no relay to report on. `layerFromServices` hand assembles the stack
@@ -142,9 +122,14 @@ export const layerWithSync = <
   const Bindings extends ReadonlyArray<SqlProjection.Any>,
 >(
   definition: D,
-  options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
+  options: {
+    readonly database?: SqliteClient.SqliteClientConfig
+    readonly health?: ReplicaHealth.Options
+    readonly projections: Bindings
+  }
 ) =>
   layerWithSyncAndLimits(definition, {
+    ...(options.database === undefined ? {} : { database: options.database }),
     health: options.health ?? ReplicaHealth.defaultOptions,
     projections: options.projections,
     limits: defaultLimits

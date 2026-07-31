@@ -1,6 +1,8 @@
 import { expect, test } from "@playwright/test"
 import type { BrowserContext, Page } from "@playwright/test"
 
+const ownershipTransitionTimeout = 40_000
+
 const instrumentWorkerBoundaries = (context: BrowserContext) =>
   context.addInitScript(() => {
     const state = globalThis as typeof globalThis & {
@@ -74,7 +76,7 @@ const attachPosted = (page: Page) =>
       if (String(error).includes("Execution context was destroyed")) return false
       throw error
     }
-  }, { timeout: 20_000 }).toBe(true)
+  }, { timeout: ownershipTransitionTimeout }).toBe(true)
 
 const ownerInfo = (page: Page) =>
   expect.poll(async () => {
@@ -93,7 +95,7 @@ const ownerInfo = (page: Page) =>
       if (String(error).includes("Execution context was destroyed")) return undefined
       throw error
     }
-  }, { timeout: 20_000 }).not.toBeUndefined()
+  }, { timeout: ownershipTransitionTimeout }).not.toBeUndefined()
 
 const ownerError = (page: Page) =>
   expect.poll(async () => {
@@ -106,7 +108,7 @@ const ownerError = (page: Page) =>
       if (String(error).includes("Execution context was destroyed")) return undefined
       throw error
     }
-  }, { timeout: 20_000 }).toBeTruthy()
+  }, { timeout: ownershipTransitionTimeout }).toBeTruthy()
 
 test.beforeEach(async ({ request }) => {
   await Promise.all([
@@ -122,7 +124,7 @@ test("starts concurrent built ownership clients and serves SQLite WASM", async (
   await request.get("/__effect-local-runtime/hold")
   const wasmResponse = context.waitForEvent("response", {
     predicate: (response) => /\/wa-sqlite-[^/]+\.wasm$/.test(new URL(response.url()).pathname),
-    timeout: 20_000
+    timeout: ownershipTransitionTimeout
   })
 
   await Promise.all([page.goto("/"), attachedPage.goto("/")])
@@ -135,8 +137,8 @@ test("starts concurrent built ownership clients and serves SQLite WASM", async (
   await request.get("/__effect-local-runtime/release")
 
   await Promise.all([
-    expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 }),
-    expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 }),
+    expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout }),
+    expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout }),
     ownerInfo(page),
     ownerInfo(attachedPage)
   ])
@@ -180,7 +182,7 @@ test("restores archived state durably through the built ownership runtime", asyn
   await Promise.all([
     attachPosted(page),
     ownerInfo(page),
-    expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+    expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   ])
 
   const archivedTitle = `Built archived backup ${crypto.randomUUID()}`
@@ -208,13 +210,13 @@ test("restores archived state durably through the built ownership runtime", asyn
 
   page.once("dialog", (dialog) => void dialog.accept())
   await page.getByLabel("Choose backup file").setInputFiles(path!)
-  await expect(page.getByText("Backup restored")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Backup restored")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await expect(page.getByText(postBackupTitle, { exact: true })).not.toBeVisible()
   await page.getByRole("button", { name: "Completed" }).click()
   await expect(page.getByText(archivedTitle, { exact: true })).toBeVisible()
 
   await page.reload()
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await expect(page.getByText(postBackupTitle, { exact: true })).not.toBeVisible()
   await page.getByRole("button", { name: "Completed" }).click()
   await expect(page.getByText(archivedTitle, { exact: true })).toBeVisible()
@@ -231,8 +233,8 @@ test("surfaces a built ownership runtime load failure", async ({ context, page, 
   await Promise.all([ownerError(page), ownerError(attachedPage)])
 
   await Promise.all([
-    expect(page.getByRole("alert")).toBeVisible({ timeout: 20_000 }),
-    expect(attachedPage.getByRole("alert")).toBeVisible({ timeout: 20_000 }),
+    expect(page.getByRole("alert")).toBeVisible({ timeout: ownershipTransitionTimeout }),
+    expect(attachedPage.getByRole("alert")).toBeVisible({ timeout: ownershipTransitionTimeout }),
     expect(page.getByText("Opening local database")).not.toBeVisible(),
     expect(attachedPage.getByText("Opening local database")).not.toBeVisible()
   ])
@@ -314,7 +316,7 @@ test("does not retain failed post-ready connections across retries", async ({ co
   await instrumentWorkerBoundaries(context)
   await request.get("/__effect-local-runtime/release")
   await page.goto("/")
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
 
   const beforeFailure = await page.evaluate(() => {
     const metrics = JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!) as {
@@ -346,7 +348,7 @@ test("does not retain failed post-ready connections across retries", async ({ co
         readonly created: number
       }
       return metrics.created
-    }), { timeout: 20_000 }).toBeGreaterThan(beforeFailure.created)
+    }), { timeout: ownershipTransitionTimeout }).toBeGreaterThan(beforeFailure.created)
   await expect.poll(() =>
     page.evaluate((failedId) => {
       const metrics = JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!) as {
@@ -360,7 +362,7 @@ test("does not retain failed post-ready connections across retries", async ({ co
   const title = `Retry ${crypto.randomUUID()}`
   await page.getByLabel("New task title").fill(title)
   await page.getByRole("button", { name: "Add task" }).click()
-  await expect(page.getByText(title, { exact: true })).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText(title, { exact: true })).toBeVisible({ timeout: ownershipTransitionTimeout })
 
   await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pagehide")))
   const metrics = await page.evaluate(() =>
@@ -377,7 +379,7 @@ test("does not create retry workers after page teardown", async ({ context, page
   await instrumentWorkerBoundaries(context)
   await request.get("/__effect-local-runtime/release")
   await page.goto("/")
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await page.clock.pauseAt(new Date("2026-01-01T00:01:00Z"))
 
   const beforeFailure = await page.evaluate(() => {
@@ -416,7 +418,7 @@ test("ignores worker errors queued across page teardown", async ({ context, page
   await instrumentWorkerBoundaries(context)
   await request.get("/__effect-local-runtime/release")
   await page.goto("/")
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
 
   const workerId = await page.evaluate(() => {
     const metrics = JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!) as {

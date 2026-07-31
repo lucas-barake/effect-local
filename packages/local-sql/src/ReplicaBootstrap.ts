@@ -40,6 +40,18 @@ export const make = (definition: ReplicaDefinition.Any) =>
       Result: Schema.Struct({ storage_format_version: Schema.Int }),
       execute: () => sql`SELECT storage_format_version FROM effect_local_metadata WHERE singleton = 1`
     })
+    const findMigratorTable = SqlSchema.findAll({
+      Request: Schema.Void,
+      Result: Schema.Struct({ name: Schema.String }),
+      execute: () => sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'effect_local_migrations'`
+    })
+    const findLatestMigration = SqlSchema.findOneOption({
+      Request: Schema.Void,
+      Result: Schema.Struct({ migration_id: Schema.Int, name: Schema.String }),
+      execute: () =>
+        sql`SELECT migration_id, name FROM effect_local_migrations
+          ORDER BY migration_id DESC LIMIT 1`
+    })
     // Which of the durable tables actually exist right now. The probe below has to run BEFORE the
     // migrator, so it cannot assume the current schema: migration 2 creates the peer tables, 9 the
     // rewrite markers and 10 the relay tables. Asking `sqlite_master` for exactly the known list lets
@@ -79,10 +91,9 @@ export const make = (definition: ReplicaDefinition.Any) =>
     })
 
     // The storage format version decides whether this build may touch the database at all, so it has to be
-    // checked before Migrations.run, which commits its own transaction. Checking afterwards would mean a build
-    // that refuses to open a replica has already migrated it. A database with no tables yet is a fresh one and
-    // is left to the migrator. This runs outside the bootstrap transaction below, so it maps its own SchemaError.
-    yield* Effect.gen(function*() {
+    // checked before Migrations.run. The separate preflight transaction keeps the format and migration-state
+    // reads on one snapshot when another process is upgrading the replica concurrently.
+    yield* sql.withTransaction(Effect.gen(function*() {
       const table = yield* findMetadataTable(undefined)
       if (table.length === 0) return
       const stored = (yield* findStorageFormat(undefined))[0]
@@ -95,13 +106,23 @@ export const make = (definition: ReplicaDefinition.Any) =>
         return
       }
       if (stored.storage_format_version === storageFormatVersion) return
+      if (stored.storage_format_version === 1) {
+        const migratorTable = yield* findMigratorTable(undefined)
+        if (migratorTable.length > 0) {
+          const latest = yield* findLatestMigration(undefined)
+          // Format 1 is upgradeable exactly while 12_document_history_counters, the only migration
+          // that writes format 2, has not run. A fully migrated database claiming format 1 is
+          // tampered or downgraded and is still refused.
+          if (latest._tag === "Some" && latest.value.migration_id < 12) return
+        }
+      }
       return yield* new ReplicaError.ReplicaError({
         reason: new ReplicaError.UnsupportedStorageFormatVersion({
           observedVersion: stored.storage_format_version,
           supportedVersion: storageFormatVersion
         })
       })
-    }).pipe(Effect.catchTag("SchemaError", (cause) =>
+    })).pipe(Effect.catchTag("SchemaError", (cause) =>
       Effect.fail(
         new ReplicaError.ReplicaError({
           reason: new ReplicaError.StorageCorrupt({ cause })
