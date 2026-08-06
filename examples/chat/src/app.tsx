@@ -8,6 +8,7 @@ import { useAtomMount, useAtomSet, useAtomValue } from "@effect/atom-react"
 import * as CommandDelivery from "@lucas-barake/effect-local/CommandDelivery"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Cause from "effect/Cause"
+import * as Exit from "effect/Exit"
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import { Check, CheckCheck, ChevronDown, Clock, Send } from "lucide-react"
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react"
@@ -93,7 +94,7 @@ const ChatView = ({ conversationId, counterpart, presenceText }: {
 }) => {
   const result = useAtomValue(Client.messages({ conversationId }))
   const rows: ReadonlyArray<MessageRowUi> = latest(result, [])
-  const runSend = useAtomSet(Client.sendMessage, { mode: "promise" })
+  const runSend = useAtomSet(Client.sendMessage, { mode: "promiseExit" })
   const [draft, setDraft] = useState("")
   // Mirrors the input synchronously: a click on a submit button can reach the handler twice in one
   // dispatch (component wrapper + native form submission), and React state has not flushed yet.
@@ -111,8 +112,10 @@ const ChatView = ({ conversationId, counterpart, presenceText }: {
     if (body.length === 0) return
     draftRef.current = ""
     setDraft("")
-    // eslint-disable-next-line no-console
-    void runSend({ conversationId, body }).catch((error) => console.error("[send]", error))
+    void runSend({ conversationId, body }).then((exit) => {
+      // eslint-disable-next-line no-console
+      if (Exit.isFailure(exit)) console.error("[send]", Cause.pretty(exit.cause))
+    })
   }
 
   return (

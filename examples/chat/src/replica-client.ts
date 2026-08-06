@@ -4,6 +4,7 @@ import * as OwnershipCoordinator from "@lucas-barake/effect-local-browser/Owners
 import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import type * as Crypto from "effect/Crypto"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -184,11 +185,26 @@ const beatConversations = (conversationIdList: ReadonlyArray<Identity.DocumentId
   }).pipe(Effect.uninterruptible)
 
 /**
+ * `runtime.atom` for the mounted daemons. The daemons are mounted fire-and-forget, so a failure
+ * would otherwise be invisible: this logs the cause with its source and then lets it propagate,
+ * so the atom's `AsyncResult` still reports the failure to anything that reads it.
+ */
+const daemonAtom = <A, E,>(
+  label: string,
+  create: (get: Atom.AtomContext) => Effect.Effect<A, E, Replica.Replica | Crypto.Crypto>
+) =>
+  runtime.atom((get) =>
+    create(get).pipe(
+      Effect.tapCause((cause) => Effect.logWarning(`${label} failed`, cause))
+    )
+  )
+
+/**
  * Presence heartbeat: while mounted, an open app writes `presence:<me>` into every conversation on
  * an interval. Duplicate beats from several tabs collapse in the document — each user's presence
  * is one key only that user writes.
  */
-export const presenceHeartbeat = runtime.atom((get) =>
+export const presenceHeartbeat = daemonAtom("presence heartbeat", (get) =>
   Effect.gen(function*() {
     const ids = yield* get.result(conversationIds, { suspendOnWaiting: true })
     // Materialized once: `Effect.forever` re-runs the same beat, and a bare `ids.values()`
@@ -196,19 +212,23 @@ export const presenceHeartbeat = runtime.atom((get) =>
     // no-op.
     const conversationIdList = [...ids.values()]
     yield* beatConversations(conversationIdList).pipe(
-      Effect.catchCause((cause) => Effect.logWarning("presence heartbeat failed", cause)),
       Effect.andThen(Effect.sleep(Duration.seconds(15))),
       Effect.forever
     )
-  })
-)
+  }).pipe(
+    // Nothing re-runs this atom (its one dependency never changes), so a transient beat failure
+    // would end presence for the rest of the session. Restart the loop instead, on the same
+    // cadence as the beat it replaces.
+    Effect.tapCause((cause) => Effect.logWarning("presence heartbeat restarting", cause)),
+    Effect.retry({ schedule: Schedule.spaced(Duration.seconds(15)) })
+  ))
 
 /**
  * Delivery receipts: any open tab of this user acknowledges inbound messages, whether or not their
  * conversation is on screen — the replica holds them durably, which is what two gray ticks mean.
  * Re-runs whenever the query updates; the set-if-null handler makes overlapping marks no-ops.
  */
-export const deliveredReceipts = runtime.atom((get) => {
+export const deliveredReceipts = daemonAtom("delivery receipts", (get) => {
   const undelivered = get(undeliveredInbound({ me: me.id }))
   if (undelivered._tag !== "Success") return Effect.void
   return Effect.gen(function*() {
@@ -224,11 +244,8 @@ export const deliveredReceipts = runtime.atom((get) => {
           })),
       { discard: true }
     )
-  }).pipe(
     // Same reason as the read receipts below: the batch must survive its own invalidations.
-    Effect.uninterruptible,
-    Effect.catchCause((cause) => Effect.logWarning("delivery receipts failed", cause))
-  )
+  }).pipe(Effect.uninterruptible)
 })
 
 /**
@@ -236,7 +253,7 @@ export const deliveredReceipts = runtime.atom((get) => {
  * conversation and its rows both come from the graph, so selecting a conversation and receiving a
  * message while it is open re-run this without any component wiring.
  */
-export const readReceipts = runtime.atom((get) => {
+export const readReceipts = daemonAtom("read receipts", (get) => {
   const selected = get(selectedConversation)
   if (selected === undefined) return Effect.void
   const result = get(messages({ conversationId: selected.conversationId }))
@@ -256,12 +273,9 @@ export const readReceipts = runtime.atom((get) => {
           })),
       { discard: true }
     )
-  }).pipe(
     // The daemon re-evaluates the moment its own commits invalidate the query it watches, which
     // cancels the previous run. An interrupted mutate can have committed without ever reaching
     // the relay push stream, silently stranding the receipt on this replica — so the batch always
     // runs to completion.
-    Effect.uninterruptible,
-    Effect.catchCause((cause) => Effect.logWarning("read receipts failed", cause))
-  )
+  }).pipe(Effect.uninterruptible)
 })
