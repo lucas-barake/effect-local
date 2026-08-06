@@ -208,6 +208,16 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
             for (const binding of matching) {
               yield* replace(binding, snapshot, binding.table)
             }
+            // Inbound peer sync, history rewrites, quarantine, and evolution defer projection work
+            // by marking the document not `Ready`. The rows just written come from the document's
+            // current merged snapshot, so whatever rebuild that mark was waiting for has now
+            // happened. The clear is fenced on the commit outbox row for this sequence: a command
+            // that changed nothing inserts no outbox row, and flipping queryability without a
+            // published invalidation would leave reactive subscribers stuck on the stale failure.
+            yield* sql`UPDATE effect_local_documents SET projection_status = 'Ready'
+              WHERE document_id = ${snapshot.documentId} AND projection_status != 'Ready'
+                AND EXISTS (SELECT 1 FROM effect_local_commit_outbox
+                  WHERE commit_sequence = ${commitSequence} AND document_id = ${snapshot.documentId})`
             yield* sql`UPDATE effect_local_commit_outbox
               SET invalidation_keys = ${
               Schema.encodeSync(StringArrayJson)([
