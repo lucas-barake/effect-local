@@ -26,6 +26,7 @@
         "src/replica.shared-worker.ts",
         "src/replica.shared-worker-runtime.ts",
         "server/main.ts",
+        "server/reset-test-db.ts",
         "tests/*.spec.ts",
         "vite.config.ts",
         "playwright.config.ts"

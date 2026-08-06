@@ -299,9 +299,26 @@ const Seed = HttpRouter.add(
 
 const Ready = HttpRouter.add("GET", "/ready", HttpServerResponse.text("ok"))
 
+/**
+ * `NodeHttpServer.layer` starts listening as soon as its layer builds, but the router's handler is
+ * attached later, once the backend layers (Postgres pool, inbox migrations, cluster, seed
+ * provisioning) have built. Node drops a `request` event that fires with no listener, so a request
+ * accepted in that window would never get a response and its connection would hang — readiness
+ * probes with no request timeout hang with it. This fallback answers 503 until the real handler is
+ * attached; it stays registered afterwards but yields as soon as it sees the second listener.
+ */
+const createGatedServer = () => {
+  const server = createServer()
+  server.on("request", (_request, response) => {
+    if (server.listenerCount("request") > 1) return
+    response.writeHead(503, { "retry-after": "1" }).end()
+  })
+  return server
+}
+
 HttpRouter.serve(Layer.mergeAll(Rpc, Seed, Ready)).pipe(
   Layer.provide(SeedArchiveLive),
-  Layer.provide(NodeHttpServer.layer(createServer, { port, host: "0.0.0.0" })),
+  Layer.provide(NodeHttpServer.layer(createGatedServer, { port, host: "0.0.0.0" })),
   Layer.provide(Telemetry),
   Layer.launch,
   NodeRuntime.runMain

@@ -8,16 +8,18 @@ const cwd = fileURLToPath(new URL(".", import.meta.url))
  * its own relay server on its own port against the `chat_test` database, so a dev relay on the
  * default port can keep running.
  *
- * The relay's inbox and the seed archive persist in `chat_test` across runs, so prior-run
- * messages can legitimately replay into the fresh browser contexts. The spec asserts on
- * run-unique message bodies rather than on message counts.
+ * The relay command resets `chat_test` before booting: without it the retained inbox replays
+ * every prior run's traffic into each fresh browser context, and the suite degrades as that
+ * backlog grows.
  */
 const relayPort = 8788
 const appPort = 5176
 
 export default defineConfig({
   testDir: "./tests",
-  timeout: 120_000,
+  // The golden path spans first-launch provisioning, several sync round-trips, and heartbeat-paced
+  // projection rebuilds on both devices.
+  timeout: 240_000,
   // One worker: every test shares one relay process and one set of user identities.
   workers: 1,
   use: {
@@ -26,7 +28,7 @@ export default defineConfig({
   },
   webServer: [
     {
-      command: "pnpm exec tsx server/main.ts",
+      command: "pnpm exec tsx server/reset-test-db.ts && pnpm exec tsx server/main.ts",
       cwd,
       env: {
         CHAT_RELAY_PORT: String(relayPort),

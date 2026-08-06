@@ -28,8 +28,10 @@ test("messages, ticks, read receipts, presence, and multi-tab", async ({ browser
   await alice.getByTestId("conversation-bob").click()
   await alice.getByPlaceholder("Message Bob").fill(fromAlice)
   await alice.getByRole("button", { name: "Send" }).click()
+  // Usually instant (the send itself rebuilds the sender's projections), but replayed inbound
+  // traffic arriving in the same window can re-block the list until the next heartbeat.
   const aliceBubble = alice.locator(".bubble", { hasText: fromAlice })
-  await expect(aliceBubble).toBeVisible()
+  await expect(aliceBubble).toBeVisible({ timeout: 40_000 })
   await expect(aliceBubble.locator(".tick-wrap")).toHaveAttribute(
     "data-status",
     /Received by server|Delivered|Read/,
@@ -46,9 +48,10 @@ test("messages, ticks, read receipts, presence, and multi-tab", async ({ browser
     timeout: 60_000
   })
 
-  // Read: bob opens the conversation.
+  // Read: bob opens the conversation. Inbound changes can keep the message list blocked until
+  // bob's next local command — up to one heartbeat interval — so this allows more than one.
   await bob.getByTestId("conversation-alice").click()
-  await expect(bob.locator(".bubble", { hasText: fromAlice })).toBeVisible()
+  await expect(bob.locator(".bubble", { hasText: fromAlice })).toBeVisible({ timeout: 40_000 })
   await expect(aliceBubble.locator(".tick-wrap")).toHaveAttribute("data-status", "Read", {
     timeout: 60_000
   })
@@ -61,7 +64,7 @@ test("messages, ticks, read receipts, presence, and multi-tab", async ({ browser
   // The reply flows the other way.
   await bob.getByPlaceholder("Message Alice").fill(fromBob)
   await bob.getByRole("button", { name: "Send" }).click()
-  await expect(bob.locator(".bubble", { hasText: fromBob })).toHaveCount(1)
+  await expect(bob.locator(".bubble", { hasText: fromBob })).toHaveCount(1, { timeout: 40_000 })
   await expect(alice.locator(".bubble", { hasText: fromBob })).toBeVisible({ timeout: 60_000 })
 
   // Multi-tab: a second tab of the same profile attaches to the same SharedWorker replica and

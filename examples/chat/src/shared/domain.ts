@@ -110,7 +110,7 @@ const PresenceRow = Schema.Struct({
   lastSeenAtMillis: Schema.Number
 })
 
-export const Presence = Projection.make("Presence", {
+const Presence = Projection.make("Presence", {
   document: Conversation,
   version: 1,
   Row: PresenceRow,

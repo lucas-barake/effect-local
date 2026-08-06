@@ -4,7 +4,7 @@ import { Input } from "@base-ui/react/input"
 import { ScrollArea } from "@base-ui/react/scroll-area"
 import { Select } from "@base-ui/react/select"
 import { Tooltip } from "@base-ui/react/tooltip"
-import { useAtomSet, useAtomValue } from "@effect/atom-react"
+import { useAtomMount, useAtomSet, useAtomValue } from "@effect/atom-react"
 import * as CommandDelivery from "@lucas-barake/effect-local/CommandDelivery"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Cause from "effect/Cause"
@@ -12,15 +12,7 @@ import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import { Check, CheckCheck, ChevronDown, Clock, Send } from "lucide-react"
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react"
 import * as Client from "./replica-client.ts"
-import {
-  type ChatUser,
-  conversationIdFor,
-  counterpartsOf,
-  endpointFor,
-  relayPeerId,
-  userById,
-  users
-} from "./shared/identities.ts"
+import { type ChatUser, counterpartsOf, endpointFor, relayPeerId, users } from "./shared/identities.ts"
 
 const me = Client.me
 const counterparts = counterpartsOf(me.id)
@@ -36,7 +28,6 @@ interface MessageRowUi {
 }
 
 const ONLINE_WINDOW_MILLIS = 45_000
-const HEARTBEAT_INTERVAL_MILLIS = 15_000
 
 /**
  * Inbound sync blocks a document's projections until the next local command (here: the presence
@@ -102,29 +93,12 @@ const ChatView = ({ conversationId, counterpart, presenceText }: {
 }) => {
   const result = useAtomValue(Client.messages({ conversationId }))
   const rows: ReadonlyArray<MessageRowUi> = latest(result, [])
-  const runMarkRead = useAtomSet(Client.markRead, { mode: "promise" })
   const runSend = useAtomSet(Client.sendMessage, { mode: "promise" })
   const [draft, setDraft] = useState("")
   // Mirrors the input synchronously: a click on a submit button can reach the handler twice in one
   // dispatch (component wrapper + native form submission), and React state has not flushed yet.
   const draftRef = useRef("")
-  const readInFlight = useRef(new Set<string>())
   const viewportRef = useRef<HTMLDivElement>(null)
-
-  // Read receipts: an inbound message is "read" once its conversation is the one on screen.
-  useEffect(() => {
-    for (const row of rows) {
-      if (row.author === me.id || row.readAtMillis !== null) continue
-      if (readInFlight.current.has(row.messageId)) continue
-      readInFlight.current.add(row.messageId)
-      void runMarkRead({ conversationId, messageId: row.messageId })
-        // eslint-disable-next-line no-console
-        .catch((error) => console.error("[read]", error))
-        .finally(() => {
-          readInFlight.current.delete(row.messageId)
-        })
-    }
-  }, [rows, conversationId, runMarkRead])
 
   useEffect(() => {
     const viewport = viewportRef.current
@@ -194,77 +168,31 @@ const relayStatusText = {
 } as const
 
 export const App = () => {
-  const [conversationIds, setConversationIds] = useState<ReadonlyMap<string, Identity.DocumentId>>()
-  const [selectedId, setSelectedId] = useState<string>()
-  const [now, setNow] = useState(() => Date.now())
+  // The daemons live in the atom graph; mounting is the only involvement React has in them.
+  useAtomMount(Client.presenceHeartbeat)
+  useAtomMount(Client.deliveredReceipts)
+  useAtomMount(Client.readReceipts)
 
   const relayStatus = useAtomValue(Client.relayConnectionStatus)
   const summariesResult = useAtomValue(Client.conversationSummaries({ me: me.id }))
   const presenceResult = useAtomValue(Client.presenceSnapshot())
-  const undeliveredResult = useAtomValue(Client.undeliveredInbound({ me: me.id }))
-  const runMarkDelivered = useAtomSet(Client.markDelivered, { mode: "promise" })
-  const runHeartbeat = useAtomSet(Client.heartbeat, { mode: "promise" })
-  const deliveredInFlight = useRef(new Set<string>())
-
-  useEffect(() => {
-    let active = true
-    void Promise.all(
-      counterparts.map(async (counterpart) => [counterpart.id, await conversationIdFor(me.id, counterpart.id)] as const)
-    ).then((entries) => {
-      if (active) setConversationIds(new Map(entries))
-    })
-    return () => {
-      active = false
-    }
-  }, [])
-
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 5_000)
-    return () => clearInterval(timer)
-  }, [])
-
-  // Presence heartbeat: an open app claims the user is online, into every conversation that
-  // already exists locally (the shared worker may still be provisioning on first launch). Not
-  // gated on tab visibility: embedded browsers can report every page as hidden, and "open but
-  // backgrounded" still reads as online in a chat.
-  useEffect(() => {
-    if (conversationIds === undefined) return
-    const beat = () => {
-      for (const conversationId of conversationIds.values()) {
-        // eslint-disable-next-line no-console
-        void runHeartbeat({ conversationId }).catch((error) => console.error("[heartbeat]", error))
-      }
-    }
-    beat()
-    const timer = setInterval(beat, HEARTBEAT_INTERVAL_MILLIS)
-    return () => clearInterval(timer)
-  }, [conversationIds, runHeartbeat])
-
-  // Delivery receipts: any open tab of this user acknowledges inbound messages, whether or not
-  // their conversation is on screen — the replica has them durably, which is what two ticks mean.
-  useEffect(() => {
-    if (undeliveredResult._tag !== "Success") return
-    for (const row of undeliveredResult.value) {
-      if (deliveredInFlight.current.has(row.messageId)) continue
-      deliveredInFlight.current.add(row.messageId)
-      void runMarkDelivered({ conversationId: row.conversationId, messageId: row.messageId })
-        .catch(() => undefined)
-        .finally(() => deliveredInFlight.current.delete(row.messageId))
-    }
-  }, [undeliveredResult, runMarkDelivered])
+  const conversationIds = latest(useAtomValue(Client.conversationIds), undefined)
+  const now = latest(useAtomValue(Client.nowMillis), Date.now())
+  const selectedId = useAtomValue(Client.selectedCounterpartId)
+  const setSelectedId = useAtomSet(Client.selectedCounterpartId)
+  const selected = useAtomValue(Client.selectedConversation)
 
   useEffect(() => {
     for (
       const [name, result] of [
         ["summaries", summariesResult],
-        ["presence", presenceResult],
-        ["undelivered", undeliveredResult]
+        ["presence", presenceResult]
       ] as const
     ) {
       // eslint-disable-next-line no-console
       if (result._tag === "Failure") console.error(`[query:${name}]`, Cause.pretty(result.cause))
     }
-  }, [summariesResult, presenceResult, undeliveredResult])
+  }, [summariesResult, presenceResult])
 
   const summaries = latest(summariesResult, [])
   const presenceRows = latest(presenceResult, [])
@@ -290,8 +218,6 @@ export const App = () => {
       .toSorted((left, right) => (right.summary?.lastSentAtMillis ?? 0) - (left.summary?.lastSentAtMillis ?? 0))
   }, [summaries, conversationIds])
 
-  const selected = selectedId === undefined ? undefined : userById(selectedId)
-  const selectedConversationId = selected === undefined ? undefined : conversationIds?.get(selected.id)
   const relayTag = relayStatus._tag === "Success" ? relayStatus.value._tag : "Connecting"
 
   return (
@@ -373,12 +299,12 @@ export const App = () => {
             </ScrollArea.Scrollbar>
           </ScrollArea.Root>
         </aside>
-        {selected !== undefined && selectedConversationId !== undefined
+        {selected !== undefined
           ? (
             <ChatView
-              conversationId={selectedConversationId}
-              counterpart={selected}
-              presenceText={presenceOf(selected)}
+              conversationId={selected.conversationId}
+              counterpart={selected.counterpart}
+              presenceText={presenceOf(selected.counterpart)}
             />
           )
           : (
