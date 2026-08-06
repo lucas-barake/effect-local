@@ -11,6 +11,7 @@
     { "path": "packages/local-browser/test-browser/ownership" },
     { "path": "packages/local-browser/test-browser/relay" },
     { "path": "packages/local-rpc/tsconfig.test.json" },
-    { "path": "packages/local-test/tsconfig.test.json" }
+    { "path": "packages/local-test/tsconfig.test.json" },
+    { "path": "examples/chat" }
   ]
 }

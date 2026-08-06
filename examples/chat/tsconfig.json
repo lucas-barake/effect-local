@@ -1,0 +1,39 @@
+{
+  "$schema": "http://json.schemastore.org/tsconfig",
+  "extends": "../../tsconfig.base.json",
+  "include": [
+    "src",
+    "server",
+    "tests",
+    "playwright.config.ts"
+  ],
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "dist",
+    "lib": [
+      "ES2023",
+      "DOM",
+      "DOM.Iterable",
+      "WebWorker"
+    ],
+    "types": [
+      "vite/client",
+      "node"
+    ],
+    "jsx": "react-jsx"
+  },
+  "references": [
+    {
+      "path": "../../packages/local"
+    },
+    {
+      "path": "../../packages/local-rpc"
+    },
+    {
+      "path": "../../packages/local-sql"
+    },
+    {
+      "path": "../../packages/local-browser"
+    }
+  ]
+}
