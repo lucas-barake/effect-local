@@ -602,8 +602,28 @@ const makeWithTerminal = (
             "ReplicaError",
             "DocumentLineageChanged",
             (reason) => refuse(envelope.documentId, reason).pipe(Effect.as(null))
+          ),
+          // Quota trips are transient, so rejecting would discard a message the replica can hold
+          // later, and failing the session turned one over-quota message into a reconnect churn
+          // loop. Settling nothing keeps custody at the relay until the next session retries.
+          Effect.catchReason(
+            "ReplicaError",
+            "QuotaExceeded",
+            (reason) =>
+              Effect.logWarning(
+                "Peer session parked an inbound message after a receive quota was exceeded; the message stays in relay custody"
+              ).pipe(
+                Effect.annotateLogs({
+                  documentId: envelope.documentId,
+                  peerId: connection.peerId,
+                  resource: reason.resource,
+                  limit: reason.limit
+                }),
+                Effect.as("Parked" as const)
+              )
           )
         )
+        if (result === "Parked") return "Parked" as const
         if (result === null) return "ApplicationRejected" as const
         yield* publisher.publishPending
         if (result.reply !== null) {
@@ -635,6 +655,8 @@ const makeWithTerminal = (
         Effect.flatMap((outcome) =>
           outcome === "ApplicationRejected"
             ? relayCall("relay reject", delivery.reject("ApplicationRejected"))
+            : outcome === "Parked"
+            ? Effect.void
             : relayCall("relay acknowledge", delivery.acknowledge)
         ),
         Effect.catchTag(
