@@ -199,10 +199,24 @@ export class RelayInboxStore extends Context.Service<RelayInboxStore, {
    *
    * One head per channel: the owner delivers heads concurrently across channels and strictly in
    * order within a channel.
+   *
+   * The order is a delivery guarantee, not presentation. Each sender's most recently started
+   * channel comes first (live channels among themselves oldest first), then every superseded
+   * channel oldest first. A sender mints a fresh connection epoch per session, so a crash looping
+   * sender leaves one channel per lapsed epoch; the owner takes heads in this order into a bounded
+   * number of delivery slots, and age order alone would hand every slot to that stale trail while
+   * the sender's live epoch starves behind it.
+   *
+   * Priority alone would starve in the other direction: live channels that are never empty never
+   * leave a slot idle, and a superseded message the relay accepted custody of would expire
+   * undelivered — the sender only replays its current epoch's outbox, so expiry destroys the last
+   * copy. A superseded head that has burned half its TTL by `now` is therefore promoted into the
+   * priority class, where its age puts it at the front. Deprioritization is bounded at half the
+   * message's lifetime; the other half is the delivery window it was promoted to use.
    */
   readonly pendingHeads: (
     inboxKey: string,
-    options: { readonly limit: number }
+    options: { readonly limit: number; readonly now: number }
   ) => Effect.Effect<ReadonlyArray<PendingMessage>, StoreError>
 
   readonly recordDelivery: (

@@ -133,7 +133,7 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
       const result = yield* store.admit(admission({ inboxKey: "admit", id: "000000000001", sequence: 0, now: 0 }))
       assert.strictEqual(result._tag, "Admitted")
 
-      const heads = yield* store.pendingHeads("admit", { limit: 10 })
+      const heads = yield* store.pendingHeads("admit", { limit: 10, now: 0 })
       assert.strictEqual(heads.length, 1)
       assert.strictEqual(heads[0]!.relayMessageId, relayId("000000000001"))
     })
@@ -147,7 +147,7 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
 
       assert.strictEqual(replay._tag, "Duplicate")
       assert.strictEqual(replay._tag === "Duplicate" ? replay.state : "", "Pending")
-      const heads = yield* store.pendingHeads("replay", { limit: 10 })
+      const heads = yield* store.pendingHeads("replay", { limit: 10, now: 0 })
       assert.strictEqual(heads.length, 1, "a replay must not create a second row")
     })
   },
@@ -194,12 +194,12 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
       yield* store.expire({ now: 1_005_000, limit: 1_000, terminalRetentionMillis: 1_000 })
 
       assert.strictEqual(
-        (yield* store.pendingHeads("sweep-overdue", { limit: 10 })).length,
+        (yield* store.pendingHeads("sweep-overdue", { limit: 10, now: 0 })).length,
         0,
         "the overdue message is expired"
       )
       assert.strictEqual(
-        (yield* store.pendingHeads("sweep-live", { limit: 10 })).length,
+        (yield* store.pendingHeads("sweep-live", { limit: 10, now: 0 })).length,
         1,
         "the other inbox still holds a message with time left"
       )
@@ -220,12 +220,113 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
         admission({ inboxKey: "heads", id: "000000000003", sequence: 500, now: 2, subject: "sender-c" })
       )
 
-      assert.strictEqual((yield* store.pendingHeads("heads", { limit: 2 })).length, 2)
+      assert.strictEqual((yield* store.pendingHeads("heads", { limit: 2, now: 0 })).length, 2)
 
-      const all = yield* store.pendingHeads("heads", { limit: 10 })
+      const all = yield* store.pendingHeads("heads", { limit: 10, now: 0 })
       assert.deepStrictEqual(
         all.map((head) => head.channel.senderSubjectId).toSorted(),
         ["sender-a", "sender-b", "sender-c"]
+      )
+    })
+  },
+  {
+    name: "prioritizes each sender's most recent connection epoch over its stale ones",
+    run: Effect.gen(function*() {
+      const store = yield* RelayInboxStore.RelayInboxStore
+      // A crash looping sender mints a fresh epoch per reconnect and leaves one channel per lapsed
+      // epoch. Selection driven by channel age alone hands every delivery slot to the stale trail
+      // and starves the epoch the sender is connected on right now, until the stale heads dead
+      // letter or expire.
+      yield* store.admit(
+        admission({ inboxKey: "epoch-priority", id: "000000000001", sequence: 0, now: 0, epoch: "epoch-1" })
+      )
+      yield* store.admit(
+        admission({ inboxKey: "epoch-priority", id: "000000000002", sequence: 0, now: 1_000, epoch: "epoch-2" })
+      )
+      yield* store.admit(
+        admission({
+          inboxKey: "epoch-priority",
+          id: "000000000003",
+          sequence: 0,
+          now: 1_500,
+          subject: "sender-b",
+          epoch: "epoch-b"
+        })
+      )
+      yield* store.admit(
+        admission({ inboxKey: "epoch-priority", id: "000000000004", sequence: 0, now: 2_000, epoch: "epoch-3" })
+      )
+
+      // Two slots, two senders: each sender's live epoch lands ahead of any superseded epoch, and
+      // the live epochs keep the age order stale channels would otherwise consume.
+      const slots = yield* store.pendingHeads("epoch-priority", { limit: 2, now: 0 })
+      assert.deepStrictEqual(
+        slots.map((head) => head.relayMessageId),
+        [relayId("000000000003"), relayId("000000000004")]
+      )
+
+      // The stale epochs are deprioritized, never dropped: they follow, oldest first.
+      const all = yield* store.pendingHeads("epoch-priority", { limit: 10, now: 0 })
+      assert.deepStrictEqual(
+        all.map((head) => head.relayMessageId),
+        [
+          relayId("000000000003"),
+          relayId("000000000004"),
+          relayId("000000000001"),
+          relayId("000000000002")
+        ]
+      )
+    })
+  },
+  {
+    name: "promotes a superseded channel's head before its message expires",
+    run: Effect.gen(function*() {
+      const store = yield* RelayInboxStore.RelayInboxStore
+      // Priority alone would starve a superseded channel forever while the live epoch keeps
+      // producing, and an undelivered message expires — destroying the last copy, because the
+      // sender only replays its current epoch's outbox. Once a head has burned half its TTL it
+      // must outrank the live channel.
+      //
+      // Real epoch-millisecond timestamps on purpose: the production caller passes the wall
+      // clock, and values this size are where dialect parameter-type inference breaks — an
+      // arithmetic expression over the `now` parameter made PostgreSQL pair it with `integer`
+      // and overflow, which small test values can never see.
+      const start = 1_754_000_000_000
+      yield* store.admit(
+        admission({
+          inboxKey: "epoch-aging",
+          id: "000000000001",
+          sequence: 0,
+          now: start,
+          ttl: 1_000,
+          epoch: "epoch-1"
+        })
+      )
+      yield* store.admit(
+        admission({
+          inboxKey: "epoch-aging",
+          id: "000000000002",
+          sequence: 0,
+          now: start + 100,
+          ttl: 1_000,
+          epoch: "epoch-2"
+        })
+      )
+
+      const young = yield* store.pendingHeads("epoch-aging", { limit: 1, now: start + 100 })
+      assert.deepStrictEqual(
+        young.map((head) => head.relayMessageId),
+        [relayId("000000000002")],
+        "while the superseded head is young the live epoch keeps the slot"
+      )
+
+      // At +550 the stale head (created +0, expires +1 000) is past its half-life; the live head
+      // (created +100, expires +1 100) is not.
+      const aged = yield* store.pendingHeads("epoch-aging", { limit: 1, now: start + 550 })
+      assert.deepStrictEqual(
+        aged.map((head) => head.relayMessageId),
+        [relayId("000000000001")],
+        "a superseded head past half its TTL takes priority, and its age puts it first"
       )
     })
   },
@@ -236,7 +337,7 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
       yield* store.admit(admission({ inboxKey: "order", id: "000000000002", sequence: 5, now: 0 }))
       yield* store.admit(admission({ inboxKey: "order", id: "000000000001", sequence: 1, now: 1 }))
 
-      const heads = yield* store.pendingHeads("order", { limit: 10 })
+      const heads = yield* store.pendingHeads("order", { limit: 10, now: 0 })
       assert.strictEqual(heads.length, 1, "one head per channel")
       assert.strictEqual(heads[0]!.relayMessageId, relayId("000000000001"))
     })
@@ -263,7 +364,7 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
       })
       assert.strictEqual(second._tag, "DeadLettered")
 
-      const heads = yield* store.pendingHeads("budget", { limit: 10 })
+      const heads = yield* store.pendingHeads("budget", { limit: 10, now: 0 })
       assert.strictEqual(heads.length, 0, "a dead lettered message stops blocking its channel")
     })
   },
@@ -293,7 +394,7 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
         terminalRetentionMillis: 1_000
       })
       assert.strictEqual(settled, "Settled")
-      assert.strictEqual((yield* store.pendingHeads("ack", { limit: 10 })).length, 0)
+      assert.strictEqual((yield* store.pendingHeads("ack", { limit: 10, now: 0 })).length, 0)
     })
   },
   {
@@ -310,7 +411,7 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
       })
       assert.strictEqual(settled, "HashMismatch")
       assert.strictEqual(
-        (yield* store.pendingHeads("hash", { limit: 10 })).length,
+        (yield* store.pendingHeads("hash", { limit: 10, now: 0 })).length,
         1,
         "the message stays deliverable"
       )
@@ -351,7 +452,7 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
       )
       assert.strictEqual(replay._tag, "Duplicate")
       assert.strictEqual(
-        (yield* store.pendingHeads("dedupe", { limit: 10 })).length,
+        (yield* store.pendingHeads("dedupe", { limit: 10, now: 0 })).length,
         0,
         "an acknowledged message must not become deliverable again"
       )
@@ -441,7 +542,7 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
       )
       assert.strictEqual(replay._tag, "Admitted")
       assert.strictEqual(
-        (yield* store.pendingHeads("revive", { limit: 10 })).length,
+        (yield* store.pendingHeads("revive", { limit: 10, now: 0 })).length,
         1,
         "the revived message is deliverable again"
       )

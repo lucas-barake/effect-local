@@ -443,11 +443,14 @@ export const layer = (options: Options) =>
             // the latch and the following await returns immediately.
             yield* session.wake.close
             // Widened by the channels this session has already been told it may not receive.
-            // Heads come back oldest first, so asking only for as many as can be delivered would
-            // return nothing but withheld ones once enough of them accumulate, and the channels
-            // behind them — which the recipient is entitled to — would never even be looked at.
+            // Heads come back in a fixed priority order, so asking only for as many as can be
+            // delivered would return nothing but withheld ones once enough of them accumulate, and
+            // the channels behind them — which the recipient is entitled to — would never even be
+            // looked at.
+            const now = yield* Clock.currentTimeMillis
             const heads = yield* store.pendingHeads(inboxKey, {
-              limit: options.maxConcurrentChannels + session.withheldChannels.size
+              limit: options.maxConcurrentChannels + session.withheldChannels.size,
+              now
             })
             for (const head of heads) {
               const channel = channelId(head.channel)

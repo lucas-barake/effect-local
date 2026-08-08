@@ -504,7 +504,7 @@ describe("RelayServer", () => {
 
       const pending = yield* peer.store.pendingHeads(
         yield* inboxKeyOf(peer, recipient),
-        { limit: 10 }
+        { limit: 10, now: 0 }
       )
       assert.strictEqual(pending.length, 0, "an acknowledged message is terminal")
     })))
@@ -544,7 +544,7 @@ describe("RelayServer", () => {
 
       const pending = yield* peer.store.pendingHeads(
         yield* inboxKeyOf(peer, recipient),
-        { limit: 10 }
+        { limit: 10, now: 0 }
       )
       assert.strictEqual(pending.length, 0, "a denied push must not reach durable custody")
     })))
@@ -571,7 +571,7 @@ describe("RelayServer", () => {
 
       const pending = yield* peer.store.pendingHeads(
         yield* inboxKeyOf(peer, recipient),
-        { limit: 10 }
+        { limit: 10, now: 0 }
       )
       assert.strictEqual(pending.length, 1, "the message stays durable for a later session")
 
@@ -604,7 +604,7 @@ describe("RelayServer", () => {
 
       const pending = yield* peer.store.pendingHeads(
         yield* inboxKeyOf(peer, recipient),
-        { limit: 10 }
+        { limit: 10, now: 0 }
       )
       assert.strictEqual(pending.length, 0, "no malformed push reaches durable custody")
     })))
@@ -741,7 +741,7 @@ describe("RelayServer", () => {
 
       const pending = yield* peer.store.pendingHeads(
         yield* inboxKeyOf(peer, recipient),
-        { limit: 10 }
+        { limit: 10, now: 0 }
       )
       assert.isTrue(
         pending.some((message) => message.relayMessageId === relayId("000000000001")),
@@ -777,7 +777,7 @@ describe("RelayServer", () => {
 
       const pending = yield* peer.store.pendingHeads(
         yield* inboxKeyOf(peer, recipient),
-        { limit: 10 }
+        { limit: 10, now: 0 }
       )
       assert.strictEqual(pending.length, 0, "a borrowed session admits nothing")
     })))
@@ -829,7 +829,7 @@ describe("RelayServer", () => {
 
       const pending = yield* peer.store.pendingHeads(
         yield* inboxKeyOf(peer, recipient),
-        { limit: 10 }
+        { limit: 10, now: 0 }
       )
       assert.strictEqual(pending.length, 0, "an unacknowledged risk admits nothing")
     })))
@@ -859,7 +859,7 @@ describe("RelayServer", () => {
 
       const pending = yield* peer.store.pendingHeads(
         yield* inboxKeyOf(peer, recipient),
-        { limit: 10 }
+        { limit: 10, now: 0 }
       )
       assert.strictEqual(pending.length, 1, "the terminal transition never ran")
     })))
@@ -914,7 +914,7 @@ describe("RelayServer", () => {
       // The message was delivered but never settled, so it is still the relay's responsibility.
       const pending = yield* peer.store.pendingHeads(
         yield* inboxKeyOf(peer, recipient),
-        { limit: 10 }
+        { limit: 10, now: 0 }
       )
       assert.strictEqual(pending.length, 1, "an unsettled message survives the revocation")
     })))
@@ -1030,7 +1030,7 @@ describe("RelayServer", () => {
 
       const pending = yield* peer.store.pendingHeads(
         yield* inboxKeyOf(peer, recipient),
-        { limit: 10 }
+        { limit: 10, now: 0 }
       )
       assert.isTrue(
         pending.some((message) => message.relayMessageId === relayId("000000000001")),
@@ -1082,7 +1082,7 @@ describe("RelayServer", () => {
 
       const pending = yield* peer.store.pendingHeads(
         yield* inboxKeyOf(peer, recipient),
-        { limit: 10 }
+        { limit: 10, now: 0 }
       )
       assert.isTrue(
         pending.some((message) => message.relayMessageId === relayId("000000000001")),
@@ -1128,7 +1128,7 @@ describe("RelayServer", () => {
 
       const pending = yield* peer.store.pendingHeads(
         yield* inboxKeyOf(peer, recipient),
-        { limit: 10 }
+        { limit: 10, now: 0 }
       )
       assert.strictEqual(pending.length, 1, "the terminal transition never ran")
     })))
@@ -1179,20 +1179,25 @@ describe("RelayServer", () => {
 
       const pending = yield* peer.store.pendingHeads(
         yield* inboxKeyOf(peer, recipient),
-        { limit: 10 }
+        { limit: 10, now: 0 }
       )
       assert.isTrue(
         pending.some((message) => message.relayMessageId === relayId("000000000001")),
         "the unacknowledged document stays durable"
       )
 
-      // Withheld rather than dropped: acknowledging the risk and reconnecting produces it.
+      // Withheld rather than dropped: acknowledging the risk and reconnecting produces it. Both
+      // messages are still pending, and head selection prioritizes the sender's most recent epoch,
+      // so the withheld one is not necessarily first — what matters is that it is delivered at all.
       peer.knobs.allowRisk = () => true
       const restored = yield* open(peer, recipient, sender, documents)
-      const released = yield* Queue.take(restored.events)
-      assert.strictEqual(released._tag, "StoredMessage")
-      if (released._tag !== "StoredMessage") return
-      assert.strictEqual(released.relayMessageId, relayId("000000000001"))
+      const released = [yield* Queue.take(restored.events), yield* Queue.take(restored.events)]
+      assert.isTrue(
+        released.some(
+          (event) => event._tag === "StoredMessage" && event.relayMessageId === relayId("000000000001")
+        ),
+        "the withheld message is delivered once its risk is acknowledged"
+      )
     })))
 
   it.effect("refuses a settlement whose unbounded decode risk is no longer acknowledged", () =>
@@ -1220,7 +1225,7 @@ describe("RelayServer", () => {
 
       const pending = yield* peer.store.pendingHeads(
         yield* inboxKeyOf(peer, recipient),
-        { limit: 10 }
+        { limit: 10, now: 0 }
       )
       assert.strictEqual(pending.length, 1, "the terminal transition never ran")
     })))
