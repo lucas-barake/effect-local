@@ -1,6 +1,7 @@
 import * as Automerge from "@automerge/automerge"
 import * as Equal from "effect/Equal"
 import * as Schema from "effect/Schema"
+import * as SyncChunks from "./syncChunks.js"
 
 export const WriterSchemaVersion = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))
 
@@ -35,24 +36,10 @@ export const equals = (
 export const changeHashes = <T,>(document: Automerge.Doc<T>): ReadonlyArray<string> =>
   Automerge.getAllChanges(document).map((bytes) => Automerge.decodeChange(bytes).hash).toSorted()
 
-export const syncMessageChangeHashes = (message: Uint8Array): ReadonlyArray<string> => {
-  const hashes = new Set<string>()
-  for (const chunk of Automerge.decodeSyncMessage(message).changes) {
-    try {
-      hashes.add(Automerge.decodeChange(chunk).hash)
-    } catch {
-      const document = Automerge.load(chunk)
-      try {
-        for (const bytes of Automerge.getAllChanges(document)) {
-          hashes.add(Automerge.decodeChange(bytes).hash)
-        }
-      } finally {
-        Automerge.free(document)
-      }
-    }
-  }
-  return [...hashes].toSorted()
-}
+export const syncMessageChangeHashes = (message: Uint8Array): ReadonlyArray<string> =>
+  SyncChunks.decodeSyncChanges(Automerge.decodeSyncMessage(message).changes)
+    .map((change) => change.hash)
+    .toSorted()
 
 export const backfill = (
   changeHashes: ReadonlyArray<string>,

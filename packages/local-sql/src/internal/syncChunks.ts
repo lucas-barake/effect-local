@@ -11,6 +11,7 @@ const chunkMagic = [0x85, 0x6f, 0x4a, 0x83]
 const chunkTypeDocument = 0
 const chunkTypeChange = 1
 const chunkTypeCompressed = 2
+const chunkTypeBundle = 3
 
 const splitChunks = (bytes: Uint8Array): Array<{ type: number; bytes: Uint8Array }> => {
   const chunks: Array<{ type: number; bytes: Uint8Array }> = []
@@ -64,9 +65,14 @@ export const decodeSyncChanges = (
         } finally {
           Automerge.free(document)
         }
+      } else if (part.type === chunkTypeBundle) {
+        Automerge.free(Automerge.load(part.bytes, { allowMissingChanges: true }))
+        for (const change of Automerge.readBundle(part.bytes).changes) {
+          changes.set(change.hash, change)
+        }
       } else {
-        // Bundles and future chunk types never appear in sync messages today; guessing at one
-        // would misattribute provenance, which the receiving replica validates count for count.
+        // Guessing at a future chunk type would misattribute provenance, which the receiving
+        // replica validates count for count.
         throw new Error(`unsupported Automerge chunk type ${part.type}`)
       }
     }
