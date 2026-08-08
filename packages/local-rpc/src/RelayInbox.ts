@@ -431,9 +431,7 @@ export const layer = (options: Options) =>
             // the channel, which is the whole point — a released attempt that kept waiting for a
             // settlement would hold its channel, and enough of them would hold every delivery slot
             // and starve channels the recipient is perfectly entitled to.
-            yield* Effect.sync(() =>
-              session.withheldChannels.add(channelId(head.channel))
-            )
+            session.withheldChannels.add(channelId(head.channel))
             yield* Effect.logDebug("Relay inbox delivery released without settling").pipe(
               Effect.annotateLogs({ inboxKey, relayMessageId: head.relayMessageId })
             )
@@ -505,12 +503,18 @@ export const layer = (options: Options) =>
             })
             for (const head of heads) {
               const channel = channelId(head.channel)
-              if (session.busyChannels.has(channel)) continue
+              if (session.busyChannels.has(channel)) {
+                continue
+              }
               // Skipped for this session only. Re-offering a head the front door just withheld
               // would spin, and passing over it to reach the next message in the same channel
               // would break the ordering the channel exists to preserve.
-              if (session.withheldChannels.has(channel)) continue
-              if (session.busyChannels.size >= options.maxConcurrentChannels) break
+              if (session.withheldChannels.has(channel)) {
+                continue
+              }
+              if (session.busyChannels.size >= options.maxConcurrentChannels) {
+                break
+              }
               session.busyChannels.add(channel)
               yield* Effect.forkIn(deliverHead(session, head), session.scope)
             }
@@ -531,14 +535,20 @@ export const layer = (options: Options) =>
       // a session is never performed by a fiber the close itself must interrupt.
       yield* Effect.gen(function*() {
         const current = yield* Ref.get(sessionRef)
-        if (Option.isNone(current)) return
+        if (Option.isNone(current)) {
+          return
+        }
         const now = yield* Clock.currentTimeMillis
         const deadlineAt = yield* Ref.get(current.value.deadlineAt)
-        if (now < deadlineAt) return
+        if (now < deadlineAt) {
+          return
+        }
         yield* sessionLock.withPermit(
           Effect.gen(function*() {
             const latest = yield* Ref.get(sessionRef)
-            if (Option.isNone(latest) || latest.value.sessionId !== current.value.sessionId) return
+            if (Option.isNone(latest) || latest.value.sessionId !== current.value.sessionId) {
+              return
+            }
             yield* Effect.logInfo("Relay inbox session deadline lapsed; releasing session").pipe(
               Effect.annotateLogs({ inboxKey, sessionId: current.value.sessionId })
             )
@@ -562,7 +572,9 @@ export const layer = (options: Options) =>
       // reference to the outer scope, so this is a property of the deployment's
       // `entityTerminationTimeout`, not something the entity can fix: size it knowing a rebalance
       // costs each moving device up to that long before its next session can be served.
-      yield* Effect.addFinalizer(() => Effect.orDie(closeCurrentSession))
+      yield* Effect.addFinalizer(() =>
+        Effect.orDie(closeCurrentSession)
+      )
 
       const currentSession = (sessionId: Identity.SessionId) =>
         Ref.get(sessionRef).pipe(
@@ -761,7 +773,7 @@ export const layer = (options: Options) =>
             yield* extendDeadline(session)
             // Marked here as well as on the delivering fiber, so the channel is skipped from the
             // moment the release is accepted rather than whenever that fiber next runs.
-            yield* Effect.sync(() => session.withheldChannels.add(settlement.channelId))
+            session.withheldChannels.add(settlement.channelId)
             yield* Deferred.succeed(settlement.requested, "Released")
           }).pipe(
             Effect.withSpan("RelayInbox.Release", {
