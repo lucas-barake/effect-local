@@ -786,7 +786,7 @@ describe("RelayInbox", () => {
         outcome: "Acknowledged"
       })
       const store = yield* RelayInboxStore.RelayInboxStore
-      assert.strictEqual((yield* store.pendingHeads(inboxKey, { limit: 10 })).length, 0)
+      assert.strictEqual((yield* store.pendingHeads(inboxKey, { limit: 10, now: 0 })).length, 0)
     }).pipe(Effect.provide(layer)))
 
   it.effect("does not charge a delivery the recipient never took", () =>

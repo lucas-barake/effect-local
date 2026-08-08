@@ -454,7 +454,7 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
       })
       assert.isFalse(applied)
 
-      const survivor = (yield* store.pendingHeads("refund-guard", { limit: 10 }))
+      const survivor = (yield* store.pendingHeads("refund-guard", { limit: 10, now: 0 }))
         .find((message) => message.relayMessageId === relayId("000000000001"))
       assert.strictEqual(survivor?.deliveries, 0)
     })
