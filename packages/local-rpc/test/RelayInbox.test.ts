@@ -375,7 +375,15 @@ describe("RelayInbox", () => {
       )
     }).pipe(
       Effect.provide(relay({
-        entity: { maxConcurrentChannels: 1, sessionDeadline: Duration.hours(2) }
+        entity: {
+          maxConcurrentChannels: 1,
+          sessionDeadline: Duration.hours(2),
+          // Must exceed the 60s the clock jumps per settlement: the transport can already hold
+          // the next delivery attempt when the clock moves, and a deadline inside the jump
+          // abandons that attempt, so its redelivered claim token no longer matches the one the
+          // recipient is settling with.
+          settleDeadline: Duration.minutes(2)
+        }
       }))
     ))
 
