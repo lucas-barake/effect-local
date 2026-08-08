@@ -133,6 +133,7 @@ interface EngineSnapshot {
 
 interface EngineHealth {
   lastRoundTripAt: number
+  lastProbeTickAt: number
   probeStartedAt: number | undefined
   warned: boolean
 }
@@ -658,7 +659,7 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                   epoch: event.epoch,
                   provider: event.candidate,
                   // The start itself just proved a round trip, so the deadline counts from here.
-                  health: { lastRoundTripAt: now, probeStartedAt: undefined, warned: false }
+                  health: { lastRoundTripAt: now, lastProbeTickAt: now, probeStartedAt: undefined, warned: false }
                 }
                 current.engine = Option.some(engine)
                 current.tried.clear()
@@ -685,6 +686,21 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
               const engine = current.engine.value
               return Effect.flatMap(Clock.currentTimeMillis, (now) => {
                 const health = engine.health
+                // The deadline below reads the wall clock, but this handler runs on the same
+                // dispatcher the browser throttles when every client of the worker is hidden —
+                // in a worker each task hop is a setTimeout. When the gap since the previous
+                // probe tick swallows the whole deadline, the coordinator itself was frozen
+                // while the clock ran on, and that silence is evidence about the environment,
+                // not the engine. Re-baseline and let a fresh round trip judge the engine.
+                const sinceLastTick = now - health.lastProbeTickAt
+                health.lastProbeTickAt = now
+                if (sinceLastTick >= healthDeadlineMillis) {
+                  health.lastRoundTripAt = now
+                  if (health.probeStartedAt !== undefined) {
+                    health.probeStartedAt = now
+                    health.warned = false
+                  }
+                }
                 if (health.probeStartedAt !== undefined) {
                   // The probe shares the engine's single connection queue, so it cannot tell a
                   // busy worker from a dead one by lateness alone: only a round trip that never
