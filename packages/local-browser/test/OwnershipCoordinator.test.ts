@@ -17,6 +17,7 @@ import * as ManagedRuntime from "effect/ManagedRuntime"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Schedule from "effect/Schedule"
+import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import { TestClock } from "effect/testing"
@@ -925,6 +926,83 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
       }).pipe(
         Effect.provide(Coordinator),
         Effect.scoped
+      )
+    }))
+
+  it.effect("keeps a live engine when the dispatcher is starved past the deadline", () =>
+    Effect.gen(function*() {
+      const started: Array<StartedEngine> = []
+      const Coordinator = OwnershipCoordinator.layerSharedWorker({
+        name: "effect-local-ownership-starvation-test",
+        definition,
+        engine: makeEngineFactory(started, ":memory:"),
+        info: ownerInfo,
+        provisionTimeout: "500 millis",
+        engineStartTimeout: "5 seconds",
+        engineDisposeTimeout: "100 millis",
+        healthCheck: { interval: "100 millis", timeout: "200 millis", deadline: "1 second" }
+      })
+
+      // Browser workers have no setImmediate, so every dispatcher hop is a setTimeout — and when
+      // a SharedWorker's clients are all hidden, the browser throttles those together with
+      // ordinary timers while the wall clock runs on. This scheduler reproduces that: while
+      // frozen, the coordinator's tasks queue instead of running, exactly like a throttled
+      // worker, and the wall clock (TestClock) races ahead of them.
+      const pending: Array<() => void> = []
+      let frozen = false
+      const scheduler = new Scheduler.MixedScheduler("async", (task) => {
+        if (frozen) {
+          pending.push(task)
+          return () => {}
+        }
+        const handle = setImmediate(task)
+        return () => clearImmediate(handle)
+      })
+      const pump = Effect.promise(() => new Promise((resolve) => setImmediate(resolve))).pipe(
+        Effect.andThen(Effect.sync(() => {
+          for (const task of pending.splice(0)) task()
+        })),
+        Effect.repeat({ times: 40 }),
+        Effect.asVoid
+      )
+
+      const scope = yield* Scope.make()
+      const context = yield* Layer.buildWithScope(Coordinator, scope).pipe(
+        Effect.provideService(Scheduler.Scheduler, scheduler)
+      )
+      yield* Effect.gen(function*() {
+        const tab = yield* attachTab
+        yield* acceptNextProvision(tab)
+        yield* takeFrame(tab, "ProvisionAccepted")
+        yield* takeFrame(tab, "Attached")
+        assert.strictEqual(started.length, 1)
+
+        // Healthy round trips complete while the dispatcher runs normally.
+        yield* TestClock.adjust("300 millis")
+        yield* pump
+
+        // The freeze: wall clock advances far past the deadline while not one coordinator task
+        // runs. The engine is untouched and perfectly healthy the whole time.
+        frozen = true
+        yield* TestClock.adjust("5 seconds")
+        frozen = false
+        yield* pump
+        yield* TestClock.adjust("100 millis")
+        yield* pump
+
+        // Starvation of the coordinator is evidence about the environment, not the engine: the
+        // engine must survive it and keep serving.
+        assert.isFalse(tab.receivedTags.includes("Reattach"))
+        assert.strictEqual(started.length, 1)
+        const engineContext = yield* started[0].runtime.contextEffect
+        const alive = yield* Effect.gen(function*() {
+          const sql = yield* SqlClient.SqlClient
+          return yield* sql`SELECT 1 AS ok`
+        }).pipe(Effect.provide(engineContext))
+        assert.strictEqual(alive.length, 1)
+      }).pipe(
+        Effect.provide(context),
+        Effect.onExit((exit) => Scope.close(scope, exit))
       )
     }))
 })
