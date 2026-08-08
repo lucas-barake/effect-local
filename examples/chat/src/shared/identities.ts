@@ -21,7 +21,7 @@ export const tenantId = "chat-demo"
  * than its last tab, so engine code changes during development do not reach a surviving worker
  * until its identity changes. The OPFS database name stays version free — data survives bumps.
  */
-export const engineGeneration = 1
+export const engineGeneration = 2
 
 export const relayPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-00000000ffff")
 

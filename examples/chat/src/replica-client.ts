@@ -82,6 +82,11 @@ const OwnershipLive = OwnershipCoordinator.layerTab({
   },
   onOwnerError: (message) => {
     window.__chatOwnerError = message
+    // The tab-side RPC error for a dead worker is information-free (the browser's worker error
+    // event crosses the thread boundary without the original exception), so this report from the
+    // owner is the only place the engine's actual failure reaches the page console.
+    // eslint-disable-next-line no-console
+    console.error("[engine]", message)
   }
 })
 

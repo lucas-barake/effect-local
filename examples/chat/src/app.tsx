@@ -9,6 +9,7 @@ import * as CommandDelivery from "@lucas-barake/effect-local/CommandDelivery"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Cause from "effect/Cause"
 import * as Exit from "effect/Exit"
+import * as Option from "effect/Option"
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import { Check, CheckCheck, ChevronDown, Clock, Send } from "lucide-react"
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react"
@@ -192,8 +193,16 @@ export const App = () => {
         ["presence", presenceResult]
       ] as const
     ) {
+      if (result._tag !== "Failure") continue
+      // ProjectionBlocked is the designed steady-state transient (inbound sync defers projection
+      // rebuild to the next local command; the UI renders the previous rows meanwhile), so at
+      // steady state it would drip into the console forever and drown real failures.
+      const blocked = Option.exists(
+        Cause.findErrorOption(result.cause),
+        (error) => error.reason._tag === "ProjectionBlocked"
+      )
       // eslint-disable-next-line no-console
-      if (result._tag === "Failure") console.error(`[query:${name}]`, Cause.pretty(result.cause))
+      if (!blocked) console.error(`[query:${name}]`, Cause.pretty(result.cause))
     }
   }, [summariesResult, presenceResult])
 
