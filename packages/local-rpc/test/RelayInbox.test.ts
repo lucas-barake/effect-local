@@ -37,6 +37,7 @@ const baseOptions: RelayInbox.Options = {
   terminalRetention: Duration.minutes(10),
   sessionDeadline: Duration.seconds(90),
   sessionSweep: Duration.seconds(1),
+  settleDeadline: Duration.seconds(30),
   maxConcurrentChannels: 4,
   storeRetry: Duration.zero,
   maxPendingMessages: 100,
@@ -651,11 +652,14 @@ describe("RelayInbox", () => {
       const first = yield* receiveOnly(client, sessionId("000000000001"), 1)
       assert.deepStrictEqual(ids(first), [relayId("000000000001")])
 
-      const second = yield* receiveOnly(client, sessionId("000000000002"), 2)
+      // The exhausted head is never transmitted again: a recipient handed a message whose
+      // settlement the relay already refuses can only fail its acknowledgement, and that failure
+      // used to tear down the whole connection. Dead lettering happens before the offer.
+      const second = yield* receiveOnly(client, sessionId("000000000002"), 1)
       assert.deepStrictEqual(
         ids(second),
-        [relayId("000000000001"), relayId("000000000002")],
-        "the exhausted head is dead lettered and the channel moves on"
+        [relayId("000000000002")],
+        "the exhausted head is dead lettered without another transmission and the channel moves on"
       )
 
       const store = yield* RelayInboxStore.RelayInboxStore
@@ -666,6 +670,48 @@ describe("RelayInbox", () => {
         "an abandoned message stays answerable, because its sender already released custody"
       )
     }).pipe(Effect.provide(relay({ entity: { maxDeliveries: 1 } }))))
+
+  it.effect("abandons an unsettled delivery at the settle deadline and redelivers it on the same session", () =>
+    Effect.gen(function*() {
+      const client = yield* inbox
+      yield* client.Deliver(deliver({ id: "000000000001", sequence: 0 }))
+
+      // The recipient takes the message and never settles it — the shape of an acknowledgement
+      // that failed in transit while the session survives. Without the deadline the delivering
+      // fiber would hold this channel for the whole session and nothing behind it would flow.
+      const session = sessionId("000000000001")
+      const collector = yield* client.Subscribe({ sessionId: session }).pipe(
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild
+      )
+      yield* TestClock.adjust(1000)
+      assert.isUndefined(collector.pollUnsafe(), "no redelivery before the deadline")
+
+      yield* TestClock.adjust(Duration.toMillis(baseOptions.settleDeadline))
+      const messages = [...(yield* Fiber.join(collector))]
+      assert.deepStrictEqual(
+        messages.map((message) => message.relayMessageId),
+        [relayId("000000000001"), relayId("000000000001")],
+        "the abandoned head is redelivered on the same session"
+      )
+      assert.notStrictEqual(
+        messages[0]!.claimToken,
+        messages[1]!.claimToken,
+        "the redelivery is a fresh attempt"
+      )
+
+      // The redelivered attempt is fully settleable: abandonment cost the attempt, not the row.
+      yield* client.Settle({
+        sessionId: session,
+        relayMessageId: messages[1]!.relayMessageId,
+        claimToken: messages[1]!.claimToken,
+        messageHash: messages[1]!.messageHash,
+        outcome: "Acknowledged"
+      })
+      const store = yield* RelayInboxStore.RelayInboxStore
+      assert.strictEqual((yield* store.pendingHeads(inboxKey, { limit: 10 })).length, 0)
+    }).pipe(Effect.provide(layer)))
 
   it.effect("does not charge a delivery the recipient never took", () =>
     Effect.gen(function*() {

@@ -268,6 +268,127 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
     })
   },
   {
+    name: "restarts the delivery streak of a charge that follows settled progress",
+    run: Effect.gen(function*() {
+      const store = yield* RelayInboxStore.RelayInboxStore
+      yield* store.admit(
+        admission({ inboxKey: "progress", id: "000000000001", sequence: 0, now: 0, subject: "sender-a" })
+      )
+      yield* store.admit(
+        admission({ inboxKey: "progress", id: "000000000002", sequence: 0, now: 0, subject: "sender-b" })
+      )
+
+      // Churn: the first message keeps reaching sessions that die before settling it. With a
+      // budget of two, one more zero-progress charge would dead letter it.
+      yield* store.recordDelivery("progress", relayId("000000000001"), { maxDeliveries: 2, now: 1 })
+      yield* store.recordDelivery("progress", relayId("000000000001"), { maxDeliveries: 2, now: 2 })
+
+      // Settling any other message proves the recipient is alive and draining, so churn spent so
+      // far must stop counting toward dead letter. Only zero-progress churn may destroy custody.
+      const settled = yield* store.settle("progress", relayId("000000000002"), {
+        outcome: "Acknowledged",
+        messageHash: "a".repeat(64),
+        now: 3,
+        terminalRetentionMillis: 1_000
+      })
+      assert.strictEqual(settled, "Settled")
+
+      const charge = yield* store.recordDelivery("progress", relayId("000000000001"), {
+        maxDeliveries: 2,
+        now: 4
+      })
+      assert.deepStrictEqual(
+        charge,
+        { _tag: "Recorded", deliveries: 1 },
+        "the charge after settled progress restarts the streak instead of dead lettering"
+      )
+    })
+  },
+  {
+    name: "dead letters an exhausted message without charging another delivery",
+    run: Effect.gen(function*() {
+      const store = yield* RelayInboxStore.RelayInboxStore
+      yield* store.admit(admission({ inboxKey: "exhausted", id: "000000000001", sequence: 0, now: 0 }))
+      yield* store.recordDelivery("exhausted", relayId("000000000001"), { maxDeliveries: 2, now: 1 })
+      yield* store.recordDelivery("exhausted", relayId("000000000001"), { maxDeliveries: 2, now: 2 })
+
+      const applied = yield* store.deadLetterExhausted("exhausted", relayId("000000000001"), {
+        maxDeliveries: 2,
+        now: 5
+      })
+      assert.isTrue(applied)
+
+      const abandoned = yield* store.abandoned("exhausted", { limit: 10 })
+      assert.deepStrictEqual(
+        abandoned.map((message) => [message.relayMessageId, message.state, message.deliveries]),
+        [[relayId("000000000001"), "DeadLettered", 2]],
+        "the transition spends no delivery of its own"
+      )
+    })
+  },
+  {
+    name: "refuses to dead letter a message whose budget was refunded",
+    run: Effect.gen(function*() {
+      const store = yield* RelayInboxStore.RelayInboxStore
+      yield* store.admit(
+        admission({ inboxKey: "refund-guard", id: "000000000001", sequence: 0, now: 0, subject: "sender-a" })
+      )
+      yield* store.admit(
+        admission({ inboxKey: "refund-guard", id: "000000000002", sequence: 0, now: 0, subject: "sender-b" })
+      )
+      yield* store.recordDelivery("refund-guard", relayId("000000000001"), { maxDeliveries: 3, now: 1 })
+      yield* store.recordDelivery("refund-guard", relayId("000000000001"), { maxDeliveries: 3, now: 2 })
+
+      // The dispatcher read deliveries=2 before this settlement refunded the budget. Its stale
+      // read must not destroy a row entitled to the refund.
+      yield* store.settle("refund-guard", relayId("000000000002"), {
+        outcome: "Acknowledged",
+        messageHash: "a".repeat(64),
+        now: 3,
+        terminalRetentionMillis: 1_000
+      })
+      const applied = yield* store.deadLetterExhausted("refund-guard", relayId("000000000001"), {
+        maxDeliveries: 2,
+        now: 4
+      })
+      assert.isFalse(applied)
+
+      const survivor = (yield* store.pendingHeads("refund-guard", { limit: 10 }))
+        .find((message) => message.relayMessageId === relayId("000000000001"))
+      assert.strictEqual(survivor?.deliveries, 0)
+    })
+  },
+  {
+    name: "concurrent settlements in one inbox do not abort each other",
+    run: Effect.gen(function*() {
+      const store = yield* RelayInboxStore.RelayInboxStore
+      // Enough charged pending rows that the settlement's budget refund touches a wide row set:
+      // the shape that deadlocked when the refund ran inside the settlement transaction.
+      const ids = Array.from({ length: 24 }, (_, index) => String(index + 1).padStart(12, "0"))
+      for (const [index, id] of ids.entries()) {
+        yield* store.admit(
+          admission({ inboxKey: "concurrent", id, sequence: 0, now: 0, subject: `sender-${index}` })
+        )
+        yield* store.recordDelivery("concurrent", relayId(id), { maxDeliveries: 100, now: 1 })
+      }
+
+      const exits = yield* Effect.all(
+        ids.slice(0, 4).map((id) =>
+          store.settle("concurrent", relayId(id), {
+            outcome: "Acknowledged" as const,
+            messageHash: "a".repeat(64),
+            now: 2,
+            terminalRetentionMillis: 1_000
+          }).pipe(Effect.exit)
+        ),
+        { concurrency: "unbounded" }
+      )
+      for (const exit of exits) {
+        assert.isTrue(exit._tag === "Success" && exit.value === "Settled")
+      }
+    })
+  },
+  {
     name: "makes an abandoned message answerable after the fact",
     run: Effect.gen(function*() {
       const store = yield* RelayInboxStore.RelayInboxStore

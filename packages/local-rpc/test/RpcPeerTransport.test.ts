@@ -558,7 +558,7 @@ describe("RpcPeerTransport", () => {
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
-  it.effect("defers Ack until the delivery consumer commits and closes on Ack failure", () =>
+  it.effect("defers Ack until the delivery consumer commits and stays open on Ack failure", () =>
     Effect.scoped(
       Effect.gen(function*() {
         const stored = yield* makeStoredMessage(Uint8Array.of(4, 5, 6))
@@ -597,7 +597,10 @@ describe("RpcPeerTransport", () => {
         const error = yield* delivery.acknowledge.pipe(Effect.flip)
         assert.strictEqual(error.reason._tag, "StorageUnavailable")
         assert.strictEqual(yield* Ref.get(acknowledgements), 1)
-        assert.strictEqual(yield* Ref.get(finalized), 1)
+        // The connection survives the failed settlement. The message stays in relay custody and
+        // is redelivered to a later session; closing here is what let one unsettleable message
+        // tear down every session that touched it.
+        assert.strictEqual(yield* Ref.get(finalized), 0)
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 

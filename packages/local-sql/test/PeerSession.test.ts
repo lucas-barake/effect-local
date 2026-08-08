@@ -1380,7 +1380,7 @@ it.layer(Layer.mergeAll(
       }).pipe(Effect.provide(TestShardingConfig))
     ))
 
-  it.effect("rejects invalid inbound envelopes before dispatch or publication and closes the connection", () =>
+  it.effect("rejects invalid inbound envelopes before dispatch or publication and keeps the session alive", () =>
     Effect.gen(function*() {
       const documentId = yield* Identity.makeDocumentId
       const otherDocumentId = yield* Identity.makeDocumentId
@@ -1495,7 +1495,7 @@ it.layer(Layer.mergeAll(
       for (const testCase of cases) {
         yield* Effect.scoped(Effect.gen(function*() {
           const inbound = yield* Queue.unbounded<Uint8Array>()
-          const closed = yield* Deferred.make<void>()
+          const rejected = yield* Deferred.make<PeerTransport.PermanentRejectReason>()
           const entityCalls = yield* Ref.make(0)
           const publications = yield* Ref.make(0)
           const peerId = yield* Identity.makePeerId
@@ -1523,9 +1523,17 @@ it.layer(Layer.mergeAll(
                 peerId,
                 relayPeerId: testRelayPeerId,
                 capabilities: {},
-                receive: acknowledged(peerId, Stream.fromQueue(inbound)),
+                // The reject is observed rather than failed: settling an invalid envelope is the
+                // session's job, and the session outliving it is part of what this test pins.
+                receive: acknowledged(peerId, Stream.fromQueue(inbound)).pipe(
+                  Stream.map((delivery) => ({
+                    ...delivery,
+                    reject: (reason: PeerTransport.PermanentRejectReason) =>
+                      Deferred.succeed(rejected, reason).pipe(Effect.asVoid)
+                  }))
+                ),
                 send: () => Effect.die(`unexpected send for ${testCase.name}`),
-                close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
+                close: Effect.void
               })
           })
           yield* PeerSession.makeTestClient(
@@ -1554,7 +1562,7 @@ it.layer(Layer.mergeAll(
             Effect.provideService(ReplicaLimits.ReplicaLimits, limits)
           )
           yield* Queue.offer(inbound, testCase.bytes)
-          yield* Deferred.await(closed)
+          assert.strictEqual(yield* Deferred.await(rejected), "ProtocolInvalid")
           assert.strictEqual(yield* Ref.get(entityCalls), 0)
           assert.strictEqual(yield* Ref.get(publications), 0)
         }))

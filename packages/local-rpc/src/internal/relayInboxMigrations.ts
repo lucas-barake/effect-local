@@ -69,6 +69,7 @@ const createTable = Effect.gen(function*() {
           sender_sequence INTEGER NOT NULL,
           state TEXT NOT NULL,
           deliveries INTEGER NOT NULL DEFAULT 0,
+          charged_at INTEGER NOT NULL DEFAULT 0,
           envelope TEXT NOT NULL,
           message_hash TEXT NOT NULL,
           outer_envelope_digest TEXT NOT NULL,
@@ -94,6 +95,7 @@ const createTable = Effect.gen(function*() {
           sender_sequence BIGINT NOT NULL,
           state TEXT NOT NULL,
           deliveries INTEGER NOT NULL DEFAULT 0,
+          charged_at BIGINT NOT NULL DEFAULT 0,
           envelope TEXT NOT NULL,
           message_hash TEXT NOT NULL,
           outer_envelope_digest TEXT NOT NULL,
@@ -119,6 +121,7 @@ const createTable = Effect.gen(function*() {
           sender_sequence BIGINT NOT NULL,
           state ${mysqlIdentity(16)} NOT NULL,
           deliveries INT NOT NULL DEFAULT 0,
+          charged_at BIGINT NOT NULL DEFAULT 0,
           envelope LONGTEXT NOT NULL,
           message_hash ${mysqlIdentity(64)} NOT NULL,
           outer_envelope_digest ${mysqlIdentity(64)} NOT NULL,
@@ -183,8 +186,54 @@ const createTable = Effect.gen(function*() {
   })
 })
 
+/**
+ * `charged_at` records when a `Pending` row was last charged a delivery, so the budget can count
+ * consecutive charges without settled inbox progress rather than lifetime transmissions. Databases
+ * created by migration 1 after this column landed already have it, so the add is guarded by an
+ * existence check on every dialect — none of the three supports `ADD COLUMN IF NOT EXISTS` in a
+ * form usable here, and swallowing a duplicate-column error would also swallow real failures.
+ */
+const addChargedAt = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+
+  const CountResult = Schema.Struct({
+    count: Schema.Union([Schema.Int, Schema.NumberFromString]).check(Schema.isInt())
+  })
+  const columnCount = SqlSchema.findOne({
+    Request: Schema.Void,
+    Result: CountResult,
+    execute: () =>
+      sql.onDialectOrElse({
+        orElse: () =>
+          sql`
+            SELECT COUNT(*) AS count FROM pragma_table_info(${tableName})
+            WHERE name = 'charged_at'
+          `,
+        pg: () =>
+          sql`
+            SELECT COUNT(*) AS count FROM information_schema.columns
+            WHERE table_name = ${tableName} AND column_name = 'charged_at'
+          `,
+        mysql: () =>
+          sql`
+            SELECT COUNT(*) AS count FROM information_schema.columns
+            WHERE table_schema = DATABASE() AND table_name = ${tableName} AND column_name = 'charged_at'
+          `
+      })
+  })
+
+  const existing = yield* columnCount(undefined)
+  if (existing.count > 0) return
+  yield* sql.onDialectOrElse({
+    orElse: () => sql.unsafe(`ALTER TABLE ${tableName} ADD COLUMN charged_at INTEGER NOT NULL DEFAULT 0`),
+    pg: () => sql.unsafe(`ALTER TABLE ${tableName} ADD COLUMN charged_at BIGINT NOT NULL DEFAULT 0`),
+    mysql: () => sql.unsafe(`ALTER TABLE ${tableName} ADD COLUMN charged_at BIGINT NOT NULL DEFAULT 0`)
+  })
+})
+
 const loader = Migrator.fromRecord({
-  "1_create_relay_inbox": createTable
+  "1_create_relay_inbox": createTable,
+  "2_add_charged_at": addChargedAt
 })
 
 /**

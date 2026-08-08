@@ -205,6 +205,19 @@ export class RelayInboxStore extends Context.Service<RelayInboxStore, {
     options: { readonly limit: number }
   ) => Effect.Effect<ReadonlyArray<PendingMessage>, StoreError>
 
+  /**
+   * Charges one delivery to a `Pending` message and dead letters it when the charge exceeds the
+   * budget.
+   *
+   * The budget counts consecutive charges with zero settled progress in the inbox, not lifetime
+   * transmissions: a charge that follows any settlement newer than the row's previous charge
+   * restarts the count at one. Session churn that still drains something therefore never destroys
+   * custody — only a recipient that settles nothing across the whole budget does, which is
+   * indistinguishable from a poisoned message or a peer that never comes back. The deliberate
+   * cost is the inverse case: a message that can never settle while its inbox keeps making
+   * progress is retransmitted until its TTL rather than dead lettered, and blocks its channel
+   * for that long.
+   */
   readonly recordDelivery: (
     inboxKey: string,
     relayMessageId: Identity.RelayMessageId,
@@ -224,6 +237,10 @@ export class RelayInboxStore extends Context.Service<RelayInboxStore, {
    *
    * `deduplicate_until` only ever grows. Shrinking it would reopen a deduplication window that a
    * sender may still be replaying into.
+   *
+   * A settlement is also the progress marker `recordDelivery` and `deadLetterExhausted` compare
+   * charge streaks against, which is why `terminal_at` must be written even though the payload is
+   * erased.
    */
   readonly settle: (
     inboxKey: string,
@@ -235,6 +252,18 @@ export class RelayInboxStore extends Context.Service<RelayInboxStore, {
       readonly terminalRetentionMillis: number
     }
   ) => Effect.Effect<SettleResult, StoreError>
+
+  /**
+   * Dead letters a `Pending` message whose stored delivery count has already reached the budget,
+   * without charging another delivery. A settlement newer than the row's last charge restarts the
+   * streak instead: the count is reset to zero and nothing is dead lettered. Reports whether the
+   * transition applied; the report is not exactly once under races on an identical `now`.
+   */
+  readonly deadLetterExhausted: (
+    inboxKey: string,
+    relayMessageId: Identity.RelayMessageId,
+    options: { readonly maxDeliveries: number; readonly now: number }
+  ) => Effect.Effect<boolean, StoreError>
 
   readonly usage: (inboxKey: string) => Effect.Effect<Usage, StoreError>
 

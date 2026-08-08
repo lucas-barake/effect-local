@@ -471,14 +471,17 @@ export const layer = (
                         result: adapterResult
                       })
 
-                    const terminalCall = (
+                    // A failed settlement does not close the connection. Custody stays with the
+                    // relay, the row is redelivered to a later session, and the recipient's
+                    // durable receipt turns the re-apply into a plain re-acknowledgement — so the
+                    // failure is the message's problem. Closing here is what let one exhausted
+                    // message tear down every session that touched it, forever.
+                    const settleCall = (
                       effect: Effect.Effect<void, ReplicaError.ReplicaError>
                     ) =>
                       callWithinConnection(
                         effect,
                         terminalLock
-                      ).pipe(
-                        Effect.onExitIf(Exit.isFailure, closeWithExit)
                       )
 
                     const acknowledged = Stream.scoped(
@@ -505,7 +508,7 @@ export const layer = (
                                         outerEnvelopeDigest: event.outerEnvelopeDigest
                                       },
                                       receiptRetentionMillis: options.receiptRetentionMillis,
-                                      acknowledge: terminalCall(
+                                      acknowledge: settleCall(
                                         PeerRpcObservability.observeRelay({
                                           effect: client.Acknowledge({
                                             sessionId: handshake.sessionId,
@@ -527,7 +530,7 @@ export const layer = (
                                         })
                                       ),
                                       reject: (reason: PeerTransport.PermanentRejectReason) =>
-                                        terminalCall(
+                                        settleCall(
                                           PeerRpcObservability.observeRelay({
                                             effect: client.Reject({
                                               sessionId: handshake.sessionId,
