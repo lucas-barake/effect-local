@@ -21,6 +21,7 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as DocumentStore from "./DocumentStore.js"
 import * as InternalAutomerge from "./internal/automerge.js"
 import * as HistoryCounters from "./internal/historyCounters.js"
+import * as SyncChunks from "./internal/syncChunks.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
@@ -220,30 +221,6 @@ const receivedFromReceipt = (documentId: Identity.DocumentId, receipt: typeof Re
 
 const sameHeads = (left: ReadonlyArray<string>, right: ReadonlyArray<string>) =>
   Equal.equals(left.toSorted(), right.toSorted())
-
-const decodeSyncChanges = (
-  chunks: ReadonlyArray<Uint8Array>
-): ReadonlyArray<Automerge.DecodedChange> => {
-  const changes = new Map<string, Automerge.DecodedChange>()
-  for (const chunk of chunks) {
-    try {
-      const change = Automerge.decodeChange(chunk)
-      changes.set(change.hash, change)
-      continue
-    } catch {
-      const document = Automerge.load(chunk)
-      try {
-        for (const bytes of Automerge.getAllChanges(document)) {
-          const change = Automerge.decodeChange(bytes)
-          changes.set(change.hash, change)
-        }
-      } finally {
-        Automerge.free(document)
-      }
-    }
-  }
-  return [...changes.values()]
-}
 
 export class PeerSync extends Context.Service<PeerSync, {
   readonly open: (peerId: Identity.PeerId) => Effect.Effect<Session, ReplicaError.ReplicaError>
@@ -1056,7 +1033,7 @@ const make = (
     const loadWriterProvenance = (documentId: Identity.DocumentId, message: Uint8Array) =>
       Effect.gen(function*() {
         const changes = yield* Effect.try({
-          try: () => decodeSyncChanges(Automerge.decodeSyncMessage(message).changes),
+          try: () => SyncChunks.decodeSyncChanges(Automerge.decodeSyncMessage(message).changes),
           catch: (cause) =>
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({ cause })
@@ -1735,7 +1712,7 @@ const make = (
                     })
                 })
                 const incomingChanges = yield* Effect.try({
-                  try: () => decodeSyncChanges(decoded.changes),
+                  try: () => SyncChunks.decodeSyncChanges(decoded.changes),
                   catch: (cause) =>
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.ProtocolMismatch({
