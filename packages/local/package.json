@@ -1,10 +1,16 @@
 {
   "name": "@lucas-barake/effect-local",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local-first domain primitives for Effect",
   "homepage": "https://github.com/lucas-barake/effect-local#readme",
   "bugs": "https://github.com/lucas-barake/effect-local/issues",
-  "keywords": ["effect", "local-first", "automerge", "offline-first", "typescript"],
+  "keywords": [
+    "effect",
+    "local-first",
+    "automerge",
+    "offline-first",
+    "typescript"
+  ],
   "engines": {
     "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
   },
