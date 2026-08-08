@@ -98,13 +98,13 @@ describe("RelayInboxMaintenance", () => {
 
       const now = yield* Clock.currentTimeMillis
       yield* inbox.admit(admission(now, 2_000))
-      assert.strictEqual((yield* inbox.pendingHeads(inboxKey, { limit: 10 })).length, 1)
+      assert.strictEqual((yield* inbox.pendingHeads(inboxKey, { limit: 10, now: 0 })).length, 1)
 
       // Nothing is subscribed to this inbox and its entity is passivated, which is precisely the
       // state in which TTL matters: only a cluster-wide owner can sweep it.
       yield* TestClock.adjust(4_000)
       assert.strictEqual(
-        (yield* inbox.pendingHeads(inboxKey, { limit: 10 })).length,
+        (yield* inbox.pendingHeads(inboxKey, { limit: 10, now: 0 })).length,
         0,
         "an overdue message is expired by the singleton"
       )
@@ -129,7 +129,7 @@ describe("RelayInboxMaintenance", () => {
       // The flag is load bearing in both directions: a deployment that did not ask for retention
       // must not have its durable rows deleted on a schedule it never chose.
       assert.strictEqual(
-        (yield* inbox.pendingHeads(inboxKey, { limit: 10 })).length,
+        (yield* inbox.pendingHeads(inboxKey, { limit: 10, now: 0 })).length,
         1,
         "no sweep runs when retention is disabled"
       )

@@ -271,8 +271,21 @@ export const make = Effect.gen(function*() {
         ))
     )
 
+  // Each sender's most recently started channel goes first. A sender allocates a fresh connection
+  // epoch per session, so a crash looping sender leaves one channel per lapsed epoch — and under
+  // age order alone that stale trail occupies every delivery slot while the epoch the sender is
+  // connected on right now waits behind it until the stale heads dead letter or expire. Recency is
+  // the channel's first pending admission, because the epochs themselves are opaque and carry no
+  // order.
+  //
+  // Superseded channels are deprioritized, never dropped. Priority alone would starve them the
+  // other way: a live channel that is never empty never leaves a slot idle, and a superseded
+  // message would sit `Pending` until expiry destroyed the last copy — the sender only replays its
+  // current epoch's outbox. So a head that has burned half its TTL is promoted into the priority
+  // class, where its age puts it at the front: deprioritization is bounded at half the message's
+  // lifetime and the other half is its delivery window.
   const findHeads = SqlSchema.findAll({
-    Request: Schema.Struct({ inboxKey: Schema.String, limit: Schema.Int }),
+    Request: Schema.Struct({ inboxKey: Schema.String, limit: Schema.Int, now: Schema.Number }),
     Result: PendingRow,
     execute: (request) =>
       sql`
@@ -280,20 +293,32 @@ export const make = Effect.gen(function*() {
                sender_replica_incarnation, sender_connection_epoch, sender_sequence,
                deliveries, envelope, message_hash, outer_envelope_digest
         FROM (
-          SELECT *, ROW_NUMBER() OVER (
-            PARTITION BY channel_key ORDER BY sender_sequence ASC
-          ) AS rn
-          FROM ${sql(table)}
-          WHERE inbox_key = ${request.inboxKey} AND state = 'Pending'
-        ) heads
-        WHERE rn = 1
-        ORDER BY created_at ASC, channel_key ASC
+          SELECT heads.*, ROW_NUMBER() OVER (
+            PARTITION BY tenant_id, sender_subject_id, sender_peer_id, sender_replica_incarnation
+            ORDER BY channel_started_at DESC, channel_key DESC
+          ) AS channel_recency
+          FROM (
+            SELECT *,
+              ROW_NUMBER() OVER (
+                PARTITION BY channel_key ORDER BY sender_sequence ASC
+              ) AS rn,
+              MIN(created_at) OVER (PARTITION BY channel_key) AS channel_started_at
+            FROM ${sql(table)}
+            WHERE inbox_key = ${request.inboxKey} AND state = 'Pending'
+          ) heads
+          WHERE rn = 1
+        ) ranked
+        ORDER BY CASE
+            WHEN channel_recency = 1 OR created_at + expires_at <= ${request.now * 2} THEN 0
+            ELSE 1
+          END,
+          created_at ASC, channel_key ASC
         LIMIT ${sql.literal(String(request.limit))}
       `
   })
 
-  const pendingHeads = (inboxKey: string, options: { readonly limit: number }) =>
-    findHeads({ inboxKey, limit: options.limit }).pipe(
+  const pendingHeads = (inboxKey: string, options: { readonly limit: number; readonly now: number }) =>
+    findHeads({ inboxKey, limit: options.limit, now: options.now }).pipe(
       // A `SchemaError` here is a row this store cannot decode, which is corruption rather than
       // downtime. Collapsing the two would have callers retry a row that will never decode.
       Effect.catchTag(

@@ -247,7 +247,7 @@ describe("RelayInbox", () => {
       assert.strictEqual(settled.length, 2)
 
       const store = yield* RelayInboxStore.RelayInboxStore
-      const pending = yield* store.pendingHeads(inboxKey, { limit: 10 })
+      const pending = yield* store.pendingHeads(inboxKey, { limit: 10, now: 0 })
       assert.strictEqual(
         pending.length,
         0,
@@ -265,7 +265,7 @@ describe("RelayInbox", () => {
       assert.isTrue(exit._tag === "Failure")
 
       const store = yield* RelayInboxStore.RelayInboxStore
-      const pending = yield* store.pendingHeads(inboxKey, { limit: 10 })
+      const pending = yield* store.pendingHeads(inboxKey, { limit: 10, now: 0 })
       assert.strictEqual(pending.length, 0, "a failed admission must leave no durable trace")
     }).pipe(Effect.provide(relay({
       store: storeFailing(() => ({ admit: () => Effect.fail(unavailable) }))
@@ -302,6 +302,82 @@ describe("RelayInbox", () => {
         [relayId("000000000001"), relayId("000000000002")].toSorted()
       )
     }).pipe(Effect.provide(layer)))
+
+  it.effect("delivers the live epoch ahead of a crash looper's stale epochs", () =>
+    Effect.gen(function*() {
+      const client = yield* inbox
+      // A crash looping sender mints a fresh epoch per reconnect and leaves one channel per lapsed
+      // epoch. With one delivery slot, age ordered selection spends it on the oldest stale epoch
+      // and the epoch the sender is connected on right now waits behind the whole trail until the
+      // stale heads dead letter or expire.
+      yield* client.Deliver(deliver({ id: "000000000001", sequence: 0, epoch: "epoch-1" }))
+      yield* TestClock.adjust(1000)
+      yield* client.Deliver(deliver({ id: "000000000002", sequence: 0, epoch: "epoch-2" }))
+      yield* TestClock.adjust(1000)
+      yield* client.Deliver(deliver({ id: "000000000003", sequence: 0, epoch: "epoch-3" }))
+
+      const first = yield* receiveOnly(client, sessionId("000000000001"), 1)
+      assert.deepStrictEqual(
+        ids(first),
+        [relayId("000000000003")],
+        "the one slot goes to the sender's live epoch, not the oldest stale one"
+      )
+
+      // Deprioritized, never abandoned: once the live head is settled the leftover capacity
+      // drains the stale trail.
+      const drained = yield* receiveAndSettle(client, sessionId("000000000002"), 3)
+      assert.strictEqual(ids(drained)[0], relayId("000000000003"))
+      assert.deepStrictEqual(
+        ids(drained).toSorted(),
+        [relayId("000000000001"), relayId("000000000002"), relayId("000000000003")].toSorted()
+      )
+    }).pipe(Effect.provide(relay({ entity: { maxConcurrentChannels: 1 } }))))
+
+  it.effect("keeps draining a superseded channel while the live epoch keeps producing", () =>
+    Effect.gen(function*() {
+      const client = yield* inbox
+      // One stale-epoch head the recipient is entitled to, behind a live epoch whose channel is
+      // never empty. Strict live-first priority would keep the single slot on the live channel at
+      // every poll, so the stale message would never be handed over and would eventually expire —
+      // and the sender only replays its current epoch's outbox, so expiry destroys the last copy.
+      // Aging bounds that: once the stale head has burned half its TTL it must outrank the live
+      // channel.
+      yield* client.Deliver(deliver({ id: "0000000000ff", sequence: 0, epoch: "epoch-1" }))
+      yield* TestClock.adjust(1000)
+      for (let sequence = 0; sequence < 10; sequence++) {
+        yield* client.Deliver(
+          deliver({ id: `0000000000a${sequence.toString(16)}`, sequence, epoch: "epoch-2" })
+        )
+      }
+
+      // Half of the 10 minute TTL passes across the settlements, one minute per message.
+      const session = sessionId("000000000001")
+      const received = yield* client.Subscribe({ sessionId: session }).pipe(
+        Stream.take(8),
+        Stream.mapEffect((message) =>
+          client.Settle({
+            sessionId: session,
+            relayMessageId: message.relayMessageId,
+            claimToken: message.claimToken,
+            messageHash: message.messageHash,
+            outcome: "Acknowledged"
+          }).pipe(
+            Effect.andThen(TestClock.adjust(60_000)),
+            Effect.as(message)
+          )
+        ),
+        Stream.runCollect
+      )
+
+      assert.isTrue(
+        ids(received).includes(relayId("0000000000ff")),
+        "a superseded head must be promoted before it expires, however busy the live epoch is"
+      )
+    }).pipe(
+      Effect.provide(relay({
+        entity: { maxConcurrentChannels: 1, sessionDeadline: Duration.hours(2) }
+      }))
+    ))
 
   it.effect("answers a settle inside its declared failure channel when the session is released", () =>
     Effect.gen(function*() {
@@ -581,7 +657,7 @@ describe("RelayInbox", () => {
       assert.isTrue(outcome[0]!._tag === "Failure")
 
       const store = yield* RelayInboxStore.RelayInboxStore
-      const pending = yield* store.pendingHeads(inboxKey, { limit: 10 })
+      const pending = yield* store.pendingHeads(inboxKey, { limit: 10, now: 0 })
       assert.strictEqual(pending.length, 1, "the message stays deliverable")
     }).pipe(Effect.provide(layer)))
 
@@ -611,7 +687,7 @@ describe("RelayInbox", () => {
       assert.isTrue(outcome[0]!._tag === "Failure")
 
       const store = yield* RelayInboxStore.RelayInboxStore
-      const pending = yield* store.pendingHeads(inboxKey, { limit: 10 })
+      const pending = yield* store.pendingHeads(inboxKey, { limit: 10, now: 0 })
       assert.strictEqual(pending.length, 1, "the message stays this inbox's responsibility")
     }).pipe(Effect.provide(layer)))
 
@@ -731,7 +807,7 @@ describe("RelayInbox", () => {
       yield* TestClock.adjust(10)
 
       const store = yield* RelayInboxStore.RelayInboxStore
-      const untaken = (yield* store.pendingHeads(inboxKey, { limit: 10 }))
+      const untaken = (yield* store.pendingHeads(inboxKey, { limit: 10, now: 0 }))
         .find((message) => message.relayMessageId === relayId("000000000002"))
       assert.strictEqual(untaken?.deliveries, 0, "an untransmitted attempt costs the message nothing")
 
@@ -740,7 +816,7 @@ describe("RelayInbox", () => {
       const later = yield* receiveOnly(client, sessionId("000000000002"), 2)
       assert.isTrue(ids(later).includes(relayId("000000000002")))
 
-      const transmitted = (yield* store.pendingHeads(inboxKey, { limit: 10 }))
+      const transmitted = (yield* store.pendingHeads(inboxKey, { limit: 10, now: 0 }))
         .find((message) => message.relayMessageId === relayId("000000000002"))
       assert.strictEqual(
         transmitted?.deliveries,
@@ -762,7 +838,7 @@ describe("RelayInbox", () => {
       assert.strictEqual(received.length, 2)
 
       const store = yield* RelayInboxStore.RelayInboxStore
-      const pending = yield* store.pendingHeads(inboxKey, { limit: 10 })
+      const pending = yield* store.pendingHeads(inboxKey, { limit: 10, now: 0 })
       assert.deepStrictEqual(
         pending.map((message) => [message.relayMessageId, message.deliveries]).toSorted(),
         [
@@ -784,7 +860,7 @@ describe("RelayInbox", () => {
         now: 1_000,
         terminalRetentionMillis: Duration.toMillis(baseOptions.terminalRetention)
       })
-      const promoted = (yield* store.pendingHeads(inboxKey, { limit: 10 }))
+      const promoted = (yield* store.pendingHeads(inboxKey, { limit: 10, now: 0 }))
         .find((message) => message.relayMessageId === relayId("000000000002"))
       assert.strictEqual(
         promoted?.deliveries,

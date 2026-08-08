@@ -467,7 +467,7 @@ describe("relay custody against a real relay", () => {
           }
 
           const heads = yield* backend.store
-            .pendingHeads(yield* inboxKeyOf(remotePrincipal, backend.crypto), { limit: 10 })
+            .pendingHeads(yield* inboxKeyOf(remotePrincipal, backend.crypto), { limit: 10, now: 0 })
             .pipe(Effect.orDie)
           const head = heads.find((candidate) =>
             candidate.envelope.writerProvenance.some((entry) => expectedChangeHashes.has(entry.changeHash))
@@ -483,7 +483,7 @@ describe("relay custody against a real relay", () => {
 
           // A count on the recipient's inbox alone would not catch a message filed back to its sender.
           const localHeads = yield* backend.store
-            .pendingHeads(yield* inboxKeyOf(localPrincipal, backend.crypto), { limit: 10 })
+            .pendingHeads(yield* inboxKeyOf(localPrincipal, backend.crypto), { limit: 10, now: 0 })
             .pipe(Effect.orDie)
           assert.isFalse(
             localHeads.some((candidate) =>
@@ -566,7 +566,7 @@ describe("relay custody against a real relay", () => {
           for (const principal of [localPrincipal, remotePrincipal]) {
             assert.deepStrictEqual(
               yield* backend.store
-                .pendingHeads(yield* inboxKeyOf(principal, backend.crypto), { limit: 10 })
+                .pendingHeads(yield* inboxKeyOf(principal, backend.crypto), { limit: 10, now: 0 })
                 .pipe(Effect.orDie),
               []
             )
@@ -846,7 +846,7 @@ describe("relay custody against a real relay", () => {
         yield* Effect.scoped(Effect.gen(function*() {
           yield* RpcPeerTransport.makeSession(client, options).pipe(Effect.provideContext(sender.context))
 
-          const heads = yield* backend.store.pendingHeads(recipientInbox, { limit: 10 }).pipe(Effect.orDie)
+          const heads = yield* backend.store.pendingHeads(recipientInbox, { limit: 10, now: 0 }).pipe(Effect.orDie)
           assert.isTrue(
             heads.some((head) => head.relayMessageId === pending[0]!.relay_message_id),
             "the entry the failed session admitted reached the relay through the replay"
