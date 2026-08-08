@@ -1380,7 +1380,7 @@ it.layer(Layer.mergeAll(
       }).pipe(Effect.provide(TestShardingConfig))
     ))
 
-  it.effect("rejects invalid inbound envelopes before dispatch or publication and closes the connection", () =>
+  it.effect("rejects invalid inbound envelopes before dispatch or publication and keeps the session alive", () =>
     Effect.gen(function*() {
       const documentId = yield* Identity.makeDocumentId
       const otherDocumentId = yield* Identity.makeDocumentId
@@ -1495,7 +1495,7 @@ it.layer(Layer.mergeAll(
       for (const testCase of cases) {
         yield* Effect.scoped(Effect.gen(function*() {
           const inbound = yield* Queue.unbounded<Uint8Array>()
-          const closed = yield* Deferred.make<void>()
+          const rejected = yield* Deferred.make<PeerTransport.PermanentRejectReason>()
           const entityCalls = yield* Ref.make(0)
           const publications = yield* Ref.make(0)
           const peerId = yield* Identity.makePeerId
@@ -1523,9 +1523,17 @@ it.layer(Layer.mergeAll(
                 peerId,
                 relayPeerId: testRelayPeerId,
                 capabilities: {},
-                receive: acknowledged(peerId, Stream.fromQueue(inbound)),
+                // The reject is observed rather than failed: settling an invalid envelope is the
+                // session's job, and the session outliving it is part of what this test pins.
+                receive: acknowledged(peerId, Stream.fromQueue(inbound)).pipe(
+                  Stream.map((delivery) => ({
+                    ...delivery,
+                    reject: (reason: PeerTransport.PermanentRejectReason) =>
+                      Deferred.succeed(rejected, reason).pipe(Effect.asVoid)
+                  }))
+                ),
                 send: () => Effect.die(`unexpected send for ${testCase.name}`),
-                close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
+                close: Effect.void
               })
           })
           yield* PeerSession.makeTestClient(
@@ -1554,7 +1562,7 @@ it.layer(Layer.mergeAll(
             Effect.provideService(ReplicaLimits.ReplicaLimits, limits)
           )
           yield* Queue.offer(inbound, testCase.bytes)
-          yield* Deferred.await(closed)
+          assert.strictEqual(yield* Deferred.await(rejected), "ProtocolInvalid")
           assert.strictEqual(yield* Ref.get(entityCalls), 0)
           assert.strictEqual(yield* Ref.get(publications), 0)
         }))
@@ -2712,6 +2720,159 @@ it.layer(Layer.mergeAll(
       assert.deepStrictEqual(
         (yield* Ref.get(resets)).toSorted(),
         ["local-epoch", "sender-epoch-a", "sender-epoch-b"]
+      )
+    }).pipe(Effect.provide(NodeCrypto.layer)))
+
+  it.effect("parks an inbound message in relay custody and keeps the session alive when a receive quota is exceeded", () =>
+    Effect.gen(function*() {
+      const deliveries = yield* Queue.unbounded<PeerTransport.AcknowledgedDelivery>()
+      const events = yield* Queue.unbounded<string>()
+      const closed = yield* Deferred.make<void>()
+      const rejections = yield* Ref.make<ReadonlyArray<PeerTransport.PermanentRejectReason>>([])
+      const documentId = yield* Identity.makeDocumentId
+      const senderPeerId = yield* Identity.makePeerId
+      const relayPeerId = yield* Identity.makePeerId
+      const message = yield* Effect.acquireUseRelease(
+        Effect.sync(() => Automerge.init()),
+        (document) =>
+          Effect.sync(() => {
+            const encoded = Automerge.generateSyncMessage(document, Automerge.initSyncState())[1]
+            if (encoded === null) throw new TypeError("Expected an initial sync message")
+            return encoded
+          }),
+        (document) => Effect.sync(() => Automerge.free(document))
+      )
+      const messageHash = yield* Canonical.digest(message)
+      const sync = PeerSync.PeerSync.of({
+        withDocumentInvalidation: (_documentId, effect) => effect,
+        invalidateDocument: () => Effect.void,
+        open: (peerId) =>
+          Effect.succeed({
+            peerId,
+            connectionEpoch: "local-epoch",
+            replicaIncarnation: permit.incarnation
+          }),
+        reset: () => Effect.void,
+        generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
+        receive: () => Effect.succeed(result),
+        enqueue: () => Effect.die("unexpected enqueue"),
+        pending: () => Effect.succeed([]),
+        markSent: () => Effect.succeed(true),
+        pruneRelayReceipts: Effect.succeed(0)
+      })
+      const transport = PeerTransport.PeerTransport.of({
+        capabilities: {},
+        connect: () =>
+          Effect.succeed({
+            peerId: senderPeerId,
+            relayPeerId,
+            capabilities: {},
+            receive: Stream.fromQueue(deliveries),
+            send: () => Effect.void,
+            close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
+          })
+      })
+      const publisher = CommitPublisher.CommitPublisher.of({
+        publishPending: Queue.offer(events, "publish").pipe(Effect.as(0)),
+        invalidate: () => Effect.void,
+        subscribe: Effect.succeed({
+          watermark: Identity.CommitSequence.make(0),
+          refreshGeneration: 0,
+          events: Stream.never
+        })
+      })
+      const delivery = (
+        sequence: number,
+        relayMessageId: Identity.RelayMessageId
+      ): Effect.Effect<PeerTransport.AcknowledgedDelivery, ReplicaError.ReplicaError> =>
+        PeerSyncEnvelope.encodeSyncEnvelope({
+          connectionEpoch: "sender-epoch-a",
+          sequence,
+          documentId,
+          documentType: Task.name,
+          messageHash,
+          message,
+          lineage: Identity.genesisLineage,
+          writerProvenance: []
+        }).pipe(
+          Effect.map((bytes) => ({
+            message: bytes,
+            identity: {
+              relayMessageId,
+              relayPeerId,
+              senderTenantId: "tenant",
+              senderSubjectId: "sender",
+              senderPeerId,
+              senderReplicaIncarnation: Identity.ReplicaIncarnation.make(9),
+              messageHash,
+              outerEnvelopeDigest: "a".repeat(64)
+            },
+            receiptRetentionMillis: PeerRelayReceiptLimits.defaults.receiptRetentionMillis,
+            acknowledge: Queue.offer(events, "ack").pipe(Effect.asVoid),
+            reject: (reason) =>
+              Ref.update(rejections, (current) => [...current, reason]).pipe(
+                Effect.andThen(Queue.offer(events, `reject:${reason}`)),
+                Effect.asVoid
+              )
+          }))
+        )
+      yield* Effect.scoped(
+        Effect.gen(function*() {
+          yield* PeerSession.makeTestClient(
+            { peerId: senderPeerId, documents: [{ document: Task, documentId }] },
+            () =>
+              Effect.succeed({
+                ApplySync: (request: typeof DocumentEntity.ApplySync.payloadSchema.Type) =>
+                  Queue.offer(events, "apply").pipe(
+                    Effect.andThen(
+                      request.receiveSequence === 0
+                        ? Effect.fail(
+                          new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.QuotaExceeded({
+                              resource: "relay receipt bytes per remote",
+                              limit: 64
+                            })
+                          })
+                        )
+                        : Effect.succeed(result)
+                    )
+                  )
+              } as never)
+          )
+          yield* Queue.offer(
+            deliveries,
+            yield* delivery(0, Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000011"))
+          )
+          assert.strictEqual(yield* Queue.take(events), "apply")
+          yield* Queue.offer(
+            deliveries,
+            yield* delivery(1, Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000012"))
+          )
+          // Deliveries are consumed serially, so had the quota message been settled, its ack or
+          // reject event would surface here before the second apply. The race is what makes the
+          // failure legible when the session dies instead of parking the message.
+          assert.deepStrictEqual(
+            yield* Effect.forEach([0, 1, 2], () =>
+              Effect.raceFirst(
+                Queue.take(events),
+                Deferred.await(closed).pipe(Effect.as("close"))
+              )),
+            ["apply", "publish", "ack"]
+          )
+          assert.isTrue(Option.isNone(yield* Deferred.poll(closed)))
+          assert.deepStrictEqual(yield* Ref.get(rejections), [])
+        }).pipe(
+          Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
+          Effect.provideService(PeerSync.PeerSync, sync),
+          Effect.provideService(ReplicaGate.ReplicaGate, gate),
+          Effect.provideService(CommitPublisher.CommitPublisher, publisher),
+          Effect.provideService(ReplicaLimits.ReplicaLimits, limits),
+          Effect.provideService(
+            PeerRelayReceiptLimits.PeerRelayReceiptLimits,
+            PeerRelayReceiptLimits.defaults
+          )
+        )
       )
     }).pipe(Effect.provide(NodeCrypto.layer)))
 

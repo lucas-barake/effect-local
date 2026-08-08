@@ -199,12 +199,39 @@ export class RelayInboxStore extends Context.Service<RelayInboxStore, {
    *
    * One head per channel: the owner delivers heads concurrently across channels and strictly in
    * order within a channel.
+   *
+   * The order is a delivery guarantee, not presentation. Each sender's most recently started
+   * channel comes first (live channels among themselves oldest first), then every superseded
+   * channel oldest first. A sender mints a fresh connection epoch per session, so a crash looping
+   * sender leaves one channel per lapsed epoch; the owner takes heads in this order into a bounded
+   * number of delivery slots, and age order alone would hand every slot to that stale trail while
+   * the sender's live epoch starves behind it.
+   *
+   * Priority alone would starve in the other direction: live channels that are never empty never
+   * leave a slot idle, and a superseded message the relay accepted custody of would expire
+   * undelivered — the sender only replays its current epoch's outbox, so expiry destroys the last
+   * copy. A superseded head that has burned half its TTL by `now` is therefore promoted into the
+   * priority class, where its age puts it at the front. Deprioritization is bounded at half the
+   * message's lifetime; the other half is the delivery window it was promoted to use.
    */
   readonly pendingHeads: (
     inboxKey: string,
-    options: { readonly limit: number }
+    options: { readonly limit: number; readonly now: number }
   ) => Effect.Effect<ReadonlyArray<PendingMessage>, StoreError>
 
+  /**
+   * Charges one delivery to a `Pending` message and dead letters it when the charge exceeds the
+   * budget.
+   *
+   * The budget counts consecutive charges with zero settled progress in the inbox, not lifetime
+   * transmissions: a charge that follows any settlement newer than the row's previous charge
+   * restarts the count at one. Session churn that still drains something therefore never destroys
+   * custody — only a recipient that settles nothing across the whole budget does, which is
+   * indistinguishable from a poisoned message or a peer that never comes back. The deliberate
+   * cost is the inverse case: a message that can never settle while its inbox keeps making
+   * progress is retransmitted until its TTL rather than dead lettered, and blocks its channel
+   * for that long.
+   */
   readonly recordDelivery: (
     inboxKey: string,
     relayMessageId: Identity.RelayMessageId,
@@ -224,6 +251,10 @@ export class RelayInboxStore extends Context.Service<RelayInboxStore, {
    *
    * `deduplicate_until` only ever grows. Shrinking it would reopen a deduplication window that a
    * sender may still be replaying into.
+   *
+   * A settlement is also the progress marker `recordDelivery` and `deadLetterExhausted` compare
+   * charge streaks against, which is why `terminal_at` must be written even though the payload is
+   * erased.
    */
   readonly settle: (
     inboxKey: string,
@@ -235,6 +266,18 @@ export class RelayInboxStore extends Context.Service<RelayInboxStore, {
       readonly terminalRetentionMillis: number
     }
   ) => Effect.Effect<SettleResult, StoreError>
+
+  /**
+   * Dead letters a `Pending` message whose stored delivery count has already reached the budget,
+   * without charging another delivery. A settlement newer than the row's last charge restarts the
+   * streak instead: the count is reset to zero and nothing is dead lettered. Reports whether the
+   * transition applied; the report is not exactly once under races on an identical `now`.
+   */
+  readonly deadLetterExhausted: (
+    inboxKey: string,
+    relayMessageId: Identity.RelayMessageId,
+    options: { readonly maxDeliveries: number; readonly now: number }
+  ) => Effect.Effect<boolean, StoreError>
 
   readonly usage: (inboxKey: string) => Effect.Effect<Usage, StoreError>
 

@@ -116,6 +116,7 @@ const inboxOptions: RelayInbox.Options = {
   terminalRetention: Duration.minutes(10),
   sessionDeadline: Duration.seconds(90),
   sessionSweep: Duration.seconds(1),
+  settleDeadline: Duration.seconds(30),
   maxConcurrentChannels: 4,
   storeRetry: Duration.zero,
   maxPendingMessages: 100,
@@ -136,119 +137,120 @@ const serverOptions: RelayServer.Options = {
 // real Sharding, real SqlRelayInboxStore over its own SQLite database.
 // ---------------------------------------------------------------------------
 
-const relayBackend = Effect.gen(function*() {
-  const crypto = yield* Crypto.Crypto.pipe(Effect.provide(NodeCrypto.layer))
+const relayBackend = (inboxOverrides?: Partial<RelayInbox.Options>) =>
+  Effect.gen(function*() {
+    const crypto = yield* Crypto.Crypto.pipe(Effect.provide(NodeCrypto.layer))
 
-  const authorization = yield* PeerRelayAuthorization.PeerRelayAuthorization.pipe(
-    Effect.provide(PeerRelayAuthorization.layer(
-      (request) =>
-        Effect.succeed({
-          remote: {
-            tenantId: request.principal.tenantId,
-            subjectId: request.remote.subjectId,
-            peerId: request.remote.peerId
-          },
-          documents: request.documents.map((requested) => ({
-            document: Task,
-            documentId: requested.documentId
-          })),
-          validUntil: Number.MAX_SAFE_INTEGER,
-          invalidated: Effect.never
-        }),
-      (request) =>
-        Effect.succeed({
-          _tag: "UnsafeUnboundedAutomerge3DecodeGrant" as const,
-          risk: PeerRelayAuthorization.unsafeUnboundedAutomerge3DecodeRisk,
-          principal: request.principal,
-          remote: {
-            tenantId: request.principal.tenantId,
-            subjectId: request.remote.subjectId,
-            peerId: request.remote.peerId
-          },
-          direction: request.direction,
-          documents: request.documents,
-          validUntil: Number.MAX_SAFE_INTEGER,
-          invalidated: Effect.never
-        })
-    ))
-  )
-
-  // A second, separate database. The relay's inbox custody is not the client's replica.
-  const relayStore = SqlRelayInboxStore.layer.pipe(
-    Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
-    Layer.provide(Layer.succeed(Crypto.Crypto)(crypto)),
-    Layer.orDie
-  )
-
-  const cluster = Sharding.layer.pipe(
-    Layer.provide(Runners.layerNoop),
-    Layer.provideMerge(MessageStorage.layerMemory),
-    Layer.provide(RunnerStorage.layerMemory),
-    Layer.provide(RunnerHealth.layerNoop),
-    Layer.provide(TestShardingConfig),
-    Layer.provideMerge(relayStore)
-  )
-
-  const context = yield* Layer.build(
-    RelayServer.layer({
-      ...serverOptions,
-      inbox: inboxOptions,
-      maintenance: {
-        interval: Duration.minutes(1),
-        batchLimit: 100,
-        terminalRetention: inboxOptions.terminalRetention,
-        enabled: true
-      }
-    }).pipe(
-      Layer.provideMerge(cluster),
-      Layer.provide(Layer.mergeAll(
-        Layer.succeed(Crypto.Crypto)(crypto),
-        Layer.succeed(PeerRelayLimits.PeerRelayLimits)(PeerRelayLimits.defaults),
-        Layer.succeed(PeerRelayAuthorization.PeerRelayAuthorization)(authorization)
-      ))
-    )
-  )
-
-  const principals = new Map([
-    ["local", localPrincipal],
-    ["remote", remotePrincipal]
-  ])
-
-  const authentication = yield* PeerAuthentication.PeerAuthentication.pipe(
-    Effect.provide(PeerAuthentication.layerServer),
-    Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
-      authenticate: (secret) => {
-        const principal = principals.get(Redacted.value(secret))
-        return principal === undefined
-          ? Effect.fail(new PeerRpcError.AuthenticationFailure())
-          : Effect.succeed({
-            principal,
+    const authorization = yield* PeerRelayAuthorization.PeerRelayAuthorization.pipe(
+      Effect.provide(PeerRelayAuthorization.layer(
+        (request) =>
+          Effect.succeed({
+            remote: {
+              tenantId: request.principal.tenantId,
+              subjectId: request.remote.subjectId,
+              peerId: request.remote.peerId
+            },
+            documents: request.documents.map((requested) => ({
+              document: Task,
+              documentId: requested.documentId
+            })),
+            validUntil: Number.MAX_SAFE_INTEGER,
+            invalidated: Effect.never
+          }),
+        (request) =>
+          Effect.succeed({
+            _tag: "UnsafeUnboundedAutomerge3DecodeGrant" as const,
+            risk: PeerRelayAuthorization.unsafeUnboundedAutomerge3DecodeRisk,
+            principal: request.principal,
+            remote: {
+              tenantId: request.principal.tenantId,
+              subjectId: request.remote.subjectId,
+              peerId: request.remote.peerId
+            },
+            direction: request.direction,
+            documents: request.documents,
             validUntil: Number.MAX_SAFE_INTEGER,
             invalidated: Effect.never
           })
-      }
-    }),
-    Effect.provideService(PeerRelayLimits.PeerRelayLimits, PeerRelayLimits.defaults)
-  )
-
-  /** One `PeerRpc.RpcClient` per authenticated subject, over the same relay handlers. */
-  const clientFor = (subject: string) =>
-    RpcTest.makeClient(PeerRpc.Rpcs).pipe(
-      Effect.provideContext(
-        Context.add(context, PeerAuthentication.PeerAuthentication, authentication)
-      ),
-      Effect.provide(PeerAuthentication.layerClient),
-      Effect.provideService(PeerCredentials.PeerCredentials, {
-        get: Effect.succeed(Redacted.make(subject))
-      })
+      ))
     )
 
-  // Shard assignment and acquisition run on scheduled fibers.
-  yield* TestClock.adjust(5000)
+    // A second, separate database. The relay's inbox custody is not the client's replica.
+    const relayStore = SqlRelayInboxStore.layer.pipe(
+      Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
+      Layer.provide(Layer.succeed(Crypto.Crypto)(crypto)),
+      Layer.orDie
+    )
 
-  const store = Context.get(context, RelayInboxStore.RelayInboxStore)
-  return { clientFor, crypto, store }
-})
+    const cluster = Sharding.layer.pipe(
+      Layer.provide(Runners.layerNoop),
+      Layer.provideMerge(MessageStorage.layerMemory),
+      Layer.provide(RunnerStorage.layerMemory),
+      Layer.provide(RunnerHealth.layerNoop),
+      Layer.provide(TestShardingConfig),
+      Layer.provideMerge(relayStore)
+    )
+
+    const context = yield* Layer.build(
+      RelayServer.layer({
+        ...serverOptions,
+        inbox: { ...inboxOptions, ...inboxOverrides },
+        maintenance: {
+          interval: Duration.minutes(1),
+          batchLimit: 100,
+          terminalRetention: inboxOptions.terminalRetention,
+          enabled: true
+        }
+      }).pipe(
+        Layer.provideMerge(cluster),
+        Layer.provide(Layer.mergeAll(
+          Layer.succeed(Crypto.Crypto)(crypto),
+          Layer.succeed(PeerRelayLimits.PeerRelayLimits)(PeerRelayLimits.defaults),
+          Layer.succeed(PeerRelayAuthorization.PeerRelayAuthorization)(authorization)
+        ))
+      )
+    )
+
+    const principals = new Map([
+      ["local", localPrincipal],
+      ["remote", remotePrincipal]
+    ])
+
+    const authentication = yield* PeerAuthentication.PeerAuthentication.pipe(
+      Effect.provide(PeerAuthentication.layerServer),
+      Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
+        authenticate: (secret) => {
+          const principal = principals.get(Redacted.value(secret))
+          return principal === undefined
+            ? Effect.fail(new PeerRpcError.AuthenticationFailure())
+            : Effect.succeed({
+              principal,
+              validUntil: Number.MAX_SAFE_INTEGER,
+              invalidated: Effect.never
+            })
+        }
+      }),
+      Effect.provideService(PeerRelayLimits.PeerRelayLimits, PeerRelayLimits.defaults)
+    )
+
+    /** One `PeerRpc.RpcClient` per authenticated subject, over the same relay handlers. */
+    const clientFor = (subject: string) =>
+      RpcTest.makeClient(PeerRpc.Rpcs).pipe(
+        Effect.provideContext(
+          Context.add(context, PeerAuthentication.PeerAuthentication, authentication)
+        ),
+        Effect.provide(PeerAuthentication.layerClient),
+        Effect.provideService(PeerCredentials.PeerCredentials, {
+          get: Effect.succeed(Redacted.make(subject))
+        })
+      )
+
+    // Shard assignment and acquisition run on scheduled fibers.
+    yield* TestClock.adjust(5000)
+
+    const store = Context.get(context, RelayInboxStore.RelayInboxStore)
+    return { clientFor, crypto, store }
+  })
 
 // ---------------------------------------------------------------------------
 // Client replica. Real PeerSync.layerRelay, real PeerRelayOutbox, real
@@ -349,7 +351,7 @@ describe("relay custody against a real relay", () => {
   it.effect("reports exact public command custody and complete document confirmation", () =>
     Effect.scoped(
       Effect.gen(function*() {
-        const backend = yield* relayBackend
+        const backend = yield* relayBackend()
         const client = yield* backend.clientFor("local")
         const recipientClient = yield* backend.clientFor("remote")
         const { documentId, recipient, sender } = yield* seedPair
@@ -465,7 +467,7 @@ describe("relay custody against a real relay", () => {
           }
 
           const heads = yield* backend.store
-            .pendingHeads(yield* inboxKeyOf(remotePrincipal, backend.crypto), { limit: 10 })
+            .pendingHeads(yield* inboxKeyOf(remotePrincipal, backend.crypto), { limit: 10, now: 0 })
             .pipe(Effect.orDie)
           const head = heads.find((candidate) =>
             candidate.envelope.writerProvenance.some((entry) => expectedChangeHashes.has(entry.changeHash))
@@ -481,7 +483,7 @@ describe("relay custody against a real relay", () => {
 
           // A count on the recipient's inbox alone would not catch a message filed back to its sender.
           const localHeads = yield* backend.store
-            .pendingHeads(yield* inboxKeyOf(localPrincipal, backend.crypto), { limit: 10 })
+            .pendingHeads(yield* inboxKeyOf(localPrincipal, backend.crypto), { limit: 10, now: 0 })
             .pipe(Effect.orDie)
           assert.isFalse(
             localHeads.some((candidate) =>
@@ -497,7 +499,7 @@ describe("relay custody against a real relay", () => {
   it.effect("carries a real client change through the relay into the recipient's replica", () =>
     Effect.scoped(
       Effect.gen(function*() {
-        const backend = yield* relayBackend
+        const backend = yield* relayBackend()
         const senderClient = yield* backend.clientFor("local")
         const recipientClient = yield* backend.clientFor("remote")
         const { documentId, recipient, sender } = yield* seedPair
@@ -564,7 +566,7 @@ describe("relay custody against a real relay", () => {
           for (const principal of [localPrincipal, remotePrincipal]) {
             assert.deepStrictEqual(
               yield* backend.store
-                .pendingHeads(yield* inboxKeyOf(principal, backend.crypto), { limit: 10 })
+                .pendingHeads(yield* inboxKeyOf(principal, backend.crypto), { limit: 10, now: 0 })
                 .pipe(Effect.orDie),
               []
             )
@@ -578,7 +580,7 @@ describe("relay custody against a real relay", () => {
   it.effect("drains a large pre-existing backlog into a fresh recipient session", () =>
     Effect.scoped(
       Effect.gen(function*() {
-        const backend = yield* relayBackend
+        const backend = yield* relayBackend()
         const senderClient = yield* backend.clientFor("local")
         const recipientClient = yield* backend.clientFor("remote")
         const { documentId, recipient, sender } = yield* seedPair
@@ -654,14 +656,160 @@ describe("relay custody against a real relay", () => {
           )
         }))
         // Virtual-time deterministic; the wall clock only covers 50 growing Automerge applies,
-        // which outgrows the default timeout on slower CI runners.
+        // which outgrows the default timeout when the suite runs fully parallel.
       }).pipe(Effect.provide(NodeCrypto.layer))
     ), 20_000)
+
+  it.effect("survives a head whose delivery budget is already exhausted", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const backend = yield* relayBackend({ maxDeliveries: 1 })
+        const senderClient = yield* backend.clientFor("local")
+        const recipientClient = yield* backend.clientFor("remote")
+        const { documentId, recipient, sender } = yield* seedPair
+        yield* TestClock.adjust(5000)
+
+        // Two messages queue on one channel while the recipient is offline.
+        yield* Effect.scoped(Effect.gen(function*() {
+          const session = yield* RpcPeerTransport.makeSession(
+            senderClient,
+            transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
+          ).pipe(Effect.provideContext(sender.context))
+          yield* sender.replica.mutate(AddLabel, {
+            commandId: yield* Identity.makeCommandId,
+            documentId,
+            payload: "burst"
+          })
+          yield* session.markDirty(documentId)
+          yield* session.flush
+          yield* TestClock.adjust(1000)
+        }))
+
+        // A session that takes the head and cannot settle it spends the head's whole budget.
+        const failingSettles: PeerRpc.RpcClient = {
+          ...recipientClient,
+          Acknowledge: ((() => Effect.fail(new PeerRpcError.ServerUnavailable())) as PeerRpc.RpcClient["Acknowledge"]),
+          Reject: ((() => Effect.fail(new PeerRpcError.ServerUnavailable())) as PeerRpc.RpcClient["Reject"])
+        }
+        yield* Effect.exit(Effect.scoped(Effect.gen(function*() {
+          yield* RpcPeerTransport.makeSession(
+            failingSettles,
+            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
+          ).pipe(Effect.provideContext(recipient.context))
+          yield* TestClock.adjust(5000)
+        })))
+
+        const recipientInbox = yield* inboxKeyOf(remotePrincipal, backend.crypto)
+        const exhausted = yield* backend.store.pendingHeads(recipientInbox, { limit: 10, now: 0 }).pipe(Effect.orDie)
+        assert.isAbove(exhausted.length, 0, "the unsettled head stays pending")
+        assert.isAbove(exhausted[0]!.deliveries, 0, "the failed session spent the head's budget")
+
+        // A fresh honest session must not die on the exhausted head: the relay dead letters it
+        // without transmitting it, and the rest of the backlog drains and settles normally.
+        yield* Effect.scoped(Effect.gen(function*() {
+          yield* RpcPeerTransport.makeSession(
+            recipientClient,
+            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
+          ).pipe(Effect.provideContext(recipient.context))
+          let remaining = exhausted.length
+          for (let round = 0; round < 100 && remaining > 0; round++) {
+            yield* TestClock.adjust(1000)
+            remaining = (yield* backend.store.usage(recipientInbox).pipe(Effect.orDie)).pendingCount
+          }
+          assert.strictEqual(remaining, 0, "everything but the exhausted head settled")
+        }))
+
+        const abandoned = yield* backend.store.abandoned(recipientInbox, { limit: 10 }).pipe(Effect.orDie)
+        assert.deepStrictEqual(
+          abandoned.map((message) => message.state),
+          ["DeadLettered"],
+          "only the exhausted head lost custody"
+        )
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("treats a failed acknowledgement as the message's problem, not the session's", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const backend = yield* relayBackend()
+        const senderClient = yield* backend.clientFor("local")
+        const recipientClient = yield* backend.clientFor("remote")
+        const { documentId, recipient, sender } = yield* seedPair
+        yield* TestClock.adjust(5000)
+
+        // Two channels: the sender pushes over two sessions, each with its own connection epoch,
+        // so the recipient's drain has a second head to prove the session outlived the failure.
+        for (const label of ["first-epoch", "second-epoch"]) {
+          yield* Effect.scoped(Effect.gen(function*() {
+            const session = yield* RpcPeerTransport.makeSession(
+              senderClient,
+              transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
+            ).pipe(Effect.provideContext(sender.context))
+            yield* sender.replica.mutate(AddLabel, {
+              commandId: yield* Identity.makeCommandId,
+              documentId,
+              payload: label
+            })
+            yield* session.markDirty(documentId)
+            yield* session.flush
+            yield* TestClock.adjust(1000)
+          }))
+        }
+        const recipientInbox = yield* inboxKeyOf(remotePrincipal, backend.crypto)
+        const flooded = (yield* backend.store.usage(recipientInbox).pipe(Effect.orDie)).pendingCount
+
+        // The first message's acknowledgement fails and keeps failing, so the client's bounded
+        // settle retries cannot heal it — this exercises the swallow path. The message stays in
+        // relay custody; what must not happen is the session dying with the backlog unread.
+        const failing = new Set<string>()
+        const flakySettles: PeerRpc.RpcClient = {
+          ...recipientClient,
+          Acknowledge: ((request) => {
+            if (failing.size === 0 || failing.has(request.relayMessageId)) {
+              failing.add(request.relayMessageId)
+              return Effect.fail(new PeerRpcError.ServerUnavailable())
+            }
+            return recipientClient.Acknowledge(request)
+          }) as PeerRpc.RpcClient["Acknowledge"]
+        }
+        yield* Effect.scoped(Effect.gen(function*() {
+          yield* RpcPeerTransport.makeSession(
+            flakySettles,
+            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
+          ).pipe(Effect.provideContext(recipient.context))
+          let remaining = flooded
+          for (let round = 0; round < 20; round++) {
+            yield* TestClock.adjust(1000)
+            remaining = (yield* backend.store.usage(recipientInbox).pipe(Effect.orDie)).pendingCount
+          }
+          // The unsettled head holds its own channel until the session ends, and whatever queued
+          // behind it on that channel waits with it. Everything on the other channel settled,
+          // which is the proof the session outlived the failure.
+          assert.isBelow(remaining, flooded, "the session outlived the failed acknowledgement")
+          assert.isAtLeast(remaining, 1, "the unsettled message stayed in relay custody")
+        }))
+
+        // The unsettled message is redelivered to the next session, deduplicated by the durable
+        // receipt the apply already wrote, and acknowledged without a second apply.
+        yield* Effect.scoped(Effect.gen(function*() {
+          yield* RpcPeerTransport.makeSession(
+            recipientClient,
+            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
+          ).pipe(Effect.provideContext(recipient.context))
+          let remaining = 1
+          for (let round = 0; round < 100 && remaining > 0; round++) {
+            yield* TestClock.adjust(1000)
+            remaining = (yield* backend.store.usage(recipientInbox).pipe(Effect.orDie)).pendingCount
+          }
+          assert.strictEqual(remaining, 0, "relay custody fully transferred on redelivery")
+        }))
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
 
   it.effect("replays an outbox entry the session that admitted it never handed over", () =>
     Effect.scoped(
       Effect.gen(function*() {
-        const backend = yield* relayBackend
+        const backend = yield* relayBackend()
         const client = yield* backend.clientFor("local")
         const { documentId, sender } = yield* seedPair
         yield* sender.replica.mutate(AddLabel, {
@@ -698,7 +846,7 @@ describe("relay custody against a real relay", () => {
         yield* Effect.scoped(Effect.gen(function*() {
           yield* RpcPeerTransport.makeSession(client, options).pipe(Effect.provideContext(sender.context))
 
-          const heads = yield* backend.store.pendingHeads(recipientInbox, { limit: 10 }).pipe(Effect.orDie)
+          const heads = yield* backend.store.pendingHeads(recipientInbox, { limit: 10, now: 0 }).pipe(Effect.orDie)
           assert.isTrue(
             heads.some((head) => head.relayMessageId === pending[0]!.relay_message_id),
             "the entry the failed session admitted reached the relay through the replay"

@@ -16,6 +16,7 @@ import * as Layer from "effect/Layer"
 import * as ManagedRuntime from "effect/ManagedRuntime"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
+import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import { TestClock } from "effect/testing"
@@ -587,6 +588,210 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
         assert.isTrue(promoted._tag === "Attached" && promoted.provider)
       }).pipe(
         Effect.provide(coordinatorLayer(started)),
+        Effect.scoped
+      )
+    }))
+
+  it.effect("backs off between re-provisions when the engine start keeps failing", () =>
+    Effect.gen(function*() {
+      const started: Array<StartedEngine> = []
+      const engine = makeEngineFactory(
+        started,
+        ":memory:",
+        () => Effect.die(new Error("corrupt replica database"))
+      )
+      const Coordinator = OwnershipCoordinator.layerSharedWorker({
+        name: "effect-local-ownership-backoff-test",
+        definition,
+        engine,
+        info: ownerInfo,
+        provisionTimeout: "500 millis",
+        engineStartTimeout: "5 seconds",
+        engineDisposeTimeout: "100 millis",
+        healthCheck: { interval: "100 millis", timeout: "500 millis" },
+        provisionRetry: {
+          schedule: Schedule.andThen(Schedule.recurs(1), Schedule.exponential("1 second")),
+          failureBudget: 3
+        }
+      })
+
+      // MessagePort delivery is a macrotask, so absence assertions must pump the task queue
+      // before polling; TestClock adjustments alone never deliver a posted frame.
+      const pumpTasks = Effect.promise(() => new Promise((resolve) => setImmediate(resolve))).pipe(
+        Effect.repeat({ times: 4 }),
+        Effect.asVoid
+      )
+      const reattach = (tab: TestTab) => {
+        const channel = new MessageChannel()
+        postToOwner(tab, {
+          _tag: "Attach",
+          protocolVersion: OwnershipProtocol.protocolVersion,
+          rpcPort: channel.port1
+        })
+      }
+
+      yield* Effect.gen(function*() {
+        const tab = yield* attachTab
+        yield* acceptNextProvision(tab)
+        yield* takeFrame(tab, "ProvisionRejected")
+
+        // The first failure re-provisions immediately: a failed candidate is dropped, so the
+        // tab re-registers with a fresh attach and is asked to provide again with no delay.
+        reattach(tab)
+        yield* acceptNextProvision(tab)
+        yield* takeFrame(tab, "ProvisionRejected")
+
+        // The second consecutive failure opens the backoff window. A fresh attach inside the
+        // window registers the tab but must not trigger provisioning early.
+        reattach(tab)
+        yield* TestClock.adjust("500 millis")
+        yield* pumpTasks
+        assert.isTrue(Option.isNone(yield* Queue.poll(tab.frames)))
+
+        yield* TestClock.adjust("500 millis")
+        yield* acceptNextProvision(tab)
+        yield* takeFrame(tab, "ProvisionRejected")
+
+        // The third failure crosses the budget: the failing condition is surfaced to the app
+        // while retrying continues, so a recoverable cause still heals without intervention.
+        const surfaced = yield* takeFrame(tab, "OwnerError")
+        assert.include(surfaced.message, "3 consecutive")
+        assert.deepStrictEqual(surfaced.reason, { _tag: "EngineProvisionFailing", failures: 3 })
+
+        reattach(tab)
+        yield* TestClock.adjust("2 seconds")
+        yield* acceptNextProvision(tab)
+        yield* takeFrame(tab, "ProvisionRejected")
+        yield* takeFrame(tab, "OwnerError")
+      }).pipe(
+        Effect.provide(Coordinator),
+        Effect.scoped
+      )
+    }))
+
+  it.effect("restarts the retry schedule after a healthy interval", () =>
+    Effect.gen(function*() {
+      const started: Array<StartedEngine> = []
+      const engine = makeEngineFactory(
+        started,
+        ":memory:",
+        (attempt) => attempt <= 2 ? Effect.die(new Error("transient start failure")) : Effect.void
+      )
+      const Coordinator = OwnershipCoordinator.layerSharedWorker({
+        name: "effect-local-ownership-healthy-reset-test",
+        definition,
+        engine,
+        info: ownerInfo,
+        provisionTimeout: "500 millis",
+        engineStartTimeout: "5 seconds",
+        engineDisposeTimeout: "100 millis",
+        healthCheck: { interval: "100 millis", timeout: "500 millis" },
+        provisionRetry: { schedule: Schedule.exponential("1 second"), failureBudget: 5 }
+      })
+      const reattach = (tab: TestTab) => {
+        const channel = new MessageChannel()
+        postToOwner(tab, {
+          _tag: "Attach",
+          protocolVersion: OwnershipProtocol.protocolVersion,
+          rpcPort: channel.port1
+        })
+      }
+
+      yield* Effect.gen(function*() {
+        const tab = yield* attachTab
+        yield* acceptNextProvision(tab)
+        yield* takeFrame(tab, "ProvisionRejected")
+        reattach(tab)
+        yield* TestClock.adjust("1 second")
+        yield* acceptNextProvision(tab)
+        yield* takeFrame(tab, "ProvisionRejected")
+
+        reattach(tab)
+        yield* TestClock.adjust("2 seconds")
+        yield* acceptNextProvision(tab)
+        yield* takeFrame(tab, "ProvisionAccepted")
+        yield* takeFrame(tab, "Attached")
+
+        // Two passing periodic probes prove a healthy interval, which ends the failure streak.
+        yield* TestClock.adjust("200 millis")
+
+        assert.strictEqual(started.length, 3)
+        yield* started[2].sqlite.disposeEffect
+        yield* TestClock.adjust("100 millis")
+        yield* takeFrame(tab, "Reattach")
+
+        // The reset after a healthy interval starts a fresh schedule run: the delay is the
+        // schedule's first delay again, not a continuation of the pre-recovery streak (4s here).
+        yield* TestClock.adjust("1 second")
+        yield* acceptNextProvision(tab)
+        yield* takeFrame(tab, "ProvisionAccepted")
+        const reattached = yield* takeFrame(tab, "Attached")
+        assert.isTrue(reattached.provider)
+      }).pipe(
+        Effect.provide(Coordinator),
+        Effect.scoped
+      )
+    }))
+
+  it.effect("stops provisioning when the retry schedule completes and restarts on a fresh attach", () =>
+    Effect.gen(function*() {
+      const started: Array<StartedEngine> = []
+      const engine = makeEngineFactory(
+        started,
+        ":memory:",
+        () => Effect.die(new Error("corrupt replica database"))
+      )
+      const Coordinator = OwnershipCoordinator.layerSharedWorker({
+        name: "effect-local-ownership-exhaustion-test",
+        definition,
+        engine,
+        info: ownerInfo,
+        provisionTimeout: "500 millis",
+        engineStartTimeout: "5 seconds",
+        engineDisposeTimeout: "100 millis",
+        healthCheck: { interval: "100 millis", timeout: "500 millis" },
+        provisionRetry: { schedule: Schedule.recurs(0), failureBudget: 5 }
+      })
+      const pumpTasks = Effect.promise(() => new Promise((resolve) => setImmediate(resolve))).pipe(
+        Effect.repeat({ times: 4 }),
+        Effect.asVoid
+      )
+
+      yield* Effect.gen(function*() {
+        const candidate = yield* attachTab
+        yield* takeFrame(candidate, "Provision").pipe(
+          Effect.flatMap((provision) =>
+            Effect.sync(() => {
+              const database = new MessageChannel()
+              postToOwner(candidate, { _tag: "Provision", nonce: provision.nonce, databasePort: database.port1 })
+              database.port2.close()
+            })
+          )
+        )
+        const bystander = yield* attachTab
+        yield* takeFrame(candidate, "ProvisionRejected")
+
+        // recurs(0) completes on the first failure: the bystander tab is told provisioning
+        // stopped, with a reason the app can discriminate on to offer a repair flow.
+        const surfaced = yield* takeFrame(bystander, "OwnerError")
+        assert.include(surfaced.message, "retry schedule is exhausted")
+        assert.deepStrictEqual(surfaced.reason, { _tag: "EngineProvisionExhausted", failures: 1 })
+
+        // Stopped means stopped: no amount of elapsed time provisions another engine.
+        yield* TestClock.adjust("1 minute")
+        yield* pumpTasks
+        assert.isTrue(Option.isNone(yield* Queue.poll(bystander.frames)))
+
+        // A fresh attach is the recovery signal and starts a new schedule run.
+        const channel = new MessageChannel()
+        postToOwner(bystander, {
+          _tag: "Attach",
+          protocolVersion: OwnershipProtocol.protocolVersion,
+          rpcPort: channel.port1
+        })
+        yield* takeFrame(bystander, "Provision")
+      }).pipe(
+        Effect.provide(Coordinator),
         Effect.scoped
       )
     }))

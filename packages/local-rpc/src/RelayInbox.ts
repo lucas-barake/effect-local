@@ -141,11 +141,15 @@ export const RelayInbox = Entity.make("EffectLocalRelayInbox", [
 
 export interface Options {
   /**
-   * How many times a message may be handed to a session before it is dead lettered.
+   * How many consecutive times a message may be handed to a session without any settled progress
+   * in the inbox before it is dead lettered.
    *
    * Counts deliveries rather than failures. A recipient that reads a message and then disconnects
    * without settling it is not a failure at any layer, yet left uncounted it would redeliver
-   * forever and block its channel, so the budget has to be spent by the attempt itself.
+   * forever and block its channel, so the budget has to be spent by the attempt itself. Any
+   * settlement in the inbox restarts every other message's count, so session churn that still
+   * drains something never destroys custody — only a recipient that settles nothing across the
+   * whole budget does.
    */
   readonly maxDeliveries: number
   /** How long an undelivered message survives before it is expired. */
@@ -159,6 +163,15 @@ export interface Options {
   readonly sessionDeadline: Duration.Input
   /** How often the entity checks for a lapsed session deadline. */
   readonly sessionSweep: Duration.Input
+  /**
+   * How long a delivered message may wait unsettled on a live session before the attempt is
+   * abandoned. The row stays `Pending` and its channel is freed, so the head is redelivered — to
+   * this same session if it is still subscribed, where the recipient's durable receipt turns the
+   * re-apply into a plain re-acknowledgement. Without this bound, a recipient whose settlement
+   * failed in transit holds its channel for the session's whole life while the messages queued
+   * behind it silently expire.
+   */
+  readonly settleDeadline: Duration.Input
   /** Maximum channels delivered concurrently to one session. */
   readonly maxConcurrentChannels: number
   /** Backoff after a store failure, so a failing database cannot spin the dispatcher. */
@@ -263,6 +276,7 @@ export const layer = (options: Options) =>
       const messageTtlMillis = Duration.toMillis(options.messageTtl)
       const terminalRetentionMillis = Duration.toMillis(options.terminalRetention)
       const sessionDeadlineMillis = Duration.toMillis(options.sessionDeadline)
+      const settleDeadlineMillis = Duration.toMillis(options.settleDeadline)
 
       const sessionRef = yield* Ref.make(Option.none<Session>())
       // Serializes session installation so two concurrent reconnects cannot both install
@@ -328,6 +342,32 @@ export const layer = (options: Options) =>
        */
       const deliverHead = (session: Session, head: RelayInboxStore.PendingMessage) =>
         Effect.gen(function*() {
+          // A head that already spent its whole budget is dead lettered here, before the offer,
+          // and never transmitted. Delivering it first would hand the recipient a message whose
+          // settlement no longer exists, so its acknowledgement could only fail — and the
+          // recipient cannot tell that failure from a broken relay session.
+          if (head.deliveries >= options.maxDeliveries) {
+            const now = yield* Clock.currentTimeMillis
+            // Conditional inside its own transaction rather than trusting this fiber's read of
+            // `head.deliveries`: a settlement elsewhere in the inbox may have reset the count
+            // since the poll, and that row is entitled to its refunded budget.
+            const exhausted = yield* store.deadLetterExhausted(inboxKey, head.relayMessageId, {
+              maxDeliveries: options.maxDeliveries,
+              now
+            })
+            if (exhausted) {
+              yield* Effect.logWarning(
+                "Relay inbox message exhausted its delivery budget and was dead lettered"
+              ).pipe(
+                Effect.annotateLogs({
+                  inboxKey,
+                  relayMessageId: head.relayMessageId,
+                  deliveries: head.deliveries
+                })
+              )
+            }
+            return
+          }
           const claimToken = yield* makeClaimToken
           const requested = yield* Deferred.make<AttemptOutcome>()
           const durable = yield* Deferred.make<void, PeerRpcError.ServerUnavailable>()
@@ -372,14 +412,28 @@ export const layer = (options: Options) =>
             return
           }
 
-          const outcome = yield* Deferred.await(requested)
+          // Bounded, because a settlement is not guaranteed to arrive on a live session: the
+          // recipient's Acknowledge can fail in transit and the recipient survives that. An
+          // abandoned attempt leaves the row `Pending` and frees the channel without withholding
+          // it, so the next poll redelivers the head — same session or later one.
+          const outcome = yield* Deferred.await(requested).pipe(
+            Effect.timeout(settleDeadlineMillis),
+            Effect.catchTag("TimeoutError", () =>
+              Effect.logWarning("Relay inbox delivery went unsettled past the settle deadline").pipe(
+                Effect.annotateLogs({ inboxKey, relayMessageId: head.relayMessageId }),
+                Effect.as("Abandoned" as const)
+              ))
+          )
+          if (outcome === "Abandoned") return
           if (outcome === "Released") {
             // The front door took the message and then found the recipient may not have it. Nothing
             // is written: the row stays `Pending` for a later session. Returning here is what frees
             // the channel, which is the whole point — a released attempt that kept waiting for a
             // settlement would hold its channel, and enough of them would hold every delivery slot
             // and starve channels the recipient is perfectly entitled to.
-            yield* Effect.sync(() => session.withheldChannels.add(channelId(head.channel)))
+            yield* Effect.sync(() =>
+              session.withheldChannels.add(channelId(head.channel))
+            )
             yield* Effect.logDebug("Relay inbox delivery released without settling").pipe(
               Effect.annotateLogs({ inboxKey, relayMessageId: head.relayMessageId })
             )
@@ -443,11 +497,14 @@ export const layer = (options: Options) =>
             // the latch and the following await returns immediately.
             yield* session.wake.close
             // Widened by the channels this session has already been told it may not receive.
-            // Heads come back oldest first, so asking only for as many as can be delivered would
-            // return nothing but withheld ones once enough of them accumulate, and the channels
-            // behind them — which the recipient is entitled to — would never even be looked at.
+            // Heads come back in a fixed priority order, so asking only for as many as can be
+            // delivered would return nothing but withheld ones once enough of them accumulate, and
+            // the channels behind them — which the recipient is entitled to — would never even be
+            // looked at.
+            const now = yield* Clock.currentTimeMillis
             const heads = yield* store.pendingHeads(inboxKey, {
-              limit: options.maxConcurrentChannels + session.withheldChannels.size
+              limit: options.maxConcurrentChannels + session.withheldChannels.size,
+              now
             })
             for (const head of heads) {
               const channel = channelId(head.channel)

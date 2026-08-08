@@ -75,6 +75,7 @@ const inboxOptions: RelayInbox.Options = {
   terminalRetention: Duration.minutes(10),
   sessionDeadline: Duration.seconds(90),
   sessionSweep: Duration.seconds(1),
+  settleDeadline: Duration.seconds(30),
   maxConcurrentChannels: 4,
   storeRetry: Duration.zero,
   maxPendingMessages: 100,

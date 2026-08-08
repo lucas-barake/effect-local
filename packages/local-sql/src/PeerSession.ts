@@ -7,9 +7,11 @@ import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
+import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
@@ -602,8 +604,28 @@ const makeWithTerminal = (
             "ReplicaError",
             "DocumentLineageChanged",
             (reason) => refuse(envelope.documentId, reason).pipe(Effect.as(null))
+          ),
+          // Quota trips are transient, so rejecting would discard a message the replica can hold
+          // later, and failing the session turned one over-quota message into a reconnect churn
+          // loop. Settling nothing keeps custody at the relay until the next session retries.
+          Effect.catchReason(
+            "ReplicaError",
+            "QuotaExceeded",
+            (reason) =>
+              Effect.logWarning(
+                "Peer session parked an inbound message after a receive quota was exceeded; the message stays in relay custody"
+              ).pipe(
+                Effect.annotateLogs({
+                  documentId: envelope.documentId,
+                  peerId: connection.peerId,
+                  resource: reason.resource,
+                  limit: reason.limit
+                }),
+                Effect.as("Parked" as const)
+              )
           )
         )
+        if (result === "Parked") return "Parked" as const
         if (result === null) return "ApplicationRejected" as const
         yield* publisher.publishPending
         if (result.reply !== null) {
@@ -630,16 +652,41 @@ const makeWithTerminal = (
           ))
       )
 
+    // A failed settlement costs the message, never the session. Transient failures are retried on
+    // this session — the relay keeps the delivery addressable for exactly that. Once retries are
+    // exhausted, custody stays with the relay: the attempt is abandoned server side at its settle
+    // deadline and the head is redelivered, where the durable receipt written by the apply turns
+    // the re-apply into a plain re-acknowledgement. Failing the session here turned one
+    // unsettleable message into a reconnect loop that burned every pending message's delivery
+    // budget toward dead letter.
+    const settleDelivery = (
+      operation: string,
+      effect: Effect.Effect<void, ReplicaError.ReplicaError>
+    ) =>
+      relayCall(operation, effect).pipe(
+        Effect.retry({
+          schedule: Schedule.spaced(Duration.seconds(1)),
+          times: 2,
+          while: (error) => error.reason._tag === "StorageUnavailable"
+        }),
+        Effect.catchTag("ReplicaError", (error) =>
+          Effect.logWarning("relay settlement failed; the message stays in relay custody").pipe(
+            Effect.annotateLogs({ operation, reason: error.reason._tag })
+          ))
+      )
+
     const receiveAcknowledged = (delivery: PeerTransport.AcknowledgedDelivery) =>
       processReceive(delivery.message, delivery).pipe(
         Effect.flatMap((outcome) =>
           outcome === "ApplicationRejected"
-            ? relayCall("relay reject", delivery.reject("ApplicationRejected"))
-            : relayCall("relay acknowledge", delivery.acknowledge)
+            ? settleDelivery("relay reject", delivery.reject("ApplicationRejected"))
+            : outcome === "Parked"
+            ? Effect.void
+            : settleDelivery("relay acknowledge", delivery.acknowledge)
         ),
         Effect.catchTag(
           "RelayProtocolInvalid",
-          () => relayCall("relay reject", delivery.reject("ProtocolInvalid"))
+          () => settleDelivery("relay reject", delivery.reject("ProtocolInvalid"))
         )
       )
     yield* Effect.addFinalizer(() =>

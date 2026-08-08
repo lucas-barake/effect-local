@@ -69,7 +69,13 @@ const AbandonedRow = Schema.Struct({
   terminal_at: Schema.NullOr(DatabaseInt)
 })
 
-const StateRow = Schema.Struct({ state: Schema.String, deliveries: DatabaseInt })
+const ChargeRow = Schema.Struct({
+  state: Schema.String,
+  deliveries: DatabaseInt,
+  charged_at: DatabaseInt
+})
+
+const ProgressRow = Schema.Struct({ progressed: DatabaseInt })
 
 const IdRow = Schema.Struct({ inbox_key: Schema.String, relay_message_id: Schema.String })
 
@@ -265,8 +271,21 @@ export const make = Effect.gen(function*() {
         ))
     )
 
+  // Each sender's most recently started channel goes first. A sender allocates a fresh connection
+  // epoch per session, so a crash looping sender leaves one channel per lapsed epoch — and under
+  // age order alone that stale trail occupies every delivery slot while the epoch the sender is
+  // connected on right now waits behind it until the stale heads dead letter or expire. Recency is
+  // the channel's first pending admission, because the epochs themselves are opaque and carry no
+  // order.
+  //
+  // Superseded channels are deprioritized, never dropped. Priority alone would starve them the
+  // other way: a live channel that is never empty never leaves a slot idle, and a superseded
+  // message would sit `Pending` until expiry destroyed the last copy — the sender only replays its
+  // current epoch's outbox. So a head that has burned half its TTL is promoted into the priority
+  // class, where its age puts it at the front: deprioritization is bounded at half the message's
+  // lifetime and the other half is its delivery window.
   const findHeads = SqlSchema.findAll({
-    Request: Schema.Struct({ inboxKey: Schema.String, limit: Schema.Int }),
+    Request: Schema.Struct({ inboxKey: Schema.String, limit: Schema.Int, now: Schema.Number }),
     Result: PendingRow,
     execute: (request) =>
       sql`
@@ -274,20 +293,32 @@ export const make = Effect.gen(function*() {
                sender_replica_incarnation, sender_connection_epoch, sender_sequence,
                deliveries, envelope, message_hash, outer_envelope_digest
         FROM (
-          SELECT *, ROW_NUMBER() OVER (
-            PARTITION BY channel_key ORDER BY sender_sequence ASC
-          ) AS rn
-          FROM ${sql(table)}
-          WHERE inbox_key = ${request.inboxKey} AND state = 'Pending'
-        ) heads
-        WHERE rn = 1
-        ORDER BY created_at ASC, channel_key ASC
+          SELECT heads.*, ROW_NUMBER() OVER (
+            PARTITION BY tenant_id, sender_subject_id, sender_peer_id, sender_replica_incarnation
+            ORDER BY channel_started_at DESC, channel_key DESC
+          ) AS channel_recency
+          FROM (
+            SELECT *,
+              ROW_NUMBER() OVER (
+                PARTITION BY channel_key ORDER BY sender_sequence ASC
+              ) AS rn,
+              MIN(created_at) OVER (PARTITION BY channel_key) AS channel_started_at
+            FROM ${sql(table)}
+            WHERE inbox_key = ${request.inboxKey} AND state = 'Pending'
+          ) heads
+          WHERE rn = 1
+        ) ranked
+        ORDER BY CASE
+            WHEN channel_recency = 1 OR created_at + expires_at <= ${request.now * 2} THEN 0
+            ELSE 1
+          END,
+          created_at ASC, channel_key ASC
         LIMIT ${sql.literal(String(request.limit))}
       `
   })
 
-  const pendingHeads = (inboxKey: string, options: { readonly limit: number }) =>
-    findHeads({ inboxKey, limit: options.limit }).pipe(
+  const pendingHeads = (inboxKey: string, options: { readonly limit: number; readonly now: number }) =>
+    findHeads({ inboxKey, limit: options.limit, now: options.now }).pipe(
       // A `SchemaError` here is a row this store cannot decode, which is corruption rather than
       // downtime. Collapsing the two would have callers retry a row that will never decode.
       Effect.catchTag(
@@ -377,13 +408,30 @@ export const make = Effect.gen(function*() {
       ))
     )
 
-  const findState = SqlSchema.findOneOption({
+  const findCharge = SqlSchema.findOneOption({
     Request: Schema.Struct({ inboxKey: Schema.String, relayMessageId: Schema.String }),
-    Result: StateRow,
+    Result: ChargeRow,
     execute: (request) =>
       sql`
-        SELECT state, deliveries FROM ${sql(table)}
+        SELECT state, deliveries, charged_at FROM ${sql(table)}
         WHERE inbox_key = ${request.inboxKey} AND relay_message_id = ${request.relayMessageId}
+      `
+  })
+
+  /**
+   * Whether any message in the inbox settled after the given charge time. A settlement proves the
+   * recipient was alive and draining at that moment, so a message still failing to settle across
+   * it is failing for its own reasons rather than because sessions keep dying.
+   */
+  const findProgress = SqlSchema.findOne({
+    Request: Schema.Struct({ inboxKey: Schema.String, since: Schema.Int }),
+    Result: ProgressRow,
+    execute: (request) =>
+      sql`
+        SELECT COUNT(*) AS progressed FROM ${sql(table)}
+        WHERE inbox_key = ${request.inboxKey}
+          AND state IN ('Acknowledged', 'Rejected')
+          AND terminal_at > ${request.since}
       `
   })
 
@@ -393,29 +441,37 @@ export const make = Effect.gen(function*() {
     options: { readonly maxDeliveries: number; readonly now: number }
   ) =>
     sql.withTransaction(Effect.gen(function*() {
-      // Incremented only for rows that are still `Pending`, so a message settled concurrently by
-      // its recipient cannot be charged for a delivery it no longer needs.
-      yield* sql`
-        UPDATE ${sql(table)} SET deliveries = deliveries + 1
-        WHERE inbox_key = ${inboxKey} AND relay_message_id = ${relayMessageId}
-          AND state = 'Pending'
-      `
-      const current = yield* findState({ inboxKey, relayMessageId })
-      if (Option.isNone(current)) {
+      const before = yield* findCharge({ inboxKey, relayMessageId })
+      if (Option.isNone(before)) {
         return { _tag: "Recorded", deliveries: 0 } as const
       }
-      const deliveries = current.value.deliveries
+      // Charged only for rows that are still `Pending`, so a message settled concurrently by its
+      // recipient cannot be charged for a delivery it no longer needs.
+      if (before.value.state !== "Pending") {
+        return { _tag: "Recorded", deliveries: before.value.deliveries } as const
+      }
+      // The budget counts consecutive transmissions with zero settled progress in the inbox, not
+      // lifetime transmissions. Session churn that still drains something restarts every other
+      // message's streak, so only a recipient that settles nothing across the whole budget — a
+      // poisoned message or a peer that never comes back — loses custody to dead letter.
+      const progressed = yield* findProgress({ inboxKey, since: before.value.charged_at })
+      const deliveries = progressed.progressed > 0 ? 1 : before.value.deliveries + 1
       // Strictly greater: the attempt that spends the last of the budget is still a real delivery
       // the recipient can settle, so dead lettering at equality would waste it.
-      if (current.value.state === "Pending" && deliveries > options.maxDeliveries) {
+      if (deliveries > options.maxDeliveries) {
         yield* sql`
           UPDATE ${sql(table)}
-          SET state = 'DeadLettered', terminal_at = ${options.now}
+          SET deliveries = ${deliveries}, state = 'DeadLettered', terminal_at = ${options.now}
           WHERE inbox_key = ${inboxKey} AND relay_message_id = ${relayMessageId}
             AND state = 'Pending'
         `
         return { _tag: "DeadLettered", deliveries } as const
       }
+      yield* sql`
+        UPDATE ${sql(table)} SET deliveries = ${deliveries}, charged_at = ${options.now}
+        WHERE inbox_key = ${inboxKey} AND relay_message_id = ${relayMessageId}
+          AND state = 'Pending'
+      `
       return { _tag: "Recorded", deliveries } as const
     })).pipe(
       Effect.catchTag("SqlError", (cause) =>
@@ -423,6 +479,64 @@ export const make = Effect.gen(function*() {
           new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) })
         )),
       Effect.catchTag("SchemaError", (cause) =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageCorrupt({ cause }) })
+        )),
+      // A COUNT aggregate that returns no row at all is corruption, not downtime; retrying it
+      // would spin against a database that will never answer differently.
+      Effect.catchTag("NoSuchElementError", (cause) =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageCorrupt({ cause }) })
+        ))
+    )
+
+  const deadLetterExhausted = (
+    inboxKey: string,
+    relayMessageId: string,
+    options: { readonly maxDeliveries: number; readonly now: number }
+  ) =>
+    sql.withTransaction(Effect.gen(function*() {
+      // Conditional on the stored row rather than the caller's read: a concurrent settlement may
+      // have restarted the streak since the caller polled, and that row keeps its refund.
+      const before = yield* findCharge({ inboxKey, relayMessageId })
+      if (
+        Option.isNone(before) ||
+        before.value.state !== "Pending" ||
+        before.value.deliveries < options.maxDeliveries
+      ) {
+        return false
+      }
+      // The settlement that landed after this row's last charge is the streak restart the next
+      // charge would apply; destroying custody on the stale count would take back the refund.
+      const progressed = yield* findProgress({ inboxKey, since: before.value.charged_at })
+      if (progressed.progressed > 0) {
+        yield* sql`
+          UPDATE ${sql(table)} SET deliveries = 0
+          WHERE inbox_key = ${inboxKey} AND relay_message_id = ${relayMessageId}
+            AND state = 'Pending'
+        `
+        return false
+      }
+      yield* sql`
+        UPDATE ${sql(table)}
+        SET state = 'DeadLettered', terminal_at = ${options.now}
+        WHERE inbox_key = ${inboxKey} AND relay_message_id = ${relayMessageId}
+          AND state = 'Pending' AND deliveries >= ${options.maxDeliveries}
+      `
+      const after = yield* findExisting({ inboxKey, relayMessageId })
+      return Option.isSome(after) &&
+        after.value.state === "DeadLettered" &&
+        after.value.terminal_at === options.now
+    })).pipe(
+      Effect.catchTag("SqlError", (cause) =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageUnavailable({ cause }) })
+        )),
+      Effect.catchTag("SchemaError", (cause) =>
+        Effect.fail(
+          new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageCorrupt({ cause }) })
+        )),
+      Effect.catchTag("NoSuchElementError", (cause) =>
         Effect.fail(
           new ReplicaError.ReplicaError({ reason: new ReplicaError.StorageCorrupt({ cause }) })
         ))
@@ -667,6 +781,12 @@ export const make = Effect.gen(function*() {
       settle(inboxKey, relayMessageId, options).pipe(
         Effect.withSpan("SqlRelayInboxStore.settle", {
           attributes: { inbox_key: inboxKey, relay_message_id: relayMessageId, outcome: options.outcome }
+        })
+      ),
+    deadLetterExhausted: (inboxKey, relayMessageId, options) =>
+      deadLetterExhausted(inboxKey, relayMessageId, options).pipe(
+        Effect.withSpan("SqlRelayInboxStore.deadLetterExhausted", {
+          attributes: { inbox_key: inboxKey, relay_message_id: relayMessageId, max_deliveries: options.maxDeliveries }
         })
       ),
     usage: (inboxKey) =>
