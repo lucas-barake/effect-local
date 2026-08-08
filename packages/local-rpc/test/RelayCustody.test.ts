@@ -653,8 +653,10 @@ describe("relay custody against a real relay", () => {
             0
           )
         }))
+        // Virtual-time deterministic; the wall clock only covers 50 growing Automerge applies,
+        // which outgrows the default timeout on slower CI runners.
       }).pipe(Effect.provide(NodeCrypto.layer))
-    ))
+    ), 20_000)
 
   it.effect("replays an outbox entry the session that admitted it never handed over", () =>
     Effect.scoped(
