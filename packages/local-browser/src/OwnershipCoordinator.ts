@@ -19,8 +19,10 @@ import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as ManagedRuntime from "effect/ManagedRuntime"
 import * as Option from "effect/Option"
+import * as Pull from "effect/Pull"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
+import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
@@ -86,6 +88,23 @@ export interface SharedWorkerOptions<E, A, E2,> {
     readonly timeout?: Duration.Input | undefined
     readonly deadline?: Duration.Input | undefined
   } | undefined
+  /**
+   * Governs re-provisioning after engine failures. The `schedule` shapes one run per failure
+   * streak: every consecutive engine failure takes one step, the step's delay gates the next
+   * provisioning attempt, and a passing periodic health probe ends the streak so the next failure
+   * starts a fresh run. A provider tab detaching is not a failure and never consults the schedule,
+   * so tab-close takeover stays immediate. When the schedule completes, provisioning stops, every
+   * tab is posted an `OwnerError` frame with an `EngineProvisionExhausted` reason, and the next
+   * tab attach starts a new run. The default schedule retries forever: an immediate first retry,
+   * then jittered exponential delays from 500ms capped at 30 seconds. Independently, once
+   * `failureBudget` (default 5) consecutive failures accumulate, every further failure is surfaced
+   * to tabs as an `OwnerError` frame with an `EngineProvisionFailing` reason while retrying
+   * continues, so the app can react without the coordinator giving up.
+   */
+  readonly provisionRetry?: {
+    readonly schedule?: Schedule.Schedule<unknown, void> | undefined
+    readonly failureBudget?: number | undefined
+  } | undefined
 }
 
 export class OwnershipCoordinator extends Context.Service<OwnershipCoordinator, {
@@ -143,6 +162,11 @@ interface CoordinatorState {
   disposing: boolean
   epoch: number
   readonly tried: Set<MessagePort>
+  failures: number
+  retryStep: ((input: void) => Pull.Pull<unknown, never, unknown>) | undefined
+  retryGeneration: number
+  backingOff: boolean
+  exhausted: boolean
 }
 
 type CoordinatorEvent =
@@ -169,6 +193,18 @@ type CoordinatorEvent =
     readonly ok: boolean
   }
   | { readonly _tag: "EngineDisposed"; readonly epoch: number }
+  | { readonly _tag: "BackoffElapsed"; readonly generation: number }
+  | { readonly _tag: "RetryExhausted"; readonly generation: number }
+
+const defaultRetrySchedule: Schedule.Schedule<unknown, void> = Schedule.andThen(
+  Schedule.recurs(1),
+  Schedule.jittered(
+    Schedule.modifyDelay(
+      Schedule.exponential("500 millis"),
+      ({ duration }) => Effect.succeed(Math.min(Duration.toMillis(duration), 30_000))
+    )
+  )
+)
 
 const HealthRow = Schema.Struct({ ok: Schema.Int })
 
@@ -208,6 +244,8 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
       const healthDeadlineMillis = Duration.toMillis(
         Duration.fromInputUnsafe(options.healthCheck?.deadline ?? "30 seconds")
       )
+      const retrySchedule = options.provisionRetry?.schedule ?? defaultRetrySchedule
+      const failureBudget = options.provisionRetry?.failureBudget ?? 5
 
       const events = yield* Queue.unbounded<CoordinatorEvent>()
       const state = yield* Ref.make<CoordinatorState>({
@@ -217,7 +255,12 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
         starting: Option.none(),
         disposing: false,
         epoch: 0,
-        tried: new Set()
+        tried: new Set(),
+        failures: 0,
+        retryStep: undefined,
+        retryGeneration: 0,
+        backingOff: false,
+        exhausted: false
       })
 
       const post = (port: MessagePort, frame: OwnershipProtocol.OwnerToPageFrame) =>
@@ -319,7 +362,7 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
         const current = Ref.getUnsafe(state)
         if (
           Option.isSome(current.engine) || Option.isSome(current.provisioning) || Option.isSome(current.starting) ||
-          current.disposing
+          current.disposing || current.backingOff || current.exhausted
         ) {
           return Effect.void
         }
@@ -349,6 +392,59 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
         )
       })
 
+      // One schedule run spans a failure streak, so consecutive failures step the same run and
+      // its delays grow; the step is discarded when a health probe passes, which starts the next
+      // streak on a fresh run.
+      const kickAfterBackoff: Effect.Effect<void> = Effect.suspend(() => {
+        const current = Ref.getUnsafe(state)
+        if (current.failures === 0) return kickProvisioning
+        if (current.exhausted) return Effect.void
+        const acquireStep = current.retryStep !== undefined
+          ? Effect.succeed(current.retryStep)
+          : Schedule.toStepWithSleep(retrySchedule).pipe(
+            Effect.tap((made) =>
+              Effect.sync(() => {
+                current.retryStep = made
+              })
+            )
+          )
+        current.retryGeneration += 1
+        const generation = current.retryGeneration
+        current.backingOff = true
+        return acquireStep.pipe(
+          Effect.flatMap((step) =>
+            Pull.matchEffect(step(undefined), {
+              onSuccess: () => Queue.offer(events, { _tag: "BackoffElapsed", generation }),
+              onDone: () => Queue.offer(events, { _tag: "RetryExhausted", generation }),
+              onFailure: (cause) =>
+                Cause.hasInterruptsOnly(cause)
+                  ? Effect.failCause(cause)
+                  : Effect.logError("replica engine retry schedule failed", cause).pipe(
+                    Effect.andThen(Queue.offer(events, { _tag: "RetryExhausted", generation }))
+                  )
+            })
+          ),
+          Effect.forkIn(layerScope),
+          Effect.asVoid
+        )
+      })
+
+      const noteEngineFailure = (candidate?: MessagePort): Effect.Effect<void> =>
+        Effect.suspend(() => {
+          const current = Ref.getUnsafe(state)
+          current.failures += 1
+          if (current.failures < failureBudget) return Effect.void
+          const message =
+            `the replica engine failed ${current.failures} consecutive times and keeps retrying with backoff`
+          const reason = { _tag: "EngineProvisionFailing", failures: current.failures }
+          const posts: Array<Effect.Effect<void>> = []
+          if (candidate !== undefined) posts.push(postOwnerError(candidate, message, reason))
+          for (const client of current.clients.values()) {
+            if (client.controlPort !== candidate) posts.push(postOwnerError(client.controlPort, message, reason))
+          }
+          return Effect.forEach(posts, (effect) => effect, { discard: true })
+        })
+
       const scheduleHealthChecks = (epoch: number): Effect.Effect<void> =>
         Effect.suspend(() => {
           const current = Ref.getUnsafe(state)
@@ -366,7 +462,7 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
           Effect.ignore
         )
 
-      const resetEngine = (reason: string): Effect.Effect<void> =>
+      const resetEngine = (reason: string, mode?: { readonly failure: boolean }): Effect.Effect<void> =>
         Effect.suspend(() => {
           const current = Ref.getUnsafe(state)
           if (Option.isNone(current.engine) || current.disposing) return Effect.void
@@ -385,6 +481,7 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
           return Effect.logInfo("replica owner engine reset").pipe(
             Effect.annotateLogs({ reason, epoch: engine.epoch, ownerId: engine.ownerId }),
             Effect.andThen(Effect.forEach(reattach, (effect) => effect, { discard: true })),
+            Effect.andThen(mode?.failure === true ? noteEngineFailure() : Effect.void),
             Effect.andThen(
               disposeEngine(engine, Exit.void).pipe(
                 Effect.andThen(Queue.offer(events, { _tag: "EngineDisposed", epoch: engine.epoch })),
@@ -419,6 +516,12 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                   // A fresh attach is a fresh signal: a tab dropped or passed over in an earlier
                   // provisioning round becomes eligible to provide again.
                   current.tried.delete(event.controlPort)
+                  if (current.exhausted) {
+                    // An attach after exhaustion means the app reloaded or opened a new tab, so
+                    // the retry schedule starts a new run.
+                    current.exhausted = false
+                    current.retryStep = undefined
+                  }
                   if (Option.isNone(current.engine)) {
                     return kickProvisioning
                   }
@@ -537,7 +640,8 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                 return Effect.logWarning("replica engine start failed").pipe(
                   Effect.annotateLogs({ cause: Cause.pretty(event.exit.cause) }),
                   Effect.andThen(post(event.candidate, { _tag: "ProvisionRejected", nonce: event.nonce })),
-                  Effect.andThen(kickProvisioning)
+                  Effect.andThen(noteEngineFailure(event.candidate)),
+                  Effect.andThen(kickAfterBackoff)
                 )
               }
               if (!current.clients.has(event.candidate)) {
@@ -630,20 +734,25 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                 Effect.sync(() => {
                   engine.health.lastRoundTripAt = now
                   engine.health.probeStartedAt = undefined
+                  // A settled periodic probe is the healthy signal that ends the failure streak.
+                  // The start round trip must not: an engine that crashes right after starting
+                  // would defeat the backoff.
+                  current.failures = 0
+                  current.retryStep = undefined
                 }))
             }
             case "HealthFailed": {
               if (Option.isNone(current.engine) || current.engine.value.epoch !== event.epoch) {
                 return Effect.void
               }
-              return resetEngine("the database worker health check failed")
+              return resetEngine("the database worker health check failed", { failure: true })
             }
             case "AttachVerified": {
               if (Option.isNone(current.engine) || current.engine.value.epoch !== event.epoch) {
                 return Effect.void
               }
               if (!event.ok) {
-                return resetEngine("the database worker health check failed")
+                return resetEngine("the database worker health check failed", { failure: true })
               }
               const client = current.clients.get(event.controlPort)
               if (client === undefined || client.rpcPort === undefined) return Effect.void
@@ -653,7 +762,28 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
               if (event.epoch !== current.epoch) return Effect.void
               current.disposing = false
               current.tried.clear()
+              return kickAfterBackoff
+            }
+            case "BackoffElapsed": {
+              if (event.generation !== current.retryGeneration || !current.backingOff) return Effect.void
+              current.backingOff = false
               return kickProvisioning
+            }
+            case "RetryExhausted": {
+              if (event.generation !== current.retryGeneration || !current.backingOff) return Effect.void
+              current.backingOff = false
+              current.exhausted = true
+              const message =
+                `the replica engine failed ${current.failures} consecutive times and the retry schedule is exhausted; provisioning is stopped until a tab attaches again`
+              const reason = { _tag: "EngineProvisionExhausted", failures: current.failures }
+              const posts: Array<Effect.Effect<void>> = []
+              for (const client of current.clients.values()) {
+                posts.push(postOwnerError(client.controlPort, message, reason))
+              }
+              return Effect.logWarning("replica engine provisioning exhausted").pipe(
+                Effect.annotateLogs({ failures: current.failures }),
+                Effect.andThen(Effect.forEach(posts, (effect) => effect, { discard: true }))
+              )
             }
           }
         })

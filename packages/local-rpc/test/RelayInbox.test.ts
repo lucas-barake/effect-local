@@ -375,7 +375,15 @@ describe("RelayInbox", () => {
       )
     }).pipe(
       Effect.provide(relay({
-        entity: { maxConcurrentChannels: 1, sessionDeadline: Duration.hours(2) }
+        entity: {
+          maxConcurrentChannels: 1,
+          sessionDeadline: Duration.hours(2),
+          // Must exceed the 60s the clock jumps per settlement: the transport can already hold
+          // the next delivery attempt when the clock moves, and a deadline inside the jump
+          // abandons that attempt, so its redelivered claim token no longer matches the one the
+          // recipient is settling with.
+          settleDeadline: Duration.minutes(2)
+        }
       }))
     ))
 
@@ -786,7 +794,7 @@ describe("RelayInbox", () => {
         outcome: "Acknowledged"
       })
       const store = yield* RelayInboxStore.RelayInboxStore
-      assert.strictEqual((yield* store.pendingHeads(inboxKey, { limit: 10 })).length, 0)
+      assert.strictEqual((yield* store.pendingHeads(inboxKey, { limit: 10, now: 0 })).length, 0)
     }).pipe(Effect.provide(layer)))
 
   it.effect("does not charge a delivery the recipient never took", () =>

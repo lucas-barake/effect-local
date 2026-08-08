@@ -700,7 +700,7 @@ describe("relay custody against a real relay", () => {
         })))
 
         const recipientInbox = yield* inboxKeyOf(remotePrincipal, backend.crypto)
-        const exhausted = yield* backend.store.pendingHeads(recipientInbox, { limit: 10 }).pipe(Effect.orDie)
+        const exhausted = yield* backend.store.pendingHeads(recipientInbox, { limit: 10, now: 0 }).pipe(Effect.orDie)
         assert.isAbove(exhausted.length, 0, "the unsettled head stays pending")
         assert.isAbove(exhausted[0]!.deliveries, 0, "the failed session spent the head's budget")
 
