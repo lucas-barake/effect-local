@@ -575,6 +575,87 @@ describe("relay custody against a real relay", () => {
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
+  it.effect("drains a large pre-existing backlog into a fresh recipient session", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const backend = yield* relayBackend
+        const senderClient = yield* backend.clientFor("local")
+        const recipientClient = yield* backend.clientFor("remote")
+        const { documentId, recipient, sender } = yield* seedPair
+        yield* TestClock.adjust(5000)
+
+        // The recipient is offline for all of it, so every push files one Pending message into
+        // its inbox: the polluted-inbox shape a fresh client faces after its peer worked alone.
+        const total = 50
+        yield* Effect.scoped(Effect.gen(function*() {
+          const session = yield* RpcPeerTransport.makeSession(
+            senderClient,
+            transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
+          ).pipe(Effect.provideContext(sender.context))
+          for (let index = 0; index < total; index++) {
+            yield* sender.replica.mutate(AddLabel, {
+              commandId: yield* Identity.makeCommandId,
+              documentId,
+              payload: `label-${index}`
+            })
+            yield* session.markDirty(documentId)
+            yield* session.flush
+            yield* TestClock.adjust(100)
+          }
+        }))
+        const recipientInbox = yield* inboxKeyOf(remotePrincipal, backend.crypto)
+        const senderInbox = yield* inboxKeyOf(localPrincipal, backend.crypto)
+        const flooded = yield* backend.store.usage(recipientInbox).pipe(Effect.orDie)
+        assert.isAbove(flooded.pendingCount, 1, "the backlog holds more than a coalesced message")
+
+        yield* Effect.scoped(Effect.gen(function*() {
+          yield* RpcPeerTransport.makeSession(
+            recipientClient,
+            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
+          ).pipe(Effect.provideContext(recipient.context))
+
+          // The fresh session must drain the whole backlog by itself: apply and settle every
+          // message, one channel head at a time, without the session dying. The drain is
+          // stop-and-wait, so it rendezvouses on the store's pending count rather than a fixed
+          // sleep; the iteration bound only guards a broken drain.
+          let remaining = flooded.pendingCount
+          for (let round = 0; round < 200 && remaining > 0; round++) {
+            yield* TestClock.adjust(1000)
+            remaining = (yield* backend.store.usage(recipientInbox).pipe(Effect.orDie)).pendingCount
+          }
+          assert.strictEqual(remaining, 0, "the whole backlog settled")
+
+          // The backlog alone cannot converge the document: sync messages generated against a
+          // silent peer only announce state, and the changes travel once the sender processes
+          // the replies the drain filed into its inbox. The sender coming back completes it.
+          yield* RpcPeerTransport.makeSession(
+            senderClient,
+            transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
+          ).pipe(Effect.provideContext(sender.context))
+
+          const expected = Array.from({ length: total }, (_, index) => `label-${index}`).toSorted()
+          let labels: ReadonlyArray<string> = []
+          for (let round = 0; round < 300; round++) {
+            yield* TestClock.adjust(1000)
+            labels = (yield* recipient.store.load(Task, documentId).pipe(Effect.orDie)).encoded.labels
+            if (labels.length !== total) continue
+            const senderPending = (yield* backend.store.usage(senderInbox).pipe(Effect.orDie)).pendingCount
+            const recipientPending = (yield* backend.store.usage(recipientInbox).pipe(Effect.orDie)).pendingCount
+            if (senderPending === 0 && recipientPending === 0) break
+          }
+          assert.deepStrictEqual([...labels].toSorted(), expected)
+          assert.strictEqual(
+            (yield* backend.store.usage(senderInbox).pipe(Effect.orDie)).pendingCount,
+            0
+          )
+          assert.strictEqual(
+            (yield* backend.store.usage(recipientInbox).pipe(Effect.orDie)).pendingCount,
+            0
+          )
+        }))
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
   it.effect("replays an outbox entry the session that admitted it never handed over", () =>
     Effect.scoped(
       Effect.gen(function*() {
