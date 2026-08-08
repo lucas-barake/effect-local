@@ -642,4 +642,84 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
         Effect.scoped
       )
     }))
+
+  it.effect("keeps serving while a long transaction delays the health round trip", () =>
+    Effect.gen(function*() {
+      const started: Array<StartedEngine> = []
+      yield* Effect.gen(function*() {
+        const tab = yield* attachTab
+        yield* acceptNextProvision(tab)
+        yield* takeFrame(tab, "ProvisionAccepted")
+        yield* takeFrame(tab, "Attached")
+
+        // A backlog drain holds the client's single connection permit through long write
+        // transactions. The health probe queues behind it: late, but the database is alive.
+        assert.strictEqual(started.length, 1)
+        const context = yield* started[0].runtime.contextEffect
+        const release = yield* Deferred.make<void>()
+        const held = yield* Deferred.make<void>()
+        const busy = yield* Effect.gen(function*() {
+          const sql = yield* SqlClient.SqlClient
+          yield* sql.withTransaction(
+            Deferred.succeed(held, undefined).pipe(Effect.andThen(Deferred.await(release)))
+          )
+        }).pipe(Effect.provide(context), Effect.forkChild)
+        yield* Deferred.await(held)
+
+        // Far past the probe timeout, still well under the round-trip deadline.
+        yield* TestClock.adjust("1 second")
+        yield* TestClock.adjust("1 second")
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(busy)
+        yield* TestClock.adjust("100 millis")
+
+        assert.isFalse(tab.receivedTags.includes("Reattach"))
+        const lease = yield* openSession(tab.rpcChannel.port2)
+        assert.isTrue(lease.ownerEpoch.length > 0)
+      }).pipe(
+        Effect.provide(coordinatorLayer(started)),
+        Effect.scoped
+      )
+    }))
+
+  it.effect("resets an engine whose round trips never complete within the deadline", () =>
+    Effect.gen(function*() {
+      const started: Array<StartedEngine> = []
+      const Coordinator = OwnershipCoordinator.layerSharedWorker({
+        name: "effect-local-ownership-deadline-test",
+        definition,
+        engine: makeEngineFactory(started, ":memory:"),
+        info: ownerInfo,
+        provisionTimeout: "500 millis",
+        engineStartTimeout: "5 seconds",
+        engineDisposeTimeout: "100 millis",
+        healthCheck: { interval: "100 millis", timeout: "200 millis", deadline: "1 second" }
+      })
+      yield* Effect.gen(function*() {
+        const tab = yield* attachTab
+        yield* acceptNextProvision(tab)
+        yield* takeFrame(tab, "ProvisionAccepted")
+        yield* takeFrame(tab, "Attached")
+
+        // The connection wedges: the transaction never commits and never fails, so the probe
+        // can only hang. This is indistinguishable from a dead database worker and must reset.
+        assert.strictEqual(started.length, 1)
+        const context = yield* started[0].runtime.contextEffect
+        const held = yield* Deferred.make<void>()
+        yield* Effect.gen(function*() {
+          const sql = yield* SqlClient.SqlClient
+          yield* sql.withTransaction(
+            Deferred.succeed(held, undefined).pipe(Effect.andThen(Effect.never))
+          )
+        }).pipe(Effect.provide(context), Effect.forkChild)
+        yield* Deferred.await(held)
+
+        yield* TestClock.adjust("1 second")
+        yield* TestClock.adjust("200 millis")
+        yield* takeFrame(tab, "Reattach")
+      }).pipe(
+        Effect.provide(Coordinator),
+        Effect.scoped
+      )
+    }))
 })

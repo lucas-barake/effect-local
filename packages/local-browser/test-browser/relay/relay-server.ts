@@ -107,6 +107,7 @@ const Relay = RelayServer.layer({
     terminalRetention: Duration.minutes(60),
     sessionDeadline: Duration.seconds(90),
     sessionSweep: Duration.seconds(5),
+    settleDeadline: Duration.minutes(2),
     maxConcurrentChannels: 8,
     storeRetry: Duration.seconds(1),
     maxPendingMessages: 1_000,

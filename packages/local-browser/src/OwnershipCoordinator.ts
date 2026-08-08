@@ -9,6 +9,7 @@ import type * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/Rela
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as Cause from "effect/Cause"
+import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Duration from "effect/Duration"
@@ -71,9 +72,19 @@ export interface SharedWorkerOptions<E, A, E2,> {
   readonly provisionTimeout?: Duration.Input | undefined
   readonly engineStartTimeout?: Duration.Input | undefined
   readonly engineDisposeTimeout?: Duration.Input | undefined
+  /**
+   * Liveness policy for the database worker behind the engine. A probe is one `SELECT 1` round
+   * trip through the engine's own `SqlClient` and therefore queues behind the engine's regular
+   * SQL work: under a heavy write burst, such as a relay backlog drain, a probe completes late
+   * even though the worker is perfectly healthy. `interval` paces probes, with at most one in
+   * flight at a time. A probe outstanding past `timeout` logs a warning. The engine is reset
+   * only when no round trip has completed within `deadline`, or when a probe fails outright,
+   * which means the database worker is gone or broken rather than busy.
+   */
   readonly healthCheck?: {
     readonly interval?: Duration.Input | undefined
     readonly timeout?: Duration.Input | undefined
+    readonly deadline?: Duration.Input | undefined
   } | undefined
 }
 
@@ -101,9 +112,16 @@ interface EngineSnapshot {
   readonly info: unknown
 }
 
+interface EngineHealth {
+  lastRoundTripAt: number
+  probeStartedAt: number | undefined
+  warned: boolean
+}
+
 interface LiveEngine extends EngineSnapshot {
   readonly epoch: number
   readonly provider: MessagePort
+  readonly health: EngineHealth
 }
 
 interface Provisioning {
@@ -142,6 +160,7 @@ type CoordinatorEvent =
     readonly exit: Exit.Exit<EngineSnapshot, unknown>
   }
   | { readonly _tag: "HealthProbe"; readonly epoch: number }
+  | { readonly _tag: "HealthProbeSettled"; readonly epoch: number }
   | { readonly _tag: "HealthFailed"; readonly epoch: number }
   | {
     readonly _tag: "AttachVerified"
@@ -185,6 +204,9 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
       )
       const healthTimeoutMillis = Duration.toMillis(
         Duration.fromInputUnsafe(options.healthCheck?.timeout ?? "5 seconds")
+      )
+      const healthDeadlineMillis = Duration.toMillis(
+        Duration.fromInputUnsafe(options.healthCheck?.deadline ?? "30 seconds")
       )
 
       const events = yield* Queue.unbounded<CoordinatorEvent>()
@@ -402,10 +424,11 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                   }
                   // A tab is never attached to an unverified engine: the database worker is
                   // probed through the engine itself before this tab is served, so a dead
-                  // database behind a live control channel cannot hand out a stale owner.
+                  // database behind a live control channel cannot hand out a stale owner. The
+                  // verification has no timeout of its own: a busy engine serves the tab late,
+                  // and a dead one is reset by the periodic round-trip deadline.
                   const engine = current.engine.value
                   return provideRuntime(engine.runtime, healthProbe).pipe(
-                    Effect.timeout(healthTimeoutMillis),
                     Effect.flatMap((result) =>
                       Queue.offer(events, {
                         _tag: "AttachVerified",
@@ -524,50 +547,90 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                   Effect.asVoid
                 )
               }
-              const engine: LiveEngine = {
-                ...event.exit.value,
-                epoch: event.epoch,
-                provider: event.candidate
-              }
-              current.engine = Option.some(engine)
-              current.tried.clear()
-              const serves: Array<Effect.Effect<void>> = []
-              for (const client of current.clients.values()) {
-                if (client.rpcPort !== undefined) serves.push(serve(client, engine))
-              }
-              return post(event.candidate, { _tag: "ProvisionAccepted", nonce: event.nonce }).pipe(
-                Effect.andThen(Effect.forEach(serves, (serveEffect) => serveEffect, { discard: true })),
-                Effect.andThen(
-                  Effect.sleep(healthIntervalMillis).pipe(
-                    Effect.andThen(scheduleHealthChecks(engine.epoch)),
-                    Effect.forkIn(layerScope)
-                  )
-                ),
-                Effect.asVoid
-              )
+              const snapshot = event.exit.value
+              return Effect.flatMap(Clock.currentTimeMillis, (now) => {
+                const engine: LiveEngine = {
+                  ...snapshot,
+                  epoch: event.epoch,
+                  provider: event.candidate,
+                  // The start itself just proved a round trip, so the deadline counts from here.
+                  health: { lastRoundTripAt: now, probeStartedAt: undefined, warned: false }
+                }
+                current.engine = Option.some(engine)
+                current.tried.clear()
+                const serves: Array<Effect.Effect<void>> = []
+                for (const client of current.clients.values()) {
+                  if (client.rpcPort !== undefined) serves.push(serve(client, engine))
+                }
+                return post(event.candidate, { _tag: "ProvisionAccepted", nonce: event.nonce }).pipe(
+                  Effect.andThen(Effect.forEach(serves, (serveEffect) => serveEffect, { discard: true })),
+                  Effect.andThen(
+                    Effect.sleep(healthIntervalMillis).pipe(
+                      Effect.andThen(scheduleHealthChecks(engine.epoch)),
+                      Effect.forkIn(layerScope)
+                    )
+                  ),
+                  Effect.asVoid
+                )
+              })
             }
             case "HealthProbe": {
               if (Option.isNone(current.engine) || current.engine.value.epoch !== event.epoch) {
                 return Effect.void
               }
               const engine = current.engine.value
-              return provideRuntime(engine.runtime, healthProbe).pipe(
-                Effect.timeout(healthTimeoutMillis),
-                Effect.flatMap((result) =>
-                  Option.isSome(result)
-                    ? Effect.void
-                    : Queue.offer(events, { _tag: "HealthFailed", epoch: engine.epoch })
-                ),
-                // A failed or defecting database round trip means the database worker is gone or
-                // broken; both are takeover conditions. Interruption passes through untouched.
-                Effect.catchCause((cause) =>
-                  Cause.hasInterruptsOnly(cause)
-                    ? Effect.failCause(cause)
-                    : Queue.offer(events, { _tag: "HealthFailed", epoch: engine.epoch })
-                ),
-                Effect.forkIn(layerScope),
-                Effect.asVoid
-              )
+              return Effect.flatMap(Clock.currentTimeMillis, (now) => {
+                const health = engine.health
+                if (health.probeStartedAt !== undefined) {
+                  // The probe shares the engine's single connection queue, so it cannot tell a
+                  // busy worker from a dead one by lateness alone: only a round trip that never
+                  // completes within the deadline is death. Plain lateness is worth a warning,
+                  // once per probe, because it usually means a long drain is in progress.
+                  if (now - health.lastRoundTripAt >= healthDeadlineMillis) {
+                    return Queue.offer(events, { _tag: "HealthFailed", epoch: engine.epoch })
+                  }
+                  if (!health.warned && now - health.probeStartedAt >= healthTimeoutMillis) {
+                    health.warned = true
+                    return Effect.logWarning("replica database round trip is delayed").pipe(
+                      Effect.annotateLogs({
+                        epoch: engine.epoch,
+                        ownerId: engine.ownerId,
+                        delayedMillis: now - health.probeStartedAt
+                      })
+                    )
+                  }
+                  return Effect.void
+                }
+                health.probeStartedAt = now
+                health.warned = false
+                return provideRuntime(engine.runtime, healthProbe).pipe(
+                  Effect.flatMap((result) =>
+                    Option.isSome(result)
+                      ? Queue.offer(events, { _tag: "HealthProbeSettled", epoch: engine.epoch })
+                      : Queue.offer(events, { _tag: "HealthFailed", epoch: engine.epoch })
+                  ),
+                  // A failed or defecting database round trip means the database worker is gone or
+                  // broken; both are takeover conditions. Interruption passes through untouched.
+                  Effect.catchCause((cause) =>
+                    Cause.hasInterruptsOnly(cause)
+                      ? Effect.failCause(cause)
+                      : Queue.offer(events, { _tag: "HealthFailed", epoch: engine.epoch })
+                  ),
+                  Effect.forkIn(layerScope),
+                  Effect.asVoid
+                )
+              })
+            }
+            case "HealthProbeSettled": {
+              if (Option.isNone(current.engine) || current.engine.value.epoch !== event.epoch) {
+                return Effect.void
+              }
+              const engine = current.engine.value
+              return Effect.flatMap(Clock.currentTimeMillis, (now) =>
+                Effect.sync(() => {
+                  engine.health.lastRoundTripAt = now
+                  engine.health.probeStartedAt = undefined
+                }))
             }
             case "HealthFailed": {
               if (Option.isNone(current.engine) || current.engine.value.epoch !== event.epoch) {
