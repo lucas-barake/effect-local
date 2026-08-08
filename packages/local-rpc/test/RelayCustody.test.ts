@@ -577,6 +577,71 @@ describe("relay custody against a real relay", () => {
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
+  it.effect("carries a multi-change message through the relay", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const backend = yield* relayBackend()
+        const senderClient = yield* backend.clientFor("local")
+        const recipientClient = yield* backend.clientFor("remote")
+        const { documentId, recipient, sender } = yield* seedPair
+        yield* TestClock.adjust(5000)
+
+        const sessions = Effect.gen(function*() {
+          yield* RpcPeerTransport.makeSession(
+            recipientClient,
+            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
+          ).pipe(Effect.provideContext(recipient.context))
+          const senderSession = yield* RpcPeerTransport.makeSession(
+            senderClient,
+            transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
+          ).pipe(Effect.provideContext(sender.context))
+          yield* senderSession.markDirty(documentId)
+          yield* senderSession.flush
+          yield* TestClock.adjust(5000)
+        })
+
+        // A first live exchange, then everyone disconnects.
+        yield* sender.replica.mutate(AddLabel, {
+          commandId: yield* Identity.makeCommandId,
+          documentId,
+          payload: "opening"
+        })
+        yield* Effect.scoped(sessions)
+
+        // Two commits while offline. A live session pushes every commit as its own single-change
+        // message, so this is the only way a real client ever accumulates a multi-change sync
+        // message: automerge's v2 protocol concatenates all of them into a single chunk that
+        // cannot be decoded change by change. Any app that commits offline, or whose peer
+        // reconnects with a fresh sync state, produces this shape.
+        for (const label of ["first-of-batch", "second-of-batch"]) {
+          yield* recipient.replica.mutate(AddLabel, {
+            commandId: yield* Identity.makeCommandId,
+            documentId,
+            payload: label
+          })
+        }
+
+        // Both sides return; the recipient's reply to the sender's announcement must carry both
+        // offline commits in one message.
+        yield* Effect.scoped(sessions)
+
+        const senderLoaded = yield* sender.store.load(Task, documentId).pipe(Effect.orDie)
+        assert.deepStrictEqual(
+          [...senderLoaded.encoded.labels].toSorted(),
+          ["first-of-batch", "opening", "second-of-batch"],
+          "the batched reply reached the sender"
+        )
+        for (const principal of [localPrincipal, remotePrincipal]) {
+          assert.deepStrictEqual(
+            yield* backend.store
+              .pendingHeads(yield* inboxKeyOf(principal, backend.crypto), { limit: 10, now: 0 })
+              .pipe(Effect.orDie),
+            []
+          )
+        }
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
   it.effect("drains a large pre-existing backlog into a fresh recipient session", () =>
     Effect.scoped(
       Effect.gen(function*() {

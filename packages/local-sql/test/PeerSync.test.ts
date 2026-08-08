@@ -28,6 +28,7 @@ import { join } from "node:path"
 import * as Compaction from "../src/Compaction.js"
 import * as DocumentStore from "../src/DocumentStore.js"
 import * as InternalAutomerge from "../src/internal/automerge.js"
+import * as SyncChunks from "../src/internal/syncChunks.js"
 import * as PeerRelayReceiptLimits from "../src/PeerRelayReceiptLimits.js"
 import * as PeerSync from "../src/PeerSync.js"
 import * as Recovery from "../src/Recovery.js"
@@ -194,21 +195,10 @@ describe("PeerSync", () => {
     writerSchemaVersion = Task.version,
     writerDefinitionHash = definition.hash
   ) => {
-    const hashes = new Set<string>()
-    for (const chunk of Automerge.decodeSyncMessage(message).changes) {
-      try {
-        hashes.add(Automerge.decodeChange(chunk).hash)
-      } catch {
-        const document = Automerge.load(chunk)
-        try {
-          for (const bytes of Automerge.getAllChanges(document)) {
-            hashes.add(Automerge.decodeChange(bytes).hash)
-          }
-        } finally {
-          Automerge.free(document)
-        }
-      }
-    }
+    const hashes = new Set(
+      SyncChunks.decodeSyncChanges(Automerge.decodeSyncMessage(message).changes)
+        .map((change) => change.hash)
+    )
     return [...hashes].toSorted().map((changeHash) => ({
       changeHash,
       writerSchemaVersion,
@@ -755,6 +745,84 @@ describe("PeerSync", () => {
       }])
       InternalAutomerge.free(reloaded.automerge)
       InternalAutomerge.free(remote)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(TestLayer)))
+
+  it.effect("enqueues a reply that batches several changes for a stale peer", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+
+      // A first peer contributes a deep shared history, then two more changes on top of it, so
+      // this replica ends up holding exactly two changes a stale copy of that history lacks.
+      let remote = Automerge.clone(created.automerge, { actor: "1".repeat(32) })
+      for (let index = 0; index < 8; index++) {
+        remote = Automerge.change(remote, (draft) => {
+          const value = draft.value as { title: string; labels: Array<string> }
+          value.labels.push(`base-${index}`)
+        })
+      }
+      const firstPeer = yield* Identity.makePeerId
+      const firstSession = yield* sync.open(firstPeer)
+      let remoteState = Automerge.initSyncState()
+      let sequence = 0
+      const drain = Effect.gen(function*() {
+        while (sequence < 20) {
+          const [nextState, message] = Automerge.generateSyncMessage(remote, remoteState)
+          remoteState = nextState
+          if (message === null) return
+          const received = yield* sync.receive(Task, documentId, firstSession, {
+            remoteConnectionEpoch: firstSession.connectionEpoch,
+            receiveSequence: sequence++,
+            lineage: Identity.genesisLineage,
+            message,
+            writerProvenance: provenanceFor(message)
+          })
+          if (received.reply !== null) {
+            const advanced = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
+            remote = advanced[0]
+            remoteState = advanced[1]
+          }
+        }
+      })
+      yield* drain
+      const staleDocument = Automerge.clone(remote, { actor: "2".repeat(32) })
+      for (const label of ["from-remote-1", "from-remote-2"]) {
+        remote = Automerge.change(remote, (draft) => {
+          const value = draft.value as { title: string; labels: Array<string> }
+          value.labels.push(label)
+        })
+      }
+      yield* drain
+
+      // A peer holding the shared history but not the two newest changes announces itself. The
+      // reply must carry exactly those two changes, and automerge's v2 sync protocol
+      // concatenates them into one chunk - the shape every reply takes when the peer is more
+      // than one change behind, which is any peer that was offline while this replica kept
+      // committing. (A peer missing MORE than a third of the history gets a whole-document
+      // chunk instead, which decodes standalone.)
+      const stalePeer = yield* Identity.makePeerId
+      const staleSession = yield* sync.open(stalePeer)
+      const [, announce] = Automerge.generateSyncMessage(staleDocument, Automerge.initSyncState())
+      assert.isNotNull(announce)
+      const received = yield* sync.receive(Task, documentId, staleSession, {
+        remoteConnectionEpoch: staleSession.connectionEpoch,
+        receiveSequence: 0,
+        lineage: Identity.genesisLineage,
+        message: announce!,
+        writerProvenance: provenanceFor(announce!)
+      })
+      assert.isNotNull(received.reply)
+      const outbound = yield* sync.enqueue(staleSession, received.reply!)
+      assert.isAtLeast(
+        outbound.writerProvenance.length,
+        2,
+        "the batched reply's provenance covers every change it carries"
+      )
+      Automerge.free(remote)
+      Automerge.free(staleDocument)
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(TestLayer)))
 
