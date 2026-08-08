@@ -15,13 +15,17 @@ import * as Effect from "effect/Effect"
 
 export const tenantId = "chat-demo"
 
+declare const __ENGINE_GENERATION__: string | undefined
+
 /**
- * Part of the SharedWorker name, so bumping it forces every tab onto a fresh worker. A
+ * Part of the SharedWorker name, so a new value forces every tab onto a fresh worker. A
  * SharedWorker keeps the module graph it was born with, and browsers may keep it alive longer
- * than its last tab, so engine code changes during development do not reach a surviving worker
- * until its identity changes. The OPFS database name stays version free — data survives bumps.
+ * than its last tab, so engine code changes never reach a surviving worker until its identity
+ * changes. Vite defines the value at process start (see vite.config.ts), so every dev-server
+ * restart and every production build mints a fresh generation on its own. The OPFS database name
+ * stays version free — data survives generations.
  */
-export const engineGeneration = 2
+export const engineGeneration = typeof __ENGINE_GENERATION__ === "string" ? __ENGINE_GENERATION__ : "0"
 
 export const relayPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-00000000ffff")
 

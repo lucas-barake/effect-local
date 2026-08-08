@@ -9,6 +9,12 @@ const wasmPath = fileURLToPath(
 
 export default defineConfig({
   root: fileURLToPath(new URL(".", import.meta.url)),
+  // Stamped once per vite process, this names the SharedWorker generation: every dev-server
+  // restart or production build moves tabs onto fresh workers instead of letting them reattach
+  // to survivors running an older module graph.
+  define: {
+    __ENGINE_GENERATION__: JSON.stringify(Date.now().toString(36))
+  },
   // Crawl every entry at startup. Without this the dev server discovers worker dependencies only
   // after the first page load, re-optimizes, and forces a reload that tears down the SharedWorker.
   optimizeDeps: {
