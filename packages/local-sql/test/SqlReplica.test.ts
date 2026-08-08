@@ -848,6 +848,99 @@ describe("SqlReplica", () => {
         assert.isTrue(invalidated)
       }).pipe(Effect.scoped, Effect.provide(services))
     }))
+
+  it.effect("publishes a commit whose mutate fiber was interrupted right after the transaction committed", () =>
+    Effect.gen(function*() {
+      const parked = yield* Deferred.make<void>()
+      const release = yield* Latch.make()
+      let armed = false
+      const database = Layer.merge(
+        SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+        NodeCrypto.layer
+      )
+      const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provideMerge(database))
+      const infrastructure = Layer.merge(bootstrap, Limits)
+      const gate = ReplicaGate.layer.pipe(Layer.provideMerge(infrastructure))
+      const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
+      const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
+      const projections = ProjectionStore.layer([]).pipe(Layer.provideMerge(store))
+      const health = ReplicaHealth.layer(definition, ReplicaHealth.defaultOptions).pipe(Layer.provideMerge(projections))
+      const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(health))
+      const queries = QueryExecutor.layer(definition).pipe(
+        Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
+      )
+      // The mutate fiber's inline publishPending call parks here so the interrupt lands at the
+      // first interruptible point after COMMIT; the poller forked inside CommitPublisher.layer
+      // keeps the real implementation and must recover the commit on its own.
+      const publisher = Layer.effect(
+        CommitPublisher.CommitPublisher,
+        Effect.gen(function*() {
+          const real = yield* CommitPublisher.CommitPublisher
+          return CommitPublisher.CommitPublisher.of({
+            ...real,
+            publishPending: Effect.suspend(() =>
+              armed
+                ? Deferred.succeed(parked, undefined).pipe(
+                  Effect.andThen(release.await),
+                  Effect.andThen(real.publishPending)
+                )
+                : real.publishPending
+            )
+          })
+        })
+      ).pipe(Layer.provideMerge(CommitPublisher.layer.pipe(Layer.provideMerge(queries))))
+      const deliveryStore = CommandDeliveryStore.layer.pipe(Layer.provideMerge(gate))
+      const deliveryPublisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
+        Layer.provideMerge(deliveryStore)
+      )
+      const backups = BackupStore.layer(definition).pipe(
+        Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
+      )
+      const direct = SqlReplica.layerFromServices(definition).pipe(
+        Layer.provideMerge(Layer.mergeAll(backups, deliveryStore, deliveryPublisher))
+      )
+      const services = Layer.merge(direct, Reactivity.layer).pipe(Layer.provide(Handler))
+
+      yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const sql = yield* SqlClient.SqlClient
+        const publisherService = yield* CommitPublisher.CommitPublisher
+        const created = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "before" }
+        })
+        const subscription = yield* publisherService.subscribe
+        armed = true
+        const mutate = yield* replica.mutate(Rename, {
+          commandId: yield* Identity.makeCommandId,
+          documentId: created,
+          payload: "after"
+        }).pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Deferred.await(parked)
+        yield* Fiber.interrupt(mutate)
+        assert.isTrue(Exit.hasInterrupts(yield* Fiber.await(mutate)))
+        armed = false
+
+        // The transaction committed before the fiber parked: the write is durable but its outbox
+        // row is still unpublished — the state the interrupted caller leaves behind.
+        assert.strictEqual((yield* replica.get(Task, created)).value.title, "after")
+        const pending = yield* sql`SELECT commit_sequence FROM effect_local_commit_outbox
+          WHERE document_id = ${created} AND published = 0`
+        assert.strictEqual(pending.length, 1)
+
+        // The background poller, not any request fiber, must publish it.
+        yield* TestClock.adjust("1 second")
+        const event = yield* subscription.events.pipe(
+          Stream.filter((candidate) => candidate._tag === "Commit" && candidate.documentId === created),
+          Stream.runHead
+        )
+        assert.isTrue(Option.isSome(event))
+        const published = yield* sql`SELECT commit_sequence FROM effect_local_commit_outbox
+          WHERE document_id = ${created} AND published = 0`
+        assert.strictEqual(published.length, 0)
+        yield* release.open
+      }).pipe(Effect.scoped, Effect.provide(services))
+    }))
   const statusServices = Effect.gen(function*() {
     const database = Layer.merge(
       SqliteClient.layer({ filename: ":memory:", disableWAL: true }),

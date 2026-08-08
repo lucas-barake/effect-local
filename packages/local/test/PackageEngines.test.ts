@@ -41,9 +41,13 @@ const workspacePackages = JSON.parse(
   })
 ) as ReadonlyArray<WorkspacePackage>
 
-const packageDirectories = readdirSync(packagesDirectory, { withFileTypes: true })
-  .filter((entry) => entry.isDirectory())
-  .map((entry) => join(packagesDirectory, entry.name))
+const examplesDirectory = join(repoRoot, "examples")
+
+const packageDirectories = [packagesDirectory, examplesDirectory].flatMap((parent) =>
+  readdirSync(parent, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => join(parent, entry.name))
+)
 
 const packageDirectoryManifests = packageDirectories.map((directory) => ({
   directory,

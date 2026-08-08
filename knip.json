@@ -18,6 +18,20 @@
     },
     "packages/local-test": {
       "ignoreDependencies": ["@effect/platform-node-shared"]
+    },
+    "examples/chat": {
+      "entry": [
+        "src/main.tsx",
+        "src/opfs.worker.ts",
+        "src/replica.shared-worker.ts",
+        "src/replica.shared-worker-runtime.ts",
+        "server/main.ts",
+        "server/reset-test-db.ts",
+        "tests/*.spec.ts",
+        "vite.config.ts",
+        "playwright.config.ts"
+      ],
+      "ignoreDependencies": ["tsx"]
     }
   }
 }

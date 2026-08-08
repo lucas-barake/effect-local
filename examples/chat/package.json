@@ -1,0 +1,39 @@
+{
+  "name": "@effect-local/example-chat",
+  "private": true,
+  "type": "module",
+  "description": "Local-first 1:1 chat example: SharedWorker multi-tab replicas, relay sync over WebSocket, Postgres-backed relay with OTEL traces",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5174",
+    "dev:server": "tsx server/main.ts",
+    "build": "vite build",
+    "check": "tsc -b tsconfig.json",
+    "test:browser": "playwright test --config playwright.config.ts"
+  },
+  "dependencies": {
+    "@base-ui/react": "^1.7.0",
+    "@effect/atom-react": "4.0.0-beta.99",
+    "@effect/platform-browser": "4.0.0-beta.99",
+    "@effect/platform-node": "4.0.0-beta.99",
+    "@effect/sql-pg": "4.0.0-beta.99",
+    "@effect/sql-sqlite-node": "4.0.0-beta.99",
+    "@effect/sql-sqlite-wasm": "4.0.0-beta.99",
+    "@effect/wa-sqlite": "0.1.2",
+    "@lucas-barake/effect-local": "workspace:^",
+    "@lucas-barake/effect-local-browser": "workspace:^",
+    "@lucas-barake/effect-local-rpc": "workspace:^",
+    "@lucas-barake/effect-local-sql": "workspace:^",
+    "effect": "4.0.0-beta.99",
+    "lucide-react": "^0.468.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "tsx": "4.20.6",
+    "vite": "^7.2.7",
+    "vite-plugin-wasm": "^3.5.0"
+  }
+}
