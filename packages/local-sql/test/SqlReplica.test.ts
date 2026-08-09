@@ -848,6 +848,73 @@ describe("SqlReplica", () => {
         assert.isTrue(invalidated)
       }).pipe(Effect.scoped, Effect.provide(services))
     }))
+
+  it.effect("publishes a commit whose mutate fiber was interrupted right after the transaction committed", () =>
+    Effect.gen(function*() {
+      const publishing = yield* Deferred.make<void>()
+      const release = yield* Latch.make()
+      let armed = false
+      const baseDatabase = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+      const probedDatabase = Layer.effect(
+        SqlClient.SqlClient,
+        Effect.gen(function*() {
+          const sql = yield* SqlClient.SqlClient
+          return new Proxy(sql, {
+            apply(target, thisArg, args) {
+              const statement = Reflect.apply(target, thisArg, args) as Effect.Effect<unknown, unknown>
+              const strings = args[0]
+              if (!Array.isArray(strings) || !armed) return statement
+              const query = strings.join("?").replace(/\s+/g, " ").trim()
+              if (!query.includes("FROM effect_local_commit_outbox WHERE published = 0")) return statement
+              armed = false
+              return Deferred.succeed(publishing, undefined).pipe(
+                Effect.andThen(release.await),
+                Effect.andThen(statement)
+              )
+            }
+          }) as SqlClient.SqlClient
+        })
+      ).pipe(Layer.provide(baseDatabase))
+      const database = Layer.merge(probedDatabase, NodeCrypto.layer)
+      const services = SqlReplica.layerWithBindings(definition, { projections: [] }).pipe(
+        Layer.provideMerge(Layer.mergeAll(database, Handler, Limits))
+      )
+
+      yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const sql = yield* SqlClient.SqlClient
+        const publisher = yield* CommitPublisher.CommitPublisher
+        yield* Effect.addFinalizer(() => release.open)
+        const documentId = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "before" }
+        })
+        const subscription = yield* publisher.subscribe
+        armed = true
+        const mutate = yield* replica.mutate(Rename, {
+          commandId: yield* Identity.makeCommandId,
+          documentId,
+          payload: "after"
+        }).pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Deferred.await(publishing)
+        yield* Fiber.interrupt(mutate)
+        assert.isTrue(Exit.hasInterrupts(yield* Fiber.await(mutate)))
+        assert.strictEqual((yield* replica.get(Task, documentId)).value.title, "after")
+        const pending = yield* sql`SELECT commit_sequence FROM effect_local_commit_outbox
+          WHERE document_id = ${documentId} AND published = 0`
+        assert.strictEqual(pending.length, 1)
+
+        yield* TestClock.adjust("1 second")
+        const event = yield* subscription.events.pipe(
+          Stream.filter((candidate) => candidate._tag === "Commit" && candidate.documentId === documentId),
+          Stream.runHead
+        )
+        assert.isTrue(Option.isSome(event))
+        const remaining = yield* sql`SELECT commit_sequence FROM effect_local_commit_outbox
+          WHERE document_id = ${documentId} AND published = 0`
+        assert.strictEqual(remaining.length, 0)
+      }).pipe(Effect.scoped, Effect.provide(services))
+    }))
   const statusServices = Effect.gen(function*() {
     const database = Layer.merge(
       SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
