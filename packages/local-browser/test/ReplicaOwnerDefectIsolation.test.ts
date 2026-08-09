@@ -1,26 +1,22 @@
 import * as BrowserWorker from "@effect/platform-browser/BrowserWorker"
 import * as BrowserWorkerRunner from "@effect/platform-browser/BrowserWorkerRunner"
 import { NodeCrypto } from "@effect/platform-node"
+import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, it } from "@effect/vitest"
-import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
-import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
-import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
+import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as Identity from "@lucas-barake/effect-local/Identity"
-import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
-import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
-import * as Queue from "effect/Queue"
 import * as Stream from "effect/Stream"
 import { RpcClient } from "effect/unstable/rpc"
 import * as Worker from "effect/unstable/workers/Worker"
 import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
-import { definition, DeliveryPublisher, replica } from "./fixtures.js"
+import { definition, Read, Rename, Task } from "./fixtures.js"
 
 const limits = {
   maxBackupBytes: 1024,
@@ -68,44 +64,37 @@ it.layer(NodeCrypto.layer)("ReplicaOwner defect isolation", (it) => {
     Effect.gen(function*() {
       const invalidationsSubscribed = yield* Deferred.make<void>()
       const invalidationReceived = yield* Deferred.make<void>()
-      const events = yield* Queue.unbounded<CommitPublisher.CommitEvent>()
       let queryCalls = 0
-      const rigged: Replica.Replica["Service"] = {
-        ...replica,
-        query: (query, ...payload) =>
-          Effect.suspend(() => {
-            queryCalls++
-            return queryCalls === 1
-              ? Effect.die(new TypeError("poisoned query"))
-              : replica.query(query, ...payload)
-          })
-      }
-      const Publisher = Layer.merge(
-        Layer.succeed(
-          CommitPublisher.CommitPublisher,
-          CommitPublisher.CommitPublisher.of({
-            publishPending: Effect.succeed(0),
-            invalidate: () => Effect.void,
-            subscribe: Deferred.succeed(invalidationsSubscribed, undefined).pipe(
-              Effect.as({
-                watermark: Identity.CommitSequence.make(0),
-                refreshGeneration: 0,
-                events: Stream.fromQueue(events)
-              })
-            )
-          })
-        ),
-        DeliveryPublisher
+      const Engine = Layer.merge(
+        SqlReplica.layerWithBindings(definition, { projections: [] }),
+        SessionManager.layer
+      ).pipe(
+        Layer.provideMerge(Layer.mergeAll(
+          SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+          NodeCrypto.layer,
+          ReplicaLimits.layer(limits),
+          Rename.toLayer(({ draft, payload }) => {
+            draft.title = payload.title
+            return "renamed"
+          }),
+          Read.toLayer((payload) =>
+            Effect.suspend(() => {
+              queryCalls++
+              return queryCalls === 1
+                ? Effect.die(new TypeError("poisoned query"))
+                : Effect.succeed([{ title: payload }])
+            })
+          )
+        )),
+        Layer.orDie
       )
       const channel = new MessageChannel()
-      const Owner = ReplicaOwner.layerWorker(definition).pipe(
-        Layer.provide(BrowserWorkerRunner.layerMessagePort(channel.port1)),
-        Layer.provide(PeerConnectionStatus.layer),
-        Layer.provide(RelayConnectionStatus.layerNotConfigured),
-        Layer.provideMerge(SessionManager.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)))),
-        Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, rigged)))
+      yield* Layer.build(
+        ReplicaOwner.layerWorker(definition).pipe(
+          Layer.provide(BrowserWorkerRunner.layerMessagePort(channel.port1)),
+          Layer.provide(Engine)
+        )
       )
-      yield* Layer.build(Owner)
 
       yield* Effect.gen(function*() {
         const client = yield* RpcClient.make(ReplicaRpc.group)
@@ -115,12 +104,14 @@ it.layer(NodeCrypto.layer)("ReplicaOwner defect isolation", (it) => {
           protocolVersion: ReplicaRpc.protocolVersion,
           definitionHash: definition.hash
         })
-        const invalidations = yield* client.Invalidations({
+        yield* client.Invalidations({
           sessionId,
           ownerEpoch: session.ownerEpoch
         }).pipe(
           Stream.tap((event) =>
-            event._tag === "Invalidation"
+            event._tag === "InvalidationsReady"
+              ? Deferred.succeed(invalidationsSubscribed, undefined)
+              : event._tag === "Invalidation"
               ? Deferred.succeed(invalidationReceived, undefined)
               : Effect.void
           ),
@@ -129,18 +120,17 @@ it.layer(NodeCrypto.layer)("ReplicaOwner defect isolation", (it) => {
         )
         yield* Deferred.await(invalidationsSubscribed)
 
-        const poisoned = yield* client.Query({ sessionId, query: "Read", payload: "one" }).pipe(Effect.exit)
+        const poisoned = yield* client.Query({ sessionId, query: Read.name, payload: "one" }).pipe(Effect.exit)
         assert.isTrue(Exit.isFailure(poisoned), "the poisoned query must not succeed")
-        yield* Queue.offer(events, {
-          _tag: "Commit",
-          commitSequence: Identity.CommitSequence.make(1),
-          documentId: yield* Identity.makeDocumentId,
-          keys: ["after-defect"],
-          refreshGeneration: 0
+        yield* client.Create({
+          sessionId,
+          document: Task.name,
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "after defect" }
         })
-        yield* Effect.raceFirst(Deferred.await(invalidationReceived), Fiber.join(invalidations))
+        yield* Deferred.await(invalidationReceived)
 
-        const answered = yield* client.Query({ sessionId, query: "Read", payload: "two" })
+        const answered = yield* client.Query({ sessionId, query: Read.name, payload: "two" })
         assert.deepStrictEqual(answered, [{ title: "two" }])
         assert.strictEqual(queryCalls, 2)
       }).pipe(
