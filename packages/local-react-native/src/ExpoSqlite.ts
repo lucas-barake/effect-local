@@ -365,8 +365,7 @@ export const make = (
     const semaphore = yield* Semaphore.make(1)
     const connection = yield* makeConnection
 
-    const acquirer = semaphore.withPermits(1)(Effect.succeed(connection))
-    const transactionAcquirer = Effect.uninterruptibleMask((restore) => {
+    const acquirer = Effect.uninterruptibleMask((restore) => {
       const fiber = Fiber.getCurrent()!
       const scope = Context.getUnsafe(fiber.context, Scope.Scope)
       return Effect.as(
@@ -377,6 +376,7 @@ export const make = (
         connection
       )
     })
+    const transactionAcquirer = acquirer
 
     return Object.assign(
       (yield* Client.make({

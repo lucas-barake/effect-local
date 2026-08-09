@@ -142,6 +142,45 @@ describe("ExpoSqlite", () => {
       assert.deepStrictEqual(rows, [{ id: 1 }])
     }).pipe(Effect.provide(memory)))
 
+  it.effect("serializes ordinary statements for the lifetime of native execution", () =>
+    Effect.gen(function*() {
+      const original = ExpoSqliteNode.SQLiteDatabase.prototype.getAllAsync
+      const firstEntered = Deferred.makeUnsafe<void>()
+      let releaseQuery!: () => void
+      const queryGate = new Promise<void>((resolve) => {
+        releaseQuery = resolve
+      })
+      let active = 0
+      let maxActive = 0
+      ExpoSqliteNode.SQLiteDatabase.prototype.getAllAsync = async function<T,>(
+        source: string,
+        ...params: ReadonlyArray<unknown>
+      ): Promise<Array<T>> {
+        active++
+        maxActive = Math.max(maxActive, active)
+        Deferred.doneUnsafe(firstEntered, Effect.void)
+        await queryGate
+        try {
+          return await original.call(this, source, ...params) as Array<T>
+        } finally {
+          active--
+        }
+      }
+      try {
+        const sql = yield* Client.SqlClient
+        const first = yield* sql`SELECT 1 AS value`.pipe(Effect.forkChild)
+        yield* Deferred.await(firstEntered)
+        const second = Effect.runFork(sql`SELECT 2 AS value`)
+        assert.strictEqual(maxActive, 1)
+        releaseQuery()
+        yield* Fiber.join(first)
+        yield* Fiber.join(second)
+      } finally {
+        releaseQuery()
+        ExpoSqliteNode.SQLiteDatabase.prototype.getAllAsync = original
+      }
+    }).pipe(Effect.provide(memory)))
+
   it.effect("closes the database when the layer scope closes", () =>
     Effect.gen(function*() {
       const before = ExpoSqliteNode.openHandleCount()
