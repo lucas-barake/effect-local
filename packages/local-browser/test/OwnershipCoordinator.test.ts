@@ -435,7 +435,9 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
         callbackError = error
       }
 
-      assert.isTrue(callbackError instanceof Error)
+      if (!(callbackError instanceof Error)) {
+        assert.fail(`expected callback error, received ${String(callbackError)}`)
+      }
       assert.strictEqual(callbackError.message, "consumer callback failed")
       assert.strictEqual(rpcErrors, 1)
     }).pipe(Effect.scoped))
