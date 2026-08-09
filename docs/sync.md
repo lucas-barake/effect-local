@@ -7,10 +7,11 @@ route encrypted or plain application frames, but it is never authoritative for l
 without a connection.
 
 Each connection has its own Automerge `SyncState`. State transitions are serialized. Only one send is in flight per
-peer epoch and sequence. Inbound receipts store session neutral reply bytes. `PeerSession` idempotently enqueues those
-bytes under the current local epoch, so Cluster replay cannot reuse an expired connection sequence. Closing a session
-removes its outbox and starts the next connection with fresh Automerge reconciliation. It recovers document state, not
-the identity of the previous in flight transport operation. A bounded transport send retains the shared restore fence
+peer epoch and sequence. Inbound receipts store exact ordered reply fragments with session neutral identities and
+durable sent progress. `PeerSession` idempotently enqueues only the pending suffix under the current local epoch, so a
+duplicate delivery cannot recreate a sent prefix or reuse an expired connection sequence. Closing a session removes
+its outbox and starts the next connection with fresh Automerge reconciliation. It recovers document state, not the
+identity of the previous in flight transport operation. A bounded transport send retains the shared restore fence
 until the network effect completes or reaches `maxPeerSendMillis`, so destructive restore cannot overtake an old
 outbound frame.
 
@@ -22,6 +23,11 @@ times. The engine preserves temporary divergence as normal operation.
 Inbound frames are decoded before application. Limits cover bytes, changes, dependency edges, operations, pending
 bytes, pending changes, pending dependency edges, and age. Limits exist per document, per peer, and per replica. A
 peer cannot force unbounded missing dependency retention.
+
+A logical sync response that exceeds the per message change, writer provenance, or byte limit is split into fragments
+in dependency order. Every fragment satisfies `maxSyncChangesPerMessage`, the wire provenance limit, and
+`maxSyncMessageBytes`. The complete batch also remains within the peer's pending message and byte quotas. If one
+change cannot fit in a valid fragment, the response fails with `QuotaExceeded` instead of emitting an oversized frame.
 
 Unknown but valid canonical changes remain durable even when the installed application schema cannot project them.
 The document becomes read only with `ProjectionBlocked` until compatible code arrives.
