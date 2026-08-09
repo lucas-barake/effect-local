@@ -34,7 +34,7 @@
       "esbuild"
     ],
     "overrides": {
-      "@effect/platform-node-shared": "4.0.0-beta.99"
+      "@effect/platform-node-shared": "4.0.0-beta.101"
     }
   },
   "devDependencies": {
@@ -42,12 +42,12 @@
     "@changesets/changelog-github": "^0.7.0",
     "@changesets/cli": "^2.31.0",
     "@effect/language-service": "^0.85.1",
-    "@effect/vitest": "4.0.0-beta.99",
+    "@effect/vitest": "4.0.0-beta.101",
     "@types/node": "^25.7.0",
     "@typescript/native-preview": "7.0.0-dev.20260420.1",
     "@vitest/coverage-v8": "4.1.10",
     "dprint": "^0.55.1",
-    "effect": "4.0.0-beta.99",
+    "effect": "4.0.0-beta.101",
     "glob": "^13.0.6",
     "knip": "6.27.0",
     "madge": "^8.0.0",
