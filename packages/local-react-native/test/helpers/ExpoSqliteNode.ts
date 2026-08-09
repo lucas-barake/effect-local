@@ -19,8 +19,26 @@ import { join } from "node:path"
 import { DatabaseSync, type StatementSync } from "node:sqlite"
 
 let openHandles = 0
+let preparedStatements = 0
+
+let openProbe:
+  | {
+    readonly beforeOpen?: (() => Promise<void>) | undefined
+    readonly afterOpen?: (() => void) | undefined
+  }
+  | undefined
 
 export const openHandleCount = (): number => openHandles
+
+export const preparedStatementCount = (): number => preparedStatements
+
+export const resetPreparedStatementCount = (): void => {
+  preparedStatements = 0
+}
+
+export const setOpenProbe = (probe: typeof openProbe): void => {
+  openProbe = probe
+}
 
 export interface SQLiteRunResult {
   readonly lastInsertRowId: number
@@ -67,6 +85,42 @@ class SQLiteStatement {
   private finalized = false
   constructor(private readonly statement: StatementSync) {}
 
+  private result<T,>(rows: Array<T>): AsyncIterableIterator<T> & { getAllAsync: () => Promise<Array<T>> } {
+    let index = 0
+    let drained = false
+    return {
+      [Symbol.asyncIterator]() {
+        return this
+      },
+      next: async () => {
+        if (drained || index >= rows.length) return { done: true, value: undefined }
+        return { done: false, value: rows[index++] }
+      },
+      getAllAsync: () => {
+        if (drained || index > 0) return Promise.reject(new Error("The statement cursor has already been consumed"))
+        drained = true
+        return Promise.resolve(rows)
+      }
+    }
+  }
+
+  executeAsync<T,>(...params: ReadonlyArray<unknown>): Promise<
+    AsyncIterableIterator<T> & {
+      getAllAsync: () => Promise<Array<T>>
+    }
+  > {
+    if (this.finalized) return Promise.reject(new Error("statement is finalized"))
+    const normalized = normalizeParams(params)
+    return Promise.resolve().then(() => {
+      this.statement.setReadBigInts(true)
+      if (this.statement.columns().length === 0) {
+        this.statement.run(...normalized)
+        return this.result<T>([])
+      }
+      return this.result((this.statement.all(...normalized) as Array<T>).map(readRow))
+    })
+  }
+
   executeForRawResultAsync(
     ...params: ReadonlyArray<unknown>
   ): Promise<{ getAllAsync: () => Promise<Array<Array<unknown>>> }> {
@@ -84,14 +138,7 @@ class SQLiteStatement {
       } finally {
         statement.setReturnArrays(false)
       }
-      let drained = false
-      return {
-        getAllAsync: () => {
-          if (drained) return Promise.reject(new Error("The statement cursor has already been consumed"))
-          drained = true
-          return Promise.resolve(rows)
-        }
-      }
+      return this.result(rows)
     })
   }
 
@@ -109,10 +156,15 @@ class SQLiteStatement {
 export class SQLiteDatabase {
   constructor(private readonly db: DatabaseSync) {}
 
+  private prepare(source: string): StatementSync {
+    preparedStatements++
+    return this.db.prepare(source)
+  }
+
   getAllAsync<T,>(source: string, ...params: ReadonlyArray<unknown>): Promise<Array<T>> {
     const normalized = normalizeParams(params)
     return Promise.resolve().then(() => {
-      const statement = this.db.prepare(source)
+      const statement = this.prepare(source)
       statement.setReadBigInts(true)
       if (statement.columns().length > 0) {
         return (statement.all(...normalized) as Array<T>).map(readRow)
@@ -125,13 +177,13 @@ export class SQLiteDatabase {
   runAsync(source: string, ...params: ReadonlyArray<unknown>): Promise<SQLiteRunResult> {
     const normalized = normalizeParams(params)
     return Promise.resolve().then(() => {
-      const result = this.db.prepare(source).run(...normalized)
+      const result = this.prepare(source).run(...normalized)
       return { changes: Number(result.changes), lastInsertRowId: Number(result.lastInsertRowid) }
     })
   }
 
   prepareAsync(source: string): Promise<SQLiteStatement> {
-    return Promise.resolve().then(() => new SQLiteStatement(this.db.prepare(source)))
+    return Promise.resolve().then(() => new SQLiteStatement(this.prepare(source)))
   }
 
   execAsync(source: string): Promise<void> {
@@ -146,7 +198,7 @@ export class SQLiteDatabase {
   }
 
   async *getEachAsync<T,>(source: string, ...params: ReadonlyArray<unknown>): AsyncIterableIterator<T> {
-    const statement = this.db.prepare(source)
+    const statement = this.prepare(source)
     statement.setReadBigInts(true)
     const normalized = normalizeParams(params)
     // node:sqlite statements need no explicit finalization, so an early break only ends
@@ -162,11 +214,14 @@ export const openDatabaseAsync = (
   _options?: SQLiteOpenOptions,
   directory?: string
 ): Promise<SQLiteDatabase> =>
-  Promise.resolve().then(() => {
+  Promise.resolve().then(async () => {
+    await openProbe?.beforeOpen?.()
     const filename = databaseName === ":memory:"
       ? ":memory:"
       : join(directory ?? tmpdir(), databaseName)
     if (filename !== ":memory:") mkdirSync(join(filename, ".."), { recursive: true })
     openHandles++
-    return new SQLiteDatabase(new DatabaseSync(filename))
+    const database = new SQLiteDatabase(new DatabaseSync(filename))
+    openProbe?.afterOpen?.()
+    return database
   })
