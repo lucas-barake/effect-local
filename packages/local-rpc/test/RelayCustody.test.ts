@@ -311,11 +311,11 @@ const awaitUsage = (
  * A function rather than module constants: layer memoization is by reference, so two peers
  * sharing one value would silently be one replica and the exchange would prove nothing.
  */
-const clientStack = () => {
+const clientStack = (limits: ReplicaLimits.Values = replicaLimits) => {
   const Base = Layer.mergeAll(
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
     NodeCrypto.layer,
-    ReplicaLimits.layer(replicaLimits),
+    ReplicaLimits.layer(limits),
     PeerRelayReceiptLimits.layer(receiptLimits),
     PeerRelayOutboxLimits.layer(outboxLimits)
   )
@@ -359,43 +359,46 @@ const outboxRows = (sql: SqlClient.SqlClient) =>
  * The recipient is a clone rather than an independently created replica: a document created
  * twice for the same id is two lineages, and this exchange syncs two copies of one.
  */
-const seedPair = Effect.gen(function*() {
-  const senderContext = yield* Layer.build(clientStack())
-  const recipientContext = yield* Layer.build(clientStack())
-  const sender = Context.get(senderContext, Replica.Replica)
-  const recipient = Context.get(recipientContext, Replica.Replica)
+const seedPairWith = (limits: ReplicaLimits.Values) =>
+  Effect.gen(function*() {
+    const senderContext = yield* Layer.build(clientStack(limits))
+    const recipientContext = yield* Layer.build(clientStack(limits))
+    const sender = Context.get(senderContext, Replica.Replica)
+    const recipient = Context.get(recipientContext, Replica.Replica)
 
-  const documentId = yield* sender.create(Task, {
-    commandId: yield* Identity.makeCommandId,
-    value: { title: "one", labels: [] }
-  })
-  const backup = yield* sender.exportBackup({ maxBytes: replicaLimits.maxBackupBytes }).pipe(Stream.runCollect)
-  yield* recipient.restoreBackup({
-    expectedDefinitionHash: definition.hash,
-    installationId: yield* Identity.makeBackupInstallationId,
-    maxBytes: replicaLimits.maxBackupBytes,
-    mode: "clone",
-    source: Stream.fromIterable(backup)
-  })
+    const documentId = yield* sender.create(Task, {
+      commandId: yield* Identity.makeCommandId,
+      value: { title: "one", labels: [] }
+    })
+    const backup = yield* sender.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+    yield* recipient.restoreBackup({
+      expectedDefinitionHash: definition.hash,
+      installationId: yield* Identity.makeBackupInstallationId,
+      maxBytes: limits.maxBackupBytes,
+      mode: "clone",
+      source: Stream.fromIterable(backup)
+    })
 
-  return {
-    documentId,
-    sender: {
-      context: senderContext,
-      replica: sender,
-      store: Context.get(senderContext, DocumentStore.DocumentStore),
-      sql: Context.get(senderContext, SqlClient.SqlClient),
-      incarnation: (yield* Context.get(senderContext, ReplicaGate.ReplicaGate).current).incarnation
-    },
-    recipient: {
-      context: recipientContext,
-      replica: recipient,
-      store: Context.get(recipientContext, DocumentStore.DocumentStore),
-      sql: Context.get(recipientContext, SqlClient.SqlClient),
-      incarnation: (yield* Context.get(recipientContext, ReplicaGate.ReplicaGate).current).incarnation
+    return {
+      documentId,
+      sender: {
+        context: senderContext,
+        replica: sender,
+        store: Context.get(senderContext, DocumentStore.DocumentStore),
+        sql: Context.get(senderContext, SqlClient.SqlClient),
+        incarnation: (yield* Context.get(senderContext, ReplicaGate.ReplicaGate).current).incarnation
+      },
+      recipient: {
+        context: recipientContext,
+        replica: recipient,
+        store: Context.get(recipientContext, DocumentStore.DocumentStore),
+        sql: Context.get(recipientContext, SqlClient.SqlClient),
+        incarnation: (yield* Context.get(recipientContext, ReplicaGate.ReplicaGate).current).incarnation
+      }
     }
-  }
-})
+  })
+
+const seedPair = seedPairWith(replicaLimits)
 
 describe("relay custody against a real relay", () => {
   it.effect("reports exact public command custody and complete document confirmation", () =>
@@ -687,6 +690,62 @@ describe("relay custody against a real relay", () => {
               .pendingHeads(yield* inboxKeyOf(principal, backend.crypto), { limit: 10, now: 0 })
               .pipe(Effect.orDie),
             []
+          )
+        }
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("withholds an oversized reply and still settles the inbound that asked for it", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const tinyBudget: ReplicaLimits.Values = { ...replicaLimits, maxSyncChangesPerMessage: 4 }
+        const backend = yield* relayBackend()
+        const senderClient = yield* backend.clientFor("local")
+        const recipientClient = yield* backend.clientFor("remote")
+        const { documentId, recipient, sender } = yield* seedPairWith(tinyBudget)
+        yield* TestClock.adjust(5000)
+
+        const sessions = Effect.gen(function*() {
+          yield* RpcPeerTransport.makeSession(
+            recipientClient,
+            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
+          ).pipe(Effect.provideContext(recipient.context))
+          const senderSession = yield* RpcPeerTransport.makeSession(
+            senderClient,
+            transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
+          ).pipe(Effect.provideContext(sender.context))
+          yield* senderSession.markDirty(documentId)
+          yield* senderSession.flush
+          yield* TestClock.adjust(5000)
+        })
+
+        yield* sender.replica.mutate(AddLabel, {
+          commandId: yield* Identity.makeCommandId,
+          documentId,
+          payload: "opening"
+        })
+        yield* Effect.scoped(sessions)
+
+        // More offline commits than one sync message's provenance may carry: the recipient's
+        // reply to the sender's next announcement cannot be sent within the budget.
+        for (let index = 0; index < 6; index++) {
+          yield* recipient.replica.mutate(AddLabel, {
+            commandId: yield* Identity.makeCommandId,
+            documentId,
+            payload: `over-budget-${index}`
+          })
+        }
+        yield* Effect.scoped(sessions)
+
+        // The reply is withheld, never a session death: the announcement that triggered it must
+        // settle, or the relay redelivers it to a fresh session that dies the same way, forever.
+        for (const principal of [localPrincipal, remotePrincipal]) {
+          assert.deepStrictEqual(
+            yield* backend.store
+              .pendingHeads(yield* inboxKeyOf(principal, backend.crypto), { limit: 10, now: 0 })
+              .pipe(Effect.orDie),
+            [],
+            "every delivered message settled despite the withheld reply"
           )
         }
       }).pipe(Effect.provide(NodeCrypto.layer))

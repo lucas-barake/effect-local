@@ -629,7 +629,29 @@ const makeWithTerminal = (
         if (result === null) return "ApplicationRejected" as const
         yield* publisher.publishPending
         if (result.reply !== null) {
-          yield* sync.enqueue(session, result.reply).pipe(Effect.flatMap(schedule))
+          // A reply that exceeds the per-message change budget can never be sent, and the budget
+          // is a property of this document's history: failing the session would reconnect into
+          // the same oversized reply forever, redelivering the message that asked for it each
+          // time. Withholding the reply keeps the session serving and lets the inbound settle;
+          // the peer stays behind on this document until its history fits the budget.
+          yield* sync.enqueue(session, result.reply).pipe(
+            Effect.flatMap(schedule),
+            Effect.catchIf(
+              (error) =>
+                error.reason._tag === "QuotaExceeded" &&
+                error.reason.resource === "sync message writer provenance",
+              (error) =>
+                Effect.logWarning(
+                  "Peer session withheld a sync reply whose changes exceed the per-message budget; the peer stays behind on this document"
+                ).pipe(
+                  Effect.annotateLogs({
+                    documentId: envelope.documentId,
+                    peerId: connection.peerId,
+                    limit: error.reason._tag === "QuotaExceeded" ? error.reason.limit : undefined
+                  })
+                )
+            )
+          )
           yield* Queue.offer(flushRequests, undefined)
         }
         return "Applied" as const
