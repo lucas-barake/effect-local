@@ -4,6 +4,7 @@ import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, it } from "@effect/vitest"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -17,9 +18,10 @@ import * as Layer from "effect/Layer"
 import * as Scope from "effect/Scope"
 import * as Worker from "effect/unstable/workers/Worker"
 import * as BrowserReplica from "../src/BrowserReplica.js"
+import * as ReplicaClient from "../src/ReplicaClient.js"
 import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as SessionManager from "../src/SessionManager.js"
-import { Task } from "./fixtures.js"
+import { PeerRelayRuntime, Task } from "./fixtures.js"
 
 const definition = ReplicaDefinition.make({
   name: "browser-replica-graphs",
@@ -72,7 +74,7 @@ const limits = {
 
 const engineLayer = Layer.merge(
   SqlReplica.layerWithBindings(definition, { projections: [] }),
-  SessionManager.layer
+  Layer.merge(SessionManager.layer, PeerRelayRuntime)
 ).pipe(
   Layer.provideMerge(Layer.mergeAll(
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
@@ -113,6 +115,27 @@ it.layer(NodeCrypto.layer)("BrowserReplica graphs", (it) => {
       const first = yield* Layer.buildWithMemoMap(graph(portA), memoMap, scope)
       const second = yield* Layer.buildWithMemoMap(graph(portB), memoMap, scope)
 
+      const firstClient = Context.get(first, ReplicaClient.ReplicaClient)
+      const secondClient = Context.get(second, ReplicaClient.ReplicaClient)
+      assert.strictEqual(Context.get(first, Replica.Replica), firstClient)
+      assert.strictEqual(
+        Context.get(first, PeerConnectionStatus.PeerConnectionStatus),
+        firstClient.peerConnectionStatus
+      )
+      assert.strictEqual(
+        Context.get(first, RelayConnectionStatus.RelayConnectionStatus),
+        firstClient.relayConnectionStatus
+      )
+      assert.strictEqual(Context.get(second, Replica.Replica), secondClient)
+      assert.strictEqual(
+        Context.get(second, PeerConnectionStatus.PeerConnectionStatus),
+        secondClient.peerConnectionStatus
+      )
+      assert.strictEqual(
+        Context.get(second, RelayConnectionStatus.RelayConnectionStatus),
+        secondClient.relayConnectionStatus
+      )
+
       const documentId = yield* Context.get(first, Replica.Replica).create(Task, {
         commandId: yield* Identity.makeCommandId,
         value: { title: "only in the first replica" }
@@ -125,6 +148,10 @@ it.layer(NodeCrypto.layer)("BrowserReplica graphs", (it) => {
       assert.notStrictEqual(
         Context.get(first, PeerConnectionStatus.PeerConnectionStatus),
         Context.get(second, PeerConnectionStatus.PeerConnectionStatus)
+      )
+      assert.notStrictEqual(
+        firstClient,
+        secondClient
       )
 
       yield* Scope.close(scope, Exit.void)

@@ -94,7 +94,14 @@ export const Values = Schema.Struct({
    * Sessions are the front door's only unbounded resource and an authenticated client can open them
    * in a loop, so this is the cap that makes a refusal possible.
    */
-  maxSessionsPerSubject: PositiveInt
+  maxSessionsPerSubject: PositiveInt,
+
+  /** Sustained transient messages allowed per live relay session. */
+  transientRatePerSecond: PositiveNumber,
+  /** Transient messages a live relay session may send at once. */
+  transientBurst: PositiveInt,
+  /** Volatile messages retained for each currently attached recipient stream. */
+  transientRecipientQueueCapacity: PositiveInt
 })
 export type Values = typeof Values.Type
 
@@ -110,7 +117,10 @@ export const defaults: Values = Values.make({
   maxRetainedRateLimitedConnections: 10_000,
   rateLimitIdleRetention: Duration.minutes(10),
 
-  maxSessionsPerSubject: 4
+  maxSessionsPerSubject: 4,
+  transientRatePerSecond: 16,
+  transientBurst: 32,
+  transientRecipientQueueCapacity: 64
 })
 
 export class InvalidPeerRelayLimits extends Schema.TaggedErrorClass<InvalidPeerRelayLimits>(
@@ -156,6 +166,11 @@ const validate = (values: Values) => {
       // sized to admit, so the rate limiter would be the binding constraint rather than the pool.
       "authenticationBurst",
       values.authenticationBurst >= values.maxInFlightAuthentication
+    ],
+    [
+      // The bucket must hold one full second of the configured sustained allowance.
+      "transientBurst",
+      values.transientBurst >= values.transientRatePerSecond
     ]
   ]
   const firstInvalid = relations.find(([, valid]) => !valid)

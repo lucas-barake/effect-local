@@ -36,7 +36,7 @@ import * as OwnershipCoordinator from "../src/OwnershipCoordinator.js"
 import * as ReplicaClient from "../src/ReplicaClient.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
-import { Task } from "./fixtures.js"
+import { PeerRelayRuntime, Task } from "./fixtures.js"
 
 const definition = ReplicaDefinition.make({
   name: "ownership-test",
@@ -129,7 +129,7 @@ const makeEngineFactory = (
     const sqlite = ManagedRuntime.make(SqliteClient.layer({ filename, disableWAL: true }))
     const services = Layer.merge(
       SqlReplica.layerWithBindings(definition, { projections: [] }),
-      SessionManager.layer
+      Layer.merge(SessionManager.layer, PeerRelayRuntime)
     ).pipe(
       Layer.provideMerge(Layer.mergeAll(
         Layer.unwrap(Effect.map(sqlite.contextEffect, Layer.succeedContext)),
@@ -296,7 +296,7 @@ const makeBrowserEngineRuntime = (databasePort: MessagePort) =>
   ManagedRuntime.make(
     Layer.merge(
       SqlReplica.layerWithBindings(definition, { projections: [] }),
-      SessionManager.layer
+      Layer.merge(SessionManager.layer, PeerRelayRuntime)
     ).pipe(
       Layer.provideMerge(Layer.mergeAll(
         BrowserSqlite.layerMessagePort(databasePort),

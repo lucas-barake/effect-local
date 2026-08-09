@@ -156,7 +156,7 @@ it.layer(Layer.mergeAll(
   const acknowledged = (
     peerId: Identity.PeerId,
     stream: Stream.Stream<Uint8Array, ReplicaError.ReplicaError>
-  ): Stream.Stream<PeerTransport.AcknowledgedDelivery, ReplicaError.ReplicaError> =>
+  ): Stream.Stream<PeerTransport.Inbound, ReplicaError.ReplicaError> =>
     Stream.map(stream, (message) => {
       let messageHash = "0".repeat(64)
       try {
@@ -168,31 +168,34 @@ it.layer(Layer.mergeAll(
       relayMessageSequence += 1
       const suffix = relayMessageSequence.toString(16).padStart(12, "0").slice(-12)
       return {
-        message,
-        identity: {
-          relayMessageId: Identity.RelayMessageId.make(`rly_00000000-0000-4000-8000-${suffix}`),
-          relayPeerId: testRelayPeerId,
-          senderTenantId: "tenant",
-          senderSubjectId: "subject",
-          senderPeerId: peerId,
-          senderReplicaIncarnation: permit.incarnation,
-          messageHash,
-          outerEnvelopeDigest: "0".repeat(64)
-        },
-        receiptRetentionMillis: PeerRelayReceiptLimits.defaults.receiptRetentionMillis,
-        acknowledge: Effect.void,
-        reject: (reason) =>
-          reason === "ApplicationRejected"
-            ? Effect.void
-            : Effect.fail(
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.ProtocolMismatch({
-                  expected: "valid relay delivery",
-                  observed: "invalid relay delivery"
+        _tag: "Durable",
+        delivery: {
+          message,
+          identity: {
+            relayMessageId: Identity.RelayMessageId.make(`rly_00000000-0000-4000-8000-${suffix}`),
+            relayPeerId: testRelayPeerId,
+            senderTenantId: "tenant",
+            senderSubjectId: "subject",
+            senderPeerId: peerId,
+            senderReplicaIncarnation: permit.incarnation,
+            messageHash,
+            outerEnvelopeDigest: "0".repeat(64)
+          },
+          receiptRetentionMillis: PeerRelayReceiptLimits.defaults.receiptRetentionMillis,
+          acknowledge: Effect.void,
+          reject: (reason) =>
+            reason === "ApplicationRejected"
+              ? Effect.void
+              : Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.ProtocolMismatch({
+                    expected: "valid relay delivery",
+                    observed: "invalid relay delivery"
+                  })
                 })
-              })
-            )
-      }
+              )
+        }
+      } as const
     })
 
   const makeLiveFixture = (documents: ReadonlyArray<PeerSession.SelectedDocument>) =>
@@ -208,6 +211,8 @@ it.layer(Layer.mergeAll(
       const generateFailures = yield* Ref.make(new Map<Identity.DocumentId, ReplicaError.ReplicaError>())
       const pendingCalls = yield* Ref.make(0)
       const receiveFailure = yield* Deferred.make<never, ReplicaError.ReplicaError>()
+      const inbound = yield* Queue.unbounded<PeerTransport.Inbound>()
+      const transientSends = yield* Queue.unbounded<PeerTransport.TransientDelivery>()
       const subscribed = yield* Deferred.make<void>()
       const subscriberEnded = yield* Deferred.make<void>()
       const closed = yield* Ref.make(0)
@@ -251,8 +256,13 @@ it.layer(Layer.mergeAll(
             peerId,
             relayPeerId: testRelayPeerId,
             capabilities: {},
-            receive: Stream.fromEffect(Deferred.await(receiveFailure)),
+            receive: Stream.merge(
+              Stream.fromQueue(inbound),
+              Stream.fromEffect(Deferred.await(receiveFailure))
+            ),
             send: () => Effect.void,
+            transient: (documentId, payload) =>
+              Queue.offer(transientSends, { peerId, documentId, payload }).pipe(Effect.asVoid),
             close: Ref.update(closed, (count) => count + 1)
           })
       })
@@ -284,6 +294,8 @@ it.layer(Layer.mergeAll(
         generateFailures,
         pendingCalls,
         receiveFailure,
+        inbound,
+        transientSends,
         subscribed,
         subscriberEnded,
         closed,
@@ -443,6 +455,7 @@ it.layer(Layer.mergeAll(
               capabilities: {},
               receive: Stream.never,
               send: () => Effect.void,
+              transient: () => Effect.void,
               close: Effect.void
             })
           )
@@ -535,6 +548,7 @@ it.layer(Layer.mergeAll(
               capabilities: {},
               receive: acknowledged(peerId, Stream.fromQueue(inbound)),
               send: () => Effect.void,
+              transient: () => Effect.void,
               close: Effect.void
             })
         })
@@ -666,6 +680,7 @@ it.layer(Layer.mergeAll(
               capabilities: {},
               receive: acknowledged(peerId, Stream.fromQueue(inbound)),
               send: () => Effect.void,
+              transient: () => Effect.void,
               close: Effect.void
             })
         })
@@ -843,6 +858,7 @@ it.layer(Layer.mergeAll(
                     yield* Deferred.succeed(secondSent, undefined)
                   }
                 }),
+              transient: () => Effect.void,
               close: Effect.void
             })
         })
@@ -1026,6 +1042,7 @@ it.layer(Layer.mergeAll(
                   Effect.asVoid,
                   Effect.orDie
                 ),
+              transient: () => Effect.void,
               close: Effect.void
             })
         })
@@ -1157,6 +1174,7 @@ it.layer(Layer.mergeAll(
                   ),
                   Effect.orDie
                 ),
+              transient: () => Effect.void,
               close: Effect.void
             })
         })
@@ -1250,6 +1268,7 @@ it.layer(Layer.mergeAll(
                   ),
                   Effect.asVoid
                 ),
+              transient: () => Effect.void,
               close: Effect.void
             })
         })
@@ -1325,6 +1344,7 @@ it.layer(Layer.mergeAll(
               capabilities: {},
               receive: acknowledged(peerId, Stream.fromQueue(inbound)),
               send: () => Effect.die(new Error("automatic send defect")),
+              transient: () => Effect.void,
               close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
             })
         })
@@ -1526,13 +1546,19 @@ it.layer(Layer.mergeAll(
                 // The reject is observed rather than failed: settling an invalid envelope is the
                 // session's job, and the session outliving it is part of what this test pins.
                 receive: acknowledged(peerId, Stream.fromQueue(inbound)).pipe(
-                  Stream.map((delivery) => ({
-                    ...delivery,
-                    reject: (reason: PeerTransport.PermanentRejectReason) =>
-                      Deferred.succeed(rejected, reason).pipe(Effect.asVoid)
-                  }))
+                  Stream.map((inbound) =>
+                    inbound._tag === "Transient" ? inbound : ({
+                      _tag: "Durable",
+                      delivery: {
+                        ...inbound.delivery,
+                        reject: (reason: PeerTransport.PermanentRejectReason) =>
+                          Deferred.succeed(rejected, reason).pipe(Effect.asVoid)
+                      }
+                    })
+                  )
                 ),
                 send: () => Effect.die(`unexpected send for ${testCase.name}`),
+                transient: () => Effect.void,
                 close: Effect.void
               })
           })
@@ -1609,6 +1635,7 @@ it.layer(Layer.mergeAll(
               capabilities: {},
               receive: Stream.never,
               send: () => Effect.void,
+              transient: () => Effect.void,
               close: Ref.set(closed, true)
             }),
             () => Ref.set(released, true)
@@ -1706,6 +1733,7 @@ it.layer(Layer.mergeAll(
               capabilities: {},
               receive: Stream.never,
               send: () => Effect.void,
+              transient: () => Effect.void,
               close: Effect.void
             })
           )
@@ -1766,6 +1794,7 @@ it.layer(Layer.mergeAll(
             capabilities: {},
             receive: Stream.empty,
             send: () => Effect.void,
+            transient: () => Effect.void,
             close: Ref.set(closed, true)
           })
       })
@@ -1838,6 +1867,7 @@ it.layer(Layer.mergeAll(
               capabilities: {},
               receive: Stream.fromEffect(Deferred.await(endReceive)).pipe(Stream.drain),
               send: () => Effect.void,
+              transient: () => Effect.void,
               close: Deferred.succeed(closeStarted, undefined).pipe(
                 Effect.andThen(Deferred.await(releaseClose))
               )
@@ -1913,6 +1943,7 @@ it.layer(Layer.mergeAll(
             capabilities: {},
             receive: acknowledged(peerId, Stream.fromQueue(inbound)),
             send: () => Ref.update(sends, (count) => count + 1),
+            transient: () => Effect.void,
             close: Effect.void
           })
       })
@@ -2047,6 +2078,7 @@ it.layer(Layer.mergeAll(
             capabilities: {},
             receive: Stream.never,
             send: () => Deferred.succeed(sendStarted, undefined).pipe(Effect.andThen(Effect.never)),
+            transient: () => Effect.void,
             close: Effect.void
           })
       })
@@ -2146,6 +2178,7 @@ it.layer(Layer.mergeAll(
                   yield* Deferred.await(releaseFirst)
                 }
               }).pipe(Effect.ensuring(Ref.update(activeSends, (current) => current - 1))),
+            transient: () => Effect.void,
             close: Effect.void
           })
       })
@@ -2278,6 +2311,7 @@ it.layer(Layer.mergeAll(
             capabilities: {},
             receive: Stream.never,
             send: () => Ref.update(sends, (count) => count + 1),
+            transient: () => Effect.void,
             close: Ref.set(closed, true)
           })
       })
@@ -2388,6 +2422,7 @@ it.layer(Layer.mergeAll(
               capabilities: {},
               receive: Stream.never,
               send: () => Effect.void,
+              transient: () => Effect.void,
               close: Ref.set(closed, true)
             })
         })
@@ -2521,8 +2556,11 @@ it.layer(Layer.mergeAll(
             peerId: senderPeerId,
             relayPeerId,
             capabilities: {},
-            receive: Stream.fromQueue(deliveries),
+            receive: Stream.fromQueue(deliveries).pipe(
+              Stream.map((delivery) => ({ _tag: "Durable", delivery }) as const)
+            ),
             send: () => Effect.void,
+            transient: () => Effect.void,
             close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
           })
       })
@@ -2767,8 +2805,11 @@ it.layer(Layer.mergeAll(
             peerId: senderPeerId,
             relayPeerId,
             capabilities: {},
-            receive: Stream.fromQueue(deliveries),
+            receive: Stream.fromQueue(deliveries).pipe(
+              Stream.map((delivery) => ({ _tag: "Durable", delivery }) as const)
+            ),
             send: () => Effect.void,
+            transient: () => Effect.void,
             close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
           })
       })
@@ -2941,8 +2982,11 @@ it.layer(Layer.mergeAll(
             peerId: senderPeerId,
             relayPeerId,
             capabilities: {},
-            receive: Stream.fromQueue(deliveries),
+            receive: Stream.fromQueue(deliveries).pipe(
+              Stream.map((delivery) => ({ _tag: "Durable", delivery }) as const)
+            ),
             send: () => Effect.void,
+            transient: () => Effect.void,
             close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
           })
       })
@@ -3071,6 +3115,7 @@ it.layer(Layer.mergeAll(
                     : Effect.void
                 )
               ),
+            transient: () => Effect.void,
             close: Effect.void
           })
       })
@@ -3120,10 +3165,72 @@ it.layer(Layer.mergeAll(
       markDirty: () => Effect.void,
       flush: Effect.void,
       observedByPeer: () => Effect.succeed(false),
-      durableConfirmation: () => Effect.succeed(false as const)
+      durableConfirmation: () => Effect.succeed(false as const),
+      transient: () => Effect.void,
+      transients: Stream.never
     }
     assert.strictEqual(session.connectionEpoch, "structural")
   })
+
+  it.effect("sends selected transients and multicasts inbound values without replay", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const documentId = yield* Identity.makeDocumentId
+      const fixture = yield* makeLiveFixture([{ document: Task, documentId }])
+      const sessionFiber = yield* PeerSession.makeLive({
+        peerId: fixture.peerId,
+        documents: fixture.documents
+      }).pipe(Effect.provide(fixture.layer), Effect.forkChild)
+      assert.strictEqual(yield* Queue.take(fixture.generateStarted), documentId)
+      yield* Queue.offer(fixture.generateReleases, undefined)
+      const session = yield* Fiber.join(sessionFiber)
+      yield* Queue.take(fixture.generated)
+
+      const outgoing = Uint8Array.of(1, 2, 3)
+      yield* session.transient(documentId, outgoing)
+      assert.deepStrictEqual(yield* Queue.take(fixture.transientSends), {
+        peerId: fixture.peerId,
+        documentId,
+        payload: outgoing
+      })
+
+      const missed = Uint8Array.of(4)
+      const priorScope = yield* Scope.make()
+      const priorPull = yield* Stream.toPull(session.transients).pipe(
+        Effect.provideService(Scope.Scope, priorScope)
+      )
+      const priorFiber = yield* priorPull.pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Queue.offer(fixture.inbound, {
+        _tag: "Transient",
+        delivery: { peerId: fixture.peerId, documentId, payload: missed }
+      })
+      assert.deepStrictEqual((yield* Fiber.join(priorFiber))[0]?.payload, missed)
+      yield* Scope.close(priorScope, Exit.void)
+      const firstPull = yield* Stream.toPull(session.transients)
+      const secondPull = yield* Stream.toPull(session.transients)
+      const firstFiber = yield* firstPull.pipe(Effect.forkChild({ startImmediately: true }))
+      const secondFiber = yield* secondPull.pipe(Effect.forkChild({ startImmediately: true }))
+      const accepted = Uint8Array.of(5)
+      yield* Queue.offer(fixture.inbound, {
+        _tag: "Transient",
+        delivery: { peerId: fixture.peerId, documentId, payload: accepted }
+      })
+      assert.deepStrictEqual((yield* Fiber.join(firstFiber))[0]?.payload, accepted)
+      assert.deepStrictEqual((yield* Fiber.join(secondFiber))[0]?.payload, accepted)
+
+      const unselected = yield* Identity.makeDocumentId
+      const sendExit = yield* Effect.exit(session.transient(unselected, Uint8Array.of(6)))
+      assert.strictEqual(sendExit._tag, "Failure")
+
+      yield* Queue.offer(fixture.inbound, {
+        _tag: "Transient",
+        delivery: {
+          peerId: yield* Identity.makePeerId,
+          documentId,
+          payload: Uint8Array.of(7)
+        }
+      })
+      assert.strictEqual((yield* Effect.exit(session.awaitDisconnect))._tag, "Failure")
+    })))
 
   it.effect("publishes a selected commit made after the live subscription is acquired", () =>
     Effect.scoped(
@@ -3478,6 +3585,7 @@ it.layer(Layer.mergeAll(
               capabilities: { lineageAware: true },
               receive: acknowledged(peerId, Stream.fromQueue(inbound)),
               send: () => Effect.void,
+              transient: () => Effect.void,
               close: Ref.update(closed, (count) => count + 1).pipe(
                 Effect.andThen(Deferred.succeed(closeStarted, undefined)),
                 Effect.asVoid
@@ -3610,6 +3718,7 @@ it.layer(Layer.mergeAll(
             capabilities: {},
             receive: acknowledged(peerId, Stream.fromQueue(inbound)),
             send: () => Effect.void,
+            transient: () => Effect.void,
             close: Effect.void
           })
       })
@@ -3697,6 +3806,7 @@ it.layer(Layer.mergeAll(
             capabilities: {},
             receive: Stream.never,
             send: () => Effect.void,
+            transient: () => Effect.void,
             close: Effect.void
           })
       })
@@ -3738,6 +3848,7 @@ it.layer(Layer.mergeAll(
             capabilities: {},
             receive: Stream.never,
             send: () => Effect.void,
+            transient: () => Effect.void,
             close: Effect.void
           })
       })

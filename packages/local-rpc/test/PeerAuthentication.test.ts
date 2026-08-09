@@ -71,6 +71,7 @@ describe("PeerAuthentication", () => {
       const handlers = PeerRpc.Rpcs.toLayer(PeerRpc.Rpcs.of({
         Open: () => Stream.empty,
         Push: () => Effect.void,
+        Transient: () => Effect.void,
         ...terminalHandlers
       }))
       const client = yield* RpcTest.makeClient(PeerRpc.Rpcs).pipe(
@@ -124,6 +125,7 @@ describe("PeerAuthentication", () => {
             })
           ),
         Push: () => PeerAuthentication.AuthenticatedPeer.pipe(Effect.asVoid),
+        Transient: () => PeerAuthentication.AuthenticatedPeer.pipe(Effect.asVoid),
         ...terminalHandlers
       }))
       const client = yield* RpcTest.makeClient(PeerRpc.Rpcs).pipe(
@@ -173,6 +175,7 @@ describe("PeerAuthentication", () => {
       const handlers = PeerRpc.Rpcs.toLayer(PeerRpc.Rpcs.of({
         Open: () => Stream.empty,
         Push: () => Effect.void,
+        Transient: () => Effect.void,
         ...terminalHandlers
       }))
       const client = yield* RpcTest.makeClient(PeerRpc.Rpcs).pipe(

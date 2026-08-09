@@ -14,6 +14,8 @@ import * as TestPeer from "../src/TestPeer.js"
 
 const leftId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000001")
 const rightId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000002")
+const replicaId = Identity.ReplicaId.make("rep_00000000-0000-4000-8000-000000000001")
+const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
 
 const options: TestPeer.Options = {
   queueCapacity: 2,
@@ -24,6 +26,26 @@ const options: TestPeer.Options = {
 const bytes = (value: number) => Uint8Array.of(value)
 
 describe("TestPeer", () => {
+  it.effect("delivers transient messages only to the current live connection", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const network = yield* TestPeer.make(options)
+      const [left, right] = yield* Effect.all([
+        network.transport(leftId).connect({ replicaId, peerId: rightId }),
+        network.transport(rightId).connect({ replicaId, peerId: leftId })
+      ], { concurrency: "unbounded" })
+      yield* left.transient(documentId, bytes(2))
+      const inbound = yield* Stream.runHead(right.receive)
+      assert.isTrue(Option.isSome(inbound))
+      if (Option.isSome(inbound)) {
+        assert.strictEqual(inbound.value._tag, "Transient")
+        if (inbound.value._tag === "Transient") {
+          assert.strictEqual(inbound.value.delivery.peerId, leftId)
+          assert.strictEqual(inbound.value.delivery.documentId, documentId)
+          assert.deepStrictEqual(inbound.value.delivery.payload, bytes(2))
+        }
+      }
+    })).pipe(Effect.provide(FaultInjection.none)))
+
   it.effect("fails invalid options in the typed error channel", () =>
     Effect.gen(function*() {
       const invalidOptions: ReadonlyArray<TestPeer.Options> = [

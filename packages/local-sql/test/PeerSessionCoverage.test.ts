@@ -124,6 +124,7 @@ it.layer(Layer.merge(
             capabilities: {} as const,
             receive: Stream.never,
             send: () => Effect.void,
+            transient: () => Effect.void,
             close: Ref.update(closed, (count) => count + 1)
           }),
           () => Ref.update(closed, (count) => count + 1)

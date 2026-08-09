@@ -9,11 +9,13 @@ import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
+import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Latch from "effect/Latch"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Redacted from "effect/Redacted"
 import * as Ref from "effect/Ref"
@@ -312,7 +314,7 @@ const harness = (options?: {
       Effect.provideService(PeerRelayLimits.PeerRelayLimits, limits)
     )
 
-    const client = yield* RpcTest.makeClient(PeerRpc.Rpcs).pipe(
+    const makeClient = RpcTest.makeClient(PeerRpc.Rpcs).pipe(
       Effect.provideContext(
         Context.add(context, PeerAuthentication.PeerAuthentication, authentication)
       ),
@@ -321,13 +323,15 @@ const harness = (options?: {
         get: Ref.get(credential).pipe(Effect.map(Redacted.make))
       })
     )
+    const client = yield* makeClient
+    const secondClient = yield* makeClient
 
     // Shard assignment and acquisition run on scheduled fibers, so no entity is reachable under
     // virtual time until the clock is advanced past them.
     yield* TestClock.adjust(5000)
 
     const store = Context.get(context, RelayInboxStore.RelayInboxStore)
-    return { client, credential, crypto, knobs, store }
+    return { client, secondClient, credential, crypto, knobs, store }
   })
 
 type Harness = Effect.Success<ReturnType<typeof harness>>
@@ -394,7 +398,143 @@ const push = (peer: Harness, sessionId: Identity.SessionId, payload: Uint8Array,
     Effect.andThen(peer.client.Push({ sessionId, relayMessageId: relayId(id), payload }))
   )
 
+const sendTransient = (
+  peer: Harness,
+  sessionId: Identity.SessionId,
+  payload = Uint8Array.of(1, 2, 3),
+  document: PeerRpc.RequestedDocument = { documentType: Task.name, documentId }
+) =>
+  Ref.set(peer.credential, "sender").pipe(
+    Effect.andThen(peer.client.Transient({ sessionId, document, payload }))
+  )
+
 describe("RelayServer", () => {
+  it.effect("delivers transient bytes with the authenticated sender and selected document", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const peer = yield* harness()
+      const senderSession = yield* open(peer, sender, recipient)
+      const recipientSession = yield* open(peer, recipient, sender)
+
+      yield* sendTransient(peer, senderSession.opened.sessionId)
+      const event = yield* Queue.take(recipientSession.events)
+      assert.strictEqual(event._tag, "TransientMessage")
+      if (event._tag !== "TransientMessage") return
+      assert.deepStrictEqual(event.sender, sender)
+      assert.deepStrictEqual(event.document, { documentType: Task.name, documentId })
+      assert.deepStrictEqual(event.payload, Uint8Array.of(1, 2, 3))
+    })))
+
+  it.effect("requires a selected document and current Send authority for transient sends", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const peer = yield* harness()
+      const senderSession = yield* open(peer, sender, recipient)
+
+      const unselected = yield* sendTransient(peer, senderSession.opened.sessionId, Uint8Array.of(1), {
+        documentType: Task.name,
+        documentId: otherDocumentId
+      }).pipe(Effect.flip)
+      assert.strictEqual(unselected._tag, "InvalidRequest")
+
+      peer.knobs.allow = (request) => request.direction !== "Send"
+      const denied = yield* sendTransient(peer, senderSession.opened.sessionId).pipe(Effect.flip)
+      assert.strictEqual(denied._tag, "AccessDenied")
+    })))
+
+  it.effect("silently drops transient messages denied by current Receive authority", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const receiveChecked = yield* Deferred.make<void>()
+      let observeReceive = false
+      const peer = yield* harness({
+        knobs: {
+          onAuthorize: (request) =>
+            observeReceive && request.direction === "Receive" &&
+              request.principal.subjectId === recipient.subjectId
+              ? Deferred.succeed(receiveChecked, undefined).pipe(Effect.asVoid)
+              : Effect.void
+        }
+      })
+      const senderSession = yield* open(peer, sender, recipient)
+      const recipientSession = yield* open(peer, recipient, sender)
+
+      observeReceive = true
+      peer.knobs.allow = (request) =>
+        request.direction !== "Receive" || request.principal.subjectId !== recipient.subjectId
+      yield* sendTransient(peer, senderSession.opened.sessionId, Uint8Array.of(1))
+      yield* Deferred.await(receiveChecked)
+      yield* Effect.yieldNow
+      const denied = yield* Queue.poll(recipientSession.events)
+      assert.isTrue(Option.isNone(denied))
+
+      peer.knobs.allow = () => true
+      yield* sendTransient(peer, senderSession.opened.sessionId, Uint8Array.of(2))
+      const accepted = yield* Queue.take(recipientSession.events)
+      assert.strictEqual(accepted._tag, "TransientMessage")
+      if (accepted._tag === "TransientMessage") {
+        assert.deepStrictEqual(accepted.payload, Uint8Array.of(2))
+      }
+    })))
+
+  it.effect("rate limits transient sends per live session with deterministic refill", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const peer = yield* harness({
+        limits: {
+          ...PeerRelayLimits.defaults,
+          transientRatePerSecond: 2,
+          transientBurst: 2
+        }
+      })
+      const senderSession = yield* open(peer, sender, recipient)
+
+      yield* sendTransient(peer, senderSession.opened.sessionId)
+      yield* sendTransient(peer, senderSession.opened.sessionId)
+      assert.strictEqual(
+        (yield* sendTransient(peer, senderSession.opened.sessionId).pipe(Effect.flip))._tag,
+        "TransientRateLimitExceeded"
+      )
+
+      yield* TestClock.adjust(250)
+      assert.strictEqual(
+        (yield* sendTransient(peer, senderSession.opened.sessionId).pipe(Effect.flip))._tag,
+        "TransientRateLimitExceeded"
+      )
+      yield* TestClock.adjust(250)
+      yield* sendTransient(peer, senderSession.opened.sessionId)
+
+      yield* TestClock.setTime(5_000)
+      assert.strictEqual(
+        (yield* sendTransient(peer, senderSession.opened.sessionId).pipe(Effect.flip))._tag,
+        "TransientRateLimitExceeded"
+      )
+      yield* TestClock.setTime(6_000)
+      yield* sendTransient(peer, senderSession.opened.sessionId)
+    })))
+
+  it.effect("admits no more than the transient burst under concurrent sends", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const peer = yield* harness()
+      const senderSession = yield* open(peer, sender, recipient)
+      yield* Ref.set(peer.credential, "sender")
+
+      const exits = yield* Effect.all(
+        Array.from({ length: PeerRelayLimits.defaults.transientBurst + 1 }, () =>
+          peer.client.Transient({
+            sessionId: senderSession.opened.sessionId,
+            document: { documentType: Task.name, documentId },
+            payload: Uint8Array.of(1)
+          }).pipe(Effect.exit)),
+        { concurrency: "unbounded" }
+      )
+      assert.strictEqual(exits.filter((exit) => exit._tag === "Success").length, 32)
+      const failure = exits.find((exit) => exit._tag === "Failure")
+      assert.isDefined(failure)
+      if (failure?._tag === "Failure") {
+        assert.strictEqual(
+          Option.getOrThrow(Cause.findErrorOption(failure.cause))._tag,
+          "TransientRateLimitExceeded"
+        )
+      }
+    })))
+
   it.effect("refuses an unsupported protocol version and opens no session", () =>
     Effect.scoped(Effect.gen(function*() {
       const peer = yield* harness()
@@ -650,6 +790,33 @@ describe("RelayServer", () => {
         Effect.flip
       )
       assert.strictEqual(failure._tag, "RequestCapacityExceeded")
+    })))
+
+  it.effect("reserves the per-subject session cap across concurrent opens", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const peer = yield* harness({
+        limits: PeerRelayLimits.Values.make({
+          ...PeerRelayLimits.defaults,
+          maxSessionsPerSubject: 1
+        })
+      })
+      yield* Ref.set(peer.credential, "sender")
+      const outcomes = yield* Queue.unbounded<"Opened" | { readonly _tag: string }>()
+      const keepOpen = yield* Deferred.make<void>()
+      const run = (client: PeerRpc.RpcClient) =>
+        client.Open(openRequest(sender, recipient)).pipe(
+          Stream.runForEach((event) =>
+            event._tag === "Opened"
+              ? Queue.offer(outcomes, "Opened").pipe(Effect.andThen(Deferred.await(keepOpen)))
+              : Effect.void
+          ),
+          Effect.catch((error) => Queue.offer(outcomes, error)),
+          Effect.forkScoped
+        )
+      yield* Effect.all([run(peer.client), run(peer.secondClient)], { concurrency: "unbounded" })
+      const observed = [yield* Queue.take(outcomes), yield* Queue.take(outcomes)]
+      assert.strictEqual(observed.filter((outcome) => outcome === "Opened").length, 1)
+      assert.isTrue(observed.some((outcome) => outcome !== "Opened" && outcome._tag === "RequestCapacityExceeded"))
     })))
 
   it.effect("leaves no session behind when a handshake is refused", () =>

@@ -41,6 +41,12 @@ export class ReplicaClient extends Context.Service<
     readonly ownerEpoch: string
     readonly peerConnectionStatus: PeerConnectionStatus.PeerConnectionStatus["Service"]
     readonly relayConnectionStatus: RelayConnectionStatus.RelayConnectionStatus["Service"]
+    readonly transient: (
+      peerId: Identity.PeerId,
+      documentId: Identity.DocumentId,
+      payload: Uint8Array
+    ) => Effect.Effect<void, ReplicaError.ReplicaError>
+    readonly transients: Stream.Stream<ReplicaRpc.TransientMessage, ReplicaError.ReplicaError>
     readonly invalidations: Stream.Stream<ReplicaRpc.Invalidation, ReplicaError.ReplicaError>
   }
 >()(
@@ -1334,6 +1340,36 @@ export const fromRpcClient = (
           })
         )
       }),
+      transient: (peerId, documentId, payload) =>
+        withSession(
+          "Transient",
+          (session) => rpc.Transient({ sessionId: session.sessionId, peerId, documentId, payload }),
+          { replayAfterReopen: false }
+        ).pipe(
+          Effect.catchTag("RpcClientError", (error) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({ cause: error })
+              })
+            ))
+        ),
+      transients: withSessionStream(
+        (session) => rpc.Transients({ sessionId: session.sessionId })
+      ).pipe(
+        Stream.catchTag("RpcClientError", (error) =>
+          Stream.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageUnavailable({ cause: error })
+            })
+          )),
+        Stream.retry(
+          Schedule.spaced("1 second").pipe(
+            Schedule.setInputType<ReplicaError.ReplicaError>(),
+            Schedule.while(({ input }) => isTransient(input) || isActiveSessionMismatch(input))
+          )
+        ),
+        Stream.interruptWhen(Deferred.await(pageHidden))
+      ),
       invalidations,
       create: (document, options) =>
         Wire.encode(document.schema, options.value).pipe(

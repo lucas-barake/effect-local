@@ -18,7 +18,7 @@ import * as ReplicaClient from "../src/ReplicaClient.js"
 import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
-import { definition, DeliveryPublisher, replica } from "./fixtures.js"
+import { definition, DeliveryPublisher, PeerRelayRuntime, replica } from "./fixtures.js"
 
 const limits = {
   maxBackupBytes: 1024,
@@ -78,6 +78,7 @@ const Publisher = Layer.merge(
   DeliveryPublisher
 )
 const Owner = ReplicaOwner.layerHandlers(definition).pipe(
+  Layer.provide(PeerRelayRuntime),
   Layer.provide(PeerConnectionStatus.layer),
   Layer.provide(RelayConnectionStatus.layerNotConfigured),
   Layer.provideMerge(Sessions),
@@ -135,6 +136,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient pagehide", (it) => {
         Stream.make(CommandDelivery.UnknownCommand.make({ commandId })).pipe(Stream.concat(Stream.never))
     }
     const ActiveOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerRelayRuntime),
       Layer.provide(PeerConnectionStatus.layer),
       Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),

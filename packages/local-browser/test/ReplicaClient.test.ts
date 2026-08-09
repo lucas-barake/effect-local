@@ -3,6 +3,7 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, it } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as PeerRelayClientRuntime from "@lucas-barake/effect-local-sql/PeerRelayClientRuntime"
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
@@ -33,13 +34,15 @@ import { RequestId } from "effect/unstable/rpc/RpcMessage"
 import * as WorkerError from "effect/unstable/workers/WorkerError"
 import * as RestoreProtocol from "../src/internal/restoreProtocol.js"
 import * as ReplicaClient from "../src/ReplicaClient.js"
-import * as ReplicaOwner from "../src/ReplicaOwner.js"
+import * as ReplicaOwnerModule from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
 import {
   definition,
   DeliveryPublisher,
   documentId,
+  PeerRelayRuntime,
+  peerRelayRuntimeService,
   Read,
   ReadError,
   Rename,
@@ -47,6 +50,12 @@ import {
   replica,
   Task
 } from "./fixtures.js"
+
+const ReplicaOwner = {
+  ...ReplicaOwnerModule,
+  layerHandlers: (definition: ReplicaDefinition.Any) =>
+    ReplicaOwnerModule.layerHandlers(definition).pipe(Layer.provide(PeerRelayRuntime))
+}
 
 it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
   const limits = {
@@ -1309,6 +1318,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       const close = yield* ReplicaRpc.group.accessHandler("CloseSession")
       const get = yield* ReplicaRpc.group.accessHandler("Get")
       const status = yield* ReplicaRpc.group.accessHandler("Status")
+      const transient = yield* ReplicaRpc.group.accessHandler("Transient")
+      const transients = yield* ReplicaRpc.group.accessHandler("Transients")
       const sessionId = yield* Identity.makeSessionId
       const owner = new Rpc.ServerClient(1)
       const other = new Rpc.ServerClient(2)
@@ -1362,6 +1373,25 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         )))).reason._tag,
         "ProtocolMismatch"
       )
+      assert.strictEqual(
+        (yield* Effect.flip(unary(transient(
+          {
+            sessionId,
+            peerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-0000000000d3"),
+            documentId,
+            payload: Uint8Array.of(1)
+          },
+          options(other, "transient-other")
+        )))).reason._tag,
+        "ProtocolMismatch"
+      )
+
+      const otherTransients = transients({ sessionId }, options(other, "transients-other"))
+      const transientStreamError = yield* (otherTransients as Stream.Stream<unknown, ReplicaError.ReplicaError>).pipe(
+        Stream.runDrain,
+        Effect.flip
+      )
+      assert.strictEqual(transientStreamError.reason._tag, "ProtocolMismatch")
 
       const otherStatus = status({ sessionId }, options(other, "status-other"))
       assert.isTrue(Stream.isStream(otherStatus))
@@ -1382,7 +1412,41 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         Array.from(yield* Stream.runCollect(ownerStatus as Stream.Stream<unknown, ReplicaError.ReplicaError>)),
         1
       )
-      yield* unary(close({ sessionId }, options(owner, "close-owner")))
+      yield* unary(transient(
+        {
+          sessionId,
+          peerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-0000000000d4"),
+          documentId,
+          payload: Uint8Array.of(2)
+        },
+        options(owner, "transient-owner")
+      ))
+      yield* Stream.runDrain(
+        transients({ sessionId }, options(owner, "transients-owner")) as Stream.Stream<
+          unknown,
+          ReplicaError.ReplicaError
+        >
+      )
+
+      yield* TestClock.adjust(SessionManager.leaseDurationMillis + 1)
+      assert.strictEqual(
+        (yield* Effect.flip(unary(transient(
+          {
+            sessionId,
+            peerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-0000000000d5"),
+            documentId,
+            payload: Uint8Array.of(3)
+          },
+          options(owner, "transient-expired")
+        )))).reason._tag,
+        "ProtocolMismatch"
+      )
+      const expiredTransients = transients({ sessionId }, options(owner, "transients-expired"))
+      const expiredStreamError = yield* (expiredTransients as Stream.Stream<unknown, ReplicaError.ReplicaError>).pipe(
+        Stream.runDrain,
+        Effect.flip
+      )
+      assert.strictEqual(expiredStreamError.reason._tag, "ProtocolMismatch")
     })).pipe(Effect.provide(Owner)))
 
   it.effect("transfers backup bytes through the owner", () => {
@@ -2859,6 +2923,94 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       )
       assert.strictEqual(observed.length, 1)
       assert.strictEqual(observed[0]?._tag, "UnknownCommand")
+    })).pipe(Effect.provide(Owner)))
+
+  it.effect("exposes bounded transient RPC values and a requirement-free client capability", () => {
+    const peerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-0000000000d1")
+    const payload = new Uint8Array([1, 2, 3])
+    const sent: Array<ReplicaRpc.TransientMessage> = []
+    const TransientRuntime = Layer.succeed(
+      PeerRelayClientRuntime.PeerRelayClientRuntime,
+      {
+        ...peerRelayRuntimeService,
+        send: (peerId, documentId, payload) =>
+          Effect.sync(() => {
+            sent.push({ peerId, documentId, payload })
+          }),
+        transients: Stream.make({ peerId, documentId, payload })
+      }
+    )
+    const TransientOwner = ReplicaOwnerModule.layerHandlers(definition).pipe(
+      Layer.provide(TransientRuntime),
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
+      Layer.provideMerge(Sessions),
+      Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, replica)))
+    )
+    return Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
+
+      yield* client.transient(peerId, documentId, payload)
+      const event = yield* client.transients.pipe(Stream.runHead)
+
+      assert.deepStrictEqual(sent, [{ peerId, documentId, payload }])
+      assert.isTrue(event._tag === "Some")
+      if (event._tag === "Some") {
+        assert.strictEqual(event.value.peerId, peerId)
+        assert.strictEqual(event.value.documentId, documentId)
+        assert.deepStrictEqual(event.value.payload, payload)
+      }
+    })).pipe(Effect.provide(TransientOwner))
+  })
+
+  it.effect("rejects an oversized transient payload at the browser RPC boundary", () =>
+    Effect.gen(function*() {
+      const exit = yield* Effect.exit(
+        Schema.decodeUnknownEffect(ReplicaRpc.TransientMessage)({
+          peerId: Identity.PeerId.make("peer_00000000-0000-4000-8000-0000000000d2"),
+          documentId,
+          payload: new Uint8Array(ReplicaRpc.maximumTransientPayloadBytes + 1)
+        })
+      )
+      assert.strictEqual(exit._tag, "Failure")
+    }))
+
+  it.effect("reconnects the transient stream without replaying an emitted event", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const peerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-0000000000d6")
+      const first = { peerId, documentId, payload: Uint8Array.of(1) }
+      const second = { peerId, documentId, payload: Uint8Array.of(2) }
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const firstObserved = yield* Deferred.make<void>()
+      let subscriptions = 0
+      const reconnecting = new Proxy(rpc, {
+        get(target, property, receiver) {
+          if (property !== "Transients") return Reflect.get(target, property, receiver)
+          return () =>
+            Stream.unwrap(Effect.sync(() => {
+              subscriptions++
+              return subscriptions === 1
+                ? Stream.make(first).pipe(
+                  Stream.tap(() => Deferred.succeed(firstObserved, undefined)),
+                  Stream.concat(Stream.fail(protocolMismatch("expired transient stream")))
+                )
+                : Stream.make(second)
+            }))
+        }
+      })
+      const client = yield* ReplicaClient.fromRpcClient(definition, reconnecting)
+      const collected = yield* client.transients.pipe(
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild({ startImmediately: true })
+      )
+
+      yield* Deferred.await(firstObserved)
+      yield* TestClock.adjust("1 second")
+      const events = Array.from(yield* Fiber.join(collected))
+      assert.deepStrictEqual(events, [first, second])
+      assert.strictEqual(subscriptions, 2)
     })).pipe(Effect.provide(Owner)))
 
   it.effect("rejects negative delivery cursors at the RPC boundary", () =>

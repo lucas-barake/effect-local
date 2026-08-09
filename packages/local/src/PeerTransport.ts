@@ -52,13 +52,33 @@ export interface AcknowledgedDelivery {
   ) => Effect.Effect<void, ReplicaError.ReplicaError>
 }
 
+export interface TransientDelivery {
+  readonly peerId: Identity.PeerId
+  readonly documentId: Identity.DocumentId
+  readonly payload: Uint8Array
+}
+
+export type Inbound =
+  | {
+    readonly _tag: "Durable"
+    readonly delivery: AcknowledgedDelivery
+  }
+  | {
+    readonly _tag: "Transient"
+    readonly delivery: TransientDelivery
+  }
+
 export interface Connection {
   readonly peerId: Identity.PeerId
   readonly relayPeerId: Identity.PeerId
   readonly relayEndpoint?: RelayEndpoint
   readonly capabilities: Capabilities
-  readonly receive: Stream.Stream<AcknowledgedDelivery, ReplicaError.ReplicaError>
+  readonly receive: Stream.Stream<Inbound, ReplicaError.ReplicaError>
   readonly send: (message: Uint8Array) => Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly transient: (
+    documentId: Identity.DocumentId,
+    payload: Uint8Array
+  ) => Effect.Effect<void, ReplicaError.ReplicaError>
   /**
    * Terminates `receive`. A fiber parked consuming it observes an interrupt only `Exit`, never a normal end and
    * never a failure. A normal end would be read as a retryable transport fault, and a failure would be reported as

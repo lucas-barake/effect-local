@@ -17,7 +17,7 @@ import * as Worker from "effect/unstable/workers/Worker"
 import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
-import { definition, Read, Rename, Task } from "./fixtures.js"
+import { definition, PeerRelayRuntime, Read, Rename, Task } from "./fixtures.js"
 
 const limits = {
   maxBackupBytes: 1024,
@@ -92,6 +92,7 @@ it.layer(NodeCrypto.layer)("ReplicaOwner defect isolation", (it) => {
       const channel = new MessageChannel()
       yield* Layer.build(
         ReplicaOwner.layerWorker(definition).pipe(
+          Layer.provide(PeerRelayRuntime),
           Layer.provide(BrowserWorkerRunner.layerMessagePort(channel.port1)),
           Layer.provide(Engine)
         )

@@ -14,8 +14,11 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as PubSub from "effect/PubSub"
+import * as Queue from "effect/Queue"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
+import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as PeerRelayClientRuntime from "../src/PeerRelayClientRuntime.js"
@@ -250,4 +253,115 @@ describe("PeerRelayClientRuntime", () => {
       assert.strictEqual(exit._tag, "Failure")
       yield* Scope.close(scope, Exit.void)
     }))
+
+  it.effect("registers exact routes, multicasts without replay, and unregisters token safely", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const runtime = yield* PeerRelayClientRuntime.PeerRelayClientRuntime
+        const peerId = yield* Identity.makePeerId
+        const documentId = yield* Identity.makeDocumentId
+        const inbound = yield* Effect.acquireRelease(
+          PubSub.sliding<PeerRelayClientRuntime.TransientMessage>(64),
+          PubSub.shutdown
+        )
+        const sends = yield* Queue.unbounded<Uint8Array>()
+        const makeSession = (target: Queue.Queue<Uint8Array>) => ({
+          peerId,
+          connectionEpoch: "runtime-test",
+          markDirty: () => Effect.void,
+          flush: Effect.void,
+          observedByPeer: () => Effect.succeed(false),
+          durableConfirmation: () => Effect.succeed(false),
+          transient: (_documentId: Identity.DocumentId, payload: Uint8Array) =>
+            Queue.offer(target, payload).pipe(Effect.asVoid),
+          transients: Stream.fromPubSub(inbound)
+        })
+        const documents = [{ document: Task, documentId }]
+        const first = yield* runtime.register(makeSession(sends), documents)
+        const duplicate = yield* Effect.exit(runtime.register(makeSession(sends), documents))
+        assert.strictEqual(duplicate._tag, "Failure")
+
+        const priorScope = yield* Scope.make()
+        const priorPull = yield* Stream.toPull(runtime.transients).pipe(
+          Effect.provideService(Scope.Scope, priorScope)
+        )
+        const priorFiber = yield* priorPull.pipe(Effect.forkChild({ startImmediately: true }))
+        const missed = { peerId, documentId, payload: Uint8Array.of(1) }
+        yield* PubSub.publish(inbound, missed)
+        assert.deepStrictEqual((yield* Fiber.join(priorFiber))[0], missed)
+        yield* Scope.close(priorScope, Exit.void)
+
+        const firstPull = yield* Stream.toPull(runtime.transients)
+        const secondPull = yield* Stream.toPull(runtime.transients)
+        const firstFiber = yield* firstPull.pipe(Effect.forkChild({ startImmediately: true }))
+        const secondFiber = yield* secondPull.pipe(Effect.forkChild({ startImmediately: true }))
+        const accepted = { peerId, documentId, payload: Uint8Array.of(2) }
+        yield* PubSub.publish(inbound, accepted)
+        assert.deepStrictEqual((yield* Fiber.join(firstFiber))[0], accepted)
+        assert.deepStrictEqual((yield* Fiber.join(secondFiber))[0], accepted)
+
+        yield* runtime.send(peerId, documentId, Uint8Array.of(3))
+        assert.deepStrictEqual(yield* Queue.take(sends), Uint8Array.of(3))
+        yield* first.unregister
+
+        const afterUnregisterPull = yield* Stream.toPull(runtime.transients)
+        const afterUnregisterFiber = yield* afterUnregisterPull.pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* PubSub.publish(inbound, { peerId, documentId, payload: Uint8Array.of(99) })
+
+        const replacementSends = yield* Queue.unbounded<Uint8Array>()
+        const replacement = yield* runtime.register(makeSession(replacementSends), documents)
+        yield* first.unregister
+        const replacementInbound = { peerId, documentId, payload: Uint8Array.of(100) }
+        yield* PubSub.publish(inbound, replacementInbound)
+        assert.deepStrictEqual((yield* Fiber.join(afterUnregisterFiber))[0], replacementInbound)
+        yield* runtime.send(peerId, documentId, Uint8Array.of(4))
+        assert.deepStrictEqual(yield* Queue.take(replacementSends), Uint8Array.of(4))
+        yield* replacement.unregister
+        const unavailable = yield* Effect.exit(runtime.send(peerId, documentId, Uint8Array.of(5)))
+        assert.strictEqual(unavailable._tag, "Failure")
+      }).pipe(Effect.provide(layers()))
+    ))
+
+  it.effect("lets a slow multicast subscriber converge on the newest 64 values", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const runtime = yield* PeerRelayClientRuntime.PeerRelayClientRuntime
+        const peerId = yield* Identity.makePeerId
+        const documentId = yield* Identity.makeDocumentId
+        const inbound = yield* Effect.acquireRelease(
+          PubSub.sliding<PeerRelayClientRuntime.TransientMessage>(64),
+          PubSub.shutdown
+        )
+        const session = {
+          peerId,
+          connectionEpoch: "slow-runtime-test",
+          markDirty: () => Effect.void,
+          flush: Effect.void,
+          observedByPeer: () => Effect.succeed(false),
+          durableConfirmation: () => Effect.succeed(false),
+          transient: () => Effect.void,
+          transients: Stream.fromPubSub(inbound)
+        }
+        yield* runtime.register(session, [{ document: Task, documentId }])
+        const slowPull = yield* Stream.toPull(runtime.transients)
+        const fastPull = yield* Stream.toPull(runtime.transients)
+        const slowFirst = yield* slowPull.pipe(Effect.forkChild({ startImmediately: true }))
+        for (let index = 0; index < 66; index++) {
+          const fast = yield* fastPull.pipe(Effect.forkChild({ startImmediately: true }))
+          yield* PubSub.publish(inbound, {
+            peerId,
+            documentId,
+            payload: Uint8Array.of(index)
+          })
+          assert.strictEqual((yield* Fiber.join(fast))[0]?.payload[0], index)
+        }
+        assert.strictEqual((yield* Fiber.join(slowFirst))[0]?.payload[0], 0)
+        const newest = yield* slowPull
+        assert.strictEqual(newest.length, 64)
+        assert.strictEqual(newest[0]?.payload[0], 2)
+        assert.strictEqual(newest[63]?.payload[0], 65)
+      }).pipe(Effect.provide(layers()))
+    ))
 })

@@ -6,6 +6,7 @@ import * as Crypto from "effect/Crypto"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Ref from "effect/Ref"
 import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
@@ -90,6 +91,12 @@ interface Session {
   readonly inboxKeySelf: string
   readonly inboxKeyRemote: string
   readonly delivered: Map<Identity.RelayMessageId, Delivered>
+  readonly transientBucket: Ref.Ref<TransientBucket>
+}
+
+interface TransientBucket {
+  readonly tokens: number
+  readonly refilledAtMillis: number
 }
 
 const RelayEnvelopeJson = Schema.fromJsonString(
@@ -105,6 +112,7 @@ export const layerHandlers = (options: Options) =>
     const crypto = yield* Crypto.Crypto
 
     const sessions = new Map<Identity.SessionId, Session>()
+    const sessionSlots = yield* Ref.make<ReadonlyMap<string, number>>(new Map())
     const decodeEnvelope = Schema.decodeUnknownEffect(RelayEnvelopeJson)
 
     // The wire negotiates its windows in milliseconds, so the configured durations are converted
@@ -312,20 +320,30 @@ export const layerHandlers = (options: Options) =>
               return yield* new PeerRpcError.AccessDenied()
             }
 
-            // Sessions are the front door's only unbounded resource, and an authenticated client can
-            // open them in a loop. Checked before minting an id so a refusal costs nothing.
-            let heldBySubject = 0
-            for (const held of sessions.values()) {
-              if (
-                held.principal.tenantId === principal.tenantId &&
-                held.principal.subjectId === principal.subjectId
-              ) {
-                heldBySubject += 1
-              }
-            }
-            if (heldBySubject >= limits.maxSessionsPerSubject) {
-              return yield* new PeerRpcError.RequestCapacityExceeded()
-            }
+            // The slot is acquired with its scope finalizer before any asynchronous session setup.
+            // Concurrent Open calls therefore count reservations, not only fully registered sessions.
+            const subjectKey = JSON.stringify([principal.tenantId, principal.subjectId])
+            yield* Effect.acquireRelease(
+              Ref.modify(sessionSlots, (current) => {
+                const held = current.get(subjectKey) ?? 0
+                if (held >= limits.maxSessionsPerSubject) return [false, current] as const
+                return [true, new Map(current).set(subjectKey, held + 1)] as const
+              }).pipe(
+                Effect.filterOrFail(
+                  (reserved) => reserved,
+                  () => new PeerRpcError.RequestCapacityExceeded()
+                )
+              ),
+              () =>
+                Ref.update(sessionSlots, (current) => {
+                  const held = current.get(subjectKey)
+                  if (held === undefined) return current
+                  const next = new Map(current)
+                  if (held === 1) next.delete(subjectKey)
+                  else next.set(subjectKey, held - 1)
+                  return next
+                })
+            )
 
             const sessionId = yield* Identity.makeSessionId.pipe(
               Effect.provideService(Crypto.Crypto, crypto),
@@ -351,7 +369,11 @@ export const layerHandlers = (options: Options) =>
               senderRetryHorizonMillis: payload.senderRetryHorizonMillis,
               inboxKeySelf,
               inboxKeyRemote,
-              delivered: new Map()
+              delivered: new Map(),
+              transientBucket: yield* Ref.make({
+                tokens: limits.transientBurst,
+                refilledAtMillis: authorizedAt
+              })
             }
 
             sessions.set(sessionId, session)
@@ -423,6 +445,28 @@ export const layerHandlers = (options: Options) =>
                 // recipient's right to see a particular document. A message that fails here is left
                 // unsettled and simply not emitted, so it stays durable for a later session.
                 Stream.filterEffect((message) => {
+                  if (message._tag === "TransientMessage") {
+                    const selected = session.documents.some((document) =>
+                      document.documentType === message.document.documentType &&
+                      document.documentId === message.document.documentId
+                    )
+                    if (!selected || message.sender.tenantId !== session.principal.tenantId) {
+                      return Effect.succeed(false)
+                    }
+                    return authorization.authorize({
+                      direction: "Receive",
+                      principal: session.principal,
+                      remote: {
+                        subjectId: message.sender.subjectId,
+                        peerId: message.sender.peerId
+                      },
+                      documents: [message.document]
+                    }).pipe(
+                      Effect.as(true),
+                      Effect.catchTag("AccessDenied", () => Effect.succeed(false)),
+                      Effect.catchTag("ServerUnavailable", () => Effect.succeed(false))
+                    )
+                  }
                   // The counterparty is taken from the message, never from the handshake. This
                   // inbox is keyed by its owner alone, so every peer holding a Send grant to this
                   // device writes into it and one session drains all of them. Asking whether the
@@ -632,6 +676,60 @@ export const layerHandlers = (options: Options) =>
             attributes: { relay_message_id: payload.relayMessageId }
           })
         ),
+
+      Transient: (payload) =>
+        Effect.gen(function*() {
+          const authenticated = yield* PeerAuthentication.AuthenticatedPeer
+          const session = yield* sessionFor(payload.sessionId, authenticated.principal)
+          const document = session.documents.find((candidate) =>
+            candidate.documentId === payload.document.documentId &&
+            candidate.documentType === payload.document.documentType
+          )
+          if (document === undefined) {
+            return yield* new PeerRpcError.InvalidRequest()
+          }
+
+          const send = yield* authorization.authorize({
+            direction: "Send",
+            principal: session.principal,
+            remote: session.remote,
+            documents: [document]
+          })
+          if (send.documents.length === 0) {
+            return yield* new PeerRpcError.AccessDenied()
+          }
+
+          const now = yield* Clock.currentTimeMillis
+          const admitted = yield* Ref.modify(session.transientBucket, (state) => {
+            const elapsedMillis = Math.max(0, now - state.refilledAtMillis)
+            const available = Math.min(
+              limits.transientBurst,
+              state.tokens + elapsedMillis * limits.transientRatePerSecond / 1_000
+            )
+            if (available < 1) return [false, state]
+            return [true, {
+              tokens: available - 1,
+              refilledAtMillis: Math.max(now, state.refilledAtMillis)
+            }]
+          })
+          if (!admitted) {
+            return yield* new PeerRpcError.TransientRateLimitExceeded()
+          }
+
+          yield* bounded(
+            inboxClient(session.inboxKeyRemote).Transient({
+              message: PeerRpc.TransientMessage.make({
+                sender: session.principal,
+                document,
+                payload: payload.payload
+              })
+            })
+          ).pipe(
+            Effect.catchTag("MailboxFull", () => new PeerRpcError.SessionOverloaded()),
+            Effect.catchTag("AlreadyProcessingMessage", () => new PeerRpcError.SessionOverloaded()),
+            Effect.catchTag("PersistenceError", () => new PeerRpcError.ServerUnavailable())
+          )
+        }).pipe(Effect.withSpan("RelayServer.Transient")),
 
       Acknowledge: (payload) => settle(payload, "Acknowledged"),
 

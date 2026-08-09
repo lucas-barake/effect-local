@@ -150,6 +150,12 @@ export const make = (
     const partitions = yield* Ref.make<ReadonlySet<string>>(new Set())
     const held = yield* Ref.make<ReadonlyMap<string, Scheduled>>(new Map())
     const sequence = yield* Ref.make(0)
+    const transientRoutes = yield* Ref.make<
+      ReadonlyMap<string, {
+        readonly token: symbol
+        readonly queue: Queue.Queue<PeerTransport.TransientDelivery>
+      }>
+    >(new Map())
 
     const validate = (packet: FaultInjection.Packet, decision: FaultInjection.Decision) => {
       const delay = toValidatedMillis(decision.delay)
@@ -351,31 +357,65 @@ export const make = (
                 Stream.runHead
               )
             ),
-            Effect.map((connection) => ({
-              peerId: remotePeerId,
-              relayPeerId: peerId,
-              capabilities: { lineageAware: true },
-              receive: connection.receive.pipe(
-                Stream.map((message): PeerTransport.AcknowledgedDelivery => ({
-                  message,
-                  identity: deliveryIdentity(message, peerId, remotePeerId),
-                  receiptRetentionMillis: 24 * 60 * 60 * 1_000,
-                  acknowledge: Effect.void,
-                  reject: () => Effect.void
-                }))
-              ),
-              send: (message) =>
-                connection.send(message).pipe(
-                  Effect.mapError((error) =>
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageUnavailable({
-                        cause: error
-                      })
-                    })
-                  )
-                ),
-              close: connection.close
-            }))
+            Effect.flatMap((connection) =>
+              Effect.gen(function*() {
+                const token = Symbol("test peer transient route")
+                const transientInbound = yield* Queue.dropping<PeerTransport.TransientDelivery>(options.queueCapacity)
+                yield* Ref.update(transientRoutes, (current) =>
+                  new Map(current).set(route(remotePeerId, peerId), { token, queue: transientInbound }))
+                const unregisterTransient = Ref.update(transientRoutes, (current) => {
+                  const key = route(remotePeerId, peerId)
+                  if (current.get(key)?.token !== token) {
+                    return current
+                  }
+                  const next = new Map(current)
+                  next.delete(key)
+                  return next
+                }).pipe(Effect.andThen(Queue.shutdown(transientInbound)))
+                yield* Effect.addFinalizer(() =>
+                  unregisterTransient
+                )
+                const close = connection.close.pipe(Effect.ensuring(unregisterTransient))
+                return {
+                  peerId: remotePeerId,
+                  relayPeerId: peerId,
+                  capabilities: { lineageAware: true },
+                  receive: Stream.merge(
+                    connection.receive.pipe(
+                      Stream.map((message): PeerTransport.Inbound => ({
+                        _tag: "Durable",
+                        delivery: {
+                          message,
+                          identity: deliveryIdentity(message, peerId, remotePeerId),
+                          receiptRetentionMillis: 24 * 60 * 60 * 1_000,
+                          acknowledge: Effect.void,
+                          reject: () => Effect.void
+                        }
+                      }))
+                    ),
+                    Stream.fromQueue(transientInbound).pipe(
+                      Stream.map((delivery): PeerTransport.Inbound => ({ _tag: "Transient", delivery }))
+                    )
+                  ),
+                  send: (message: Uint8Array) =>
+                    connection.send(message).pipe(
+                      Effect.mapError((error) =>
+                        new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.StorageUnavailable({ cause: error })
+                        })
+                      )
+                    ),
+                  transient: (documentId: Identity.DocumentId, payload: Uint8Array) =>
+                    Effect.sync(() => {
+                      if (Ref.getUnsafe(partitions).has(route(peerId, remotePeerId))) return
+                      const target = Ref.getUnsafe(transientRoutes).get(route(peerId, remotePeerId))
+                      if (target === undefined) return
+                      Queue.offerUnsafe(target.queue, { peerId, documentId, payload: payload.slice() })
+                    }),
+                  close
+                }
+              })
+            )
           )
       })
     }

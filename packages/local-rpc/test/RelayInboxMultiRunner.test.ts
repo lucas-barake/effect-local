@@ -28,6 +28,7 @@ import * as SqlRunnerStorage from "effect/unstable/cluster/SqlRunnerStorage"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as SocketServer from "effect/unstable/socket/SocketServer"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as PeerRelayLimits from "../src/PeerRelayLimits.js"
 import type * as PeerRpc from "../src/PeerRpc.js"
 import * as RelayInbox from "../src/RelayInbox.js"
 import * as SqlRelayInboxStore from "../src/SqlRelayInboxStore.js"
@@ -152,7 +153,8 @@ const runner = (
     Layer.provide(config),
     Layer.provideMerge(Layer.orDie(SqlRelayInboxStore.layer)),
     Layer.provide(sql),
-    Layer.provide(NodeCrypto.layer)
+    Layer.provide(NodeCrypto.layer),
+    Layer.provide(PeerRelayLimits.layerDefaults)
   )
 }
 
@@ -250,7 +252,9 @@ const probe = (options: { readonly isolated: boolean }) =>
     const deliveredA = yield* Queue.unbounded<PeerRpc.StoredMessage>()
     const streamA = yield* Effect.forkChild(
       Stream.runForEach(
-        clientA.Subscribe({ sessionId: sessionId("00000000000a") }),
+        clientA.Subscribe({ sessionId: sessionId("00000000000a") }).pipe(
+          Stream.filter((message): message is PeerRpc.StoredMessage => message._tag === "StoredMessage")
+        ),
         (message) => Queue.offer(deliveredA, message)
       )
     )
@@ -261,7 +265,9 @@ const probe = (options: { readonly isolated: boolean }) =>
     const deliveredB = yield* Queue.unbounded<PeerRpc.StoredMessage>()
     yield* Effect.forkChild(
       Stream.runForEach(
-        clientB.Subscribe({ sessionId: sessionId("00000000000b") }),
+        clientB.Subscribe({ sessionId: sessionId("00000000000b") }).pipe(
+          Stream.filter((message): message is PeerRpc.StoredMessage => message._tag === "StoredMessage")
+        ),
         (message) => Queue.offer(deliveredB, message)
       )
     )

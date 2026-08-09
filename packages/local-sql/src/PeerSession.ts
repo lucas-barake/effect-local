@@ -9,6 +9,7 @@ import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as PubSub from "effect/PubSub"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Schedule from "effect/Schedule"
@@ -40,6 +41,11 @@ export interface PeerSession {
   readonly durableConfirmation: (
     documentId: Identity.DocumentId
   ) => Effect.Effect<boolean, ReplicaError.ReplicaError>
+  readonly transient: (
+    documentId: Identity.DocumentId,
+    payload: Uint8Array
+  ) => Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly transients: Stream.Stream<PeerTransport.TransientDelivery>
 }
 
 export interface SupervisedPeerSession extends PeerSession {
@@ -204,6 +210,10 @@ const makeWithTerminal = (
     const sendLock = yield* Semaphore.make(1)
     const flushLock = yield* Semaphore.make(1)
     const flushRequests = yield* Queue.dropping<void>(1)
+    const transients = yield* Effect.acquireRelease(
+      PubSub.sliding<PeerTransport.TransientDelivery>(64),
+      PubSub.shutdown
+    )
     const scheduled = yield* Ref.make(new Map<number, PeerSync.Outbound>())
     const syncLocks = new Map(options.documents.map((entry) => [entry.documentId, Semaphore.makeUnsafe(1)]))
     const failTerminal = (error: ReplicaError.ReplicaError) =>
@@ -712,6 +722,23 @@ const makeWithTerminal = (
           () => settleDelivery("relay reject", delivery.reject("ProtocolInvalid"))
         )
       )
+    const receiveInbound = (inbound: PeerTransport.Inbound) => {
+      if (inbound._tag === "Durable") return receiveAcknowledged(inbound.delivery)
+      return selectedById(inbound.delivery.documentId).pipe(
+        Effect.andThen(
+          inbound.delivery.peerId === connection.peerId
+            ? PubSub.publish(transients, inbound.delivery).pipe(Effect.asVoid)
+            : Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.ProtocolMismatch({
+                  expected: connection.peerId,
+                  observed: inbound.delivery.peerId
+                })
+              })
+            )
+        )
+      )
+    }
     yield* Effect.addFinalizer(() =>
       disconnect.pipe(Effect.andThen(Effect.gen(function*() {
         const boundEpoch = yield* Ref.get(remoteEpoch)
@@ -733,7 +760,7 @@ const makeWithTerminal = (
     )
     yield* supervise(
       failTerminal,
-      Stream.runForEach(connection.receive, receiveAcknowledged).pipe(
+      Stream.runForEach(connection.receive, receiveInbound).pipe(
         Effect.andThen(
           Effect.fail(
             new ReplicaError.ReplicaError({
@@ -806,6 +833,15 @@ const makeWithTerminal = (
       observedByPeer: (documentId) =>
         Ref.get(observed).pipe(Effect.map((values) => values.get(documentId)?.value ?? false)),
       durableConfirmation: (documentId) => deliveries.documentConfirmed(documentId, connection.relayEndpoint),
+      transient: (documentId, payload) =>
+        guardTerminal(
+          selectedById(documentId).pipe(
+            Effect.andThen(
+              relayCall("relay transient", sendLock.withPermit(connection.transient(documentId, payload)))
+            )
+          )
+        ),
+      transients: Stream.fromPubSub(transients),
       awaitDisconnect: Deferred.await(terminalFailure)
     }
     return { session: sessionValue, disconnect, failTerminal }

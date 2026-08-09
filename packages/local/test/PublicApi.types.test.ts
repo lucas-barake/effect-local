@@ -227,17 +227,25 @@ describe("public API types", () => {
       acknowledge: Effect.void,
       reject: (_reason) => Effect.void
     }
+    const inbound: PeerTransport.Inbound = { _tag: "Durable", delivery }
+    const transientDelivery: PeerTransport.TransientDelivery = {
+      peerId,
+      documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000005"),
+      payload: new Uint8Array([2])
+    }
+    const transientInbound: PeerTransport.Inbound = { _tag: "Transient", delivery: transientDelivery }
     const connection = {
       peerId,
       relayPeerId,
       capabilities: {},
-      receive: Stream.make(delivery),
+      receive: Stream.make(inbound, transientInbound),
       send: () => Effect.void,
+      transient: () => Effect.void,
       close: Effect.void
     } satisfies PeerTransport.Connection
     const acknowledgedReceive: Equal<
       PeerTransport.Connection["receive"],
-      Stream.Stream<PeerTransport.AcknowledgedDelivery, ReplicaError.ReplicaError>
+      Stream.Stream<PeerTransport.Inbound, ReplicaError.ReplicaError>
     > = true
     const requiredRelayPeerId: Equal<
       PeerTransport.Connection["relayPeerId"],

@@ -22,7 +22,7 @@ import type * as RestoreProtocol from "../src/internal/restoreProtocol.js"
 import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
-import { definition, DeliveryPublisher, replica } from "./fixtures.js"
+import { definition, DeliveryPublisher, PeerRelayRuntime, replica } from "./fixtures.js"
 
 it.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
   const limits = {
@@ -83,6 +83,7 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
   )
   const ownerLayer = (replicaService: Replica.Replica["Service"] = replica) =>
     ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerRelayRuntime),
       Layer.provide(PeerConnectionStatus.layer),
       Layer.provide(RelayConnectionStatus.layerNotConfigured),
       Layer.provideMerge(Sessions),
