@@ -125,6 +125,11 @@ interface Client {
   served: boolean
 }
 
+const DatabaseActivityFrame = Schema.Union([
+  Schema.Tuple([Schema.Int, Schema.Unknown, Schema.Unknown]),
+  Schema.Tuple([Schema.Literal("update_hook"), Schema.String, Schema.Number])
+])
+
 interface EngineSnapshot {
   readonly runtime: ManagedRuntime.ManagedRuntime<EngineServices, unknown>
   readonly scope: Scope.Closeable
@@ -327,13 +332,13 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
           // while a long transaction keeps the periodic probe queued. Never `start()` the port
           // here — the driver owns dispatch.
           const databaseReplies = { count: 0 }
-          const onDatabaseReply = () => {
-            databaseReplies.count++
+          const runtime = yield* Effect.sync(() => options.engine(databasePort))
+          const engineScope = yield* Scope.make()
+          const onDatabaseReply = (event: MessageEvent<unknown>) => {
+            if (Schema.is(DatabaseActivityFrame)(event.data)) databaseReplies.count++
           }
           databasePort.addEventListener("message", onDatabaseReply)
           const detachDatabaseObserver = () => databasePort.removeEventListener("message", onDatabaseReply)
-          const runtime = yield* Effect.sync(() => options.engine(databasePort))
-          const engineScope = yield* Scope.make()
           // A candidate that detaches mid start has this fiber interrupted, and the engine it
           // already built is reachable from nowhere else: it never became an `EngineStarted` event,
           // so `disposeEngine` can never see it.
