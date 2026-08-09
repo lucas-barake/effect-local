@@ -25,7 +25,8 @@ const expectations = {
       [10, "peer_relay_state"],
       [11, "command_delivery"],
       [12, "document_history_counters"],
-      [13, "backup_document_installations"]
+      [13, "backup_document_installations"],
+      [14, "batched_sync_replies"]
     ],
     outbox: "none"
   },
@@ -41,7 +42,8 @@ const expectations = {
       [10, "peer_relay_state"],
       [11, "command_delivery"],
       [12, "document_history_counters"],
-      [13, "backup_document_installations"]
+      [13, "backup_document_installations"],
+      [14, "batched_sync_replies"]
     ],
     outbox: "backfilled"
   },
@@ -56,7 +58,8 @@ const expectations = {
       [10, "peer_relay_state"],
       [11, "command_delivery"],
       [12, "document_history_counters"],
-      [13, "backup_document_installations"]
+      [13, "backup_document_installations"],
+      [14, "batched_sync_replies"]
     ],
     outbox: { frozen: "2020-01-01T00:00:00.000Z" }
   }
@@ -147,7 +150,8 @@ const assertMigrationHistory = Effect.gen(function*() {
     { migration_id: 10, name: "peer_relay_state" },
     { migration_id: 11, name: "command_delivery" },
     { migration_id: 12, name: "document_history_counters" },
-    { migration_id: 13, name: "backup_document_installations" }
+    { migration_id: 13, name: "backup_document_installations" },
+    { migration_id: 14, name: "batched_sync_replies" }
   ])
 
   const catalog = yield* SqlSchema.findAll({
@@ -180,6 +184,11 @@ const assertMigrationHistory = Effect.gen(function*() {
       migration_id: 13,
       name: "backup_document_installations",
       checksum: Migrations.backupDocumentInstallationsChecksum
+    },
+    {
+      migration_id: 14,
+      name: "batched_sync_replies",
+      checksum: Migrations.batchedSyncRepliesChecksum
     }
   ])
 })

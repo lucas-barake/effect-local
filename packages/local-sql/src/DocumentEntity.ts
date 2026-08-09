@@ -129,7 +129,14 @@ export const ApplySyncResult = Schema.Struct({
     documentId: Identity.DocumentId,
     message: Schema.Uint8ArrayFromBase64,
     messageHash: Schema.String,
-    heads: Schema.Array(Schema.String)
+    heads: Schema.Array(Schema.String),
+    fragments: Schema.optionalKey(Schema.Array(Schema.Struct({
+      receiptReplyId: Schema.Int,
+      replyIndex: Schema.Int,
+      message: Schema.Uint8ArrayFromBase64,
+      messageHash: Schema.String,
+      heads: Schema.Array(Schema.String)
+    })))
   })),
   heads: Schema.Array(Schema.String),
   acceptedHeads: Schema.Array(Schema.String),

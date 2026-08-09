@@ -2761,7 +2761,7 @@ it.layer(Layer.mergeAll(
       )
     }).pipe(Effect.provide(NodeCrypto.layer)))
 
-  it.effect("parks an inbound message in relay custody and keeps the session alive when a receive quota is exceeded", () =>
+  it.effect("parks relay messages for transient receive and enqueue quota pressure", () =>
     Effect.gen(function*() {
       const deliveries = yield* Queue.unbounded<PeerTransport.AcknowledgedDelivery>()
       const events = yield* Queue.unbounded<string>()
@@ -2781,6 +2781,10 @@ it.layer(Layer.mergeAll(
         (document) => Effect.sync(() => Automerge.free(document))
       )
       const messageHash = yield* Canonical.digest(message)
+      const replyResult = {
+        ...result,
+        reply: { documentId, message, messageHash, heads: [] }
+      }
       const sync = PeerSync.PeerSync.of({
         withDocumentInvalidation: (_documentId, effect) => effect,
         invalidateDocument: () => Effect.void,
@@ -2793,7 +2797,15 @@ it.layer(Layer.mergeAll(
         reset: () => Effect.void,
         generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
         receive: () => Effect.succeed(result),
-        enqueue: () => Effect.die("unexpected enqueue"),
+        enqueue: () =>
+          Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.QuotaExceeded({
+                resource: "peer sync outbox bytes",
+                limit: 64
+              })
+            })
+          ),
         pending: () => Effect.succeed([]),
         markSent: () => Effect.succeed(true),
         pruneRelayReceipts: Effect.succeed(0)
@@ -2875,7 +2887,7 @@ it.layer(Layer.mergeAll(
                             })
                           })
                         )
-                        : Effect.succeed(result)
+                        : Effect.succeed(request.receiveSequence === 1 ? replyResult : result)
                     )
                   )
               } as never)
@@ -2889,9 +2901,16 @@ it.layer(Layer.mergeAll(
             deliveries,
             yield* delivery(1, Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000012"))
           )
+          assert.deepStrictEqual(
+            yield* Effect.forEach([0, 1], () => Queue.take(events)),
+            ["apply", "publish"]
+          )
+          yield* Queue.offer(
+            deliveries,
+            yield* delivery(2, Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000013"))
+          )
           // Deliveries are consumed serially, so had the quota message been settled, its ack or
-          // reject event would surface here before the second apply. The race is what makes the
-          // failure legible when the session dies instead of parking the message.
+          // reject event would surface here before the next apply.
           assert.deepStrictEqual(
             yield* Effect.forEach([0, 1, 2], () =>
               Effect.raceFirst(

@@ -24,6 +24,7 @@ import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
 import * as Redacted from "effect/Redacted"
+import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
@@ -695,7 +696,7 @@ describe("relay custody against a real relay", () => {
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
-  it.effect("withholds an oversized reply and still settles the inbound that asked for it", () =>
+  it.effect("batches an oversized reply and still settles the inbound that asked for it", () =>
     Effect.scoped(
       Effect.gen(function*() {
         const tinyBudget: ReplicaLimits.Values = { ...replicaLimits, maxSyncChangesPerMessage: 4 }
@@ -726,8 +727,7 @@ describe("relay custody against a real relay", () => {
         })
         yield* Effect.scoped(sessions)
 
-        // More offline commits than one sync message's provenance may carry: the recipient's
-        // reply to the sender's next announcement cannot be sent within the budget.
+        // More offline commits than one sync message's provenance may carry.
         for (let index = 0; index < 6; index++) {
           yield* recipient.replica.mutate(AddLabel, {
             commandId: yield* Identity.makeCommandId,
@@ -737,8 +737,11 @@ describe("relay custody against a real relay", () => {
         }
         yield* Effect.scoped(sessions)
 
-        // The reply is withheld, never a session death: the announcement that triggered it must
-        // settle, or the relay redelivers it to a fresh session that dies the same way, forever.
+        const senderLoaded = yield* sender.store.load(Task, documentId).pipe(Effect.orDie)
+        assert.deepStrictEqual(
+          [...senderLoaded.encoded.labels].toSorted(),
+          ["opening", ...Array.from({ length: 6 }, (_, index) => `over-budget-${index}`)].toSorted()
+        )
         for (const principal of [localPrincipal, remotePrincipal]) {
           assert.deepStrictEqual(
             yield* backend.store
@@ -750,6 +753,97 @@ describe("relay custody against a real relay", () => {
         }
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
+
+  it.effect("keeps relay custody when a reply waits for local outbox capacity", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const onePending: ReplicaLimits.Values = { ...replicaLimits, maxPendingChangesPerPeer: 1 }
+        const backend = yield* relayBackend()
+        const senderClient = yield* backend.clientFor("local")
+        const recipientClient = yield* backend.clientFor("remote")
+        const { documentId, recipient, sender } = yield* seedPairWith(onePending)
+        yield* TestClock.adjust(5000)
+        const blockPush = yield* Ref.make(false)
+        const blockedRecipientClient: PeerRpc.RpcClient = {
+          ...recipientClient,
+          Push: ((request) =>
+            Ref.get(blockPush).pipe(
+              Effect.flatMap((blocked) => blocked ? Effect.never : recipientClient.Push(request))
+            )) as PeerRpc.RpcClient["Push"]
+        }
+
+        yield* recipient.replica.mutate(AddLabel, {
+          commandId: yield* Identity.makeCommandId,
+          documentId,
+          payload: "recipient-pending"
+        })
+        yield* sender.replica.mutate(AddLabel, {
+          commandId: yield* Identity.makeCommandId,
+          documentId,
+          payload: "sender-request"
+        })
+        yield* Effect.scoped(Effect.gen(function*() {
+          const recipientSession = yield* RpcPeerTransport.makeSession(
+            blockedRecipientClient,
+            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
+          ).pipe(Effect.provideContext(recipient.context))
+          const senderSession = yield* RpcPeerTransport.makeSession(
+            senderClient,
+            transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
+          ).pipe(Effect.provideContext(sender.context))
+          yield* Ref.set(blockPush, true)
+          yield* recipientSession.markDirty(documentId)
+          yield* Effect.forkChild(recipientSession.flush)
+          yield* TestClock.adjust(5000)
+          const localPending = yield* recipient.sql<{ readonly count: number }>`
+            SELECT COUNT(*) AS count FROM effect_local_peer_outbox WHERE status = 'Pending'
+          `
+          assert.strictEqual(localPending[0]?.count, 1)
+          yield* senderSession.markDirty(documentId)
+          yield* senderSession.flush
+          yield* TestClock.adjust(5000)
+
+          const pending = yield* backend.store
+            .pendingHeads(yield* inboxKeyOf(remotePrincipal, backend.crypto), { limit: 10, now: 0 })
+            .pipe(Effect.orDie)
+          assert.isAbove(pending.length, 0, "the inbound remains in relay custody while enqueue is over quota")
+        }))
+        yield* Ref.set(blockPush, false)
+
+        yield* Effect.scoped(Effect.gen(function*() {
+          const recipientSession = yield* RpcPeerTransport.makeSession(
+            recipientClient,
+            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
+          ).pipe(Effect.provideContext(recipient.context))
+          const senderSession = yield* RpcPeerTransport.makeSession(
+            senderClient,
+            transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
+          ).pipe(Effect.provideContext(sender.context))
+          yield* recipientSession.markDirty(documentId)
+          yield* senderSession.markDirty(documentId)
+          yield* recipientSession.flush
+          yield* senderSession.flush
+          yield* TestClock.adjust(5000)
+        }))
+
+        const senderLoaded = yield* sender.store.load(Task, documentId).pipe(Effect.orDie)
+        const recipientLoaded = yield* recipient.store.load(Task, documentId).pipe(Effect.orDie)
+        assert.deepStrictEqual(
+          [...senderLoaded.encoded.labels].toSorted(),
+          ["recipient-pending", "sender-request"]
+        )
+        assert.deepStrictEqual(
+          [...recipientLoaded.encoded.labels].toSorted(),
+          ["recipient-pending", "sender-request"]
+        )
+        assert.deepStrictEqual(
+          yield* backend.store
+            .pendingHeads(yield* inboxKeyOf(remotePrincipal, backend.crypto), { limit: 10, now: 0 })
+            .pipe(Effect.orDie),
+          []
+        )
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ), 20_000)
 
   it.effect("drains a large pre-existing backlog into a fresh recipient session", () =>
     Effect.scoped(
