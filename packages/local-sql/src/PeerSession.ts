@@ -9,6 +9,7 @@ import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as PubSub from "effect/PubSub"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
@@ -26,6 +27,7 @@ import * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
 import * as PeerSync from "./PeerSync.js"
 import * as PeerSyncEnvelope from "./PeerSyncEnvelope.js"
 import * as ReplicaGate from "./ReplicaGate.js"
+import * as ReplicaOperationScheduler from "./ReplicaOperationScheduler.js"
 
 export interface SelectedDocument {
   readonly document: Document.Any
@@ -89,7 +91,8 @@ const makeWithTerminal = (
   entity: (
     documentId: Identity.DocumentId
   ) => Effect.Effect<ReturnType<Effect.Success<typeof DocumentEntity.DocumentEntity.client>>>,
-  terminalFailure: Deferred.Deferred<never, ReplicaError.ReplicaError>
+  terminalFailure: Deferred.Deferred<never, ReplicaError.ReplicaError>,
+  retainPersistedAdmission: boolean
 ): Effect.Effect<
   OpenedSession,
   ReplicaError.ReplicaError,
@@ -101,12 +104,14 @@ const makeWithTerminal = (
   | PeerTransport.PeerTransport
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
+  | ReplicaOperationScheduler.ReplicaOperationScheduler
   | ReplicaLimits.ReplicaLimits
 > => {
   let cleanupOnError: Effect.Effect<void> = Effect.void
   return Effect.gen(function*() {
     const deliveries = yield* CommandDeliveryStore.CommandDeliveryStore
     const gate = yield* ReplicaGate.ReplicaGate
+    const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
     const publisher = yield* CommitPublisher.CommitPublisher
     const limits = yield* ReplicaLimits.ReplicaLimits
     const transport = yield* PeerTransport.PeerTransport
@@ -491,7 +496,8 @@ const makeWithTerminal = (
 
     const processReceive = (
       bytes: Uint8Array,
-      delivery: PeerTransport.AcknowledgedDelivery
+      delivery: PeerTransport.AcknowledgedDelivery,
+      incarnation: Identity.ReplicaIncarnation
     ) =>
       Effect.gen(function*() {
         const protocolInvalid = (expected: string, observed: string) => Effect.fail(new RelayProtocolInvalid())
@@ -513,19 +519,15 @@ const makeWithTerminal = (
         const result = yield* withSyncLock(
           envelope.documentId,
           Effect.gen(function*() {
-            const incarnation = yield* Effect.scoped(Effect.gen(function*() {
-              const permit = yield* gate.shared
-              if (permit.incarnation !== session.replicaIncarnation) {
-                return yield* new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageUnavailable({
-                    cause: new Error(
-                      `Replica incarnation changed from ${session.replicaIncarnation} to ${permit.incarnation}`
-                    )
-                  })
+            if (incarnation !== session.replicaIncarnation) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: new Error(
+                    `Replica incarnation changed from ${session.replicaIncarnation} to ${incarnation}`
+                  )
                 })
-              }
-              return permit.incarnation
-            }))
+              })
+            }
             const observationRevision = (yield* Ref.get(observed)).get(envelope.documentId)?.revision ?? 0
             const client = yield* entity(envelope.documentId)
             const relay = yield* Effect.gen(function*() {
@@ -589,7 +591,7 @@ const makeWithTerminal = (
                   )
               )
             )
-            const result = yield* applySync.pipe(
+            const result = yield* (retainPersistedAdmission ? Effect.uninterruptible(applySync) : applySync).pipe(
               Effect.catchReason(
                 "ReplicaError",
                 "ProtocolMismatch",
@@ -696,7 +698,7 @@ const makeWithTerminal = (
           )
           if (enqueueOutcome === "Parked") return "Parked" as const
           yield* Queue.offer(flushRequests, undefined)
-        }
+        })
         return "Applied" as const
       })
 
@@ -741,19 +743,27 @@ const makeWithTerminal = (
       )
 
     const receiveAcknowledged = (delivery: PeerTransport.AcknowledgedDelivery) =>
-      processReceive(delivery.message, delivery).pipe(
-        Effect.flatMap((outcome) =>
-          outcome === "ApplicationRejected"
-            ? settleDelivery("relay reject", delivery.reject("ApplicationRejected"))
-            : outcome === "Parked"
-            ? Effect.void
-            : settleDelivery("relay acknowledge", delivery.acknowledge)
-        ),
-        Effect.catchTag(
-          "RelayProtocolInvalid",
-          () => settleDelivery("relay reject", delivery.reject("ProtocolInvalid"))
+      Effect.scoped(Effect.gen(function*() {
+        const admissionScope = yield* Effect.acquireRelease(Scope.make(), Scope.close)
+        yield* scheduler.background.pipe(Effect.provideService(Scope.Scope, admissionScope))
+        const permit = yield* Effect.scoped(gate.shared)
+        const outcome = yield* processReceive(delivery.message, delivery, permit.incarnation).pipe(
+          Effect.catchTag("RelayProtocolInvalid", () => Effect.succeed("ProtocolInvalid" as const))
         )
-      )
+        if (outcome === "Parked") {
+          yield* Scope.close(admissionScope, Exit.void)
+          return
+        }
+        // Keep restore excluded after releasing SQL admission. Normal reads share this gate and can
+        // proceed while relay settlement retries, but restore cannot erase the receipt being settled.
+        yield* gate.shared
+        yield* Scope.close(admissionScope, Exit.void)
+        return yield* outcome === "ApplicationRejected"
+          ? settleDelivery("relay reject", delivery.reject("ApplicationRejected"))
+          : outcome === "ProtocolInvalid"
+          ? settleDelivery("relay reject", delivery.reject("ProtocolInvalid"))
+          : settleDelivery("relay acknowledge", delivery.acknowledge)
+      }))
     const receiveInbound = (inbound: PeerTransport.Inbound) => {
       if (inbound._tag === "Durable") return receiveAcknowledged(inbound.delivery)
       return selectedById(inbound.delivery.documentId).pipe(
@@ -902,10 +912,11 @@ export const makeTestClient = (
   | PeerTransport.PeerTransport
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
+  | ReplicaOperationScheduler.ReplicaOperationScheduler
   | ReplicaLimits.ReplicaLimits
 > =>
   Deferred.make<never, ReplicaError.ReplicaError>().pipe(
-    Effect.flatMap((terminalFailure) => makeWithTerminal(options, entity, terminalFailure)),
+    Effect.flatMap((terminalFailure) => makeWithTerminal(options, entity, terminalFailure, false)),
     Effect.map((opened) => opened.session)
   )
 
@@ -923,6 +934,7 @@ export const makeSupervised = (options: {
   | PeerTransport.PeerTransport
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
+  | ReplicaOperationScheduler.ReplicaOperationScheduler
   | ReplicaLimits.ReplicaLimits
   | Sharding.Sharding
 > =>
@@ -932,7 +944,8 @@ export const makeSupervised = (options: {
     const opened = yield* makeWithTerminal(
       options,
       (documentId) => Effect.succeed(entity(documentId)),
-      terminalFailure
+      terminalFailure,
+      true
     )
     return opened.session
   })
@@ -951,6 +964,7 @@ export const make = (options: {
   | PeerTransport.PeerTransport
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
+  | ReplicaOperationScheduler.ReplicaOperationScheduler
   | ReplicaLimits.ReplicaLimits
   | Sharding.Sharding
 > => makeSupervised(options)
@@ -969,6 +983,7 @@ export const makeLive = (options: {
   | PeerTransport.PeerTransport
   | PeerSync.PeerSync
   | ReplicaGate.ReplicaGate
+  | ReplicaOperationScheduler.ReplicaOperationScheduler
   | ReplicaLimits.ReplicaLimits
   | Sharding.Sharding
 > =>
@@ -980,7 +995,8 @@ export const makeLive = (options: {
     const opened = yield* makeWithTerminal(
       options,
       (documentId) => Effect.succeed(entity(documentId)),
-      terminalFailure
+      terminalFailure,
+      true
     )
     const session = opened.session
     const selected = new Set(options.documents.map((entry) => entry.documentId))

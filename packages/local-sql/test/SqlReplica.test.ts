@@ -35,6 +35,7 @@ import * as PeerRelayClientRuntime from "../src/PeerRelayClientRuntime.js"
 import * as PeerRelayOutboxLimits from "../src/PeerRelayOutboxLimits.js"
 import * as PeerRelayReceiptLimits from "../src/PeerRelayReceiptLimits.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
+import * as ReplicaOperationScheduler from "../src/ReplicaOperationScheduler.js"
 import * as ReplicaWorkflow from "../src/ReplicaWorkflow.js"
 import * as SqlProjection from "../src/SqlProjection.js"
 import * as SqlReplica from "../src/SqlReplica.js"
@@ -192,6 +193,66 @@ describe("SqlReplica", () => {
   ).pipe(
     Layer.provide(Layer.mergeAll(Database, Handler, Limits))
   )
+  const PriorityLimits = ReplicaLimits.layer({ ...limits, maxQueuedRpc: 1 })
+  const PriorityLive = SqlReplica.layerWithBindings(definition, { projections: [] }).pipe(
+    Layer.provide(Layer.mergeAll(Database, Handler, PriorityLimits))
+  )
+  const PriorityDirectLive = SqlReplica.layerFromServices(definition).pipe(
+    Layer.provideMerge(SqlReplica.servicesLayerWithBindings(definition, { projections: [] })),
+    Layer.provide(Layer.mergeAll(Database, Handler, PriorityLimits))
+  )
+
+  const assertInteractivePriority = Effect.gen(function*() {
+    const replica = yield* Replica.Replica
+    const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
+    const documentId = yield* Identity.makeDocumentId
+    const holderEntered = yield* Deferred.make<void>()
+    const holderRelease = yield* Deferred.make<void>()
+    const completed = yield* Queue.unbounded<string>()
+    const holder = yield* Effect.forkChild(
+      Effect.scoped(Effect.gen(function*() {
+        yield* scheduler.background
+        yield* Deferred.succeed(holderEntered, undefined)
+        yield* Deferred.await(holderRelease)
+      })),
+      { startImmediately: true }
+    )
+    yield* Deferred.await(holderEntered)
+    const background = yield* Effect.forkChild(
+      Effect.scoped(
+        scheduler.background.pipe(Effect.andThen(Queue.offer(completed, "background")))
+      ),
+      { startImmediately: true }
+    )
+    const interactive = yield* Effect.all(["interactive-1", "interactive-2"].map((label) =>
+      Effect.forkChild(
+        Effect.exit(replica.get(Task, documentId)).pipe(Effect.andThen(Queue.offer(completed, label))),
+        { startImmediately: true }
+      )
+    ))
+    const overflow = yield* Effect.forkChild(Effect.exit(Effect.scoped(scheduler.interactive)), {
+      startImmediately: true
+    })
+    const overflowExit = overflow.pollUnsafe()
+    assert.isDefined(overflowExit)
+    if (overflowExit !== undefined) {
+      assert.isTrue(Exit.isSuccess(overflowExit))
+      if (Exit.isSuccess(overflowExit)) assert.isTrue(Exit.isFailure(overflowExit.value))
+    }
+    yield* Deferred.succeed(holderRelease, undefined)
+    assert.deepStrictEqual(new Set(yield* Queue.takeN(completed, 2)), new Set(["interactive-1", "interactive-2"]))
+    assert.strictEqual(yield* Queue.take(completed), "background")
+    yield* Fiber.join(holder)
+    yield* Fiber.join(background)
+    yield* Effect.forEach(interactive, Fiber.join, { discard: true })
+    yield* Fiber.await(overflow)
+  })
+
+  it.effect("prioritizes interactive work through both replica constructors", () =>
+    Effect.gen(function*() {
+      yield* assertInteractivePriority.pipe(Effect.provide(PriorityLive))
+      yield* assertInteractivePriority.pipe(Effect.provide(PriorityDirectLive))
+    }).pipe(Effect.scoped, Effect.provide(NodeCrypto.layer), TestClock.withLive))
 
   it("rejects duplicate bindings for one projection", () => {
     assert.throws(
