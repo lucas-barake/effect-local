@@ -953,7 +953,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                       })
                     )
                   )
-                  yield* projections.replaceDocument(document, stored.snapshot, stored.commitSequence).pipe(
+                  yield* projections.replaceDocument(document, stored.snapshot, stored.commitSequence, "Reused").pipe(
                     Effect.ensuring(Effect.sync(() => InternalAutomerge.free(stored.automerge)))
                   )
                 }

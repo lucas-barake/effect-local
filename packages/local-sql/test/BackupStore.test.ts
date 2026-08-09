@@ -566,13 +566,13 @@ describe("BackupStore", () => {
       const sql = yield* SqlClient.SqlClient
       const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "before" })
-      yield* projections.replaceDocument(Task, created.snapshot, created.commitSequence)
+      yield* projections.replaceDocument(Task, created.snapshot, created.commitSequence, "Fresh")
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
       const staged = yield* store.stage(created, (draft) => {
         draft.title = "after"
       })
       const changed = yield* store.persist(Task, documentId, created, staged)
-      yield* projections.replaceDocument(Task, changed.snapshot, changed.commitSequence)
+      yield* projections.replaceDocument(Task, changed.snapshot, changed.commitSequence, "Fresh")
       InternalAutomerge.free(changed.automerge)
       InternalAutomerge.free(staged)
       InternalAutomerge.free(created.automerge)

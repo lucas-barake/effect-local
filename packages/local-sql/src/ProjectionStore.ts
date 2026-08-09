@@ -1,6 +1,6 @@
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Document from "@lucas-barake/effect-local/Document"
-import type * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Projection from "@lucas-barake/effect-local/Projection"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -37,7 +37,8 @@ export class ProjectionStore extends Context.Service<ProjectionStore, {
   readonly replaceDocument: <D extends Document.Any,>(
     document: D,
     snapshot: Snapshot.FromDocument<D>,
-    commitSequence: Identity.CommitSequence
+    commitSequence: Identity.CommitSequence,
+    commitSequenceKind: "Fresh" | "Reused"
   ) => Effect.Effect<void, ReplicaError.ReplicaError>
 }>()("@lucas-barake/effect-local-sql/ProjectionStore") {}
 
@@ -70,6 +71,27 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
         execute: (projectionName) =>
           sql`SELECT table_name, projection_version, schema_checksum
             FROM effect_local_projection_registry WHERE projection_name = ${projectionName}`
+      })
+      const transitionReady = SqlSchema.findAll({
+        Request: Schema.Struct({
+          commitSequence: Identity.CommitSequence,
+          documentId: Identity.DocumentId
+        }),
+        Result: Schema.Struct({ document_id: Identity.DocumentId }),
+        execute: ({ commitSequence, documentId }) =>
+          sql`UPDATE effect_local_documents SET projection_status = 'Ready'
+            WHERE document_id = ${documentId} AND projection_status != 'Ready'
+              AND EXISTS (SELECT 1 FROM effect_local_commit_outbox
+                WHERE commit_sequence = ${commitSequence} AND document_id = ${documentId}
+                  AND published = 0)
+            RETURNING document_id`
+      })
+      const nextCommitSequence = SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: Schema.Struct({ commit_sequence: Identity.CommitSequence }),
+        execute: () =>
+          sql`UPDATE effect_local_metadata SET commit_sequence = commit_sequence + 1
+            WHERE singleton = 1 RETURNING commit_sequence`
       })
       const tables = new Set<string>()
       // One transaction over every binding's migrations and registry reconciliation
@@ -202,20 +224,40 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
           Effect.mapError(toProjectionBlocked("$all"))
         ),
         replace,
-        replaceDocument: (document, snapshot, commitSequence) =>
+        replaceDocument: (document, snapshot, commitSequence, commitSequenceKind) =>
           sql.withTransaction(Effect.gen(function*() {
             const matching = resolved.filter((binding) => binding.projection.document.name === document.name)
             for (const binding of matching) {
               yield* replace(binding, snapshot, binding.table)
             }
-            yield* sql`UPDATE effect_local_commit_outbox
-              SET invalidation_keys = ${
-              Schema.encodeSync(StringArrayJson)([
-                ...ReplicaDefinition.documentCommitKeys(document.name, snapshot.documentId),
-                ...matching.map((binding) => binding.projection.name)
-              ])
+            const keys = [
+              ...ReplicaDefinition.documentCommitKeys(document.name, snapshot.documentId),
+              ...matching.map((binding) => binding.projection.name)
+            ]
+            const transitioned = yield* transitionReady({
+              commitSequence,
+              documentId: snapshot.documentId
+            }).pipe(Effect.mapError(toProjectionBlocked(document.name)))
+            if (transitioned.length > 0 && commitSequenceKind === "Reused") {
+              // The pending row can already be in a publisher's memory. Keep its payload immutable
+              // and publish the rebuilt projection under a fresh sequence.
+              const fresh = yield* nextCommitSequence(undefined).pipe(
+                Effect.mapError(toProjectionBlocked(document.name))
+              )
+              yield* sql`INSERT INTO effect_local_commit_outbox (
+                commit_sequence, document_id, invalidation_keys, published
+              ) VALUES (
+                ${fresh.commit_sequence}, ${snapshot.documentId},
+                ${Schema.encodeSync(StringArrayJson)(keys)}, 0
+              )`
+            } else {
+              yield* sql`UPDATE effect_local_commit_outbox
+                SET invalidation_keys = ${Schema.encodeSync(StringArrayJson)(keys)}
+                WHERE commit_sequence = ${commitSequence} AND document_id = ${snapshot.documentId}
+                  AND published = 0
+                  AND EXISTS (SELECT 1 FROM effect_local_documents
+                    WHERE document_id = ${snapshot.documentId} AND projection_status = 'Ready')`
             }
-              WHERE commit_sequence = ${commitSequence} AND document_id = ${snapshot.documentId}`
           })).pipe(
             Effect.catchTag("SqlError", (cause) => Effect.fail(toProjectionBlocked(document.name)(cause)))
           )
