@@ -222,6 +222,8 @@ it.effect("encodes every restore error and defect at the minimum configured budg
       new ReplicaError.DocumentNotFound({ documentId }),
       new ReplicaError.DocumentDecodeError({ documentId, cause }),
       new ReplicaError.DocumentEncodeError({ documentId, cause }),
+      new ReplicaError.TransientDecodeError({ topic: "activity", documentId, cause }),
+      new ReplicaError.TransientEncodeError({ topic: "activity", documentId, cause }),
       new ReplicaError.UnsupportedDocumentVersion({
         documentId,
         observedVersion: 2,

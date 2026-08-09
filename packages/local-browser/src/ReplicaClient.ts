@@ -10,6 +10,7 @@ import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import * as Transient from "@lucas-barake/effect-local/Transient"
 import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
@@ -1994,7 +1995,16 @@ export const fromRpcClient = (
   })
 
 export const layer = (definition: ReplicaDefinition.Any, options?: Options) =>
-  Layer.effect(
-    ReplicaClient,
-    RpcClient.make(ReplicaRpc.group).pipe(Effect.flatMap((rpc) => fromRpcClient(definition, rpc, options)))
+  Layer.effectContext(
+    RpcClient.make(ReplicaRpc.group).pipe(
+      Effect.flatMap((rpc) => fromRpcClient(definition, rpc, options)),
+      Effect.map((client) =>
+        Context.make(ReplicaClient, client).pipe(
+          Context.add(Transient.Transport, {
+            send: client.transient,
+            messages: client.transients
+          })
+        )
+      )
+    )
   )

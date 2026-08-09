@@ -17,6 +17,8 @@ revocation prevents admission or drains an already admitted bounded operation.
 `transient` operation sends once, and its `transients` stream is bounded, multicast, and no replay.
 `PeerRelayClientRuntime` registers live peer and document routes so an owner can send and receive transient values
 without putting them in the SQL outbox or receipt stores.
+It also provides the raw `Transient.Transport` adapter consumed by the core typed contract layer. Applications should
+use registered transient contracts. The raw runtime operations remain available for custom transport composition.
 
 See the [Effect Local documentation](https://github.com/lucas-barake/effect-local#readme) for durable composition,
 projections, recovery, compaction, sync, and API reference. The relay durability boundaries are documented in

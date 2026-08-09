@@ -6,6 +6,7 @@ import type * as Mutation from "./Mutation.js"
 import type * as Projection from "./Projection.js"
 import type * as Query from "./Query.js"
 import * as SchemaDescriptor from "./SchemaDescriptor.js"
+import type * as Transient from "./Transient.js"
 
 export interface ReplicaDefinition<
   out Name extends string,
@@ -13,16 +14,18 @@ export interface ReplicaDefinition<
   Mutations extends ReadonlyArray<Mutation.Any>,
   Projections extends ReadonlyArray<Projection.Any>,
   Queries extends ReadonlyArray<Query.Any>,
+  Transients extends ReadonlyArray<Transient.Any>,
 > {
   readonly name: Name
   readonly documents: DocumentSet.DocumentSet<Documents>
   readonly mutations: Mutations
   readonly projections: Projections
   readonly queries: Queries
+  readonly transients: Transients
   readonly hash: string
 }
 
-export type Any = ReplicaDefinition<any, any, any, any, any>
+export type Any = ReplicaDefinition<any, any, any, any, any, any>
 
 const invalidationKeyDomain = "@lucas-barake/effect-local/invalidation"
 
@@ -61,23 +64,38 @@ const assertUnique = (kind: string, values: ReadonlyArray<{ readonly name: strin
   }
 }
 
+const assertKnownDocuments = (
+  kind: string,
+  values: ReadonlyArray<{ readonly name: string; readonly document: Document.Any }>,
+  documents: ReadonlySet<Document.Any>
+): void => {
+  for (const value of values) {
+    if (!documents.has(value.document)) {
+      throw new TypeError(`${kind} references an unknown document: ${value.name}`)
+    }
+  }
+}
+
 export const make = <
   const Name extends string,
   const Documents extends ReadonlyArray<Document.Any>,
   const Mutations extends ReadonlyArray<Mutation.Any> = readonly [],
   const Projections extends ReadonlyArray<Projection.Any> = readonly [],
   const Queries extends ReadonlyArray<Query.Any> = readonly [],
+  const Transients extends ReadonlyArray<Transient.Any> = readonly [],
 >(options: {
   readonly name: Name
   readonly documents: DocumentSet.DocumentSet<Documents>
   readonly mutations?: Mutations
   readonly projections?: Projections
   readonly queries?: Queries
-}): ReplicaDefinition<Name, Documents, Mutations, Projections, Queries> => {
+  readonly transients?: Transients
+}): ReplicaDefinition<Name, Documents, Mutations, Projections, Queries, Transients> => {
   if (options.name.length === 0) throw new TypeError("Replica definition name must be nonempty")
   const mutations = Object.freeze([...(options.mutations ?? [])]) as unknown as Mutations
   const projections = Object.freeze([...(options.projections ?? [])]) as unknown as Projections
   const queries = Object.freeze([...(options.queries ?? [])]) as unknown as Queries
+  const transients = Object.freeze([...(options.transients ?? [])]) as unknown as Transients
   const documentSet: DocumentSet.DocumentSet<Documents> = {
     documents: Object.freeze([...options.documents.documents]) as unknown as Documents,
     byName: new Map(options.documents.byName)
@@ -85,18 +103,11 @@ export const make = <
   assertUnique("mutation", mutations)
   assertUnique("projection", projections)
   assertUnique("query", queries)
+  assertUnique("transient", transients)
   const documents = new Set(documentSet.documents)
   const registeredProjections = new Set(projections)
-  for (const mutation of mutations) {
-    if (!documents.has(mutation.document)) {
-      throw new TypeError(`Mutation references an unknown document: ${mutation.name}`)
-    }
-  }
-  for (const projection of projections) {
-    if (!documents.has(projection.document)) {
-      throw new TypeError(`Projection references an unknown document: ${projection.name}`)
-    }
-  }
+  assertKnownDocuments("Mutation", mutations, documents)
+  assertKnownDocuments("Projection", projections, documents)
   for (const query of queries) {
     for (const dependency of query.dependsOn) {
       if (!registeredProjections.has(dependency)) {
@@ -104,6 +115,7 @@ export const make = <
       }
     }
   }
+  assertKnownDocuments("Transient", transients, documents)
   const definitionHash = `def_${
     Canonical.hash({
       name: options.name,
@@ -133,8 +145,17 @@ export const make = <
         payload: SchemaDescriptor.make(query.payloadSchema),
         success: SchemaDescriptor.make(query.successSchema),
         version: query.version
-      }))
+      })),
+      ...(transients.length === 0
+        ? {}
+        : {
+          transients: transients.map((transient) => ({
+            document: transient.document.name,
+            name: transient.name,
+            payload: SchemaDescriptor.make(transient.payloadSchema)
+          }))
+        })
     })
   }`
-  return { ...options, documents: documentSet, mutations, projections, queries, hash: definitionHash }
+  return { ...options, documents: documentSet, mutations, projections, queries, transients, hash: definitionHash }
 }

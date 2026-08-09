@@ -3,7 +3,16 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
-import { Document, DocumentSet, Identity, Mutation, PeerTransport, Query, SchemaDescriptor } from "../src/index.js"
+import {
+  Document,
+  DocumentSet,
+  Identity,
+  Mutation,
+  PeerTransport,
+  Query,
+  SchemaDescriptor,
+  Transient
+} from "../src/index.js"
 import type { CommandOutcome, Conflict, Replica } from "../src/index.js"
 import type * as ReplicaError from "../src/ReplicaError.js"
 
@@ -91,6 +100,12 @@ describe("public API types", () => {
     payload: Schema.Struct({ title: Schema.String }),
     error: DomainError
   })
+  class Typing extends Schema.TaggedClass<Typing>()("Typing", { userId: Schema.String }) {}
+  class ReadPosition extends Schema.TaggedClass<ReadPosition>()("ReadPosition", { messageId: Schema.String }) {}
+  const ChatTransient = Transient.make("ChatActivity", {
+    document: Task,
+    payload: Schema.Union([Typing, ReadPosition])
+  })
   const ReadWithUnion = Query.make("ReadWithUnion", {
     success: Schema.Array(Task.schema),
     error: DomainError,
@@ -124,6 +139,20 @@ describe("public API types", () => {
     assert.isTrue(queryError)
     assert.isTrue(mutationErrorUnion)
     assert.isTrue(queryErrorUnion)
+  })
+
+  it("preserves transient tagged union inference", () => {
+    const payload: Equal<typeof ChatTransient.payloadSchema.Type, Typing | ReadPosition> = true
+    const client: Equal<
+      typeof ChatTransient.client,
+      Effect.Effect<
+        (documentId: Identity.DocumentId) => Transient.Client<Typing | ReadPosition>,
+        never,
+        Transient.Transient
+      >
+    > = true
+    assert.isTrue(payload)
+    assert.isTrue(client)
   })
 
   it("narrows document lookup by literal name", () => {
