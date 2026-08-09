@@ -12,6 +12,12 @@ import * as ReplicaClient from "./ReplicaClient.js"
 
 type WorkerOptions = Parameters<typeof RpcClient.layerProtocolWorker>[0]
 
+/**
+ * The republished services must build per graph, not once. They re-export whichever
+ * `ReplicaClient` their own graph provides, and Layer memoization is by object identity under the
+ * app wide `Atom.runtime` memo map, so lifting them out of this function would make a second
+ * replica silently resolve to the first one's client.
+ */
 const clientServices = (definition: ReplicaDefinition.Any) =>
   Layer.merge(
     Layer.effectContext(
