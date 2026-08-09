@@ -507,7 +507,10 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
   })).pipe(Layer.provide(RestoreTransport.freshLayer))
 
 export const layer = (definition: ReplicaDefinition.Any) =>
-  RpcServer.layer(ReplicaRpc.group).pipe(Layer.provide(layerHandlers(definition)))
+  // One request's defect must answer that request, not tear down the tab's whole session.
+  RpcServer.layer(ReplicaRpc.group, { disableFatalDefects: true }).pipe(
+    Layer.provide(layerHandlers(definition))
+  )
 
 export const layerWorker = (definition: ReplicaDefinition.Any) =>
   layer(definition).pipe(Layer.provide(RpcServer.layerProtocolWorkerRunner))

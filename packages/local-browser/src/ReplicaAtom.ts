@@ -9,6 +9,7 @@ import type * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Hash from "effect/Hash"
@@ -25,12 +26,14 @@ export const layerReactivity = Layer.effectDiscard(Effect.gen(function*() {
   const reactivity = yield* Reactivity.Reactivity
   yield* replica.invalidations.pipe(
     Stream.runForEach((event) => reactivity.invalidate(event.keys)),
-    Effect.retry({
-      schedule: Schedule.spaced(1_000),
-      while: (error) => error.reason._tag === "StorageUnavailable" || error.reason._tag === "QuotaExceeded"
-    }),
-    Effect.tapCause(Effect.logError),
-    Effect.ignore,
+    // Restarting after a noninterrupt failure keeps remote invalidations live. Interruption remains
+    // terminal so the owning scope controls shutdown.
+    Effect.catchCause((cause) =>
+      Cause.hasInterrupts(cause)
+        ? Effect.failCause(cause)
+        : Effect.logWarning("replica invalidation stream restarting", cause)
+    ),
+    Effect.repeat(Schedule.spaced(1_000)),
     Effect.forkScoped
   )
 })).pipe(Layer.fresh)
