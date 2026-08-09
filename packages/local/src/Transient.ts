@@ -105,37 +105,6 @@ const EnvelopeJson = Schema.fromJsonString(Schema.toCodecJson(Envelope))
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 
-const encode = (
-  topic: Any,
-  documentId: Identity.DocumentId,
-  payload: unknown
-): Effect.Effect<Uint8Array, ReplicaError.ReplicaError> =>
-  Schema.encodeUnknownEffect(Schema.toCodecJson(topic.payloadSchema))(payload).pipe(
-    Effect.flatMap((encodedPayload) =>
-      Schema.encodeEffect(EnvelopeJson)({ topic: topic.name, payload: encodedPayload })
-    ),
-    Effect.map((encoded) => encoder.encode(encoded)),
-    Effect.mapError((cause) =>
-      new ReplicaError.ReplicaError({
-        reason: new ReplicaError.TransientEncodeError({ topic: topic.name, documentId, cause })
-      })
-    )
-  )
-
-const decodeEnvelope = (
-  topic: Any,
-  documentId: Identity.DocumentId,
-  payload: Uint8Array
-): Effect.Effect<Schema.Json | undefined, ReplicaError.ReplicaError> =>
-  Schema.decodeUnknownEffect(EnvelopeJson)(decoder.decode(payload)).pipe(
-    Effect.map((envelope) => envelope.topic === topic.name ? envelope.payload : undefined),
-    Effect.mapError((cause) =>
-      new ReplicaError.ReplicaError({
-        reason: new ReplicaError.TransientDecodeError({ topic: topic.name, documentId, cause })
-      })
-    )
-  )
-
 export const layer = (topics: ReadonlyArray<Any>): Layer.Layer<Transient, never, Transport> =>
   Layer.effect(
     Transient,
@@ -144,30 +113,35 @@ export const layer = (topics: ReadonlyArray<Any>): Layer.Layer<Transient, never,
       return Transient.of({
         client: <A,>(topic: Any, documentId: Identity.DocumentId): Client<A> => {
           if (!registered.has(topic)) throw new TypeError(`Transient is not registered: ${topic.name}`)
+          const payloadCodec = Schema.toCodecJson(topic.payloadSchema)
           return {
             publish: (peerId, payload) =>
-              encode(topic, documentId, payload).pipe(
-                Effect.flatMap((encoded) => transport.send(peerId, documentId, encoded))
+              Schema.encodeUnknownEffect(payloadCodec)(payload).pipe(
+                Effect.flatMap((encodedPayload) =>
+                  Schema.encodeEffect(EnvelopeJson)({ topic: topic.name, payload: encodedPayload })
+                ),
+                Effect.mapError((cause) =>
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.TransientEncodeError({ topic: topic.name, documentId, cause })
+                  })
+                ),
+                Effect.flatMap((encoded) => transport.send(peerId, documentId, encoder.encode(encoded)))
               ),
             messages: transport.messages.pipe(
               Stream.filter((message) => message.documentId === documentId),
               Stream.mapEffect((message) =>
-                decodeEnvelope(topic, documentId, message.payload).pipe(
-                  Effect.flatMap((payload) =>
-                    payload === undefined
-                      ? Effect.succeed(undefined)
-                      : Schema.decodeUnknownEffect(Schema.toCodecJson(topic.payloadSchema))(payload).pipe(
-                        Effect.map((decoded) => ({ peerId: message.peerId, payload: decoded as A })),
-                        Effect.mapError((cause) =>
-                          new ReplicaError.ReplicaError({
-                            reason: new ReplicaError.TransientDecodeError({
-                              topic: topic.name,
-                              documentId,
-                              cause
-                            })
-                          })
-                        )
+                Schema.decodeUnknownEffect(EnvelopeJson)(decoder.decode(message.payload)).pipe(
+                  Effect.flatMap((envelope) =>
+                    envelope.topic === topic.name
+                      ? Schema.decodeUnknownEffect(payloadCodec)(envelope.payload).pipe(
+                        Effect.map((decoded) => ({ peerId: message.peerId, payload: decoded as A }))
                       )
+                      : Effect.succeed(undefined)
+                  ),
+                  Effect.mapError((cause) =>
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.TransientDecodeError({ topic: topic.name, documentId, cause })
+                    })
                   )
                 )
               ),
