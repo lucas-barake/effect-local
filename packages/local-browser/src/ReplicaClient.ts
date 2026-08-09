@@ -1284,7 +1284,17 @@ export const fromRpcClient = (
                     cause: error
                   })
                 })
-              ))
+              )),
+            // Same recovery as `relayConnectionStatus` below: an owner engine reset fails every
+            // rpc port under the tab, and without the retry the per-peer indicator is stranded on
+            // the dead subscription while the replacement owner is already serving.
+            Stream.retry(
+              Schedule.spaced("1 second").pipe(
+                Schedule.setInputType<ReplicaError.ReplicaError>(),
+                Schedule.while(({ input }) => isTransientStatus(input))
+              )
+            ),
+            Stream.interruptWhen(Deferred.await(pageHidden))
           )
       }),
       relayConnectionStatus: RelayConnectionStatus.RelayConnectionStatus.of({
@@ -1307,7 +1317,19 @@ export const fromRpcClient = (
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageUnavailable({ cause: error })
                   })
-                ))
+                )),
+              // An owner engine reset fails every rpc port under the tab, which surfaces here as a
+              // transient transport error. Without this the stream is terminal and the page's relay
+              // indicator is stranded on whatever the dead engine last said, even though the
+              // replacement owner is already serving.
+              Stream.retry(
+                Schedule.spaced("1 second").pipe(
+                  Schedule.setInputType<ReplicaError.ReplicaError>(),
+                  Schedule.while(({ input }) => isTransientStatus(input))
+                )
+              ),
+              // The retry above would otherwise reopen a session the page has already closed.
+              Stream.interruptWhen(Deferred.await(pageHidden))
             )
           })
         )
