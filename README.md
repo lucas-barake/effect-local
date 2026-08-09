@@ -239,6 +239,11 @@ projection, every mutation and query handler Layer, a `ReplicaLimits` value, Eff
 [`packages/local-sql/examples/domain.ts`](packages/local-sql/examples/domain.ts) and copied verbatim from
 `TestReplica.defaultLimits`, which is a starting point rather than production capacity planning.
 
+`checkpointAuthority` is an optional `SqlReplica` constructor option. Without it, ordinary peer sync, local
+compaction, and local history rewriting continue, but the replica neither authorizes outgoing checkpoint
+transfers nor accepts incoming ones. Configure it when peers must bootstrap or recover from compact checkpoints.
+The authority contract is described under [Checkpoint shipping](#checkpoint-shipping).
+
 ```ts
 // node.ts
 import { NodeCrypto } from "@effect/platform-node"
@@ -1261,7 +1266,10 @@ effects. Transient values contain authenticated `peerId`, selected `documentId`,
 acknowledgement or rejection operation. The adapter returns one scoped `Connection` per connection epoch. Its scope
 must release every transport resource. `capabilities.lineageAware` describes the REMOTE peer: set it only when that
 peer compares document lineage before merging, because the durable send path refuses to emit a rewritten document
-to a peer that does not.
+to a peer that does not. `capabilities.checkpointTransfer` also describes the remote peer. Set it only when the
+remote protocol can receive and validate a checkpoint plus its incremental tail. `RpcPeerTransport` advertises both
+capabilities automatically. A custom transport must negotiate them with the remote peer and treat an absent value
+as `false`.
 
 `PeerSession` binds one connection to selected whole documents and drives both directions:
 
@@ -1297,6 +1305,44 @@ has been accepted for every current local change in that document for the exact 
 connections still return `false`. Transient sends never affect either durable signal. Command scoped applications
 should prefer `lookupCommandDelivery`, since document confirmation combines all current local changes and is not tied
 to one command.
+
+### Checkpoint shipping
+
+Ordinary Automerge sync sends incremental history. When a remote peer advertises `checkpointTransfer`, the sender
+can instead ship a bounded checkpoint when that history exceeds `maxSyncMessageBytes` or
+`maxSyncChangesPerMessage`. A checkpoint can initialize an absent document, replace a contained prefix in the same
+lineage, or move a stale peer across rewritten lineages through a continuous transition chain. The install commits
+the checkpoint, projections, sync receipt, and lineage metadata atomically. Divergent local heads, pending local
+work, an invalid transition chain, or a definition or schema mismatch cause rejection without mutation.
+
+Checkpoint bytes are not trusted merely because the peer is authenticated. Configure
+`SqlReplica.Options.checkpointAuthority` with four operations supplied by the application:
+
+```ts
+export interface Implementation {
+  readonly signManifest: (
+    claims: CheckpointAuthority.ManifestClaims
+  ) => Effect.Effect<Option.Option<CheckpointAuthority.AuthorizationToken>, ReplicaError.ReplicaError>
+  readonly verifyManifest: (
+    claims: CheckpointAuthority.ManifestClaims,
+    token: CheckpointAuthority.AuthorizationToken
+  ) => Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly signTransition: (
+    claims: CheckpointAuthority.TransitionClaims
+  ) => Effect.Effect<Option.Option<CheckpointAuthority.AuthorizationToken>, ReplicaError.ReplicaError>
+  readonly verifyTransition: (
+    claims: CheckpointAuthority.TransitionClaims,
+    token: CheckpointAuthority.AuthorizationToken
+  ) => Effect.Effect<void, ReplicaError.ReplicaError>
+}
+```
+
+Sign canonical claims with an application key or equivalent authority, and verify them against the trust policy
+for the receiving replica. Manifest claims bind the document, lineage, checkpoint hash, heads, base, schema
+version, and writer definition hash. Transition claims additionally bind the prior and resulting lineage anchors.
+Tokens are bounded opaque bytes. Returning `Option.none()` declines to authorize an outgoing checkpoint. A failed
+verification raises `ReplicaError` / `CheckpointRejected`. Omitting the option installs a reject all authority, so
+checkpoint shipping fails closed while compatible ordinary sync remains available.
 
 One socket carries every session. `RpcPeerTransport.layer` takes an already built `PeerRpc.RpcClient` and never
 opens a connection of its own, and the relay tracks each `Open` by its own session id independently of which
@@ -1728,16 +1774,18 @@ Contract points that are easy to get wrong:
 1. An operation ID is bound to the first document it rewrote. Reusing one against a different document fails
    with `ReplicaError` / `ProtocolMismatch` before anything destructive runs. A new operation ID performs a
    second rewrite and mints a second lineage.
-2. A rewritten document never synchronizes with a peer holding the superseded lineage, and it cannot be seeded
-   to a peer that never held the document. Peers that did not advertise `lineageAware` are never sent the
-   document at all; aware but stale peers are refused with a typed non retryable error scoped to that document
-   while every other selected document keeps synchronizing.
-3. Lineage is an unauthenticated peer assertion on the sync envelope. It is a correctness signal against an
-   honest but stale peer, not a security control. Confirm locally that a rewrite ran before acting on a
-   refusal.
-4. Recovery for a refused peer replaces its obsolete canonical state: export the authoritative replica after
-   the rewrite and clone restore onto the refused replica. Either restore mode discards unsynced changes on the
-   superseded lineage, which is why history rewrite is opt in rather than a background policy.
+2. A peer that advertises both `lineageAware` and `checkpointTransfer` can receive a rewritten document through a
+   signed transition chain. The first transition must prove that its prior snapshot contains the receiving
+   replica's current heads. A signed bootstrap manifest can seed a peer that does not yet hold the document.
+3. Peers that do not advertise `lineageAware` are never sent a rewritten document. A lineage aware peer without
+   checkpoint transfer support receives the existing typed, non retryable `DocumentLineageChanged` refusal while
+   every other selected document keeps synchronizing.
+4. Lineage on an ordinary sync envelope remains an unauthenticated correctness signal. A checkpoint transfer is a
+   separate trust boundary. Its manifest and every lineage transition must pass `CheckpointAuthority`
+   verification before installation.
+5. A divergent peer, a peer with pending work, or a peer that cannot verify the checkpoint remains unchanged.
+   Resolve the pending or divergent work first. Archive restore remains the explicit replacement path when that
+   work should be discarded.
 
 ## Testing
 
@@ -1862,6 +1910,7 @@ durable `Rejected` outcomes. Resource bounds and document loading failures remai
 | `UnsupportedStorageFormatVersion` | `observedVersion`, `supportedVersion`               | The on disk format belongs to another library build                                        | Terminal; run a matching build or re-seed                          |
 | `CheckpointSuperseded`            | `documentIds`, `attempts`                           | Checkpoint publication lost the install race on every attempt                              | Partial compaction; retry with a new operation ID                  |
 | `DocumentLineageChanged`          | `documentId`, `localLineage`, `remoteLineage`       | A peer holds a superseded document lineage                                                 | Terminal for that document; repair by archive restore              |
+| `CheckpointRejected`              | `documentId`, `reason`                              | Checkpoint authorization, integrity, ancestry, or installation preconditions failed        | Terminal; fix trust or peer state before reconnecting              |
 | `CommandOutcomeUnknown`           | `commandId`, `cause`                                | The command may or may not have committed                                                  | Never retry; use the matching complete lookup                      |
 
 Fields named `cause` use `Schema.Defect()` and carry the original failure. They stay inside the local process;
@@ -1965,6 +2014,9 @@ rest are advanced assembly for custom runtimes.
 
 - `SqlReplica`: `layerWithBindings`, `layerRelayWithBindings`, `layer`, `layerRelay`, `layerFromServices`. See
   [Durable Node composition](#durable-node-composition).
+- `CheckpointAuthority`: `layer`, `layerRejectAll`, claim and token schemas, and the `CheckpointAuthority`
+  service. Standard `SqlReplica` constructors accept its `Implementation` through `checkpointAuthority`. See
+  [Checkpoint shipping](#checkpoint-shipping).
 - `SqlProjection`: `make`; types `SqlProjection`, `Migration`, `BindingService`, `Any`. Each binding exposes
   `service` and `layer`.
 - `PeerSession`: `make`, `makeSupervised`, `makeLive`, `makeTestClient`; types `SelectedDocument`, `PeerSession`,
