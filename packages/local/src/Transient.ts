@@ -81,19 +81,15 @@ export const make = <
   if (name.startsWith("$")) {
     throw new TypeError(`Transient name must not start with "$", it is reserved for protocol sentinels: ${name}`)
   }
-  const topic = {
+  const topic: Topic<Name, D, SchemaInput.Wire<P>> = {
     [TypeId]: TypeId,
     name,
     document: options.document,
     payloadSchema: SchemaInput.normalize(options.payload),
-    client: undefined as never
-  } as Topic<Name, D, SchemaInput.Wire<P>>
-  Object.defineProperty(topic, "client", {
-    enumerable: true,
-    value: Transient.pipe(
+    client: Transient.pipe(
       Effect.map((service) => (documentId: Identity.DocumentId) => service.client(topic, documentId))
     )
-  })
+  }
   return topic
 }
 
