@@ -36,9 +36,9 @@ export const ExpoCryptoModule = Context.Reference<typeof ExpoCrypto>(
  */
 export const layer: Layer.Layer<Crypto.Crypto> = Layer.effect(
   Crypto.Crypto,
-  Effect.map(ExpoCryptoModule, (expoCrypto) =>
-    Crypto.make({
-      randomBytes: (size) => expoCrypto.getRandomBytes(size),
+  Effect.map(ExpoCryptoModule, (expoCrypto) => {
+    const crypto = Crypto.make({
+      randomBytes: (size) => expoCrypto.getRandomValues(new Uint8Array(size)),
       digest: (algorithm, data) =>
         Effect.map(
           Effect.tryPromise({
@@ -55,5 +55,43 @@ export const layer: Layer.Layer<Crypto.Crypto> = Layer.effect(
           }),
           (buffer) => new Uint8Array(buffer)
         )
-    }))
+    })
+    return Crypto.Crypto.of({
+      ...crypto,
+      randomBytes: (size) =>
+        crypto.randomBytes(size).pipe(
+          Effect.catchDefect((cause) =>
+            Effect.fail(PlatformError.systemError({
+              module: "Crypto",
+              method: "randomBytes",
+              _tag: "Unknown",
+              description: "Could not generate random bytes",
+              cause
+            }))
+          )
+        ),
+      randomUUIDv4: crypto.randomUUIDv4.pipe(
+        Effect.catchDefect((cause) =>
+          Effect.fail(PlatformError.systemError({
+            module: "Crypto",
+            method: "randomUUIDv4",
+            _tag: "Unknown",
+            description: "Could not generate UUIDv4",
+            cause
+          }))
+        )
+      ),
+      randomUUIDv7: crypto.randomUUIDv7.pipe(
+        Effect.catchDefect((cause) =>
+          Effect.fail(PlatformError.systemError({
+            module: "Crypto",
+            method: "randomUUIDv7",
+            _tag: "Unknown",
+            description: "Could not generate UUIDv7",
+            cause
+          }))
+        )
+      )
+    })
+  })
 )

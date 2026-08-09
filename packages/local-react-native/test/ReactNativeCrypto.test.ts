@@ -1,6 +1,8 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
+import * as Layer from "effect/Layer"
+import * as ExpoCrypto from "expo-crypto"
 import * as ReactNativeCrypto from "../src/ReactNativeCrypto.js"
 import * as ReactNativePolyfills from "../src/ReactNativePolyfills.js"
 
@@ -31,6 +33,56 @@ describe("ReactNativeCrypto", () => {
       assert.match(v7, /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
       assert.notStrictEqual(yield* crypto.randomUUIDv4, v4)
     }).pipe(Effect.provide(ReactNativeCrypto.layer)))
+
+  it.effect("uses getRandomValues without the development Math.random fallback", () =>
+    Effect.gen(function*() {
+      let getRandomValuesCalls = 0
+      const native = {
+        ...ExpoCrypto,
+        getRandomBytes: () => {
+          throw new Error("getRandomBytes must not be used")
+        },
+        getRandomValues: <T extends Uint8Array,>(bytes: T): T => {
+          getRandomValuesCalls++
+          bytes.fill(0x5a)
+          return bytes
+        }
+      } as typeof ExpoCrypto
+      const crypto = yield* Crypto.Crypto.pipe(
+        Effect.provide(
+          ReactNativeCrypto.layer.pipe(
+            Layer.provide(Layer.succeed(ReactNativeCrypto.ExpoCryptoModule, native))
+          )
+        )
+      )
+      const bytes = yield* crypto.randomBytes(2_048)
+      assert.strictEqual(bytes.length, 2_048)
+      assert.isTrue(bytes.every((byte) => byte === 0x5a))
+      assert.strictEqual(getRandomValuesCalls, 1)
+    }))
+
+  it.effect("maps native random failures to PlatformError", () =>
+    Effect.gen(function*() {
+      const native = {
+        ...ExpoCrypto,
+        getRandomBytes: () => {
+          throw new Error("native entropy unavailable")
+        },
+        getRandomValues: () => {
+          throw new Error("native entropy unavailable")
+        }
+      } as typeof ExpoCrypto
+      const crypto = yield* Crypto.Crypto.pipe(
+        Effect.provide(
+          ReactNativeCrypto.layer.pipe(
+            Layer.provide(Layer.succeed(ReactNativeCrypto.ExpoCryptoModule, native))
+          )
+        )
+      )
+      const result = yield* Effect.result(crypto.randomBytes(32))
+      assert.strictEqual(result._tag, "Failure")
+      if (result._tag === "Failure") assert.strictEqual(result.failure._tag, "PlatformError")
+    }))
 })
 
 describe("ReactNativePolyfills", () => {
