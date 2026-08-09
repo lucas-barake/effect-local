@@ -18,6 +18,9 @@
     },
     "packages/local-test": {
       "ignoreDependencies": ["@effect/platform-node-shared"]
+    },
+    "examples/chat": {
+      "entry": ["server/reset-test-db.ts"]
     }
   }
 }
