@@ -1,11 +1,12 @@
 import { assert, describe, it } from "@effect/vitest"
 import { execFileSync } from "node:child_process"
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 const repoRoot = join(import.meta.dirname, "../../..")
 const packagesDirectory = join(repoRoot, "packages")
+const examplesDirectory = join(repoRoot, "examples")
 
 const expectedPublishedPackages = [
   "@lucas-barake/effect-local",
@@ -41,9 +42,13 @@ const workspacePackages = JSON.parse(
   })
 ) as ReadonlyArray<WorkspacePackage>
 
-const packageDirectories = readdirSync(packagesDirectory, { withFileTypes: true })
-  .filter((entry) => entry.isDirectory())
-  .map((entry) => join(packagesDirectory, entry.name))
+const packageDirectories = [packagesDirectory, examplesDirectory]
+  .filter(existsSync)
+  .flatMap((parent) =>
+    readdirSync(parent, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => join(parent, entry.name))
+  )
 
 const packageDirectoryManifests = packageDirectories.map((directory) => ({
   directory,
