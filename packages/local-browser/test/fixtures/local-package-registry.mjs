@@ -41,16 +41,20 @@ const pack = (name, version, packageDirectory) => {
   const key = `${name}@${version}`
   const existing = packed.get(key)
   if (existing !== undefined) return existing
-  const result = JSON.parse(execFileSync(
-    "npm",
-    ["pack", "--json", "--ignore-scripts", "--pack-destination", tarballs, packageDirectory],
-    { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 }
-  ))
-  const filename = result[0]?.filename
-  if (typeof filename !== "string") throw new Error(`npm pack did not return a filename for ${key}`)
+  const filename = tarballFilename(name, version)
   const tarball = path.join(tarballs, filename)
-  packed.set(key, tarball)
-  return tarball
+  const staging = fs.mkdtempSync(path.join(registryRoot, "pack-"))
+  try {
+    fs.cpSync(packageDirectory, path.join(staging, "package"), {
+      recursive: true,
+      filter: (source) => path.basename(source) !== "node_modules"
+    })
+    execFileSync("tar", ["-czf", tarball, "-C", staging, "package"])
+    packed.set(key, tarball)
+    return tarball
+  } finally {
+    fs.rmSync(staging, { recursive: true, force: true })
+  }
 }
 
 const server = http.createServer((request, response) => {
@@ -66,8 +70,9 @@ const server = http.createServer((request, response) => {
         response.writeHead(404).end()
         return
       }
+      const tarball = pack(name, found[0], found[1].packageDirectory)
       response.writeHead(200, { "content-type": "application/octet-stream" })
-      fs.createReadStream(pack(name, found[0], found[1].packageDirectory)).pipe(response)
+      fs.createReadStream(tarball).pipe(response)
       return
     }
 
@@ -92,9 +97,9 @@ const server = http.createServer((request, response) => {
       versions: metadata
     }))
   } catch (error) {
-    response.writeHead(500, { "content-type": "application/json" }).end(JSON.stringify({
-      error: error instanceof Error ? error.message : String(error)
-    }))
+    const body = JSON.stringify({ error: error instanceof Error ? error.message : String(error) })
+    if (response.headersSent) response.destroy(error instanceof Error ? error : new Error(String(error)))
+    else response.writeHead(500, { "content-type": "application/json" }).end(body)
   }
 })
 
