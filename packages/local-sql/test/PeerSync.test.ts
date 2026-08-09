@@ -31,6 +31,7 @@ import * as InternalAutomerge from "../src/internal/automerge.js"
 import * as SyncChunks from "../src/internal/syncChunks.js"
 import * as PeerRelayReceiptLimits from "../src/PeerRelayReceiptLimits.js"
 import * as PeerSync from "../src/PeerSync.js"
+import * as ProjectionStore from "../src/ProjectionStore.js"
 import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
@@ -98,7 +99,8 @@ describe("PeerSync", () => {
   const Limits = ReplicaLimits.layer(limits)
   const Infrastructure = Layer.mergeAll(Base, Gate, Limits)
   const StoreService = DocumentStore.layer.pipe(Layer.provide(Infrastructure))
-  const Services = Layer.merge(Infrastructure, StoreService)
+  const Projections = ProjectionStore.layer([]).pipe(Layer.provide(Base))
+  const Services = Layer.mergeAll(Infrastructure, StoreService, Projections)
   const SyncService = PeerSync.layer.pipe(Layer.provide(Services))
   const TestLayer = Layer.merge(Services, SyncService)
   const RelayServices = Layer.merge(
@@ -128,7 +130,7 @@ describe("PeerSync", () => {
   const StrictLimits = ReplicaLimits.layer({ ...limits, maxSyncOperationsPerMessage: 1 })
   const StrictInfrastructure = Layer.mergeAll(Base, Gate, StrictLimits)
   const StrictStoreService = DocumentStore.layer.pipe(Layer.provide(StrictInfrastructure))
-  const StrictServices = Layer.merge(StrictInfrastructure, StrictStoreService)
+  const StrictServices = Layer.mergeAll(StrictInfrastructure, StrictStoreService, Projections)
   const StrictSyncService = PeerSync.layer.pipe(Layer.provide(StrictServices))
   const StrictLayer = Layer.merge(StrictServices, StrictSyncService)
   const sourceLayer = (
@@ -152,31 +154,35 @@ describe("PeerSync", () => {
   })
   const EdgeInfrastructure = Layer.mergeAll(Base, Gate, EdgeLimits)
   const EdgeStoreService = DocumentStore.layer.pipe(Layer.provide(EdgeInfrastructure))
-  const EdgeServices = Layer.merge(EdgeInfrastructure, EdgeStoreService)
+  const EdgeServices = Layer.mergeAll(EdgeInfrastructure, EdgeStoreService, Projections)
   const EdgeSyncService = PeerSync.layer.pipe(Layer.provide(EdgeServices))
   const EdgeLayer = Layer.merge(EdgeServices, EdgeSyncService)
   const ReceiptLimits = ReplicaLimits.layer({ ...limits, maxPendingChangesPerPeer: 2 })
   const ReceiptInfrastructure = Layer.mergeAll(Base, Gate, ReceiptLimits)
   const ReceiptStoreService = DocumentStore.layer.pipe(Layer.provide(ReceiptInfrastructure))
-  const ReceiptServices = Layer.merge(ReceiptInfrastructure, ReceiptStoreService)
+  const ReceiptServices = Layer.mergeAll(ReceiptInfrastructure, ReceiptStoreService, Projections)
   const ReceiptSyncService = PeerSync.layer.pipe(Layer.provide(ReceiptServices))
   const ReceiptLayer = Layer.merge(ReceiptServices, ReceiptSyncService)
   const DocumentReceiptLimits = ReplicaLimits.layer({ ...limits, maxPendingChangesPerDocument: 2 })
   const DocumentReceiptInfrastructure = Layer.mergeAll(Base, Gate, DocumentReceiptLimits)
   const DocumentReceiptStoreService = DocumentStore.layer.pipe(Layer.provide(DocumentReceiptInfrastructure))
-  const DocumentReceiptServices = Layer.merge(DocumentReceiptInfrastructure, DocumentReceiptStoreService)
+  const DocumentReceiptServices = Layer.mergeAll(
+    DocumentReceiptInfrastructure,
+    DocumentReceiptStoreService,
+    Projections
+  )
   const DocumentReceiptSyncService = PeerSync.layer.pipe(Layer.provide(DocumentReceiptServices))
   const DocumentReceiptLayer = Layer.merge(DocumentReceiptServices, DocumentReceiptSyncService)
   const ReplicaReceiptLimits = ReplicaLimits.layer({ ...limits, maxPendingChangesPerReplica: 2 })
   const ReplicaReceiptInfrastructure = Layer.mergeAll(Base, Gate, ReplicaReceiptLimits)
   const ReplicaReceiptStoreService = DocumentStore.layer.pipe(Layer.provide(ReplicaReceiptInfrastructure))
-  const ReplicaReceiptServices = Layer.merge(ReplicaReceiptInfrastructure, ReplicaReceiptStoreService)
+  const ReplicaReceiptServices = Layer.mergeAll(ReplicaReceiptInfrastructure, ReplicaReceiptStoreService, Projections)
   const ReplicaReceiptSyncService = PeerSync.layer.pipe(Layer.provide(ReplicaReceiptServices))
   const ReplicaReceiptLayer = Layer.merge(ReplicaReceiptServices, ReplicaReceiptSyncService)
   const PendingReceiptLimits = ReplicaLimits.layer({ ...limits, maxPendingChangesPerPeer: 1 })
   const PendingReceiptInfrastructure = Layer.mergeAll(Base, Gate, PendingReceiptLimits)
   const PendingReceiptStoreService = DocumentStore.layer.pipe(Layer.provide(PendingReceiptInfrastructure))
-  const PendingReceiptServices = Layer.merge(PendingReceiptInfrastructure, PendingReceiptStoreService)
+  const PendingReceiptServices = Layer.mergeAll(PendingReceiptInfrastructure, PendingReceiptStoreService, Projections)
   const PendingReceiptSyncService = PeerSync.layer.pipe(Layer.provide(PendingReceiptServices))
   const PendingReceiptLayer = Layer.merge(PendingReceiptServices, PendingReceiptSyncService)
   const CapacityReceiptLimits = ReplicaLimits.layer({
@@ -187,7 +193,11 @@ describe("PeerSync", () => {
   })
   const CapacityReceiptInfrastructure = Layer.mergeAll(Base, Gate, CapacityReceiptLimits)
   const CapacityReceiptStoreService = DocumentStore.layer.pipe(Layer.provide(CapacityReceiptInfrastructure))
-  const CapacityReceiptServices = Layer.merge(CapacityReceiptInfrastructure, CapacityReceiptStoreService)
+  const CapacityReceiptServices = Layer.mergeAll(
+    CapacityReceiptInfrastructure,
+    CapacityReceiptStoreService,
+    Projections
+  )
   const CapacityReceiptSyncService = PeerSync.layer.pipe(Layer.provide(CapacityReceiptServices))
   const CapacityReceiptLayer = Layer.merge(CapacityReceiptServices, CapacityReceiptSyncService)
   const provenanceFor = (
@@ -2875,7 +2885,7 @@ describe("PeerSync", () => {
       })
       const converged = yield* store.load(Task, documentId)
       assert.deepStrictEqual(converged.snapshot.value, { title: "two", labels: ["after"] })
-      assert.strictEqual(converged.snapshot.projection, "Blocked")
+      assert.strictEqual(converged.snapshot.projection, "Ready")
       const provenance = yield* sql<{
         readonly change_hash: string
         readonly writer_definition_hash: string
@@ -2986,7 +2996,8 @@ describe("PeerSync", () => {
       const gate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(base))
       const infrastructure = Layer.mergeAll(base, gate, Limits)
       const store = DocumentStore.layer.pipe(Layer.provide(infrastructure))
-      const services = Layer.merge(infrastructure, store)
+      const projections = ProjectionStore.layer([]).pipe(Layer.provide(database))
+      const services = Layer.mergeAll(infrastructure, store, projections)
       const sync = PeerSync.layer.pipe(Layer.provide(services))
       const result = yield* Effect.result(Effect.scoped(
         Effect.gen(function*() {

@@ -20,6 +20,7 @@ import * as DocumentStore from "../src/DocumentStore.js"
 import * as InternalAutomerge from "../src/internal/automerge.js"
 import * as ClusterStorage from "../src/internal/clusterStorage.js"
 import * as PeerSync from "../src/PeerSync.js"
+import * as ProjectionStore from "../src/ProjectionStore.js"
 import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
@@ -113,7 +114,17 @@ describe("ReplicaWorkflow", () => {
   const CompactionService = Compaction.layer.pipe(
     Layer.provide(Layer.mergeAll(Database, Gate, RecoveryService, Limits))
   )
-  const Inputs = Layer.mergeAll(Database, Bootstrap, Limits, Gate, Store, RecoveryService, CompactionService)
+  const Projections = ProjectionStore.layer([]).pipe(Layer.provide(Database))
+  const Inputs = Layer.mergeAll(
+    Database,
+    Bootstrap,
+    Limits,
+    Gate,
+    Store,
+    RecoveryService,
+    CompactionService,
+    Projections
+  )
   /** The same expression `DurableRuntime` builds the workflow branch's engine from. */
   const Cluster = ClusterWorkflowEngine.layer.pipe(Layer.provideMerge(ClusterStorage.layer))
 

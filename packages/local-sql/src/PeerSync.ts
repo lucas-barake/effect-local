@@ -1,6 +1,6 @@
 import * as Automerge from "@automerge/automerge"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
-import type * as Document from "@lucas-barake/effect-local/Document"
+import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
@@ -24,6 +24,7 @@ import * as HistoryCounters from "./internal/historyCounters.js"
 import * as SyncChunks from "./internal/syncChunks.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
+import * as ProjectionStore from "./ProjectionStore.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
@@ -293,6 +294,7 @@ type Requirements =
   | ReplicaBootstrap.ReplicaBootstrap
   | ReplicaGate.ReplicaGate
   | ReplicaLimits.ReplicaLimits
+  | ProjectionStore.ProjectionStore
   | Crypto.Crypto
   | SqlClient.SqlClient
 
@@ -306,6 +308,7 @@ const make = (
     const bootstrap = yield* ReplicaBootstrap.ReplicaBootstrap
     const gate = yield* ReplicaGate.ReplicaGate
     const limits = yield* ReplicaLimits.ReplicaLimits
+    const projections = yield* ProjectionStore.ProjectionStore
     const crypto = yield* Crypto.Crypto
     const digest = (value: unknown) => Canonical.digest(value).pipe(Effect.provideService(Crypto.Crypto, crypto))
     const states = yield* Ref.make(new Map<string, Automerge.SyncState>())
@@ -2278,6 +2281,9 @@ const make = (
                         ? materializedHeads
                         : [...new Set([...durable.acceptedHeads, ...materializedHeads, ...decoded.heads])].toSorted()
                       const transition = !sameHeads(materializedHeads, durable.materializedHeads)
+                      const value = transition
+                        ? yield* Document.decode(document, documentId, InternalAutomerge.value(staged))
+                        : durable.snapshot.value
                       // A chunk whose dependencies are not satisfied yet stays queued inside the Automerge
                       // document instead of joining its history, so `getChangesSince` above never reports it
                       // and it never becomes an `effect_local_changes` row. The saved checkpoint is the only
@@ -2495,6 +2501,17 @@ const make = (
               ${commitSequence}, ${documentId},
               ${Schema.encodeSync(Heads)(ReplicaDefinition.documentCommitKeys(document.name, documentId))}, 0
             )`
+                            yield* projections.replaceDocument(
+                              document,
+                              {
+                                ...durable.snapshot,
+                                heads: materializedHeads,
+                                tombstone: InternalAutomerge.tombstone(staged),
+                                value
+                              },
+                              commitSequence,
+                              "Fresh"
+                            )
                           }
                           const reply = generated[1] === null
                             ? null
