@@ -44,7 +44,7 @@ const DocumentIdOutcome = CommandOutcome.schema(Identity.DocumentId, Schema.Neve
  * group before then belongs to the same unreleased version 1. `PeerSyncEnvelope.relayProtocolVersion`
  * is 1 for the same reason. Bump this on the first change that ships after release.
  */
-export const protocolVersion = 1
+export const protocolVersion = 2
 export const commandDeliveryInvalidationKey = "@lucas-barake/effect-local/command-delivery"
 const DeliveryEventSequence = Schema.Int.check(Schema.isGreaterThan(0))
 const DeliveryCursor = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
@@ -284,13 +284,24 @@ export const group = RpcGroup.make(
     error: ReplicaError.ReplicaError
   }),
   Rpc.make("BeginRestoreBackup", {
-    payload: {
-      sessionId: Identity.SessionId,
-      mode: Schema.Literals(["clone", "replace"]),
-      maxBytes: Schema.Number,
-      expectedDefinitionHash: Schema.String,
-      installationId: Identity.BackupInstallationId
-    },
+    payload: Schema.Union([
+      Schema.Struct({
+        sessionId: Identity.SessionId,
+        mode: Schema.Literals(["clone", "replace"]),
+        maxBytes: Schema.Number,
+        expectedDefinitionHash: Schema.String,
+        installationId: Identity.BackupInstallationId
+      }),
+      Schema.Struct({
+        sessionId: Identity.SessionId,
+        mode: Schema.Literal("document"),
+        document: Schema.String,
+        documentId: Identity.DocumentId,
+        maxBytes: Schema.Number,
+        expectedDefinitionHash: Schema.String,
+        installationId: Identity.BackupInstallationId
+      })
+    ]),
     success: Schema.Struct({
       nonce: RestoreProtocol.RestoreNonce,
       port: MessagePortSchema

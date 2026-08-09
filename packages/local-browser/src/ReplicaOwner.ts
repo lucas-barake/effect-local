@@ -431,19 +431,34 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           )
         ),
       BeginRestoreBackup: (
-        { expectedDefinitionHash, installationId, maxBytes, mode, sessionId },
+        options,
         { client }
       ) =>
-        Backup.validateMaxBytes(maxBytes).pipe(
+        Backup.validateMaxBytes(options.maxBytes).pipe(
           Effect.flatMap((validatedMaxBytes) =>
-            restoreTransport.begin({
-              sessionId,
-              clientId: client.id,
-              mode,
-              maxBytes: validatedMaxBytes,
-              expectedDefinitionHash,
-              installationId
-            })
+            options.mode === "document"
+              ? lookup(documents, "document", options.document).pipe(
+                Effect.flatMap((document) =>
+                  restoreTransport.begin({
+                    sessionId: options.sessionId,
+                    clientId: client.id,
+                    mode: options.mode,
+                    document,
+                    documentId: options.documentId,
+                    maxBytes: validatedMaxBytes,
+                    expectedDefinitionHash: options.expectedDefinitionHash,
+                    installationId: options.installationId
+                  })
+                )
+              )
+              : restoreTransport.begin({
+                sessionId: options.sessionId,
+                clientId: client.id,
+                mode: options.mode,
+                maxBytes: validatedMaxBytes,
+                expectedDefinitionHash: options.expectedDefinitionHash,
+                installationId: options.installationId
+              })
           )
         ),
       FinishRestoreBackup: ({ nonce, sessionId }, { client }) =>

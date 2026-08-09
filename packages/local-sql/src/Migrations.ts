@@ -23,6 +23,7 @@ export const historyRewriteMarkersChecksum = "sha256:effect-local-history-rewrit
 export const peerRelayStateChecksum = "sha256:effect-local-peer-relay-state-v3"
 export const commandDeliveryChecksum = "sha256:effect-local-command-delivery-v1"
 export const documentHistoryCountersChecksum = "sha256:effect-local-document-history-counters-v1"
+export const backupDocumentInstallationsChecksum = "sha256:effect-local-backup-document-installations-v1"
 
 const migration = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
@@ -1089,6 +1090,13 @@ const commandDeliveryMigration = Effect.gen(function*() {
     VALUES (11, 'command_delivery', ${commandDeliveryChecksum})`
 })
 
+const backupDocumentInstallationsMigration = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`ALTER TABLE effect_local_backup_installations ADD COLUMN document_id TEXT`
+  yield* sql`INSERT INTO effect_local_migration_catalog (migration_id, name, checksum)
+    VALUES (13, 'backup_document_installations', ${backupDocumentInstallationsChecksum})`
+})
+
 export const loader = Migrator.fromRecord({
   "1_canonical_store": migration,
   "2_peer_sync": peerSyncMigration,
@@ -1101,7 +1109,8 @@ export const loader = Migrator.fromRecord({
   "9_history_rewrite_markers": historyRewriteMarkersMigration,
   "10_peer_relay_state": peerRelayStateMigration,
   "11_command_delivery": commandDeliveryMigration,
-  "12_document_history_counters": documentHistoryCountersMigration
+  "12_document_history_counters": documentHistoryCountersMigration,
+  "13_backup_document_installations": backupDocumentInstallationsMigration
 })
 
 const migrate = Migrator.make({})({ loader, table: "effect_local_migrations" })
@@ -1161,6 +1170,12 @@ export const run = Effect.gen(function*() {
       name: "document_history_counters",
       checksum: documentHistoryCountersChecksum,
       label: "Document history counters"
+    },
+    {
+      id: 13,
+      name: "backup_document_installations",
+      checksum: backupDocumentInstallationsChecksum,
+      label: "Backup document installations"
     }
   ] as const
   // One transaction over migrate + validation so a rejected catalog rolls back

@@ -1446,6 +1446,65 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     })).pipe(Effect.provide(BackupOwner))
   })
 
+  it.effect("transfers a selective backup installation through the owner", () => {
+    let installed:
+      | {
+        readonly document: Document.Any
+        readonly documentId: Identity.DocumentId
+        readonly chunks: ReadonlyArray<Uint8Array>
+        readonly expectedDefinitionHash: string
+        readonly installationId: Identity.BackupInstallationId
+        readonly maxBytes: number
+      }
+      | undefined
+    const BackupOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
+      Layer.provideMerge(Sessions),
+      Layer.provide(Layer.merge(
+        Publisher,
+        Layer.succeed(Replica.Replica, {
+          ...replica,
+          installBackupDocument: (document, { documentId, expectedDefinitionHash, installationId, maxBytes, source }) =>
+            Stream.runCollect(source).pipe(
+              Effect.map((chunks) => {
+                installed = {
+                  document,
+                  documentId,
+                  chunks: Array.from(chunks),
+                  expectedDefinitionHash,
+                  installationId,
+                  maxBytes
+                }
+              })
+            )
+        })
+      ))
+    )
+    return Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
+      const chunks = [Uint8Array.of(1, 2), Uint8Array.of(3)]
+      yield* client.installBackupDocument(Task, {
+        source: Stream.fromIterable(chunks),
+        documentId,
+        maxBytes: 1024,
+        expectedDefinitionHash: definition.hash,
+        installationId: Identity.BackupInstallationId.make("bak_85f269a1-b6f1-48f9-b658-96d75be94c71")
+      })
+
+      assert.strictEqual(installed?.document, Task)
+      assert.strictEqual(installed?.documentId, documentId)
+      assert.strictEqual(installed?.expectedDefinitionHash, definition.hash)
+      assert.strictEqual(installed?.installationId, "bak_85f269a1-b6f1-48f9-b658-96d75be94c71")
+      assert.strictEqual(installed?.maxBytes, 1024)
+      assert.deepStrictEqual(
+        installed?.chunks.flatMap((chunk) => Array.from(chunk)),
+        chunks.flatMap((chunk) => Array.from(chunk))
+      )
+    })).pipe(Effect.provide(BackupOwner))
+  })
+
   it.effect("applies maxBytes exactly once and rejects maxBytes plus one without applying", () => {
     const maxBytes = 1_024
     const applications: Array<ReadonlyArray<Uint8Array>> = []

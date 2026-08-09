@@ -3,6 +3,7 @@ import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConn
 import * as Backup from "@lucas-barake/effect-local/Backup"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Conflict from "@lucas-barake/effect-local/Conflict"
+import type * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
@@ -1251,7 +1252,20 @@ export const fromRpcClient = (
         })
       )
 
-    return {
+    type ArchiveTransferOptions<R,> =
+      | Backup.RestoreOptions<R>
+      | (
+        Backup.InstallDocumentOptions<R> & {
+          readonly mode: "document"
+          readonly document: Document.Any
+        }
+      )
+    type ClientService = Omit<ReplicaClient["Service"], "restoreBackup"> & {
+      readonly restoreBackup: <R,>(
+        options: ArchiveTransferOptions<R>
+      ) => Effect.Effect<void, ReplicaError.ReplicaError, R>
+    }
+    const client: ClientService = {
       get ownerEpoch() {
         return SubscriptionRef.getUnsafe(sessions).lease.ownerEpoch
       },
@@ -1657,7 +1671,7 @@ export const fromRpcClient = (
               })
             ))
         ),
-      restoreBackup: <R,>(options: Backup.RestoreOptions<R>) =>
+      restoreBackup: <R,>(options: ArchiveTransferOptions<R>) =>
         Effect.gen(function*() {
           const startedAt = yield* Clock.currentTimeMillis
           const deadline = Math.min(
@@ -1726,13 +1740,25 @@ export const fromRpcClient = (
           const operation = withSession(
             "RestoreBackup",
             (session) =>
-              rpc.BeginRestoreBackup({
-                sessionId: session.sessionId,
-                mode: options.mode,
-                maxBytes,
-                expectedDefinitionHash: options.expectedDefinitionHash,
-                installationId: options.installationId
-              }).pipe(
+              rpc.BeginRestoreBackup(
+                options.mode === "document"
+                  ? {
+                    sessionId: session.sessionId,
+                    mode: options.mode,
+                    document: options.document.name,
+                    documentId: options.documentId,
+                    maxBytes,
+                    expectedDefinitionHash: options.expectedDefinitionHash,
+                    installationId: options.installationId
+                  }
+                  : {
+                    sessionId: session.sessionId,
+                    mode: options.mode,
+                    maxBytes,
+                    expectedDefinitionHash: options.expectedDefinitionHash,
+                    installationId: options.installationId
+                  }
+              ).pipe(
                 Effect.catchCause((cause) => {
                   if (
                     cause.reasons.length === 1 &&
@@ -1853,7 +1879,13 @@ export const fromRpcClient = (
               )
             )
           )
-        ),
+        ) as Effect.Effect<void, ReplicaError.ReplicaError, R>,
+      installBackupDocument: (document, options) =>
+        client.restoreBackup({
+          ...options,
+          mode: "document",
+          document
+        }),
       exportDocument: (document, documentId) =>
         withSession(
           "ExportDocument",
@@ -1900,6 +1932,7 @@ export const fromRpcClient = (
           )
         )
     }
+    return client
   })
 
 export const layer = (definition: ReplicaDefinition.Any, options?: Options) =>

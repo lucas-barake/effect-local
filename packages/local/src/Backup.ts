@@ -41,6 +41,14 @@ export interface RestoreOptions<R,> {
   readonly installationId: Identity.BackupInstallationId
 }
 
+export interface InstallDocumentOptions<R,> {
+  readonly source: Stream.Stream<Uint8Array, ReplicaError.ReplicaError, R>
+  readonly documentId: Identity.DocumentId
+  readonly maxBytes: number
+  readonly expectedDefinitionHash: string
+  readonly installationId: Identity.BackupInstallationId
+}
+
 export interface ExportedDocument<E,> {
   readonly documentName: string
   readonly schemaVersion: number
