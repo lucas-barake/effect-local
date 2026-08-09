@@ -369,7 +369,9 @@ export const make = Effect.gen(function*() {
       // after a checkpoint would let a tampered covered row pass because replay never reads it.
       const provenanceConsistency = yield* Effect.result(Effect.try({
         try: () => {
-          const checkpointProvenance = checkpoints.flatMap((checkpoint) => checkpoint.writer_provenance)
+          const checkpointProvenance = checkpoints.flatMap((checkpoint) =>
+            WriterProvenance.exactEntries(checkpoint.writer_provenance)
+          )
           WriterProvenance.resolve(
             [...new Set(checkpointProvenance.map((entry) => entry.changeHash))],
             [
@@ -436,16 +438,26 @@ export const make = Effect.gen(function*() {
                     checksum !== checkpoint.checksum || checkpoint.checkpoint_hash !== checkpointHash ||
                     !Equal.equals(InternalAutomerge.heads(current!), checkpointHeads)
                   ) throw new TypeError(`Invalid checkpoint: ${checkpoint.checkpoint_hash}`)
-                  const checkpointChangeHashes = WriterProvenance.changeHashes(current!)
-                  WriterProvenance.validateExact(checkpointChangeHashes, checkpoint.writer_provenance)
-                  WriterProvenance.resolve(checkpointChangeHashes, [
-                    ...checkpoint.writer_provenance,
-                    ...survivingChanges.map((change) => ({
-                      changeHash: change.change_hash,
-                      writerSchemaVersion: change.writer_schema_version,
-                      writerDefinitionHash: change.writer_definition_hash
-                    }))
-                  ])
+                  if (WriterProvenance.isCompactCheckpoint(checkpoint.writer_provenance)) {
+                    const compact = checkpoint.writer_provenance
+                    if (
+                      compact.checkpointHash !== checkpoint.checkpoint_hash ||
+                      compact.lineage !== checkpoint.lineage ||
+                      !Equal.equals(compact.heads, checkpointHeads) ||
+                      Automerge.getMissingDeps(current!, []).length !== 0
+                    ) throw new TypeError(`Invalid compact checkpoint proof: ${checkpoint.checkpoint_hash}`)
+                  } else {
+                    const checkpointChangeHashes = WriterProvenance.changeHashes(current!)
+                    WriterProvenance.validateExact(checkpointChangeHashes, checkpoint.writer_provenance)
+                    WriterProvenance.resolve(checkpointChangeHashes, [
+                      ...checkpoint.writer_provenance,
+                      ...survivingChanges.map((change) => ({
+                        changeHash: change.change_hash,
+                        writerSchemaVersion: change.writer_schema_version,
+                        writerDefinitionHash: change.writer_definition_hash
+                      }))
+                    ])
+                  }
                 },
                 catch: (cause) =>
                   new ReplicaError.ReplicaError({
@@ -480,7 +492,9 @@ export const make = Effect.gen(function*() {
             })
             yield* Effect.try({
               try: () => {
-                const checkpointProvenance = checkpoint?.writer_provenance ?? []
+                const checkpointProvenance = checkpoint === null
+                  ? []
+                  : WriterProvenance.exactEntries(checkpoint.writer_provenance)
                 const required = [
                   ...checkpointProvenance.map((entry) => entry.changeHash),
                   ...retainedChanges.map(({ decoded }) => decoded.hash)

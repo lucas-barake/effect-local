@@ -266,7 +266,7 @@ describe("public API types", () => {
     const connection = {
       peerId,
       relayPeerId,
-      capabilities: {},
+      capabilities: { checkpointTransfer: true },
       receive: Stream.make(inbound, transientInbound),
       send: () => Effect.void,
       transient: () => Effect.void,
@@ -280,8 +280,13 @@ describe("public API types", () => {
       PeerTransport.Connection["relayPeerId"],
       Identity.PeerId
     > = true
+    const optionalCheckpointTransfer: Equal<
+      PeerTransport.Capabilities["checkpointTransfer"],
+      boolean | undefined
+    > = true
+    const legacyCapabilities: PeerTransport.Capabilities = {}
     const transport = PeerTransport.PeerTransport.of({
-      capabilities: {},
+      capabilities: { checkpointTransfer: true },
       connect: () => Effect.succeed(connection)
     })
     const protocolRejection = delivery.reject("ProtocolInvalid")
@@ -291,6 +296,9 @@ describe("public API types", () => {
     assert.isDefined(connection.receive)
     assert.isTrue(acknowledgedReceive)
     assert.isTrue(requiredRelayPeerId)
+    assert.isTrue(optionalCheckpointTransfer)
+    assert.deepStrictEqual(legacyCapabilities, {})
+    assert.isTrue(connection.capabilities.checkpointTransfer)
     assert.isDefined(protocolRejection)
     assert.isDefined(applicationRejection)
   })

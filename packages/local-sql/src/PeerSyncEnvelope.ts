@@ -5,6 +5,7 @@ import type * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import type * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
+import * as CheckpointAuthority from "./CheckpointAuthority.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 
 export const syncEnvelopeVersion = 1
@@ -13,10 +14,88 @@ export const relayOuterEnvelopeDomain = "effect-local/relay-outer-envelope"
 export const relayProtocolVersion = 1
 export const maximumWriterProvenanceEntries = 1_000
 export const maximumRelayPayloadBytes = 4 * 1_024 * 1_024
+export const maximumCheckpointTransitions = 32
 
 const BoundedName = Schema.NonEmptyString.check(Schema.isMaxLength(256))
 const MessageHash = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
 const Sequence = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+
+const CheckpointManifest = Schema.Struct({
+  ...CheckpointAuthority.ManifestClaims.fields,
+  authorization: CheckpointAuthority.AuthorizationToken
+})
+
+const CheckpointTransition = Schema.Struct({
+  ...CheckpointAuthority.TransitionClaims.fields,
+  priorSnapshot: Schema.Uint8Array,
+  authorization: CheckpointAuthority.AuthorizationToken
+})
+export const CheckpointTransfer = Schema.Struct({
+  snapshot: Schema.Uint8Array,
+  manifest: CheckpointManifest,
+  transitions: Schema.Array(CheckpointTransition).check(
+    Schema.isMaxLength(maximumCheckpointTransitions)
+  )
+})
+export type CheckpointTransfer = typeof CheckpointTransfer.Type
+
+const CheckpointTransferJson = Schema.fromJsonString(Schema.toCodecJson(CheckpointTransfer))
+
+export const encodeCheckpointTransfer = (
+  transfer: CheckpointTransfer,
+  maxSyncMessageBytes: number
+): Effect.Effect<Uint8Array, ReplicaError.ReplicaError> =>
+  Schema.encodeEffect(CheckpointTransferJson)(transfer).pipe(
+    Effect.map((value) => new TextEncoder().encode(value)),
+    Effect.flatMap((bytes) =>
+      bytes.byteLength <= maxSyncMessageBytes
+        ? Effect.succeed(bytes)
+        : Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: `checkpoint transfer at most ${maxSyncMessageBytes} bytes`,
+              observed: "oversized checkpoint transfer"
+            })
+          })
+        )
+    ),
+    Effect.catchTag("SchemaError", () =>
+      Effect.fail(
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.ProtocolMismatch({
+            expected: "encodable checkpoint transfer",
+            observed: "invalid checkpoint transfer"
+          })
+        })
+      ))
+  )
+
+export const decodeCheckpointTransfer = (
+  bytes: Uint8Array,
+  maxSyncMessageBytes: number
+): Effect.Effect<CheckpointTransfer, ReplicaError.ReplicaError> => {
+  if (bytes.byteLength > maxSyncMessageBytes) {
+    return Effect.fail(
+      new ReplicaError.ReplicaError({
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: `checkpoint transfer at most ${maxSyncMessageBytes} bytes`,
+          observed: "oversized checkpoint transfer"
+        })
+      })
+    )
+  }
+  return Schema.decodeUnknownEffect(CheckpointTransferJson)(new TextDecoder().decode(bytes)).pipe(
+    Effect.catchTag("SchemaError", () =>
+      Effect.fail(
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.ProtocolMismatch({
+            expected: "checkpoint transfer",
+            observed: "invalid checkpoint transfer"
+          })
+        })
+      ))
+  )
+}
 
 export const SyncEnvelope = Schema.Struct({
   connectionEpoch: BoundedName,
@@ -26,7 +105,8 @@ export const SyncEnvelope = Schema.Struct({
   messageHash: MessageHash,
   message: Schema.Uint8ArrayFromBase64,
   lineage: Identity.DocumentLineage,
-  writerProvenance: WriterProvenance.ChangeProvenances
+  writerProvenance: WriterProvenance.ChangeProvenances,
+  checkpointTransfer: Schema.optionalKey(Schema.Uint8ArrayFromBase64)
 })
 export type SyncEnvelope = typeof SyncEnvelope.Type
 
@@ -43,7 +123,12 @@ export interface SyncEnvelopeLimits extends
 export const maximumSyncEnvelopeBytes = (
   maxSyncMessageBytes: number,
   maxSyncChangesPerMessage: number
-): number => maxSyncMessageBytes * 2 + maxSyncChangesPerMessage * 512 + 4_096
+): number =>
+  Math.max(
+    maxSyncMessageBytes * 2 + maxSyncChangesPerMessage * 512,
+    Math.ceil(maxSyncMessageBytes / 3) * 4
+  ) +
+  4_096
 
 const SyncEnvelopeJson = Schema.fromJsonString(Schema.toCodecJson(SyncEnvelope))
 
@@ -87,6 +172,28 @@ export const validateSyncEnvelope = (
         reason: new ReplicaError.ProtocolMismatch({
           expected: `at most ${limits.maxSyncChangesPerMessage} writer provenance entries`,
           observed: "excess writer provenance"
+        })
+      })
+    }
+    if (
+      envelope.checkpointTransfer !== undefined &&
+      envelope.checkpointTransfer.byteLength > limits.maxSyncMessageBytes
+    ) {
+      return yield* new ReplicaError.ReplicaError({
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: `checkpoint transfer at most ${limits.maxSyncMessageBytes} bytes`,
+          observed: "oversized checkpoint transfer"
+        })
+      })
+    }
+    if (
+      envelope.checkpointTransfer !== undefined &&
+      (envelope.message.byteLength !== 0 || envelope.writerProvenance.length !== 0)
+    ) {
+      return yield* new ReplicaError.ReplicaError({
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: "empty sync message and writer provenance for checkpoint transfer",
+          observed: "checkpoint transfer mixed with ordinary sync content"
         })
       })
     }

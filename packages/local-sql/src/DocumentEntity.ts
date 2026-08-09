@@ -10,6 +10,7 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
+import * as Encoding from "effect/Encoding"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as ClusterSchema from "effect/unstable/cluster/ClusterSchema"
@@ -46,6 +47,7 @@ const syncPrimaryKey = (payload: {
   readonly messageHash: string
   readonly lineage?: Identity.DocumentLineage
   readonly writerProvenance: ReadonlyArray<WriterProvenance.ChangeProvenance>
+  readonly checkpointTransfer?: Uint8Array
   readonly relay?: PeerSync.RelayReceipt | undefined
 }) =>
   payload.relay === undefined
@@ -56,7 +58,8 @@ const syncPrimaryKey = (payload: {
       payload.receiveSequence,
       payload.messageHash,
       WriterProvenance.canonicalize(payload.writerProvenance),
-      payload.lineage ?? Identity.genesisLineage
+      payload.lineage ?? Identity.genesisLineage,
+      payload.checkpointTransfer === undefined ? null : Encoding.encodeBase64(payload.checkpointTransfer)
     ])
     : JSON.stringify([
       "Relay",
@@ -129,7 +132,8 @@ export const ApplySyncResult = Schema.Struct({
     documentId: Identity.DocumentId,
     message: Schema.Uint8ArrayFromBase64,
     messageHash: Schema.String,
-    heads: Schema.Array(Schema.String)
+    heads: Schema.Array(Schema.String),
+    checkpointTransfer: Schema.optionalKey(Schema.Uint8ArrayFromBase64)
   })),
   heads: Schema.Array(Schema.String),
   acceptedHeads: Schema.Array(Schema.String),
@@ -153,6 +157,7 @@ export const ApplySync = Rpc.make("ApplySync", {
     // replay instead of replaying as the genesis lineage it was written under.
     lineage: Schema.optionalKey(Identity.DocumentLineage),
     writerProvenance: WriterProvenance.ChangeProvenances,
+    checkpointTransfer: Schema.optionalKey(Schema.Uint8ArrayFromBase64),
     relay: Schema.optional(RelayReceipt)
   },
   success: ApplySyncResult,
@@ -375,6 +380,9 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   lineage: request.payload.lineage ?? Identity.genesisLineage,
                   message: request.payload.message,
                   writerProvenance: request.payload.writerProvenance,
+                  ...(request.payload.checkpointTransfer === undefined
+                    ? {}
+                    : { checkpointTransfer: request.payload.checkpointTransfer }),
                   ...(request.payload.relay === undefined ? {} : { relay: request.payload.relay })
                 }
               )

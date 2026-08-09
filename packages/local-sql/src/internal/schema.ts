@@ -16,6 +16,7 @@ export const tables = [
   "effect_local_peer_receipts",
   "effect_local_peer_outbox",
   "effect_local_history_rewrites",
+  "effect_local_lineage_transitions",
   "effect_local_peer_relay_receipt_delete_tokens",
   "effect_local_peer_relay_receipt_usage",
   "effect_local_peer_relay_outbox",

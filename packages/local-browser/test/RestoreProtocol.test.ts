@@ -79,6 +79,19 @@ it.effect("round trips a changed document lineage reason through the restore wir
     assert.deepStrictEqual(RestoreProtocol.replicaErrorFromWire(decoded), original)
   }))
 
+it.effect("round trips a rejected checkpoint reason through the restore wire", () =>
+  Effect.gen(function*() {
+    const original = new ReplicaError.ReplicaError({
+      reason: new ReplicaError.CheckpointRejected({
+        documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001"),
+        reason: "checkpoint authorization failed"
+      })
+    })
+    const encoded = RestoreProtocol.encodeReplicaError(original, 4_096)
+    const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
+    assert.deepStrictEqual(RestoreProtocol.replicaErrorFromWire(decoded), original)
+  }))
+
 it.effect("drops both lineages whole rather than truncating them when the budget is tight", () =>
   Effect.gen(function*() {
     const encoded = RestoreProtocol.encodeReplicaError(
@@ -263,6 +276,10 @@ it.effect("encodes every restore error and defect at the minimum configured budg
         documentId,
         localLineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000003"),
         remoteLineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000004")
+      }),
+      new ReplicaError.CheckpointRejected({
+        documentId,
+        reason: "checkpoint rejected".repeat(32)
       })
     ]
 

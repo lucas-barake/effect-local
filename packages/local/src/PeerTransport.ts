@@ -6,6 +6,8 @@ import type * as Identity from "./Identity.js"
 import type * as ReplicaError from "./ReplicaError.js"
 
 export interface Capabilities {
+  /** Whether the peer can receive a document checkpoint plus its incremental tail. */
+  readonly checkpointTransfer?: boolean
   /**
    * Whether the peer compares document lineage before it merges a sync message.
    *

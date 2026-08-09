@@ -12,18 +12,21 @@ import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as RcMap from "effect/RcMap"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
 import * as Semaphore from "effect/Semaphore"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as CheckpointAuthority from "./CheckpointAuthority.js"
 import * as DocumentStore from "./DocumentStore.js"
 import * as InternalAutomerge from "./internal/automerge.js"
 import * as HistoryCounters from "./internal/historyCounters.js"
 import * as SyncChunks from "./internal/syncChunks.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
+import * as PeerSyncEnvelope from "./PeerSyncEnvelope.js"
 import * as ProjectionStore from "./ProjectionStore.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -49,6 +52,7 @@ export interface Outbound {
    */
   readonly lineage: Identity.DocumentLineage
   readonly writerProvenance: ReadonlyArray<WriterProvenance.ChangeProvenance>
+  readonly checkpointTransfer?: Uint8Array
 }
 
 export interface Reply {
@@ -56,6 +60,7 @@ export interface Reply {
   readonly message: Uint8Array
   readonly messageHash: string
   readonly heads: ReadonlyArray<string>
+  readonly checkpointTransfer?: Uint8Array
 }
 
 export interface Generated {
@@ -79,6 +84,7 @@ export interface RelayReceipt extends PeerTransport.RelayDeliveryIdentity {
 }
 
 const Heads = Schema.fromJsonString(Schema.Array(Schema.String))
+const Versions = Schema.fromJsonString(Schema.Array(Schema.Int))
 
 class ConcurrentDocumentWrite extends Schema.TaggedErrorClass<ConcurrentDocumentWrite>(
   "@lucas-barake/effect-local-sql/ConcurrentDocumentWrite"
@@ -92,7 +98,8 @@ const ReceiptRow = Schema.Struct({
   reply: Schema.NullOr(Schema.Uint8Array),
   reply_hash: Schema.NullOr(Schema.String),
   document_id: Schema.String,
-  writer_provenance: WriterProvenance.StoredChangeProvenances
+  writer_provenance: WriterProvenance.StoredChangeProvenances,
+  checkpoint_transfer: Schema.NullOr(Schema.Uint8Array)
 })
 
 const RelayReceiptRow = Schema.Struct({
@@ -142,6 +149,7 @@ const ExistingChangeRow = Schema.Struct({
 })
 
 const OutboxRow = Schema.Struct({
+  checkpoint_transfer: Schema.NullOr(Schema.Uint8Array),
   document_id: Schema.String,
   heads: Heads,
   lineage: Identity.DocumentLineage,
@@ -155,6 +163,33 @@ const DocumentLineageRow = Schema.Struct({
   lineage: Identity.DocumentLineage
 })
 
+const CheckpointDocumentRow = Schema.Struct({
+  accepted_heads: Heads,
+  checkpoint_hash: Schema.NullOr(Schema.String),
+  document_type: Schema.String,
+  lineage: Identity.DocumentLineage,
+  materialized_heads: Heads,
+  projection_status: Schema.Literals(["Ready", "Blocked", "Rebuilding"]),
+  tombstone: Schema.Int
+})
+
+const DefinitionHashRow = Schema.Struct({
+  definition_hash: WriterProvenance.WriterDefinitionHash
+})
+
+const LineageTransitionRow = Schema.Struct({
+  authorization: Schema.NullOr(WriterProvenance.AuthorizationToken),
+  checkpoint_hash: Schema.String,
+  heads: Heads,
+  lineage: Identity.DocumentLineage,
+  prior_checkpoint_hash: Schema.String,
+  prior_heads: Heads,
+  prior_lineage: Identity.DocumentLineage,
+  prior_snapshot: Schema.Uint8Array,
+  schema_version: WriterProvenance.WriterSchemaVersion,
+  writer_definition_hash: WriterProvenance.WriterDefinitionHash
+})
+
 const ChangeProvenanceRow = Schema.Struct({
   change_hash: WriterProvenance.ChangeHash,
   writer_definition_hash: WriterProvenance.WriterDefinitionHash,
@@ -162,7 +197,7 @@ const ChangeProvenanceRow = Schema.Struct({
 })
 
 const CheckpointProvenanceRow = Schema.Struct({
-  writer_provenance: WriterProvenance.StoredChangeProvenances
+  writer_provenance: WriterProvenance.StoredCheckpointProvenance
 })
 
 const CheckpointHashRow = Schema.Struct({
@@ -211,7 +246,8 @@ const receivedFromReceipt = (documentId: Identity.DocumentId, receipt: typeof Re
     documentId,
     message: receipt.reply,
     messageHash: receipt.reply_hash,
-    heads: receipt.heads
+    heads: receipt.heads,
+    ...(receipt.checkpoint_transfer === null ? {} : { checkpointTransfer: receipt.checkpoint_transfer })
   },
   heads: receipt.heads,
   acceptedHeads: receipt.accepted_heads,
@@ -222,6 +258,25 @@ const receivedFromReceipt = (documentId: Identity.DocumentId, receipt: typeof Re
 
 const sameHeads = (left: ReadonlyArray<string>, right: ReadonlyArray<string>) =>
   Equal.equals(left.toSorted(), right.toSorted())
+
+const syncStateAtHeads = (
+  heads: ReadonlyArray<string>,
+  sentHashes: ReadonlyArray<string>
+): Automerge.SyncState => {
+  const state = Automerge.initSyncState() as Automerge.SyncState & {
+    sharedHeads: ReadonlyArray<string>
+    lastSentHeads: ReadonlyArray<string>
+    theirHeads: ReadonlyArray<string> | null
+    sentHashes: ReadonlyArray<string>
+  }
+  return {
+    ...state,
+    sharedHeads: [...heads],
+    lastSentHeads: [...heads],
+    theirHeads: [...heads],
+    sentHashes: [...sentHashes]
+  }
+}
 
 export class PeerSync extends Context.Service<PeerSync, {
   readonly open: (peerId: Identity.PeerId) => Effect.Effect<Session, ReplicaError.ReplicaError>
@@ -238,7 +293,7 @@ export class PeerSync extends Context.Service<PeerSync, {
     document: D,
     documentId: Identity.DocumentId,
     session: Session,
-    peer: { readonly lineageAware: boolean }
+    peer: { readonly lineageAware: boolean; readonly checkpointTransfer?: boolean }
   ) => Effect.Effect<Generated, ReplicaError.ReplicaError>
   readonly receive: <D extends Document.Any,>(
     document: D,
@@ -254,6 +309,7 @@ export class PeerSync extends Context.Service<PeerSync, {
       readonly lineage?: Identity.DocumentLineage
       readonly message: Uint8Array
       readonly writerProvenance: ReadonlyArray<WriterProvenance.ChangeProvenance>
+      readonly checkpointTransfer?: Uint8Array
       readonly relay?: RelayReceipt
     }
   ) => Effect.Effect<Received, ReplicaError.ReplicaError>
@@ -309,6 +365,10 @@ const make = (
     const gate = yield* ReplicaGate.ReplicaGate
     const limits = yield* ReplicaLimits.ReplicaLimits
     const projections = yield* ProjectionStore.ProjectionStore
+    const checkpointAuthority = Option.getOrElse(
+      yield* Effect.serviceOption(CheckpointAuthority.CheckpointAuthority),
+      () => CheckpointAuthority.rejectAll
+    )
     const crypto = yield* Crypto.Crypto
     const digest = (value: unknown) => Canonical.digest(value).pipe(Effect.provideService(Crypto.Crypto, crypto))
     const states = yield* Ref.make(new Map<string, Automerge.SyncState>())
@@ -333,8 +393,8 @@ const make = (
       }),
       Result: ReceiptRow,
       execute: (request) =>
-        sql`SELECT accepted_heads, commit_sequence, document_id, heads, message_hash, reply, reply_hash,
-          writer_provenance
+        sql`SELECT accepted_heads, checkpoint_transfer, commit_sequence, document_id, heads, message_hash, reply,
+          reply_hash, writer_provenance
           FROM effect_local_peer_receipts
           WHERE replica_incarnation = ${request.replicaIncarnation}
             AND peer_id = ${request.peerId}
@@ -352,8 +412,8 @@ const make = (
       }),
       Result: RelayReceiptRow,
       execute: (request) =>
-        sql`SELECT accepted_heads, commit_sequence, document_id, heads, message_hash, reply, reply_hash,
-          writer_provenance, relay_encoded_size, relay_outer_envelope_digest, relay_receipt_expires_at
+        sql`SELECT accepted_heads, checkpoint_transfer, commit_sequence, document_id, heads, message_hash, reply,
+          reply_hash, writer_provenance, relay_encoded_size, relay_outer_envelope_digest, relay_receipt_expires_at
           FROM effect_local_peer_receipts
           WHERE replica_incarnation = ${request.replicaIncarnation}
             AND relay_sender_tenant_id = ${request.senderTenantId}
@@ -489,6 +549,85 @@ const make = (
       Result: DocumentLineageRow,
       execute: (documentId) => sql`SELECT lineage FROM effect_local_documents WHERE document_id = ${documentId}`
     })
+    const findCheckpointDocument = SqlSchema.findOneOption({
+      Request: Identity.DocumentId,
+      Result: CheckpointDocumentRow,
+      execute: (documentId) =>
+        sql`SELECT accepted_heads, checkpoint_hash, document_type, lineage, materialized_heads,
+          projection_status, tombstone
+          FROM effect_local_documents WHERE document_id = ${documentId}`
+    })
+    const checkpointInstallCounts = SqlSchema.findOne({
+      Request: Schema.Struct({ documentId: Identity.DocumentId, now: Schema.String }),
+      Result: Schema.Struct({
+        direct_outbox: Schema.Int,
+        pending_changes: Schema.Int,
+        pending_receipts: Schema.Int,
+        relay_outbox: Schema.Int,
+        unexpired_relay_receipts: Schema.Int
+      }),
+      execute: ({ documentId, now }) =>
+        sql`SELECT
+          (SELECT COUNT(*) FROM effect_local_changes
+            WHERE document_id = ${documentId} AND applied = 0) AS pending_changes,
+          (SELECT COUNT(*) FROM effect_local_peer_receipts
+            WHERE document_id = ${documentId} AND pending_message IS NOT NULL) AS pending_receipts,
+          (SELECT COUNT(*) FROM effect_local_peer_outbox
+            WHERE document_id = ${documentId} AND status = 'Pending') AS direct_outbox,
+          (SELECT COUNT(*) FROM effect_local_peer_relay_outbox
+            WHERE document_id = ${documentId}) AS relay_outbox,
+          (SELECT COUNT(*) FROM effect_local_peer_receipts
+            WHERE document_id = ${documentId} AND relay_message_id IS NOT NULL
+              AND relay_receipt_expires_at > ${now}) AS unexpired_relay_receipts`
+    })
+    const findDefinitionHash = SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: DefinitionHashRow,
+      execute: () => sql`SELECT definition_hash FROM effect_local_metadata WHERE singleton = 1`
+    })
+    const findGenerationLineageTransitions = SqlSchema.findAll({
+      Request: Schema.Struct({
+        documentId: Identity.DocumentId,
+        lineage: Identity.DocumentLineage
+      }),
+      Result: LineageTransitionRow,
+      execute: ({ documentId, lineage }) =>
+        sql`WITH RECURSIVE transition_chain (
+          authorization, checkpoint_hash, heads, lineage, prior_checkpoint_hash,
+          prior_heads, prior_lineage, prior_snapshot, schema_version, writer_definition_hash, depth
+        ) AS (
+          SELECT authorization, checkpoint_hash, heads, lineage, prior_checkpoint_hash,
+            prior_heads, prior_lineage, prior_snapshot, schema_version, writer_definition_hash, 1
+          FROM effect_local_lineage_transitions
+          WHERE document_id = ${documentId} AND lineage = ${lineage}
+          UNION ALL
+          SELECT transition.authorization, transition.checkpoint_hash, transition.heads,
+            transition.lineage, transition.prior_checkpoint_hash, transition.prior_heads,
+            transition.prior_lineage, transition.prior_snapshot, transition.schema_version,
+            transition.writer_definition_hash, chain.depth + 1
+          FROM effect_local_lineage_transitions AS transition
+          INNER JOIN transition_chain AS chain ON transition.lineage = chain.prior_lineage
+          WHERE transition.document_id = ${documentId} AND chain.depth <= ${PeerSyncEnvelope.maximumCheckpointTransitions}
+        )
+        SELECT authorization, checkpoint_hash, heads, lineage, prior_checkpoint_hash,
+          prior_heads, prior_lineage, prior_snapshot, schema_version, writer_definition_hash
+        FROM transition_chain ORDER BY depth
+        LIMIT ${PeerSyncEnvelope.maximumCheckpointTransitions + 1}`
+    })
+    const findRelevantLineageTransitions = SqlSchema.findAll({
+      Request: Schema.Struct({
+        documentId: Identity.DocumentId,
+        lineages: Schema.Array(Identity.DocumentLineage),
+        priorLineages: Schema.Array(Identity.DocumentLineage)
+      }),
+      Result: LineageTransitionRow,
+      execute: ({ documentId, lineages, priorLineages }) =>
+        sql`SELECT authorization, checkpoint_hash, heads, lineage, prior_checkpoint_hash,
+          prior_heads, prior_lineage, prior_snapshot, schema_version, writer_definition_hash
+          FROM effect_local_lineage_transitions
+          WHERE document_id = ${documentId}
+            AND (${sql.in("lineage", lineages)} OR ${sql.in("prior_lineage", priorLineages)})`
+    })
     const documentLineage = (documentId: Identity.DocumentId) =>
       findDocumentLineage(documentId).pipe(
         Effect.map((row) => row.lineage),
@@ -518,7 +657,8 @@ const make = (
       }),
       Result: OutboxRow,
       execute: (request) =>
-        sql`SELECT document_id, heads, lineage, message, message_hash, send_sequence, writer_provenance
+        sql`SELECT checkpoint_transfer, document_id, heads, lineage, message, message_hash, send_sequence,
+          writer_provenance
           FROM effect_local_peer_outbox
           WHERE replica_incarnation = ${request.replicaIncarnation}
             AND peer_id = ${request.peerId}
@@ -536,7 +676,8 @@ const make = (
       }),
       Result: OutboxRow,
       execute: (request) =>
-        sql`SELECT document_id, heads, lineage, message, message_hash, send_sequence, writer_provenance
+        sql`SELECT checkpoint_transfer, document_id, heads, lineage, message, message_hash, send_sequence,
+          writer_provenance
           FROM effect_local_peer_outbox
           WHERE replica_incarnation = ${request.replicaIncarnation}
             AND peer_id = ${request.peerId}
@@ -652,7 +793,8 @@ const make = (
       }),
       Result: TotalsRow,
       execute: (request) =>
-        sql`SELECT COALESCE(SUM(LENGTH(message)), 0) AS bytes, COUNT(*) AS count
+        sql`SELECT COALESCE(SUM(LENGTH(message) + COALESCE(LENGTH(checkpoint_transfer), 0)), 0) AS bytes,
+          COUNT(*) AS count
           FROM effect_local_peer_outbox
           WHERE replica_incarnation = ${request.replicaIncarnation}
             AND peer_id = ${request.peerId}
@@ -1080,7 +1222,9 @@ const make = (
                   writerSchemaVersion: row.writer_schema_version,
                   writerDefinitionHash: row.writer_definition_hash
                 })),
-                ...checkpoints.flatMap((checkpoint) => checkpoint.writer_provenance)
+                ...checkpoints.flatMap((checkpoint) =>
+                  Array.isArray(checkpoint.writer_provenance) ? checkpoint.writer_provenance : []
+                )
               ]
             ),
           catch: (cause) =>
@@ -1094,10 +1238,13 @@ const make = (
       session: Session,
       documentId: Identity.DocumentId,
       message: Uint8Array,
-      heads: ReadonlyArray<string>
+      heads: ReadonlyArray<string>,
+      checkpointTransfer?: Uint8Array
     ) =>
       Effect.gen(function*() {
-        const writerProvenance = yield* loadWriterProvenance(documentId, message)
+        const writerProvenance = checkpointTransfer === undefined
+          ? yield* loadWriterProvenance(documentId, message)
+          : []
         // Read here and stored on the row, never re-read when the row is finally sent. This is the
         // generation time the message describes: a message queued before a rewrite must stay
         // labelled with the lineage it was generated from, or the peer would apply pre-rewrite
@@ -1108,7 +1255,10 @@ const make = (
           peerId: session.peerId,
           connectionEpoch: session.connectionEpoch
         })
-        if ((totals[0]?.bytes ?? 0) + message.byteLength > limits.maxPendingBytesPerPeer) {
+        if (
+          (totals[0]?.bytes ?? 0) + message.byteLength + (checkpointTransfer?.byteLength ?? 0) >
+            limits.maxPendingBytesPerPeer
+        ) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.QuotaExceeded({
               resource: "peer sync outbox bytes",
@@ -1134,13 +1284,23 @@ const make = (
         const createdAt = new Date(yield* Clock.currentTimeMillis).toISOString()
         yield* sql`INSERT INTO effect_local_peer_outbox (
           replica_incarnation, peer_id, connection_epoch, document_id, send_sequence,
-          message, message_hash, heads, status, created_at, writer_provenance, lineage
+          message, message_hash, heads, status, created_at, writer_provenance, lineage, checkpoint_transfer
         ) VALUES (
           ${session.replicaIncarnation}, ${session.peerId}, ${session.connectionEpoch}, ${documentId}, ${sendSequence},
           ${message}, ${messageHash}, ${Schema.encodeSync(Heads)(heads)}, 'Pending', ${createdAt},
-          ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(writerProvenance)}, ${lineage}
+          ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(writerProvenance)}, ${lineage},
+          ${checkpointTransfer ?? null}
         )`
-        return { sendSequence, documentId, message, messageHash, heads, lineage, writerProvenance } satisfies Outbound
+        return {
+          sendSequence,
+          documentId,
+          message,
+          messageHash,
+          heads,
+          lineage,
+          writerProvenance,
+          ...(checkpointTransfer === undefined ? {} : { checkpointTransfer })
+        } satisfies Outbound
       })
 
     const enqueue = (session: Session, reply: Reply) =>
@@ -1184,6 +1344,14 @@ const make = (
           )
           const existing = rows[0]
           if (existing !== undefined) {
+            if (!Equal.equals(existing.checkpoint_transfer, reply.checkpointTransfer ?? null)) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.ProtocolMismatch({
+                  expected: "matching queued checkpoint transfer",
+                  observed: "conflicting queued checkpoint transfer"
+                })
+              })
+            }
             return {
               sendSequence: existing.send_sequence,
               documentId: reply.documentId,
@@ -1191,10 +1359,19 @@ const make = (
               messageHash: existing.message_hash,
               heads: existing.heads,
               lineage: existing.lineage,
-              writerProvenance: existing.writer_provenance
+              writerProvenance: existing.writer_provenance,
+              ...(existing.checkpoint_transfer === null
+                ? {}
+                : { checkpointTransfer: existing.checkpoint_transfer })
             }
           }
-          return yield* persistOutbound(session, reply.documentId, reply.message, reply.heads).pipe(
+          return yield* persistOutbound(
+            session,
+            reply.documentId,
+            reply.message,
+            reply.heads,
+            reply.checkpointTransfer
+          ).pipe(
             Effect.catchTags({
               SqlError: (cause) =>
                 Effect.fail(
@@ -1224,7 +1401,7 @@ const make = (
       document: D,
       documentId: Identity.DocumentId,
       session: Session,
-      peer: { readonly lineageAware: boolean }
+      peer: { readonly lineageAware: boolean; readonly checkpointTransfer?: boolean }
     ) =>
       withSessionGeneration(session, (generation) =>
         Effect.scoped(Effect.gen(function*() {
@@ -1299,13 +1476,151 @@ const make = (
                       )
                       return { outbound: null, observedByPeer, dirty: false }
                     }
-                    if (generated[1].byteLength > limits.maxSyncMessageBytes) {
+                    const generatedChangeCount = yield* Effect.try({
+                      try: () =>
+                        SyncChunks.decodeSyncChanges(Automerge.decodeSyncMessage(generated[1]!).changes).length,
+                      catch: (cause) =>
+                        new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.ProtocolMismatch({
+                            expected: "valid local Automerge sync message",
+                            observed: String(cause)
+                          })
+                        })
+                    })
+                    const oversizedBytes = generated[1].byteLength > limits.maxSyncMessageBytes
+                    const oversizedChanges = generatedChangeCount > limits.maxSyncChangesPerMessage
+                    // The first v2 cold-sync frame is only an announcement. Its follow-up carries
+                    // the history after the peer answers, so use the snapshot's decoded count while
+                    // there are no shared heads or the quota failure would be deferred until a reply
+                    // path that has no capability negotiation input.
+                    const proactiveColdCheckpoint = peer.checkpointTransfer === true &&
+                      state.sharedHeads.length === 0 &&
+                      durable.historyChanges !== null &&
+                      durable.historyChanges > limits.maxSyncChangesPerMessage
+                    if ((oversizedBytes || oversizedChanges) && !peer.checkpointTransfer) {
                       return yield* new ReplicaError.ReplicaError({
                         reason: new ReplicaError.QuotaExceeded({
-                          resource: "sync message bytes",
-                          limit: limits.maxSyncMessageBytes
+                          resource: oversizedBytes ? "sync message bytes" : "sync message writer provenance",
+                          limit: oversizedBytes
+                            ? limits.maxSyncMessageBytes
+                            : limits.maxSyncChangesPerMessage
                         })
                       })
+                    }
+                    let checkpointTransfer: Uint8Array | undefined
+                    let outboundMessage = generated[1]
+                    if (oversizedBytes || oversizedChanges || proactiveColdCheckpoint) {
+                      const snapshot = InternalAutomerge.save(durable.automerge)
+                      if (Automerge.getMissingDeps(durable.automerge, []).length !== 0) {
+                        return yield* new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.StorageCorrupt({
+                            cause: new Error("Cannot transfer an incomplete checkpoint snapshot")
+                          })
+                        })
+                      }
+                      const checkpointHash = yield* digest({ documentId, bytes: snapshot })
+                      const [definition, retained] = yield* Effect.all([
+                        findDefinitionHash(undefined),
+                        findGenerationLineageTransitions({ documentId, lineage })
+                      ]).pipe(
+                        Effect.catchTags({
+                          NoSuchElementError: () =>
+                            Effect.fail(
+                              new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.ReplicaMetadataMissing({
+                                  operation: "PeerSync.generate checkpoint"
+                                })
+                              })
+                            ),
+                          SqlError: (cause) =>
+                            Effect.fail(
+                              new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.StorageUnavailable({ cause })
+                              })
+                            ),
+                          SchemaError: (cause) =>
+                            Effect.fail(
+                              new ReplicaError.ReplicaError({
+                                reason: new ReplicaError.StorageCorrupt({ cause })
+                              })
+                            )
+                        })
+                      )
+                      if (retained.length > PeerSyncEnvelope.maximumCheckpointTransitions) {
+                        return yield* new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.QuotaExceeded({
+                            resource: "checkpoint lineage transitions",
+                            limit: PeerSyncEnvelope.maximumCheckpointTransitions
+                          })
+                        })
+                      }
+                      const definitionHash = definition.definition_hash
+                      const baseHeads = state.sharedHeads
+                      const base = baseHeads.length === 0
+                        ? { _tag: "Bootstrap" as const }
+                        : { _tag: "Heads" as const, baseHeads }
+                      const manifestClaims = CheckpointAuthority.ManifestClaims.make({
+                        purpose: CheckpointAuthority.manifestPurpose,
+                        documentId,
+                        lineage,
+                        checkpointHash,
+                        heads: durable.materializedHeads,
+                        base,
+                        schemaVersion: durable.snapshot.version,
+                        writerDefinitionHash: definitionHash
+                      })
+                      const authorization = yield* checkpointAuthority.signManifest(manifestClaims)
+                      if (Option.isNone(authorization)) {
+                        if (oversizedBytes || oversizedChanges) {
+                          return yield* new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.QuotaExceeded({
+                              resource: oversizedBytes ? "sync message bytes" : "sync message writer provenance",
+                              limit: oversizedBytes
+                                ? limits.maxSyncMessageBytes
+                                : limits.maxSyncChangesPerMessage
+                            })
+                          })
+                        }
+                      } else {
+                        const byResultingLineage = new Map(retained.map((row) => [row.lineage, row]))
+                        const reversed: Array<typeof LineageTransitionRow.Type> = []
+                        let cursor = lineage
+                        const seen = new Set<Identity.DocumentLineage>()
+                        while (cursor !== Identity.genesisLineage) {
+                          if (seen.has(cursor)) {
+                            return yield* new ReplicaError.ReplicaError({
+                              reason: new ReplicaError.StorageCorrupt({
+                                cause: new Error("Lineage transition chain contains a cycle")
+                              })
+                            })
+                          }
+                          seen.add(cursor)
+                          const transition = byResultingLineage.get(cursor)
+                          if (transition === undefined) break
+                          if (transition.authorization === null) break
+                          reversed.push(transition)
+                          cursor = transition.prior_lineage
+                        }
+                        checkpointTransfer = yield* PeerSyncEnvelope.encodeCheckpointTransfer({
+                          snapshot,
+                          manifest: { ...manifestClaims, authorization: authorization.value },
+                          transitions: reversed.toReversed().map((transition) => ({
+                            purpose: CheckpointAuthority.transitionPurpose,
+                            documentId,
+                            priorLineage: transition.prior_lineage,
+                            priorCheckpointHash: transition.prior_checkpoint_hash,
+                            priorHeads: transition.prior_heads,
+                            priorSnapshot: transition.prior_snapshot,
+                            resultingLineage: transition.lineage,
+                            anchorCheckpointHash: transition.checkpoint_hash,
+                            resultingHeads: transition.heads,
+                            schemaVersion: transition.schema_version,
+                            writerDefinitionHash: transition.writer_definition_hash,
+                            authorization: transition.authorization!
+                          }))
+                        }, limits.maxSyncMessageBytes)
+                        outboundMessage = new Uint8Array()
+                      }
                     }
                     const outbound = yield* sql.withTransaction(quotaLock.withPermit(Effect.gen(function*() {
                       yield* validateSessionGeneration(generation, sessionGeneration)
@@ -1319,10 +1634,20 @@ const make = (
                       const outbound = yield* persistOutbound(
                         session,
                         documentId,
-                        generated[1]!,
-                        durable.materializedHeads
+                        outboundMessage!,
+                        durable.materializedHeads,
+                        checkpointTransfer
                       )
-                      yield* writeState(session, documentId, generated[0])
+                      yield* writeState(
+                        session,
+                        documentId,
+                        checkpointTransfer === undefined
+                          ? generated[0]
+                          : syncStateAtHeads(
+                            durable.materializedHeads,
+                            WriterProvenance.changeHashes(durable.automerge)
+                          )
+                      )
                       return outbound
                     }))).pipe(
                       Effect.catchTags({
@@ -1350,6 +1675,554 @@ const make = (
           )
         })))
 
+    const installCheckpoint = <D extends Document.Any,>(
+      document: D,
+      documentId: Identity.DocumentId,
+      session: Session,
+      receiptSession: Session,
+      receiveSequence: number,
+      remoteLineage: Identity.DocumentLineage,
+      checkpointTransferBytes: Uint8Array,
+      messageHash: string,
+      acceptedAt: string,
+      relay: RelayReceipt | undefined,
+      generation: Ref.Ref<number>,
+      sessionGeneration: number,
+      permit: ReplicaGate.Permit
+    ) =>
+      Effect.acquireUseRelease(
+        Effect.gen(function*() {
+          const transfer = yield* PeerSyncEnvelope.decodeCheckpointTransfer(
+            checkpointTransferBytes,
+            limits.maxSyncMessageBytes
+          )
+          const manifest = transfer.manifest
+          if (
+            manifest.documentId !== documentId || manifest.lineage !== remoteLineage ||
+            manifest.schemaVersion !== document.version
+          ) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.CheckpointRejected({
+                documentId,
+                reason: "Checkpoint manifest does not match the requested document"
+              })
+            })
+          }
+          const definitionHash = (yield* findDefinitionHash(undefined)).definition_hash
+          if (manifest.writerDefinitionHash !== definitionHash) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.CheckpointRejected({
+                documentId,
+                reason: "Checkpoint definition does not match this replica"
+              })
+            })
+          }
+          const checkpointHash = yield* digest({ documentId, bytes: transfer.snapshot })
+          if (checkpointHash !== manifest.checkpointHash) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.CheckpointRejected({
+                documentId,
+                reason: "Checkpoint snapshot hash does not match its manifest"
+              })
+            })
+          }
+          yield* checkpointAuthority.verifyManifest(manifest, manifest.authorization)
+          const priorChangeHashes = new Map<Identity.DocumentLineage, ReadonlySet<string>>()
+          let preceding: PeerSyncEnvelope.CheckpointTransfer["transitions"][number] | undefined
+          for (const transition of transfer.transitions) {
+            if (
+              transition.documentId !== documentId ||
+              transition.schemaVersion !== manifest.schemaVersion ||
+              transition.writerDefinitionHash !== manifest.writerDefinitionHash ||
+              (preceding !== undefined &&
+                (
+                  preceding.resultingLineage !== transition.priorLineage ||
+                  !sameHeads(preceding.resultingHeads, transition.priorHeads)
+                ))
+            ) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.CheckpointRejected({
+                  documentId,
+                  reason: "Checkpoint lineage transition claims are discontinuous"
+                })
+              })
+            }
+            yield* checkpointAuthority.verifyTransition(transition, transition.authorization)
+            const priorHash = yield* digest({ documentId, bytes: transition.priorSnapshot })
+            if (priorHash !== transition.priorCheckpointHash) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.CheckpointRejected({
+                  documentId,
+                  reason: "Checkpoint lineage transition prior snapshot hash is invalid"
+                })
+              })
+            }
+            const prior = yield* Effect.try({
+              try: () => Automerge.load(transition.priorSnapshot),
+              catch: () =>
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.CheckpointRejected({
+                    documentId,
+                    reason: "Checkpoint lineage transition prior snapshot is invalid"
+                  })
+                })
+            })
+            const validPrior = sameHeads(Automerge.getHeads(prior), transition.priorHeads) &&
+              Automerge.getMissingDeps(prior, []).length === 0
+            priorChangeHashes.set(
+              transition.resultingLineage,
+              new Set(WriterProvenance.changeHashes(prior))
+            )
+            Automerge.free(prior)
+            if (!validPrior) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.CheckpointRejected({
+                  documentId,
+                  reason: "Checkpoint lineage transition prior snapshot heads are invalid"
+                })
+              })
+            }
+            preceding = transition
+          }
+          const automerge = yield* Effect.try({
+            try: () => Automerge.load<InternalAutomerge.Root<D["schema"]["Encoded"]>>(transfer.snapshot),
+            catch: (cause) =>
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.CheckpointRejected({
+                  documentId,
+                  reason: `Checkpoint snapshot cannot be decoded: ${String(cause)}`
+                })
+              })
+          })
+          const heads = InternalAutomerge.heads(automerge)
+          if (!sameHeads(heads, manifest.heads) || Automerge.getMissingDeps(automerge, []).length !== 0) {
+            InternalAutomerge.free(automerge)
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.CheckpointRejected({
+                documentId,
+                reason: "Checkpoint snapshot heads are incomplete or do not match its manifest"
+              })
+            })
+          }
+          const encoded = InternalAutomerge.value(automerge)
+          const value = yield* Document.decodeStored(
+            document,
+            documentId,
+            manifest.schemaVersion,
+            encoded
+          ).pipe(
+            Effect.mapError(() =>
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.CheckpointRejected({
+                  documentId,
+                  reason: "Checkpoint snapshot does not materialize as the requested document"
+                })
+              })
+            ),
+            Effect.onError(() => Effect.sync(() => InternalAutomerge.free(automerge)))
+          )
+          return { automerge, encoded, heads, manifest, priorChangeHashes, transfer, value }
+        }).pipe(
+          Effect.catchTags({
+            NoSuchElementError: () =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.ReplicaMetadataMissing({
+                    operation: "PeerSync.receive checkpoint"
+                  })
+                })
+              ),
+            SqlError: (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({ cause })
+                })
+              ),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageCorrupt({ cause })
+                })
+              )
+          })
+        ),
+        (prepared) =>
+          Effect.gen(function*() {
+            const { automerge, heads, manifest, priorChangeHashes, transfer, value } = prepared
+            const existingBefore = yield* findCheckpointDocument(documentId)
+            const existing = Option.getOrUndefined(existingBefore)
+            if (existing === undefined) {
+              if (manifest.base._tag !== "Bootstrap") {
+                return yield* new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.CheckpointRejected({
+                    documentId,
+                    reason: "A missing document requires a bootstrap checkpoint"
+                  })
+                })
+              }
+            } else if (existing.lineage === manifest.lineage) {
+              if (
+                (manifest.base._tag === "Heads" &&
+                  !sameHeads(manifest.base.baseHeads, existing.materialized_heads)) ||
+                !Automerge.hasHeads(automerge, [...existing.materialized_heads])
+              ) {
+                return yield* new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.CheckpointRejected({
+                    documentId,
+                    reason: "Checkpoint does not extend the current document heads"
+                  })
+                })
+              }
+            } else {
+              const start = transfer.transitions.findIndex((transition) => transition.priorLineage === existing.lineage)
+              if (start < 0) {
+                return yield* new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.CheckpointRejected({
+                    documentId,
+                    reason: "Checkpoint has no transition from the current lineage"
+                  })
+                })
+              }
+              const chain = transfer.transitions.slice(start)
+              let anchorHeads = existing.materialized_heads
+              let anchorLineage = existing.lineage
+              for (const [index, transition] of chain.entries()) {
+                if (
+                  transition.documentId !== documentId || transition.priorLineage !== anchorLineage ||
+                  (index !== 0 && !sameHeads(transition.priorHeads, anchorHeads))
+                ) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.CheckpointRejected({
+                      documentId,
+                      reason: "Checkpoint lineage transition chain is discontinuous"
+                    })
+                  })
+                }
+                const priorHashes = priorChangeHashes.get(transition.resultingLineage)
+                if (
+                  priorHashes === undefined ||
+                  (index === 0 && existing.materialized_heads.some((head) => !priorHashes.has(head)))
+                ) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.CheckpointRejected({
+                      documentId,
+                      reason: "Checkpoint lineage transition prior snapshot does not contain the local heads"
+                    })
+                  })
+                }
+                anchorLineage = transition.resultingLineage
+                anchorHeads = transition.resultingHeads
+              }
+              if (
+                anchorLineage !== manifest.lineage ||
+                !Automerge.hasHeads(automerge, [...anchorHeads])
+              ) {
+                return yield* new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.CheckpointRejected({
+                    documentId,
+                    reason: "Checkpoint does not contain the final lineage anchor"
+                  })
+                })
+              }
+            }
+            const checksum = yield* digest(transfer.snapshot)
+            const history = yield* HistoryCounters.check(
+              HistoryCounters.measureDecoded(InternalAutomerge.changesSince(automerge, [])),
+              limits
+            )
+            const checkpointChangeHashes = WriterProvenance.changeHashes(automerge)
+            return yield* sql.withTransaction(quotaLock.withPermit(Effect.gen(function*() {
+              yield* validateSessionGeneration(generation, sessionGeneration)
+              yield* gate.validate(permit)
+              const current = Option.getOrUndefined(yield* findCheckpointDocument(documentId))
+              if (
+                (existing === undefined) !== (current === undefined) ||
+                (existing !== undefined && current !== undefined &&
+                  (
+                    current.lineage !== existing.lineage ||
+                    !sameHeads(current.materialized_heads, existing.materialized_heads) ||
+                    !sameHeads(current.accepted_heads, existing.accepted_heads) ||
+                    current.checkpoint_hash !== existing.checkpoint_hash
+                  ))
+              ) {
+                return yield* new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.CheckpointRejected({
+                    documentId,
+                    reason: "Document advanced while checkpoint installation was prepared"
+                  })
+                })
+              }
+              if (current !== undefined) {
+                const counts = yield* checkpointInstallCounts({ documentId, now: acceptedAt })
+                if (
+                  !sameHeads(current.materialized_heads, current.accepted_heads) ||
+                  counts.pending_changes !== 0 || counts.pending_receipts !== 0 ||
+                  counts.direct_outbox !== 0 || counts.relay_outbox !== 0 ||
+                  counts.unexpired_relay_receipts !== 0
+                ) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.CheckpointRejected({
+                      documentId,
+                      reason: "Cannot replace an incomplete or unsettled document"
+                    })
+                  })
+                }
+              }
+              const commitSequence = (yield* incrementCommitSequence(undefined))[0]?.commit_sequence
+              if (commitSequence === undefined) {
+                return yield* new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.ReplicaMetadataMissing({
+                    operation: "PeerSync.receive checkpoint commit"
+                  })
+                })
+              }
+              if (current === undefined) {
+                yield* sql`INSERT INTO effect_local_documents (
+                  document_id, document_type, schema_version, observed_versions, materialized_heads,
+                  accepted_heads, tombstone, projection_status, checkpoint_hash, history_changes,
+                  history_operations, history_bytes, lineage
+                ) VALUES (
+                  ${documentId}, ${document.name}, ${manifest.schemaVersion},
+                  ${Schema.encodeSync(Versions)([manifest.schemaVersion])}, ${Schema.encodeSync(Heads)(heads)},
+                  ${Schema.encodeSync(Heads)(heads)}, ${InternalAutomerge.tombstone(automerge) ? 1 : 0},
+                  'Ready', ${manifest.checkpointHash}, ${history.changes}, ${history.operations},
+                  ${history.bytes}, ${manifest.lineage}
+                )`
+              } else {
+                yield* sql`UPDATE effect_local_documents SET
+                  schema_version = ${manifest.schemaVersion},
+                  observed_versions = ${Schema.encodeSync(Versions)([manifest.schemaVersion])},
+                  materialized_heads = ${Schema.encodeSync(Heads)(heads)},
+                  accepted_heads = ${Schema.encodeSync(Heads)(heads)},
+                  tombstone = ${InternalAutomerge.tombstone(automerge) ? 1 : 0},
+                  projection_status = 'Ready', checkpoint_hash = ${manifest.checkpointHash},
+                  history_changes = ${history.changes}, history_operations = ${history.operations},
+                  history_bytes = ${history.bytes}, lineage = ${manifest.lineage}
+                  WHERE document_id = ${documentId}`
+                yield* sql`DELETE FROM effect_local_changes WHERE document_id = ${documentId}`
+                yield* sql`DELETE FROM effect_local_checkpoints WHERE document_id = ${documentId}`
+                yield* sql`DELETE FROM effect_local_peer_outbox WHERE document_id = ${documentId}`
+                yield* sql`DELETE FROM effect_local_peer_receipts
+                  WHERE document_id = ${documentId} AND relay_message_id IS NULL`
+              }
+              const compactProvenance = WriterProvenance.CompactCheckpointProvenance.make({
+                checkpointHash: manifest.checkpointHash,
+                lineage: manifest.lineage,
+                heads: manifest.heads,
+                base: manifest.base,
+                schemaVersion: manifest.schemaVersion,
+                writerDefinitionHash: manifest.writerDefinitionHash,
+                authorization: manifest.authorization
+              })
+              yield* sql`INSERT INTO effect_local_checkpoints (
+                checkpoint_hash, document_id, heads, bytes, checksum, commit_sequence, verified,
+                writer_provenance, lineage
+              ) VALUES (
+                ${manifest.checkpointHash}, ${documentId}, ${Schema.encodeSync(Heads)(heads)},
+                ${transfer.snapshot}, ${checksum}, ${commitSequence}, 1,
+                ${Schema.encodeSync(WriterProvenance.StoredCheckpointProvenance)(compactProvenance)},
+                ${manifest.lineage}
+              )`
+              const storedTransitions = transfer.transitions.length === 0
+                ? []
+                : yield* findRelevantLineageTransitions({
+                  documentId,
+                  lineages: transfer.transitions.map((transition) => transition.resultingLineage),
+                  priorLineages: transfer.transitions.map((transition) => transition.priorLineage)
+                })
+              for (const transition of transfer.transitions) {
+                const conflict = storedTransitions.find((stored) =>
+                  stored.lineage === transition.resultingLineage ||
+                  stored.prior_lineage === transition.priorLineage
+                )
+                if (conflict !== undefined) {
+                  if (
+                    conflict.lineage !== transition.resultingLineage ||
+                    conflict.prior_lineage !== transition.priorLineage ||
+                    conflict.checkpoint_hash !== transition.anchorCheckpointHash ||
+                    conflict.prior_checkpoint_hash !== transition.priorCheckpointHash ||
+                    !sameHeads(conflict.heads, transition.resultingHeads) ||
+                    !sameHeads(conflict.prior_heads, transition.priorHeads) ||
+                    !Equal.equals(conflict.prior_snapshot, transition.priorSnapshot) ||
+                    !Equal.equals(conflict.authorization, transition.authorization)
+                  ) {
+                    return yield* new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.CheckpointRejected({
+                        documentId,
+                        reason: "Stored lineage transition conflicts with checkpoint transfer"
+                      })
+                    })
+                  }
+                  continue
+                }
+                yield* sql`INSERT INTO effect_local_lineage_transitions (
+                  document_id, prior_lineage, prior_checkpoint_hash, prior_heads, prior_snapshot,
+                  lineage, checkpoint_hash, heads, schema_version, writer_definition_hash,
+                  authorization, created_at
+                ) VALUES (
+                  ${documentId}, ${transition.priorLineage}, ${transition.priorCheckpointHash},
+                  ${Schema.encodeSync(Heads)(transition.priorHeads)}, ${transition.priorSnapshot},
+                  ${transition.resultingLineage}, ${transition.anchorCheckpointHash},
+                  ${Schema.encodeSync(Heads)(transition.resultingHeads)}, ${transition.schemaVersion},
+                  ${transition.writerDefinitionHash}, ${transition.authorization}, ${acceptedAt}
+                )`
+              }
+              yield* sql`INSERT INTO effect_local_commit_outbox (
+                commit_sequence, document_id, invalidation_keys, published
+              ) VALUES (
+                ${commitSequence}, ${documentId},
+                ${Schema.encodeSync(Heads)(ReplicaDefinition.documentCommitKeys(document.name, documentId))}, 0
+              )`
+              yield* projections.replaceDocument(
+                document,
+                {
+                  documentId,
+                  value,
+                  version: manifest.schemaVersion,
+                  heads,
+                  tombstone: InternalAutomerge.tombstone(automerge),
+                  projection: "Ready"
+                },
+                Identity.CommitSequence.make(commitSequence),
+                "Fresh"
+              )
+              const encodedWriterProvenance = Schema.encodeSync(
+                WriterProvenance.StoredChangeProvenances
+              )([])
+              const relayRetainedSize = relay === undefined
+                ? null
+                : relay.encodedSize + checkpointTransferBytes.byteLength +
+                  new TextEncoder().encode(encodedWriterProvenance).byteLength
+              yield* sql`INSERT INTO effect_local_peer_receipts (
+                replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id,
+                message_hash, reply, reply_hash, pending_message, heads, accepted_heads,
+                commit_sequence, accepted_at, writer_provenance, checkpoint_transfer,
+                relay_sender_tenant_id, relay_sender_subject_id, relay_sender_peer_id,
+                relay_message_id, relay_outer_envelope_digest, relay_receipt_expires_at,
+                relay_encoded_size
+              ) VALUES (
+                ${receiptSession.replicaIncarnation}, ${receiptSession.peerId},
+                ${receiptSession.connectionEpoch}, ${receiveSequence}, ${documentId}, ${messageHash},
+                NULL, NULL, NULL, ${Schema.encodeSync(Heads)(heads)}, ${Schema.encodeSync(Heads)(heads)},
+                ${commitSequence}, ${acceptedAt}, ${encodedWriterProvenance},
+                ${checkpointTransferBytes}, ${relay?.senderTenantId ?? null},
+                ${relay?.senderSubjectId ?? null}, ${relay?.senderPeerId ?? null},
+                ${relay?.relayMessageId ?? null}, ${relay?.outerEnvelopeDigest ?? null},
+                ${relay?.receiptExpiresAt ?? null}, ${relayRetainedSize}
+              )`
+              if (relay !== undefined) {
+                yield* sql`INSERT INTO effect_local_peer_relay_receipt_usage (
+                  replica_incarnation, sender_tenant_id, sender_subject_id, sender_peer_id,
+                  receipt_count, encoded_bytes
+                ) VALUES (
+                  ${receiptSession.replicaIncarnation}, ${relay.senderTenantId},
+                  ${relay.senderSubjectId}, ${relay.senderPeerId}, 1, ${relayRetainedSize!}
+                ) ON CONFLICT(replica_incarnation, sender_tenant_id, sender_subject_id, sender_peer_id)
+                DO UPDATE SET
+                  receipt_count = effect_local_peer_relay_receipt_usage.receipt_count + 1,
+                  encoded_bytes = effect_local_peer_relay_receipt_usage.encoded_bytes + excluded.encoded_bytes`
+                const remote = (yield* findRelayReceiptUsage({
+                  replicaIncarnation: receiptSession.replicaIncarnation,
+                  senderPeerId: relay.senderPeerId,
+                  senderSubjectId: relay.senderSubjectId,
+                  senderTenantId: relay.senderTenantId
+                }))[0]
+                const replica = (yield* findRelayReplicaReceiptUsage(
+                  receiptSession.replicaIncarnation
+                ))[0]
+                if ((remote?.receipt_count ?? 0) > relayReceiptLimits!.maxReceiptsPerRemote) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.QuotaExceeded({
+                      resource: "relay receipts per remote",
+                      limit: relayReceiptLimits!.maxReceiptsPerRemote
+                    })
+                  })
+                }
+                if ((remote?.encoded_bytes ?? 0) > relayReceiptLimits!.maxEncodedBytesPerRemote) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.QuotaExceeded({
+                      resource: "relay receipt bytes per remote",
+                      limit: relayReceiptLimits!.maxEncodedBytesPerRemote
+                    })
+                  })
+                }
+                if ((replica?.count ?? 0) > relayReceiptLimits!.maxReceiptsPerReplica) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.QuotaExceeded({
+                      resource: "relay receipts per replica",
+                      limit: relayReceiptLimits!.maxReceiptsPerReplica
+                    })
+                  })
+                }
+                if ((replica?.bytes ?? 0) > relayReceiptLimits!.maxEncodedBytesPerReplica) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.QuotaExceeded({
+                      resource: "relay receipt bytes per replica",
+                      limit: relayReceiptLimits!.maxEncodedBytesPerReplica
+                    })
+                  })
+                }
+              }
+              yield* gate.validate(permit)
+              return {
+                reply: null,
+                heads,
+                acceptedHeads: heads,
+                commitSequence: Identity.CommitSequence.make(commitSequence),
+                observedByPeer: false,
+                duplicate: false
+              } satisfies Received
+            }))).pipe(
+              Effect.tap((received) =>
+                writeState(
+                  session,
+                  documentId,
+                  syncStateAtHeads(received.heads, checkpointChangeHashes)
+                )
+              ),
+              Effect.catchTags({
+                SqlError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageUnavailable({ cause })
+                    })
+                  ),
+                SchemaError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageCorrupt({ cause })
+                    })
+                  )
+              })
+            )
+          }),
+        (prepared) => Effect.sync(() => InternalAutomerge.free(prepared.automerge))
+      ).pipe(
+        Effect.catchTags({
+          NoSuchElementError: () =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.ReplicaMetadataMissing({
+                  operation: "PeerSync.receive checkpoint"
+                })
+              })
+            ),
+          SqlError: (cause) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({ cause })
+              })
+            ),
+          SchemaError: (cause) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause })
+              })
+            )
+        }),
+        Effect.onError(() => removeDocumentState(documentId))
+      )
+
     const receive = <D extends Document.Any,>(
       document: D,
       documentId: Identity.DocumentId,
@@ -1360,6 +2233,7 @@ const make = (
         readonly lineage?: Identity.DocumentLineage
         readonly message: Uint8Array
         readonly writerProvenance: ReadonlyArray<WriterProvenance.ChangeProvenance>
+        readonly checkpointTransfer?: Uint8Array
         readonly relay?: RelayReceipt
       }
     ) =>
@@ -1371,6 +2245,7 @@ const make = (
               Effect.scoped(Effect.gen(function*() {
                 const receiptSession = { ...session, connectionEpoch: input.remoteConnectionEpoch }
                 const { message, receiveSequence } = input
+                const checkpointTransfer = input.checkpointTransfer
                 const relay = input.relay
                 if (relay !== undefined && relayReceiptLimits === null) {
                   return yield* new ReplicaError.ReplicaError({
@@ -1432,6 +2307,17 @@ const make = (
                     })
                   })
                 }
+                if (
+                  checkpointTransfer !== undefined &&
+                  (message.byteLength !== 0 || writerProvenance.length !== 0)
+                ) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.ProtocolMismatch({
+                      expected: "empty sync message and writer provenance for checkpoint transfer",
+                      observed: "checkpoint transfer mixed with ordinary sync content"
+                    })
+                  })
+                }
                 // Refuse before anything else touches storage. Every Automerge ingestion path is a
                 // union, so a message from a superseded lineage cannot be merged at all: applying
                 // it restores exactly the history the rewrite discarded, and the rewritten value
@@ -1445,7 +2331,7 @@ const make = (
                 // expensive part of the whole path, which would make the cheapest hostile message
                 // the most expensive one to reject.
                 const localLineage = yield* documentLineage(documentId)
-                if (localLineage !== remoteLineage) {
+                if (checkpointTransfer === undefined && localLineage !== remoteLineage) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.DocumentLineageChanged({
                       documentId,
@@ -1565,6 +2451,19 @@ const make = (
                         })
                       })
                     }
+                    if (
+                      !Equal.equals(
+                        receipt.checkpoint_transfer,
+                        checkpointTransfer ?? null
+                      )
+                    ) {
+                      return yield* new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.ProtocolMismatch({
+                          expected: "matching checkpoint transfer",
+                          observed: "conflicting checkpoint transfer"
+                        })
+                      })
+                    }
                   })
                 const loadReceipt = () =>
                   relay === undefined
@@ -1621,7 +2520,27 @@ const make = (
                 if (receipt !== undefined) {
                   yield* validateStoredReceipt(receipt)
                   yield* quotaLock.withPermit(validateSessionGeneration(generation, sessionGeneration))
+                  if (receipt.checkpoint_transfer !== null) {
+                    yield* Effect.uninterruptible(removeDocumentState(documentId))
+                  }
                   return receivedFromReceipt(documentId, receipt)
+                }
+                if (checkpointTransfer !== undefined) {
+                  return yield* installCheckpoint(
+                    document,
+                    documentId,
+                    session,
+                    receiptSession,
+                    receiveSequence,
+                    remoteLineage,
+                    checkpointTransfer,
+                    messageHash,
+                    acceptedAt,
+                    relay,
+                    generation,
+                    sessionGeneration,
+                    permit
+                  )
                 }
                 const validateReceiptQuota = Effect.gen(function*() {
                   const receiptTotals = yield* findReceiptTotals({
@@ -2166,7 +3085,29 @@ const make = (
                         string,
                         WriterProvenance.ChangeProvenance
                       >()
-                      for (const entry of checkpointProvenanceRows.flatMap((row) => row.writer_provenance)) {
+                      const durableChangeHashes = WriterProvenance.changeHashes(durable.automerge)
+                      for (const row of checkpointProvenanceRows) {
+                        if (!WriterProvenance.isCompactCheckpoint(row.writer_provenance)) continue
+                        const compact = row.writer_provenance
+                        if (!Automerge.hasHeads(durable.automerge, [...compact.heads])) continue
+                        const changesAfterCheckpoint = new Set(
+                          Automerge.getChangesSince(durable.automerge, [...compact.heads])
+                            .map((bytes) => Automerge.decodeChange(bytes).hash)
+                        )
+                        for (const changeHash of durableChangeHashes) {
+                          if (changesAfterCheckpoint.has(changeHash)) continue
+                          checkpointProvenanceByHash.set(changeHash, {
+                            changeHash,
+                            writerSchemaVersion: compact.schemaVersion,
+                            writerDefinitionHash: compact.writerDefinitionHash
+                          })
+                        }
+                      }
+                      for (
+                        const entry of checkpointProvenanceRows.flatMap((row) =>
+                          Array.isArray(row.writer_provenance) ? row.writer_provenance : []
+                        )
+                      ) {
                         const existing = checkpointProvenanceByHash.get(entry.changeHash)
                         if (
                           existing !== undefined &&
@@ -2548,7 +3489,7 @@ const make = (
             heads, accepted_heads, commit_sequence, accepted_at, writer_provenance,
             relay_sender_tenant_id, relay_sender_subject_id, relay_sender_peer_id,
             relay_message_id, relay_outer_envelope_digest, relay_receipt_expires_at,
-            relay_encoded_size
+            relay_encoded_size, checkpoint_transfer
           ) VALUES (
             ${receiptSession.replicaIncarnation}, ${receiptSession.peerId}, ${receiptSession.connectionEpoch},
             ${receiveSequence},
@@ -2559,7 +3500,7 @@ const make = (
             ${relay?.senderTenantId ?? null}, ${relay?.senderSubjectId ?? null},
             ${relay?.senderPeerId ?? null}, ${relay?.relayMessageId ?? null},
             ${relay?.outerEnvelopeDigest ?? null}, ${relay?.receiptExpiresAt ?? null},
-            ${relayRetainedSize}
+            ${relayRetainedSize}, ${checkpointTransfer ?? null}
           )`
                           if (relay !== undefined) {
                             yield* sql`INSERT INTO effect_local_peer_relay_receipt_usage (
@@ -2730,7 +3671,10 @@ const make = (
                 messageHash: row.message_hash,
                 heads: row.heads,
                 lineage: row.lineage,
-                writerProvenance: row.writer_provenance
+                writerProvenance: row.writer_provenance,
+                ...(row.checkpoint_transfer === null
+                  ? {}
+                  : { checkpointTransfer: row.checkpoint_transfer })
               }))
             ),
             Effect.catchTags({

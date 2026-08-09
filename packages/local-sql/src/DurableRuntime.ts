@@ -1,8 +1,10 @@
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as ClusterWorkflowEngine from "effect/unstable/cluster/ClusterWorkflowEngine"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as CheckpointAuthority from "./CheckpointAuthority.js"
 import * as DocumentEntity from "./DocumentEntity.js"
 import * as ClusterStorage from "./internal/clusterStorage.js"
 import * as PeerSync from "./PeerSync.js"
@@ -16,6 +18,10 @@ const layerWithPeerSync = <A, E, R, EPeer, RPeer,>(
 ) =>
   Layer.unwrap(Effect.gen(function*() {
     yield* ReplicaBootstrap.ReplicaBootstrap
+    const checkpointAuthority = Option.getOrElse(
+      yield* Effect.serviceOption(CheckpointAuthority.CheckpointAuthority),
+      () => CheckpointAuthority.rejectAll
+    )
     const sql = yield* SqlClient.SqlClient
     const cluster = ClusterWorkflowEngine.layer.pipe(
       Layer.provideMerge(ClusterStorage.layer),
@@ -35,7 +41,11 @@ const layerWithPeerSync = <A, E, R, EPeer, RPeer,>(
     // cycle and preserves the relay-specific implementation.
     return Layer.merge(DocumentEntity.layer(definition), workflows)
       .pipe(
-        Layer.provideMerge(peerSync),
+        Layer.provideMerge(peerSync.pipe(
+          Layer.provideMerge(
+            Layer.succeed(CheckpointAuthority.CheckpointAuthority)(checkpointAuthority)
+          )
+        )),
         Layer.provideMerge(cluster)
       )
   }))

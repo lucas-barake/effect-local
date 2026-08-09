@@ -8,8 +8,10 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Schema from "effect/Schema"
 import * as Migrator from "effect/unstable/sql/Migrator"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as Rows from "../src/internal/rows.js"
 import { tables } from "../src/internal/schema.js"
 import * as Migrations from "../src/Migrations.js"
 import * as PeerSyncEnvelope from "../src/PeerSyncEnvelope.js"
@@ -24,11 +26,45 @@ describe("Migrations", () => {
       `
       const names = new Set(rows.map((row) => row.name))
       for (const table of tables) assert.isTrue(names.has(table))
+      assert.isTrue(names.has("effect_local_lineage_transitions"))
+      const transitionColumns = yield* sql<{
+        readonly name: string
+        readonly notnull: number
+        readonly pk: number
+      }>`SELECT name, "notnull", pk FROM pragma_table_info('effect_local_lineage_transitions')`
+      assert.deepStrictEqual(transitionColumns, [
+        { name: "document_id", notnull: 1, pk: 1 },
+        { name: "prior_lineage", notnull: 1, pk: 0 },
+        { name: "prior_checkpoint_hash", notnull: 1, pk: 0 },
+        { name: "prior_heads", notnull: 1, pk: 0 },
+        { name: "prior_snapshot", notnull: 1, pk: 0 },
+        { name: "lineage", notnull: 1, pk: 2 },
+        { name: "checkpoint_hash", notnull: 1, pk: 0 },
+        { name: "heads", notnull: 1, pk: 0 },
+        { name: "schema_version", notnull: 1, pk: 0 },
+        { name: "writer_definition_hash", notnull: 1, pk: 0 },
+        { name: "authorization", notnull: 0, pk: 0 },
+        { name: "created_at", notnull: 1, pk: 0 }
+      ])
+      const checkpointInstallPlan = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN SELECT
+        (SELECT COUNT(*) FROM effect_local_peer_outbox
+          WHERE document_id = 'document-00001' AND status = 'Pending') AS direct_outbox,
+        (SELECT COUNT(*) FROM effect_local_peer_relay_outbox
+          WHERE document_id = 'document-00001') AS relay_outbox`
+      assert.isTrue(
+        checkpointInstallPlan.some((row) => row.detail.includes("effect_local_peer_outbox_document_status")),
+        JSON.stringify(checkpointInstallPlan)
+      )
+      assert.isTrue(
+        checkpointInstallPlan.some((row) => row.detail.includes("effect_local_peer_relay_outbox_document")),
+        JSON.stringify(checkpointInstallPlan)
+      )
       const indexes = yield* sql<{ readonly name: string }>`
         SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'effect_local_peer_%'
       `
       assert.deepStrictEqual(indexes.map((row) => row.name).toSorted(), [
         "effect_local_peer_outbox_connection_status",
+        "effect_local_peer_outbox_document_status",
         "effect_local_peer_outbox_incarnation_created",
         "effect_local_peer_receipts_direct_identity",
         "effect_local_peer_receipts_document_sequence",
@@ -39,6 +75,7 @@ describe("Migrations", () => {
         "effect_local_peer_receipts_relay_identity",
         "effect_local_peer_relay_delivery_changes_hash",
         "effect_local_peer_relay_delivery_messages_document",
+        "effect_local_peer_relay_outbox_document",
         "effect_local_peer_relay_outbox_due_endpoint",
         "effect_local_peer_relay_outbox_retry_deadline"
       ])
@@ -74,6 +111,52 @@ describe("Migrations", () => {
         FROM documents`
       yield* sql`UPDATE effect_local_documents SET projection_status = 'Blocked'
         WHERE document_id = 'document-10000'`
+      yield* sql`INSERT INTO effect_local_lineage_transitions (
+        document_id, prior_lineage, prior_checkpoint_hash, prior_heads, prior_snapshot,
+        lineage, checkpoint_hash, heads, schema_version, writer_definition_hash,
+        authorization, created_at
+      ) VALUES (
+        'document-00001', 'prior-lineage', 'prior-checkpoint', '["a"]', ${new Uint8Array([1])},
+        'lineage', 'checkpoint', '["b"]', 1, 'definition', ${new Uint8Array([2])},
+        '2026-01-01T00:00:00.000Z'
+      )`
+      const ambiguousFork = yield* Effect.exit(sql`INSERT INTO effect_local_lineage_transitions (
+        document_id, prior_lineage, prior_checkpoint_hash, prior_heads, prior_snapshot,
+        lineage, checkpoint_hash, heads, schema_version, writer_definition_hash,
+        authorization, created_at
+      ) VALUES (
+        'document-00001', 'prior-lineage', 'other-prior-checkpoint', '["a"]', ${new Uint8Array([1])},
+        'other-lineage', 'other-checkpoint', '["c"]', 1, 'definition', NULL,
+        '2026-01-01T00:00:01.000Z'
+      )`)
+      assert.strictEqual(ambiguousFork._tag, "Failure")
+      const oversizedAuthorizationRow = yield* Effect.exit(
+        Schema.decodeUnknownEffect(Rows.LineageTransitionRow)({
+          authorization: new Uint8Array(16_385),
+          checkpoint_hash: "checkpoint",
+          created_at: "2026-01-01T00:00:02.000Z",
+          document_id: Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001"),
+          heads: "[\"b\"]",
+          lineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000002"),
+          prior_checkpoint_hash: "prior-checkpoint",
+          prior_heads: "[\"a\"]",
+          prior_lineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000003"),
+          prior_snapshot: new Uint8Array([1]),
+          schema_version: 1,
+          writer_definition_hash: "definition"
+        })
+      )
+      assert.strictEqual(oversizedAuthorizationRow._tag, "Failure")
+      const oversizedAuthorization = yield* Effect.exit(sql`INSERT INTO effect_local_lineage_transitions (
+        document_id, prior_lineage, prior_checkpoint_hash, prior_heads, prior_snapshot,
+        lineage, checkpoint_hash, heads, schema_version, writer_definition_hash,
+        authorization, created_at
+      ) VALUES (
+        'document-00001', 'another-prior-lineage', 'prior-checkpoint', '["a"]', ${new Uint8Array([1])},
+        'another-lineage', 'checkpoint', '["b"]', 1, 'definition', ${new Uint8Array(16_385)},
+        '2026-01-01T00:00:02.000Z'
+      )`)
+      assert.strictEqual(oversizedAuthorization._tag, "Failure")
       yield* sql`ANALYZE`
       const blockedDocumentPlan = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN
         SELECT DISTINCT document_type FROM effect_local_documents
@@ -142,11 +225,13 @@ describe("Migrations", () => {
       `
       assert.strictEqual(indexes.length, 0)
       const recorded = yield* sql<{ readonly migration_id: number }>`
-        SELECT migration_id FROM effect_local_migrations WHERE migration_id IN (4, 5, 6, 7, 8, 9, 10, 11)
+        SELECT migration_id FROM effect_local_migrations
+        WHERE migration_id IN (4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
       `
       assert.strictEqual(recorded.length, 0)
       const catalog = yield* sql<{ readonly migration_id: number }>`
-        SELECT migration_id FROM effect_local_migration_catalog WHERE migration_id IN (4, 5, 6, 7, 8, 9, 10, 11)
+        SELECT migration_id FROM effect_local_migration_catalog
+        WHERE migration_id IN (4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14)
       `
       assert.strictEqual(catalog.length, 0)
       const receiptPrimaryKey = yield* sql<{ readonly name: string; readonly pk: number }>`
@@ -162,6 +247,11 @@ describe("Migrations", () => {
       assert.deepStrictEqual(
         yield* sql`SELECT name FROM sqlite_master
           WHERE type = 'table' AND name = 'effect_local_peer_relay_outbox'`,
+        []
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT name FROM sqlite_master
+          WHERE type = 'table' AND name = 'effect_local_lineage_transitions'`,
         []
       )
     }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
@@ -252,19 +342,22 @@ describe("Migrations", () => {
         [10, "peer_relay_state"],
         [11, "command_delivery"],
         [12, "document_history_counters"],
-        [13, "backup_document_installations"]
+        [13, "backup_document_installations"],
+        [14, "checkpoint_shipping"]
       ])
 
       const outbox = yield* sql<{
+        readonly checkpoint_transfer: Uint8Array | null
         readonly created_at: string
         readonly writer_provenance: string
       }>`
-        SELECT created_at, writer_provenance
+        SELECT checkpoint_transfer, created_at, writer_provenance
         FROM effect_local_peer_outbox
         WHERE message_hash = 'message-1'
       `
       assert.match(outbox[0]?.created_at ?? "", /^\d{4}-\d{2}-\d{2}T/)
       assert.strictEqual(outbox[0]?.writer_provenance, "[]")
+      assert.isNull(outbox[0]?.checkpoint_transfer)
 
       const changes = yield* sql<{ readonly writer_definition_hash: string }>`
         SELECT writer_definition_hash
@@ -277,6 +370,11 @@ describe("Migrations", () => {
         SELECT name FROM pragma_table_info('effect_local_peer_receipts')
       `
       assert.isTrue(receiptColumns.some((column) => column.name === "writer_provenance"))
+      assert.isTrue(receiptColumns.some((column) => column.name === "checkpoint_transfer"))
+      const outboxColumns = yield* sql<{ readonly name: string }>`
+        SELECT name FROM pragma_table_info('effect_local_peer_outbox')
+      `
+      assert.isTrue(outboxColumns.some((column) => column.name === "checkpoint_transfer"))
       for (
         const name of [
           "relay_sender_tenant_id",
@@ -399,6 +497,11 @@ describe("Migrations", () => {
           migration_id: 13,
           name: "backup_document_installations",
           checksum: Migrations.backupDocumentInstallationsChecksum
+        },
+        {
+          migration_id: 14,
+          name: "checkpoint_shipping",
+          checksum: Migrations.checkpointShippingChecksum
         }
       ])
 
@@ -663,7 +766,8 @@ describe("Migrations", () => {
       assert.deepStrictEqual(yield* Migrations.run, [
         [11, "command_delivery"],
         [12, "document_history_counters"],
-        [13, "backup_document_installations"]
+        [13, "backup_document_installations"],
+        [14, "checkpoint_shipping"]
       ])
       assert.deepStrictEqual(yield* selectDurableOutbox, outboxBefore)
       assert.deepStrictEqual(
@@ -774,7 +878,8 @@ describe("Migrations", () => {
           { migration_id: 10, name: "peer_relay_state" },
           { migration_id: 11, name: "command_delivery" },
           { migration_id: 12, name: "document_history_counters" },
-          { migration_id: 13, name: "backup_document_installations" }
+          { migration_id: 13, name: "backup_document_installations" },
+          { migration_id: 14, name: "checkpoint_shipping" }
         ]
       )
       assert.deepStrictEqual(
@@ -1032,7 +1137,8 @@ describe("Migrations", () => {
 
       assert.deepStrictEqual(yield* Migrations.run, [
         [12, "document_history_counters"],
-        [13, "backup_document_installations"]
+        [13, "backup_document_installations"],
+        [14, "checkpoint_shipping"]
       ])
       const counters = yield* sql<{
         readonly document_id: string
@@ -1102,7 +1208,8 @@ describe("Migrations", () => {
         FROM documents`
       assert.deepStrictEqual(yield* Migrations.run, [
         [12, "document_history_counters"],
-        [13, "backup_document_installations"]
+        [13, "backup_document_installations"],
+        [14, "checkpoint_shipping"]
       ])
       const counters = yield* sql<{
         readonly document_id: string
@@ -1149,7 +1256,8 @@ describe("Migrations", () => {
 
       assert.deepStrictEqual(yield* Migrations.run, [
         [12, "document_history_counters"],
-        [13, "backup_document_installations"]
+        [13, "backup_document_installations"],
+        [14, "checkpoint_shipping"]
       ])
       const counters = yield* sql<{
         readonly document_id_type: string

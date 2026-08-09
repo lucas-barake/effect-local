@@ -292,7 +292,10 @@ const makeWithTerminal = (
             // message was generated under, and a rewrite between generation and send must not
             // relabel it.
             lineage: outbound.lineage,
-            writerProvenance: outbound.writerProvenance
+            writerProvenance: outbound.writerProvenance,
+            ...(outbound.checkpointTransfer === undefined
+              ? {}
+              : { checkpointTransfer: outbound.checkpointTransfer })
           })
           yield* Effect.scoped(Effect.gen(function*() {
             const permit = yield* gate.shared
@@ -384,7 +387,8 @@ const makeWithTerminal = (
                 Effect.gen(function*() {
                   const observationRevision = (yield* Ref.get(observed)).get(entry.documentId)?.revision ?? 0
                   const result = yield* sync.generate(entry.document, entry.documentId, session, {
-                    lineageAware: connection.capabilities.lineageAware === true
+                    lineageAware: connection.capabilities.lineageAware === true,
+                    checkpointTransfer: connection.capabilities.checkpointTransfer === true
                   })
                   yield* Ref.update(observed, (values) => {
                     const current = values.get(entry.documentId)
@@ -404,6 +408,11 @@ const makeWithTerminal = (
                     "DocumentLineageChanged",
                     (reason) => refuse(entry.documentId, reason).pipe(Effect.as({ _tag: "Refused" } as const))
                   ),
+                  Effect.catchReason(
+                    "ReplicaError",
+                    "DocumentNotFound",
+                    () => Effect.succeed({ _tag: "Missing" } as const)
+                  ),
                   Effect.catchIf(
                     (error) =>
                       error.reason._tag === "QuotaExceeded" &&
@@ -420,6 +429,7 @@ const makeWithTerminal = (
         })
         if (generated._tag === "TornDown") return
         if (generated._tag === "Refused") continue
+        if (generated._tag === "Missing") continue
         const update = Ref.update(dirty, (values) => {
           if (values.get(entry.documentId) !== revision) return values
           const next = new Map(values)
@@ -562,6 +572,9 @@ const makeWithTerminal = (
               // absent key of a pre lineage peer becomes the genesis lineage.
               lineage: envelope.lineage,
               writerProvenance: envelope.writerProvenance,
+              ...(envelope.checkpointTransfer === undefined
+                ? {}
+                : { checkpointTransfer: envelope.checkpointTransfer }),
               relay
             }).pipe(
               Effect.catchTag(
@@ -614,6 +627,11 @@ const makeWithTerminal = (
             "ReplicaError",
             "DocumentLineageChanged",
             (reason) => refuse(envelope.documentId, reason).pipe(Effect.as(null))
+          ),
+          Effect.catchReason(
+            "ReplicaError",
+            "CheckpointRejected",
+            () => Effect.succeed(null)
           ),
           // Quota trips are transient, so rejecting would discard a message the replica can hold
           // later, and failing the session turned one over-quota message into a reconnect churn

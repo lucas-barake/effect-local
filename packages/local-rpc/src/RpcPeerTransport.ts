@@ -262,7 +262,7 @@ export const layer = (
       } as const
 
       return {
-        capabilities: { lineageAware: true },
+        capabilities: { checkpointTransfer: true, lineageAware: true },
         connect: (connectOptions) =>
           PeerRpcObservability.observe({
             effect: Effect.gen(function*() {
@@ -660,7 +660,7 @@ export const layer = (
                         },
                         relayPeerId: options.expectedRelayPeerId
                       },
-                      capabilities: { lineageAware: true },
+                      capabilities: { checkpointTransfer: true, lineageAware: true },
                       receive: inbound,
                       send,
                       transient,

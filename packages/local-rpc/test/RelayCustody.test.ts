@@ -1,6 +1,7 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
+import type * as CheckpointAuthority from "@lucas-barake/effect-local-sql/CheckpointAuthority"
 import * as DocumentStore from "@lucas-barake/effect-local-sql/DocumentStore"
 import * as PeerRelayClientRuntime from "@lucas-barake/effect-local-sql/PeerRelayClientRuntime"
 import * as PeerRelayOutboxLimits from "@lucas-barake/effect-local-sql/PeerRelayOutboxLimits"
@@ -15,13 +16,16 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Equal from "effect/Equal"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
@@ -98,6 +102,33 @@ const replicaLimits: ReplicaLimits.Values = {
 
 const outboxLimits: PeerRelayOutboxLimits.Values = PeerRelayOutboxLimits.defaults
 const receiptLimits: PeerRelayReceiptLimits.Values = PeerRelayReceiptLimits.defaults
+const checkpointToken = Uint8Array.of(17, 29, 43)
+const checkpointAuthority: CheckpointAuthority.Implementation = {
+  signManifest: () => Effect.succeed(Option.some(checkpointToken)),
+  verifyManifest: (claims, token) =>
+    Equal.equals(token, checkpointToken)
+      ? Effect.void
+      : Effect.fail(
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.CheckpointRejected({
+            documentId: claims.documentId,
+            reason: "Invalid deterministic checkpoint token"
+          })
+        })
+      ),
+  signTransition: () => Effect.succeed(Option.some(checkpointToken)),
+  verifyTransition: (claims, token) =>
+    Equal.equals(token, checkpointToken)
+      ? Effect.void
+      : Effect.fail(
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.CheckpointRejected({
+            documentId: claims.documentId,
+            reason: "Invalid deterministic transition token"
+          })
+        })
+      )
+}
 
 /**
  * The explicit cluster configuration. `internal/clusterStorage.layer` hardcodes
@@ -311,7 +342,10 @@ const awaitUsage = (
  * A function rather than module constants: layer memoization is by reference, so two peers
  * sharing one value would silently be one replica and the exchange would prove nothing.
  */
-const clientStack = (limits: ReplicaLimits.Values = replicaLimits) => {
+const clientStack = (
+  limits: ReplicaLimits.Values = replicaLimits,
+  authority?: CheckpointAuthority.Implementation
+) => {
   const Base = Layer.mergeAll(
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
     NodeCrypto.layer,
@@ -319,7 +353,10 @@ const clientStack = (limits: ReplicaLimits.Values = replicaLimits) => {
     PeerRelayReceiptLimits.layer(receiptLimits),
     PeerRelayOutboxLimits.layer(outboxLimits)
   )
-  const ReplicaLayer = SqlReplica.layerRelay(definition, { projections: [] }).pipe(
+  const ReplicaLayer = SqlReplica.layerRelay(definition, {
+    projections: [],
+    ...(authority === undefined ? {} : { checkpointAuthority: authority })
+  }).pipe(
     Layer.provide(Handlers),
     Layer.provideMerge(Base),
     Layer.orDie
@@ -355,14 +392,21 @@ const outboxRows = (sql: SqlClient.SqlClient) =>
     SELECT relay_message_id FROM effect_local_peer_relay_outbox
   `.pipe(Effect.orDie)
 
+const directOutboxRows = (sql: SqlClient.SqlClient) =>
+  sql<{ readonly send_sequence: number }>`SELECT send_sequence FROM effect_local_peer_outbox`.pipe(Effect.orDie)
+
 /**
  * The recipient is a clone rather than an independently created replica: a document created
  * twice for the same id is two lineages, and this exchange syncs two copies of one.
  */
-const seedPairWith = (limits: ReplicaLimits.Values) =>
+const seedPairWith = (
+  limits: ReplicaLimits.Values,
+  authority?: CheckpointAuthority.Implementation,
+  cloneRecipient = true
+) =>
   Effect.gen(function*() {
-    const senderContext = yield* Layer.build(clientStack(limits))
-    const recipientContext = yield* Layer.build(clientStack(limits))
+    const senderContext = yield* Layer.build(clientStack(limits, authority))
+    const recipientContext = yield* Layer.build(clientStack(limits, authority))
     const sender = Context.get(senderContext, Replica.Replica)
     const recipient = Context.get(recipientContext, Replica.Replica)
 
@@ -370,14 +414,16 @@ const seedPairWith = (limits: ReplicaLimits.Values) =>
       commandId: yield* Identity.makeCommandId,
       value: { title: "one", labels: [] }
     })
-    const backup = yield* sender.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
-    yield* recipient.restoreBackup({
-      expectedDefinitionHash: definition.hash,
-      installationId: yield* Identity.makeBackupInstallationId,
-      maxBytes: limits.maxBackupBytes,
-      mode: "clone",
-      source: Stream.fromIterable(backup)
-    })
+    if (cloneRecipient) {
+      const backup = yield* sender.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      yield* recipient.restoreBackup({
+        expectedDefinitionHash: definition.hash,
+        installationId: yield* Identity.makeBackupInstallationId,
+        maxBytes: limits.maxBackupBytes,
+        mode: "clone",
+        source: Stream.fromIterable(backup)
+      })
+    }
 
     return {
       documentId,
@@ -694,6 +740,121 @@ describe("relay custody against a real relay", () => {
         }
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
+
+  it.effect("ships an oversized offline history through relay checkpoint custody for issue 123", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const checkpointLimits: ReplicaLimits.Values = {
+          ...replicaLimits,
+          maxSyncChangesPerMessage: 2
+        }
+        const backend = yield* relayBackend()
+        const senderClient = yield* backend.clientFor("local")
+        const recipientClient = yield* backend.clientFor("remote")
+        const { documentId, recipient, sender } = yield* seedPairWith(
+          checkpointLimits,
+          checkpointAuthority,
+          false
+        )
+
+        const offlineLabels = Array.from({ length: 4 }, (_, index) => `offline-${index}`)
+        for (const label of offlineLabels) {
+          yield* sender.replica.mutate(AddLabel, {
+            commandId: yield* Identity.makeCommandId,
+            documentId,
+            payload: label
+          })
+        }
+        yield* TestClock.adjust(5000)
+
+        yield* Effect.scoped(Effect.gen(function*() {
+          const recipientSession = yield* RpcPeerTransport.makeSession(
+            recipientClient,
+            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
+          ).pipe(Effect.provideContext(recipient.context))
+          const senderSession = yield* RpcPeerTransport.makeSession(
+            senderClient,
+            transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
+          ).pipe(Effect.provideContext(sender.context))
+
+          yield* senderSession.markDirty(documentId)
+          yield* senderSession.flush
+          yield* TestClock.adjust(5000)
+
+          const recipientAfterCheckpoint = yield* recipient.store.load(Task, documentId).pipe(Effect.orDie)
+          assert.deepStrictEqual(
+            [...recipientAfterCheckpoint.encoded.labels].toSorted(),
+            offlineLabels.toSorted(),
+            "the relay checkpoint converged the recipient beyond the ordinary change cap"
+          )
+          const checkpointRows = yield* recipient.sql<{ readonly writer_provenance: string }>`
+            SELECT writer_provenance
+            FROM effect_local_checkpoints
+            WHERE document_id = ${documentId}
+            ORDER BY commit_sequence DESC
+            LIMIT 1
+          `
+          assert.strictEqual(
+            (JSON.parse(checkpointRows[0]!.writer_provenance) as { readonly _tag?: string })._tag,
+            "Compact"
+          )
+
+          for (const side of [sender, recipient]) {
+            assert.strictEqual((yield* outboxRows(side.sql)).length, 0)
+          }
+
+          yield* recipient.replica.mutate(AddLabel, {
+            commandId: yield* Identity.makeCommandId,
+            documentId,
+            payload: "recipient-after-checkpoint"
+          })
+          yield* recipientSession.markDirty(documentId)
+          yield* recipientSession.flush
+          yield* TestClock.adjust(5000)
+          assert.include(
+            (yield* sender.store.load(Task, documentId).pipe(Effect.orDie)).encoded.labels,
+            "recipient-after-checkpoint"
+          )
+
+          yield* sender.replica.mutate(AddLabel, {
+            commandId: yield* Identity.makeCommandId,
+            documentId,
+            payload: "sender-after-checkpoint"
+          })
+          yield* senderSession.markDirty(documentId)
+          yield* senderSession.flush
+          yield* TestClock.adjust(5000)
+          yield* recipientSession.markDirty(documentId)
+          yield* recipientSession.flush
+          yield* senderSession.markDirty(documentId)
+          yield* senderSession.flush
+          yield* TestClock.adjust(5000)
+
+          const expected = [
+            ...offlineLabels,
+            "recipient-after-checkpoint",
+            "sender-after-checkpoint"
+          ].toSorted()
+          for (const side of [sender, recipient]) {
+            const loaded = yield* side.store.load(Task, documentId).pipe(Effect.orDie)
+            assert.deepStrictEqual([...loaded.encoded.labels].toSorted(), expected)
+            assert.strictEqual((yield* outboxRows(side.sql)).length, 0)
+          }
+        }))
+        for (const side of [sender, recipient]) {
+          assert.strictEqual((yield* directOutboxRows(side.sql)).length, 0)
+          assert.strictEqual((yield* outboxRows(side.sql)).length, 0)
+        }
+        for (const principal of [localPrincipal, remotePrincipal]) {
+          assert.deepStrictEqual(
+            yield* backend.store
+              .pendingHeads(yield* inboxKeyOf(principal, backend.crypto), { limit: 10, now: 0 })
+              .pipe(Effect.orDie),
+            []
+          )
+        }
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ), 0)
 
   it.effect("withholds an oversized reply and still settles the inbound that asked for it", () =>
     Effect.scoped(

@@ -1,5 +1,6 @@
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Schema from "effect/Schema"
+import * as CheckpointAuthority from "../CheckpointAuthority.js"
 import * as WriterProvenance from "./writerProvenance.js"
 
 const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
@@ -43,7 +44,7 @@ export const CheckpointRow = Schema.Struct({
   heads: Schema.String,
   lineage: Identity.DocumentLineage,
   verified: Schema.Number,
-  writer_provenance: WriterProvenance.StoredChangeProvenances
+  writer_provenance: WriterProvenance.StoredCheckpointProvenance
 })
 
 export const ChangeRow = Schema.Struct({
@@ -60,4 +61,23 @@ export const ChangeRow = Schema.Struct({
   sequence: Schema.Number,
   writer_definition_hash: WriterProvenance.WriterDefinitionHash,
   writer_schema_version: WriterProvenance.WriterSchemaVersion
+})
+
+export const CheckpointTransferColumn = Schema.Struct({
+  checkpoint_transfer: Schema.NullOr(Schema.Uint8Array)
+})
+
+export const LineageTransitionRow = Schema.Struct({
+  authorization: Schema.NullOr(CheckpointAuthority.AuthorizationToken),
+  checkpoint_hash: Schema.String,
+  created_at: Schema.String,
+  document_id: Identity.DocumentId,
+  heads: Schema.String,
+  lineage: Identity.DocumentLineage,
+  prior_checkpoint_hash: Schema.String,
+  prior_heads: Schema.String,
+  prior_lineage: Identity.DocumentLineage,
+  prior_snapshot: Schema.Uint8Array,
+  schema_version: WriterProvenance.WriterSchemaVersion,
+  writer_definition_hash: WriterProvenance.WriterDefinitionHash
 })

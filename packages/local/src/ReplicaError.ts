@@ -171,6 +171,13 @@ export class DocumentLineageChanged extends Schema.TaggedErrorClass<DocumentLine
   remoteLineage: Identity.DocumentLineage
 }) {}
 
+export class CheckpointRejected extends Schema.TaggedErrorClass<CheckpointRejected>(
+  "@lucas-barake/effect-local/ReplicaError/CheckpointRejected"
+)("CheckpointRejected", {
+  documentId: Identity.DocumentId,
+  reason: Schema.String.check(Schema.isMaxLength(1_024))
+}) {}
+
 /**
  * The command may or may not have committed, and the replica cannot tell which.
  *
@@ -215,6 +222,7 @@ export const Reason = Schema.Union([
   UnsupportedStorageFormatVersion,
   CheckpointSuperseded,
   DocumentLineageChanged,
+  CheckpointRejected,
   CommandOutcomeUnknown
 ])
 export type Reason = typeof Reason.Type

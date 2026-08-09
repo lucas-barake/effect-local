@@ -8,12 +8,14 @@ import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
-import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
+import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Equal from "effect/Equal"
 import type * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
@@ -25,12 +27,15 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import { rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import * as CheckpointAuthority from "../src/CheckpointAuthority.js"
 import * as Compaction from "../src/Compaction.js"
 import * as DocumentStore from "../src/DocumentStore.js"
 import * as InternalAutomerge from "../src/internal/automerge.js"
 import * as SyncChunks from "../src/internal/syncChunks.js"
+import * as WriterProvenance from "../src/internal/writerProvenance.js"
 import * as PeerRelayReceiptLimits from "../src/PeerRelayReceiptLimits.js"
 import * as PeerSync from "../src/PeerSync.js"
+import * as PeerSyncEnvelope from "../src/PeerSyncEnvelope.js"
 import * as ProjectionStore from "../src/ProjectionStore.js"
 import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
@@ -94,7 +99,7 @@ describe("PeerSync", () => {
     NodeCrypto.layer
   )
   const Bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(Database))
-  const Base = Layer.merge(Database, Bootstrap)
+  const Base = Layer.mergeAll(Database, Bootstrap, CheckpointAuthority.layerRejectAll)
   const Gate = ReplicaGate.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)), Layer.provide(Base))
   const Limits = ReplicaLimits.layer(limits)
   const Infrastructure = Layer.mergeAll(Base, Gate, Limits)
@@ -135,9 +140,13 @@ describe("PeerSync", () => {
   const StrictLayer = Layer.merge(StrictServices, StrictSyncService)
   const sourceLayer = (
     sourceLimits: ReplicaLimits.Values,
-    filename = ":memory:"
+    filename = ":memory:",
+    checkpointAuthority?: CheckpointAuthority.Implementation
   ) =>
-    SqlReplica.layerWithBindings(definition, { projections: [] }).pipe(
+    SqlReplica.layerWithBindings(definition, {
+      projections: [],
+      ...(checkpointAuthority === undefined ? {} : { checkpointAuthority })
+    }).pipe(
       Layer.provideMerge([
         SqliteClient.layer({ filename, disableWAL: true }),
         NodeCrypto.layer,
@@ -2992,7 +3001,7 @@ describe("PeerSync", () => {
         }).pipe(Effect.provide(database))
       )
       const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(database))
-      const base = Layer.merge(database, bootstrap)
+      const base = Layer.mergeAll(database, bootstrap, CheckpointAuthority.layerRejectAll)
       const gate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(base))
       const infrastructure = Layer.mergeAll(base, gate, Limits)
       const store = DocumentStore.layer.pipe(Layer.provide(infrastructure))
@@ -3765,6 +3774,892 @@ describe("PeerSync", () => {
       assert.isNotNull((yield* sync.generate(Task, documentId, session, { lineageAware: true })).outbound)
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(TestLayer)))
+
+  const checkpointToken = new Uint8Array([17, 29, 43])
+  const checkpointAuthority: CheckpointAuthority.Implementation = {
+    signManifest: () => Effect.succeed(Option.some(checkpointToken)),
+    verifyManifest: (claims, token) =>
+      Equal.equals(token, checkpointToken)
+        ? Effect.void
+        : Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.CheckpointRejected({
+              documentId: claims.documentId,
+              reason: "Invalid deterministic checkpoint token"
+            })
+          })
+        ),
+    signTransition: () => Effect.succeed(Option.some(checkpointToken)),
+    verifyTransition: (claims, token) =>
+      Equal.equals(token, checkpointToken)
+        ? Effect.void
+        : Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.CheckpointRejected({
+              documentId: claims.documentId,
+              reason: "Invalid deterministic transition token"
+            })
+          })
+        )
+  }
+  const CheckpointLimits = { ...limits, maxSyncChangesPerMessage: 2 }
+  const checkpointSourceLayer = (
+    checkpointAuthority?: CheckpointAuthority.Implementation
+  ) => {
+    const services = SqlReplica.servicesLayerWithBindings(definition, {
+      projections: [],
+      ...(checkpointAuthority === undefined ? {} : { checkpointAuthority })
+    }).pipe(
+      Layer.provideMerge([
+        SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+        NodeCrypto.layer,
+        ReplicaLimits.layer(CheckpointLimits)
+      ])
+    )
+    return Layer.merge(services, PeerSync.layer.pipe(Layer.provide(services)))
+  }
+  const checkpointRelayLayer = (receiptLimits: PeerRelayReceiptLimits.Values) => {
+    const database = Layer.merge(
+      SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+      NodeCrypto.layer
+    )
+    const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(database))
+    const base = Layer.mergeAll(
+      database,
+      bootstrap,
+      CheckpointAuthority.layer(checkpointAuthority)
+    )
+    const limitsLayer = ReplicaLimits.layer(CheckpointLimits)
+    const gate = ReplicaGate.layer.pipe(Layer.provide(limitsLayer), Layer.provide(base))
+    const infrastructure = Layer.mergeAll(base, gate, limitsLayer)
+    const store = DocumentStore.layer.pipe(Layer.provide(infrastructure))
+    const projections = ProjectionStore.layer([]).pipe(Layer.provide(base))
+    const services = Layer.mergeAll(
+      infrastructure,
+      store,
+      projections,
+      PeerRelayReceiptLimits.layer(receiptLimits)
+    )
+    const peerSync = PeerSync.layerRelay.pipe(Layer.provide(services))
+    return Layer.merge(services, peerSync)
+  }
+
+  const generateColdCheckpoint = Effect.gen(function*() {
+    const store = yield* DocumentStore.DocumentStore
+    const sync = yield* PeerSync.PeerSync
+    const documentId = yield* Identity.makeDocumentId
+    let stored = yield* store.create(Task, documentId, { title: "write-0", labels: [] })
+    for (let index = 1; index <= 3; index++) {
+      const staged = yield* store.stage(stored, (draft) => {
+        draft.title = `write-${index}`
+      })
+      const next = yield* store.persist(Task, documentId, stored, staged)
+      InternalAutomerge.free(staged)
+      InternalAutomerge.free(stored.automerge)
+      stored = next
+    }
+    const session = yield* sync.open(yield* Identity.makePeerId)
+    const generated = yield* sync.generate(Task, documentId, session, {
+      lineageAware: true,
+      checkpointTransfer: true
+    })
+    assert.isNotNull(generated.outbound)
+    assert.deepStrictEqual(generated.outbound!.message, new Uint8Array())
+    assert.deepStrictEqual(generated.outbound!.writerProvenance, [])
+    assert.isDefined(generated.outbound!.checkpointTransfer)
+    yield* sync.markSent(session, generated.outbound!.sendSequence, generated.outbound!.messageHash)
+    const staged = yield* store.stage(stored, (draft) => {
+      draft.title = "after-checkpoint-send"
+    })
+    const advanced = yield* store.persist(Task, documentId, stored, staged)
+    const next = yield* sync.generate(Task, documentId, session, {
+      lineageAware: true,
+      checkpointTransfer: true
+    })
+    assert.isNotNull(next.outbound)
+    assert.isAbove(next.outbound!.message.byteLength, 0)
+    assert.isUndefined(next.outbound!.checkpointTransfer)
+    InternalAutomerge.free(advanced.automerge)
+    InternalAutomerge.free(staged)
+    InternalAutomerge.free(stored.automerge)
+    return { documentId, outbound: generated.outbound! }
+  })
+
+  it.effect("converges an oversized cold sync through a compact checkpoint and replays its receipt", () =>
+    Effect.gen(function*() {
+      const generated = yield* generateColdCheckpoint.pipe(
+        Effect.provide(checkpointSourceLayer(checkpointAuthority))
+      )
+      yield* Effect.gen(function*() {
+        const sync = yield* PeerSync.PeerSync
+        const store = yield* DocumentStore.DocumentStore
+        const sql = yield* SqlClient.SqlClient
+        const session = yield* sync.open(yield* Identity.makePeerId)
+        const input = {
+          remoteConnectionEpoch: "checkpoint-source",
+          receiveSequence: 0,
+          lineage: generated.outbound.lineage,
+          message: generated.outbound.message,
+          writerProvenance: generated.outbound.writerProvenance,
+          checkpointTransfer: generated.outbound.checkpointTransfer!
+        }
+        const received = yield* sync.receive(Task, generated.documentId, session, input)
+        const duplicate = yield* sync.receive(Task, generated.documentId, session, input)
+        const decodedTransfer = yield* PeerSyncEnvelope.decodeCheckpointTransfer(
+          generated.outbound.checkpointTransfer!,
+          CheckpointLimits.maxSyncMessageBytes
+        )
+        const replacement = yield* PeerSyncEnvelope.encodeCheckpointTransfer({
+          ...decodedTransfer,
+          manifest: {
+            ...decodedTransfer.manifest,
+            base: { _tag: "Heads", baseHeads: received.heads }
+          }
+        }, CheckpointLimits.maxSyncMessageBytes)
+        yield* sql`UPDATE effect_local_peer_receipts SET pending_message = ${new Uint8Array([1])}
+          WHERE document_id = ${generated.documentId}`
+        const rejected = yield* Effect.result(sync.receive(Task, generated.documentId, session, {
+          ...input,
+          receiveSequence: 1,
+          checkpointTransfer: replacement
+        }))
+        const loaded = yield* store.load(Task, generated.documentId)
+        const rows = yield* sql<{
+          readonly receipts: number
+          readonly writer_provenance: string
+        }>`SELECT writer_provenance,
+          (SELECT COUNT(*) FROM effect_local_peer_receipts
+            WHERE document_id = ${generated.documentId}) AS receipts
+          FROM effect_local_checkpoints WHERE document_id = ${generated.documentId}`
+
+        assert.isFalse(received.duplicate)
+        assert.isTrue(duplicate.duplicate)
+        assert.isTrue(Result.isFailure(rejected))
+        if (Result.isFailure(rejected)) {
+          assert.strictEqual(rejected.failure.reason._tag, "CheckpointRejected")
+        }
+        assert.strictEqual(loaded.snapshot.value.title, "write-3")
+        assert.strictEqual(rows[0]?.receipts, 1)
+        const provenance = Schema.decodeSync(WriterProvenance.StoredCheckpointProvenance)(
+          rows[0]!.writer_provenance
+        )
+        assert.isTrue(WriterProvenance.isCompactCheckpoint(provenance))
+        InternalAutomerge.free(loaded.automerge)
+      }).pipe(Effect.provide(checkpointSourceLayer(checkpointAuthority)))
+    }))
+
+  it.effect("keeps the legacy cold announcement when checkpoint transfer is not advertised", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const documentId = yield* Identity.makeDocumentId
+      let stored = yield* store.create(Task, documentId, { title: "write-0", labels: [] })
+      for (let index = 1; index <= 3; index++) {
+        const staged = yield* store.stage(stored, (draft) => {
+          draft.title = `write-${index}`
+        })
+        const next = yield* store.persist(Task, documentId, stored, staged)
+        InternalAutomerge.free(staged)
+        InternalAutomerge.free(stored.automerge)
+        stored = next
+      }
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const result = yield* sync.generate(Task, documentId, session, {
+        lineageAware: true
+      })
+      assert.isNotNull(result.outbound)
+      assert.isAbove(result.outbound!.message.byteLength, 0)
+      assert.isUndefined(result.outbound!.checkpointTransfer)
+      InternalAutomerge.free(stored.automerge)
+    }).pipe(Effect.provide(checkpointSourceLayer(checkpointAuthority))))
+
+  it.effect("falls back to the ordinary cold announcement when checkpoint signing is unavailable", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const documentId = yield* Identity.makeDocumentId
+      let stored = yield* store.create(Task, documentId, { title: "write-0", labels: [] })
+      for (let index = 1; index <= 3; index++) {
+        const staged = yield* store.stage(stored, (draft) => {
+          draft.title = `write-${index}`
+        })
+        const next = yield* store.persist(Task, documentId, stored, staged)
+        InternalAutomerge.free(staged)
+        InternalAutomerge.free(stored.automerge)
+        stored = next
+      }
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const result = yield* sync.generate(Task, documentId, session, {
+        lineageAware: true,
+        checkpointTransfer: true
+      })
+
+      assert.isNotNull(result.outbound)
+      assert.isAbove(result.outbound!.message.byteLength, 0)
+      assert.isUndefined(result.outbound!.checkpointTransfer)
+      InternalAutomerge.free(stored.automerge)
+    }).pipe(Effect.provide(checkpointSourceLayer())))
+
+  it.effect("rejects a checkpoint with invalid authorization without durable mutation", () =>
+    Effect.gen(function*() {
+      const generated = yield* generateColdCheckpoint.pipe(
+        Effect.provide(checkpointSourceLayer(checkpointAuthority))
+      )
+      const decoded = yield* PeerSyncEnvelope.decodeCheckpointTransfer(
+        generated.outbound.checkpointTransfer!,
+        CheckpointLimits.maxSyncMessageBytes
+      )
+      const hostile = yield* PeerSyncEnvelope.encodeCheckpointTransfer({
+        ...decoded,
+        manifest: { ...decoded.manifest, authorization: new Uint8Array([99]) }
+      }, CheckpointLimits.maxSyncMessageBytes)
+      yield* Effect.gen(function*() {
+        const sync = yield* PeerSync.PeerSync
+        const sql = yield* SqlClient.SqlClient
+        const session = yield* sync.open(yield* Identity.makePeerId)
+        const result = yield* Effect.result(sync.receive(Task, generated.documentId, session, {
+          remoteConnectionEpoch: "hostile-checkpoint",
+          receiveSequence: 0,
+          lineage: generated.outbound.lineage,
+          message: new Uint8Array(),
+          writerProvenance: [],
+          checkpointTransfer: hostile
+        }))
+        assert.isTrue(Result.isFailure(result))
+        if (Result.isFailure(result)) {
+          assert.strictEqual(result.failure.reason._tag, "CheckpointRejected")
+        }
+        const rows = yield* sql<{ readonly documents: number; readonly receipts: number }>`SELECT
+          (SELECT COUNT(*) FROM effect_local_documents) AS documents,
+          (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts`
+        assert.deepStrictEqual(rows, [{ documents: 0, receipts: 0 }])
+      }).pipe(Effect.provide(checkpointSourceLayer(checkpointAuthority)))
+    }))
+
+  it.effect("accepts and idempotently replays a relayed checkpoint receipt with usage", () =>
+    Effect.gen(function*() {
+      const generated = yield* generateColdCheckpoint.pipe(
+        Effect.provide(checkpointSourceLayer(checkpointAuthority))
+      )
+      yield* Effect.gen(function*() {
+        const sync = yield* PeerSync.PeerSync
+        const sql = yield* SqlClient.SqlClient
+        const senderPeerId = yield* Identity.makePeerId
+        const session = yield* sync.open(senderPeerId)
+        const messageHash = yield* Canonical.digest(new Uint8Array())
+        const relay: PeerSync.RelayReceipt = {
+          relayMessageId: yield* Identity.makeRelayMessageId,
+          relayPeerId: yield* Identity.makePeerId,
+          senderTenantId: "checkpoint-tenant",
+          senderSubjectId: "checkpoint-subject",
+          senderPeerId,
+          senderReplicaIncarnation: Identity.ReplicaIncarnation.make(7),
+          messageHash,
+          outerEnvelopeDigest: "a".repeat(64),
+          receiptExpiresAt: new Date(
+            (yield* Clock.currentTimeMillis) + PeerRelayReceiptLimits.defaults.receiptRetentionMillis
+          ).toISOString(),
+          encodedSize: generated.outbound.checkpointTransfer!.byteLength + 128
+        }
+        const input = {
+          remoteConnectionEpoch: "relay-checkpoint",
+          receiveSequence: 0,
+          lineage: generated.outbound.lineage,
+          message: new Uint8Array(),
+          writerProvenance: [] as const,
+          checkpointTransfer: generated.outbound.checkpointTransfer!,
+          relay
+        }
+        const received = yield* sync.receive(Task, generated.documentId, session, input)
+        const duplicate = yield* sync.receive(Task, generated.documentId, session, input)
+        const rows = yield* sql<{
+          readonly checkpoint_transfer: Uint8Array
+          readonly relay_outer_envelope_digest: string
+          readonly usage_bytes: number
+          readonly usage_count: number
+        }>`SELECT checkpoint_transfer, relay_outer_envelope_digest,
+          (SELECT encoded_bytes FROM effect_local_peer_relay_receipt_usage) AS usage_bytes,
+          (SELECT receipt_count FROM effect_local_peer_relay_receipt_usage) AS usage_count
+          FROM effect_local_peer_receipts WHERE relay_message_id = ${relay.relayMessageId}`
+
+        assert.isFalse(received.duplicate)
+        assert.isTrue(duplicate.duplicate)
+        assert.deepStrictEqual(rows[0]?.checkpoint_transfer, input.checkpointTransfer)
+        assert.strictEqual(rows[0]?.relay_outer_envelope_digest, relay.outerEnvelopeDigest)
+        assert.strictEqual(rows[0]?.usage_count, 1)
+        assert.isAbove(rows[0]?.usage_bytes ?? 0, relay.encodedSize)
+      }).pipe(Effect.provide(checkpointRelayLayer(PeerRelayReceiptLimits.defaults)))
+    }))
+
+  it.effect("rolls back a relayed checkpoint when retained receipt bytes exceed quota", () =>
+    Effect.gen(function*() {
+      const generated = yield* generateColdCheckpoint.pipe(
+        Effect.provide(checkpointSourceLayer(checkpointAuthority))
+      )
+      yield* Effect.gen(function*() {
+        const sync = yield* PeerSync.PeerSync
+        const sql = yield* SqlClient.SqlClient
+        const senderPeerId = yield* Identity.makePeerId
+        const session = yield* sync.open(senderPeerId)
+        const relay: PeerSync.RelayReceipt = {
+          relayMessageId: yield* Identity.makeRelayMessageId,
+          relayPeerId: yield* Identity.makePeerId,
+          senderTenantId: "quota-tenant",
+          senderSubjectId: "quota-subject",
+          senderPeerId,
+          senderReplicaIncarnation: Identity.ReplicaIncarnation.make(8),
+          messageHash: yield* Canonical.digest(new Uint8Array()),
+          outerEnvelopeDigest: "b".repeat(64),
+          receiptExpiresAt: new Date(
+            (yield* Clock.currentTimeMillis) + PeerRelayReceiptLimits.defaults.receiptRetentionMillis
+          ).toISOString(),
+          encodedSize: 1
+        }
+        const result = yield* Effect.result(sync.receive(Task, generated.documentId, session, {
+          remoteConnectionEpoch: "relay-checkpoint-quota",
+          receiveSequence: 0,
+          lineage: generated.outbound.lineage,
+          message: new Uint8Array(),
+          writerProvenance: [],
+          checkpointTransfer: generated.outbound.checkpointTransfer!,
+          relay
+        }))
+        const rows = yield* sql<{
+          readonly checkpoints: number
+          readonly commits: number
+          readonly documents: number
+          readonly receipts: number
+          readonly usage: number
+        }>`SELECT
+          (SELECT COUNT(*) FROM effect_local_documents) AS documents,
+          (SELECT COUNT(*) FROM effect_local_checkpoints) AS checkpoints,
+          (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts,
+          (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS usage,
+          (SELECT COUNT(*) FROM effect_local_commit_outbox) AS commits`
+
+        assert.isTrue(Result.isFailure(result))
+        if (Result.isFailure(result)) {
+          assert.strictEqual(result.failure.reason._tag, "QuotaExceeded")
+          if (result.failure.reason._tag === "QuotaExceeded") {
+            assert.strictEqual(result.failure.reason.resource, "relay receipt bytes per remote")
+          }
+        }
+        assert.deepStrictEqual(rows, [{
+          checkpoints: 0,
+          commits: 0,
+          documents: 0,
+          receipts: 0,
+          usage: 0
+        }])
+      }).pipe(Effect.provide(checkpointRelayLayer({
+        ...PeerRelayReceiptLimits.defaults,
+        maxEncodedBytesPerRemote: 1,
+        maxEncodedBytesPerReplica: 1
+      })))
+    }))
+
+  it.effect("rejects an in-flight checkpoint install after its session resets", () =>
+    Effect.gen(function*() {
+      const generated = yield* generateColdCheckpoint.pipe(
+        Effect.provide(checkpointSourceLayer(checkpointAuthority))
+      )
+      const verificationStarted = yield* Deferred.make<void>()
+      const releaseVerification = yield* Deferred.make<void>()
+      const blockingAuthority: CheckpointAuthority.Implementation = {
+        ...checkpointAuthority,
+        verifyManifest: (claims, token) =>
+          Deferred.succeed(verificationStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseVerification)),
+            Effect.andThen(checkpointAuthority.verifyManifest(claims, token))
+          )
+      }
+      yield* Effect.gen(function*() {
+        const sync = yield* PeerSync.PeerSync
+        const sql = yield* SqlClient.SqlClient
+        const session = yield* sync.open(yield* Identity.makePeerId)
+        const input = {
+          remoteConnectionEpoch: "checkpoint-reset",
+          receiveSequence: 0,
+          lineage: generated.outbound.lineage,
+          message: new Uint8Array(),
+          writerProvenance: [] as const,
+          checkpointTransfer: generated.outbound.checkpointTransfer!
+        }
+        const installing = yield* Effect.exit(
+          sync.receive(Task, generated.documentId, session, input)
+        ).pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Deferred.await(verificationStarted)
+        yield* sync.reset(session)
+        yield* Deferred.succeed(releaseVerification, undefined)
+        const exit = yield* Fiber.join(installing)
+        const rows = yield* sql<{
+          readonly documents: number
+          readonly receipts: number
+        }>`SELECT
+          (SELECT COUNT(*) FROM effect_local_documents) AS documents,
+          (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts`
+
+        assert.strictEqual(exit._tag, "Failure")
+        assert.deepStrictEqual(rows, [{ documents: 0, receipts: 0 }])
+      }).pipe(
+        Effect.provide(checkpointSourceLayer(blockingAuthority)),
+        Effect.ensuring(Deferred.succeed(releaseVerification, undefined))
+      )
+    }))
+
+  it.effect("installs a same-lineage bootstrap checkpoint over an existing contained prefix", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const documentId = yield* Identity.makeDocumentId
+      const local = yield* store.create(Task, documentId, { title: "prefix", labels: [] })
+      const current = Automerge.change(
+        Automerge.clone(local.automerge, { actor: "3".repeat(32) }),
+        (draft) => {
+          ;(draft.value as { title: string }).title = "same-lineage-current"
+        }
+      )
+      const snapshot = InternalAutomerge.save(current)
+      const heads = InternalAutomerge.heads(current)
+      const checkpointHash = yield* Canonical.digest({ documentId, bytes: snapshot })
+      const transfer = yield* PeerSyncEnvelope.encodeCheckpointTransfer({
+        snapshot,
+        manifest: {
+          purpose: CheckpointAuthority.manifestPurpose,
+          documentId,
+          lineage: Identity.genesisLineage,
+          checkpointHash,
+          heads,
+          base: { _tag: "Bootstrap" },
+          schemaVersion: Task.version,
+          writerDefinitionHash: definition.hash,
+          authorization: checkpointToken
+        },
+        transitions: []
+      }, CheckpointLimits.maxSyncMessageBytes)
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      yield* sync.receive(Task, documentId, session, {
+        remoteConnectionEpoch: "same-lineage-bootstrap",
+        receiveSequence: 0,
+        lineage: Identity.genesisLineage,
+        message: new Uint8Array(),
+        writerProvenance: [],
+        checkpointTransfer: transfer
+      })
+      const loaded = yield* store.load(Task, documentId)
+      assert.strictEqual(loaded.snapshot.value.title, "same-lineage-current")
+      assert.deepStrictEqual(loaded.materializedHeads, heads)
+      const staged = yield* store.stage(loaded, (draft) => {
+        draft.title = "after-checkpoint-receive"
+      })
+      const advanced = yield* store.persist(Task, documentId, loaded, staged)
+      const outbound = yield* sync.generate(Task, documentId, session, {
+        lineageAware: true,
+        checkpointTransfer: true
+      })
+      assert.isNotNull(outbound.outbound)
+      assert.isAbove(outbound.outbound!.message.byteLength, 0)
+      assert.isUndefined(outbound.outbound!.checkpointTransfer)
+      InternalAutomerge.free(advanced.automerge)
+      InternalAutomerge.free(staged)
+      InternalAutomerge.free(loaded.automerge)
+      InternalAutomerge.free(current)
+      InternalAutomerge.free(local.automerge)
+    }).pipe(Effect.provide(checkpointSourceLayer(checkpointAuthority))))
+
+  it.effect("syncs ordinary edits in both directions after installing a compact checkpoint", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const senderContext = yield* Layer.build(checkpointSourceLayer(checkpointAuthority))
+      const recipientContext = yield* Layer.build(checkpointSourceLayer(checkpointAuthority))
+      const sender = {
+        store: Context.get(senderContext, DocumentStore.DocumentStore),
+        sync: Context.get(senderContext, PeerSync.PeerSync),
+        session: undefined as unknown as PeerSync.Session
+      }
+      const recipient = {
+        store: Context.get(recipientContext, DocumentStore.DocumentStore),
+        sync: Context.get(recipientContext, PeerSync.PeerSync),
+        session: undefined as unknown as PeerSync.Session
+      }
+      sender.session = yield* sender.sync.open(yield* Identity.makePeerId)
+      recipient.session = yield* recipient.sync.open(yield* Identity.makePeerId)
+
+      const documentId = yield* Identity.makeDocumentId
+      let stored = yield* sender.store.create(Task, documentId, { title: "write-0", labels: [] })
+      for (let index = 1; index <= 3; index++) {
+        const staged = yield* sender.store.stage(stored, (draft) => {
+          draft.title = `write-${index}`
+        })
+        const next = yield* sender.store.persist(Task, documentId, stored, staged)
+        InternalAutomerge.free(staged)
+        InternalAutomerge.free(stored.automerge)
+        stored = next
+      }
+      InternalAutomerge.free(stored.automerge)
+
+      type Side = typeof sender
+      type Packet = { readonly from: Side; readonly outbound: PeerSync.Outbound; readonly to: Side }
+      const pending: Array<Packet> = []
+      const enqueueGenerated = Effect.fnUntraced(function*(from: Side, to: Side) {
+        const generated = yield* from.sync.generate(Task, documentId, from.session, {
+          lineageAware: true,
+          checkpointTransfer: true
+        })
+        if (generated.outbound !== null) pending.push({ from, outbound: generated.outbound, to })
+        return generated
+      })
+      const drain = Effect.fnUntraced(function*() {
+        for (let round = 0; round < 32; round++) {
+          while (pending.length > 0) {
+            const packet = pending.shift()!
+            const received = yield* packet.to.sync.receive(Task, documentId, packet.to.session, {
+              remoteConnectionEpoch: packet.from.session.connectionEpoch,
+              receiveSequence: packet.outbound.sendSequence,
+              lineage: packet.outbound.lineage,
+              message: packet.outbound.message,
+              writerProvenance: packet.outbound.writerProvenance,
+              ...(packet.outbound.checkpointTransfer === undefined
+                ? {}
+                : { checkpointTransfer: packet.outbound.checkpointTransfer })
+            })
+            yield* packet.from.sync.markSent(
+              packet.from.session,
+              packet.outbound.sendSequence,
+              packet.outbound.messageHash
+            )
+            if (received.reply !== null) {
+              pending.push({
+                from: packet.to,
+                outbound: yield* packet.to.sync.enqueue(packet.to.session, received.reply),
+                to: packet.from
+              })
+            }
+          }
+          const [fromSender, fromRecipient] = yield* Effect.all([
+            enqueueGenerated(sender, recipient),
+            enqueueGenerated(recipient, sender)
+          ])
+          if (
+            pending.length === 0 && fromSender.outbound === null && fromRecipient.outbound === null &&
+            !fromSender.dirty && !fromRecipient.dirty
+          ) return
+        }
+        return yield* Effect.die("post-checkpoint peer sync did not reach quiescence")
+      })
+
+      const checkpoint = yield* enqueueGenerated(sender, recipient)
+      assert.isNotNull(checkpoint.outbound)
+      assert.isDefined(checkpoint.outbound!.checkpointTransfer)
+      yield* drain()
+
+      const recipientStored = yield* recipient.store.load(Task, documentId)
+      const recipientStaged = yield* recipient.store.stage(recipientStored, (draft) => {
+        draft.title = "recipient-edit"
+      })
+      const recipientAdvanced = yield* recipient.store.persist(
+        Task,
+        documentId,
+        recipientStored,
+        recipientStaged
+      )
+      InternalAutomerge.free(recipientAdvanced.automerge)
+      InternalAutomerge.free(recipientStaged)
+      InternalAutomerge.free(recipientStored.automerge)
+      yield* drain()
+
+      const senderStored = yield* sender.store.load(Task, documentId)
+      assert.strictEqual(senderStored.snapshot.value.title, "recipient-edit")
+      const senderStaged = yield* sender.store.stage(senderStored, (draft) => {
+        draft.title = "sender-edit"
+      })
+      const senderAdvanced = yield* sender.store.persist(Task, documentId, senderStored, senderStaged)
+      InternalAutomerge.free(senderAdvanced.automerge)
+      InternalAutomerge.free(senderStaged)
+      InternalAutomerge.free(senderStored.automerge)
+      yield* drain()
+
+      const converged = yield* recipient.store.load(Task, documentId)
+      assert.strictEqual(converged.snapshot.value.title, "sender-edit")
+      InternalAutomerge.free(converged.automerge)
+    })).pipe(Effect.provide(NodeCrypto.layer)))
+
+  it.effect("rejects generation when the retained lineage chain exceeds the wire bound", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      let stored = yield* store.create(Task, documentId, { title: "write-0", labels: [] })
+      for (let index = 1; index <= 3; index++) {
+        const staged = yield* store.stage(stored, (draft) => {
+          draft.title = `write-${index}`
+        })
+        const next = yield* store.persist(Task, documentId, stored, staged)
+        InternalAutomerge.free(staged)
+        InternalAutomerge.free(stored.automerge)
+        stored = next
+      }
+      const snapshot = InternalAutomerge.save(stored.automerge)
+      const heads = stored.materializedHeads
+      const checkpointHash = yield* Canonical.digest({ documentId, bytes: snapshot })
+      const lineages = Array.from({ length: PeerSyncEnvelope.maximumCheckpointTransitions + 1 }, (_, index) =>
+        Identity.DocumentLineage.make(
+          `lin_${(index + 1).toString(16).padStart(8, "0")}-0000-4000-8000-${
+            (index + 1).toString(16).padStart(12, "0")
+          }`
+        ))
+      for (const [index, lineage] of lineages.entries()) {
+        yield* sql`INSERT INTO effect_local_lineage_transitions (
+          document_id, prior_lineage, prior_checkpoint_hash, prior_heads, prior_snapshot,
+          lineage, checkpoint_hash, heads, schema_version, writer_definition_hash,
+          authorization, created_at
+        ) VALUES (
+          ${documentId}, ${index === 0 ? Identity.genesisLineage : lineages[index - 1]!},
+          ${checkpointHash}, ${Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)))(heads)},
+          ${snapshot}, ${lineage}, ${checkpointHash},
+          ${Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)))(heads)},
+          ${Task.version}, ${definition.hash}, ${checkpointToken}, ${new Date(0).toISOString()}
+        )`
+      }
+      yield* sql`UPDATE effect_local_documents SET lineage = ${lineages.at(-1)!}
+        WHERE document_id = ${documentId}`
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const result = yield* Effect.result(sync.generate(Task, documentId, session, {
+        lineageAware: true,
+        checkpointTransfer: true
+      }))
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure.reason._tag, "QuotaExceeded")
+      }
+      InternalAutomerge.free(stored.automerge)
+    }).pipe(Effect.provide(checkpointSourceLayer(checkpointAuthority))))
+
+  const firstRewrittenLineage = Identity.DocumentLineage.make(
+    "lin_aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  )
+  const secondRewrittenLineage = Identity.DocumentLineage.make(
+    "lin_bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+  )
+
+  it.effect("installs a signed rewrite when the receiver is a strict prefix of the transition snapshot", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const documentId = yield* Identity.makeDocumentId
+      const local = yield* store.create(Task, documentId, { title: "local-prefix", labels: [] })
+      const prior = Automerge.change(
+        Automerge.clone(local.automerge, { actor: "a".repeat(32) }),
+        (draft) => {
+          ;(draft.value as { title: string }).title = "before-rewrite"
+        }
+      )
+      const priorSnapshot = InternalAutomerge.save(prior)
+      const priorHeads = InternalAutomerge.heads(prior)
+      const priorCheckpointHash = yield* Canonical.digest({ documentId, bytes: priorSnapshot })
+      const anchor = InternalAutomerge.reroot(
+        InternalAutomerge.value(prior),
+        false,
+        "b".repeat(32)
+      )
+      const anchorSnapshot = InternalAutomerge.save(anchor)
+      const anchorHeads = InternalAutomerge.heads(anchor)
+      const anchorCheckpointHash = yield* Canonical.digest({ documentId, bytes: anchorSnapshot })
+      const current = Automerge.change(
+        Automerge.clone(anchor, { actor: "c".repeat(32) }),
+        (draft) => {
+          ;(draft.value as { title: string }).title = "after-rewrite-mutation"
+        }
+      )
+      const snapshot = InternalAutomerge.save(current)
+      const heads = InternalAutomerge.heads(current)
+      const checkpointHash = yield* Canonical.digest({ documentId, bytes: snapshot })
+      assert.notStrictEqual(checkpointHash, anchorCheckpointHash)
+      const transfer = yield* PeerSyncEnvelope.encodeCheckpointTransfer({
+        snapshot,
+        manifest: {
+          purpose: CheckpointAuthority.manifestPurpose,
+          documentId,
+          lineage: firstRewrittenLineage,
+          checkpointHash,
+          heads,
+          base: { _tag: "Heads", baseHeads: local.materializedHeads },
+          schemaVersion: Task.version,
+          writerDefinitionHash: definition.hash,
+          authorization: checkpointToken
+        },
+        transitions: [{
+          purpose: CheckpointAuthority.transitionPurpose,
+          documentId,
+          priorLineage: Identity.genesisLineage,
+          priorCheckpointHash,
+          priorHeads,
+          priorSnapshot,
+          resultingLineage: firstRewrittenLineage,
+          anchorCheckpointHash,
+          resultingHeads: anchorHeads,
+          schemaVersion: Task.version,
+          writerDefinitionHash: definition.hash,
+          authorization: checkpointToken
+        }]
+      }, CheckpointLimits.maxSyncMessageBytes)
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const received = yield* sync.receive(Task, documentId, session, {
+        remoteConnectionEpoch: "prefix-transition",
+        receiveSequence: 0,
+        lineage: firstRewrittenLineage,
+        message: new Uint8Array(),
+        writerProvenance: [],
+        checkpointTransfer: transfer
+      })
+      const loaded = yield* store.load(Task, documentId)
+
+      assert.deepStrictEqual(received.heads, heads)
+      assert.strictEqual(loaded.snapshot.value.title, "after-rewrite-mutation")
+      assert.deepStrictEqual(loaded.materializedHeads, heads)
+
+      InternalAutomerge.free(loaded.automerge)
+      InternalAutomerge.free(current)
+      InternalAutomerge.free(anchor)
+      InternalAutomerge.free(prior)
+      InternalAutomerge.free(local.automerge)
+    }).pipe(Effect.provide(checkpointSourceLayer(checkpointAuthority))))
+
+  it.effect("rejects signed hops with mismatched intermediate heads without durable mutation", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const local = yield* store.create(Task, documentId, { title: "local-prefix", labels: [] })
+      const firstPrior = Automerge.change(
+        Automerge.clone(local.automerge, { actor: "d".repeat(32) }),
+        (draft) => {
+          ;(draft.value as { title: string }).title = "first-prior"
+        }
+      )
+      const firstPriorSnapshot = InternalAutomerge.save(firstPrior)
+      const firstPriorHeads = InternalAutomerge.heads(firstPrior)
+      const firstPriorHash = yield* Canonical.digest({ documentId, bytes: firstPriorSnapshot })
+      const firstAnchor = InternalAutomerge.reroot(
+        InternalAutomerge.value(firstPrior),
+        false,
+        "e".repeat(32)
+      )
+      const firstAnchorSnapshot = InternalAutomerge.save(firstAnchor)
+      const firstAnchorHeads = InternalAutomerge.heads(firstAnchor)
+      const firstAnchorHash = yield* Canonical.digest({ documentId, bytes: firstAnchorSnapshot })
+      const mismatchedPrior = InternalAutomerge.reroot(
+        { title: "mismatched-intermediate", labels: [] },
+        false,
+        "f".repeat(32)
+      )
+      const mismatchedPriorSnapshot = InternalAutomerge.save(mismatchedPrior)
+      const mismatchedPriorHeads = InternalAutomerge.heads(mismatchedPrior)
+      const mismatchedPriorHash = yield* Canonical.digest({ documentId, bytes: mismatchedPriorSnapshot })
+      assert.isFalse(sameHeadsForTest(firstAnchorHeads, mismatchedPriorHeads))
+      const secondAnchor = InternalAutomerge.reroot(
+        InternalAutomerge.value(mismatchedPrior),
+        false,
+        "1".repeat(32)
+      )
+      const secondAnchorSnapshot = InternalAutomerge.save(secondAnchor)
+      const secondAnchorHeads = InternalAutomerge.heads(secondAnchor)
+      const secondAnchorHash = yield* Canonical.digest({ documentId, bytes: secondAnchorSnapshot })
+      const current = Automerge.change(
+        Automerge.clone(secondAnchor, { actor: "2".repeat(32) }),
+        (draft) => {
+          ;(draft.value as { title: string }).title = "post-rewrite-mutation"
+        }
+      )
+      const snapshot = InternalAutomerge.save(current)
+      const heads = InternalAutomerge.heads(current)
+      const checkpointHash = yield* Canonical.digest({ documentId, bytes: snapshot })
+      assert.notStrictEqual(checkpointHash, secondAnchorHash)
+      const before = yield* sql<{
+        readonly checkpoints: number
+        readonly documents: string
+        readonly receipts: number
+        readonly transitions: number
+      }>`SELECT
+        (SELECT COUNT(*) FROM effect_local_checkpoints) AS checkpoints,
+        (SELECT group_concat(materialized_heads || '|' || lineage) FROM effect_local_documents) AS documents,
+        (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts,
+        (SELECT COUNT(*) FROM effect_local_lineage_transitions) AS transitions`
+      const transfer = yield* PeerSyncEnvelope.encodeCheckpointTransfer({
+        snapshot,
+        manifest: {
+          purpose: CheckpointAuthority.manifestPurpose,
+          documentId,
+          lineage: secondRewrittenLineage,
+          checkpointHash,
+          heads,
+          base: { _tag: "Heads", baseHeads: local.materializedHeads },
+          schemaVersion: Task.version,
+          writerDefinitionHash: definition.hash,
+          authorization: checkpointToken
+        },
+        transitions: [{
+          purpose: CheckpointAuthority.transitionPurpose,
+          documentId,
+          priorLineage: Identity.genesisLineage,
+          priorCheckpointHash: firstPriorHash,
+          priorHeads: firstPriorHeads,
+          priorSnapshot: firstPriorSnapshot,
+          resultingLineage: firstRewrittenLineage,
+          anchorCheckpointHash: firstAnchorHash,
+          resultingHeads: firstAnchorHeads,
+          schemaVersion: Task.version,
+          writerDefinitionHash: definition.hash,
+          authorization: checkpointToken
+        }, {
+          purpose: CheckpointAuthority.transitionPurpose,
+          documentId,
+          priorLineage: firstRewrittenLineage,
+          priorCheckpointHash: mismatchedPriorHash,
+          priorHeads: mismatchedPriorHeads,
+          priorSnapshot: mismatchedPriorSnapshot,
+          resultingLineage: secondRewrittenLineage,
+          anchorCheckpointHash: secondAnchorHash,
+          resultingHeads: secondAnchorHeads,
+          schemaVersion: Task.version,
+          writerDefinitionHash: definition.hash,
+          authorization: checkpointToken
+        }]
+      }, CheckpointLimits.maxSyncMessageBytes)
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      const result = yield* Effect.result(sync.receive(Task, documentId, session, {
+        remoteConnectionEpoch: "mismatched-transition",
+        receiveSequence: 0,
+        lineage: secondRewrittenLineage,
+        message: new Uint8Array(),
+        writerProvenance: [],
+        checkpointTransfer: transfer
+      }))
+      const after = yield* sql<{
+        readonly checkpoints: number
+        readonly documents: string
+        readonly receipts: number
+        readonly transitions: number
+      }>`SELECT
+        (SELECT COUNT(*) FROM effect_local_checkpoints) AS checkpoints,
+        (SELECT group_concat(materialized_heads || '|' || lineage) FROM effect_local_documents) AS documents,
+        (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts,
+        (SELECT COUNT(*) FROM effect_local_lineage_transitions) AS transitions`
+
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure.reason._tag, "CheckpointRejected")
+      }
+      assert.deepStrictEqual(after, before)
+
+      InternalAutomerge.free(current)
+      InternalAutomerge.free(secondAnchor)
+      InternalAutomerge.free(mismatchedPrior)
+      InternalAutomerge.free(firstAnchor)
+      InternalAutomerge.free(firstPrior)
+      InternalAutomerge.free(local.automerge)
+    }).pipe(Effect.provide(checkpointSourceLayer(checkpointAuthority))))
 })
 
 const sameHeadsForTest = (left: ReadonlyArray<string>, right: ReadonlyArray<string>) =>

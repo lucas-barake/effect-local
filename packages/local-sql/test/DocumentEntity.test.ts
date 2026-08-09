@@ -208,7 +208,7 @@ describe("DocumentEntity", () => {
     const key = keyOf(DocumentEntity.ApplySync.payloadSchema.make(base))
     assert.strictEqual(
       key,
-      JSON.stringify([1, peerId, "connection", 2, "hash-a", base.writerProvenance, ""])
+      JSON.stringify([1, peerId, "connection", 2, "hash-a", base.writerProvenance, "", null])
     )
     assert.notStrictEqual(
       key,
@@ -236,6 +236,13 @@ describe("DocumentEntity", () => {
       keyOf(DocumentEntity.ApplySync.payloadSchema.make({
         ...base,
         writerProvenance: [{ ...base.writerProvenance[0]!, writerSchemaVersion: Task.version + 1 }]
+      }))
+    )
+    assert.notStrictEqual(
+      key,
+      keyOf(DocumentEntity.ApplySync.payloadSchema.make({
+        ...base,
+        checkpointTransfer: Uint8Array.of(1, 2, 3)
       }))
     )
     assert.notStrictEqual(

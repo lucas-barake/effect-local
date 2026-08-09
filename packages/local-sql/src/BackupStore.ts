@@ -19,6 +19,7 @@ import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as CheckpointAuthority from "./CheckpointAuthority.js"
 import * as InternalAutomerge from "./internal/automerge.js"
 import * as ClusterStorage from "./internal/clusterStorage.js"
 import * as HistoryCounters from "./internal/historyCounters.js"
@@ -71,16 +72,57 @@ const ChangeRecord = Schema.Struct({
   commit_sequence: Schema.Int
 })
 
+const BoundedCompactCheckpointProvenance = Schema.Struct({
+  ...WriterProvenance.CompactCheckpointProvenance.fields,
+  authorization: CheckpointAuthority.AuthorizationToken
+})
+const CheckpointProvenance = Schema.Union([
+  WriterProvenance.ChangeProvenances,
+  BoundedCompactCheckpointProvenance
+])
+const StoredCheckpointProvenance = Schema.fromJsonString(Schema.toCodecJson(CheckpointProvenance))
+const EncodedCompactCheckpointProvenance = Schema.Struct({
+  ...WriterProvenance.CompactCheckpointProvenance.fields,
+  heads: Schema.Array(Schema.String),
+  base: Schema.Union([
+    Schema.TaggedStruct("Bootstrap", {}),
+    Schema.TaggedStruct("Heads", { baseHeads: Schema.Array(Schema.String) })
+  ]),
+  authorization: Schema.String
+})
+const EncodedCheckpointProvenance = Schema.Union([
+  WriterProvenance.ChangeProvenances,
+  EncodedCompactCheckpointProvenance
+])
+const isEncodedCompactCheckpoint = (
+  provenance: typeof EncodedCheckpointProvenance.Type
+): provenance is typeof EncodedCompactCheckpointProvenance.Type => !Array.isArray(provenance)
+
 const CheckpointRecord = Schema.Struct({
   checkpoint_hash: Schema.String,
-  document_id: Schema.String,
+  document_id: Identity.DocumentId,
   heads: Schema.String,
   bytes: Schema.String,
   checksum: Schema.String,
   commit_sequence: Schema.Int,
   verified: Schema.Int,
-  writer_provenance: Schema.optionalKey(WriterProvenance.ChangeProvenances),
+  writer_provenance: Schema.optionalKey(EncodedCheckpointProvenance),
   lineage: Identity.DocumentLineage
+})
+
+const TransitionRecord = Schema.Struct({
+  authorization: Schema.NullOr(Schema.String),
+  checkpoint_hash: WriterProvenance.ChangeHash,
+  created_at: Schema.String,
+  document_id: Identity.DocumentId,
+  heads: Schema.String,
+  lineage: Identity.DocumentLineage,
+  prior_checkpoint_hash: WriterProvenance.ChangeHash,
+  prior_heads: Schema.String,
+  prior_lineage: Identity.DocumentLineage,
+  prior_snapshot: Schema.String,
+  schema_version: WriterProvenance.WriterSchemaVersion,
+  writer_definition_hash: WriterProvenance.WriterDefinitionHash
 })
 
 const ReceiptRecord = Schema.Struct({
@@ -98,20 +140,25 @@ const StoredChangeRecord = Schema.Struct({ ...ChangeRecord.fields, bytes: Schema
 const StoredCheckpointRecord = Schema.Struct({
   ...CheckpointRecord.fields,
   bytes: Schema.Uint8Array,
-  writer_provenance: WriterProvenance.StoredChangeProvenances,
+  writer_provenance: StoredCheckpointProvenance,
   lineage: Identity.DocumentLineage
 })
 const DecodedCheckpointRecord = Schema.Struct({
   ...CheckpointRecord.fields,
   bytes: Schema.Uint8Array,
-  writer_provenance: WriterProvenance.ChangeProvenances,
+  writer_provenance: CheckpointProvenance,
   lineage: Identity.DocumentLineage
+})
+const StoredTransitionRecord = Schema.Struct({
+  ...TransitionRecord.fields,
+  authorization: Schema.NullOr(CheckpointAuthority.AuthorizationToken),
+  prior_snapshot: Schema.Uint8Array
 })
 const StoredReceiptRecord = Schema.Struct({ ...ReceiptRecord.fields, result: Schema.Uint8Array })
 
 const EndRecord = Schema.Struct({ recordCount: Schema.Int, recordsChecksum: Schema.String })
 const Envelope = Schema.Struct({ kind: Schema.String, checksum: Schema.String, value: Schema.Unknown })
-const Heads = Schema.fromJsonString(Schema.Array(Schema.String))
+const Heads = Schema.fromJsonString(Conflict.Heads)
 const ObservedVersions = Schema.fromJsonString(Schema.Array(Schema.Int))
 const BackupSizingRow = Schema.Struct({ raw_bytes: Schema.Int, record_count: Schema.Int })
 const SqliteTableRow = Schema.Struct({ name: Schema.String })
@@ -132,9 +179,10 @@ type RawDecodedRecord =
   | {
     readonly kind: "Checkpoint"
     readonly value: Omit<typeof DecodedCheckpointRecord.Type, "writer_provenance"> & {
-      readonly writer_provenance?: ReadonlyArray<WriterProvenance.ChangeProvenance>
+      readonly writer_provenance?: typeof CheckpointProvenance.Type
     }
   }
+  | { readonly kind: "Transition"; readonly value: typeof StoredTransitionRecord.Type }
   | { readonly kind: "Receipt"; readonly value: typeof StoredReceiptRecord.Type }
 
 type DecodedRecord =
@@ -194,6 +242,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
   | ReplicaGate.ReplicaGate
   | ReplicaHealth.ReplicaHealth
   | ReplicaLimits.ReplicaLimits
+  | CheckpointAuthority.CheckpointAuthority
   | Crypto.Crypto
   | SqlClient.SqlClient
 > =>
@@ -207,6 +256,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       const projections = yield* ProjectionStore.ProjectionStore
       const sql = yield* SqlClient.SqlClient
       const crypto = yield* Crypto.Crypto
+      const checkpointAuthority = yield* CheckpointAuthority.CheckpointAuthority
       const findDocuments = SqlSchema.findAll({
         Request: Schema.Void,
         Result: DocumentRecord,
@@ -222,6 +272,11 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         Result: StoredCheckpointRecord,
         execute: () => sql`SELECT * FROM effect_local_checkpoints ORDER BY document_id, commit_sequence`
       })
+      const findTransitions = SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: StoredTransitionRecord,
+        execute: () => sql`SELECT * FROM effect_local_lineage_transitions ORDER BY document_id, created_at, lineage`
+      })
       const findReceipts = SqlSchema.findAll({
         Request: Schema.Void,
         Result: StoredReceiptRecord,
@@ -235,6 +290,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             (SELECT COUNT(*) FROM effect_local_documents) +
             (SELECT COUNT(*) FROM effect_local_changes) +
             (SELECT COUNT(*) FROM effect_local_checkpoints) +
+            (SELECT COUNT(*) FROM effect_local_lineage_transitions) +
             (SELECT COUNT(*) FROM effect_local_command_receipts) AS record_count,
             (SELECT COALESCE(SUM(
               length(document_id) + length(document_type) + length(observed_versions) +
@@ -253,6 +309,12 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               length(checkpoint_hash) + length(document_id) + length(heads) + length(bytes) + length(checksum) +
               length(writer_provenance) + length(lineage)
             ), 0) FROM effect_local_checkpoints) +
+            (SELECT COALESCE(SUM(
+              length(document_id) + length(prior_lineage) + length(prior_checkpoint_hash) +
+              length(prior_heads) + length(prior_snapshot) + length(lineage) + length(checkpoint_hash) +
+              length(heads) + length(writer_definition_hash) + length(COALESCE(authorization, '')) +
+              length(created_at)
+            ), 0) FROM effect_local_lineage_transitions) +
             (SELECT COALESCE(SUM(
               length(command_id) + length(request_hash) + length(mutation_name) + length(result) +
               length(document_id) + length(heads)
@@ -347,9 +409,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               const documents = yield* findDocuments(undefined)
               const changes = yield* findChanges(undefined)
               const checkpoints = yield* findCheckpoints(undefined)
+              const transitions = yield* findTransitions(undefined)
               const receipts = yield* findReceipts(undefined)
               yield* gate.validate(identity)
-              return { documents, changes, checkpoints, receipts }
+              return { documents, changes, checkpoints, transitions, receipts }
             }))
             const records = yield* Effect.forEach([
               ...snapshot.documents.map((value) => ["Document", value] as const),
@@ -357,7 +420,23 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 ["Change", { ...row, bytes: Encoding.encodeBase64(row.bytes) }] as const
               ),
               ...snapshot.checkpoints.map((row) =>
-                ["Checkpoint", { ...row, bytes: Encoding.encodeBase64(row.bytes) }] as const
+                ["Checkpoint", {
+                  ...row,
+                  bytes: Encoding.encodeBase64(row.bytes),
+                  writer_provenance: WriterProvenance.isCompactCheckpoint(row.writer_provenance)
+                    ? {
+                      ...row.writer_provenance,
+                      authorization: Encoding.encodeBase64(row.writer_provenance.authorization)
+                    }
+                    : row.writer_provenance
+                }] as const
+              ),
+              ...snapshot.transitions.map((row) =>
+                ["Transition", {
+                  ...row,
+                  authorization: row.authorization === null ? null : Encoding.encodeBase64(row.authorization),
+                  prior_snapshot: Encoding.encodeBase64(row.prior_snapshot)
+                }] as const
               ),
               ...snapshot.receipts.map((row) =>
                 ["Receipt", { ...row, result: Encoding.encodeBase64(row.result) }] as const
@@ -602,7 +681,62 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 case "Checkpoint": {
                   const encoded = yield* Schema.decodeUnknownEffect(CheckpointRecord)(record.value)
                   const bytes = yield* decodeBytes(encoded.bytes)
-                  decoded.push({ kind: "Checkpoint", value: { ...encoded, bytes } })
+                  let writerProvenance: typeof CheckpointProvenance.Type | undefined
+                  if (encoded.writer_provenance !== undefined) {
+                    if (isEncodedCompactCheckpoint(encoded.writer_provenance)) {
+                      const authorization = yield* decodeBytes(encoded.writer_provenance.authorization)
+                      writerProvenance = yield* Schema.decodeUnknownEffect(BoundedCompactCheckpointProvenance)({
+                        ...encoded.writer_provenance,
+                        authorization
+                      })
+                      const canonicalHeads = Conflict.normalizeHeads(encoded.writer_provenance.heads)
+                      const canonicalBaseHeads = encoded.writer_provenance.base._tag === "Heads"
+                        ? Conflict.normalizeHeads(encoded.writer_provenance.base.baseHeads)
+                        : undefined
+                      if (
+                        encoded.writer_provenance.heads.length !== canonicalHeads.length ||
+                        encoded.writer_provenance.heads.some((head, index) => head !== canonicalHeads[index]) ||
+                        (
+                          encoded.writer_provenance.base._tag === "Heads" &&
+                          (
+                            encoded.writer_provenance.base.baseHeads.length !== canonicalBaseHeads!.length ||
+                            encoded.writer_provenance.base.baseHeads.some(
+                              (head, index) => head !== canonicalBaseHeads![index]
+                            )
+                          )
+                        )
+                      ) {
+                        return yield* new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.BackupInvalid({
+                            cause: new Error(`Compact checkpoint heads are not canonical: ${encoded.checkpoint_hash}`)
+                          })
+                        })
+                      }
+                    } else {
+                      writerProvenance = encoded.writer_provenance
+                    }
+                  }
+                  const { writer_provenance: _writerProvenance, ...checkpoint } = encoded
+                  decoded.push({
+                    kind: "Checkpoint",
+                    value: writerProvenance === undefined
+                      ? { ...checkpoint, bytes }
+                      : { ...checkpoint, bytes, writer_provenance: writerProvenance }
+                  })
+                  break
+                }
+                case "Transition": {
+                  const encoded = yield* Schema.decodeUnknownEffect(TransitionRecord)(record.value)
+                  const priorSnapshot = yield* decodeBytes(encoded.prior_snapshot)
+                  const authorization = encoded.authorization === null
+                    ? null
+                    : yield* decodeBytes(encoded.authorization).pipe(
+                      Effect.flatMap(Schema.decodeUnknownEffect(CheckpointAuthority.AuthorizationToken))
+                    )
+                  decoded.push({
+                    kind: "Transition",
+                    value: { ...encoded, authorization, prior_snapshot: priorSnapshot }
+                  })
                   break
                 }
                 case "Receipt": {
@@ -639,6 +773,8 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           const changeHashes = new Set<string>()
           const changeActors = new Set<string>()
           const checkpointHashes = new Set<string>()
+          const transitionLineages = new Set<string>()
+          const transitionPriorLineages = new Set<string>()
           const receiptIds = new Set<string>()
           for (const record of rawDecoded) {
             let key: string
@@ -664,6 +800,20 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 key = record.value.checkpoint_hash
                 keys = [checkpointHashes]
                 break
+              case "Transition": {
+                key = `${record.value.document_id}:${record.value.lineage}`
+                keys = [transitionLineages]
+                const priorKey = `${record.value.document_id}:${record.value.prior_lineage}`
+                if (transitionPriorLineages.has(priorKey)) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.BackupInvalid({
+                      cause: new Error(`Conflicting archive transition fork: ${priorKey}`)
+                    })
+                  })
+                }
+                transitionPriorLineages.add(priorKey)
+                break
+              }
               case "Receipt":
                 key = `${record.value.replica_incarnation}:${record.value.command_id}`
                 keys = [receiptIds]
@@ -705,71 +855,102 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             ReplicaError.ReplicaError
           > => {
             if (record.kind !== "Checkpoint") return Effect.succeed(record)
-            return Effect.acquireUseRelease(
-              Effect.try({
-                try: () => Automerge.load<InternalAutomerge.Root<unknown>>(record.value.bytes),
-                catch: (cause) =>
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.BackupInvalid({ cause })
-                  })
-              }),
-              (document) =>
+            return Effect.gen(function*() {
+              const decodedCheckpoint = yield* Effect.acquireUseRelease(
                 Effect.try({
-                  try: () => {
-                    const checkpointChanges = Automerge.getAllChanges(document).map((bytes) => ({
-                      bytes,
-                      decoded: Automerge.decodeChange(bytes)
-                    }))
-                    const declaredHeads = Schema.decodeUnknownSync(Heads)(record.value.heads)
-                      .toSorted(Conflict.compareCodeUnits)
-                    const actualHeads = Automerge.getHeads(document).toSorted(Conflict.compareCodeUnits)
-                    if (
-                      declaredHeads.length !== actualHeads.length ||
-                      declaredHeads.some((head, index) => head !== actualHeads[index])
-                    ) throw new TypeError(`Checkpoint heads mismatch: ${record.value.checkpoint_hash}`)
-                    const changeHashes = checkpointChanges.map((change) => change.decoded.hash).toSorted()
-                    const stored = changeProvenanceByDocument.get(record.value.document_id) ?? []
-                    const storedDocument = documentById.get(record.value.document_id)
-                    if (storedDocument === undefined) {
-                      throw new TypeError(`Checkpoint references unknown document ${record.value.document_id}`)
-                    }
-                    const provenance = record.value.writer_provenance ??
-                      WriterProvenance.backfill(
-                        changeHashes,
-                        stored,
-                        {
-                          writerSchemaVersion: storedDocument.schema_version,
-                          writerDefinitionHash: manifest.definitionHash
-                        }
-                      )
-                    WriterProvenance.validateExact(changeHashes, provenance)
-                    WriterProvenance.resolve(changeHashes, [...provenance, ...stored])
-                    checkpointHistoryByHash.set(record.value.checkpoint_hash, {
-                      changes: checkpointChanges.length,
-                      operations: checkpointChanges.reduce(
-                        (total, change) => total + change.decoded.ops.length,
-                        0
-                      ),
-                      bytes: checkpointChanges.reduce((total, change) => total + change.bytes.byteLength, 0)
-                    })
-                    return {
-                      kind: "Checkpoint" as const,
-                      value: { ...record.value, writer_provenance: provenance }
-                    }
-                  },
+                  try: () => Automerge.load<InternalAutomerge.Root<unknown>>(record.value.bytes),
                   catch: (cause) =>
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.BackupInvalid({ cause })
                     })
                 }),
-              (document) => Effect.sync(() => InternalAutomerge.free(document))
-            )
+                (document) =>
+                  Effect.try({
+                    try: () => {
+                      const checkpointChanges = Automerge.getAllChanges(document).map((bytes) => ({
+                        bytes,
+                        decoded: Automerge.decodeChange(bytes)
+                      }))
+                      const declaredHeads = Schema.decodeUnknownSync(Heads)(record.value.heads)
+                        .toSorted(Conflict.compareCodeUnits)
+                      const actualHeads = Automerge.getHeads(document).toSorted(Conflict.compareCodeUnits)
+                      if (
+                        declaredHeads.length !== actualHeads.length ||
+                        declaredHeads.some((head, index) => head !== actualHeads[index])
+                      ) throw new TypeError(`Checkpoint heads mismatch: ${record.value.checkpoint_hash}`)
+                      const changeHashes = checkpointChanges.map((change) => change.decoded.hash).toSorted()
+                      const stored = changeProvenanceByDocument.get(record.value.document_id) ?? []
+                      const storedDocument = documentById.get(record.value.document_id)
+                      if (storedDocument === undefined) {
+                        throw new TypeError(`Checkpoint references unknown document ${record.value.document_id}`)
+                      }
+                      const provenance = record.value.writer_provenance ??
+                        WriterProvenance.backfill(
+                          changeHashes,
+                          stored,
+                          {
+                            writerSchemaVersion: storedDocument.schema_version,
+                            writerDefinitionHash: manifest.definitionHash
+                          }
+                        )
+                      if (WriterProvenance.isCompactCheckpoint(provenance)) {
+                        if (
+                          provenance.checkpointHash !== record.value.checkpoint_hash ||
+                          provenance.lineage !== record.value.lineage ||
+                          provenance.schemaVersion !== storedDocument.schema_version ||
+                          provenance.heads.length !== actualHeads.length ||
+                          provenance.heads.some((head, index) => head !== actualHeads[index]) ||
+                          Automerge.getMissingDeps(document, []).length !== 0
+                        ) throw new TypeError(`Invalid compact checkpoint proof: ${record.value.checkpoint_hash}`)
+                      } else {
+                        WriterProvenance.validateExact(changeHashes, provenance)
+                        WriterProvenance.resolve(changeHashes, [...provenance, ...stored])
+                      }
+                      checkpointHistoryByHash.set(record.value.checkpoint_hash, {
+                        changes: checkpointChanges.length,
+                        operations: checkpointChanges.reduce(
+                          (total, change) => total + change.decoded.ops.length,
+                          0
+                        ),
+                        bytes: checkpointChanges.reduce((total, change) => total + change.bytes.byteLength, 0)
+                      })
+                      return {
+                        kind: "Checkpoint" as const,
+                        value: { ...record.value, writer_provenance: provenance }
+                      }
+                    },
+                    catch: (cause) =>
+                      new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.BackupInvalid({ cause })
+                      })
+                  }),
+                (document) => Effect.sync(() => InternalAutomerge.free(document))
+              )
+              if (WriterProvenance.isCompactCheckpoint(decodedCheckpoint.value.writer_provenance)) {
+                const provenance = decodedCheckpoint.value.writer_provenance
+                yield* checkpointAuthority.verifyManifest(
+                  CheckpointAuthority.ManifestClaims.make({
+                    purpose: CheckpointAuthority.manifestPurpose,
+                    documentId: decodedCheckpoint.value.document_id,
+                    lineage: provenance.lineage,
+                    checkpointHash: provenance.checkpointHash,
+                    heads: provenance.heads,
+                    base: provenance.base,
+                    schemaVersion: provenance.schemaVersion,
+                    writerDefinitionHash: provenance.writerDefinitionHash
+                  }),
+                  provenance.authorization
+                )
+              }
+              return decodedCheckpoint
+            })
           })
           const checkpointByHash = new Map(
             decoded.flatMap((record) =>
               record.kind === "Checkpoint" ? [[record.value.checkpoint_hash, record.value] as const] : []
             )
           )
+          const transitionsByDocument = new Map<string, Array<typeof StoredTransitionRecord.Type>>()
           for (const document of documentById.values()) {
             if (document.checkpoint_hash === null) continue
             const checkpoint = checkpointByHash.get(document.checkpoint_hash)
@@ -873,10 +1054,12 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   (document) =>
                     Effect.try({
                       try: () =>
-                        WriterProvenance.validateExact(
-                          WriterProvenance.changeHashes(document),
-                          record.value.writer_provenance
-                        ),
+                        WriterProvenance.isCompactCheckpoint(record.value.writer_provenance)
+                          ? undefined
+                          : WriterProvenance.validateExact(
+                            WriterProvenance.changeHashes(document),
+                            record.value.writer_provenance
+                          ),
                       catch: (cause) =>
                         new ReplicaError.ReplicaError({
                           reason: new ReplicaError.BackupInvalid({ cause })
@@ -884,6 +1067,112 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                     }),
                   (document) => Effect.sync(() => InternalAutomerge.free(document))
                 )
+                break
+              }
+              case "Transition": {
+                const [priorHeads, resultingHeads] = yield* Effect.try({
+                  try: () => {
+                    const priorHeads = Schema.decodeUnknownSync(Heads)(record.value.prior_heads)
+                    const resultingHeads = Schema.decodeUnknownSync(Heads)(record.value.heads)
+                    if (
+                      Schema.encodeSync(JsonString)(priorHeads) !== record.value.prior_heads ||
+                      Schema.encodeSync(JsonString)(resultingHeads) !== record.value.heads
+                    ) throw new TypeError(`Transition heads are not canonical: ${record.value.lineage}`)
+                    return [priorHeads, resultingHeads] as const
+                  },
+                  catch: (cause) =>
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.BackupInvalid({ cause })
+                    })
+                })
+                if (record.value.prior_lineage === record.value.lineage) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.BackupInvalid({
+                      cause: new Error(`Transition does not advance lineage: ${record.value.lineage}`)
+                    })
+                  })
+                }
+                const priorCheckpointHash = yield* digest({
+                  documentId: record.value.document_id,
+                  bytes: record.value.prior_snapshot
+                })
+                yield* Effect.acquireUseRelease(
+                  Effect.try({
+                    try: () => Automerge.load<InternalAutomerge.Root<unknown>>(record.value.prior_snapshot),
+                    catch: (cause) =>
+                      new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.BackupInvalid({ cause })
+                      })
+                  }),
+                  (priorDocument) =>
+                    Effect.try({
+                      try: () => {
+                        const actualHeads = Automerge.getHeads(priorDocument).toSorted(Conflict.compareCodeUnits)
+                        if (
+                          priorCheckpointHash !== record.value.prior_checkpoint_hash ||
+                          priorHeads.length !== actualHeads.length ||
+                          priorHeads.some((head, index) => head !== actualHeads[index]) ||
+                          Automerge.getMissingDeps(priorDocument, []).length !== 0
+                        ) throw new TypeError(`Invalid transition prior snapshot: ${record.value.lineage}`)
+                      },
+                      catch: (cause) =>
+                        new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.BackupInvalid({ cause })
+                        })
+                    }),
+                  (priorDocument) => Effect.sync(() => InternalAutomerge.free(priorDocument))
+                )
+                const anchor = checkpointByHash.get(record.value.checkpoint_hash)
+                if (anchor !== undefined) {
+                  const anchorHeads = yield* Schema.decodeUnknownEffect(Heads)(anchor.heads).pipe(
+                    Effect.mapError((cause) =>
+                      new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.BackupInvalid({ cause })
+                      })
+                    )
+                  )
+                  if (
+                    anchor.document_id !== record.value.document_id ||
+                    anchor.lineage !== record.value.lineage ||
+                    anchorHeads.length !== resultingHeads.length ||
+                    anchorHeads.some((head, index) => head !== resultingHeads[index])
+                  ) {
+                    return yield* new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.BackupInvalid({
+                        cause: new Error(`Transition anchor checkpoint does not match: ${record.value.lineage}`)
+                      })
+                    })
+                  }
+                }
+                if (record.value.authorization === null) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.CheckpointRejected({
+                      documentId: record.value.document_id,
+                      reason: "Lineage transition authorization is missing"
+                    })
+                  })
+                }
+                yield* checkpointAuthority.verifyTransition(
+                  CheckpointAuthority.TransitionClaims.make({
+                    purpose: CheckpointAuthority.transitionPurpose,
+                    documentId: record.value.document_id,
+                    priorLineage: record.value.prior_lineage,
+                    priorCheckpointHash: record.value.prior_checkpoint_hash,
+                    priorHeads,
+                    resultingLineage: record.value.lineage,
+                    anchorCheckpointHash: record.value.checkpoint_hash,
+                    resultingHeads,
+                    schemaVersion: record.value.schema_version,
+                    writerDefinitionHash: record.value.writer_definition_hash
+                  }),
+                  record.value.authorization
+                )
+                const transitions = transitionsByDocument.get(record.value.document_id)
+                if (transitions === undefined) {
+                  transitionsByDocument.set(record.value.document_id, [record.value])
+                } else {
+                  transitions.push(record.value)
+                }
                 break
               }
               case "Receipt": {
@@ -896,6 +1185,35 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 }
                 break
               }
+            }
+          }
+          for (const [documentId, transitions] of transitionsByDocument) {
+            const document = documentById.get(documentId)!
+            const byPriorLineage = new Map(transitions.map((transition) => [transition.prior_lineage, transition]))
+            const resultingLineages = new Set(transitions.map((transition) => transition.lineage))
+            const roots = transitions.filter((transition) => !resultingLineages.has(transition.prior_lineage))
+            if (roots.length !== 1) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.BackupInvalid({
+                  cause: new Error(`Lineage transition chain has no unique root: ${documentId}`)
+                })
+              })
+            }
+            let current = roots[0]!
+            let visited = 1
+            for (;;) {
+              const next = byPriorLineage.get(current.lineage)
+              if (next === undefined) break
+              current = next
+              visited += 1
+              if (visited > transitions.length) break
+            }
+            if (visited !== transitions.length || current.lineage !== document.lineage) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.BackupInvalid({
+                  cause: new Error(`Lineage transition chain is not adjacent to the document: ${documentId}`)
+                })
+              })
             }
           }
           const checkpointDocuments = new Set(
@@ -990,6 +1308,9 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             const selectedCheckpoints = decoded.flatMap((record) =>
               record.kind === "Checkpoint" && record.value.document_id === options.documentId ? [record.value] : []
             )
+            const selectedTransitions = decoded.flatMap((record) =>
+              record.kind === "Transition" && record.value.document_id === options.documentId ? [record.value] : []
+            )
             const activeCheckpoints = selectedDocument.checkpoint_hash === null
               ? []
               : selectedCheckpoints.filter((checkpoint) =>
@@ -1004,7 +1325,9 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             }
             const activeCheckpoint = activeCheckpoints[0]
             const checkpointChanges = new Set(
-              activeCheckpoint?.writer_provenance.map((entry) => entry.changeHash) ?? []
+              activeCheckpoint === undefined
+                ? []
+                : WriterProvenance.exactEntries(activeCheckpoint.writer_provenance).map((entry) => entry.changeHash)
             )
             if (selectedChanges.some((change) => checkpointChanges.has(change.change_hash) && change.applied !== 1)) {
               return yield* new ReplicaError.ReplicaError({
@@ -1114,7 +1437,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   }
                   if (activeCheckpoint !== undefined) {
                     const writerProvenance = yield* Schema.encodeEffect(
-                      WriterProvenance.StoredChangeProvenances
+                      StoredCheckpointProvenance
                     )(activeCheckpoint.writer_provenance)
                     yield* sql`INSERT INTO effect_local_checkpoints (
                       checkpoint_hash, document_id, heads, bytes, checksum, commit_sequence,
@@ -1125,6 +1448,11 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                       ${sequence.prior_sequence}, ${activeCheckpoint.verified},
                       ${writerProvenance}, ${activeCheckpoint.lineage}
                     )`
+                  }
+                  for (let index = 0; index < selectedTransitions.length; index += 50) {
+                    yield* sql`INSERT INTO effect_local_lineage_transitions ${
+                      sql.insert(selectedTransitions.slice(index, index + 50))
+                    }`
                   }
                   const invalidationKeys = yield* Schema.encodeEffect(
                     Schema.fromJsonString(Schema.Array(Schema.String))
@@ -1235,6 +1563,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 }
                 yield* sql`DELETE FROM effect_local_commit_outbox`
                 yield* sql`DELETE FROM effect_local_command_receipts`
+                yield* sql`DELETE FROM effect_local_lineage_transitions`
                 yield* sql`DELETE FROM effect_local_checkpoints`
                 yield* sql`DELETE FROM effect_local_changes`
                 yield* projections.clear
@@ -1255,12 +1584,13 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   record.kind === "Checkpoint"
                     ? [{
                       ...record.value,
-                      writer_provenance: Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(
+                      writer_provenance: Schema.encodeSync(StoredCheckpointProvenance)(
                         record.value.writer_provenance
                       )
                     }]
                     : []
                 )
+                const transitions = decoded.flatMap((record) => record.kind === "Transition" ? [record.value] : [])
                 const receipts = decoded.flatMap((record) => record.kind === "Receipt" ? [record.value] : [])
                 for (let index = 0; index < documents.length; index += 50) {
                   yield* sql`INSERT INTO effect_local_documents ${sql.insert(documents.slice(index, index + 50))}`
@@ -1270,6 +1600,11 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 }
                 for (let index = 0; index < checkpoints.length; index += 50) {
                   yield* sql`INSERT INTO effect_local_checkpoints ${sql.insert(checkpoints.slice(index, index + 50))}`
+                }
+                for (let index = 0; index < transitions.length; index += 50) {
+                  yield* sql`INSERT INTO effect_local_lineage_transitions ${
+                    sql.insert(transitions.slice(index, index + 50))
+                  }`
                 }
                 for (let index = 0; index < receipts.length; index += 50) {
                   yield* sql`INSERT INTO effect_local_command_receipts ${sql.insert(receipts.slice(index, index + 50))}`
@@ -1353,3 +1688,6 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       })
     })
   )
+
+export const layerRejectAll = (definition: ReplicaDefinition.Any) =>
+  layer(definition).pipe(Layer.provide(CheckpointAuthority.layerRejectAll))

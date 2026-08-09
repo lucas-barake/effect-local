@@ -225,10 +225,12 @@ const make = Effect.gen(function*() {
         Effect.flatMap((syncEnvelope) =>
           Effect.try({
             try: () =>
-              WriterProvenance.validateExact(
-                WriterProvenance.syncMessageChangeHashes(syncEnvelope.message),
-                syncEnvelope.writerProvenance
-              ).map((provenance) => provenance.changeHash),
+              syncEnvelope.checkpointTransfer === undefined
+                ? WriterProvenance.validateExact(
+                  WriterProvenance.syncMessageChangeHashes(syncEnvelope.message),
+                  syncEnvelope.writerProvenance
+                ).map((provenance) => provenance.changeHash)
+                : [],
             catch: (cause) =>
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({ cause })
@@ -771,10 +773,12 @@ const make = Effect.gen(function*() {
       )
       const changeHashes = yield* Effect.try({
         try: () =>
-          WriterProvenance.validateExact(
-            WriterProvenance.syncMessageChangeHashes(syncEnvelope.message),
-            syncEnvelope.writerProvenance
-          ).map((entry) => entry.changeHash),
+          syncEnvelope.checkpointTransfer === undefined
+            ? WriterProvenance.validateExact(
+              WriterProvenance.syncMessageChangeHashes(syncEnvelope.message),
+              syncEnvelope.writerProvenance
+            ).map((entry) => entry.changeHash)
+            : [],
         catch: (cause) =>
           new ReplicaError.ReplicaError({
             reason: new ReplicaError.ProtocolMismatch({
