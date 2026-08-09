@@ -258,24 +258,38 @@ class TestErrorEvent extends Event implements ErrorEvent {
   }
 }
 
+const makeTestControlPort = () => {
+  let onMessage: ((event: MessageEvent<unknown>) => void) | undefined
+  const port = {
+    addEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+      if (type !== "message") return
+      onMessage = typeof listener === "function"
+        ? listener as (event: MessageEvent<unknown>) => void
+        : (event) => listener.handleEvent(event)
+    },
+    removeEventListener() {},
+    postMessage() {},
+    start() {},
+    close() {}
+  } as unknown as MessagePort
+  return {
+    port,
+    dispatch(frame: OwnershipProtocol.OwnerToPageFrame) {
+      onMessage?.(
+        new MessageEvent("message", {
+          data: Schema.encodeSync(OwnershipProtocol.OwnerToPageFrame)(frame)
+        })
+      )
+    }
+  }
+}
+
 it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
   it.effect("terminates a rejected provisional worker before RPC failure listeners can tear down the tab", () =>
     Effect.gen(function*() {
-      let onControlMessage: ((event: MessageEvent<unknown>) => void) | undefined
-      const controlPort = {
-        addEventListener(type: string, listener: EventListenerOrEventListenerObject) {
-          if (type !== "message") return
-          onControlMessage = typeof listener === "function"
-            ? listener as (event: MessageEvent<unknown>) => void
-            : (event) => listener.handleEvent(event)
-        },
-        removeEventListener() {},
-        postMessage() {},
-        start() {},
-        close() {}
-      } as unknown as MessagePort
+      const control = makeTestControlPort()
       const sharedWorker = Object.assign(new EventTarget(), {
-        port: controlPort,
+        port: control.port,
         onerror: null
       }) as unknown as SharedWorker
       let terminated = 0
@@ -310,18 +324,94 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
       })
 
       const nonce = Schema.decodeUnknownSync(OwnershipProtocol.ProvisionNonce)("reentrant-rejection")
-      onControlMessage?.(
-        new MessageEvent("message", {
-          data: Schema.encodeSync(OwnershipProtocol.OwnerToPageFrame)({ _tag: "Provision", nonce })
-        })
-      )
-      onControlMessage?.(
-        new MessageEvent("message", {
-          data: Schema.encodeSync(OwnershipProtocol.OwnerToPageFrame)({ _tag: "ProvisionRejected", nonce })
+      control.dispatch({ _tag: "Provision", nonce })
+      control.dispatch({ _tag: "ProvisionRejected", nonce })
+
+      assert.strictEqual(terminated, 1)
+    }).pipe(Effect.scoped))
+
+  it.effect("fails stale RPC ports when reset error reporting throws", () =>
+    Effect.gen(function*() {
+      const control = makeTestControlPort()
+      const sharedWorker = Object.assign(new EventTarget(), {
+        port: control.port,
+        onerror: null
+      }) as unknown as SharedWorker
+      const previousErrorEvent = globalThis.ErrorEvent
+      globalThis.ErrorEvent = TestErrorEvent as typeof ErrorEvent
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          globalThis.ErrorEvent = previousErrorEvent
         })
       )
 
-      assert.strictEqual(terminated, 1)
+      const context = yield* Layer.build(
+        OwnershipCoordinator.layerTab({
+          name: "effect-local-reset-error-callback-test",
+          sharedWorker: () => sharedWorker,
+          databaseWorker: () => ({ postMessage() {}, terminate() {} }) as unknown as globalThis.Worker,
+          onOwnerError: () => {
+            throw new Error("consumer callback failed")
+          }
+        })
+      )
+      const spawn = yield* Worker.Spawner.pipe(Effect.provide(context))
+      const rpcPort = spawn(0) as MessagePort
+      let rpcErrors = 0
+      rpcPort.addEventListener("error", () => {
+        rpcErrors++
+      })
+
+      let callbackError: unknown
+      try {
+        control.dispatch({
+          _tag: "Reattach",
+          ownerId: "previous-owner",
+          reason: "the database worker health check failed"
+        })
+      } catch (error) {
+        callbackError = error
+      }
+
+      assert.isTrue(callbackError instanceof Error)
+      assert.strictEqual(callbackError.message, "consumer callback failed")
+      assert.strictEqual(rpcErrors, 1)
+    }).pipe(Effect.scoped))
+
+  it.effect("does not expose RPC defects on the browser global", () =>
+    Effect.gen(function*() {
+      const control = makeTestControlPort()
+      const sharedWorker = Object.assign(new EventTarget(), {
+        port: control.port,
+        onerror: null
+      }) as unknown as SharedWorker
+      const target = globalThis as typeof globalThis & { __rpcDefects?: Array<unknown> }
+      delete target.__rpcDefects
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          delete target.__rpcDefects
+        })
+      )
+
+      const context = yield* Layer.build(
+        OwnershipCoordinator.layerTab({
+          name: "effect-local-private-defect-test",
+          sharedWorker: () => sharedWorker,
+          databaseWorker: () => ({ postMessage() {}, terminate() {} }) as unknown as globalThis.Worker
+        })
+      )
+      const spawn = yield* Worker.Spawner.pipe(Effect.provide(context))
+      const rpcPort = spawn(0) as MessagePort
+      rpcPort.dispatchEvent(
+        new MessageEvent("message", {
+          data: [1, {
+            _tag: "Defect",
+            defect: { message: "private value", stack: "private stack" }
+          }]
+        })
+      )
+
+      assert.isFalse("__rpcDefects" in target)
     }).pipe(Effect.scoped))
 
   it.effect("fails a pending client acquisition and retries after provisioning is rejected", () =>

@@ -1137,16 +1137,14 @@ const layerTabImpl = (
             return
           }
           case "Reattach": {
-            // A reason means a failure takeover, not an ordinary ownership move. Unlike an
-            // `OwnerError` frame this must not tear the connection down: the coordinator is
-            // already re-provisioning and this tab may be the next provider.
+            // Fail stale RPC ports before reporting so a consumer callback cannot block recovery.
+            failRpcPorts(current, `replica ownership moved from ${frame.ownerId}`)
             if (frame.reason !== undefined) {
               options.onOwnerError?.(`the replica owner engine was reset: ${frame.reason}`, {
                 _tag: "EngineReset",
                 reason: frame.reason
               })
             }
-            failRpcPorts(current, `replica ownership moved from ${frame.ownerId}`)
             return
           }
           case "OwnerError": {
@@ -1214,31 +1212,6 @@ const layerTabImpl = (
         const current = connection ?? establish()
         current.rpcPorts.get(id)?.close()
         const channel = new MessageChannel()
-        channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
-          const data = event.data
-          if (!Array.isArray(data) || data[0] !== 1) return
-          const message = data[1] as { readonly _tag?: string; readonly defect?: unknown } | undefined
-          if (message === undefined || message._tag !== "Defect") return
-          const defect = message.defect as Record<string, unknown> | undefined
-          const target = globalThis as unknown as { __rpcDefects?: Array<unknown> }
-          target.__rpcDefects = target.__rpcDefects ?? []
-          target.__rpcDefects.push({
-            at: Date.now(),
-            brand: Object.prototype.toString.call(defect),
-            keys: defect === null || defect === undefined ? [] : Object.keys(defect),
-            messageType: typeof defect?.message,
-            message: String(defect?.message).slice(0, 400),
-            name: String(defect?.name).slice(0, 200),
-            stack: String(defect?.stack).slice(0, 2000),
-            json: (() => {
-              try {
-                return JSON.stringify(defect)?.slice(0, 2000)
-              } catch (cause) {
-                return `unserializable: ${String(cause)}`
-              }
-            })()
-          })
-        })
         current.rpcPorts.set(id, channel.port2)
         postFrame(current, {
           _tag: "Attach",
