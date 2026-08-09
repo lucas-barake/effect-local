@@ -149,8 +149,8 @@ importers:
         specifier: ^8.18.1
         version: 8.18.1
       effect:
-        specifier: 4.0.0-beta.99
-        version: 4.0.0-beta.99
+        specifier: 4.0.0-beta.101
+        version: 4.0.0-beta.101
       expo-crypto:
         specifier: 57.0.1
         version: 57.0.1(expo@57.0.11)
@@ -760,13 +760,6 @@ packages:
     resolution: {integrity: sha512-Sjp0K4Yw+xvDtfjuk2n5BCCX2NMEejlRocZEwQ4mdVd82pqI9dtO1QD2fdUzFEZQeBwcEuj8ZCBYbIegj7OLQw==}
     peerDependencies:
       effect: ^4.0.0-beta.101
-      react: ^19.2.4
-      scheduler: '*'
-
-  '@effect/atom-react@4.0.0-beta.99':
-    resolution: {integrity: sha512-sV5dlwK0kAldhX2jYhKnBSIYmrkY47NX7d6eV7vBuCOxJvcqeVgXlOC8kagWUWUQ5a866kiqYo+uPT/ELHUysg==}
-    peerDependencies:
-      effect: ^4.0.0-beta.99
       react: ^19.2.4
       scheduler: '*'
 
@@ -2698,9 +2691,6 @@ packages:
 
   effect@4.0.0-beta.101:
     resolution: {integrity: sha512-HjowumlIo+orthn4jMlEJPuzIYPBV+uq/XiciHWhiedLsXQpWHdNJHO5d59BVDP5s1LPuvERcktwFqRXnJqnhA==}
-
-  effect@4.0.0-beta.99:
-    resolution: {integrity: sha512-hP1C61uzINfLl/4kKMwcqksxd34s4sQ3VSjsWjhGrkx9CRlXaqnfOK9dpTEKynQ6rA7wU9rb3c+48eDYw7uzxA==}
 
   electron-to-chromium@1.5.403:
     resolution: {integrity: sha512-MQsYmdaLzvaCX5j+ZZBr5Fm6uCCnPQcRtlvmvRlWqrXy+BH2O4ffXIAScF+JQznQWB9brWp4lSD9Z4yNmaf2BA==}
@@ -5504,12 +5494,6 @@ snapshots:
       react: 19.2.7
       scheduler: 0.27.0
 
-  '@effect/atom-react@4.0.0-beta.99(effect@4.0.0-beta.99)(react@19.2.7)(scheduler@0.27.0)':
-    dependencies:
-      effect: 4.0.0-beta.99
-      react: 19.2.7
-      scheduler: 0.27.0
-
   '@effect/language-service@0.85.1': {}
 
   '@effect/platform-browser@4.0.0-beta.101(effect@4.0.0-beta.101)':
@@ -7465,19 +7449,6 @@ snapshots:
   ee-first@1.1.1: {}
 
   effect@4.0.0-beta.101:
-    dependencies:
-      '@standard-schema/spec': 1.1.0
-      fast-check: 4.9.0
-      find-my-way-ts: 0.1.6
-      ini: 7.0.0
-      kubernetes-types: 1.30.0
-      msgpackr: 2.0.4
-      multipasta: 0.2.8
-      toml: 4.3.0
-      uuid: 14.0.1
-      yaml: 2.9.0
-
-  effect@4.0.0-beta.99:
     dependencies:
       '@standard-schema/spec': 1.1.0
       fast-check: 4.9.0
