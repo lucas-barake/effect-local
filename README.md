@@ -1161,9 +1161,10 @@ export const runtime = Atom.runtime(ReplicaLive)
 export const labels = ReplicaAtom.queryFamily(runtime, ListLabels)({ prefix: "" })
 ```
 
-`AppLifecycle.layerFlushOnBackground` flushes the replica when `AppState` transitions to `background`, so
-committed mutations are durable before the OS can suspend the process. `inactive` is deliberately ignored: it
-fires for transient interruptions on iOS only, and a flush there buys nothing.
+`AppLifecycle.layerFlushOnBackground` publishes pending local commit and command-delivery notifications when
+`AppState` transitions to `background`. Mutations are already locally durable when they return. Relay I/O is
+owned by the peer session and can continue when the app resumes, so this hook does not promise remote delivery
+before suspension. `inactive` is deliberately ignored because it fires for transient interruptions on iOS only.
 
 Relay sync uses the same composition as the browser with the socket layer swapped:
 
