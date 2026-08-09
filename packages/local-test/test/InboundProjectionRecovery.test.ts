@@ -18,6 +18,7 @@ import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
@@ -223,29 +224,38 @@ const drain = (documentId: Identity.DocumentId, left: Side, right: Side) =>
   })
 
 it.layer(NodeCrypto.layer)("inbound projection recovery", (it) => {
-  it.effect("a local command after inbound sync leaves queries executable", () =>
+  it.effect("an inbound sync rebuilds projections before publishing the commit", () =>
     Effect.gen(function*() {
       const { documentId, left, right } = yield* seedPair
       yield* right.publisher.publishPending
       yield* Effect.flatMap(Identity.makeCommandId, (commandId) =>
         left.replica.mutate(EditNote, { commandId, documentId, payload: "from left" }))
+      const subscription = yield* right.publisher.subscribe
+      const event = yield* subscription.events.pipe(
+        Stream.filter((event) =>
+          event._tag === "Commit"
+        ),
+        Stream.runHead,
+        Effect.forkChild
+      )
       yield* drain(documentId, left, right)
       yield* right.publisher.publishPending
-
-      // The inbound apply defers projection work by marking the document Blocked. A local command
-      // rebuilds this document's projection rows from the merged snapshot, which must also make
-      // the document queryable again.
-      yield* Effect.flatMap(Identity.makeCommandId, (commandId) =>
-        right.replica.mutate(Touch, { commandId, documentId }))
 
       const rows = yield* right.replica.query(ListNotes)
       assert.deepStrictEqual(
         rows.map((row) => row.text),
         ["from left"]
       )
+      const received = yield* Fiber.join(event)
+      assert.isTrue(Option.isSome(received))
+      if (Option.isNone(received)) return
+      assert.deepStrictEqual(received.value.keys, [
+        ...ReplicaDefinition.documentCommitKeys(Note.name, documentId),
+        NoteRows.name
+      ])
     }).pipe(Effect.scoped))
 
-  it.effect("a pending no-change recovery publishes projection invalidation under a fresh sequence", () =>
+  it.effect("a no-change command publishes the ready inbound projection without a second commit", () =>
     Effect.gen(function*() {
       const { documentId, left, right } = yield* seedPair
       yield* right.publisher.publishPending
@@ -261,7 +271,7 @@ it.layer(NodeCrypto.layer)("inbound projection recovery", (it) => {
       const subscription = yield* right.publisher.subscribe
       const events = yield* subscription.events.pipe(
         Stream.filter((event) => event._tag === "Commit"),
-        Stream.take(2),
+        Stream.take(1),
         Stream.runCollect,
         Effect.forkChild
       )
@@ -272,7 +282,7 @@ it.layer(NodeCrypto.layer)("inbound projection recovery", (it) => {
       const after = yield* right.sql<{ readonly commit_sequence: number }>`
         SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`
 
-      assert.strictEqual(after[0]?.commit_sequence, previousSequence + 1)
+      assert.strictEqual(after[0]?.commit_sequence, previousSequence)
       assert.deepStrictEqual(
         [...yield* Fiber.join(events)].map((event) => ({
           sequence: event.commitSequence,
@@ -281,10 +291,6 @@ it.layer(NodeCrypto.layer)("inbound projection recovery", (it) => {
         [
           {
             sequence: Identity.CommitSequence.make(previousSequence),
-            keys: ReplicaDefinition.documentCommitKeys(Note.name, documentId)
-          },
-          {
-            sequence: Identity.CommitSequence.make(previousSequence + 1),
             keys: [...ReplicaDefinition.documentCommitKeys(Note.name, documentId), NoteRows.name]
           }
         ]
@@ -292,7 +298,7 @@ it.layer(NodeCrypto.layer)("inbound projection recovery", (it) => {
       assert.deepStrictEqual((yield* right.replica.query(ListNotes)).map((row) => row.text), ["from left"])
     }).pipe(Effect.scoped))
 
-  it.effect("a no-change command does not clear a published blocked projection", () =>
+  it.effect("a no-change command preserves an inbound projection that is already ready", () =>
     Effect.gen(function*() {
       const { documentId, left, right } = yield* seedPair
       yield* Effect.flatMap(Identity.makeCommandId, (commandId) =>
@@ -303,7 +309,6 @@ it.layer(NodeCrypto.layer)("inbound projection recovery", (it) => {
       yield* Effect.flatMap(Identity.makeCommandId, (commandId) =>
         right.replica.mutate(Noop, { commandId, documentId }))
 
-      const error = yield* Effect.flip(right.replica.query(ListNotes))
-      assert.strictEqual(error.reason._tag, "ProjectionBlocked")
+      assert.deepStrictEqual((yield* right.replica.query(ListNotes)).map((row) => row.text), ["from left"])
     }).pipe(Effect.scoped))
 })

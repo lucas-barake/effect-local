@@ -39,6 +39,7 @@ import * as DocumentEntity from "../src/DocumentEntity.js"
 import * as DocumentStore from "../src/DocumentStore.js"
 import * as DurableRuntime from "../src/DurableRuntime.js"
 import * as InternalAutomerge from "../src/internal/automerge.js"
+import * as ProjectionStore from "../src/ProjectionStore.js"
 import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
@@ -126,7 +127,18 @@ describe("DurableRuntime", () => {
   const CompactionService = Compaction.layer.pipe(
     Layer.provide(Layer.mergeAll(Database, Gate, RecoveryService, Limits))
   )
-  const Inputs = Layer.mergeAll(Database, Bootstrap, Executor, Limits, Gate, Store, RecoveryService, CompactionService)
+  const Projections = ProjectionStore.layer([]).pipe(Layer.provide(Database))
+  const Inputs = Layer.mergeAll(
+    Database,
+    Bootstrap,
+    Executor,
+    Limits,
+    Gate,
+    Store,
+    RecoveryService,
+    CompactionService,
+    Projections
+  )
   const Live = DurableRuntime.layer(definition).pipe(Layer.provide(Inputs))
   const Services = Layer.merge(Inputs, Live)
 
@@ -137,7 +149,18 @@ describe("DurableRuntime", () => {
     const store = DocumentStore.layer.pipe(Layer.provide(Layer.mergeAll(database, gate, Limits)))
     const recovery = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(database, gate)))
     const compaction = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(database, gate, recovery, Limits)))
-    const inputs = Layer.mergeAll(database, bootstrap, Executor, Limits, gate, store, recovery, compaction)
+    const projections = ProjectionStore.layer([]).pipe(Layer.provide(database))
+    const inputs = Layer.mergeAll(
+      database,
+      bootstrap,
+      Executor,
+      Limits,
+      gate,
+      store,
+      recovery,
+      compaction,
+      projections
+    )
     return Layer.merge(inputs, DurableRuntime.layerWith(definition, workflowRegistrations).pipe(Layer.provide(inputs)))
   }
   const servicesAt = (filename: string) => servicesAtWith(filename, Layer.empty)
@@ -480,7 +503,17 @@ describe("DurableRuntime", () => {
       const compaction = Compaction.layer.pipe(
         Layer.provide(Layer.mergeAll(Database, gateLayer, recovery, Limits))
       )
-      const inputs = Layer.mergeAll(Database, Bootstrap, Executor, Limits, gateLayer, store, recovery, compaction)
+      const inputs = Layer.mergeAll(
+        Database,
+        Bootstrap,
+        Executor,
+        Limits,
+        gateLayer,
+        store,
+        recovery,
+        compaction,
+        Projections
+      )
       const live = Layer.merge(inputs, DurableRuntime.layer(definition).pipe(Layer.provide(inputs)))
 
       yield* Effect.gen(function*() {
@@ -538,7 +571,17 @@ describe("DurableRuntime", () => {
     const compaction = Compaction.layer.pipe(
       Layer.provide(Layer.mergeAll(Database, Gate, recoveryLayer, Limits))
     )
-    const inputs = Layer.mergeAll(Database, Bootstrap, Executor, Limits, Gate, Store, recoveryLayer, compaction)
+    const inputs = Layer.mergeAll(
+      Database,
+      Bootstrap,
+      Executor,
+      Limits,
+      Gate,
+      Store,
+      recoveryLayer,
+      compaction,
+      Projections
+    )
     return Layer.merge(inputs, DurableRuntime.layer(definition).pipe(Layer.provide(inputs)))
   }
 
@@ -1127,7 +1170,17 @@ describe("DurableRuntime", () => {
         })
       })
     ).pipe(Layer.provide(Layer.mergeAll(Database, Gate, RecoveryService, CompactionService)))
-    const inputs = Layer.mergeAll(Database, Bootstrap, Executor, Limits, Gate, Store, RecoveryService, compaction)
+    const inputs = Layer.mergeAll(
+      Database,
+      Bootstrap,
+      Executor,
+      Limits,
+      Gate,
+      Store,
+      RecoveryService,
+      compaction,
+      Projections
+    )
     return {
       lineages,
       services: Layer.merge(inputs, DurableRuntime.layer(definition).pipe(Layer.provide(inputs)))
