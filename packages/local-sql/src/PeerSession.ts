@@ -629,24 +629,25 @@ const makeWithTerminal = (
         if (result === null) return "ApplicationRejected" as const
         yield* publisher.publishPending
         if (result.reply !== null) {
-          // A reply that exceeds the per-message change budget can never be sent, and the budget
-          // is a property of this document's history: failing the session would reconnect into
-          // the same oversized reply forever, redelivering the message that asked for it each
-          // time. Withholding the reply keeps the session serving and lets the inbound settle;
-          // the peer stays behind on this document until its history fits the budget.
+          // A reply that cannot be enqueued deterministically — over the per-message change
+          // budget, unresolvable provenance, an unencodable envelope — will fail identically on
+          // every retry, and failing the session only reconnects into the same reply while the
+          // relay redelivers the message that asked for it. Withholding the reply keeps the
+          // session serving and lets the inbound settle; the peer stays behind on this document,
+          // which the warning makes visible. Storage unavailability stays session-fatal: it is
+          // transient and a reconnect genuinely retries it.
           yield* sync.enqueue(session, result.reply).pipe(
             Effect.flatMap(schedule),
             Effect.catchIf(
-              (error) =>
-                error.reason._tag === "QuotaExceeded" &&
-                error.reason.resource === "sync message writer provenance",
+              (error) => error.reason._tag !== "StorageUnavailable",
               (error) =>
                 Effect.logWarning(
-                  "Peer session withheld a sync reply whose changes exceed the per-message budget; the peer stays behind on this document"
+                  "Peer session withheld an unsendable sync reply; the peer stays behind on this document"
                 ).pipe(
                   Effect.annotateLogs({
                     documentId: envelope.documentId,
                     peerId: connection.peerId,
+                    reason: error.reason._tag,
                     limit: error.reason._tag === "QuotaExceeded" ? error.reason.limit : undefined
                   })
                 )
