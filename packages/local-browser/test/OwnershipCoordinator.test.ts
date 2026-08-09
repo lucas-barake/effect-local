@@ -1140,8 +1140,7 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
 
   it.effect("keeps a live engine whose transaction outlives the deadline while the database keeps answering", () =>
     Effect.gen(function*() {
-      // A real SQLite behind the real driver protocol: replies on the database port are the only
-      // liveness evidence available while a transaction monopolizes the client's single permit.
+      // Use the real driver protocol so port replies remain observable while SQL holds its permit.
       const database = makeSqliteWorker()
 
       const runtimes: Array<ManagedRuntime.ManagedRuntime<OwnershipCoordinator.EngineServices, unknown>> = []
@@ -1167,9 +1166,7 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
         yield* takeFrame(tab, "Attached")
         assert.strictEqual(runtimes.length, 1)
 
-        // A backlog drain: one transaction holds the client's only permit far past the health
-        // deadline, but every statement inside it keeps round-tripping through the database
-        // worker. The queued probe cannot settle; the port traffic is the proof of life.
+        // Hold the SQL permit across replies so the health probe remains queued.
         const context = yield* runtimes[0].contextEffect
         const steps = yield* Effect.forEach(
           Array.from({ length: 12 }),
@@ -1190,8 +1187,6 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
           )
         }).pipe(Effect.provide(context), Effect.forkChild({ startImmediately: true }))
 
-        // 12 statements over 2.4 virtual seconds: the deadline (1s) elapses twice over with the
-        // probe still queued, while a statement answers within every deadline window.
         for (const step of steps) {
           yield* Deferred.succeed(step.go, undefined)
           yield* Deferred.await(step.done)
@@ -1200,8 +1195,6 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
         yield* Fiber.join(busy)
         yield* TestClock.adjust("100 millis")
 
-        // The engine was busy, never dead: resetting it would restart the very drain that made
-        // it busy and loop forever.
         assert.isFalse(tab.receivedTags.includes("Reattach"))
         assert.strictEqual(runtimes.length, 1)
         const lease = yield* openSession(tab.rpcChannel.port2)
@@ -1350,8 +1343,6 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
 
         yield* TestClock.adjust("1 second")
         yield* TestClock.adjust("200 millis")
-        // A failure reset must never be silent: the tab-side rpc error for a torn port carries no
-        // cause, so the reattach reason is the only way the page learns why its session just died.
         const reattached = yield* takeFrame(tab, "Reattach")
         assert.strictEqual(reattached.reason, "the database worker health check failed")
       }).pipe(

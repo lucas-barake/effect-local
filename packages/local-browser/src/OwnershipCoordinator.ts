@@ -136,7 +136,6 @@ interface EngineSnapshot {
   readonly scope: Scope.Closeable
   readonly ownerId: string
   readonly info: unknown
-  /** Messages observed arriving on the database port; see `EngineHealth.observedReplies`. */
   readonly databaseReplies: { count: number }
   readonly detachDatabaseObserver: () => void
 }
@@ -329,9 +328,8 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
         databasePort: MessagePort
       ) => {
         const start = Effect.gen(function*() {
-          // Any message arriving on the database port proves the worker is processing work, even
-          // while a long transaction keeps the periodic probe queued. Never `start()` the port
-          // here — the driver owns dispatch.
+          // Database replies prove liveness while the connection permit blocks the probe. The
+          // driver remains responsible for starting the port.
           const databaseReplies = { count: 0 }
           const runtime = yield* Effect.sync(() => options.engine(databasePort))
           const engineScope = yield* Scope.make()
@@ -507,8 +505,7 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
             // Only a tab whose server just died is told to re-attach. A tab still waiting for
             // its first serve has nothing to re-establish; the next engine serves it as is.
             if (client.served && client.rpcPort !== undefined) {
-              // The rpc error a tab sees for its torn port is cause-free, so this reason is the
-              // only way the page learns why its session died.
+              // Reattach carries the reset cause because closing the RPC port loses it.
               reattach.push(post(client.controlPort, {
                 _tag: "Reattach",
                 ownerId: engine.ownerId,
@@ -745,19 +742,14 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                     health.warned = false
                   }
                 }
-                // A long transaction keeps the probe queued behind the single connection permit,
-                // so observed port replies count as round trips: only a worker that answers
-                // nobody can reach the deadline.
+                // Database replies prove liveness while a long transaction blocks the queued probe.
                 const replies = engine.databaseReplies.count
                 if (replies !== health.observedReplies) {
                   health.observedReplies = replies
                   health.lastRoundTripAt = now
                 }
                 if (health.probeStartedAt !== undefined) {
-                  // Lateness alone cannot tell a busy worker from a dead one: only a deadline with
-                  // neither a settled probe nor any observed port reply is death. Plain lateness is
-                  // worth a warning, once per probe, because it usually means a long drain is in
-                  // progress.
+                  // Probe age warns about backlog. Only complete database silence triggers takeover.
                   if (now - health.lastRoundTripAt >= healthDeadlineMillis) {
                     return Queue.offer(events, { _tag: "HealthFailed", epoch: engine.epoch })
                   }
