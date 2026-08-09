@@ -273,7 +273,8 @@ what is in flight lives only in memory, so an abandoned attempt simply leaves th
 2. The Automerge message is applied through the production `DocumentEntity.ApplySync` path.
 3. The sender scoped relay receipt and any resulting canonical state commit in recipient SQLite.
 4. Pending commit invalidations are published.
-5. Any generated reply is durably enqueued for the local peer session.
+5. Every generated reply fragment is durably recorded, and every pending fragment is enqueued for the local peer
+   session.
 
 This boundary proves durable recipient processing for replay suppression. It does not change
 the sender's command delivery record. Sender custody confirmation happens earlier, when `Push` returns after the
