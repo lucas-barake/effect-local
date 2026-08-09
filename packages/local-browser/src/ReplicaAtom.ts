@@ -33,8 +33,7 @@ export const layerReactivity = Layer.effectDiscard(Effect.gen(function*() {
         ? Effect.failCause(cause)
         : Effect.logWarning("replica invalidation stream restarting", cause)
     ),
-    Effect.andThen(Effect.sleep(1_000)),
-    Effect.forever,
+    Effect.repeat(Schedule.spaced(1_000)),
     Effect.forkScoped
   )
 })).pipe(Layer.fresh)
