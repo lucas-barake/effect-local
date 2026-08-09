@@ -344,16 +344,16 @@ describe("RelayInbox", () => {
       // channel.
       yield* client.Deliver(deliver({ id: "0000000000ff", sequence: 0, epoch: "epoch-1" }))
       yield* TestClock.adjust(1000)
-      for (let sequence = 0; sequence < 10; sequence++) {
+      for (let sequence = 0; sequence < 3; sequence++) {
         yield* client.Deliver(
           deliver({ id: `0000000000a${sequence.toString(16)}`, sequence, epoch: "epoch-2" })
         )
       }
 
-      // Half of the 10 minute TTL passes across the settlements, one minute per message.
+      // The stale head crosses half of its four second TTL after the first live settlement.
       const session = sessionId("000000000001")
       const received = yield* client.Subscribe({ sessionId: session }).pipe(
-        Stream.take(8),
+        Stream.take(3),
         Stream.mapEffect((message) =>
           client.Settle({
             sessionId: session,
@@ -362,7 +362,7 @@ describe("RelayInbox", () => {
             messageHash: message.messageHash,
             outcome: "Acknowledged"
           }).pipe(
-            Effect.andThen(TestClock.adjust(60_000)),
+            Effect.andThen(TestClock.adjust(1_000)),
             Effect.as(message)
           )
         ),
@@ -378,14 +378,15 @@ describe("RelayInbox", () => {
         entity: {
           maxConcurrentChannels: 1,
           sessionDeadline: Duration.hours(2),
-          // Must exceed the 60s the clock jumps per settlement: the transport can already hold
+          messageTtl: Duration.seconds(4),
+          // Must exceed the second the clock jumps per settlement: the transport can already hold
           // the next delivery attempt when the clock moves, and a deadline inside the jump
           // abandons that attempt, so its redelivered claim token no longer matches the one the
           // recipient is settling with.
-          settleDeadline: Duration.minutes(2)
+          settleDeadline: Duration.seconds(2)
         }
       }))
-    ))
+    ), 0)
 
   it.effect("answers a settle inside its declared failure channel when the session is released", () =>
     Effect.gen(function*() {

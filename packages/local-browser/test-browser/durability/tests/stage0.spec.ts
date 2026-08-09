@@ -1,8 +1,19 @@
-import { expect, test } from "@playwright/test"
+import type { Page } from "@playwright/test"
+import { expect, test } from "../playwright.ts"
+
+const openDurabilityProof = async (page: Page) => {
+  await page.goto("/")
+  await expect(page.locator("#status")).toHaveText("Proof failed", { timeout: 20_000 })
+  await expect(page.locator("[data-proof=\"atomicity\"]")).toHaveAttribute("data-state", "passed")
+  await expect(page.locator("[data-proof=\"duplicate\"]")).toHaveAttribute("data-state", "passed")
+  await expect(page.locator("[data-proof=\"stream\"]")).toHaveAttribute("data-state", "passed")
+  await expect(page.locator("[data-proof=\"reload\"]")).toHaveAttribute("data-state", "failed")
+  await page.reload()
+  await expect(page.locator("#status")).toHaveText("Proof complete", { timeout: 20_000 })
+}
 
 test("persists an entity event and stored reply atomically and deduplicates", async ({ page }) => {
-  await page.goto("/")
-  await expect(page.locator("#status")).toHaveText("Proof complete", { timeout: 20_000 })
+  await openDurabilityProof(page)
 
   const commandId = crypto.randomUUID()
   const result = await page.evaluate(async (id) => {
@@ -32,8 +43,7 @@ test("persists an entity event and stored reply atomically and deduplicates", as
 })
 
 test("rolls back application state and Cluster reply together", async ({ page }) => {
-  await page.goto("/")
-  await expect(page.locator("#status")).toHaveText("Proof complete", { timeout: 20_000 })
+  await openDurabilityProof(page)
 
   const commandId = crypto.randomUUID()
   const documentId = `rollback-${commandId}`
@@ -71,8 +81,7 @@ test("rolls back application state and Cluster reply together", async ({ page })
 })
 
 test("retains application and reply state across reload", async ({ page }) => {
-  await page.goto("/")
-  await expect(page.locator("#status")).toHaveText("Proof complete", { timeout: 20_000 })
+  await openDurabilityProof(page)
 
   const commandId = crypto.randomUUID()
   const first = await page.evaluate((id) =>
@@ -104,31 +113,40 @@ test("retains application and reply state across reload", async ({ page }) => {
 })
 
 test("streams pulses while a database request remains active", async ({ page }) => {
-  await page.goto("/")
-  await expect(page.locator("#status")).toHaveText("Proof complete", { timeout: 20_000 })
+  await openDurabilityProof(page)
 
   const result = await page.evaluate(async () => {
-    const [pulses, database] = await Promise.all([
-      window.stage0.heartbeat(8, 50),
-      window.stage0.stressDatabase(250_000)
-    ])
-    return {
-      database,
-      pulseCount: pulses.length,
-      overlapping: pulses.filter((pulse) =>
-        pulse.emittedAt >= database.startedAt && pulse.emittedAt <= database.finishedAt
-      ).length
+    window.stage0.armNextDatabaseResponse()
+    let completed = false
+    const databasePromise = window.stage0.stressDatabase(250_000).then((database) => {
+      completed = true
+      return database
+    })
+    await window.stage0.waitForDatabaseRequest()
+    await window.stage0.waitForDatabaseResponse()
+    let released = false
+    try {
+      const pulses = await window.stage0.heartbeat(3)
+      const completedWhileHeld = completed
+      window.stage0.releaseDatabaseResponse()
+      released = true
+      return {
+        completedWhileHeld,
+        database: await databasePromise,
+        pulseCount: pulses.length
+      }
+    } finally {
+      if (!released) window.stage0.releaseDatabaseResponse()
     }
   })
 
-  expect(result.pulseCount).toBe(8)
-  expect(result.overlapping).toBeGreaterThanOrEqual(3)
+  expect(result.completedWhileHeld).toBe(false)
+  expect(result.pulseCount).toBe(3)
   expect(result.database.total).toBe(31_250_125_000)
 })
 
 test("resumes a suspended workflow after the owner restarts", async ({ page }) => {
-  await page.goto("/")
-  await expect(page.locator("#status")).toHaveText("Proof complete", { timeout: 20_000 })
+  await openDurabilityProof(page)
 
   const id = crypto.randomUUID()
   const executionId = await page.evaluate((workflowId) => window.stage0.startWorkflow(workflowId), id)

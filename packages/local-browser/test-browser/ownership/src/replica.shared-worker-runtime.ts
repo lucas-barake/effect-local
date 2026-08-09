@@ -23,6 +23,42 @@ const OwnerInfo = Schema.Struct({
   writerGeneration: Identity.WriterGeneration
 })
 
+const workerUrl = new URL(globalThis.location.href)
+const timerGateToken = workerUrl.searchParams.get("effectLocalTestTimerGate")
+const timerGate = timerGateToken === null
+  ? undefined
+  : new BroadcastChannel(`effect-local-ownership-timer-${timerGateToken}`)
+let timerGateArmed = workerUrl.searchParams.has("effectLocalTestTimerGateArmed")
+let releaseProvisionDeadline: (() => void) | undefined
+timerGate?.addEventListener("message", (event) => {
+  if (event.data?._tag === "Arm" && releaseProvisionDeadline === undefined) {
+    timerGateArmed = true
+    timerGate.postMessage({ _tag: "Armed" })
+  }
+  if (event.data?._tag !== "Release" || releaseProvisionDeadline === undefined) return
+  const release = releaseProvisionDeadline
+  releaseProvisionDeadline = undefined
+  timerGate.postMessage({ _tag: "Released" })
+  release()
+})
+
+const provisionDeadline: OwnershipCoordinator.SharedWorkerOptions<unknown, unknown, unknown>["provisionDeadline"] =
+  timerGate === undefined
+    ? undefined
+    : (timeout) =>
+      Effect.suspend(() => {
+        if (!timerGateArmed) return Effect.sleep(timeout)
+        timerGateArmed = false
+        return Effect.callback<void>((resume) => {
+          const release = () => resume(Effect.void)
+          releaseProvisionDeadline = release
+          timerGate.postMessage({ _tag: "Held" })
+          return Effect.sync(() => {
+            if (releaseProvisionDeadline === release) releaseProvisionDeadline = undefined
+          })
+        })
+      })
+
 const makeEngine = (databasePort: MessagePort) => {
   const DatabaseLive = BrowserSqlite.layerMessagePort(databasePort)
   const DependenciesLive = Layer.mergeAll(
@@ -41,6 +77,8 @@ const makeEngine = (databasePort: MessagePort) => {
 export const options: OwnershipCoordinator.SharedWorkerOptions<unknown, typeof OwnerInfo.Type, unknown> = {
   name: "effect-local-tasks",
   definition,
+  provisionTimeout: "2 seconds",
+  provisionDeadline,
   engine: makeEngine,
   info: {
     schema: OwnerInfo,

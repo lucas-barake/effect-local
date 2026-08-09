@@ -30,13 +30,10 @@ const RollbackSnapshot = Schema.Struct({
 })
 
 const Pulse = Schema.Struct({
-  emittedAt: Schema.Number,
   index: Schema.Number
 })
 
 const DatabaseWork = Schema.Struct({
-  finishedAt: Schema.Number,
-  startedAt: Schema.Number,
   total: Schema.Number
 })
 
@@ -136,8 +133,7 @@ export const PageApi = RpcGroup.make(
     success: Pulse,
     stream: true,
     payload: {
-      count: Schema.Number,
-      intervalMs: Schema.Number
+      count: Schema.Number
     }
   })
 )

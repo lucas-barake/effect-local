@@ -2,7 +2,9 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
+import * as Latch from "effect/Latch"
 import * as Option from "effect/Option"
 import * as Scheduler from "effect/Scheduler"
 import * as Stream from "effect/Stream"
@@ -202,11 +204,15 @@ describe("TestPeer", () => {
 
   it.effect("does not deliver delayed sends across connection generations", () =>
     Effect.scoped(Effect.gen(function*() {
-      const network = yield* TestPeer.make(options)
+      const deliveryStarted = yield* Latch.make()
+      const network = yield* TestPeer.make({
+        ...options,
+        hooks: { deliveryStarted: deliveryStarted.open.pipe(Effect.asVoid) }
+      })
       const left = yield* network.connect(leftId, rightId)
       yield* network.connect(rightId, leftId)
       const send = yield* Effect.flip(left.send(bytes(4))).pipe(Effect.forkChild)
-      yield* Effect.yieldNow
+      yield* deliveryStarted.await
       const replacement = yield* network.connect(rightId, leftId)
       yield* TestClock.adjust("1 second")
       assert.strictEqual((yield* Fiber.join(send))._tag, "ConnectionClosed")
@@ -220,11 +226,15 @@ describe("TestPeer", () => {
 
   it.effect("does not deliver delayed sends from a replaced connection", () =>
     Effect.scoped(Effect.gen(function*() {
-      const network = yield* TestPeer.make(options)
+      const deliveryStarted = yield* Latch.make()
+      const network = yield* TestPeer.make({
+        ...options,
+        hooks: { deliveryStarted: deliveryStarted.open.pipe(Effect.asVoid) }
+      })
       const left = yield* network.connect(leftId, rightId)
       const firstRight = yield* network.connect(rightId, leftId)
       const send = yield* Effect.flip(firstRight.send(bytes(5))).pipe(Effect.forkChild)
-      yield* Effect.yieldNow
+      yield* deliveryStarted.await
       yield* network.connect(rightId, leftId)
       yield* TestClock.adjust("1 second")
       assert.strictEqual((yield* Fiber.join(send))._tag, "ConnectionClosed")
@@ -363,22 +373,44 @@ describe("TestPeer", () => {
 
   it.effect("finishes retiring a displaced connection when replacement is interrupted", () =>
     Effect.scoped(Effect.gen(function*() {
-      const network = yield* TestPeer.make(options)
-      yield* network.connect(leftId, rightId)
+      const retirementStarted = yield* Latch.make()
+      const resumeRetirement = yield* Latch.make()
+      const network = yield* TestPeer.make({
+        ...options,
+        hooks: {
+          retiring: retirementStarted.open.pipe(
+            Effect.andThen(resumeRetirement.await),
+            Effect.asVoid
+          )
+        }
+      })
+      const left = yield* network.connect(leftId, rightId)
       const firstRight = yield* network.connect(rightId, leftId)
+      yield* firstRight.send(bytes(1))
       const replacing = yield* network.connect(rightId, leftId).pipe(
         Effect.forkChild({ startImmediately: true })
       )
-      yield* Effect.yieldNow
-      yield* Fiber.interrupt(replacing)
+      yield* retirementStarted.await
+      const interrupting = yield* Fiber.interrupt(replacing).pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* resumeRetirement.open
+      yield* Fiber.join(interrupting)
       const error = yield* firstRight.send(bytes(1)).pipe(
         Effect.flip,
         Effect.option
       )
       assert.isTrue(Option.isSome(error))
       if (Option.isSome(error)) assert.strictEqual(error.value._tag, "ConnectionClosed")
+      yield* network.flush
+      assert.strictEqual(yield* left.queued, 0)
+      assert.isTrue(Exit.hasInterrupts(yield* Effect.exit(Stream.runHead(firstRight.receive))))
     })).pipe(
-      Effect.provide(FaultInjection.none),
-      Effect.provideService(Scheduler.MaxOpsBeforeYield, 12)
+      Effect.provide(FaultInjection.layerSequence([{
+        drop: false,
+        copies: 1,
+        delay: 0,
+        reorder: true
+      }]))
     ))
 })

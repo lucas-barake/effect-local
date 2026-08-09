@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest"
-import { execFileSync } from "node:child_process"
+import { execFileSync, spawn } from "node:child_process"
 import * as fs from "node:fs"
 import { createRequire } from "node:module"
 import * as os from "node:os"
@@ -41,6 +41,7 @@ const browserPkg = readPkg(path.join(repoRoot, "packages/local-browser/package.j
 const testPkg = readPkg(path.join(repoRoot, "packages/local-test/package.json"))
 
 const effect = resolvePkg("effect/package.json")
+const vite = resolvePkg("vite/package.json")
 const waSqlite = resolvePkg("@effect/wa-sqlite/package.json")
 const sqlSqliteWasm = resolvePkg("@effect/sql-sqlite-wasm/package.json")
 const platformNodeSharedRequire = createRequire(require_.resolve("@effect/platform-node/package.json"))
@@ -152,6 +153,45 @@ const packPackage = (packageDirectory: string, destination: string): PackedPacka
     )
   )
 
+const startLocalRegistry = (
+  registryDirectory: string
+): Promise<{ readonly close: () => Promise<void>; readonly url: string }> =>
+  new Promise((resolve, reject) => {
+    const registry = spawn(
+      process.execPath,
+      [
+        fileURLToPath(new URL("fixtures/local-package-registry.mjs", import.meta.url)),
+        repoRoot,
+        registryDirectory
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    )
+    let stderr = ""
+    registry.stderr.setEncoding("utf8")
+    registry.stderr.on("data", (chunk: string) => {
+      stderr += chunk
+    })
+    registry.once("error", reject)
+    registry.once("exit", (code) => {
+      reject(new Error(`Local package registry exited with code ${code}\n${stderr}`))
+    })
+    registry.stdout.setEncoding("utf8")
+    registry.stdout.once("data", (chunk: string) => {
+      const url = chunk.trim()
+      resolve({
+        url,
+        close: () =>
+          new Promise((resolveClose, rejectClose) => {
+            registry.once("exit", (code) => {
+              if (code === 0) resolveClose()
+              else rejectClose(new Error(`Local package registry exited with code ${code}\n${stderr}`))
+            })
+            registry.kill("SIGTERM")
+          })
+      })
+    })
+  })
+
 const resolvedSharedVersion = (consumerDirectory: string): string => {
   const consumerRequire = createRequire(path.join(consumerDirectory, "package.json"))
   const testRequire = createRequire(consumerRequire.resolve("@lucas-barake/effect-local-test/package.json"))
@@ -214,9 +254,11 @@ describe("dependency peer invariants", () => {
     )).toEqual([nodeCommand, testNodeCommand])
   })
 
-  it("resolves each documented packed package graph with npm and pnpm", { timeout: 180_000 }, () => {
+  it("resolves each documented packed package graph with npm and pnpm", { timeout: 0 }, async () => {
     const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "effect-local-peer-invariants-"))
+    let registry: Awaited<ReturnType<typeof startLocalRegistry>> | undefined
     try {
+      registry = await startLocalRegistry(path.join(temporaryDirectory, "registry"))
       const packDirectory = path.join(temporaryDirectory, "packs")
       fs.mkdirSync(packDirectory)
       const artifacts = Object.fromEntries(
@@ -261,19 +303,33 @@ describe("dependency peer invariants", () => {
               // (@rolldown/binding-wasm32-wasi -> @napi-rs/wasm-runtime -> @emnapi/core). The
               // repository's own dev tooling resolves on vite 7, so the consumer graph pins the
               // same line in both managers until the upstream chain resolves cleanly again.
-              overrides: { vite: "7.2.7" },
-              pnpm: { overrides: { ...recipeArtifacts, vite: "7.2.7" } }
+              overrides: { vite: vite.version },
+              pnpm: { overrides: { ...recipeArtifacts, vite: vite.version } }
             })
           )
           const args = packageManager === "npm"
-            ? ["install", "--ignore-scripts", "--engine-strict", "--strict-peer-deps", "--no-audit", "--no-fund"]
-            : ["install", "--ignore-scripts", "--strict-peer-dependencies", "--config.engine-strict=true"]
+            ? ["install", "--ignore-scripts", "--strict-peer-deps", "--no-audit", "--no-fund"]
+            : ["install", "--ignore-scripts", "--strict-peer-dependencies"]
           try {
             execFileSync(packageManager, args, {
               cwd: consumerDirectory,
               encoding: "utf8",
               maxBuffer: 10 * 1024 * 1024,
-              stdio: "pipe"
+              stdio: "pipe",
+              env: {
+                ...process.env,
+                HTTP_PROXY: "http://127.0.0.1:9",
+                HTTPS_PROXY: "http://127.0.0.1:9",
+                NO_PROXY: "127.0.0.1,localhost",
+                http_proxy: "http://127.0.0.1:9",
+                https_proxy: "http://127.0.0.1:9",
+                no_proxy: "127.0.0.1,localhost",
+                npm_config_audit: "false",
+                npm_config_cache: path.join(temporaryDirectory, `cache-${recipe.name}-${packageManager}`),
+                npm_config_fund: "false",
+                npm_config_registry: registry.url,
+                npm_config_update_notifier: "false"
+              }
             })
           } catch (error) {
             const failure = error as { readonly stderr?: string; readonly stdout?: string }
@@ -293,6 +349,7 @@ describe("dependency peer invariants", () => {
         }
       }
     } finally {
+      if (registry !== undefined) await registry.close()
       fs.rmSync(temporaryDirectory, { recursive: true, force: true })
     }
   })

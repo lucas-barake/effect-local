@@ -26,6 +26,23 @@ const setProof = (name: string, passed: boolean, text: string) => {
   proof.querySelector(".proof-mark")!.textContent = passed ? "OK" : "!"
 }
 
+const proveDatabaseConcurrency = async () => {
+  client.armNextDatabaseResponse()
+  let completed = false
+  const databasePromise = client.stressDatabase(250_000).then((result) => {
+    completed = true
+    return result
+  })
+  await client.waitForDatabaseRequest()
+  await client.waitForDatabaseResponse()
+  try {
+    const pulses = await client.heartbeat(3)
+    return { completedWhileHeld: completed, databasePromise, pulses }
+  } finally {
+    client.releaseDatabaseResponse()
+  }
+}
+
 const runProof = async () => {
   runButton.disabled = true
   newButton.disabled = true
@@ -49,38 +66,50 @@ const runProof = async () => {
       value: "duplicate-must-not-run"
     })
     const after = await client.inspect(commandId)
-    const [pulses, database] = await Promise.all([
-      client.heartbeat(8, 60),
-      client.stressDatabase(250_000)
-    ])
-    const overlappingPulses = pulses.filter((pulse) =>
-      pulse.emittedAt >= database.startedAt && pulse.emittedAt <= database.finishedAt
-    ).length
+    const concurrency = await proveDatabaseConcurrency()
+    const database = await concurrency.databasePromise
+    const atomicityPassed = after.eventCount === 1 && after.processedCount === 1 && after.replyCount === 1
+    const duplicatePassed = JSON.stringify(first) === JSON.stringify(duplicate) && after.eventCount === 1
+    const reloadPassed = before.eventCount === 1 && before.replyCount === 1
+    const streamPassed = !concurrency.completedWhileHeld && concurrency.pulses.length === 3
 
     setProof(
       "atomicity",
-      after.eventCount === 1 && after.processedCount === 1 && after.replyCount === 1,
+      atomicityPassed,
       `${after.eventCount} event · ${after.replyCount} reply · ${after.processedCount} processed`
     )
     setProof(
       "duplicate",
-      JSON.stringify(first) === JSON.stringify(duplicate) && after.eventCount === 1,
+      duplicatePassed,
       `revision ${duplicate.revision} returned without another event`
     )
     setProof(
       "reload",
-      before.eventCount === 1 && before.replyCount === 1,
+      reloadPassed,
       before.eventCount === 1 ? "OPFS state found before this run" : "Reload once to verify"
     )
     setProof(
       "stream",
-      overlappingPulses >= 3,
-      `${overlappingPulses} pulses overlapped database work`
+      streamPassed,
+      `${concurrency.pulses.length} pulses arrived while the database response was held`
     )
 
-    status.textContent = "Proof complete"
-    statusDot.dataset.state = "passed"
-    details.textContent = JSON.stringify({ after, before, database, duplicate, first, overlappingPulses }, null, 2)
+    const passed = atomicityPassed && duplicatePassed && reloadPassed && streamPassed
+    status.textContent = passed ? "Proof complete" : "Proof failed"
+    statusDot.dataset.state = passed ? "passed" : "failed"
+    details.textContent = JSON.stringify(
+      {
+        after,
+        before,
+        completedWhileHeld: concurrency.completedWhileHeld,
+        database,
+        duplicate,
+        first,
+        pulseCount: concurrency.pulses.length
+      },
+      null,
+      2
+    )
   } catch (error) {
     status.textContent = "Proof failed"
     statusDot.dataset.state = "failed"

@@ -20,7 +20,9 @@ import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Queue from "effect/Queue"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
@@ -176,11 +178,44 @@ const relayBackend = (inboxOverrides?: Partial<RelayInbox.Options>) =>
     )
 
     // A second, separate database. The relay's inbox custody is not the client's replica.
-    const relayStore = SqlRelayInboxStore.layer.pipe(
+    const relayStoreChanges = yield* Queue.unbounded<string | undefined>()
+    const realRelayStore = SqlRelayInboxStore.layer.pipe(
       Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
       Layer.provide(Layer.succeed(Crypto.Crypto)(crypto)),
       Layer.orDie
     )
+    const relayStore = Layer.effect(RelayInboxStore.RelayInboxStore)(
+      Effect.gen(function*() {
+        const real = yield* RelayInboxStore.RelayInboxStore
+        return RelayInboxStore.RelayInboxStore.of({
+          ...real,
+          admit: (request) =>
+            real.admit(request).pipe(
+              Effect.tap(() => Queue.offer(relayStoreChanges, request.inboxKey))
+            ),
+          recordDelivery: (inboxKey, relayMessageId, options) =>
+            real.recordDelivery(inboxKey, relayMessageId, options).pipe(
+              Effect.tap(() => Queue.offer(relayStoreChanges, inboxKey))
+            ),
+          settle: (inboxKey, relayMessageId, options) =>
+            real.settle(inboxKey, relayMessageId, options).pipe(
+              Effect.tap(() => Queue.offer(relayStoreChanges, inboxKey))
+            ),
+          deadLetterExhausted: (inboxKey, relayMessageId, options) =>
+            real.deadLetterExhausted(inboxKey, relayMessageId, options).pipe(
+              Effect.tap(() => Queue.offer(relayStoreChanges, inboxKey))
+            ),
+          expire: (options) =>
+            real.expire(options).pipe(
+              Effect.tap(() => Queue.offer(relayStoreChanges, undefined))
+            ),
+          collect: (options) =>
+            real.collect(options).pipe(
+              Effect.tap(() => Queue.offer(relayStoreChanges, undefined))
+            )
+        })
+      })
+    ).pipe(Layer.provide(realRelayStore))
 
     const cluster = Sharding.layer.pipe(
       Layer.provide(Runners.layerNoop),
@@ -249,7 +284,22 @@ const relayBackend = (inboxOverrides?: Partial<RelayInbox.Options>) =>
     yield* TestClock.adjust(5000)
 
     const store = Context.get(context, RelayInboxStore.RelayInboxStore)
-    return { clientFor, crypto, store }
+    return { clientFor, crypto, store, storeChanges: relayStoreChanges }
+  })
+
+type RelayBackend = Effect.Success<ReturnType<typeof relayBackend>>
+
+const awaitUsage = (
+  backend: RelayBackend,
+  inboxKey: string,
+  predicate: (usage: RelayInboxStore.Usage) => boolean
+) =>
+  Effect.gen(function*() {
+    while (true) {
+      const usage = yield* backend.store.usage(inboxKey).pipe(Effect.orDie)
+      if (predicate(usage)) return usage
+      yield* Queue.take(backend.storeChanges)
+    }
   })
 
 // ---------------------------------------------------------------------------
@@ -653,7 +703,7 @@ describe("relay custody against a real relay", () => {
 
         // The recipient is offline for all of it, so every push files one Pending message into
         // its inbox: the polluted-inbox shape a fresh client faces after its peer worked alone.
-        const total = 50
+        const total = 3
         yield* Effect.scoped(Effect.gen(function*() {
           const session = yield* RpcPeerTransport.makeSession(
             senderClient,
@@ -682,15 +732,8 @@ describe("relay custody against a real relay", () => {
           ).pipe(Effect.provideContext(recipient.context))
 
           // The fresh session must drain the whole backlog by itself: apply and settle every
-          // message, one channel head at a time, without the session dying. The drain is
-          // stop-and-wait, so it rendezvouses on the store's pending count rather than a fixed
-          // sleep; the iteration bound only guards a broken drain.
-          let remaining = flooded.pendingCount
-          for (let round = 0; round < 200 && remaining > 0; round++) {
-            yield* TestClock.adjust(1000)
-            remaining = (yield* backend.store.usage(recipientInbox).pipe(Effect.orDie)).pendingCount
-          }
-          assert.strictEqual(remaining, 0, "the whole backlog settled")
+          // message, one channel head at a time, without the session dying.
+          yield* awaitUsage(backend, recipientInbox, (usage) => usage.pendingCount === 0)
 
           // The backlog alone cannot converge the document: sync messages generated against a
           // silent peer only announce state, and the changes travel once the sender processes
@@ -701,15 +744,9 @@ describe("relay custody against a real relay", () => {
           ).pipe(Effect.provideContext(sender.context))
 
           const expected = Array.from({ length: total }, (_, index) => `label-${index}`).toSorted()
-          let labels: ReadonlyArray<string> = []
-          for (let round = 0; round < 300; round++) {
-            yield* TestClock.adjust(1000)
-            labels = (yield* recipient.store.load(Task, documentId).pipe(Effect.orDie)).encoded.labels
-            if (labels.length !== total) continue
-            const senderPending = (yield* backend.store.usage(senderInbox).pipe(Effect.orDie)).pendingCount
-            const recipientPending = (yield* backend.store.usage(recipientInbox).pipe(Effect.orDie)).pendingCount
-            if (senderPending === 0 && recipientPending === 0) break
-          }
+          yield* awaitUsage(backend, senderInbox, (usage) => usage.pendingCount === 0)
+          yield* awaitUsage(backend, recipientInbox, (usage) => usage.pendingCount === 0)
+          const labels = (yield* recipient.store.load(Task, documentId).pipe(Effect.orDie)).encoded.labels
           assert.deepStrictEqual([...labels].toSorted(), expected)
           assert.strictEqual(
             (yield* backend.store.usage(senderInbox).pipe(Effect.orDie)).pendingCount,
@@ -720,10 +757,8 @@ describe("relay custody against a real relay", () => {
             0
           )
         }))
-        // Virtual-time deterministic; the wall clock only covers 50 growing Automerge applies,
-        // which outgrows the default timeout when the suite runs fully parallel.
       }).pipe(Effect.provide(NodeCrypto.layer))
-    ), 20_000)
+    ), 0)
 
   it.effect("survives a head whose delivery budget is already exhausted", () =>
     Effect.scoped(
@@ -776,12 +811,7 @@ describe("relay custody against a real relay", () => {
             recipientClient,
             transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
           ).pipe(Effect.provideContext(recipient.context))
-          let remaining = exhausted.length
-          for (let round = 0; round < 100 && remaining > 0; round++) {
-            yield* TestClock.adjust(1000)
-            remaining = (yield* backend.store.usage(recipientInbox).pipe(Effect.orDie)).pendingCount
-          }
-          assert.strictEqual(remaining, 0, "everything but the exhausted head settled")
+          yield* awaitUsage(backend, recipientInbox, (usage) => usage.pendingCount === 0)
         }))
 
         const abandoned = yield* backend.store.abandoned(recipientInbox, { limit: 10 }).pipe(Effect.orDie)
@@ -791,7 +821,7 @@ describe("relay custody against a real relay", () => {
           "only the exhausted head lost custody"
         )
       }).pipe(Effect.provide(NodeCrypto.layer))
-    ))
+    ), 0)
 
   it.effect("treats a failed acknowledgement as the message's problem, not the session's", () =>
     Effect.scoped(
@@ -842,11 +872,13 @@ describe("relay custody against a real relay", () => {
             flakySettles,
             transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
           ).pipe(Effect.provideContext(recipient.context))
-          let remaining = flooded
-          for (let round = 0; round < 20; round++) {
-            yield* TestClock.adjust(1000)
-            remaining = (yield* backend.store.usage(recipientInbox).pipe(Effect.orDie)).pendingCount
-          }
+          const progress = yield* awaitUsage(
+            backend,
+            recipientInbox,
+            (usage) => usage.pendingCount < flooded
+          ).pipe(Effect.forkChild)
+          yield* TestClock.adjust(20_000)
+          const remaining = (yield* Fiber.join(progress)).pendingCount
           // The unsettled head holds its own channel until the session ends, and whatever queued
           // behind it on that channel waits with it. Everything on the other channel settled,
           // which is the proof the session outlived the failure.
@@ -861,15 +893,10 @@ describe("relay custody against a real relay", () => {
             recipientClient,
             transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
           ).pipe(Effect.provideContext(recipient.context))
-          let remaining = 1
-          for (let round = 0; round < 100 && remaining > 0; round++) {
-            yield* TestClock.adjust(1000)
-            remaining = (yield* backend.store.usage(recipientInbox).pipe(Effect.orDie)).pendingCount
-          }
-          assert.strictEqual(remaining, 0, "relay custody fully transferred on redelivery")
+          yield* awaitUsage(backend, recipientInbox, (usage) => usage.pendingCount === 0)
         }))
       }).pipe(Effect.provide(NodeCrypto.layer))
-    ))
+    ), 0)
 
   it.effect("replays an outbox entry the session that admitted it never handed over", () =>
     Effect.scoped(

@@ -10,9 +10,81 @@ class PageClient extends Context.Service<
 >()("browser-spike/PageClient") {}
 
 const engineWorkers = new Set<{
+  readonly bridge: ReturnType<typeof makeDatabaseBridge>
   readonly database: Worker
   readonly shared: SharedWorker
 }>()
+
+const deferred = () => {
+  let resolve!: () => void
+  const promise = new Promise<void>((resume) => {
+    resolve = resume
+  })
+  return { promise, resolve }
+}
+
+const makeDatabaseBridge = () => {
+  const shared = new MessageChannel()
+  const worker = new MessageChannel()
+  let gate: {
+    readonly request: ReturnType<typeof deferred>
+    readonly response: ReturnType<typeof deferred>
+    requestObserved: boolean
+    held?: MessageEvent
+  } | undefined
+  const forward = (target: MessagePort, event: MessageEvent) => {
+    target.postMessage(event.data, [...event.ports])
+  }
+  shared.port1.addEventListener("message", (event) => {
+    if (gate !== undefined && !gate.requestObserved) {
+      gate.requestObserved = true
+      gate.request.resolve()
+    }
+    forward(worker.port2, event)
+  })
+  worker.port2.addEventListener("message", (event) => {
+    if (gate !== undefined && gate.requestObserved && gate.held === undefined) {
+      gate.held = event
+      gate.response.resolve()
+      return
+    }
+    forward(shared.port1, event)
+  })
+  shared.port1.start()
+  worker.port2.start()
+  return {
+    sharedPort: shared.port2,
+    workerPort: worker.port1,
+    arm: () => {
+      if (gate !== undefined) throw new Error("a database response gate is already armed")
+      gate = { request: deferred(), response: deferred(), requestObserved: false }
+    },
+    waitForRequest: () => {
+      if (gate === undefined) throw new Error("no database response gate is armed")
+      return gate.request.promise
+    },
+    waitForResponse: () => {
+      if (gate === undefined) throw new Error("no database response gate is armed")
+      return gate.response.promise
+    },
+    release: () => {
+      if (gate?.held === undefined) throw new Error("no database response is held")
+      forward(shared.port1, gate.held)
+      gate = undefined
+    },
+    releaseIfHeld: () => {
+      if (gate?.held !== undefined) forward(shared.port1, gate.held)
+      gate = undefined
+    },
+    close: () => {
+      if (gate !== undefined) throw new Error("database bridge closed while a response gate was armed")
+      shared.port1.close()
+      worker.port2.close()
+    }
+  }
+}
+
+let activeDatabaseBridge: ReturnType<typeof makeDatabaseBridge> | undefined
 
 const PageClientLive = Layer.effect(PageClient)(RpcClient.make(PageApi)).pipe(
   Layer.provide(RpcClient.layerProtocolWorker({ size: 1, concurrency: 16 })),
@@ -25,17 +97,18 @@ const PageClientLive = Layer.effect(PageClient)(RpcClient.make(PageApi)).pipe(
       name: "stage0-opfs",
       type: "module"
     })
-    const databaseChannel = new MessageChannel()
+    const bridge = makeDatabaseBridge()
     const rpcChannel = new MessageChannel()
     shared.addEventListener("error", (event) => console.error("Shared engine failed", event.message))
     database.addEventListener("error", (event) => console.error("OPFS worker failed", event.message))
-    database.postMessage(databaseChannel.port1, [databaseChannel.port1])
+    database.postMessage(bridge.workerPort, [bridge.workerPort])
     shared.port.postMessage({
-      databasePort: databaseChannel.port2,
+      databasePort: bridge.sharedPort,
       rpcPort: rpcChannel.port1
-    }, [databaseChannel.port2, rpcChannel.port1])
+    }, [bridge.sharedPort, rpcChannel.port1])
     shared.port.start()
-    engineWorkers.add({ database, shared })
+    activeDatabaseBridge = bridge
+    engineWorkers.add({ bridge, database, shared })
     return rpcChannel.port2
   }))
 )
@@ -60,17 +133,36 @@ export const client = {
   startWorkflow: (id: string) => run(Effect.flatMap(PageClient, (pageClient) => pageClient.StartWorkflow({ id }))),
   inspectWorkflow: (id: string, executionId: string) =>
     run(Effect.flatMap(PageClient, (pageClient) => pageClient.InspectWorkflow({ executionId, id }))),
-  heartbeat: (count: number, intervalMs: number) =>
+  heartbeat: (count: number) =>
     run(Effect.flatMap(PageClient, (pageClient) =>
-      Stream.runCollect(pageClient.Heartbeat({ count, intervalMs })).pipe(
+      Stream.runCollect(pageClient.Heartbeat({ count })).pipe(
         Effect.map((chunk) => Array.from(chunk))
       ))),
+  armNextDatabaseResponse: () => {
+    if (activeDatabaseBridge === undefined) throw new Error("database bridge is not ready")
+    activeDatabaseBridge.arm()
+  },
+  waitForDatabaseRequest: () => {
+    if (activeDatabaseBridge === undefined) throw new Error("database bridge is not ready")
+    return activeDatabaseBridge.waitForRequest()
+  },
+  waitForDatabaseResponse: () => {
+    if (activeDatabaseBridge === undefined) throw new Error("database bridge is not ready")
+    return activeDatabaseBridge.waitForResponse()
+  },
+  releaseDatabaseResponse: () => {
+    if (activeDatabaseBridge === undefined) throw new Error("database bridge is not ready")
+    activeDatabaseBridge.release()
+  },
   dispose: async () => {
+    activeDatabaseBridge?.releaseIfHeld()
     await runtime.dispose()
     for (const workers of engineWorkers) {
+      workers.bridge.close()
       workers.database.terminate()
       workers.shared.port.close()
     }
     engineWorkers.clear()
+    activeDatabaseBridge = undefined
   }
 }

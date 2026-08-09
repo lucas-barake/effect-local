@@ -1231,22 +1231,28 @@ describe("RelayServer", () => {
       assert.strictEqual(pending.length, 1, "the terminal transition never ran")
     })))
 
-  it.effect("keeps a session past its liveness deadline for as long as the socket lives", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const peer = yield* harness()
-      const senderSession = yield* open(peer, sender, recipient)
-      const recipientSession = yield* open(peer, recipient, sender)
+  it.effect(
+    "keeps a session past its liveness deadline for as long as the socket lives",
+    () =>
+      Effect.scoped(Effect.gen(function*() {
+        const peer = yield* harness()
+        const senderSession = yield* open(peer, sender, recipient)
+        const recipientSession = yield* open(peer, recipient, sender)
 
-      // A cluster cannot rely on disconnects announcing themselves, so the entity reaps any session
-      // that stops proving it is alive. Nothing on the wire refreshes it — the client does not know
-      // the session exists — so the relay drives the heartbeat itself, and without it every session
-      // would go dark one deadline after opening no matter how healthy the connection is.
-      yield* TestClock.adjust(Duration.toMillis(inboxOptions.sessionDeadline) * 4)
+        // A cluster cannot rely on disconnects announcing themselves, so the entity reaps any session
+        // that stops proving it is alive. Nothing on the wire refreshes it — the client does not know
+        // the session exists — so the relay drives the heartbeat itself, and without it every session
+        // would go dark one deadline after opening no matter how healthy the connection is.
+        yield* TestClock.adjust(
+          Duration.toMillis(inboxOptions.sessionDeadline) + Duration.toMillis(inboxOptions.sessionSweep)
+        )
 
-      yield* push(peer, senderSession.opened.sessionId, yield* encodePayload(peer))
-      const delivered = yield* Queue.take(recipientSession.events)
-      assert.strictEqual(delivered._tag, "StoredMessage")
-    })))
+        yield* push(peer, senderSession.opened.sessionId, yield* encodePayload(peer))
+        const delivered = yield* Queue.take(recipientSession.events)
+        assert.strictEqual(delivered._tag, "StoredMessage")
+      })),
+    0
+  )
 
   it.effect("reports an entity call that outlives its timeout as unavailability", () =>
     Effect.scoped(Effect.gen(function*() {

@@ -9,6 +9,7 @@ import * as PeerRpcError from "@lucas-barake/effect-local-rpc/PeerRpcError"
 import * as RelayServer from "@lucas-barake/effect-local-rpc/RelayServer"
 import * as SqlRelayInboxStore from "@lucas-barake/effect-local-rpc/SqlRelayInboxStore"
 import * as Clock from "effect/Clock"
+import * as Context from "effect/Context"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -20,6 +21,7 @@ import * as RunnerStorage from "effect/unstable/cluster/RunnerStorage"
 import * as Sharding from "effect/unstable/cluster/Sharding"
 import * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
 import * as HttpRouter from "effect/unstable/http/HttpRouter"
+import * as HttpServer from "effect/unstable/http/HttpServer"
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
@@ -33,7 +35,7 @@ import { devices } from "./src/identities.ts"
  * it. Single runner on purpose - multi-runner ownership is covered by `RelayInboxMultiRunner`.
  */
 
-const port = Number(process.env.EFFECT_LOCAL_RELAY_PORT ?? 4176)
+const port = Number(process.env.EFFECT_LOCAL_RELAY_PORT ?? 0)
 
 const principals = new Map(devices.map((device) => [device.token, device.principal]))
 
@@ -142,8 +144,16 @@ const Rpc = RpcServer.layer(PeerRpc.Rpcs).pipe(
 // Readiness without opening a websocket.
 const Ready = HttpRouter.add("GET", "/ready", HttpServerResponse.text("ok"))
 
-HttpRouter.serve(Layer.mergeAll(Rpc, Ready)).pipe(
-  Layer.provide(NodeHttpServer.layer(createServer, { port, host: "127.0.0.1" })),
-  Layer.launch,
+const Main = HttpRouter.serve(Layer.mergeAll(Rpc, Ready)).pipe(
+  Layer.provideMerge(NodeHttpServer.layer(createServer, { port, host: "127.0.0.1" }))
+)
+
+Effect.scoped(Effect.gen(function*() {
+  const context = yield* Layer.build(Main)
+  const server = Context.get(context, HttpServer.HttpServer)
+  if (server.address._tag !== "TcpAddress") throw new Error("Relay did not bind a TCP port")
+  process.send?.({ _tag: "RelayReady", url: `http://127.0.0.1:${server.address.port}` })
+  return yield* Effect.never
+})).pipe(
   NodeRuntime.runMain
 )

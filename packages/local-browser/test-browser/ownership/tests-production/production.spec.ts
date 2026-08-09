@@ -1,5 +1,5 @@
-import { expect, test } from "@playwright/test"
 import type { BrowserContext, Page } from "@playwright/test"
+import { expect, test } from "../playwright.production.ts"
 
 const ownershipTransitionTimeout = 40_000
 
@@ -175,52 +175,55 @@ test("starts concurrent built ownership clients and serves SQLite WASM", async (
   expect(wasm.headers()["content-type"]).toContain("application/wasm")
 })
 
-test("restores archived state durably through the built ownership runtime", async ({ context, page, request }) => {
-  await instrumentWorkerBoundaries(context)
-  await request.get("/__effect-local-runtime/release")
-  await page.goto("/")
-  await Promise.all([
-    attachPosted(page),
-    ownerInfo(page),
-    expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
-  ])
+test(
+  "restores archived state durably through the built ownership runtime",
+  async ({ context, page, request }, testInfo) => {
+    await instrumentWorkerBoundaries(context)
+    await request.get("/__effect-local-runtime/release")
+    await page.goto("/")
+    await Promise.all([
+      attachPosted(page),
+      ownerInfo(page),
+      expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
+    ])
 
-  const archivedTitle = `Built archived backup ${crypto.randomUUID()}`
-  const postBackupTitle = `Built post backup ${crypto.randomUUID()}`
-  await page.getByLabel("New task title").fill(archivedTitle)
-  await page.getByRole("button", { name: "Add task" }).click()
-  await expect(page.getByText(archivedTitle, { exact: true })).toBeVisible()
-  await page.getByRole("button", { name: `Mark ${archivedTitle} complete` }).click()
-  await page.getByRole("button", { name: "Completed" }).click()
-  await expect(page.getByText(archivedTitle, { exact: true })).toBeVisible()
+    const archivedTitle = `Built archived backup ${crypto.randomUUID()}`
+    const postBackupTitle = `Built post backup ${crypto.randomUUID()}`
+    await page.getByLabel("New task title").fill(archivedTitle)
+    await page.getByRole("button", { name: "Add task" }).click()
+    await expect(page.getByText(archivedTitle, { exact: true })).toBeVisible()
+    await page.getByRole("button", { name: `Mark ${archivedTitle} complete` }).click()
+    await page.getByRole("button", { name: "Completed" }).click()
+    await expect(page.getByText(archivedTitle, { exact: true })).toBeVisible()
 
-  const downloadPromise = page.waitForEvent("download")
-  await page.getByRole("button", { name: "Download" }).click()
-  const download = await downloadPromise
-  const path = await download.path()
-  expect(path).not.toBeNull()
-  await expect(page.getByText("Backup downloaded")).toBeVisible()
+    const downloadPromise = page.waitForEvent("download")
+    await page.getByRole("button", { name: "Download" }).click()
+    const download = await downloadPromise
+    const backupPath = testInfo.outputPath("backup.ndjson")
+    await download.saveAs(backupPath)
+    await expect(page.getByText("Backup downloaded")).toBeVisible()
 
-  await page.getByRole("button", { name: `Delete ${archivedTitle}` }).click()
-  await expect(page.getByText(archivedTitle, { exact: true })).not.toBeVisible()
-  await page.getByRole("button", { name: "Active" }).click()
-  await page.getByLabel("New task title").fill(postBackupTitle)
-  await page.getByRole("button", { name: "Add task" }).click()
-  await expect(page.getByText(postBackupTitle, { exact: true })).toBeVisible()
+    await page.getByRole("button", { name: `Delete ${archivedTitle}` }).click()
+    await expect(page.getByText(archivedTitle, { exact: true })).not.toBeVisible()
+    await page.getByRole("button", { name: "Active" }).click()
+    await page.getByLabel("New task title").fill(postBackupTitle)
+    await page.getByRole("button", { name: "Add task" }).click()
+    await expect(page.getByText(postBackupTitle, { exact: true })).toBeVisible()
 
-  page.once("dialog", (dialog) => void dialog.accept())
-  await page.getByLabel("Choose backup file").setInputFiles(path!)
-  await expect(page.getByText("Backup restored")).toBeVisible({ timeout: ownershipTransitionTimeout })
-  await expect(page.getByText(postBackupTitle, { exact: true })).not.toBeVisible()
-  await page.getByRole("button", { name: "Completed" }).click()
-  await expect(page.getByText(archivedTitle, { exact: true })).toBeVisible()
+    page.once("dialog", (dialog) => void dialog.accept())
+    await page.getByLabel("Choose backup file").setInputFiles(backupPath)
+    await expect(page.getByText("Backup restored")).toBeVisible({ timeout: ownershipTransitionTimeout })
+    await expect(page.getByText(postBackupTitle, { exact: true })).not.toBeVisible()
+    await page.getByRole("button", { name: "Completed" }).click()
+    await expect(page.getByText(archivedTitle, { exact: true })).toBeVisible()
 
-  await page.reload()
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
-  await expect(page.getByText(postBackupTitle, { exact: true })).not.toBeVisible()
-  await page.getByRole("button", { name: "Completed" }).click()
-  await expect(page.getByText(archivedTitle, { exact: true })).toBeVisible()
-})
+    await page.reload()
+    await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
+    await expect(page.getByText(postBackupTitle, { exact: true })).not.toBeVisible()
+    await page.getByRole("button", { name: "Completed" }).click()
+    await expect(page.getByText(archivedTitle, { exact: true })).toBeVisible()
+  }
+)
 
 test("surfaces a built ownership runtime load failure", async ({ context, page, request }) => {
   await instrumentWorkerBoundaries(context)
