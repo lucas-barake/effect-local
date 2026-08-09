@@ -10,6 +10,7 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
+import * as Result from "effect/Result"
 import * as Stream from "effect/Stream"
 import { RpcClient } from "effect/unstable/rpc"
 import * as Worker from "effect/unstable/workers/Worker"
@@ -75,7 +76,7 @@ it.layer(NodeCrypto.layer)("ReplicaOwner defect isolation", (it) => {
           ReplicaLimits.layer(limits),
           Rename.toLayer(({ draft, payload }) => {
             draft.title = payload.title
-            return "renamed"
+            return Result.succeed("renamed")
           }),
           Read.toLayer((payload) =>
             Effect.suspend(() => {
