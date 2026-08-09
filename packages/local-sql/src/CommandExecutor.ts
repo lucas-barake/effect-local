@@ -631,7 +631,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 const stored = yield* store.create(document, options.documentId, options.value).pipe(
                   Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
                 )
-                yield* projections.replaceDocument(document, stored.snapshot, stored.commitSequence)
+                yield* projections.replaceDocument(document, stored.snapshot, stored.commitSequence, "Fresh")
                 const outcome = CommandOutcome.durablyCommitted(options.commandId, options.documentId)
                 const result = yield* encodeResult(CommandOutcome.schema(Identity.DocumentId, Schema.Never), outcome)
                 yield* persistReceipt({
@@ -741,7 +741,12 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 const persisted = yield* store.persist(mutation.document, options.documentId, durable, staged).pipe(
                   Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
                 )
-                yield* projections.replaceDocument(mutation.document, persisted.snapshot, persisted.commitSequence)
+                yield* projections.replaceDocument(
+                  mutation.document,
+                  persisted.snapshot,
+                  persisted.commitSequence,
+                  changeHashes.length > 0 ? "Fresh" : "Reused"
+                )
                 const outcome = CommandOutcome.durablyCommitted(options.commandId, handlerResult.success)
                 const result = yield* encodeResult(
                   CommandOutcome.schema(mutation.successSchema, mutation.errorSchema),
@@ -803,7 +808,12 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 const persisted = yield* store.persist(document, options.documentId, durable, staged).pipe(
                   Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
                 )
-                yield* projections.replaceDocument(document, persisted.snapshot, persisted.commitSequence)
+                yield* projections.replaceDocument(
+                  document,
+                  persisted.snapshot,
+                  persisted.commitSequence,
+                  deletedChangeHashes.length > 0 ? "Fresh" : "Reused"
+                )
                 const outcome = CommandOutcome.durablyCommitted(options.commandId, undefined)
                 const result = yield* encodeResult(CommandOutcome.schema(Schema.Void, Schema.Never), outcome)
                 yield* persistReceipt({
@@ -962,7 +972,12 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 const persisted = yield* store.persist(document, options.documentId, durable, staged).pipe(
                   Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
                 )
-                yield* projections.replaceDocument(document, persisted.snapshot, persisted.commitSequence)
+                yield* projections.replaceDocument(
+                  document,
+                  persisted.snapshot,
+                  persisted.commitSequence,
+                  resolvedChangeHashes.length > 0 ? "Fresh" : "Reused"
+                )
                 const outcome = CommandOutcome.durablyCommitted(options.commandId, undefined)
                 const result = yield* encodeResult(
                   CommandOutcome.schema(Schema.Void, Conflict.ResolutionError),

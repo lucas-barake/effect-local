@@ -332,7 +332,13 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
       const leftInspection = yield* left.replica.inspectConflicts(Message, documentId)
       const rightInspection = yield* right.replica.inspectConflicts(Message, documentId)
       assert.strictEqual(leftInspection.snapshot.value.message, "right edit")
-      assert.deepStrictEqual(leftInspection.snapshot, rightInspection.snapshot)
+      // `projection` is replica-local bookkeeping: a local command rebuilds that replica's
+      // projections while inbound sync defers the rebuild, so only the converged document state is
+      // compared across replicas.
+      assert.deepStrictEqual(
+        { ...leftInspection.snapshot, projection: null },
+        { ...rightInspection.snapshot, projection: null }
+      )
       assert.deepStrictEqual(leftInspection.conflicts, [])
       assert.deepStrictEqual(rightInspection.conflicts, [])
     })))
@@ -446,7 +452,11 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
       yield* drain(documentId, left, right, true)
       const leftInspection = yield* left.replica.inspectConflicts(Message, documentId)
       const rightInspection = yield* right.replica.inspectConflicts(Message, documentId)
-      assert.deepStrictEqual(leftInspection.snapshot, rightInspection.snapshot)
+      // `projection` is replica-local bookkeeping, see above.
+      assert.deepStrictEqual(
+        { ...leftInspection.snapshot, projection: null },
+        { ...rightInspection.snapshot, projection: null }
+      )
       assert.deepStrictEqual(leftInspection.snapshot.value, {
         message: "left",
         labels: ["frontier advanced"]

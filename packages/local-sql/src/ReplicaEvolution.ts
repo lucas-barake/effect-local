@@ -73,7 +73,7 @@ export const make = (
       sql.withTransaction(
         Effect.acquireUseRelease(
           store.materialize(document, documentId),
-          (stored) => projections.replaceDocument(document, stored.snapshot, stored.commitSequence),
+          (stored) => projections.replaceDocument(document, stored.snapshot, stored.commitSequence, "Reused"),
           (stored) => Effect.sync(() => InternalAutomerge.free(stored.automerge))
         )
       )

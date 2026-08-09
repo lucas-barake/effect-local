@@ -250,14 +250,19 @@ describe("ProjectionStore", () => {
         commit_sequence, document_id, invalidation_keys, published
       ) VALUES (${commitSequence}, ${documentId}, '["Task"]', 0)`
 
-      yield* store.replaceDocument(Task, {
-        documentId,
-        value: { labels: ["one"] },
-        version: 1,
-        heads: ["first"],
-        tombstone: false,
-        projection: "Ready"
-      }, commitSequence)
+      yield* store.replaceDocument(
+        Task,
+        {
+          documentId,
+          value: { labels: ["one"] },
+          version: 1,
+          heads: ["first"],
+          tombstone: false,
+          projection: "Ready"
+        },
+        commitSequence,
+        "Fresh"
+      )
 
       const rows = yield* sql<{ readonly invalidation_keys: string }>`
         SELECT invalidation_keys FROM effect_local_commit_outbox
