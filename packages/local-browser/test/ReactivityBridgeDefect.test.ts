@@ -1,5 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Cause from "effect/Cause"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -46,6 +47,40 @@ describe("ReplicaAtom reactivity bridge", () => {
           assert.strictEqual(subscriptions, 2, "the bridge must resubscribe after a defect")
           yield* Deferred.await(consumed)
           assert.strictEqual(invalidations, 1)
+        }).pipe(
+          Effect.provideService(ReplicaClient.ReplicaClient, client),
+          Effect.provideService(Reactivity.Reactivity, reactivity)
+        )
+      )
+    }))
+
+  it.effect("preserves interruption when another cause is present", () =>
+    Effect.gen(function*() {
+      const reactivity = yield* Reactivity.make
+      const failed = yield* Deferred.make<void>()
+      let subscriptions = 0
+      const client: ReplicaClient.ReplicaClient["Service"] = {
+        ...replica,
+        ownerEpoch: "owner",
+        peerConnectionStatus,
+        relayConnectionStatus,
+        invalidations: Stream.unwrap(Effect.sync(() => {
+          subscriptions++
+          return Stream.fromEffect(Deferred.succeed(failed, undefined)).pipe(
+            Stream.flatMap(() =>
+              Stream.fromEffect(
+                Effect.failCause(Cause.combine(Cause.interrupt(1), Cause.die("cleanup defect")))
+              )
+            )
+          )
+        }))
+      }
+      yield* Effect.scoped(
+        Effect.gen(function*() {
+          yield* Layer.build(ReplicaAtom.layerReactivity)
+          yield* Deferred.await(failed)
+          yield* TestClock.adjust(1_000)
+          assert.strictEqual(subscriptions, 1, "an interrupted bridge must not restart")
         }).pipe(
           Effect.provideService(ReplicaClient.ReplicaClient, client),
           Effect.provideService(Reactivity.Reactivity, reactivity)

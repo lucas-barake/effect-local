@@ -26,11 +26,10 @@ export const layerReactivity = Layer.effectDiscard(Effect.gen(function*() {
   const reactivity = yield* Reactivity.Reactivity
   yield* replica.invalidations.pipe(
     Stream.runForEach((event) => reactivity.invalidate(event.keys)),
-    // The bridge is the only path from owner commits to this tab's atoms, so any end that is not
-    // this scope closing — a defect from a torn rpc port included — would leave the tab silently
-    // stale for the rest of its life.
+    // Restarting after a noninterrupt failure keeps remote invalidations live. Interruption remains
+    // terminal so the owning scope controls shutdown.
     Effect.catchCause((cause) =>
-      Cause.hasInterruptsOnly(cause)
+      Cause.hasInterrupts(cause)
         ? Effect.failCause(cause)
         : Effect.logWarning("replica invalidation stream restarting", cause)
     ),
