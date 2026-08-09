@@ -14,6 +14,7 @@ import * as Layer from "effect/Layer"
 import * as RcMap from "effect/RcMap"
 import * as Schema from "effect/Schema"
 import * as Semaphore from "effect/Semaphore"
+import * as Stream from "effect/Stream"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
 import * as BackupStore from "./BackupStore.js"
 import * as CommandDeliveryPublisher from "./CommandDeliveryPublisher.js"
@@ -27,6 +28,7 @@ import * as InternalConflicts from "./internal/conflicts.js"
 import * as QueryExecutor from "./QueryExecutor.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 import * as ReplicaHealth from "./ReplicaHealth.js"
+import * as ReplicaOperationScheduler from "./ReplicaOperationScheduler.js"
 
 const encode = <S extends Document.WireSchema,>(schema: S, value: S["Type"]) =>
   Schema.encodeEffect(Schema.fromJsonString(Schema.toCodecJson(schema)))(value).pipe(
@@ -64,6 +66,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
   | DocumentStore.DocumentStore
   | QueryExecutor.QueryExecutor
   | ReplicaGate.ReplicaGate
+  | ReplicaOperationScheduler.ReplicaOperationScheduler
   | ReplicaHealth.ReplicaHealth
   | ReplicaLimits.ReplicaLimits
   | Crypto.Crypto
@@ -81,6 +84,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       const entity = yield* DocumentEntity.DocumentEntity.client
       const queries = yield* QueryExecutor.QueryExecutor
       const gate = yield* ReplicaGate.ReplicaGate
+      const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
       const health = yield* ReplicaHealth.ReplicaHealth
       const limits = yield* ReplicaLimits.ReplicaLimits
       const crypto = yield* Crypto.Crypto
@@ -90,14 +94,18 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       })
 
       const withPermit = <A, E, R,>(f: (permit: ReplicaGate.Permit) => Effect.Effect<A, E, R>) =>
-        gate.admit.pipe(Effect.flatMap(f), Effect.scoped)
+        Effect.scoped(Effect.gen(function*() {
+          yield* scheduler.interactive
+          const permit = yield* gate.admit
+          return yield* f(permit)
+        }))
 
       const withCommandPermit = <A, E, R,>(
         commandId: Identity.CommandId,
         f: (permit: ReplicaGate.Permit) => Effect.Effect<A, E, R>
       ) =>
-        withPermit((permit) =>
-          RcMap.get(commandLocks, `${permit.incarnation}:${commandId}`).pipe(
+        Effect.scoped(Effect.gen(function*() {
+          const lock = yield* RcMap.get(commandLocks, commandId).pipe(
             Effect.mapError(() =>
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.QuotaExceeded({
@@ -105,10 +113,14 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   limit: limits.maxQueuedRpc
                 })
               })
-            ),
-            Effect.flatMap((lock) => lock.withPermit(f(permit)))
+            )
           )
-        )
+          return yield* lock.withPermit(Effect.gen(function*() {
+            yield* scheduler.interactive
+            const permit = yield* gate.admit
+            return yield* f(permit)
+          }))
+        }))
 
       const service: Replica.Replica["Service"] = {
         create: (document, options) =>
@@ -138,7 +150,8 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                         cause
                       })
                     })
-                  ))
+                  )),
+                Effect.uninterruptible
               )
               yield* publisher.publishPending
               yield* deliveryPublisher.publishPending.pipe(Effect.catchTag("ReplicaError", () => Effect.void))
@@ -193,7 +206,8 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.StorageUnavailable({ cause })
                     })
-                  ))
+                  )),
+                Effect.uninterruptible
               )
               const outcome = yield* decode(
                 CommandOutcome.schema(Schema.Void, Conflict.ResolutionError),
@@ -262,7 +276,8 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                         cause
                       })
                     })
-                  ))
+                  )),
+                Effect.uninterruptible
               )
               yield* publisher.publishPending
               yield* deliveryPublisher.publishPending.pipe(Effect.catchTag("ReplicaError", () => Effect.void))
@@ -293,7 +308,8 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                         cause
                       })
                     })
-                  ))
+                  )),
+                Effect.uninterruptible
               )
               yield* publisher.publishPending
               yield* deliveryPublisher.publishPending.pipe(Effect.catchTag("ReplicaError", () => Effect.void))
@@ -316,29 +332,33 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               }
             })
           ),
-        lookupCommandDelivery: (commandId) => deliveries.lookup(commandId),
-        commandDeliveryChanges: (commandId) => deliveryPublisher.changes(commandId),
+        lookupCommandDelivery: (commandId) => withPermit(() => deliveries.lookup(commandId)),
+        commandDeliveryChanges: deliveryPublisher.changes,
         flush: withPermit(() =>
           Effect.all([publisher.publishPending, deliveryPublisher.publishPending], { discard: true })
         ),
         status: health.status,
-        exportBackup: backups.export,
+        exportBackup: (options) => Stream.unwrap(scheduler.interactive.pipe(Effect.as(backups.export(options)))),
         restoreBackup: (options) =>
-          Effect.uninterruptibleMask((interruptible) =>
-            Effect.gen(function*() {
-              const restored = yield* Effect.exit(interruptible(backups.restore(options)))
-              const refreshed = yield* Effect.exit(Effect.all([
-                publisher.invalidate(ReplicaDefinition.invalidationKeys(definition)),
-                deliveryPublisher.refresh
-              ], { discard: true }))
-              return yield* Exit.asVoidAll([restored, refreshed])
-            })
-          ),
+          Effect.scoped(scheduler.interactive.pipe(Effect.andThen(
+            Effect.uninterruptibleMask((interruptible) =>
+              Effect.gen(function*() {
+                const restored = yield* Effect.exit(interruptible(backups.restore(options)))
+                const refreshed = yield* Effect.exit(Effect.all([
+                  publisher.invalidate(ReplicaDefinition.invalidationKeys(definition)),
+                  deliveryPublisher.refresh
+                ], { discard: true }))
+                return yield* Exit.asVoidAll([restored, refreshed])
+              })
+            )
+          ))),
         installBackupDocument: (document, options) =>
-          Effect.gen(function*() {
-            yield* backups.installDocument(document, options)
-            yield* publisher.publishPending
-          }),
+          Effect.scoped(scheduler.interactive.pipe(Effect.andThen(
+            Effect.gen(function*() {
+              yield* backups.installDocument(document, options)
+              yield* publisher.publishPending
+            })
+          ))),
         exportDocument: (document, documentId) =>
           withPermit(() =>
             Effect.acquireUseRelease(
