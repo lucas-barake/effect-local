@@ -1127,7 +1127,7 @@ ReactNativePolyfills.install()
 The composition itself mirrors the Node quick start with platform layers swapped:
 
 ```ts
-// src/replica.ts, abridged from the checked example under examples/react-native-tasks/
+// src/replica.ts
 import * as AppLifecycle from "@lucas-barake/effect-local-react-native/AppLifecycle"
 import * as ExpoSqlite from "@lucas-barake/effect-local-react-native/ExpoSqlite"
 import * as ReactNativeCrypto from "@lucas-barake/effect-local-react-native/ReactNativeCrypto"
@@ -1188,18 +1188,9 @@ Three platform behaviors to know before shipping:
   (`Atom.context({ memoMap: Layer.makeMemoMapUnsafe() })`), otherwise the second graph aliases the first
   graph's services.
 - **Metro and Babel configuration.** effect's `Migrator.fromFileSystem` contains a computed `import()` that
-  Metro rejects at bundle time even though local-sql never calls it; the example's
-  [`babel.config.js`](examples/react-native-tasks/babel.config.js) rewrites that one call site and is required
-  for every consumer. Consuming the workspace sources directly (instead of published builds) additionally
-  needs the `.js` to `.ts` specifier rewrite in
-  [`examples/react-native-tasks/metro.config.js`](examples/react-native-tasks/metro.config.js).
-
-The complete checked application is [`examples/react-native-tasks/`](examples/react-native-tasks/): domain,
-composition, a boot self test that proves the runtime capabilities (WebAssembly, automerge WASM init, crypto,
-base64, UTF-8, then a full replica round trip on the real database), and a reactive labels view. Run it with
-`pnpm install && pnpm start` in that directory and open it in Expo Go; the self test prints its results on the
-first screen. The package's unit and integration suites run in Node against faithful native module fakes, and
-`expo export` verifies both Hermes bytecode bundles in CI shape.
+  Metro rejects at bundle time even though local-sql never calls it. Configure Babel to rewrite that computed
+  import before Metro bundles the application. Consuming workspace TypeScript sources directly instead of
+  published builds also requires Metro to resolve emitted `.js` specifiers to their `.ts` sources.
 
 ## Reactive state
 
@@ -2114,8 +2105,8 @@ Limitations:
 
 The durable React Native composition requires React Native >= 0.85 (Expo SDK >= 56) for Hermes v1 and its
 `WebAssembly` global, expo-sqlite and expo-crypto as native modules (Expo Go already bundles both),
-`ReactNativePolyfills.install()` at application entry, and the Babel rewrite of effect's computed migration
-import shown in [`examples/react-native-tasks/babel.config.js`](examples/react-native-tasks/babel.config.js).
+`ReactNativePolyfills.install()` at application entry, and a Babel rewrite of effect's computed migration
+import before Metro bundles the application.
 Continuous background sync is not available: the OS suspends a backgrounded app, so replicas flush on
 background and sync on foreground resume.
 

@@ -1,7 +1,6 @@
 {
   "$schema": "https://unpkg.com/knip@6.27.0/schema.json",
   "includeEntryExports": false,
-  "ignore": [".worktrees/**"],
   "workspaces": {
     "packages/local-sql": {
       "entry": ["test/crash-durability/childProcess.ts", "examples/*.ts"],
@@ -25,10 +24,6 @@
     },
     "packages/local-react-native": {
       "entry": ["test/helpers/*.ts"]
-    },
-    "examples/react-native-tasks": {
-      "entry": ["index.ts", "app.json", "metro.config.js", "babel.config.js", "src/**/*.{ts,tsx}"],
-      "ignoreDependencies": ["babel-preset-expo", "expo-updates", "expo-system-ui"]
     }
   }
 }

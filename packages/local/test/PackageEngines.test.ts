@@ -74,7 +74,7 @@ describe("published package engines", () => {
       workspacePackages.some((workspacePackage) => workspacePackage.path === repoRoot && workspacePackage.private)
     )
     assert.deepStrictEqual(
-      workspacePackages.filter((workspacePackage) => workspacePackage.path.startsWith(packagesDirectory))
+      workspacePackages.filter((workspacePackage) => workspacePackage.path !== repoRoot)
         .map((workspacePackage) => workspacePackage.path)
         .toSorted(),
       packageDirectoryManifests.map(({ directory }) => directory).toSorted()

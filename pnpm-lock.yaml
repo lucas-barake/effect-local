@@ -60,49 +60,6 @@ importers:
         specifier: 4.1.10
         version: 4.1.10(@types/node@25.9.5)(@vitest/coverage-v8@4.1.10)(vite@7.3.6(@types/node@25.9.5)(jiti@2.7.0)(lightningcss@1.33.0)(terser@5.49.2)(tsx@4.20.6)(yaml@2.9.0))
 
-  examples/react-native-tasks:
-    dependencies:
-      '@effect/atom-react':
-        specifier: 4.0.0-beta.99
-        version: 4.0.0-beta.99(effect@4.0.0-beta.99)(react@19.2.7)(scheduler@0.27.0)
-      '@lucas-barake/effect-local':
-        specifier: workspace:^
-        version: link:../../packages/local
-      '@lucas-barake/effect-local-react-native':
-        specifier: workspace:^
-        version: link:../../packages/local-react-native
-      '@lucas-barake/effect-local-sql':
-        specifier: workspace:^
-        version: link:../../packages/local-sql
-      effect:
-        specifier: 4.0.0-beta.99
-        version: 4.0.0-beta.99
-      expo:
-        specifier: ^57.0.9
-        version: 57.0.11(@babel/core@7.29.7)(@expo/dom-webview@57.0.1)(react-dom@19.2.7(react@19.2.7))(react-native@0.86.2(@babel/core@7.29.7)(@types/react@19.2.17)(react@19.2.7))(react@19.2.7)(typescript@6.0.3)
-      expo-crypto:
-        specifier: ~57.0.1
-        version: 57.0.1(expo@57.0.11)
-      expo-sqlite:
-        specifier: ~57.0.1
-        version: 57.0.1(expo@57.0.11)(react-native@0.86.2(@babel/core@7.29.7)(@types/react@19.2.17)(react@19.2.7))(react@19.2.7)
-      react:
-        specifier: 19.2.7
-        version: 19.2.7
-      react-native:
-        specifier: 0.86.2
-        version: 0.86.2(@babel/core@7.29.7)(@types/react@19.2.17)(react@19.2.7)
-    devDependencies:
-      '@types/react':
-        specifier: ^19.2.0
-        version: 19.2.17
-      babel-preset-expo:
-        specifier: ~57.0.0
-        version: 57.0.6(@babel/core@7.29.7)(@babel/runtime@7.29.7)(expo@57.0.11)(react-refresh@0.14.2)
-      typescript:
-        specifier: ^6.0.3
-        version: 6.0.3
-
   packages/local:
     devDependencies:
       '@automerge/automerge':

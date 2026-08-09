@@ -14,6 +14,4 @@ Import the neutral Atom factories from `@lucas-barake/effect-local-sql/ReplicaAt
 reexport.
 
 See the [Effect Local documentation](https://github.com/lucas-barake/effect-local#readme)
-for the React Native composition guide, platform requirements, and API reference, and
-[`examples/react-native-tasks`](https://github.com/lucas-barake/effect-local/tree/main/examples/react-native-tasks)
-for a complete checked Expo application.
+for the React Native composition guide, platform requirements, and API reference.
