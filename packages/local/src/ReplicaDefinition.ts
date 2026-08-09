@@ -64,6 +64,18 @@ const assertUnique = (kind: string, values: ReadonlyArray<{ readonly name: strin
   }
 }
 
+const assertKnownDocuments = (
+  kind: string,
+  values: ReadonlyArray<{ readonly name: string; readonly document: Document.Any }>,
+  documents: ReadonlySet<Document.Any>
+): void => {
+  for (const value of values) {
+    if (!documents.has(value.document)) {
+      throw new TypeError(`${kind} references an unknown document: ${value.name}`)
+    }
+  }
+}
+
 export const make = <
   const Name extends string,
   const Documents extends ReadonlyArray<Document.Any>,
@@ -94,16 +106,8 @@ export const make = <
   assertUnique("transient", transients)
   const documents = new Set(documentSet.documents)
   const registeredProjections = new Set(projections)
-  for (const mutation of mutations) {
-    if (!documents.has(mutation.document)) {
-      throw new TypeError(`Mutation references an unknown document: ${mutation.name}`)
-    }
-  }
-  for (const projection of projections) {
-    if (!documents.has(projection.document)) {
-      throw new TypeError(`Projection references an unknown document: ${projection.name}`)
-    }
-  }
+  assertKnownDocuments("Mutation", mutations, documents)
+  assertKnownDocuments("Projection", projections, documents)
   for (const query of queries) {
     for (const dependency of query.dependsOn) {
       if (!registeredProjections.has(dependency)) {
@@ -111,11 +115,7 @@ export const make = <
       }
     }
   }
-  for (const transient of transients) {
-    if (!documents.has(transient.document)) {
-      throw new TypeError(`Transient references an unknown document: ${transient.name}`)
-    }
-  }
+  assertKnownDocuments("Transient", transients, documents)
   const definitionHash = `def_${
     Canonical.hash({
       name: options.name,
