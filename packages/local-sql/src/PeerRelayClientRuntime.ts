@@ -337,13 +337,10 @@ export const layer = Layer.effectContext(
   makeScoped.pipe(
     Effect.map((runtime) =>
       Context.make(PeerRelayClientRuntime, runtime).pipe(
-        Context.add(
-          Transient.Transport,
-          Transient.Transport.of({
-            send: runtime.send,
-            messages: runtime.transients
-          })
-        )
+        Context.add(Transient.Transport, {
+          send: runtime.send,
+          messages: runtime.transients
+        })
       )
     )
   )
