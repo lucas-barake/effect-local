@@ -44,23 +44,36 @@ const splitChunks = (bytes: Uint8Array): Array<{ type: number; bytes: Uint8Array
   return chunks
 }
 
-export const decodeSyncChanges = (
+export function decodeSyncChanges(
   chunks: ReadonlyArray<Uint8Array>
-): ReadonlyArray<Automerge.DecodedChange> => {
+): ReadonlyArray<Automerge.DecodedChange>
+export function decodeSyncChanges(
+  chunks: ReadonlyArray<Uint8Array>,
+  options: { readonly maxChanges: number }
+): ReadonlyArray<Automerge.DecodedChange> | null
+export function decodeSyncChanges(
+  chunks: ReadonlyArray<Uint8Array>,
+  options?: { readonly maxChanges?: number }
+): ReadonlyArray<Automerge.DecodedChange> | null {
   const changes = new Map<string, Automerge.DecodedChange>()
   for (const chunk of chunks) {
     for (const part of splitChunks(chunk)) {
       if (part.type === chunkTypeChange || part.type === chunkTypeCompressed) {
         const change = Automerge.decodeChange(part.bytes)
         changes.set(change.hash, change)
+        if (options?.maxChanges !== undefined && changes.size > options.maxChanges) return null
       } else if (part.type === chunkTypeDocument) {
         // A whole-document chunk is self-contained: it carries every change it describes, so it
         // loads standalone without the local document supplying dependencies.
         const document = Automerge.load(part.bytes)
         try {
+          if (options?.maxChanges !== undefined && Automerge.stats(document).numChanges > options.maxChanges) {
+            return null
+          }
           for (const bytes of Automerge.getAllChanges(document)) {
             const change = Automerge.decodeChange(bytes)
             changes.set(change.hash, change)
+            if (options?.maxChanges !== undefined && changes.size > options.maxChanges) return null
           }
         } finally {
           Automerge.free(document)
@@ -69,6 +82,7 @@ export const decodeSyncChanges = (
         Automerge.free(Automerge.load(part.bytes, { allowMissingChanges: true }))
         for (const change of Automerge.readBundle(part.bytes).changes) {
           changes.set(change.hash, change)
+          if (options?.maxChanges !== undefined && changes.size > options.maxChanges) return null
         }
       } else {
         // Guessing at a future chunk type would misattribute provenance, which the receiving
@@ -78,4 +92,101 @@ export const decodeSyncChanges = (
     }
   }
   return [...changes.values()]
+}
+
+const dependencyOrder = (
+  changes: ReadonlyArray<Automerge.DecodedChange>
+): ReadonlyArray<Automerge.DecodedChange> => {
+  const hashes = new Set(changes.map((change) => change.hash))
+  const remaining = changes.map((change) =>
+    change.deps.reduce(
+      (count, dependency) => count + (hashes.has(dependency) ? 1 : 0),
+      0
+    )
+  )
+  const dependents = new Map<string, Array<number>>()
+  for (let index = 0; index < changes.length; index++) {
+    for (const dependency of changes[index]!.deps) {
+      if (!hashes.has(dependency)) continue
+      const waiting = dependents.get(dependency) ?? []
+      waiting.push(index)
+      dependents.set(dependency, waiting)
+    }
+  }
+  const ready = remaining.flatMap((count, index) => count === 0 ? [index] : [])
+  const ordered: Array<Automerge.DecodedChange> = []
+  for (let cursor = 0; cursor < ready.length; cursor++) {
+    const index = ready[cursor]!
+    const change = changes[index]!
+    ordered.push(change)
+    for (const dependent of dependents.get(change.hash) ?? []) {
+      remaining[dependent] = remaining[dependent]! - 1
+      if (remaining[dependent] === 0) ready.push(dependent)
+    }
+  }
+  if (ordered.length !== changes.length) throw new Error("cyclic Automerge change dependencies")
+  return ordered
+}
+
+export const batchSyncMessage = (
+  message: Automerge.SyncMessage,
+  options: {
+    readonly maxChanges: number
+    readonly maxBytes: number
+    readonly maxMessages: number
+    readonly maxTotalBytes: number
+  }
+): ReadonlyArray<Automerge.SyncMessage> | null => {
+  if (message.byteLength > options.maxTotalBytes) return null
+  const decoded = Automerge.decodeSyncMessage(message)
+  const maxTotalChanges = Math.min(Number.MAX_SAFE_INTEGER, options.maxChanges * options.maxMessages)
+  const decodedChanges = decodeSyncChanges(decoded.changes, { maxChanges: maxTotalChanges })
+  if (decodedChanges === null) return null
+  const changes = dependencyOrder(decodedChanges)
+  if (changes.length <= options.maxChanges && message.byteLength <= options.maxBytes) return [message]
+  if (changes.length === 0) return null
+  if (Math.ceil(changes.length / options.maxChanges) > options.maxMessages) return null
+
+  const encodedChanges = changes.map(Automerge.encodeChange)
+  const messages: Array<Automerge.SyncMessage> = []
+  let totalBytes = 0
+  const append = (candidate: Automerge.SyncMessage) => {
+    if (messages.length >= options.maxMessages || totalBytes + candidate.byteLength > options.maxTotalBytes) {
+      return false
+    }
+    messages.push(candidate)
+    totalBytes += candidate.byteLength
+    return true
+  }
+  const encode = (candidate: ReadonlyArray<Automerge.Change>) =>
+    Automerge.encodeSyncMessage({ ...decoded, changes: [...candidate] })
+
+  for (let start = 0; start < encodedChanges.length;) {
+    const maximumEnd = Math.min(start + options.maxChanges, encodedChanges.length)
+    const maximum = encode(encodedChanges.slice(start, maximumEnd))
+    if (maximum.byteLength <= options.maxBytes) {
+      if (!append(maximum)) return null
+      start = maximumEnd
+      continue
+    }
+    let lower = start + 1
+    let upper = maximumEnd
+    let fittedEnd = start
+    let fitted: Automerge.SyncMessage | undefined
+    while (lower <= upper) {
+      const middle = Math.floor((lower + upper) / 2)
+      const candidate = encode(encodedChanges.slice(start, middle))
+      if (candidate.byteLength <= options.maxBytes) {
+        fittedEnd = middle
+        fitted = candidate
+        lower = middle + 1
+      } else {
+        upper = middle - 1
+      }
+    }
+    if (fitted === undefined) return null
+    if (!append(fitted)) return null
+    start = fittedEnd
+  }
+  return messages
 }

@@ -657,15 +657,27 @@ const makeWithTerminal = (
         if (result === null) return "ApplicationRejected" as const
         yield* publisher.publishPending
         if (result.reply !== null) {
-          // A reply that cannot be enqueued deterministically — over the per-message change
-          // budget, unresolvable provenance, an unencodable envelope — will fail identically on
-          // every retry, and failing the session only reconnects into the same reply while the
-          // relay redelivers the message that asked for it. Withholding the reply keeps the
-          // session serving and lets the inbound settle; the peer stays behind on this document,
-          // which the warning makes visible. Storage unavailability stays session-fatal: it is
-          // transient and a reconnect genuinely retries it.
-          yield* sync.enqueue(session, result.reply).pipe(
-            Effect.flatMap(schedule),
+          // Permanently invalid replies fail identically on every retry and can settle with a
+          // warning. Quota pressure is transient: keep relay custody so the stored reply can be
+          // enqueued after older outbox entries drain.
+          const enqueueOutcome = yield* sync.enqueue(session, result.reply).pipe(
+            Effect.flatMap((outbound) => outbound === null ? Effect.void : schedule(outbound)),
+            Effect.as("Enqueued" as const),
+            Effect.catchIf(
+              (error) => error.reason._tag === "QuotaExceeded",
+              (error) =>
+                Effect.logWarning(
+                  "Peer session parked an inbound message after reply enqueue quota was exceeded; the message stays in relay custody"
+                ).pipe(
+                  Effect.annotateLogs({
+                    documentId: envelope.documentId,
+                    peerId: connection.peerId,
+                    resource: error.reason._tag === "QuotaExceeded" ? error.reason.resource : undefined,
+                    limit: error.reason._tag === "QuotaExceeded" ? error.reason.limit : undefined
+                  }),
+                  Effect.as("Parked" as const)
+                )
+            ),
             Effect.catchIf(
               (error) => error.reason._tag !== "StorageUnavailable",
               (error) =>
@@ -678,9 +690,10 @@ const makeWithTerminal = (
                     reason: error.reason._tag,
                     limit: error.reason._tag === "QuotaExceeded" ? error.reason.limit : undefined
                   })
-                )
+                ).pipe(Effect.as("Enqueued" as const))
             )
           )
+          if (enqueueOutcome === "Parked") return "Parked" as const
           yield* Queue.offer(flushRequests, undefined)
         }
         return "Applied" as const
