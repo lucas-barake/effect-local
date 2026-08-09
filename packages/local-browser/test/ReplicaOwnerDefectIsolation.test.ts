@@ -2,13 +2,13 @@ import * as BrowserWorker from "@effect/platform-browser/BrowserWorker"
 import * as BrowserWorkerRunner from "@effect/platform-browser/BrowserWorkerRunner"
 import { NodeCrypto } from "@effect/platform-node"
 import { assert, it } from "@effect/vitest"
-import * as CommandDeliveryPublisher from "@lucas-barake/effect-local-sql/CommandDeliveryPublisher"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
@@ -18,7 +18,7 @@ import * as Worker from "effect/unstable/workers/Worker"
 import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
-import { definition, replica } from "./fixtures.js"
+import { definition, DeliveryPublisher, replica } from "./fixtures.js"
 
 const limits = {
   maxBackupBytes: 1024,
@@ -61,42 +61,10 @@ const limits = {
   maxRestoreErrorBytes: 4_096
 } satisfies ReplicaLimits.Values
 
-const Publisher = Layer.merge(
-  Layer.succeed(
-    CommitPublisher.CommitPublisher,
-    CommitPublisher.CommitPublisher.of({
-      publishPending: Effect.succeed(0),
-      invalidate: () => Effect.void,
-      subscribe: Effect.succeed({
-        watermark: Identity.CommitSequence.make(0),
-        refreshGeneration: 0,
-        events: Stream.never
-      })
-    })
-  ),
-  Layer.succeed(
-    CommandDeliveryPublisher.CommandDeliveryPublisher,
-    CommandDeliveryPublisher.CommandDeliveryPublisher.of({
-      publishPending: Effect.succeed(0),
-      refresh: Effect.void,
-      subscribe: Effect.succeed({
-        sequence: 0,
-        refreshEpoch: 0,
-        events: Stream.never
-      }),
-      changes: () => Stream.die("unexpected command delivery subscription")
-    })
-  )
-)
-
 it.layer(NodeCrypto.layer)("ReplicaOwner defect isolation", (it) => {
-  /**
-   * A query handler defect is one request going wrong, but with fatal defects enabled the rpc
-   * server escalates it to the tab's whole connection: every live stream (including the
-   * invalidation bridge) dies with it, and the tab is silently stale from then on.
-   */
   it.effect("answers a handler defect without tearing down the session", () =>
     Effect.gen(function*() {
+      const invalidationsSubscribed = yield* Deferred.make<void>()
       let queryCalls = 0
       const rigged: Replica.Replica["Service"] = {
         ...replica,
@@ -108,6 +76,23 @@ it.layer(NodeCrypto.layer)("ReplicaOwner defect isolation", (it) => {
               : replica.query(query, ...payload)
           })
       }
+      const Publisher = Layer.merge(
+        Layer.succeed(
+          CommitPublisher.CommitPublisher,
+          CommitPublisher.CommitPublisher.of({
+            publishPending: Effect.succeed(0),
+            invalidate: () => Effect.void,
+            subscribe: Deferred.succeed(invalidationsSubscribed, undefined).pipe(
+              Effect.as({
+                watermark: Identity.CommitSequence.make(0),
+                refreshGeneration: 0,
+                events: Stream.never
+              })
+            )
+          })
+        ),
+        DeliveryPublisher
+      )
       const channel = new MessageChannel()
       const Owner = ReplicaOwner.layerWorker(definition).pipe(
         Layer.provide(BrowserWorkerRunner.layerMessagePort(channel.port1)),
@@ -121,14 +106,20 @@ it.layer(NodeCrypto.layer)("ReplicaOwner defect isolation", (it) => {
       yield* Effect.gen(function*() {
         const client = yield* RpcClient.make(ReplicaRpc.group)
         const sessionId = yield* Identity.makeSessionId
-        yield* client.OpenSession({
+        const session = yield* client.OpenSession({
           sessionId,
           protocolVersion: ReplicaRpc.protocolVersion,
           definitionHash: definition.hash
         })
+        const invalidations = yield* client.Invalidations({
+          sessionId,
+          ownerEpoch: session.ownerEpoch
+        }).pipe(Stream.runDrain, Effect.forkChild)
+        yield* Deferred.await(invalidationsSubscribed)
 
         const poisoned = yield* client.Query({ sessionId, query: "Read", payload: "one" }).pipe(Effect.exit)
         assert.isTrue(Exit.isFailure(poisoned), "the poisoned query must not succeed")
+        assert.isUndefined(invalidations.pollUnsafe(), "an unrelated invalidation stream must stay active")
 
         const answered = yield* client.Query({ sessionId, query: "Read", payload: "two" })
         assert.deepStrictEqual(answered, [{ title: "two" }])
