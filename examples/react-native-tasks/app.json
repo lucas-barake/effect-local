@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "name": "effect-local-tasks",
+    "slug": "effect-local-tasks",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "scheme": "effect-local-tasks",
+    "ios": { "bundleIdentifier": "dev.lucasbarake.effectlocal.tasks" },
+    "android": { "package": "dev.lucasbarake.effectlocal.tasks" }
+  }
+}

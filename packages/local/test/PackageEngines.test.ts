@@ -11,6 +11,7 @@ const examplesDirectory = join(repoRoot, "examples")
 const expectedPublishedPackages = [
   "@lucas-barake/effect-local",
   "@lucas-barake/effect-local-browser",
+  "@lucas-barake/effect-local-react-native",
   "@lucas-barake/effect-local-rpc",
   "@lucas-barake/effect-local-sql",
   "@lucas-barake/effect-local-test"
@@ -73,7 +74,7 @@ describe("published package engines", () => {
       workspacePackages.some((workspacePackage) => workspacePackage.path === repoRoot && workspacePackage.private)
     )
     assert.deepStrictEqual(
-      workspacePackages.filter((workspacePackage) => workspacePackage.path !== repoRoot)
+      workspacePackages.filter((workspacePackage) => workspacePackage.path.startsWith(packagesDirectory))
         .map((workspacePackage) => workspacePackage.path)
         .toSorted(),
       packageDirectoryManifests.map(({ directory }) => directory).toSorted()

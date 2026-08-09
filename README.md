@@ -26,7 +26,7 @@ multi document transactions. Those remain application responsibilities; see
 
 ## Packages and installation
 
-All five packages are ESM. Install only what the application surface uses.
+All six packages are ESM. Install only what the application surface uses.
 
 ```sh
 # Core model: documents, mutations, projections, queries, Replica
@@ -39,6 +39,9 @@ pnpm add @lucas-barake/effect-local-sql @effect/platform-node@4.0.0-beta.101 @ef
 pnpm add @lucas-barake/effect-local-sql @lucas-barake/effect-local-browser
 pnpm add @effect/platform-browser@4.0.0-beta.101 @effect/sql-sqlite-wasm@4.0.0-beta.101 @effect/wa-sqlite@0.1.2
 
+# Durable React Native replica (Expo)
+pnpm add @lucas-barake/effect-local-sql @lucas-barake/effect-local-react-native expo-sqlite expo-crypto
+
 # Peer synchronization over Effect RPC
 pnpm add @lucas-barake/effect-local-rpc
 
@@ -50,13 +53,14 @@ pnpm add -D @lucas-barake/effect-local-test @effect/vitest@4.0.0-beta.101 vitest
 pnpm add -D @effect/platform-node@4.0.0-beta.101 @effect/platform-node-shared@4.0.0-beta.101
 ```
 
-| Package                              | Purpose                                                                                           |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------- |
-| `@lucas-barake/effect-local`         | Documents, mutations, projections, queries, command outcomes, backups, sync transport, `Replica`  |
-| `@lucas-barake/effect-local-sql`     | SQLite persistence, durable execution, recovery, compaction, peer sync, relay outbox and receipts |
-| `@lucas-barake/effect-local-browser` | Worker and RPC composition, OPFS ports, ownership, sessions, presence, Atom builders              |
-| `@lucas-barake/effect-local-rpc`     | Durable relay protocol, injectable custody, policies, bounded server, client adapter              |
-| `@lucas-barake/effect-local-test`    | Production shaped in memory replicas and deterministic bounded peer faults                        |
+| Package                                   | Purpose                                                                                           |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `@lucas-barake/effect-local`              | Documents, mutations, projections, queries, command outcomes, backups, sync transport, `Replica`  |
+| `@lucas-barake/effect-local-sql`          | SQLite persistence, durable execution, recovery, compaction, peer sync, relay outbox and receipts |
+| `@lucas-barake/effect-local-browser`      | Worker and RPC composition, OPFS ports, ownership, sessions, presence, Atom builders              |
+| `@lucas-barake/effect-local-react-native` | expo-sqlite persistence driver, crypto, Hermes polyfills, app lifecycle, Atom builders            |
+| `@lucas-barake/effect-local-rpc`          | Durable relay protocol, injectable custody, policies, bounded server, client adapter              |
+| `@lucas-barake/effect-local-test`         | Production shaped in memory replicas and deterministic bounded peer faults                        |
 
 Every module is importable as a public subpath, for example `@lucas-barake/effect-local/Replica` and
 `@lucas-barake/effect-local-sql/SqlReplica`. Paths under `internal/*` are private and unsupported.
@@ -344,6 +348,7 @@ From here, pick the composition that matches the deployment:
 
 - [Durable Node composition](#durable-node-composition) for server and CLI replicas.
 - [Browser composition](#browser-composition) for tabs, SharedWorker ownership, and OPFS.
+- [React Native composition](#react-native-composition) for Expo apps and on device SQLite.
 - [Reactive state](#reactive-state) for Effect Atom and React.
 - [Peer synchronization](#peer-synchronization) and [RPC relay](#rpc-relay) for connecting replicas.
 
@@ -1083,6 +1088,118 @@ domain model, engine runtime, tab client, and React views, compiled and exercise
 points: election of one provisioning tab, expiring provision nonces, database round trip health verification,
 takeover handoff of every attached tab, and session cleanup. `ReplicaOwner.layerWorker(definition)` serves the
 page protocol inside the engine runtime.
+
+## React Native composition
+
+A React Native app has exactly one JavaScript thread and one app instance, so none of the browser topology
+applies: there is no worker, no ownership election, and no RPC boundary between the UI and the engine.
+`@lucas-barake/effect-local-react-native` composes `SqlReplica` in-process over expo-sqlite's asynchronous API,
+which keeps SQLite work off the JS thread, and commits reach atoms directly through the shared `Reactivity`
+service.
+
+Two requirements are load bearing:
+
+- **React Native >= 0.85 (Expo SDK >= 56, SDK 57 recommended).** Automerge's engine is WebAssembly, and only
+  Hermes v1 ships a `WebAssembly` global. Metro resolves `@automerge/automerge` to its base64 entrypoint
+  automatically, so no bundler plugin is needed for the WASM itself.
+- **Runtime polyfills at application entry, before any Effect Local module is evaluated.** Hermes has no
+  `crypto.getRandomValues` (automerge seeds its random generator through it), no `atob` (automerge decodes its
+  embedded WASM with it), and no guaranteed `TextEncoder` (Effect Local instantiates one at module scope).
+  `ReactNativePolyfills.install()` installs each of these only when the runtime does not provide it. ESM
+  evaluates an entry module's imports before its body, so the call belongs in a dedicated module pulled in by
+  a bare side-effect import, which runs before any later import:
+
+```ts
+// index.ts
+import "./src/polyfills"
+
+import { registerRootComponent } from "expo"
+import { App } from "./src/App"
+
+registerRootComponent(App)
+
+// src/polyfills.ts
+import * as ReactNativePolyfills from "@lucas-barake/effect-local-react-native/ReactNativePolyfills"
+
+ReactNativePolyfills.install()
+```
+
+The composition itself mirrors the Node quick start with platform layers swapped:
+
+```ts
+// src/replica.ts, abridged from the checked example under examples/react-native-tasks/
+import * as AppLifecycle from "@lucas-barake/effect-local-react-native/AppLifecycle"
+import * as ExpoSqlite from "@lucas-barake/effect-local-react-native/ExpoSqlite"
+import * as ReactNativeCrypto from "@lucas-barake/effect-local-react-native/ReactNativeCrypto"
+import * as ReactNativeReplica from "@lucas-barake/effect-local-react-native/ReactNativeReplica"
+import * as ReplicaAtom from "@lucas-barake/effect-local-react-native/ReplicaAtom"
+import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Layer from "effect/Layer"
+import { Atom } from "effect/unstable/reactivity"
+import { AddLabelLive, definition, LabelsSql, limits, ListLabels, ListLabelsLive } from "./domain"
+
+const Database = ExpoSqlite.layer({ databaseName: "tasks.db" })
+
+const DomainLive = Layer.mergeAll(AddLabelLive, ListLabelsLive.pipe(Layer.provide(Database)))
+
+const replicaGraph = ReactNativeReplica.layer(definition, { projections: [LabelsSql] })
+
+// `Layer.merge` does not feed outputs between siblings, so the lifecycle layer is provided with the
+// replica graph it flushes. `provideMerge` keeps SqlClient, Crypto, and limits in the output context so
+// atom functions can reach them.
+export const ReplicaLive = Layer.merge(
+  replicaGraph,
+  AppLifecycle.layerFlushOnBackground.pipe(Layer.provide(replicaGraph))
+).pipe(
+  Layer.provide(DomainLive),
+  Layer.provideMerge(
+    Layer.mergeAll(Database, ReactNativeCrypto.layer, ReplicaLimits.layer(limits))
+  )
+)
+
+export const runtime = Atom.runtime(ReplicaLive)
+export const labels = ReplicaAtom.queryFamily(runtime, ListLabels)({ prefix: "" })
+```
+
+`AppLifecycle.layerFlushOnBackground` flushes the replica when `AppState` transitions to `background`, so
+committed mutations are durable before the OS can suspend the process. `inactive` is deliberately ignored: it
+fires for transient interruptions on iOS only, and a flush there buys nothing.
+
+Relay sync uses the same composition as the browser with the socket layer swapped:
+
+```ts
+import * as ReactNativeSocket from "@lucas-barake/effect-local-react-native/ReactNativeSocket"
+import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
+
+// RelayConnectionStatus.layerProtocolSocket().pipe(Layer.provide(ReactNativeSocket.layerWebSocket(url)))
+// then PeerRelayClientRuntime.layerSql exactly as in the browser relay example; see
+// packages/local-browser/test-browser/relay/src/device.ts
+```
+
+Three platform behaviors to know before shipping:
+
+- **Big integers.** expo-sqlite bridges every SQLite `INTEGER` column into a JS number, so values above 2^53
+  would come back rounded. The cluster machinery that serializes commands stores 63 bit snowflake ids, so the
+  driver wraps reads that run under `SqlClient.SafeIntegers` and returns huge integers as exact text; nothing
+  application facing changes. Bigint bind parameters outside the safe integer range are rejected with
+  `SqlError`, which is also what the native binding would do with them.
+- **One replica per Atom memo map.** `ReactNativeReplica.layer` is a constructor; build each replica once and
+  share the layer value. Running two replicas in one app requires a separate memo map per replica
+  (`Atom.context({ memoMap: Layer.makeMemoMapUnsafe() })`), otherwise the second graph aliases the first
+  graph's services.
+- **Metro and Babel configuration.** effect's `Migrator.fromFileSystem` contains a computed `import()` that
+  Metro rejects at bundle time even though local-sql never calls it; the example's
+  [`babel.config.js`](examples/react-native-tasks/babel.config.js) rewrites that one call site and is required
+  for every consumer. Consuming the workspace sources directly (instead of published builds) additionally
+  needs the `.js` to `.ts` specifier rewrite in
+  [`examples/react-native-tasks/metro.config.js`](examples/react-native-tasks/metro.config.js).
+
+The complete checked application is [`examples/react-native-tasks/`](examples/react-native-tasks/): domain,
+composition, a boot self test that proves the runtime capabilities (WebAssembly, automerge WASM init, crypto,
+base64, UTF-8, then a full replica round trip on the real database), and a reactive labels view. Run it with
+`pnpm install && pnpm start` in that directory and open it in Expo Go; the self test prints its results on the
+first screen. The package's unit and integration suites run in Node against faithful native module fakes, and
+`expo export` verifies both Hermes bytecode bundles in CI shape.
 
 ## Reactive state
 
@@ -1994,6 +2111,13 @@ Limitations:
   suite passes there.
 
 ## Browser and deployment requirements
+
+The durable React Native composition requires React Native >= 0.85 (Expo SDK >= 56) for Hermes v1 and its
+`WebAssembly` global, expo-sqlite and expo-crypto as native modules (Expo Go already bundles both),
+`ReactNativePolyfills.install()` at application entry, and the Babel rewrite of effect's computed migration
+import shown in [`examples/react-native-tasks/babel.config.js`](examples/react-native-tasks/babel.config.js).
+Continuous background sync is not available: the OS suspends a backgrounded app, so replicas flush on
+background and sync on foreground resume.
 
 The durable browser composition requires an ESM build tool with module workers and WebAssembly; `SharedWorker`,
 dedicated `Worker`, transferable `MessagePort`, Web Locks, OPFS, and WebAssembly; a secure context in

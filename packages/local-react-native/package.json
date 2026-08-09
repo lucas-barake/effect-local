@@ -1,0 +1,76 @@
+{
+  "name": "@lucas-barake/effect-local-react-native",
+  "version": "0.1.0",
+  "description": "React Native (Expo) SQLite persistence, crypto, and Atom integration for Effect Local",
+  "homepage": "https://github.com/lucas-barake/effect-local#readme",
+  "bugs": "https://github.com/lucas-barake/effect-local/issues",
+  "keywords": [
+    "effect",
+    "local-first",
+    "react-native",
+    "expo",
+    "expo-sqlite",
+    "automerge"
+  ],
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+  },
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": [],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lucas-barake/effect-local.git",
+    "directory": "packages/local-react-native"
+  },
+  "exports": {
+    "./package.json": "./package.json",
+    ".": "./src/index.ts",
+    "./*": "./src/*.ts",
+    "./internal/*": null
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "exports": {
+      "./package.json": "./package.json",
+      ".": "./dist/index.js",
+      "./*": "./dist/*.js",
+      "./internal/*": null
+    }
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "src/**/*.ts",
+    "dist/**/*.js",
+    "dist/**/*.js.map",
+    "dist/**/*.d.ts",
+    "dist/**/*.d.ts.map"
+  ],
+  "scripts": {
+    "build": "tsc -b tsconfig.json",
+    "build:tsgo": "tsgo -b tsconfig.json",
+    "check": "tsc -b tsconfig.json",
+    "test": "vitest --config vitest.config.ts"
+  },
+  "dependencies": {
+    "@lucas-barake/effect-local": "workspace:^",
+    "@lucas-barake/effect-local-sql": "workspace:^",
+    "base64-js": "^1.5.1"
+  },
+  "peerDependencies": {
+    "effect": ">=4.0.0-beta.99 <4.0.1",
+    "expo-crypto": ">=13.0.0",
+    "expo-sqlite": ">=15.0.0",
+    "react-native": ">=0.85.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1",
+    "effect": "4.0.0-beta.99",
+    "expo-crypto": "57.0.1",
+    "expo-sqlite": "57.0.1",
+    "react-native": "0.86.2",
+    "ws": "^8.18.3"
+  }
+}

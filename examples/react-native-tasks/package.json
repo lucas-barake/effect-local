@@ -1,0 +1,31 @@
+{
+  "name": "@lucas-barake/effect-local-example-react-native-tasks",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Expo example and self-test app for @lucas-barake/effect-local-react-native",
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start",
+    "ios": "expo start --ios",
+    "android": "expo start --android",
+    "typecheck": "tsc --noEmit",
+    "export": "expo export --platform ios --platform android"
+  },
+  "dependencies": {
+    "@effect/atom-react": "4.0.0-beta.99",
+    "@lucas-barake/effect-local": "workspace:^",
+    "@lucas-barake/effect-local-react-native": "workspace:^",
+    "@lucas-barake/effect-local-sql": "workspace:^",
+    "effect": "4.0.0-beta.99",
+    "expo": "^57.0.9",
+    "expo-crypto": "~57.0.1",
+    "expo-sqlite": "~57.0.1",
+    "react": "19.2.7",
+    "react-native": "0.86.2"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0",
+    "babel-preset-expo": "~57.0.0",
+    "typescript": "^6.0.3"
+  }
+}

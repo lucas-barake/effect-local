@@ -6,6 +6,7 @@
     { "path": "packages/local" },
     { "path": "packages/local-sql" },
     { "path": "packages/local-browser" },
+    { "path": "packages/local-react-native" },
     { "path": "packages/local-rpc" },
     { "path": "packages/local-test" }
   ]
