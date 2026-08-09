@@ -163,17 +163,30 @@ const installDatabaseBootstrapProbe = (
   mode: "hold" | "reject"
 ) =>
   page.addInitScript((mode) => {
+    sessionStorage.setItem("effect-local-shell-controlled", "true")
     if (
       mode === "hold" &&
       sessionStorage.getItem("effectLocalDatabaseBootstrapReleased") !== null
     ) return
     const NativeWorker = globalThis.Worker
+    let resolveError!: (message: string) => void
+    let resolveStartPosted!: () => void
+    const error = new Promise<string>((resolve) => {
+      resolveError = resolve
+    })
+    const startPosted = new Promise<void>((resolve) => {
+      resolveStartPosted = resolve
+    })
     const state: {
       error?: string
       startPosted: boolean
       url?: string
+      readonly waitFor: {
+        readonly error: Promise<string>
+        readonly startPosted: Promise<void>
+      }
       worker?: Worker
-    } = { startPosted: false }
+    } = { startPosted: false, waitFor: { error, startPosted } }
     Object.defineProperty(globalThis, "__effectLocalDatabaseBootstrap", { value: state })
     globalThis.Worker = new Proxy(NativeWorker, {
       construct(target, [scriptURL, options]) {
@@ -189,6 +202,7 @@ const installDatabaseBootstrapProbe = (
         const worker = Reflect.construct(target, [url, options]) as Worker
         worker.addEventListener("error", (event) => {
           state.error = event.message
+          resolveError(event.message)
         })
         const postMessage = worker.postMessage
         Object.defineProperty(worker, "postMessage", {
@@ -200,6 +214,7 @@ const installDatabaseBootstrapProbe = (
               message._tag === "DatabaseWorkerStart"
             ) {
               state.startPosted = true
+              resolveStartPosted()
             }
             Reflect.apply(
               postMessage,
@@ -215,25 +230,16 @@ const installDatabaseBootstrapProbe = (
   }, mode)
 
 const waitForDatabaseBootstrap = (page: Page) =>
-  expect.poll(async () => {
-    try {
-      return await page.evaluate(() => {
-        const state = globalThis as typeof globalThis & {
-          readonly __effectLocalDatabaseBootstrap?: {
-            readonly startPosted: boolean
-            readonly url?: string
-          }
-        }
-        return state.__effectLocalDatabaseBootstrap
-      })
-    } catch (error) {
-      if (String(error).includes("Execution context was destroyed")) return undefined
-      throw error
-    }
-  }).toMatchObject({
-    startPosted: true,
-    url: expect.stringContaining("type=ignore")
-  })
+  page.evaluate(async () => {
+    const state = (globalThis as typeof globalThis & {
+      readonly __effectLocalDatabaseBootstrap: {
+        readonly url: string
+        readonly waitFor: { readonly startPosted: Promise<void> }
+      }
+    }).__effectLocalDatabaseBootstrap
+    await state.waitFor.startPosted
+    return state.url
+  }).then((url) => expect(url).toContain("type=ignore"))
 
 const releaseDatabaseBootstrap = (page: Page, persist: boolean) =>
   page.evaluate((persist) => {
@@ -247,22 +253,24 @@ const releaseDatabaseBootstrap = (page: Page, persist: boolean) =>
   }, persist)
 
 test("buffers database startup while its coordinator module loads", async ({ page }) => {
+  test.setTimeout(0)
   await installDatabaseBootstrapProbe(page, "hold")
   await page.goto("/")
   await waitForDatabaseBootstrap(page)
   await releaseDatabaseBootstrap(page, true)
 
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 0 })
   const title = `Buffered database start ${crypto.randomUUID()}`
   await page.getByLabel("New task title").fill(title)
   await page.getByRole("button", { name: "Add task" }).click()
   await expect(page.getByText(title, { exact: true })).toBeVisible()
   await page.reload()
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 0 })
   await expect(page.getByText(title, { exact: true })).toBeVisible()
 })
 
 test("terminates the database worker when its coordinator module fails to load", async ({ context, page }) => {
+  test.setTimeout(0)
   await installDatabaseBootstrapProbe(page, "reject")
   await page.goto("/")
   await waitForDatabaseBootstrap(page)
@@ -270,27 +278,34 @@ test("terminates the database worker when its coordinator module fails to load",
   const browser = context.browser()
   expect(browser).not.toBeNull()
   const cdp = await browser!.newBrowserCDPSession()
-  const workerUrl = await page.evaluate(() =>
-    (globalThis as typeof globalThis & {
-      readonly __effectLocalDatabaseBootstrap: { readonly url: string }
-    }).__effectLocalDatabaseBootstrap.url
-  )
-  const beforeRelease = await cdp.send("Target.getTargets")
-  expect(beforeRelease.targetInfos.some((target) => target.type === "worker" && target.url === workerUrl)).toBe(true)
-
-  await releaseDatabaseBootstrap(page, false)
-  await expect.poll(() =>
-    page.evaluate(() =>
+  try {
+    await cdp.send("Target.setDiscoverTargets", { discover: true })
+    const beforeRelease = await cdp.send("Target.getTargets")
+    const workerTargets = beforeRelease.targetInfos.filter((target) => target.type === "worker")
+    expect(workerTargets).toHaveLength(1)
+    const workerTarget = workerTargets[0]!
+    const workerDestroyed = new Promise<void>((resolve) => {
+      const onDestroyed = (event: { readonly targetId: string }) => {
+        if (event.targetId !== workerTarget.targetId) return
+        cdp.off("Target.targetDestroyed", onDestroyed)
+        resolve()
+      }
+      cdp.on("Target.targetDestroyed", onDestroyed)
+    })
+    const workerError = page.evaluate(() =>
       (globalThis as typeof globalThis & {
-        readonly __effectLocalDatabaseBootstrap: { readonly error?: string }
-      }).__effectLocalDatabaseBootstrap.error
+        readonly __effectLocalDatabaseBootstrap: {
+          readonly waitFor: { readonly error: Promise<string> }
+        }
+      }).__effectLocalDatabaseBootstrap.waitFor.error
     )
-  ).toContain("effect-local test coordinator import failure")
-  await expect.poll(async () => {
-    const targets = await cdp.send("Target.getTargets")
-    return targets.targetInfos.some((target) => target.type === "worker" && target.url === workerUrl)
-  }).toBe(false)
-  await cdp.detach()
+
+    await releaseDatabaseBootstrap(page, false)
+    expect(await workerError).toContain("effect-local test coordinator import failure")
+    await workerDestroyed
+  } finally {
+    await cdp.detach()
+  }
 })
 
 test("creates, updates, completes, deletes, and reloads local tasks", async ({ page }) => {
