@@ -3,6 +3,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
+import * as Latch from "effect/Latch"
 import * as Option from "effect/Option"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
@@ -56,11 +57,15 @@ describe("TestPeer coverage", () => {
 
   it.effect("drops an in-flight delayed packet when a partition appears mid-delivery", () =>
     Effect.scoped(Effect.gen(function*() {
-      const network = yield* TestPeer.make(options)
+      const deliveryStarted = yield* Latch.make()
+      const network = yield* TestPeer.make({
+        ...options,
+        hooks: { deliveryStarted: deliveryStarted.open.pipe(Effect.asVoid) }
+      })
       const left = yield* network.connect(leftId, rightId)
       const right = yield* network.connect(rightId, leftId)
       const send = yield* left.send(bytes(1)).pipe(Effect.forkChild)
-      yield* Effect.yieldNow
+      yield* deliveryStarted.await
       yield* network.partition(leftId, rightId)
       yield* TestClock.adjust("1 second")
       yield* Fiber.join(send)
@@ -93,11 +98,15 @@ describe("TestPeer coverage", () => {
 
   it.effect("interrupting an in-flight delayed send propagates interruption and delivers nothing", () =>
     Effect.scoped(Effect.gen(function*() {
-      const network = yield* TestPeer.make(options)
+      const deliveryStarted = yield* Latch.make()
+      const network = yield* TestPeer.make({
+        ...options,
+        hooks: { deliveryStarted: deliveryStarted.open.pipe(Effect.asVoid) }
+      })
       const left = yield* network.connect(leftId, rightId)
       const right = yield* network.connect(rightId, leftId)
       const send = yield* left.send(bytes(1)).pipe(Effect.forkChild)
-      yield* Effect.yieldNow
+      yield* deliveryStarted.await
       yield* Fiber.interrupt(send)
       const exit = yield* Fiber.await(send)
       assert.isTrue(Exit.hasInterrupts(exit))

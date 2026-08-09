@@ -1,8 +1,139 @@
-import { expect, test } from "@playwright/test"
-import type { Page } from "@playwright/test"
+import type { Page, Worker as PlaywrightWorker } from "@playwright/test"
 import { readFile } from "node:fs/promises"
+import { expect, test } from "../playwright.ts"
 
 const ownershipTransitionTimeout = 40_000
+
+const installOwnershipHarness = (
+  page: Page,
+  options: { readonly armInitially?: boolean; readonly holdProvisionAccepted?: boolean } = {}
+) => {
+  const timerGateToken = crypto.randomUUID()
+  return page.addInitScript(({ armInitially, holdProvisionAccepted, timerGateToken }) => {
+    sessionStorage.setItem("effect-local-shell-controlled", "true")
+    const signal = () => {
+      let resolve!: () => void
+      const promise = new Promise<void>((done) => {
+        resolve = done
+      })
+      return { promise, resolve }
+    }
+    const acceptanceHeld = signal()
+    const acceptanceReleased = signal()
+    const timerGateHeld = signal()
+    const timerGateReleased = signal()
+    const timerGate = new BroadcastChannel(`effect-local-ownership-timer-${timerGateToken}`)
+    const state: {
+      acceptanceHeld: boolean
+      armTimerGate: () => void
+      releaseAcceptance?: () => void
+      releaseTimerGate: () => void
+      timerArmed: boolean
+      timerGateHeld: boolean
+      timerGateReleased: boolean
+      readonly waitFor: Record<
+        "acceptanceHeld" | "acceptanceReleased" | "timerGateHeld" | "timerGateReleased",
+        Promise<void>
+      >
+      workerUrl: string | undefined
+    } = {
+      acceptanceHeld: false,
+      armTimerGate: () => {
+        state.timerArmed = true
+        timerGate.postMessage({ _tag: "Arm" })
+      },
+      releaseTimerGate: () => timerGate.postMessage({ _tag: "Release" }),
+      timerArmed: armInitially,
+      timerGateHeld: false,
+      timerGateReleased: false,
+      waitFor: {
+        acceptanceHeld: acceptanceHeld.promise,
+        acceptanceReleased: acceptanceReleased.promise,
+        timerGateHeld: timerGateHeld.promise,
+        timerGateReleased: timerGateReleased.promise
+      },
+      workerUrl: undefined
+    }
+    Object.defineProperty(globalThis, "__effectLocalOwnershipHarness", { value: state })
+    timerGate.addEventListener("message", (event) => {
+      if (event.data?._tag === "Held") {
+        state.timerGateHeld = true
+        timerGateHeld.resolve()
+      }
+      if (event.data?._tag === "Released") {
+        state.timerGateReleased = true
+        timerGateReleased.resolve()
+      }
+    })
+
+    const NativeSharedWorker = globalThis.SharedWorker
+    globalThis.SharedWorker = new Proxy(NativeSharedWorker, {
+      construct(target, [scriptURL, workerOptions]) {
+        const url = new URL(String(scriptURL), globalThis.location.href)
+        url.searchParams.set("effectLocalTestTimerGate", timerGateToken)
+        if (state.timerArmed) url.searchParams.set("effectLocalTestTimerGateArmed", "true")
+        state.workerUrl = url.href
+        return Reflect.construct(target, [url, workerOptions])
+      }
+    })
+
+    if (holdProvisionAccepted) {
+      const addEventListener = MessagePort.prototype.addEventListener
+      MessagePort.prototype.addEventListener = function(type, listener, listenerOptions) {
+        if (type !== "message" || typeof listener !== "function") {
+          return addEventListener.call(this, type, listener, listenerOptions)
+        }
+        return addEventListener.call(this, type, function(this: MessagePort, event: MessageEvent) {
+          if (event.data?._tag !== "ProvisionAccepted") return listener.call(this, event)
+          state.acceptanceHeld = true
+          acceptanceHeld.resolve()
+          state.releaseAcceptance = () => {
+            state.acceptanceHeld = false
+            acceptanceReleased.resolve()
+            listener.call(this, event)
+          }
+        }, listenerOptions)
+      } as typeof MessagePort.prototype.addEventListener
+    }
+  }, {
+    armInitially: options.armInitially === true,
+    holdProvisionAccepted: options.holdProvisionAccepted === true,
+    timerGateToken
+  }).then(() => timerGateToken)
+}
+
+const waitForHarnessState = (
+  page: Page,
+  key: "acceptanceHeld" | "acceptanceReleased" | "timerGateHeld" | "timerGateReleased"
+) =>
+  page.evaluate((key) =>
+    (globalThis as typeof globalThis & {
+      readonly __effectLocalOwnershipHarness: {
+        readonly waitFor: Record<string, Promise<void>>
+      }
+    }).__effectLocalOwnershipHarness.waitFor[key], key)
+
+const installSharedWorkerTimerUrl = (page: Page, timerGateToken: string) =>
+  page.addInitScript((timerGateToken) => {
+    const NativeSharedWorker = globalThis.SharedWorker
+    globalThis.SharedWorker = new Proxy(NativeSharedWorker, {
+      construct(target, [scriptURL, workerOptions]) {
+        const url = new URL(String(scriptURL), globalThis.location.href)
+        url.searchParams.set("effectLocalTestTimerGate", timerGateToken)
+        return Reflect.construct(target, [url, workerOptions])
+      }
+    })
+  }, timerGateToken)
+
+const installExactSharedWorkerUrl = (page: Page, workerUrl: string) =>
+  page.addInitScript((workerUrl) => {
+    const NativeSharedWorker = globalThis.SharedWorker
+    globalThis.SharedWorker = new Proxy(NativeSharedWorker, {
+      construct(target, [, workerOptions]) {
+        return Reflect.construct(target, [workerUrl, workerOptions])
+      }
+    })
+  }, workerUrl)
 
 const ownerInfo = (page: Page) =>
   expect.poll(async () => {
@@ -25,141 +156,138 @@ const ownerInfo = (page: Page) =>
       if (String(error).includes("Execution context was destroyed")) return undefined
       throw error
     }
-  }, { timeout: ownershipTransitionTimeout }).not.toBeUndefined()
+  }, { timeout: 0 }).not.toBeUndefined()
 
 const installDatabaseBootstrapProbe = (
   page: Page,
   mode: "hold" | "reject"
-) =>
-  page.addInitScript((mode) => {
-    if (
-      mode === "hold" &&
-      sessionStorage.getItem("effectLocalDatabaseBootstrapReleased") !== null
-    ) return
-    const NativeWorker = globalThis.Worker
-    const state: {
-      error?: string
-      startPosted: boolean
-      url?: string
-      worker?: Worker
-    } = { startPosted: false }
-    Object.defineProperty(globalThis, "__effectLocalDatabaseBootstrap", { value: state })
-    globalThis.Worker = new Proxy(NativeWorker, {
-      construct(target, [scriptURL, options]) {
-        const url = new URL(String(scriptURL), globalThis.location.href)
-        if (!url.pathname.endsWith("/opfs.worker.ts")) {
-          return Reflect.construct(target, [scriptURL, options])
-        }
-        url.searchParams.set(
-          mode === "hold" ? "effectLocalTestHoldImport" : "effectLocalTestRejectImport",
-          "true"
-        )
-        state.url = url.href
-        const worker = Reflect.construct(target, [url, options]) as Worker
-        worker.addEventListener("error", (event) => {
-          state.error = event.message
-        })
-        const postMessage = worker.postMessage
-        Object.defineProperty(worker, "postMessage", {
-          value(message: unknown, transferOrOptions?: unknown) {
-            if (
-              typeof message === "object" &&
-              message !== null &&
-              "_tag" in message &&
-              message._tag === "DatabaseWorkerStart"
-            ) {
-              state.startPosted = true
-            }
-            Reflect.apply(
-              postMessage,
-              worker,
-              transferOrOptions === undefined ? [message] : [message, transferOrOptions]
-            )
-          }
-        })
-        state.worker = worker
-        return worker
-      }
+) => {
+  const signal = <A,>() => {
+    let resolve!: (value: A) => void
+    const promise = new Promise<A>((done) => {
+      resolve = done
     })
-  }, mode)
-
-const waitForDatabaseBootstrap = (page: Page) =>
-  expect.poll(async () => {
-    try {
-      return await page.evaluate(() => {
-        const state = globalThis as typeof globalThis & {
-          readonly __effectLocalDatabaseBootstrap?: {
-            readonly startPosted: boolean
-            readonly url?: string
-          }
-        }
-        return state.__effectLocalDatabaseBootstrap
-      })
-    } catch (error) {
-      if (String(error).includes("Execution context was destroyed")) return undefined
-      throw error
-    }
-  }).toMatchObject({
-    startPosted: true,
-    url: expect.stringContaining("type=ignore")
+    return { promise, resolve }
+  }
+  const error = signal<string>()
+  const release = signal<boolean>()
+  const startPosted = signal<string>()
+  const workersClosed = signal<void>()
+  const openWorkers = new Set<PlaywrightWorker>()
+  let workerErrored = false
+  const resolveWorkersClosed = () => {
+    if (workerErrored && openWorkers.size === 0) workersClosed.resolve()
+  }
+  page.on("worker", (worker) => {
+    openWorkers.add(worker)
+    worker.once("close", () => {
+      openWorkers.delete(worker)
+      resolveWorkersClosed()
+    })
   })
-
-const releaseDatabaseBootstrap = (page: Page, persist: boolean) =>
-  page.evaluate((persist) => {
-    const state = globalThis as typeof globalThis & {
-      readonly __effectLocalDatabaseBootstrap: {
-        readonly worker: Worker
+  return Promise.all([
+    page.exposeBinding("__effectLocalDatabaseBootstrapError", (_, message: string) => {
+      workerErrored = true
+      error.resolve(message)
+      resolveWorkersClosed()
+    }),
+    page.exposeBinding("__effectLocalDatabaseBootstrapRelease", () => release.promise),
+    page.exposeBinding("__effectLocalDatabaseBootstrapStarted", (_, url: string) => {
+      startPosted.resolve(url)
+    })
+  ]).then(() =>
+    page.addInitScript((mode) => {
+      sessionStorage.setItem("effect-local-shell-controlled", "true")
+      if (
+        mode === "hold" &&
+        sessionStorage.getItem("effectLocalDatabaseBootstrapReleased") !== null
+      ) return
+      const NativeWorker = globalThis.Worker
+      const bindings = globalThis as typeof globalThis & {
+        readonly __effectLocalDatabaseBootstrapError: (message: string) => Promise<void>
+        readonly __effectLocalDatabaseBootstrapRelease: () => Promise<boolean>
+        readonly __effectLocalDatabaseBootstrapStarted: (url: string) => Promise<void>
       }
+      globalThis.Worker = new Proxy(NativeWorker, {
+        construct(target, [scriptURL, options]) {
+          const url = new URL(String(scriptURL), globalThis.location.href)
+          if (!url.pathname.endsWith("/opfs.worker.ts")) {
+            return Reflect.construct(target, [scriptURL, options])
+          }
+          url.searchParams.set(
+            mode === "hold" ? "effectLocalTestHoldImport" : "effectLocalTestRejectImport",
+            "true"
+          )
+          const worker = Reflect.construct(target, [url, options]) as Worker
+          worker.addEventListener("error", (event) => {
+            void bindings.__effectLocalDatabaseBootstrapError(event.message)
+          })
+          const postMessage = worker.postMessage
+          Object.defineProperty(worker, "postMessage", {
+            value(message: unknown, transferOrOptions?: unknown) {
+              if (
+                typeof message === "object" &&
+                message !== null &&
+                "_tag" in message &&
+                message._tag === "DatabaseWorkerStart"
+              ) {
+                void bindings.__effectLocalDatabaseBootstrapStarted(url.href)
+              }
+              Reflect.apply(
+                postMessage,
+                worker,
+                transferOrOptions === undefined ? [message] : [message, transferOrOptions]
+              )
+            }
+          })
+          void bindings.__effectLocalDatabaseBootstrapRelease().then((persist) => {
+            if (persist) sessionStorage.setItem("effectLocalDatabaseBootstrapReleased", "true")
+            worker.postMessage("effectLocalTestReleaseImport")
+          }, () => undefined)
+          return worker
+        }
+      })
+    }, mode)
+  ).then(() => ({
+    release: release.resolve,
+    waitFor: {
+      error: error.promise,
+      startPosted: startPosted.promise,
+      workersClosed: workersClosed.promise
     }
-    if (persist) sessionStorage.setItem("effectLocalDatabaseBootstrapReleased", "true")
-    state.__effectLocalDatabaseBootstrap.worker.postMessage("effectLocalTestReleaseImport")
-  }, persist)
+  }))
+}
+
+const waitForDatabaseBootstrap = async (
+  probe: Awaited<ReturnType<typeof installDatabaseBootstrapProbe>>
+) => expect(await probe.waitFor.startPosted).toContain("type=ignore")
 
 test("buffers database startup while its coordinator module loads", async ({ page }) => {
-  await installDatabaseBootstrapProbe(page, "hold")
+  test.setTimeout(0)
+  const probe = await installDatabaseBootstrapProbe(page, "hold")
   await page.goto("/")
-  await waitForDatabaseBootstrap(page)
-  await releaseDatabaseBootstrap(page, true)
+  await waitForDatabaseBootstrap(probe)
+  probe.release(true)
 
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 0 })
   const title = `Buffered database start ${crypto.randomUUID()}`
   await page.getByLabel("New task title").fill(title)
   await page.getByRole("button", { name: "Add task" }).click()
   await expect(page.getByText(title, { exact: true })).toBeVisible()
   await page.reload()
-  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: 0 })
   await expect(page.getByText(title, { exact: true })).toBeVisible()
 })
 
-test("terminates the database worker when its coordinator module fails to load", async ({ context, page }) => {
-  await installDatabaseBootstrapProbe(page, "reject")
+test("terminates the database worker when its coordinator module fails to load", async ({ page }) => {
+  test.setTimeout(0)
+  const probe = await installDatabaseBootstrapProbe(page, "reject")
   await page.goto("/")
-  await waitForDatabaseBootstrap(page)
+  await waitForDatabaseBootstrap(probe)
 
-  const browser = context.browser()
-  expect(browser).not.toBeNull()
-  const cdp = await browser!.newBrowserCDPSession()
-  const workerUrl = await page.evaluate(() =>
-    (globalThis as typeof globalThis & {
-      readonly __effectLocalDatabaseBootstrap: { readonly url: string }
-    }).__effectLocalDatabaseBootstrap.url
-  )
-  const beforeRelease = await cdp.send("Target.getTargets")
-  expect(beforeRelease.targetInfos.some((target) => target.type === "worker" && target.url === workerUrl)).toBe(true)
-
-  await releaseDatabaseBootstrap(page, false)
-  await expect.poll(() =>
-    page.evaluate(() =>
-      (globalThis as typeof globalThis & {
-        readonly __effectLocalDatabaseBootstrap: { readonly error?: string }
-      }).__effectLocalDatabaseBootstrap.error
-    )
-  ).toContain("effect-local test coordinator import failure")
-  await expect.poll(async () => {
-    const targets = await cdp.send("Target.getTargets")
-    return targets.targetInfos.some((target) => target.type === "worker" && target.url === workerUrl)
-  }).toBe(false)
-  await cdp.detach()
+  probe.release(false)
+  expect(await probe.waitFor.error).toContain("effect-local test coordinator import failure")
+  await probe.waitFor.workersClosed
 })
 
 test("creates, updates, completes, deletes, and reloads local tasks", async ({ page }) => {
@@ -273,7 +401,7 @@ test("does not persist arbitrary same origin responses in the offline shell cach
   expect(offlineResponse).toBeNull()
 })
 
-test("downloads and restores a canonical local backup", async ({ page }) => {
+test("downloads and restores a canonical local backup", async ({ page }, testInfo) => {
   await page.goto("/")
   await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
 
@@ -289,8 +417,8 @@ test("downloads and restores a canonical local backup", async ({ page }) => {
   const downloadPromise = page.waitForEvent("download")
   await page.getByRole("button", { name: "Download" }).click()
   const download = await downloadPromise
-  const path = await download.path()
-  expect(path).not.toBeNull()
+  const backupPath = testInfo.outputPath("backup.ndjson")
+  await download.saveAs(backupPath)
   await expect(page.getByText("Backup downloaded")).toBeVisible()
 
   await page.getByRole("button", { name: `Delete ${archivedTitle}` }).click()
@@ -301,7 +429,7 @@ test("downloads and restores a canonical local backup", async ({ page }) => {
   await expect(page.getByText(postBackupTitle, { exact: true })).toBeVisible()
 
   page.once("dialog", (dialog) => void dialog.accept())
-  await page.getByLabel("Choose backup file").setInputFiles(path!)
+  await page.getByLabel("Choose backup file").setInputFiles(backupPath)
   await expect(page.getByText("Backup restored")).toBeVisible({ timeout: ownershipTransitionTimeout })
   await expect(page.getByText(postBackupTitle, { exact: true })).not.toBeVisible()
   await page.getByRole("button", { name: "Completed" }).click()
@@ -315,8 +443,13 @@ test("downloads and restores a canonical local backup", async ({ page }) => {
 })
 
 test("fails safely and recovers after abrupt owner termination during restore", async ({ context, page }) => {
-  test.setTimeout(90_000)
+  test.setTimeout(0)
   await page.addInitScript(() => {
+    let resolveRestorePullHeld!: () => void
+    const restorePullHeld = new Promise<void>((resolve) => {
+      resolveRestorePullHeld = resolve
+    })
+    Object.defineProperty(globalThis, "__effectLocalRestorePullHeldPromise", { value: restorePullHeld })
     const addEventListener = MessagePort.prototype.addEventListener
     MessagePort.prototype.addEventListener = function(type, listener, options) {
       if (type !== "message" || typeof listener !== "function") {
@@ -337,6 +470,7 @@ test("fails safely and recovers after abrupt owner termination during restore", 
           state.__effectLocalRestorePullHeld !== true
         ) {
           state.__effectLocalRestorePullHeld = true
+          resolveRestorePullHeld()
           return
         }
         return listener.call(this, event)
@@ -356,7 +490,6 @@ test("fails safely and recovers after abrupt owner termination during restore", 
       }
     }).__effectLocalOwnerInfo
   )
-
   const archivedTitle = `Interrupted restore ${crypto.randomUUID()}`
   const postBackupTitle = `Pre-restore state ${crypto.randomUUID()}`
   await page.getByLabel("New task title").fill(archivedTitle)
@@ -384,6 +517,7 @@ test("fails safely and recovers after abrupt owner termination during restore", 
   await page.getByRole("button", { name: "Add task" }).click()
   await expect(page.getByText(postBackupTitle, { exact: true })).toBeVisible()
 
+  await page.clock.install()
   await page.evaluate(() => {
     ;(globalThis as typeof globalThis & { __effectLocalHoldRestorePull?: boolean })
       .__effectLocalHoldRestorePull = true
@@ -394,12 +528,10 @@ test("fails safely and recovers after abrupt owner termination during restore", 
     mimeType: "application/x-ndjson",
     buffer: paddedBackup
   })
-  await expect.poll(() =>
-    page.evaluate(() =>
-      (globalThis as typeof globalThis & { __effectLocalRestorePullHeld?: boolean })
-        .__effectLocalRestorePullHeld
-    )
-  ).toBe(true)
+  await page.evaluate(() =>
+    (globalThis as typeof globalThis & { readonly __effectLocalRestorePullHeldPromise: Promise<void> })
+      .__effectLocalRestorePullHeldPromise
+  )
 
   const browser = context.browser()
   expect(browser).not.toBeNull()
@@ -409,11 +541,22 @@ test("fails safely and recovers after abrupt owner termination during restore", 
     target.type === "shared_worker" && target.url.includes("replica.shared-worker")
   )
   expect(ownerTarget).toBeDefined()
+  await cdp.send("Target.setDiscoverTargets", { discover: true })
+  const ownerDestroyed = new Promise<void>((resolve) => {
+    const onDestroyed = (event: { readonly targetId: string }) => {
+      if (event.targetId !== ownerTarget!.targetId) return
+      cdp.off("Target.targetDestroyed", onDestroyed)
+      resolve()
+    }
+    cdp.on("Target.targetDestroyed", onDestroyed)
+  })
   const closed = await cdp.send("Target.closeTarget", { targetId: ownerTarget!.targetId })
   expect(closed.success).toBe(true)
+  await ownerDestroyed
   await cdp.detach()
 
-  await expect(page.getByRole("alert").first()).toContainText("OperationTimeout", { timeout: 40_000 })
+  await page.clock.runFor(30_000)
+  await expect(page.getByRole("alert").first()).toContainText("OperationTimeout")
   await expect(page.getByText("Backup restored")).not.toBeVisible()
   await page.close()
 
@@ -464,7 +607,6 @@ test("shares one durable owner across tabs", async ({ context, page }) => {
     }).__effectLocalOwnerInfo
   )
   expect(firstOwner.provider).toBe(true)
-
   const firstTitle = `First tab ${crypto.randomUUID()}`
   await page.getByLabel("New task title").fill(firstTitle)
   await page.getByRole("button", { name: "Add task" }).click()
@@ -497,6 +639,8 @@ test("shares one durable owner across tabs", async ({ context, page }) => {
 })
 
 test("expires a stalled provisioning candidate before assigning a healthy provider", async ({ context, page }) => {
+  test.setTimeout(0)
+  const timerGateToken = await installOwnershipHarness(page)
   await page.goto("/")
   await ownerInfo(page)
   await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
@@ -511,6 +655,11 @@ test("expires a stalled provisioning candidate before assigning a healthy provid
     }).__effectLocalOwnerInfo
   )
   expect(firstOwner.provider).toBe(true)
+  const workerUrl = await page.evaluate(() =>
+    (globalThis as typeof globalThis & {
+      readonly __effectLocalOwnershipHarness: { readonly workerUrl: string }
+    }).__effectLocalOwnershipHarness.workerUrl
+  )
 
   const title = `Expired candidate ${crypto.randomUUID()}`
   await page.getByLabel("New task title").fill(title)
@@ -519,47 +668,109 @@ test("expires a stalled provisioning candidate before assigning a healthy provid
 
   const candidatePage = await context.newPage()
   await candidatePage.goto("/service-worker.js")
-  await page.close()
-  const provisionedAt = await candidatePage.evaluate(async () => {
+  await candidatePage.evaluate(async ({ timerGateToken, workerUrl }) => {
+    const signal = () => {
+      let resolve!: () => void
+      const promise = new Promise<void>((done) => {
+        resolve = done
+      })
+      return { promise, resolve }
+    }
+    const provisioned = signal()
+    const rejected = signal()
+    const timerGateArmed = signal()
+    const timerGateHeld = signal()
     const state = globalThis as typeof globalThis & {
       __effectLocalExpiredCandidate?: {
+        readonly attach: () => void
         readonly messages: Array<string>
-        provisionedAt: number
+        readonly provisioned: Promise<void>
+        readonly rejected: Promise<void>
         readonly replica: SharedWorker
         readonly rpcPort: MessagePort
+        readonly timerGate: BroadcastChannel
+        readonly timerGateArmed: Promise<void>
+        readonly timerGateHeld: Promise<void>
       }
     }
-    const replica = new SharedWorker("/src/replica.shared-worker.ts?worker_file&type=ignore", {
+    const timerGate = new BroadcastChannel(`effect-local-ownership-timer-${timerGateToken}`)
+    const replica = new SharedWorker(workerUrl, {
       name: "effect-local-tasks",
       type: "module"
     })
     const rpc = new MessageChannel()
-    const candidate = { messages: [] as Array<string>, provisionedAt: 0, replica, rpcPort: rpc.port2 }
+    const candidate = {
+      attach: () => {
+        replica.port.start()
+        replica.port.postMessage({ _tag: "Attach", protocolVersion: 1, rpcPort: rpc.port1 }, [rpc.port1])
+      },
+      messages: [] as Array<string>,
+      provisioned: provisioned.promise,
+      rejected: rejected.promise,
+      replica,
+      rpcPort: rpc.port2,
+      timerGate,
+      timerGateArmed: timerGateArmed.promise,
+      timerGateHeld: timerGateHeld.promise
+    }
     state.__effectLocalExpiredCandidate = candidate
-    replica.port.start()
-    replica.port.postMessage({ _tag: "Attach", protocolVersion: 1, rpcPort: rpc.port1 }, [rpc.port1])
-    await new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(
-        () => reject(new Error(`Candidate was not offered provisioning, saw [${candidate.messages.join(", ")}]`)),
-        20_000
-      )
-      replica.port.addEventListener("message", (event) => {
-        const message = event.data as { readonly _tag: string }
-        candidate.messages.push(message._tag)
-        if (message._tag !== "Provision") return
-        candidate.provisionedAt = Date.now()
-        clearTimeout(timeout)
-        resolve()
-      })
+    replica.port.addEventListener("message", (event) => {
+      const message = event.data as { readonly _tag: string }
+      candidate.messages.push(message._tag)
+      if (message._tag === "Provision") provisioned.resolve()
+      if (message._tag === "ProvisionRejected") rejected.resolve()
     })
-    return candidate.provisionedAt
+    timerGate.addEventListener("message", (event) => {
+      if (event.data?._tag === "Armed") timerGateArmed.resolve()
+      if (event.data?._tag === "Held") timerGateHeld.resolve()
+    })
+    timerGate.postMessage({ _tag: "Arm" })
+  }, { timerGateToken, workerUrl })
+  await candidatePage.evaluate(() =>
+    (globalThis as typeof globalThis & {
+      readonly __effectLocalExpiredCandidate: { readonly timerGateArmed: Promise<void> }
+    }).__effectLocalExpiredCandidate.timerGateArmed
+  )
+  await page.close()
+  await candidatePage.evaluate(async () => {
+    const candidate = (globalThis as typeof globalThis & {
+      readonly __effectLocalExpiredCandidate: {
+        readonly attach: () => void
+        readonly provisioned: Promise<void>
+        readonly replica: SharedWorker
+      }
+    }).__effectLocalExpiredCandidate
+    candidate.attach()
+    await candidate.provisioned
   })
 
+  await candidatePage.evaluate(() =>
+    (globalThis as typeof globalThis & {
+      readonly __effectLocalExpiredCandidate: { readonly timerGateHeld: Promise<void> }
+    }).__effectLocalExpiredCandidate.timerGateHeld
+  )
+  await candidatePage.evaluate(() =>
+    (globalThis as typeof globalThis & {
+      readonly __effectLocalExpiredCandidate: { readonly timerGate: BroadcastChannel }
+    }).__effectLocalExpiredCandidate.timerGate.postMessage({ _tag: "Release" })
+  )
+  const candidateMessages = await candidatePage.evaluate(async () => {
+    const candidate = (globalThis as typeof globalThis & {
+      readonly __effectLocalExpiredCandidate: {
+        readonly messages: ReadonlyArray<string>
+        readonly rejected: Promise<void>
+      }
+    }).__effectLocalExpiredCandidate
+    await candidate.rejected
+    return candidate.messages
+  })
+  expect(candidateMessages).toEqual(["Provision", "ProvisionRejected"])
+
   const healthyPage = await context.newPage()
+  await installSharedWorkerTimerUrl(healthyPage, timerGateToken)
   await healthyPage.goto("/")
   await ownerInfo(healthyPage)
   await expect(healthyPage.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
-  expect(Date.now() - provisionedAt).toBeGreaterThanOrEqual(1_900)
   const healthyOwner = await healthyPage.evaluate(() =>
     (globalThis as typeof globalThis & {
       readonly __effectLocalOwnerInfo: {
@@ -583,6 +794,7 @@ test("expires a stalled provisioning candidate before assigning a healthy provid
   await expect(healthyPage.getByText(renamed, { exact: true })).toBeVisible()
 
   const attachedPage = await context.newPage()
+  await installSharedWorkerTimerUrl(attachedPage, timerGateToken)
   await attachedPage.goto("/")
   await ownerInfo(attachedPage)
   await expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
@@ -602,22 +814,17 @@ test("expires a stalled provisioning candidate before assigning a healthy provid
   expect(attachedOwner.writerGeneration).toBe(healthyOwner.writerGeneration)
   await expect(attachedPage.getByText(renamed, { exact: true })).toBeVisible()
 
-  await expect.poll(() =>
-    candidatePage.evaluate(() =>
-      (globalThis as typeof globalThis & {
-        readonly __effectLocalExpiredCandidate: { readonly messages: ReadonlyArray<string> }
-      }).__effectLocalExpiredCandidate.messages
-    )
-  ).toEqual(["Provision", "ProvisionRejected"])
   await candidatePage.evaluate(() => {
     const state = globalThis as typeof globalThis & {
       __effectLocalExpiredCandidate?: {
         readonly replica: SharedWorker
         readonly rpcPort: MessagePort
+        readonly timerGate: BroadcastChannel
       }
     }
     state.__effectLocalExpiredCandidate?.replica.port.close()
     state.__effectLocalExpiredCandidate?.rpcPort.close()
+    state.__effectLocalExpiredCandidate?.timerGate.close()
     delete state.__effectLocalExpiredCandidate
   })
   await candidatePage.close()
@@ -713,37 +920,69 @@ test("reprovisions the durable owner after its database provider dies", async ({
 })
 
 test("keeps an accepted database provider while its acknowledgement is delayed", async ({ context, page }) => {
-  await page.addInitScript(() => {
-    const addEventListener = MessagePort.prototype.addEventListener
-    MessagePort.prototype.addEventListener = function(type, listener, options) {
-      if (type !== "message" || typeof listener !== "function") {
-        return addEventListener.call(this, type, listener, options)
-      }
-      return addEventListener.call(this, type, (event: MessageEvent) => {
-        if (event.data?._tag !== "ProvisionAccepted") {
-          listener.call(this, event)
-          return
-        }
-        setTimeout(() => {
-          listener.call(this, event)
-          ;(globalThis as typeof globalThis & { __effectLocalDelayedAcceptanceDelivered?: boolean })
-            .__effectLocalDelayedAcceptanceDelivered = true
-        }, 3_500)
-      }, options)
-    } as typeof MessagePort.prototype.addEventListener
+  test.setTimeout(0)
+  const timerGateToken = await installOwnershipHarness(page, {
+    armInitially: true,
+    holdProvisionAccepted: true
   })
   await page.goto("/")
+  await waitForHarnessState(page, "acceptanceHeld")
   await ownerInfo(page)
   await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
-  await expect.poll(() =>
-    page.evaluate(() =>
-      (globalThis as typeof globalThis & { __effectLocalDelayedAcceptanceDelivered?: boolean })
-        .__effectLocalDelayedAcceptanceDelivered
-    )
-  ).toBe(true)
+  await waitForHarnessState(page, "timerGateHeld")
+  const providerBeforeExpiry = await page.evaluate(() =>
+    (globalThis as typeof globalThis & {
+      readonly __effectLocalOwnerInfo: {
+        readonly ownerId: string
+        readonly provider: boolean
+        readonly replicaId: string
+        readonly writerGeneration: number
+      }
+    }).__effectLocalOwnerInfo
+  )
+  expect(providerBeforeExpiry.provider).toBe(true)
+  const workerUrl = await page.evaluate(() =>
+    (globalThis as typeof globalThis & {
+      readonly __effectLocalOwnershipHarness: { readonly workerUrl: string }
+    }).__effectLocalOwnershipHarness.workerUrl
+  )
+
+  await page.evaluate(() =>
+    (globalThis as typeof globalThis & {
+      readonly __effectLocalOwnershipHarness: { readonly releaseTimerGate: () => void }
+    }).__effectLocalOwnershipHarness.releaseTimerGate()
+  )
+  await waitForHarnessState(page, "timerGateReleased")
+  const providerAfterExpiry = await page.evaluate(() =>
+    (globalThis as typeof globalThis & { readonly __effectLocalOwnerInfo: unknown }).__effectLocalOwnerInfo
+  )
+  expect(providerAfterExpiry).toEqual(providerBeforeExpiry)
+  await waitForHarnessState(page, "acceptanceHeld")
+
+  await page.evaluate(() =>
+    (globalThis as typeof globalThis & {
+      readonly __effectLocalOwnershipHarness: { readonly releaseAcceptance: () => void }
+    }).__effectLocalOwnershipHarness.releaseAcceptance()
+  )
+  await waitForHarnessState(page, "acceptanceReleased")
 
   const attachedPage = await context.newPage()
+  await installExactSharedWorkerUrl(attachedPage, workerUrl)
   await attachedPage.goto("/")
   await ownerInfo(attachedPage)
   await expect(attachedPage.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
+  const attachedOwner = await attachedPage.evaluate(() =>
+    (globalThis as typeof globalThis & {
+      readonly __effectLocalOwnerInfo: {
+        readonly ownerId: string
+        readonly provider: boolean
+        readonly replicaId: string
+        readonly writerGeneration: number
+      }
+    }).__effectLocalOwnerInfo
+  )
+  expect(attachedOwner.provider).toBe(false)
+  expect(attachedOwner.ownerId).toBe(providerBeforeExpiry.ownerId)
+  expect(attachedOwner.replicaId).toBe(providerBeforeExpiry.replicaId)
+  expect(attachedOwner.writerGeneration).toBe(providerBeforeExpiry.writerGeneration)
 })

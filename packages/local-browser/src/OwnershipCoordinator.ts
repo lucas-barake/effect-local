@@ -72,6 +72,7 @@ export interface SharedWorkerOptions<E, A, E2,> {
     readonly make: Effect.Effect<A, E2, EngineServices>
   } | undefined
   readonly provisionTimeout?: Duration.Input | undefined
+  readonly provisionDeadline?: ((timeout: Duration.Duration) => Effect.Effect<void>) | undefined
   readonly engineStartTimeout?: Duration.Input | undefined
   readonly engineDisposeTimeout?: Duration.Input | undefined
   /**
@@ -230,6 +231,7 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
       const provisionTimeoutMillis = Duration.toMillis(
         Duration.fromInputUnsafe(options.provisionTimeout ?? "2 seconds")
       )
+      const provisionDeadline = options.provisionDeadline ?? Effect.sleep
       const engineStartTimeoutMillis = Duration.toMillis(
         Duration.fromInputUnsafe(options.engineStartTimeout ?? "30 seconds")
       )
@@ -382,7 +384,7 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
             current.provisioning = Option.some({ nonce, candidate: controlPort })
             return post(controlPort, { _tag: "Provision", nonce }).pipe(
               Effect.andThen(
-                Effect.sleep(provisionTimeoutMillis).pipe(
+                Effect.suspend(() => provisionDeadline(Duration.millis(provisionTimeoutMillis))).pipe(
                   Effect.andThen(Queue.offer(events, { _tag: "ProvisionExpired", nonce })),
                   Effect.forkIn(layerScope)
                 )

@@ -43,10 +43,16 @@ export class InvalidOptions extends Schema.TaggedErrorClass<InvalidOptions>(
 
 export type TestPeerError = InvalidFault | QueueFull | ConnectionClosed
 
+export interface Hooks {
+  readonly deliveryStarted?: Effect.Effect<void>
+  readonly retiring?: Effect.Effect<void>
+}
+
 export interface Options {
   readonly queueCapacity: number
   readonly maxCopies: number
   readonly maxDelay: Duration.Input
+  readonly hooks?: Hooks
 }
 
 export interface Connection {
@@ -168,6 +174,7 @@ export const make = (
 
     const deliver = Effect.fnUntraced(function*(scheduled: Scheduled) {
       const delay = yield* validate(scheduled.packet, scheduled.decision)
+      yield* options.hooks?.deliveryStarted ?? Effect.void
       yield* Effect.sleep(delay)
       if ((yield* Ref.get(partitions)).has(route(scheduled.packet.from, scheduled.packet.to))) return
       const failure = yield* Effect.sync(() => {
@@ -281,6 +288,7 @@ export const make = (
         })
         if (previous !== undefined) {
           yield* Ref.set(previous.active, false)
+          yield* options.hooks?.retiring ?? Effect.void
           yield* Ref.update(held, (current) => {
             const next = new Map(current)
             const inboundKey = route(to, from)

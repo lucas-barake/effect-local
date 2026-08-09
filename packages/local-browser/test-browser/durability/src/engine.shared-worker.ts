@@ -270,10 +270,8 @@ const PageHandlersLive = PageApi.toLayer(Effect.gen(function*() {
         Effect.orDie
       ),
     StressDatabase: Effect.fnUntraced(function*({ iterations }) {
-      const startedAt = Date.now()
       const { total } = yield* stress(iterations)
-      yield* Effect.sleep(350)
-      return { finishedAt: Date.now(), startedAt, total }
+      return { total }
     }, Effect.orDie),
     StartWorkflow: ({ id }) => RecoveryWorkflow.execute({ id }, { discard: true }),
     InspectWorkflow: Effect.fnUntraced(function*({ executionId, id }) {
@@ -288,13 +286,9 @@ const PageHandlersLive = PageApi.toLayer(Effect.gen(function*() {
         : "Failed"
       return { executionId, status, ...counts }
     }, Effect.orDie),
-    Heartbeat: ({ count, intervalMs }) =>
+    Heartbeat: ({ count }) =>
       Stream.range(0, count - 1).pipe(
-        Stream.mapEffect((index) =>
-          Effect.sleep(intervalMs).pipe(
-            Effect.as({ emittedAt: Date.now(), index })
-          )
-        )
+        Stream.map((index) => ({ index }))
       )
   })
 }))
