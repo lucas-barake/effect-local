@@ -9,6 +9,7 @@ import type * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Hash from "effect/Hash"
@@ -25,12 +26,16 @@ export const layerReactivity = Layer.effectDiscard(Effect.gen(function*() {
   const reactivity = yield* Reactivity.Reactivity
   yield* replica.invalidations.pipe(
     Stream.runForEach((event) => reactivity.invalidate(event.keys)),
-    Effect.retry({
-      schedule: Schedule.spaced(1_000),
-      while: (error) => error.reason._tag === "StorageUnavailable" || error.reason._tag === "QuotaExceeded"
-    }),
-    Effect.tapCause(Effect.logError),
-    Effect.ignore,
+    // The bridge is the only path from owner commits to this tab's atoms, so any end that is not
+    // this scope closing — a defect from a torn rpc port included — would leave the tab silently
+    // stale for the rest of its life.
+    Effect.catchCause((cause) =>
+      Cause.hasInterruptsOnly(cause)
+        ? Effect.failCause(cause)
+        : Effect.logWarning("replica invalidation stream restarting", cause)
+    ),
+    Effect.andThen(Effect.sleep(1_000)),
+    Effect.forever,
     Effect.forkScoped
   )
 })).pipe(Layer.fresh)
