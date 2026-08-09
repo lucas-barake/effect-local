@@ -11,11 +11,6 @@ import * as ReplicaClient from "../src/ReplicaClient.js"
 import { peerConnectionStatus, relayConnectionStatus, replica } from "./fixtures.js"
 
 describe("ReplicaAtom reactivity bridge", () => {
-  /**
-   * The owner turns any handler defect into a connection level `Defect` message, which fails every
-   * in flight request of that tab with a die. The bridge is the only path from owner commits to
-   * this tab's atoms, so a die that ends it leaves the tab silently stale for the rest of its life.
-   */
   it.effect("resubscribes after the invalidation stream dies", () =>
     Effect.gen(function*() {
       const reactivity = yield* Reactivity.make
@@ -47,9 +42,7 @@ describe("ReplicaAtom reactivity bridge", () => {
         Effect.gen(function*() {
           yield* Layer.build(ReplicaAtom.layerReactivity)
           yield* Deferred.await(died)
-          yield* Effect.yieldNow
           yield* TestClock.adjust(1_000)
-          yield* Effect.yieldNow
           assert.strictEqual(subscriptions, 2, "the bridge must resubscribe after a defect")
           yield* Deferred.await(consumed)
           assert.strictEqual(invalidations, 1)
