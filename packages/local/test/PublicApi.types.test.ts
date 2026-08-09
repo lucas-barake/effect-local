@@ -1,6 +1,5 @@
 import type * as Automerge from "@automerge/automerge"
 import { assert, describe, it } from "@effect/vitest"
-import type * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
@@ -143,17 +142,17 @@ describe("public API types", () => {
   })
 
   it("preserves transient tagged union inference", () => {
-    type Payload = typeof ChatTransient.payloadSchema.Type
-    const payload: Equal<Payload, Typing | ReadPosition> = true
-    const client = Effect.gen(function*() {
-      const forDocument = yield* ChatTransient.client
-      const documentId = yield* Identity.makeDocumentId
-      return forDocument(documentId)
-    })
-    type Requirements = Effect.Services<typeof client>
-    const requirements: Equal<Requirements, Transient.Transient | Crypto.Crypto> = true
+    const payload: Equal<typeof ChatTransient.payloadSchema.Type, Typing | ReadPosition> = true
+    const client: Equal<
+      typeof ChatTransient.client,
+      Effect.Effect<
+        (documentId: Identity.DocumentId) => Transient.Client<Typing | ReadPosition>,
+        never,
+        Transient.Transient
+      >
+    > = true
     assert.isTrue(payload)
-    assert.isTrue(requirements)
+    assert.isTrue(client)
   })
 
   it("narrows document lookup by literal name", () => {
