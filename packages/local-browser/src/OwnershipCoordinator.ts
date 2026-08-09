@@ -1082,10 +1082,11 @@ const layerTabImpl = (
           }
           case "ProvisionRejected": {
             if (current.provisioning?.nonce === frame.nonce) {
-              failRpcPorts(current, "replica provisioning was rejected")
-              current.provisioning.worker.terminate()
+              const worker = current.provisioning.worker
               current.provisioning = undefined
               current.databaseWorker = undefined
+              worker.terminate()
+              failRpcPorts(current, "replica provisioning was rejected")
             }
             return
           }
