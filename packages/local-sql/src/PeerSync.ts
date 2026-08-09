@@ -1147,7 +1147,10 @@ const make = (
       Effect.scoped(Effect.gen(function*() {
         const permit = yield* gate.shared
         yield* validateSession(permit, session)
-        return yield* quotaLock.withPermit(Effect.gen(function*() {
+        // The cluster's ApplySync handler holds the client's only transaction permit when it takes
+        // quotaLock, so holding quotaLock while touching the database deadlocks the worker. One
+        // order everywhere: gate, then transaction permit, then quotaLock.
+        return yield* sql.withTransaction(quotaLock.withPermit(Effect.gen(function*() {
           const messageHash = yield* digest(reply.message)
           if (messageHash !== reply.messageHash) {
             return yield* new ReplicaError.ReplicaError({
@@ -1191,9 +1194,7 @@ const make = (
               writerProvenance: existing.writer_provenance
             }
           }
-          return yield* sql.withTransaction(
-            persistOutbound(session, reply.documentId, reply.message, reply.heads)
-          ).pipe(
+          return yield* persistOutbound(session, reply.documentId, reply.message, reply.heads).pipe(
             Effect.catchTags({
               SqlError: (cause) =>
                 Effect.fail(
@@ -1209,7 +1210,14 @@ const make = (
                 )
             })
           )
-        }))
+        }))).pipe(
+          Effect.catchTag("SqlError", (cause) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({ cause })
+              })
+            ))
+        )
       }))
 
     const generate = <D extends Document.Any,>(
@@ -1299,7 +1307,7 @@ const make = (
                         })
                       })
                     }
-                    const outbound = yield* quotaLock.withPermit(Effect.gen(function*() {
+                    const outbound = yield* sql.withTransaction(quotaLock.withPermit(Effect.gen(function*() {
                       yield* validateSessionGeneration(generation, sessionGeneration)
                       const existing = yield* findPendingOutboxCount({
                         replicaIncarnation: session.replicaIncarnation,
@@ -1308,12 +1316,15 @@ const make = (
                         documentId
                       })
                       if ((existing[0]?.count ?? 0) > 0) return null
-                      const outbound = yield* sql.withTransaction(
-                        persistOutbound(session, documentId, generated[1]!, durable.materializedHeads)
+                      const outbound = yield* persistOutbound(
+                        session,
+                        documentId,
+                        generated[1]!,
+                        durable.materializedHeads
                       )
                       yield* writeState(session, documentId, generated[0])
                       return outbound
-                    })).pipe(
+                    }))).pipe(
                       Effect.catchTags({
                         SqlError: (cause) =>
                           Effect.fail(
@@ -2625,27 +2636,27 @@ const make = (
         pruneRelayReceipts: Effect.scoped(Effect.gen(function*() {
           const permit = yield* gate.shared
           const expiresAt = new Date(yield* Clock.currentTimeMillis).toISOString()
-          return yield* quotaLock.withPermit(
-            sql.withTransaction(Effect.gen(function*() {
+          return yield* sql.withTransaction(
+            quotaLock.withPermit(Effect.gen(function*() {
               const pruned = yield* pruneRelayReceiptsInTransaction(permit.incarnation, expiresAt)
               yield* gate.validate(permit)
               return pruned
-            })).pipe(
-              Effect.catchTags({
-                SqlError: (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageUnavailable({ cause })
-                    })
-                  ),
-                SchemaError: (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageCorrupt({ cause })
-                    })
-                  )
-              })
-            )
+            }))
+          ).pipe(
+            Effect.catchTags({
+              SqlError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageUnavailable({ cause })
+                  })
+                ),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageCorrupt({ cause })
+                  })
+                )
+            })
           )
         }))
       }
@@ -2668,26 +2679,24 @@ const make = (
         withSessionGeneration(session, (generation) =>
           Effect.scoped(Effect.gen(function*() {
             yield* gate.shared
-            yield* quotaLock.withPermit(Effect.gen(function*() {
-              yield* sql.withTransaction(Effect.gen(function*() {
-                yield* sql`DELETE FROM effect_local_peer_outbox
+            yield* sql.withTransaction(quotaLock.withPermit(Effect.gen(function*() {
+              yield* sql`DELETE FROM effect_local_peer_outbox
               WHERE replica_incarnation = ${session.replicaIncarnation}
                 AND peer_id = ${session.peerId}
                 AND connection_epoch = ${session.connectionEpoch}`
-                yield* sql`DELETE FROM effect_local_peer_receipts
+              yield* sql`DELETE FROM effect_local_peer_receipts
               WHERE replica_incarnation = ${session.replicaIncarnation}
                 AND peer_id = ${session.peerId}
                 AND connection_epoch = ${session.connectionEpoch}
                 AND relay_message_id IS NULL`
-              })).pipe(Effect.catchTag("SqlError", (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageUnavailable({ cause })
-                  })
-                )))
               yield* Ref.update(generation, (current) => current + 1)
               yield* removeState(session)
-            }))
+            }))).pipe(Effect.catchTag("SqlError", (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({ cause })
+                })
+              )))
           }))),
       generate,
       receive,
@@ -2745,8 +2754,8 @@ const make = (
         Effect.scoped(Effect.gen(function*() {
           const permit = yield* gate.shared
           yield* validateSession(permit, session)
-          return yield* quotaLock.withPermit(
-            sql.withTransaction(Effect.gen(function*() {
+          return yield* sql.withTransaction(
+            quotaLock.withPermit(Effect.gen(function*() {
               const rows = yield* markOutboxSent({
                 replicaIncarnation: session.replicaIncarnation,
                 peerId: session.peerId,
@@ -2762,22 +2771,22 @@ const make = (
                 AND status = 'Sent'
                 AND send_sequence < ${sendSequence}`
               return true
-            })).pipe(
-              Effect.catchTags({
-                SqlError: (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageUnavailable({ cause })
-                    })
-                  ),
-                SchemaError: (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageCorrupt({ cause })
-                    })
-                  )
-              })
-            )
+            }))
+          ).pipe(
+            Effect.catchTags({
+              SqlError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageUnavailable({ cause })
+                  })
+                ),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageCorrupt({ cause })
+                  })
+                )
+            })
           )
         }))
     })
