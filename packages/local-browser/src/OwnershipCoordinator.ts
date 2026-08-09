@@ -129,6 +129,7 @@ const DatabaseActivityFrame = Schema.Union([
   Schema.Tuple([Schema.Int, Schema.Unknown, Schema.Unknown]),
   Schema.Tuple([Schema.Literal("update_hook"), Schema.String, Schema.Number])
 ])
+const isDatabaseActivityFrame = Schema.is(DatabaseActivityFrame)
 
 interface EngineSnapshot {
   readonly runtime: ManagedRuntime.ManagedRuntime<EngineServices, unknown>
@@ -335,7 +336,7 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
           const runtime = yield* Effect.sync(() => options.engine(databasePort))
           const engineScope = yield* Scope.make()
           const onDatabaseReply = (event: MessageEvent<unknown>) => {
-            if (Schema.is(DatabaseActivityFrame)(event.data)) databaseReplies.count++
+            if (isDatabaseActivityFrame(event.data)) databaseReplies.count++
           }
           databasePort.addEventListener("message", onDatabaseReply)
           const detachDatabaseObserver = () => databasePort.removeEventListener("message", onDatabaseReply)
