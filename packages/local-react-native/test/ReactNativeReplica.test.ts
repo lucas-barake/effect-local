@@ -151,8 +151,9 @@ describe("ReactNativeReplica", () => {
       const unsubscribe = registry.subscribe(status, (result) => Queue.offerUnsafe(emissions, result), {
         immediate: true
       })
-      const first = yield* awaitSuccessWhere(emissions, () => true)
-      assert.isDefined(first)
+      const first = yield* awaitSuccessWhere(emissions, (value) =>
+        typeof value === "object" && value !== null && "_tag" in value)
+      assert.deepStrictEqual(first, { _tag: "Ready", pendingCommands: 0 })
       unsubscribe()
       registry.dispose()
     }))
