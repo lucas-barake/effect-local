@@ -362,9 +362,17 @@ body {
 .composer {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   padding: 10px 16px;
   background: var(--panel-raised);
+}
+
+.composer-error {
+  flex-basis: 100%;
+  color: #ff8f8f;
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .composer-input {

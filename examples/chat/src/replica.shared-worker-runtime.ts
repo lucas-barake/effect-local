@@ -139,31 +139,38 @@ const fetchSeed = Effect.tryPromise(async () => {
   return new Uint8Array(await response.arrayBuffer())
 })
 
-/**
- * First-launch provisioning: every replica must hold the conversation documents before peer sync
- * can converge them, and they must all share one genesis, so the replica restores the server's
- * seed archive instead of creating anything itself. Retries forever — the app works offline after
- * the first successful bootstrap, but the very first launch needs the relay reachable.
- */
 const ensureSeeded = Effect.gen(function*() {
   const replica = yield* Replica.Replica
-  const firstConversation = yield* conversationDocumentId(me.id, counterpartsOf(me.id)[0]!.id)
-  const seeded = yield* replica.get(Conversation, firstConversation).pipe(
-    Effect.as(true),
-    Effect.catchReason("ReplicaError", "DocumentNotFound", () => Effect.succeed(false))
+  const expected = yield* Effect.forEach(
+    counterpartsOf(me.id),
+    (counterpart) => conversationDocumentId(me.id, counterpart.id)
   )
-  if (seeded) return
+  const missing = yield* Effect.filter(expected, (documentId) =>
+    replica.get(Conversation, documentId).pipe(
+      Effect.as(false),
+      Effect.catchReason("ReplicaError", "DocumentNotFound", () => Effect.succeed(true))
+    ))
+  if (missing.length === 0) return
   const bytes = yield* fetchSeed.pipe(
     Effect.retry(Schedule.spaced(Duration.seconds(3)))
   )
-  yield* replica.restoreBackup({
-    expectedDefinitionHash: definition.hash,
-    installationId: yield* Identity.makeBackupInstallationId,
-    maxBytes: limits.maxBackupBytes,
-    mode: "clone",
-    source: Stream.make(bytes)
-  })
-  yield* Effect.log("chat replica provisioned from seed archive")
+  yield* Effect.forEach(missing, (documentId) =>
+    Effect.gen(function*() {
+      const installationId = yield* Identity.makeBackupInstallationId
+      yield* replica.installBackupDocument(Conversation, {
+        documentId,
+        expectedDefinitionHash: definition.hash,
+        installationId,
+        maxBytes: limits.maxBackupBytes,
+        source: Stream.make(bytes)
+      }).pipe(
+        Effect.retry({
+          while: (error) => error.reason._tag === "StorageUnavailable" || error.reason._tag === "QuotaExceeded",
+          schedule: Schedule.spaced(Duration.seconds(3))
+        })
+      )
+    }), { discard: true })
+  yield* Effect.log(`chat replica installed ${missing.length} missing seed conversations`)
 })
 
 const sessionOptions = (

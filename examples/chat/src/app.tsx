@@ -4,20 +4,17 @@ import { Input } from "@base-ui/react/input"
 import { ScrollArea } from "@base-ui/react/scroll-area"
 import { Select } from "@base-ui/react/select"
 import { Tooltip } from "@base-ui/react/tooltip"
-import { useAtomMount, useAtomSet, useAtomValue } from "@effect/atom-react"
+import { useAtom, useAtomMount, useAtomSet, useAtomValue } from "@effect/atom-react"
 import * as CommandDelivery from "@lucas-barake/effect-local/CommandDelivery"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Cause from "effect/Cause"
-import * as Exit from "effect/Exit"
-import * as Option from "effect/Option"
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import { Check, CheckCheck, ChevronDown, Clock, Send } from "lucide-react"
-import { type FormEvent, useEffect, useMemo, useRef, useState } from "react"
+import { type SubmitEvent, useEffect, useRef } from "react"
 import * as Client from "./replica-client.ts"
-import { type ChatUser, counterpartsOf, endpointFor, relayPeerId, users } from "./shared/identities.ts"
+import { type ChatUser, endpointFor, relayPeerId, users } from "./shared/identities.ts"
 
 const me = Client.me
-const counterparts = counterpartsOf(me.id)
 
 interface MessageRowUi {
   readonly messageId: string
@@ -29,23 +26,10 @@ interface MessageRowUi {
   readonly readAtMillis: number | null
 }
 
-const ONLINE_WINDOW_MILLIS = 45_000
-
-/**
- * Inbound sync blocks a document's projections until the next local command (here: the presence
- * heartbeat) rebuilds them, so a query can fail for up to one heartbeat interval; the previous
- * successful rows stay on screen meanwhile.
- */
 const latest = <A, E,>(result: AsyncResult.AsyncResult<A, E>, fallback: A): A =>
   AsyncResult.getOrElse(result, () => fallback)
 
 const timeOf = (millis: number) => new Date(millis).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-
-const lastSeenText = (lastSeenAtMillis: number | undefined, now: number) => {
-  if (lastSeenAtMillis === undefined) return "offline"
-  if (now - lastSeenAtMillis < ONLINE_WINDOW_MILLIS) return "online"
-  return `last seen ${timeOf(lastSeenAtMillis)}`
-}
 
 const UserAvatar = ({ size, user }: { readonly size: number; readonly user: ChatUser }) => (
   <Avatar.Root
@@ -95,11 +79,8 @@ const ChatView = ({ conversationId, counterpart, presenceText }: {
 }) => {
   const result = useAtomValue(Client.messages({ conversationId }))
   const rows: ReadonlyArray<MessageRowUi> = latest(result, [])
-  const runSend = useAtomSet(Client.sendMessage, { mode: "promiseExit" })
-  const [draft, setDraft] = useState("")
-  // Mirrors the input synchronously: a click on a submit button can reach the handler twice in one
-  // dispatch (component wrapper + native form submission), and React state has not flushed yet.
-  const draftRef = useRef("")
+  const [sendResult, runSend] = useAtom(Client.sendMessage(conversationId))
+  const [draft, setDraft] = useAtom(Client.draft(conversationId))
   const viewportRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -107,16 +88,10 @@ const ChatView = ({ conversationId, counterpart, presenceText }: {
     if (viewport !== null) viewport.scrollTop = viewport.scrollHeight
   }, [rows.length])
 
-  const submit = (event: FormEvent) => {
+  const submit = (event: SubmitEvent<HTMLFormElement>) => {
     event.preventDefault()
-    const body = draftRef.current.trim()
-    if (body.length === 0) return
-    draftRef.current = ""
-    setDraft("")
-    void runSend({ conversationId, body }).then((exit) => {
-      // eslint-disable-next-line no-console
-      if (Exit.isFailure(exit)) console.error("[send]", Cause.pretty(exit.cause))
-    })
+    if (sendResult.waiting || draft.trim().length === 0) return
+    runSend(draft)
   }
 
   return (
@@ -150,15 +125,21 @@ const ChatView = ({ conversationId, counterpart, presenceText }: {
         <Input
           className="composer-input"
           placeholder={`Message ${counterpart.displayName}`}
+          maxLength={4000}
           value={draft}
-          onValueChange={(value) => {
-            draftRef.current = value
-            setDraft(value)
-          }}
+          onValueChange={setDraft}
         />
-        <Button type="submit" className="composer-send" aria-label="Send" disabled={draft.trim().length === 0}>
+        <Button
+          type="submit"
+          className="composer-send"
+          aria-label="Send"
+          disabled={sendResult.waiting || draft.trim().length === 0}
+        >
           <Send size={18} />
         </Button>
+        {sendResult._tag === "Failure" && (
+          <div className="composer-error" role="alert">{Cause.pretty(sendResult.cause)}</div>
+        )}
       </form>
     </section>
   )
@@ -178,57 +159,10 @@ export const App = () => {
   useAtomMount(Client.readReceipts)
 
   const relayStatus = useAtomValue(Client.relayConnectionStatus)
-  const summariesResult = useAtomValue(Client.conversationSummaries({ me: me.id }))
-  const presenceResult = useAtomValue(Client.presenceSnapshot())
-  const conversationIds = latest(useAtomValue(Client.conversationIds), undefined)
-  const now = latest(useAtomValue(Client.nowMillis), Date.now())
+  const rosterRows = useAtomValue(Client.roster)
   const selectedId = useAtomValue(Client.selectedCounterpartId)
   const setSelectedId = useAtomSet(Client.selectedCounterpartId)
   const selected = useAtomValue(Client.selectedConversation)
-
-  useEffect(() => {
-    for (
-      const [name, result] of [
-        ["summaries", summariesResult],
-        ["presence", presenceResult]
-      ] as const
-    ) {
-      if (result._tag !== "Failure") continue
-      // ProjectionBlocked is the designed steady-state transient (inbound sync defers projection
-      // rebuild to the next local command; the UI renders the previous rows meanwhile), so at
-      // steady state it would drip into the console forever and drown real failures.
-      const blocked = Option.exists(
-        Cause.findErrorOption(result.cause),
-        (error) => error.reason._tag === "ProjectionBlocked"
-      )
-      // eslint-disable-next-line no-console
-      if (!blocked) console.error(`[query:${name}]`, Cause.pretty(result.cause))
-    }
-  }, [summariesResult, presenceResult])
-
-  const summaries = latest(summariesResult, [])
-  const presenceRows = latest(presenceResult, [])
-
-  const presenceOf = (counterpart: ChatUser) => {
-    const conversationId = conversationIds?.get(counterpart.id)
-    const row = presenceRows.find((candidate) =>
-      candidate.sourceDocumentId === conversationId && candidate.userId === counterpart.id
-    )
-    return lastSeenText(row?.lastSeenAtMillis, now)
-  }
-
-  const rosterRows = useMemo(() => {
-    const byConversation = new Map(summaries.map((summary) => [summary.conversationId, summary]))
-    return counterparts
-      .map((counterpart) => ({
-        counterpart,
-        conversationId: conversationIds?.get(counterpart.id),
-        summary: conversationIds === undefined
-          ? undefined
-          : byConversation.get(conversationIds.get(counterpart.id)!)
-      }))
-      .toSorted((left, right) => (right.summary?.lastSentAtMillis ?? 0) - (left.summary?.lastSentAtMillis ?? 0))
-  }, [summaries, conversationIds])
 
   const relayTag = relayStatus._tag === "Success" ? relayStatus.value._tag : "Connecting"
 
@@ -270,8 +204,7 @@ export const App = () => {
           </header>
           <ScrollArea.Root className="roster">
             <ScrollArea.Viewport className="roster-viewport">
-              {rosterRows.map(({ conversationId, counterpart, summary }) => {
-                const presenceText = presenceOf(counterpart)
+              {rosterRows.map(({ counterpart, presenceText, ready, summary }) => {
                 return (
                   <button
                     key={counterpart.id}
@@ -280,7 +213,7 @@ export const App = () => {
                     className="roster-row"
                     data-selected={selectedId === counterpart.id}
                     onClick={() => setSelectedId(counterpart.id)}
-                    disabled={conversationId === undefined}
+                    disabled={!ready}
                   >
                     <span className="roster-avatar">
                       <UserAvatar user={counterpart} size={44} />
@@ -316,7 +249,8 @@ export const App = () => {
             <ChatView
               conversationId={selected.conversationId}
               counterpart={selected.counterpart}
-              presenceText={presenceOf(selected.counterpart)}
+              presenceText={rosterRows.find((row) => row.counterpart.id === selected.counterpart.id)?.presenceText ??
+                "offline"}
             />
           )
           : (

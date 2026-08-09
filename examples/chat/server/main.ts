@@ -37,6 +37,7 @@ import * as RpcServer from "effect/unstable/rpc/RpcServer"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import { createServer } from "node:http"
+import type { Duplex } from "node:stream"
 import { Conversation, definition, DomainLive, limits, sqlProjections } from "../src/shared/domain.ts"
 import {
   channels,
@@ -300,6 +301,22 @@ const Seed = HttpRouter.add(
 
 const Ready = HttpRouter.add("GET", "/ready", HttpServerResponse.text("ok"))
 
+let setTestRelayAvailable: ((available: boolean) => void) | undefined
+
+const relayControl = (available: boolean) =>
+  Effect.sync(() => {
+    if (process.env.CHAT_TEST_CONTROL !== "1") {
+      return HttpServerResponse.text("not found", { status: 404 })
+    }
+    setTestRelayAvailable?.(available)
+    return HttpServerResponse.text("ok")
+  })
+
+const TestControl = Layer.mergeAll(
+  HttpRouter.add("POST", "/test/relay/offline", relayControl(false)),
+  HttpRouter.add("POST", "/test/relay/online", relayControl(true))
+)
+
 /**
  * `NodeHttpServer.layer` starts listening as soon as its layer builds, but the router's handler is
  * attached later, once the backend layers (Postgres pool, inbox migrations, cluster, seed
@@ -310,6 +327,24 @@ const Ready = HttpRouter.add("GET", "/ready", HttpServerResponse.text("ok"))
  */
 const createGatedServer = () => {
   const server = createServer()
+  let relayAvailable = true
+  const relaySockets = new Set<Duplex>()
+  server.prependListener("upgrade", (request, socket) => {
+    if (new URL(request.url ?? "/", "http://localhost").pathname !== "/relay") return
+    if (!relayAvailable) {
+      socket.destroy()
+      return
+    }
+    relaySockets.add(socket)
+    socket.once("close", () => relaySockets.delete(socket))
+  })
+  setTestRelayAvailable = (available) => {
+    relayAvailable = available
+    if (!available) {
+      for (const socket of relaySockets) socket.destroy()
+      relaySockets.clear()
+    }
+  }
   server.on("request", (_request, response) => {
     if (server.listenerCount("request") > 1) return
     response.writeHead(503, { "retry-after": "1" }).end()
@@ -317,7 +352,7 @@ const createGatedServer = () => {
   return server
 }
 
-HttpRouter.serve(Layer.mergeAll(Rpc, Seed, Ready)).pipe(
+HttpRouter.serve(Layer.mergeAll(Rpc, Seed, Ready, TestControl)).pipe(
   Layer.provide(SeedArchiveLive),
   Layer.provide(NodeHttpServer.layer(createGatedServer, { port, host: "0.0.0.0" })),
   Layer.provide(Telemetry),

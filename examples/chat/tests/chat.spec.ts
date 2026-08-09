@@ -1,91 +1,255 @@
-import type { Browser, Page } from "@playwright/test"
+import type { BrowserContext, Page, TestInfo } from "@playwright/test"
 import { expect, test } from "@playwright/test"
 
-/**
- * Two Chromium contexts rather than two tabs: tabs of one context share storage, and a browser
- * profile is one device in this example's model. Nothing is stubbed on either side of the wire —
- * both pages run the full SharedWorker + OPFS + relay stack against the real server.
- */
+interface FailureCapture {
+  readonly attach: () => Promise<void>
+  readonly expectClean: () => Promise<void>
+}
 
-const openUser = async (browser: Browser, user: string): Promise<Page> => {
-  const context = await browser.newContext()
+const installFailureCapture = async (
+  page: Page,
+  label: string,
+  testInfo: TestInfo
+): Promise<FailureCapture> => {
+  const errors: Array<string> = []
+
+  const recordConsoleError = (source: string, type: string, text: string) => {
+    if (type === "error") errors.push(`${source}: ${text}`)
+  }
+
+  page.on("pageerror", (error) => errors.push(`page-or-dedicated-worker: ${error.stack ?? error.message}`))
+  page.on("console", (message) => recordConsoleError("page-console", message.type(), message.text()))
+  page.context().on("console", (message) => {
+    if (message.page() === null) recordConsoleError("shared-worker-console", message.type(), message.text())
+  })
+  page.on("worker", (worker) => {
+    worker.on(
+      "console",
+      (message) => recordConsoleError(`dedicated-worker-console ${worker.url()}`, message.type(), message.text())
+    )
+  })
+
+  await page.exposeFunction("__captureChatOwnerErrorForTest", (message: string) => {
+    errors.push(`shared-worker-owner: ${message}`)
+  })
+  await page.addInitScript(() => {
+    let ownerError: string | undefined
+    Object.defineProperty(window, "__chatOwnerError", {
+      configurable: true,
+      get: () => ownerError,
+      set: (message: string | undefined) => {
+        ownerError = message
+        if (message !== undefined) {
+          void (window as unknown as {
+            __captureChatOwnerErrorForTest: (value: string) => Promise<void>
+          }).__captureChatOwnerErrorForTest(message)
+        }
+      }
+    })
+  })
+
+  let attached = false
+  const attach = async () => {
+    if (attached) return
+    attached = true
+    await testInfo.attach(`${label}-browser-errors`, {
+      body: Buffer.from(errors.length === 0 ? "none\n" : `${errors.join("\n\n")}\n`),
+      contentType: "text/plain"
+    })
+  }
+
+  return {
+    attach,
+    expectClean: async () => {
+      await attach()
+      expect(
+        errors,
+        `${label} emitted unexpected page, worker, or console errors`
+      ).toEqual([])
+    }
+  }
+}
+
+const openUserPage = async (
+  context: BrowserContext,
+  user: string,
+  label: string,
+  testInfo: TestInfo,
+  captures: Array<FailureCapture>
+): Promise<Page> => {
   const page = await context.newPage()
+  captures.push(await installFailureCapture(page, label, testInfo))
   await page.goto(`/?user=${user}`)
   await expect(page.getByText("connected", { exact: true })).toBeVisible({ timeout: 60_000 })
   await expect(page.locator(".roster-row:disabled")).toHaveCount(0, { timeout: 60_000 })
+  await expect.poll(() => page.evaluate(() => window.__chatOwnerInfo)).not.toBeUndefined()
   return page
 }
 
-test("messages, ticks, read receipts, presence, and multi-tab", async ({ browser }) => {
-  const alice = await openUser(browser, "alice")
-  const bob = await openUser(browser, "bob")
+const expectEveryConversationEnabled = async (page: Page) => {
+  await expect(page.locator(".roster-row")).toHaveCount(3)
+  await expect(page.locator(".roster-row:disabled")).toHaveCount(0)
+}
 
-  const run = Date.now().toString(36)
-  const fromAlice = `hello bob ${run}`
-  const fromBob = `hello alice ${run}`
-
-  const aliceConversation = alice.getByTestId("conversation-bob")
-  const bobConversation = bob.getByTestId("conversation-alice")
-  await expect(aliceConversation).toBeEnabled({ timeout: 60_000 })
-  await expect(bobConversation).toBeEnabled({ timeout: 60_000 })
-
-  // Socket connectivity precedes pair-session readiness. Presence is the first document exchange
-  // in both directions, so it proves the path exercised below is ready instead of racing startup.
-  await aliceConversation.click()
-  await bobConversation.click()
-  await expect(alice.locator(".chat-presence")).toHaveAttribute("data-online", "true", {
-    timeout: 90_000
-  })
-  await expect(bob.locator(".chat-presence")).toHaveAttribute("data-online", "true", {
-    timeout: 90_000
-  })
-
-  // Alice opens the Bob conversation and sends. The bubble starts on the clock (committed locally)
-  // and reaches at least relay custody once the push is accepted.
-  await alice.getByPlaceholder("Message Bob").fill(fromAlice)
-  await alice.getByRole("button", { name: "Send" }).click()
-  // Usually instant (the send itself rebuilds the sender's projections), but replayed inbound
-  // traffic arriving in the same window can re-block the list until the next heartbeat.
-  const aliceBubble = alice.locator(".bubble", { hasText: fromAlice })
-  await expect(aliceBubble).toBeVisible({ timeout: 40_000 })
-  await expect(aliceBubble.locator(".tick-wrap")).toHaveAttribute(
-    "data-status",
-    /Received by server|Delivered|Read/,
-    { timeout: 30_000 }
+const waitForPresenceOrOwnerError = async (page: Page) => {
+  await page.waitForFunction(
+    () =>
+      window.__chatOwnerError !== undefined ||
+      document.querySelector<HTMLElement>(".chat-presence")?.dataset.online === "true",
+    undefined,
+    {
+      timeout: 90_000
+    }
   )
+  const ownerError = await page.evaluate(() => window.__chatOwnerError)
+  if (ownerError !== undefined) throw new Error(ownerError)
+}
 
-  // Bob's device applies the message and acknowledges it without his tab doing anything; his
-  // sidebar shows the conversation with an unread count until he opens it.
-  await expect(bobConversation).toContainText(fromAlice, { timeout: 60_000 })
+interface RelayControl {
+  readonly disconnect: (pages: ReadonlyArray<Page>) => Promise<void>
+  readonly reconnect: () => Promise<void>
+}
 
-  // Delivered: bob's replica holds the message durably, which his open app reports back into the
-  // document whether or not the conversation is on screen.
-  await expect(aliceBubble.locator(".tick-wrap")).toHaveAttribute("data-status", /Delivered|Read/, {
-    timeout: 60_000
-  })
+const setRelayAvailability = async (state: "offline" | "online") => {
+  const response = await fetch(`http://127.0.0.1:8788/test/relay/${state}`, { method: "POST" })
+  expect(response.ok, `relay test control rejected ${state}`).toBe(true)
+}
 
-  // Read: bob opens the conversation. Inbound changes can keep the message list blocked until
-  // bob's next local command — up to one heartbeat interval — so this allows more than one.
-  await bobConversation.click()
-  await expect(bob.locator(".bubble", { hasText: fromAlice })).toBeVisible({ timeout: 40_000 })
-  await expect(aliceBubble.locator(".tick-wrap")).toHaveAttribute("data-status", "Read", {
-    timeout: 60_000
-  })
+const controlRelay = (): RelayControl => {
+  return {
+    disconnect: async (pages) => {
+      await setRelayAvailability("offline")
+      await Promise.all(
+        pages.map((page) =>
+          expect(page.locator(".relay-status")).toHaveAttribute("data-status", /Connecting|Disconnected/, {
+            timeout: 30_000
+          })
+        )
+      )
+    },
+    reconnect: async () => {
+      await setRelayAvailability("online")
+    }
+  }
+}
 
-  // The reply flows the other way.
-  await bob.getByPlaceholder("Message Alice").fill(fromBob)
-  await bob.getByRole("button", { name: "Send" }).click()
-  await expect(bob.locator(".bubble", { hasText: fromBob })).toHaveCount(1, { timeout: 40_000 })
-  await expect(alice.locator(".bubble", { hasText: fromBob })).toBeVisible({ timeout: 60_000 })
+const closeWithEvidence = async (
+  context: BrowserContext,
+  captures: ReadonlyArray<FailureCapture>
+) => {
+  await setRelayAvailability("online").catch(() => undefined)
+  await Promise.all(captures.map((capture) => capture.attach()))
+  await context.close()
+}
 
-  // Multi-tab: a second tab of the same profile attaches to the same SharedWorker replica and
-  // sees the same conversation immediately.
-  const aliceTab2 = await alice.context().newPage()
-  await aliceTab2.goto(`/?user=alice`)
-  await expect(aliceTab2.getByText("connected", { exact: true })).toBeVisible({ timeout: 60_000 })
-  const aliceTab2Conversation = aliceTab2.getByTestId("conversation-bob")
-  await expect(aliceTab2Conversation).toBeEnabled({ timeout: 60_000 })
-  await aliceTab2Conversation.click()
-  await expect(aliceTab2.locator(".bubble", { hasText: fromAlice })).toBeVisible({ timeout: 60_000 })
-  await expect(aliceTab2.locator(".bubble", { hasText: fromBob })).toBeVisible({ timeout: 60_000 })
+test("all locally ready conversations stay enabled while the relay is unavailable", async ({ browser }, testInfo) => {
+  const context = await browser.newContext()
+  const captures: Array<FailureCapture> = []
+  try {
+    const relay = controlRelay()
+    const alice = await openUserPage(context, "alice", "alice", testInfo, captures)
+
+    await relay.disconnect([alice])
+    await expectEveryConversationEnabled(alice)
+    const bob = alice.getByTestId("conversation-bob")
+    const carol = alice.getByTestId("conversation-carol")
+    const dave = alice.getByTestId("conversation-dave")
+    await bob.click()
+    await expect(bob).toHaveAttribute("data-selected", "true")
+    await carol.click()
+    await expect(carol).toHaveAttribute("data-selected", "true")
+    await dave.click()
+    await expect(dave).toHaveAttribute("data-selected", "true")
+
+    await relay.reconnect()
+    await Promise.all(captures.map((capture) => capture.expectClean()))
+  } finally {
+    await closeWithEvidence(context, captures)
+  }
+})
+
+test(
+  "an offline local send survives reload and reconnects exactly once to an open peer",
+  async ({ browser }, testInfo) => {
+    const aliceContext = await browser.newContext()
+    const bobContext = await browser.newContext()
+    const captures: Array<FailureCapture> = []
+    try {
+      const aliceRelay = controlRelay()
+      const alice = await openUserPage(aliceContext, "alice", "alice", testInfo, captures)
+      const bob = await openUserPage(bobContext, "bob", "bob", testInfo, captures)
+      const aliceConversation = alice.getByTestId("conversation-bob")
+      const bobConversation = bob.getByTestId("conversation-alice")
+      await aliceConversation.click()
+      await bobConversation.click()
+      await Promise.all([alice, bob].map(waitForPresenceOrOwnerError))
+
+      const body = `offline alice to bob ${crypto.randomUUID()}`
+      await aliceRelay.disconnect([alice, bob])
+      await expectEveryConversationEnabled(alice)
+      await alice.getByPlaceholder("Message Bob").fill(body)
+      await alice.getByRole("button", { name: "Send" }).click()
+      await expect(alice.getByRole("alert")).toHaveCount(0)
+      await expect(alice.locator(".bubble", { hasText: body })).toHaveCount(1, { timeout: 10_000 })
+      await expect(bob.locator(".bubble", { hasText: body })).toHaveCount(0)
+
+      await alice.reload()
+      await expectEveryConversationEnabled(alice)
+      await alice.getByTestId("conversation-bob").click()
+      await expect(alice.locator(".bubble", { hasText: body })).toHaveCount(1, { timeout: 10_000 })
+      await expect(bob.locator(".bubble", { hasText: body })).toHaveCount(0)
+
+      await aliceRelay.reconnect()
+      await Promise.all(
+        [alice, bob].map((page) =>
+          expect(page.locator(".relay-status")).toHaveAttribute("data-status", "Connected", { timeout: 60_000 })
+        )
+      )
+      await bob.waitForFunction(
+        (messageBody) =>
+          window.__chatOwnerError !== undefined ||
+          [...document.querySelectorAll(".bubble")].some((bubble) => bubble.textContent?.includes(messageBody)),
+        body,
+        {
+          timeout: 30_000
+        }
+      )
+      const reconnectError = await bob.evaluate(() => window.__chatOwnerError)
+      if (reconnectError !== undefined) throw new Error(reconnectError)
+      await expect(bob.locator(".bubble", { hasText: body })).toHaveCount(1, { timeout: 30_000 })
+      await expect(bobConversation).toContainText(body)
+      await expect(alice.locator(".bubble", { hasText: body })).toHaveCount(1)
+
+      await Promise.all(captures.map((capture) => capture.expectClean()))
+    } finally {
+      await Promise.all([
+        closeWithEvidence(aliceContext, captures),
+        bobContext.close()
+      ])
+    }
+  }
+)
+
+test("two already open tabs observe one new local commit", async ({ browser }, testInfo) => {
+  const context = await browser.newContext()
+  const captures: Array<FailureCapture> = []
+  try {
+    const relay = controlRelay()
+    const aliceTab1 = await openUserPage(context, "alice", "alice-tab-1", testInfo, captures)
+    const aliceTab2 = await openUserPage(context, "alice", "alice-tab-2", testInfo, captures)
+    await aliceTab1.getByTestId("conversation-bob").click()
+    await aliceTab2.getByTestId("conversation-bob").click()
+
+    const body = `shared alice commit ${crypto.randomUUID()}`
+    await relay.disconnect([aliceTab1, aliceTab2])
+    await aliceTab1.getByPlaceholder("Message Bob").fill(body)
+    await aliceTab1.getByRole("button", { name: "Send" }).click()
+
+    await expect(aliceTab1.locator(".bubble", { hasText: body })).toHaveCount(1, { timeout: 10_000 })
+    await expect(aliceTab2.locator(".bubble", { hasText: body })).toHaveCount(1, { timeout: 10_000 })
+    await relay.reconnect()
+    await Promise.all(captures.map((capture) => capture.expectClean()))
+  } finally {
+    await closeWithEvidence(context, captures)
+  }
 })

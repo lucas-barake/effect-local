@@ -8,10 +8,12 @@ import type * as Crypto from "effect/Crypto"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
-import { AsyncResult, Atom } from "effect/unstable/reactivity"
+import { Atom } from "effect/unstable/reactivity"
+import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import {
   Conversation,
   ConversationSummaries,
@@ -93,53 +95,65 @@ const ReplicaLive = Layer.merge(
 
 const runtime = Atom.runtime(ReplicaLive)
 
-export const conversationSummaries = ReplicaAtom.queryFamily(runtime, ConversationSummaries)
+const conversationSummaries = ReplicaAtom.queryFamily(runtime, ConversationSummaries)
 export const messages = ReplicaAtom.queryFamily(runtime, ListMessages)
-export const presenceSnapshot = ReplicaAtom.queryFamily(runtime, PresenceSnapshot)
+const presenceSnapshot = ReplicaAtom.queryFamily(runtime, PresenceSnapshot)
 export const commandDelivery = ReplicaAtom.commandDeliveryFamily(runtime)
 export const relayConnectionStatus = ReplicaAtom.relayConnectionStatus(runtime)
 
 const undeliveredInbound = ReplicaAtom.queryFamily(runtime, UndeliveredInbound)
 
-/**
- * The conversation ids resolve only once the replica actually holds each seeded conversation
- * document. Mutating before the seed restore lands would create the document with a fresh
- * genesis, and the restore would then silently shadow those writes — so this atom is the gate
- * everything mutating sits behind: the roster stays disabled and the daemons stay idle until it
- * succeeds.
- */
-export const conversationIds = runtime.atom(
-  Effect.gen(function*() {
-    const replica = yield* Replica.Replica
-    const entries = yield* Effect.forEach(counterpartsOf(me.id), (counterpart) =>
-      Effect.gen(function*() {
-        const conversationId = yield* Effect.promise(() => conversationIdFor(me.id, counterpart.id))
-        yield* replica.get(Conversation, conversationId).pipe(
-          Effect.retry({
-            while: (error) => error.reason._tag === "DocumentNotFound",
-            schedule: Schedule.spaced(Duration.millis(500))
-          })
-        )
-        return [counterpart.id, conversationId] as const
-      }))
-    return new Map<string, Identity.DocumentId>(entries)
-  })
+const conversationIds = runtime.atom(
+  Effect.forEach(
+    counterpartsOf(me.id),
+    (counterpart) =>
+      Effect.promise(() => conversationIdFor(me.id, counterpart.id)).pipe(
+        Effect.map((conversationId) => [counterpart.id, conversationId] as const)
+      )
+  ).pipe(Effect.map((entries) => new Map<string, Identity.DocumentId>(entries)))
 )
+
+const conversationDocument = ReplicaAtom.documentFamily(runtime, Conversation)
+
+const conversations = Atom.readable((get) => {
+  const ids = get(conversationIds)
+  if (ids._tag !== "Success") {
+    return new Map<string, { readonly conversationId: Identity.DocumentId; readonly ready: boolean }>()
+  }
+  const next = new Map(
+    [...ids.value].map(([counterpartId, conversationId]) => [
+      counterpartId,
+      { conversationId, ready: get(conversationDocument(conversationId))._tag === "Success" }
+    ])
+  )
+  const previous = get.self<typeof next>()
+  if (
+    Option.isSome(previous) &&
+    previous.value.size === next.size &&
+    [...next].every(([counterpartId, conversation]) => {
+      const prior = previous.value.get(counterpartId)
+      return prior?.conversationId === conversation.conversationId && prior.ready === conversation.ready
+    })
+  ) return previous.value
+  return next
+})
 
 /** The counterpart whose conversation is on screen. Written by the roster, read by the daemons. */
 export const selectedCounterpartId = Atom.make<string | undefined>(undefined)
 
-export const selectedConversation = Atom.make(
+export const selectedConversation = Atom.readable(
   (get): { readonly counterpart: ChatUser; readonly conversationId: Identity.DocumentId } | undefined => {
     const counterpartId = get(selectedCounterpartId)
     if (counterpartId === undefined) return undefined
-    const conversationId = AsyncResult.getOrElse(get(conversationIds), () => undefined)?.get(counterpartId)
-    return conversationId === undefined ? undefined : { counterpart: userById(counterpartId), conversationId }
+    const conversation = get(conversations).get(counterpartId)
+    return conversation?.ready !== true
+      ? undefined
+      : { counterpart: userById(counterpartId), conversationId: conversation.conversationId }
   }
 )
 
 /** Re-renders presence labels as time passes without any component owning a timer. */
-export const nowMillis = Atom.make(
+const nowMillis = Atom.make(
   Stream.succeed(Date.now()).pipe(
     Stream.concat(Stream.tick(Duration.seconds(5)).pipe(Stream.map(() => Date.now())))
   )
@@ -152,22 +166,71 @@ export const nowMillis = Atom.make(
  */
 export const commandIdOfMessage = (messageId: string) => Identity.CommandId.make(`cmd_${messageId}`)
 
-export const sendMessage = runtime.fn<{
-  readonly conversationId: Identity.DocumentId
-  readonly body: string
-}>()(
-  ({ body, conversationId }) =>
-    Effect.gen(function*() {
-      const replica = yield* Replica.Replica
-      const commandId = yield* Identity.makeCommandId
-      yield* replica.mutate(SendMessage, {
-        commandId,
-        documentId: conversationId,
-        payload: { messageId: commandId.slice("cmd_".length), author: me.id, body }
-      })
-    }),
-  { concurrent: true, reactivityKeys: [Messages.name] }
+export const draft = Atom.family((_conversationId: Identity.DocumentId) => Atom.make(""))
+
+const clearDraft = Atom.family((conversationId: Identity.DocumentId) =>
+  Atom.writable(
+    () => undefined,
+    (context, submittedDraft: string) => {
+      const conversationDraft = draft(conversationId)
+      if (context.get(conversationDraft) === submittedDraft) context.set(conversationDraft, "")
+    }
+  )
 )
+
+export const sendMessage = Atom.family((conversationId: Identity.DocumentId) =>
+  runtime.fn<string>()(
+    (submittedDraft, context) =>
+      Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const commandId = yield* Identity.makeCommandId
+        yield* replica.mutate(SendMessage, {
+          commandId,
+          documentId: conversationId,
+          payload: { messageId: commandId.slice("cmd_".length), author: me.id, body: submittedDraft.trim() }
+        })
+        context.set(clearDraft(conversationId), submittedDraft)
+      }),
+    { concurrent: true, reactivityKeys: [Messages.name] }
+  )
+)
+
+const latest = <A, E,>(result: AsyncResult.AsyncResult<A, E>, fallback: A): A =>
+  AsyncResult.getOrElse(result, () => fallback)
+
+const ONLINE_WINDOW_MILLIS = 45_000
+
+const timeOf = (millis: number) => new Date(millis).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+
+const lastSeenText = (lastSeenAtMillis: number | undefined, now: number) => {
+  if (lastSeenAtMillis === undefined) return "offline"
+  if (now - lastSeenAtMillis < ONLINE_WINDOW_MILLIS) return "online"
+  return `last seen ${timeOf(lastSeenAtMillis)}`
+}
+
+export const roster = Atom.readable((get) => {
+  const summaries = latest(get(conversationSummaries({ me: me.id })), [])
+  const presenceRows = latest(get(presenceSnapshot()), [])
+  const conversationMap = get(conversations)
+  const now = latest(get(nowMillis), Date.now())
+  const byConversation = new Map(summaries.map((summary) => [summary.conversationId, summary]))
+
+  return counterpartsOf(me.id)
+    .map((counterpart) => {
+      const conversation = conversationMap.get(counterpart.id)
+      const presence = presenceRows.find((candidate) =>
+        candidate.sourceDocumentId === conversation?.conversationId && candidate.userId === counterpart.id
+      )
+      return {
+        counterpart,
+        conversationId: conversation?.conversationId,
+        ready: conversation?.ready === true,
+        presenceText: lastSeenText(presence?.lastSeenAtMillis, now),
+        summary: conversation === undefined ? undefined : byConversation.get(conversation.conversationId)
+      }
+    })
+    .toSorted((left, right) => (right.summary?.lastSentAtMillis ?? 0) - (left.summary?.lastSentAtMillis ?? 0))
+})
 
 const beatConversations = (conversationIdList: ReadonlyArray<Identity.DocumentId>) =>
   Effect.gen(function*() {
@@ -205,19 +268,17 @@ const daemonAtom = <A, E,>(
  */
 export const presenceHeartbeat = daemonAtom("presence heartbeat", (get) =>
   Effect.gen(function*() {
-    const ids = yield* get.result(conversationIds, { suspendOnWaiting: true })
-    // Materialized once: `Effect.forever` re-runs the same beat, and a bare `ids.values()`
-    // iterator would be exhausted after the first one, silently turning every later beat into a
-    // no-op.
-    const conversationIdList = [...ids.values()]
+    const conversationIdList = [...get(conversations).values()].flatMap((conversation) =>
+      conversation.ready ? [conversation.conversationId] : []
+    )
+    if (conversationIdList.length === 0) return
     yield* beatConversations(conversationIdList).pipe(
       Effect.andThen(Effect.sleep(Duration.seconds(15))),
       Effect.forever
     )
   }).pipe(
-    // Nothing re-runs this atom (its one dependency never changes), so a transient beat failure
-    // would end presence for the rest of the session. Restart the loop instead, on the same
-    // cadence as the beat it replaces.
+    // Readiness changes can restart this atom while the profile is being provisioned. Once ready,
+    // ordinary document commits preserve the readiness map identity and the loop keeps its cadence.
     Effect.tapCause((cause) => Effect.logWarning("presence heartbeat restarting", cause)),
     Effect.retry({ schedule: Schedule.spaced(Duration.seconds(15)) })
   ))

@@ -41,6 +41,7 @@ export default defineConfig({
       cwd,
       env: {
         CHAT_RELAY_PORT: String(relayPort),
+        CHAT_TEST_CONTROL: "1",
         DATABASE_URL: "postgres://chat:chat@localhost:5433/chat_test"
       },
       url: `http://127.0.0.1:${relayPort}/ready`,
