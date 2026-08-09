@@ -257,6 +257,71 @@ class TestErrorEvent extends Event implements ErrorEvent {
 }
 
 it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
+  it.effect("terminates a rejected provisional worker before RPC failure listeners can tear down the tab", () =>
+    Effect.gen(function*() {
+      let onControlMessage: ((event: MessageEvent<unknown>) => void) | undefined
+      const controlPort = {
+        addEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+          if (type !== "message") return
+          onControlMessage = typeof listener === "function"
+            ? listener as (event: MessageEvent<unknown>) => void
+            : (event) => listener.handleEvent(event)
+        },
+        removeEventListener() {},
+        postMessage() {},
+        start() {},
+        close() {}
+      } as unknown as MessagePort
+      const sharedWorker = Object.assign(new EventTarget(), {
+        port: controlPort,
+        onerror: null
+      }) as unknown as SharedWorker
+      let terminated = 0
+      const databaseWorker = {
+        postMessage() {},
+        terminate() {
+          terminated++
+        }
+      } as unknown as globalThis.Worker
+      const previousErrorEvent = globalThis.ErrorEvent
+      globalThis.ErrorEvent = TestErrorEvent as typeof ErrorEvent
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          globalThis.ErrorEvent = previousErrorEvent
+        })
+      )
+
+      const scope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+      const context = yield* Layer.buildWithScope(
+        OwnershipCoordinator.layerTab({
+          name: "effect-local-rejected-provision-reentrancy-test",
+          sharedWorker: () => sharedWorker,
+          databaseWorker: () => databaseWorker
+        }),
+        scope
+      )
+      const spawn = yield* Worker.Spawner.pipe(Effect.provide(context))
+      const rpcPort = spawn(0) as MessagePort
+      rpcPort.addEventListener("error", () => {
+        sharedWorker.dispatchEvent(new TestErrorEvent("error", { message: "connection closed" }))
+      })
+
+      const nonce = Schema.decodeUnknownSync(OwnershipProtocol.ProvisionNonce)("reentrant-rejection")
+      onControlMessage?.(
+        new MessageEvent("message", {
+          data: Schema.encodeSync(OwnershipProtocol.OwnerToPageFrame)({ _tag: "Provision", nonce })
+        })
+      )
+      onControlMessage?.(
+        new MessageEvent("message", {
+          data: Schema.encodeSync(OwnershipProtocol.OwnerToPageFrame)({ _tag: "ProvisionRejected", nonce })
+        })
+      )
+
+      assert.strictEqual(terminated, 1)
+    }).pipe(Effect.scoped))
+
   it.effect("fails a pending client acquisition and retries after provisioning is rejected", () =>
     Effect.gen(function*() {
       const control = new MessageChannel()
