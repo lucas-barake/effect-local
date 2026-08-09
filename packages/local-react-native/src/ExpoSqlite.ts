@@ -122,25 +122,31 @@ interface ExpoSqliteConnection extends Connection {}
 
 const SAFE_INTEGER_MAX = "9007199254740991"
 
+// SQLite exposes PRAGMA and EXPLAIN metadata through bounded native integers,
+// and neither grammar can be embedded in the SELECT wrapper used for data rows.
+const isNativeMetadataRead = (sql: string): boolean =>
+  /^\s*(?:--[^\n]*\n|\/\*[^]*?\*\/\s*)*\s*(?:pragma|explain)\b/i.test(sql)
+
 // expo-sqlite bridges every INTEGER column into a JS number, so values above 2^53 —
 // cluster snowflake ids are the load-bearing case — would come back rounded and corrupt
 // every request id read back from storage. Reads running under `SqlClient.SafeIntegers`
 // (cluster message storage) are wrapped so huge integers cross the bridge as exact TEXT;
 // `messageFromRow` and friends pass them through `String(...)`, which preserves the digits.
 // Small integers keep arriving as numbers, so local schemas are unaffected.
-const isSafeIntegersRead = (sql: string): boolean => /^\s*(?:--[^\n]*\n|\/\*[^]*?\*\/\s*)*\s*(select|with)\b/i.test(sql)
-
-const wrapSelectForExactIntegers = (sql: string, columnNames: ReadonlyArray<string>): string => {
-  const expressions = columnNames.map((name) => {
-    const quoted = `"${name.replaceAll("\"", "\"\"")}"`
-    return `CASE WHEN typeof(${quoted}) = 'integer' AND (${quoted} > ${SAFE_INTEGER_MAX} OR ${quoted} < -${SAFE_INTEGER_MAX}) THEN CAST(${quoted} AS TEXT) ELSE ${quoted} END AS ${quoted}`
+const wrapSelectForExactIntegers = (
+  sql: string,
+  sourceNames: ReadonlyArray<string>,
+  resultNames: ReadonlyArray<string>
+): string => {
+  const expressions = sourceNames.map((sourceName, index) => {
+    const source = `"${sourceName.replaceAll("\"", "\"\"")}"`
+    const resultName = resultNames[index]
+    const result = `"${resultName.replaceAll("\"", "\"\"")}"`
+    return `CASE WHEN typeof(${source}) = 'integer' AND (${source} > ${SAFE_INTEGER_MAX} OR ${source} < -${SAFE_INTEGER_MAX}) THEN CAST(${source} AS TEXT) ELSE ${source} END AS ${result}`
   })
   return `SELECT ${expressions.join(", ")} FROM (${sql})`
 }
 
-// Unwrapped reads resolve duplicate column names last-wins (expo-sqlite's composeRow
-// assigns in order); a wrapped outer SELECT would resolve them first-wins. Statements
-// with duplicates fall back to unwrapped rather than silently changing which row wins.
 const hasDuplicateNames = (names: ReadonlyArray<string>): boolean => new Set(names).size !== names.length
 
 /**
@@ -187,8 +193,8 @@ export const make = (
         })
       }
 
-      const columnNamesFor = (sql: string) =>
-        Effect.acquireUseRelease(
+      const prepare = (sql: string) =>
+        Effect.acquireRelease(
           Effect.tryPromise({
             try: () => db.prepareAsync(sql),
             catch: (cause) =>
@@ -196,14 +202,6 @@ export const make = (
                 reason: classifySqliteError(cause, { message: "Failed to prepare statement", operation: "prepare" })
               })
           }),
-          (statement) =>
-            Effect.tryPromise({
-              try: () => statement.getColumnNamesAsync(),
-              catch: (cause) =>
-                new SqlError({
-                  reason: classifySqliteError(cause, { message: "Failed to read column names", operation: "prepare" })
-                })
-            }),
           (statement) =>
             Effect.tryPromise({
               try: () => statement.finalizeAsync(),
@@ -217,21 +215,40 @@ export const make = (
             }).pipe(Effect.orDie)
         )
 
-      // If the wrap cannot be built for a statement, run it unwrapped: the read
-      // degrades to expo-sqlite's double precision instead of failing a query that
-      // would otherwise work.
-      const maybeWrap = (sql: string) =>
-        Effect.withFiber<string, SqlError>((fiber) => {
+      const columnNames = (statement: SQLite.SQLiteStatement) =>
+        Effect.tryPromise({
+          try: () => statement.getColumnNamesAsync(),
+          catch: (cause) =>
+            new SqlError({
+              reason: classifySqliteError(cause, { message: "Failed to read column names", operation: "prepare" })
+            })
+        })
+
+      const columnNamesFor = (sql: string) => Effect.scoped(Effect.flatMap(prepare(sql), columnNames))
+
+      type ResolvedStatement =
+        | { readonly _tag: "Prepared"; readonly statement: SQLite.SQLiteStatement }
+        | { readonly _tag: "Sql"; readonly sql: string }
+
+      const resolveStatement = (sql: string) =>
+        Effect.withFiber<ResolvedStatement, SqlError, Scope.Scope>((fiber) => {
           const trimmed = sql.replace(/;+\s*$/, "")
-          if (!Context.get(fiber.context, Client.SafeIntegers) || !isSafeIntegersRead(trimmed)) {
-            return Effect.succeed(sql)
+          if (!Context.get(fiber.context, Client.SafeIntegers) || isNativeMetadataRead(trimmed)) {
+            return Effect.succeed({ _tag: "Sql", sql })
           }
-          return Effect.map(
-            columnNamesFor(trimmed),
-            (names) => names.length === 0 || hasDuplicateNames(names) ? sql : wrapSelectForExactIntegers(trimmed, names)
-          ).pipe(
-            Effect.catchTag("SqlError", () => Effect.succeed(sql))
-          )
+          return Effect.flatMap(prepare(trimmed), (statement) =>
+            Effect.flatMap(columnNames(statement), (resultNames): Effect.Effect<ResolvedStatement, SqlError> => {
+              if (resultNames.length === 0) {
+                return Effect.succeed<ResolvedStatement>({ _tag: "Prepared", statement })
+              }
+              const sourceNames = hasDuplicateNames(resultNames)
+                ? columnNamesFor(`SELECT * FROM (${trimmed})`)
+                : Effect.succeed(resultNames)
+              return Effect.map(sourceNames, (names) => ({
+                _tag: "Sql" as const,
+                sql: wrapSelectForExactIntegers(trimmed, names, resultNames)
+              }))
+            }))
         })
 
       const guardParams = (sql: string, params: ReadonlyArray<unknown>) =>
@@ -250,16 +267,24 @@ export const make = (
         sql: string,
         params: ReadonlyArray<unknown> = []
       ): Effect.Effect<ReadonlyArray<any>, SqlError> =>
-        guardParams(sql, params).pipe(
-          Effect.andThen(maybeWrap(sql)),
-          Effect.andThen((statement) =>
-            Effect.tryPromise({
-              try: () => db.getAllAsync(statement, normalizeParams(params) as Array<any>),
-              catch: (cause) =>
-                new SqlError({
-                  reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" })
-                })
-            })
+        Effect.scoped(
+          guardParams(sql, params).pipe(
+            Effect.andThen(resolveStatement(sql)),
+            Effect.andThen((resolved) =>
+              Effect.tryPromise({
+                try: async () => {
+                  if (resolved._tag === "Sql") {
+                    return db.getAllAsync(resolved.sql, normalizeParams(params) as Array<any>)
+                  }
+                  const result = await resolved.statement.executeAsync(...normalizeParams(params) as Array<any>)
+                  return result.getAllAsync()
+                },
+                catch: (cause) =>
+                  new SqlError({
+                    reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" })
+                  })
+              })
+            )
           )
         )
 
@@ -267,18 +292,14 @@ export const make = (
         sql: string,
         params: ReadonlyArray<unknown> = []
       ): Effect.Effect<ReadonlyArray<ReadonlyArray<unknown>>, SqlError> =>
-        guardParams(sql, params).pipe(
-          Effect.andThen(maybeWrap(sql)),
-          Effect.andThen((statementSql) =>
-            Effect.acquireUseRelease(
-              Effect.tryPromise({
-                try: () => db.prepareAsync(statementSql),
-                catch: (cause) =>
-                  new SqlError({
-                    reason: classifySqliteError(cause, { message: "Failed to prepare statement", operation: "prepare" })
-                  })
-              }),
-              (statement) =>
+        Effect.scoped(
+          guardParams(sql, params).pipe(
+            Effect.andThen(resolveStatement(sql)),
+            Effect.andThen((resolved) => {
+              const statement = resolved._tag === "Prepared"
+                ? Effect.succeed(resolved.statement)
+                : prepare(resolved.sql)
+              return Effect.flatMap(statement, (statement) =>
                 Effect.tryPromise({
                   try: async () => {
                     const result = await statement.executeForRawResultAsync(normalizeParams(params) as Array<any>)
@@ -291,19 +312,8 @@ export const make = (
                         operation: "execute"
                       })
                     })
-                }),
-              (statement) =>
-                Effect.tryPromise({
-                  try: () => statement.finalizeAsync(),
-                  catch: (cause) =>
-                    new SqlError({
-                      reason: classifySqliteError(cause, {
-                        message: "Failed to finalize statement",
-                        operation: "finalize"
-                      })
-                    })
-                }).pipe(Effect.orDie)
-            )
+                }))
+            })
           )
         )
 
@@ -339,24 +349,26 @@ export const make = (
           return this.execute(sql, params, transformRows)
         },
         executeStream(sql, params, transformRows) {
-          return Stream.unwrap(
+          const stream: Stream.Stream<any, SqlError> = Stream.unwrap(
             guardParams(sql, params).pipe(
-              Effect.andThen(maybeWrap(sql)),
-              Effect.map((statementSql) => {
-                const iterable: AsyncIterableIterator<any> = db.getEachAsync(
-                  statementSql,
-                  normalizeParams(params) as Array<any>
-                )
-                return Stream.fromAsyncIterable(
-                  iterable,
-                  (cause) =>
-                    new SqlError({
-                      reason: classifySqliteError(cause, { message: "Failed to stream statement", operation: "stream" })
-                    })
-                )
+              Effect.andThen(resolveStatement(sql)),
+              Effect.map((resolved) => {
+                const iterable: AsyncIterableIterator<any> = resolved._tag === "Prepared"
+                  ? (async function*() {
+                    const result = await resolved.statement.executeAsync(
+                      ...normalizeParams(params) as Array<any>
+                    )
+                    for await (const row of result) yield row
+                  })()
+                  : db.getEachAsync(resolved.sql, normalizeParams(params) as Array<any>)
+                return Stream.fromAsyncIterable(iterable, (cause) =>
+                  new SqlError({
+                    reason: classifySqliteError(cause, { message: "Failed to stream statement", operation: "stream" })
+                  }))
               })
             )
-          ).pipe(
+          )
+          return stream.pipe(
             transformRows ? Stream.mapArray((chunk) => transformRows(chunk) as any) : identity
           )
         }

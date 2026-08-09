@@ -263,6 +263,66 @@ describe("ExpoSqlite", () => {
       ])
     }).pipe(Effect.provide(memory)))
 
+  it.effect("preserves exact integers for VALUES and duplicate result names under SafeIntegers", () =>
+    Effect.gen(function*() {
+      const sql = yield* Client.SqlClient
+      const big = "211882234062311423"
+      const bigger = "311882234062311423"
+      const values = yield* sql`VALUES (${sql.literal(big)})`.values.pipe(
+        Effect.provideService(Client.SafeIntegers, true)
+      )
+      assert.deepStrictEqual(values, [[big]])
+      const duplicateValues = yield* sql`
+        SELECT ${sql.literal(big)} AS id, ${sql.literal(bigger)} AS id
+      `.values.pipe(Effect.provideService(Client.SafeIntegers, true))
+      assert.deepStrictEqual(duplicateValues, [[big, bigger]])
+      const duplicateRows = yield* sql<{ readonly id: string }>`
+        SELECT ${sql.literal(big)} AS id, ${sql.literal(bigger)} AS id
+      `.pipe(Effect.provideService(Client.SafeIntegers, true))
+      assert.deepStrictEqual(duplicateRows, [{ id: bigger }])
+    }).pipe(Effect.provide(memory)))
+
+  it.effect("keeps PRAGMA and EXPLAIN reads available under SafeIntegers", () =>
+    Effect.gen(function*() {
+      const sql = yield* Client.SqlClient
+      const pragma = yield* sql<{ readonly user_version: number }>`PRAGMA user_version`.pipe(
+        Effect.provideService(Client.SafeIntegers, true)
+      )
+      assert.deepStrictEqual(pragma, [{ user_version: 0 }])
+      const explain = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN SELECT 1`.pipe(
+        Effect.provideService(Client.SafeIntegers, true)
+      )
+      assert.strictEqual(explain[0].detail, "SCAN CONSTANT ROW")
+    }).pipe(Effect.provide(memory)))
+
+  it.effect("prepares a SafeIntegers statement without result columns once", () =>
+    Effect.gen(function*() {
+      const sql = yield* Client.SqlClient
+      yield* sql`CREATE TABLE prepare_count (id INTEGER)`
+      ExpoSqliteNode.resetPreparedStatementCount()
+      yield* sql`INSERT INTO prepare_count (id) VALUES (1)`.pipe(
+        Effect.provideService(Client.SafeIntegers, true)
+      )
+      assert.strictEqual(ExpoSqliteNode.preparedStatementCount(), 1)
+    }).pipe(Effect.provide(memory)))
+
+  it.effect("fails unsupported row-producing writes before they can return rounded integers", () =>
+    Effect.gen(function*() {
+      const sql = yield* Client.SqlClient
+      const big = "211882234062311423"
+      yield* sql`CREATE TABLE returning_ids (id INTEGER)`
+      const result = yield* sql`
+        INSERT INTO returning_ids (id) VALUES (${sql.literal(big)}) RETURNING id
+      `.values.pipe(
+        Effect.provideService(Client.SafeIntegers, true),
+        Effect.result
+      )
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) assert.strictEqual(result.failure._tag, "SqlError")
+      const rows = yield* sql`SELECT id FROM returning_ids`
+      assert.deepStrictEqual(rows, [])
+    }).pipe(Effect.provide(memory)))
+
   it.effect("exposes run metadata through executeRaw", () =>
     Effect.gen(function*() {
       const sql = yield* Client.SqlClient
