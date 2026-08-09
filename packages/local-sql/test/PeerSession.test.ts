@@ -40,6 +40,8 @@ import * as PeerSync from "../src/PeerSync.js"
 import * as PeerSyncEnvelope from "../src/PeerSyncEnvelope.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
+import * as ReplicaOperationScheduler from "../src/ReplicaOperationScheduler.js"
+import { gateLimits } from "./fixtures/limits.js"
 
 const deliveryStore = CommandDeliveryStore.CommandDeliveryStore.of({
   lookup: () => Effect.die("unexpected command delivery lookup"),
@@ -56,6 +58,7 @@ const deliveryStore = CommandDeliveryStore.CommandDeliveryStore.of({
 it.layer(Layer.mergeAll(
   NodeCrypto.layer,
   PeerRelayReceiptLimits.layerDefaults,
+  ReplicaOperationScheduler.layer.pipe(Layer.provide(ReplicaLimits.layer(gateLimits))),
   Layer.succeed(CommandDeliveryStore.CommandDeliveryStore, deliveryStore)
 ))("PeerSession", (it) => {
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
@@ -2479,6 +2482,8 @@ it.layer(Layer.mergeAll(
       const deliveries = yield* Queue.unbounded<PeerTransport.AcknowledgedDelivery>()
       const events = yield* Queue.unbounded<string>()
       const closed = yield* Deferred.make<void>()
+      const firstAcknowledgementStarted = yield* Deferred.make<void>()
+      const releaseFirstAcknowledgement = yield* Deferred.make<void>()
       const resets = yield* Ref.make<ReadonlyArray<string>>([])
       const rejections = yield* Ref.make<ReadonlyArray<PeerTransport.PermanentRejectReason>>([])
       const received = yield* Ref.make<ReadonlyArray<PeerSync.RelayReceipt>>([])
@@ -2608,7 +2613,13 @@ it.layer(Layer.mergeAll(
               outerEnvelopeDigest: "a".repeat(64)
             },
             receiptRetentionMillis: PeerRelayReceiptLimits.defaults.receiptRetentionMillis,
-            acknowledge: Queue.offer(events, "ack").pipe(Effect.asVoid),
+            acknowledge: connectionEpoch === "sender-epoch-a" && sequence === 0
+              ? Deferred.succeed(firstAcknowledgementStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseFirstAcknowledgement)),
+                Effect.andThen(Queue.offer(events, "ack")),
+                Effect.asVoid
+              )
+              : Queue.offer(events, "ack").pipe(Effect.asVoid),
             reject: (reason) =>
               Ref.update(rejections, (current) => [...current, reason]).pipe(
                 Effect.andThen(Queue.offer(events, `reject:${reason}`)),
@@ -2674,9 +2685,20 @@ it.layer(Layer.mergeAll(
             )
           )
           assert.deepStrictEqual(
-            yield* Effect.forEach([0, 1, 2, 3], () => Queue.take(events)),
-            ["apply", "publish", "enqueue", "ack"]
+            yield* Effect.forEach([0, 1, 2], () => Queue.take(events)),
+            ["apply", "publish", "enqueue"]
           )
+          yield* Deferred.await(firstAcknowledgementStarted)
+          const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
+          const interactiveAcquired = yield* Deferred.make<void>()
+          const interactive = yield* Effect.forkChild(
+            Effect.scoped(scheduler.interactive.pipe(Effect.andThen(Deferred.succeed(interactiveAcquired, undefined)))),
+            { startImmediately: true }
+          )
+          yield* Deferred.await(interactiveAcquired)
+          yield* Fiber.join(interactive)
+          yield* Deferred.succeed(releaseFirstAcknowledgement, undefined)
+          assert.strictEqual(yield* Queue.take(events), "ack")
           assert.isTrue(Option.isNone(yield* Deferred.poll(closed)))
           yield* Queue.offer(
             deliveries,

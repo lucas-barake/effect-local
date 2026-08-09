@@ -23,6 +23,9 @@ const OutboxRow = Schema.Struct({
 
 const WatermarkRow = Schema.Struct({ watermark: Identity.CommitSequence })
 
+/** Bounds one publication turn so an outbox backlog cannot monopolize the SQL connection. */
+export const pendingCommitBatchSize = 128
+
 export type CommitEvent =
   | {
     readonly _tag: "Commit"
@@ -58,7 +61,8 @@ export const layer: Layer.Layer<CommitPublisher, never, Reactivity.Reactivity | 
       Result: OutboxRow,
       execute: () =>
         sql`SELECT commit_sequence, document_id, invalidation_keys
-          FROM effect_local_commit_outbox WHERE published = 0 ORDER BY commit_sequence`
+          FROM effect_local_commit_outbox WHERE published = 0
+          ORDER BY commit_sequence LIMIT ${pendingCommitBatchSize}`
     })
     const findWatermark = SqlSchema.findOneOption({
       Request: Schema.Void,
@@ -92,11 +96,14 @@ export const layer: Layer.Layer<CommitPublisher, never, Reactivity.Reactivity | 
                 keys: row.invalidation_keys,
                 refreshGeneration: yield* Ref.get(refreshGeneration)
               })
+            }
+            const last = rows.at(-1)
+            if (last !== undefined) {
               yield* sql.withTransaction(Effect.gen(function*() {
                 yield* sql`UPDATE effect_local_commit_outbox SET published = 1
-                    WHERE commit_sequence = ${row.commit_sequence}`
+                    WHERE published = 0 AND commit_sequence <= ${last.commit_sequence}`
                 yield* sql`DELETE FROM effect_local_commit_outbox
-                    WHERE published = 1 AND commit_sequence < ${row.commit_sequence}`
+                    WHERE published = 1 AND commit_sequence < ${last.commit_sequence}`
               }))
             }
             return rows.length

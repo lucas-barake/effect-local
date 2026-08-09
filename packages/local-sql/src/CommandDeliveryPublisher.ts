@@ -10,6 +10,7 @@ import type * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as CommandDeliveryStore from "./CommandDeliveryStore.js"
+import * as ReplicaOperationScheduler from "./ReplicaOperationScheduler.js"
 
 export interface Options {
   readonly eventCapacity: number
@@ -59,7 +60,7 @@ export class CommandDeliveryPublisher extends Context.Service<CommandDeliveryPub
 export const layer = (options: Options): Layer.Layer<
   CommandDeliveryPublisher,
   never,
-  CommandDeliveryStore.CommandDeliveryStore
+  CommandDeliveryStore.CommandDeliveryStore | ReplicaOperationScheduler.ReplicaOperationScheduler
 > => {
   if (!Number.isSafeInteger(options.eventCapacity) || options.eventCapacity < 1) {
     throw new TypeError("Command delivery event capacity must be a positive integer")
@@ -73,6 +74,7 @@ export const layer = (options: Options): Layer.Layer<
     CommandDeliveryPublisher,
     Effect.gen(function*() {
       const store = yield* CommandDeliveryStore.CommandDeliveryStore
+      const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
       const lock = yield* Semaphore.make(1)
       const events = yield* Effect.acquireRelease(
         PubSub.sliding<DeliveryEvent>(options.eventCapacity),
@@ -116,10 +118,12 @@ export const layer = (options: Options): Layer.Layer<
         }
       })
 
+      const scheduleRead = <A,>(effect: Effect.Effect<A, ReplicaError.ReplicaError>) =>
+        Effect.scoped(scheduler.interactive.pipe(Effect.andThen(effect)))
       const changes = (commandId: Identity.CommandId) =>
         Stream.unwrap(Effect.gen(function*() {
           const subscription = yield* PubSub.subscribe(events)
-          const [snapshot, cursor] = yield* store.snapshotWithCursor(commandId)
+          const [snapshot, cursor] = yield* scheduleRead(store.snapshotWithCursor(commandId))
           const updates = Stream.fromSubscription(subscription).pipe(
             Stream.mapAccum(
               () => cursor,
@@ -143,7 +147,7 @@ export const layer = (options: Options): Layer.Layer<
                 ] as const
               }
             ),
-            Stream.mapEffect(() => store.lookup(commandId))
+            Stream.mapEffect(() => scheduleRead(store.lookup(commandId)))
           )
           return Stream.make(snapshot).pipe(
             Stream.concat(updates),

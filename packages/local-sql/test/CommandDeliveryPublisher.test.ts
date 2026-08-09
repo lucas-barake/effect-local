@@ -18,6 +18,7 @@ import * as CommandDeliveryPublisher from "../src/CommandDeliveryPublisher.js"
 import * as CommandDeliveryStore from "../src/CommandDeliveryStore.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
+import * as ReplicaOperationScheduler from "../src/ReplicaOperationScheduler.js"
 
 describe("CommandDeliveryPublisher", () => {
   const Task = Document.make("Task", {
@@ -79,11 +80,12 @@ describe("CommandDeliveryPublisher", () => {
     const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provideMerge(database))
     const base = Layer.merge(bootstrap, ReplicaLimits.layer(limits))
     const gate = ReplicaGate.layer.pipe(Layer.provideMerge(base))
+    const scheduler = ReplicaOperationScheduler.layer.pipe(Layer.provideMerge(base))
     const store = CommandDeliveryStore.layer.pipe(Layer.provideMerge(gate))
     const publisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
-      Layer.provideMerge(store)
+      Layer.provideMerge(Layer.merge(store, scheduler))
     )
-    return Layer.mergeAll(database, bootstrap, gate, store, publisher)
+    return Layer.mergeAll(database, bootstrap, gate, scheduler, store, publisher)
   })()
 
   it.effect("delivers a full pending batch to a subscriber without evicting the oldest events", () =>
@@ -214,11 +216,12 @@ describe("CommandDeliveryPublisher", () => {
     const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provideMerge(database))
     const base = Layer.merge(bootstrap, ReplicaLimits.layer(limits))
     const gate = ReplicaGate.layer.pipe(Layer.provideMerge(base))
+    const scheduler = ReplicaOperationScheduler.layer.pipe(Layer.provideMerge(base))
     const store = CommandDeliveryStore.layer.pipe(Layer.provideMerge(gate))
     const publisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
-      Layer.provideMerge(store)
+      Layer.provideMerge(Layer.merge(store, scheduler))
     )
-    const testLayer = Layer.mergeAll(database, bootstrap, gate, store, publisher)
+    const testLayer = Layer.mergeAll(database, bootstrap, gate, scheduler, store, publisher)
 
     return Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
