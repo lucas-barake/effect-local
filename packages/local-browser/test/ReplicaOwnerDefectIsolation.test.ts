@@ -11,7 +11,9 @@ import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Queue from "effect/Queue"
 import * as Stream from "effect/Stream"
 import { RpcClient } from "effect/unstable/rpc"
 import * as Worker from "effect/unstable/workers/Worker"
@@ -65,6 +67,8 @@ it.layer(NodeCrypto.layer)("ReplicaOwner defect isolation", (it) => {
   it.effect("answers a handler defect without tearing down the session", () =>
     Effect.gen(function*() {
       const invalidationsSubscribed = yield* Deferred.make<void>()
+      const invalidationReceived = yield* Deferred.make<void>()
+      const events = yield* Queue.unbounded<CommitPublisher.CommitEvent>()
       let queryCalls = 0
       const rigged: Replica.Replica["Service"] = {
         ...replica,
@@ -86,7 +90,7 @@ it.layer(NodeCrypto.layer)("ReplicaOwner defect isolation", (it) => {
               Effect.as({
                 watermark: Identity.CommitSequence.make(0),
                 refreshGeneration: 0,
-                events: Stream.never
+                events: Stream.fromQueue(events)
               })
             )
           })
@@ -114,12 +118,27 @@ it.layer(NodeCrypto.layer)("ReplicaOwner defect isolation", (it) => {
         const invalidations = yield* client.Invalidations({
           sessionId,
           ownerEpoch: session.ownerEpoch
-        }).pipe(Stream.runDrain, Effect.forkChild)
+        }).pipe(
+          Stream.tap((event) =>
+            event._tag === "Invalidation"
+              ? Deferred.succeed(invalidationReceived, undefined)
+              : Effect.void
+          ),
+          Stream.runDrain,
+          Effect.forkChild
+        )
         yield* Deferred.await(invalidationsSubscribed)
 
         const poisoned = yield* client.Query({ sessionId, query: "Read", payload: "one" }).pipe(Effect.exit)
         assert.isTrue(Exit.isFailure(poisoned), "the poisoned query must not succeed")
-        assert.isUndefined(invalidations.pollUnsafe(), "an unrelated invalidation stream must stay active")
+        yield* Queue.offer(events, {
+          _tag: "Commit",
+          commitSequence: Identity.CommitSequence.make(1),
+          documentId: yield* Identity.makeDocumentId,
+          keys: ["after-defect"],
+          refreshGeneration: 0
+        })
+        yield* Effect.raceFirst(Deferred.await(invalidationReceived), Fiber.join(invalidations))
 
         const answered = yield* client.Query({ sessionId, query: "Read", payload: "two" })
         assert.deepStrictEqual(answered, [{ title: "two" }])
