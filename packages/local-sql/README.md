@@ -13,6 +13,11 @@ existing change, dependency, and operation limits.
 Relay SQLite commits are not atomic with an external policy authority. The RPC server local gate decides whether
 revocation prevents admission or drains an already admitted bounded operation.
 
+`PeerSession` uses the same live transport connection for durable sync and document scoped transient values. Its
+`transient` operation sends once, and its `transients` stream is bounded, multicast, and no replay.
+`PeerRelayClientRuntime` registers live peer and document routes so an owner can send and receive transient values
+without putting them in the SQL outbox or receipt stores.
+
 See the [Effect Local documentation](https://github.com/lucas-barake/effect-local#readme) for durable composition,
 projections, recovery, compaction, sync, and API reference. The relay durability boundaries are documented in
 [Store and forward](https://github.com/lucas-barake/effect-local/blob/main/docs/store-and-forward.md).

@@ -14,8 +14,10 @@ import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
+import * as Stream from "effect/Stream"
 import * as Entity from "effect/unstable/cluster/Entity"
 import * as Rpc from "effect/unstable/rpc/Rpc"
+import * as PeerRelayLimits from "./PeerRelayLimits.js"
 import * as PeerRpc from "./PeerRpc.js"
 import * as PeerRpcError from "./PeerRpcError.js"
 import * as RelayInboxStore from "./RelayInboxStore.js"
@@ -63,6 +65,11 @@ export class DeliverRpc extends Rpc.make("Deliver", {
   error: InboxError
 }) {}
 
+export class TransientRpc extends Rpc.make("Transient", {
+  payload: { message: PeerRpc.TransientMessage },
+  error: InboxError
+}) {}
+
 /**
  * Opens the recipient's live session and streams its durable inbox.
  *
@@ -71,7 +78,7 @@ export class DeliverRpc extends Rpc.make("Deliver", {
  */
 export class SubscribeRpc extends Rpc.make("Subscribe", {
   payload: { sessionId: Identity.SessionId },
-  success: PeerRpc.StoredMessage,
+  success: PeerRpc.RelayMessage,
   error: InboxError,
   stream: true
 }) {}
@@ -132,6 +139,7 @@ export class EndSessionRpc extends Rpc.make("EndSession", {
 
 export const RelayInbox = Entity.make("EffectLocalRelayInbox", [
   DeliverRpc,
+  TransientRpc,
   SubscribeRpc,
   SettleRpc,
   ReleaseRpc,
@@ -220,6 +228,7 @@ interface Settlement {
 interface Session {
   readonly sessionId: Identity.SessionId
   readonly outbound: Queue.Queue<PeerRpc.StoredMessage, PeerRpcError.ServerUnavailable | Cause.Done>
+  readonly transientOutbound: Queue.Queue<PeerRpc.TransientMessage, Cause.Done>
   readonly settlements: Map<Identity.RelayMessageId, Settlement>
   /** Channels with a delivery in flight. One message per channel at a time preserves order. */
   readonly busyChannels: Set<string>
@@ -261,6 +270,7 @@ export const layer = (options: Options) =>
       const address = yield* Entity.CurrentAddress
       const inboxKey = address.entityId
       const store = yield* RelayInboxStore.RelayInboxStore
+      const limits = yield* PeerRelayLimits.PeerRelayLimits
       // Resolved once here so the handlers carry no requirement of their own. A claim token is the
       // anti-replay binding between one delivery attempt and its settlement, so it is minted from
       // the deployment's own `Crypto` like every other identity in this package rather than from
@@ -311,6 +321,7 @@ export const layer = (options: Options) =>
           session.settlements.clear()
           yield* Scope.close(session.scope, Exit.void)
           yield* Queue.end(session.outbound)
+          yield* Queue.end(session.transientOutbound)
         }).pipe(
           // Atomic once it starts. The first step takes the session out of `sessionRef`, which is
           // the only handle anything holds on it — the session scope is detached and its fibers are
@@ -647,6 +658,15 @@ export const layer = (options: Options) =>
             })
           ),
 
+        Transient: ({ payload }) =>
+          Ref.get(sessionRef).pipe(
+            Effect.flatMap(Option.match({
+              onNone: () => Effect.void,
+              onSome: (session) => Queue.offer(session.transientOutbound, payload.message).pipe(Effect.asVoid)
+            })),
+            Effect.withSpan("RelayInbox.Transient", { attributes: { inbox_key: inboxKey } })
+          ),
+
         // Forked so it does not hold the entity's sequential handler permit. Without this the
         // session would occupy the only permit for its whole lifetime and the settlement that ends
         // each delivery could never be handled, stalling the inbox with no error anywhere.
@@ -654,7 +674,7 @@ export const layer = (options: Options) =>
           Rpc.fork(
             // Spans the installation of the session, not its lifetime: the handler returns the
             // queue as soon as the session is reachable, and the stream outlives it.
-            Effect.withSpan(
+            Stream.unwrap(Effect.withSpan(
               sessionLock.withPermit(
                 // Installation is uninterruptible up to the point the session becomes reachable
                 // through `sessionRef`. An interrupt in between would strand the scope — nothing
@@ -670,11 +690,16 @@ export const layer = (options: Options) =>
                         PeerRpc.StoredMessage,
                         PeerRpcError.ServerUnavailable | Cause.Done
                       >(0)
+                      const transientOutbound = yield* Queue.dropping<
+                        PeerRpc.TransientMessage,
+                        Cause.Done
+                      >(limits.transientRecipientQueueCapacity)
                       const now = yield* Clock.currentTimeMillis
                       const deadlineAt = yield* Ref.make(now + sessionDeadlineMillis)
                       const session: Session = {
                         sessionId: payload.sessionId,
                         outbound,
+                        transientOutbound,
                         settlements: new Map(),
                         busyChannels: new Set(),
                         withheldChannels: new Set(),
@@ -707,7 +732,10 @@ export const layer = (options: Options) =>
                         Effect.forkIn(scope)
                       )
                       yield* Ref.set(sessionRef, Option.some(session))
-                      return outbound
+                      return Stream.merge(
+                        Stream.fromQueue(outbound),
+                        Stream.fromQueue(transientOutbound)
+                      )
                     })
                     return yield* Effect.onError(
                       install,
@@ -718,7 +746,7 @@ export const layer = (options: Options) =>
               ),
               "RelayInbox.Subscribe",
               { attributes: { inbox_key: inboxKey } }
-            )
+            ))
           ),
 
         Settle: ({ payload }) =>

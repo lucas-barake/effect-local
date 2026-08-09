@@ -101,6 +101,16 @@ describe("PeerRpc", () => {
       ...acknowledge,
       reason: "ProtocolInvalid"
     })
+    const transient = PeerRpc.TransientRpc.payloadSchema.make({
+      sessionId,
+      document: { documentType: "Task", documentId },
+      payload: new Uint8Array(PeerRpc.maximumTransientPayloadBytes)
+    })
+    const transientMessage = PeerRpc.TransientMessage.make({
+      sender: { tenantId: "tenant", subjectId: "subject", peerId: localPeerId },
+      document: transient.document,
+      payload: transient.payload
+    })
 
     assert.deepStrictEqual(Schema.decodeUnknownSync(PeerRpc.OpenRpc.payloadSchema)(open), open)
     assert.deepStrictEqual(Schema.decodeUnknownSync(PeerRpc.OpenEvent)(stored), stored)
@@ -110,6 +120,26 @@ describe("PeerRpc", () => {
       acknowledge
     )
     assert.deepStrictEqual(Schema.decodeUnknownSync(PeerRpc.RejectRpc.payloadSchema)(reject), reject)
+    assert.deepStrictEqual(
+      Schema.decodeUnknownSync(PeerRpc.TransientRpc.payloadSchema)(transient),
+      transient
+    )
+    assert.deepStrictEqual(Schema.decodeUnknownSync(PeerRpc.OpenEvent)(transientMessage), transientMessage)
+  })
+
+  it("accepts the transient payload boundary and rejects one byte beyond it", () => {
+    const request = {
+      sessionId,
+      document: { documentType: "Task", documentId },
+      payload: new Uint8Array(PeerRpc.maximumTransientPayloadBytes)
+    }
+    assert.doesNotThrow(() => Schema.decodeUnknownSync(PeerRpc.TransientRpc.payloadSchema)(request))
+    assert.throws(() =>
+      Schema.decodeUnknownSync(PeerRpc.TransientRpc.payloadSchema)({
+        ...request,
+        payload: new Uint8Array(PeerRpc.maximumTransientPayloadBytes + 1)
+      })
+    )
   })
 
   it("rejects invalid durations, empty document sets, identifiers, hashes, and oversized payloads", () => {

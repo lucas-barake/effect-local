@@ -1,6 +1,7 @@
 import * as CommandDeliveryPublisher from "@lucas-barake/effect-local-sql/CommandDeliveryPublisher"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as PeerRelayClientRuntime from "@lucas-barake/effect-local-sql/PeerRelayClientRuntime"
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as Backup from "@lucas-barake/effect-local/Backup"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
@@ -14,6 +15,7 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { RpcServer } from "effect/unstable/rpc"
@@ -47,6 +49,7 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
     const restoreTransport = yield* RestoreTransport.RestoreTransport
     const commits = yield* CommitPublisher.CommitPublisher
     const peerConnections = yield* PeerConnectionStatus.PeerConnectionStatus
+    const peerRelay = yield* Effect.serviceOption(PeerRelayClientRuntime.PeerRelayClientRuntime)
     const relayConnection = yield* RelayConnectionStatus.RelayConnectionStatus
     const deliveries = yield* CommandDeliveryPublisher.CommandDeliveryPublisher
     const crypto = yield* Crypto.Crypto
@@ -408,6 +411,44 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           sessionId,
           client.id,
           relayConnection.status.pipe(Stream.withSpan("ReplicaOwner.relayConnectionStatus"))
+        ),
+      Transient: ({ documentId, payload, peerId, sessionId }, { client }) =>
+        sessions.run(
+          sessionId,
+          client.id,
+          Option.match(peerRelay, {
+            onNone: () =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.ProtocolMismatch({
+                    expected: "relay configured transient messaging",
+                    observed: "direct replica"
+                  })
+                })
+              ),
+            onSome: (runtime) => runtime.send(peerId, documentId, payload)
+          }).pipe(
+            Effect.withSpan("ReplicaOwner.transient", {
+              attributes: { "peer.id": peerId, "document.id": documentId }
+            })
+          )
+        ),
+      Transients: ({ sessionId }, { client }) =>
+        sessions.stream(
+          sessionId,
+          client.id,
+          Option.match(peerRelay, {
+            onNone: () =>
+              Stream.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.ProtocolMismatch({
+                    expected: "relay configured transient messaging",
+                    observed: "direct replica"
+                  })
+                })
+              ),
+            onSome: (runtime) => runtime.transients
+          }).pipe(Stream.withSpan("ReplicaOwner.transients"))
         ),
       ExportBackup: ({ maxBytes, sessionId }, { client }) =>
         sessions.stream(

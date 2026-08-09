@@ -19,7 +19,10 @@ import { definition } from "./fixtures.js"
 describe("public browser API types", () => {
   it("keeps worker creation as a layer requirement", () => {
     const layer: Layer.Layer<
-      Replica.Replica | PeerConnectionStatus.PeerConnectionStatus | RelayConnectionStatus.RelayConnectionStatus,
+      | Replica.Replica
+      | ReplicaClient.ReplicaClient
+      | PeerConnectionStatus.PeerConnectionStatus
+      | RelayConnectionStatus.RelayConnectionStatus,
       ReplicaError.ReplicaError | WorkerError.WorkerError,
       Crypto.Crypto | Worker.WorkerPlatform | Worker.Spawner
     > = BrowserReplica.layer(definition)

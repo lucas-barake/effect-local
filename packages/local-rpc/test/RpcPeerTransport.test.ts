@@ -92,11 +92,15 @@ const makeRelayClient = (
   ) => Effect.Effect<void, unknown> = () => Effect.void,
   reject: (
     request: typeof PeerRpc.RejectRpc.payloadSchema.Type
+  ) => Effect.Effect<void, unknown> = () => Effect.void,
+  transient: (
+    request: typeof PeerRpc.TransientRpc.payloadSchema.Type
   ) => Effect.Effect<void, unknown> = () => Effect.void
 ): PeerRpc.RpcClient =>
   ({
     Open: open,
     Push: push,
+    Transient: transient,
     Acknowledge: acknowledge,
     Reject: reject
   }) as never
@@ -273,8 +277,17 @@ const makeRuntime = (overrides: RuntimeOverrides = {}) =>
     validateConnectionConfiguration: overrides.validateConnectionConfiguration ?? (() => Effect.void),
     signalReceiptPrune: overrides.signalReceiptPrune ?? Effect.void,
     health: overrides.health ?? Effect.void,
-    awaitFatal: overrides.awaitFatal ?? Effect.never
+    awaitFatal: overrides.awaitFatal ?? Effect.never,
+    register: () => Effect.succeed({ unregister: Effect.void }),
+    send: () => Effect.void,
+    transients: Stream.never
   })
+
+const durable = (inbound: PeerTransport.Inbound): PeerTransport.AcknowledgedDelivery => {
+  assert.strictEqual(inbound._tag, "Durable")
+  if (inbound._tag !== "Durable") throw new Error("Expected durable delivery")
+  return inbound.delivery
+}
 
 const connectRelay = (
   client: PeerRpc.RpcClient,
@@ -330,6 +343,66 @@ describe("RpcPeerTransport", () => {
       assert.strictEqual(connection.peerId, remotePeerId)
       assert.strictEqual(connection.relayPeerId, relayPeerId)
       assert.strictEqual(yield* Ref.get(configurations), 1)
+      yield* connection.close
+    })))
+
+  it.effect("uses the current Open session for transient send and receive without durable custody", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const opens = yield* Ref.make(0)
+      const admissions = yield* Ref.make(0)
+      const acknowledgements = yield* Ref.make(0)
+      const rejections = yield* Ref.make(0)
+      const sent = yield* Deferred.make<typeof PeerRpc.TransientRpc.payloadSchema.Type>()
+      const payload = Uint8Array.of(9, 8, 7)
+      const event = PeerRpc.TransientMessage.make({
+        _tag: "TransientMessage",
+        sender: {
+          tenantId: relayOptions.expectedLocal.tenantId,
+          subjectId: relayOptions.remote.subjectId,
+          peerId: relayOptions.remote.peerId
+        },
+        document: { documentType: Task.name, documentId },
+        payload
+      })
+      const client = makeRelayClient(
+        () =>
+          Ref.update(opens, (count) => count + 1).pipe(
+            Effect.as(
+              Stream.fromIterable([relayOpened, event]).pipe(
+                Stream.rechunk(1),
+                Stream.concat(Stream.never)
+              )
+            ),
+            Stream.unwrap
+          ),
+        undefined,
+        () => Ref.update(acknowledgements, (count) => count + 1),
+        () => Ref.update(rejections, (count) => count + 1),
+        (request) => Deferred.succeed(sent, request).pipe(Effect.asVoid)
+      )
+      const runtime = makeRuntime({
+        admit: (input) =>
+          Ref.update(admissions, (count) => count + 1).pipe(
+            Effect.as(relayEntry(input.payload))
+          )
+      })
+      const connection = yield* connectRelay(client, runtime)
+      const inbound = yield* Stream.runHead(connection.receive).pipe(Effect.map(Option.getOrThrow))
+      assert.deepStrictEqual(inbound, {
+        _tag: "Transient",
+        delivery: { peerId: remotePeerId, documentId, payload }
+      })
+      const outgoing = Uint8Array.of(1, 2)
+      yield* connection.transient(documentId, outgoing)
+      assert.deepStrictEqual(yield* Deferred.await(sent), {
+        sessionId,
+        document: { documentType: Task.name, documentId },
+        payload: outgoing
+      })
+      assert.strictEqual(yield* Ref.get(opens), 1)
+      assert.strictEqual(yield* Ref.get(admissions), 0)
+      assert.strictEqual(yield* Ref.get(acknowledgements), 0)
+      assert.strictEqual(yield* Ref.get(rejections), 0)
       yield* connection.close
     })))
 
@@ -550,9 +623,11 @@ describe("RpcPeerTransport", () => {
           () => Stream.fromIterable([relayOpened, stored]).pipe(Stream.rechunk(1))
         )
         const connection = yield* connectRelay(client, makeRuntime())
-        const delivery = yield* Stream.runHead(
-          connection.receive
-        ).pipe(Effect.map(Option.getOrThrow))
+        const delivery = durable(
+          yield* Stream.runHead(
+            connection.receive
+          ).pipe(Effect.map(Option.getOrThrow))
+        )
         assert.deepStrictEqual(delivery.message, stored.payload)
         yield* connection.close
       }).pipe(Effect.provide(NodeCrypto.layer))
@@ -586,7 +661,7 @@ describe("RpcPeerTransport", () => {
         const deliveryOption = yield* Stream.runHead(connection.receive)
         assert.isTrue(Option.isSome(deliveryOption))
         if (Option.isNone(deliveryOption)) return
-        const delivery = deliveryOption.value
+        const delivery = durable(deliveryOption.value)
         assert.strictEqual(yield* Ref.get(acknowledgements), 0)
         assert.strictEqual(
           delivery.receiptRetentionMillis,
@@ -621,9 +696,11 @@ describe("RpcPeerTransport", () => {
             signalReceiptPrune: Ref.update(pruneSignals, (count) => count + 1)
           })
         )
-        const delivery = yield* Stream.runHead(
-          connection.receive
-        ).pipe(Effect.map(Option.getOrThrow))
+        const delivery = durable(
+          yield* Stream.runHead(
+            connection.receive
+          ).pipe(Effect.map(Option.getOrThrow))
+        )
         assert.strictEqual(yield* Ref.get(acknowledgements), 0)
         assert.strictEqual(yield* Ref.get(pruneSignals), 0)
         yield* delivery.acknowledge
@@ -647,9 +724,11 @@ describe("RpcPeerTransport", () => {
           (request) => Deferred.succeed(rejected, request).pipe(Effect.asVoid)
         )
         const connection = yield* connectRelay(client, makeRuntime())
-        const delivery = yield* Stream.runHead(
-          connection.receive
-        ).pipe(Effect.map(Option.getOrThrow))
+        const delivery = durable(
+          yield* Stream.runHead(
+            connection.receive
+          ).pipe(Effect.map(Option.getOrThrow))
+        )
         yield* delivery.reject("ApplicationRejected")
         assert.deepStrictEqual(yield* Deferred.await(rejected), {
           sessionId,
@@ -738,9 +817,11 @@ describe("RpcPeerTransport", () => {
         () => Stream.fromIterable([relayOpened, stored]).pipe(Stream.rechunk(1))
       )
       const ackConnection = yield* connectRelay(ackClient, makeRuntime())
-      const acknowledged = yield* Stream.runHead(
-        ackConnection.receive
-      ).pipe(Effect.map(Option.getOrThrow))
+      const acknowledged = durable(
+        yield* Stream.runHead(
+          ackConnection.receive
+        ).pipe(Effect.map(Option.getOrThrow))
+      )
       yield* acknowledged.acknowledge
       yield* ackConnection.close
 
@@ -748,9 +829,11 @@ describe("RpcPeerTransport", () => {
         () => Stream.fromIterable([relayOpened, stored]).pipe(Stream.rechunk(1))
       )
       const rejectConnection = yield* connectRelay(rejectClient, makeRuntime())
-      const rejected = yield* Stream.runHead(
-        rejectConnection.receive
-      ).pipe(Effect.map(Option.getOrThrow))
+      const rejected = durable(
+        yield* Stream.runHead(
+          rejectConnection.receive
+        ).pipe(Effect.map(Option.getOrThrow))
+      )
       yield* rejected.reject("ApplicationRejected")
       yield* rejectConnection.close
 
@@ -763,9 +846,11 @@ describe("RpcPeerTransport", () => {
         unavailableClient,
         makeRuntime()
       )
-      const unavailable = yield* Stream.runHead(
-        unavailableConnection.receive
-      ).pipe(Effect.map(Option.getOrThrow))
+      const unavailable = durable(
+        yield* Stream.runHead(
+          unavailableConnection.receive
+        ).pipe(Effect.map(Option.getOrThrow))
+      )
       assert.isTrue(Exit.isFailure(yield* unavailable.acknowledge.pipe(Effect.exit)))
 
       const terminalSpans = spans.filter((span) => span.name === "effect_local_rpc.adapter.relay_acknowledge")

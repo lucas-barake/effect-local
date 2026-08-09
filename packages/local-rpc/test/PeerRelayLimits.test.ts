@@ -20,8 +20,14 @@ describe("PeerRelayLimits", () => {
         "maximumSenderRetryHorizon",
         "messageTtl",
         "minimumTerminalRetention",
-        "rateLimitIdleRetention"
+        "rateLimitIdleRetention",
+        "transientBurst",
+        "transientRatePerSecond",
+        "transientRecipientQueueCapacity"
       ])
+      assert.strictEqual(limits.transientRatePerSecond, 16)
+      assert.strictEqual(limits.transientBurst, 32)
+      assert.strictEqual(limits.transientRecipientQueueCapacity, 64)
     }).pipe(Effect.provide(PeerRelayLimits.layerDefaults)))
 
   it.effect.each(
@@ -34,7 +40,10 @@ describe("PeerRelayLimits", () => {
       // Negotiated windows also have to fit in what the wire contract can carry.
       ["maximumReceiptRetention", Duration.days(91)],
       ["maxSessionsPerSubject", 0],
-      ["authenticationRatePerSecond", Number.NaN]
+      ["authenticationRatePerSecond", Number.NaN],
+      ["transientRatePerSecond", 0],
+      ["transientBurst", 0],
+      ["transientRecipientQueueCapacity", 0]
     ] as const
   )("rejects scalar %s with the stable configuration error", ([field, value]) =>
     Effect.gen(function*() {
@@ -54,7 +63,8 @@ describe("PeerRelayLimits", () => {
       ["maximumReceiptRetention", { maximumSenderRetryHorizon: Duration.days(8) }],
       // A burst under the concurrency cap makes the rate limiter, not the pool, the binding
       // constraint — so the pool is sized for a concurrency it is never allowed to reach.
-      ["authenticationBurst", { authenticationBurst: 1 }]
+      ["authenticationBurst", { authenticationBurst: 1 }],
+      ["transientBurst", { transientRatePerSecond: 33 }]
     ] as const
   )(
     "rejects the %s cross field constraint through the production Layer",

@@ -57,6 +57,13 @@ const mapError = (error: PeerRpcError.PeerRpcError | RpcClientError) => {
     case "SessionOverloaded":
     case "ServerUnavailable":
       return unavailable()
+    case "TransientRateLimitExceeded":
+      return new ReplicaError.ReplicaError({
+        reason: new ReplicaError.QuotaExceeded({
+          resource: "relay transient rate",
+          limit: 0
+        })
+      })
     case "AuthenticationFailure":
     case "AccessDenied":
     case "UnsupportedVersion":
@@ -205,6 +212,33 @@ const validateStoredMessage = (
     if (digest !== event.outerEnvelopeDigest) {
       return yield* protocolFailure("relay outer envelope digest")
     }
+  })
+
+const validateTransientMessage = (
+  event: PeerRpc.TransientMessage,
+  options: Options
+) =>
+  Effect.suspend(() => {
+    const expectedSender: PeerSyncEnvelope.RelayPeerPrincipal = {
+      tenantId: options.expectedLocal.tenantId,
+      subjectId: options.remote.subjectId,
+      peerId: options.remote.peerId
+    }
+    if (!samePrincipal(event.sender, expectedSender)) {
+      return Effect.fail(protocolFailure("transient sender endpoint"))
+    }
+    const selected = options.documents.some((entry) =>
+      entry.document.name === event.document.documentType &&
+      entry.documentId === event.document.documentId
+    )
+    if (!selected) return Effect.fail(protocolFailure("selected transient document"))
+    return Effect.succeed(
+      {
+        peerId: event.sender.peerId,
+        documentId: event.document.documentId,
+        payload: event.payload
+      } satisfies PeerTransport.TransientDelivery
+    )
   })
 
 export const layer = (
@@ -471,6 +505,33 @@ export const layer = (
                         result: adapterResult
                       })
 
+                    const transient = (
+                      documentId: Identity.DocumentId,
+                      payload: Uint8Array
+                    ) => {
+                      const selected = options.documents.find((entry) => entry.documentId === documentId)
+                      if (selected === undefined) {
+                        return Effect.fail(protocolFailure("selected transient document"))
+                      }
+                      return PeerRpcObservability.observe({
+                        effect: callWithinConnection(
+                          client.Transient({
+                            sessionId: handshake.sessionId,
+                            document: {
+                              documentType: selected.document.name,
+                              documentId
+                            },
+                            payload
+                          }).pipe(Effect.mapError(mapError)),
+                          sendLock
+                        ),
+                        operation: "AdapterPush",
+                        spanName: "effect_local_rpc.adapter.relay_transient",
+                        attributes: { "rpc.payload_bytes": payload.byteLength },
+                        result: adapterResult
+                      })
+                    }
+
                     // A failed settlement does not close the connection. Custody stays with the
                     // relay, the row is redelivered to a later session, and the recipient's
                     // durable receipt turns the re-apply into a plain re-acknowledgement — so the
@@ -484,75 +545,86 @@ export const layer = (
                         terminalLock
                       )
 
-                    const acknowledged = Stream.scoped(
+                    const toInbound = (
+                      event: PeerRpc.OpenEvent
+                    ): Effect.Effect<PeerTransport.Inbound, ReplicaError.ReplicaError> => {
+                      if (event._tag === "TransientMessage") {
+                        return validateTransientMessage(event, options).pipe(
+                          Effect.map((delivery) => ({ _tag: "Transient", delivery }) as const)
+                        )
+                      }
+                      if (event._tag !== "StoredMessage") {
+                        return Effect.fail(protocolFailure(event._tag))
+                      }
+                      return validateStoredMessage(event, options, crypto, limits).pipe(
+                        Effect.as({
+                          _tag: "Durable",
+                          delivery: {
+                            message: event.payload,
+                            identity: {
+                              relayMessageId: event.relayMessageId,
+                              relayPeerId: event.relayPeerId,
+                              senderTenantId: event.sender.tenantId,
+                              senderSubjectId: event.sender.subjectId,
+                              senderPeerId: event.sender.peerId,
+                              senderReplicaIncarnation: event.sender.replicaIncarnation,
+                              messageHash: event.messageHash,
+                              outerEnvelopeDigest: event.outerEnvelopeDigest
+                            },
+                            receiptRetentionMillis: options.receiptRetentionMillis,
+                            acknowledge: settleCall(
+                              PeerRpcObservability.observeRelay({
+                                effect: client.Acknowledge({
+                                  sessionId: handshake.sessionId,
+                                  relayMessageId: event.relayMessageId,
+                                  claimToken: event.claimToken,
+                                  messageHash: event.messageHash
+                                }).pipe(
+                                  Effect.mapError(mapError),
+                                  Effect.andThen(runtime.signalReceiptPrune)
+                                ),
+                                operation: "AdapterAcknowledge",
+                                direction: "Receive",
+                                facts: () => ({
+                                  bytes: event.payload.byteLength,
+                                  items: 1,
+                                  version: event.payloadVersion
+                                }),
+                                result: adapterAcknowledgeResult("Acknowledged")
+                              })
+                            ),
+                            reject: (reason: PeerTransport.PermanentRejectReason) =>
+                              settleCall(
+                                PeerRpcObservability.observeRelay({
+                                  effect: client.Reject({
+                                    sessionId: handshake.sessionId,
+                                    relayMessageId: event.relayMessageId,
+                                    claimToken: event.claimToken,
+                                    messageHash: event.messageHash,
+                                    reason
+                                  }).pipe(Effect.mapError(mapError)),
+                                  operation: "AdapterAcknowledge",
+                                  direction: "Receive",
+                                  facts: () => ({
+                                    bytes: event.payload.byteLength,
+                                    items: 1,
+                                    version: event.payloadVersion
+                                  }),
+                                  result: adapterAcknowledgeResult("DeadLettered")
+                                })
+                              )
+                          }
+                        })
+                      )
+                    }
+
+                    const inbound = Stream.scoped(
                       Stream.fromEffect(
                         Effect.acquireRelease(beginUse, (release) => release)
                       ).pipe(
                         Stream.flatMap(() =>
                           remainder.pipe(
-                            Stream.mapEffect((event) =>
-                              event._tag !== "StoredMessage"
-                                ? Effect.fail(protocolFailure(event._tag))
-                                : validateStoredMessage(event, options, crypto, limits).pipe(
-                                  Effect.as(
-                                    {
-                                      message: event.payload,
-                                      identity: {
-                                        relayMessageId: event.relayMessageId,
-                                        relayPeerId: event.relayPeerId,
-                                        senderTenantId: event.sender.tenantId,
-                                        senderSubjectId: event.sender.subjectId,
-                                        senderPeerId: event.sender.peerId,
-                                        senderReplicaIncarnation: event.sender.replicaIncarnation,
-                                        messageHash: event.messageHash,
-                                        outerEnvelopeDigest: event.outerEnvelopeDigest
-                                      },
-                                      receiptRetentionMillis: options.receiptRetentionMillis,
-                                      acknowledge: settleCall(
-                                        PeerRpcObservability.observeRelay({
-                                          effect: client.Acknowledge({
-                                            sessionId: handshake.sessionId,
-                                            relayMessageId: event.relayMessageId,
-                                            claimToken: event.claimToken,
-                                            messageHash: event.messageHash
-                                          }).pipe(
-                                            Effect.mapError(mapError),
-                                            Effect.andThen(runtime.signalReceiptPrune)
-                                          ),
-                                          operation: "AdapterAcknowledge",
-                                          direction: "Receive",
-                                          facts: () => ({
-                                            bytes: event.payload.byteLength,
-                                            items: 1,
-                                            version: event.payloadVersion
-                                          }),
-                                          result: adapterAcknowledgeResult("Acknowledged")
-                                        })
-                                      ),
-                                      reject: (reason: PeerTransport.PermanentRejectReason) =>
-                                        settleCall(
-                                          PeerRpcObservability.observeRelay({
-                                            effect: client.Reject({
-                                              sessionId: handshake.sessionId,
-                                              relayMessageId: event.relayMessageId,
-                                              claimToken: event.claimToken,
-                                              messageHash: event.messageHash,
-                                              reason
-                                            }).pipe(Effect.mapError(mapError)),
-                                            operation: "AdapterAcknowledge",
-                                            direction: "Receive",
-                                            facts: () => ({
-                                              bytes: event.payload.byteLength,
-                                              items: 1,
-                                              version: event.payloadVersion
-                                            }),
-                                            result: adapterAcknowledgeResult("DeadLettered")
-                                          })
-                                        )
-                                    } satisfies PeerTransport.AcknowledgedDelivery
-                                  )
-                                )
-                            ),
+                            Stream.mapEffect(toInbound),
                             Stream.interruptWhen(awaitFatal),
                             Stream.interruptWhen(interruptOnClose)
                           )
@@ -589,8 +661,9 @@ export const layer = (
                         relayPeerId: options.expectedRelayPeerId
                       },
                       capabilities: { lineageAware: true },
-                      receive: acknowledged,
+                      receive: inbound,
                       send,
+                      transient,
                       close: closeWithExit(Exit.void)
                     }
                   })).pipe(Effect.onExitIf(Exit.isFailure, closeWithExit))
@@ -610,9 +683,12 @@ export const makeSession = (
   client: PeerRpc.RpcClient,
   options: Options
 ) =>
-  PeerSession.makeLive({
-    peerId: options.remote.peerId,
-    documents: options.documents
-  }).pipe(
-    Effect.provide(layer(client, options))
-  )
+  Effect.gen(function*() {
+    const runtime = yield* PeerRelayClientRuntime.PeerRelayClientRuntime
+    const session = yield* PeerSession.makeLive({
+      peerId: options.remote.peerId,
+      documents: options.documents
+    }).pipe(Effect.provide(layer(client, options)))
+    yield* runtime.register(session, options.documents)
+    return session
+  })

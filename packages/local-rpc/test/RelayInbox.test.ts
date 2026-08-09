@@ -4,6 +4,7 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
+import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -19,6 +20,7 @@ import * as Runners from "effect/unstable/cluster/Runners"
 import * as RunnerStorage from "effect/unstable/cluster/RunnerStorage"
 import * as Sharding from "effect/unstable/cluster/Sharding"
 import * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
+import * as PeerRelayLimits from "../src/PeerRelayLimits.js"
 import * as PeerRpc from "../src/PeerRpc.js"
 import * as RelayInbox from "../src/RelayInbox.js"
 import * as RelayInboxStore from "../src/RelayInboxStore.js"
@@ -87,7 +89,8 @@ const relay = (
     // wrote. Delivery budgets and terminal states are durable guarantees, not internals.
     Layer.provideMerge(options?.store ?? sqliteStore),
     // The entity mints claim tokens from the deployment's own randomness, not the ambient global.
-    Layer.provide(NodeCrypto.layer)
+    Layer.provide(NodeCrypto.layer),
+    Layer.provide(PeerRelayLimits.layerDefaults)
   )
 
 const layer = relay()
@@ -167,6 +170,10 @@ const deliver = (message: Message) => {
 const inboxFor = Effect.map(RelayInbox.RelayInbox.client, (make) => make(inboxKey))
 type Inbox = Effect.Success<typeof inboxFor>
 
+const storedMessages = Stream.filter<PeerRpc.RelayMessage, PeerRpc.StoredMessage>(
+  (message: PeerRpc.RelayMessage): message is PeerRpc.StoredMessage => message._tag === "StoredMessage"
+)
+
 /**
  * Brings the runner up: shard assignment and acquisition are driven by scheduled fibers, so under
  * the virtual clock no entity is reachable until time is advanced.
@@ -184,6 +191,7 @@ const receiveAndSettle = (
   outcome: RelayInboxStore.TerminalOutcome = "Acknowledged"
 ) =>
   client.Subscribe({ sessionId: session }).pipe(
+    storedMessages,
     Stream.take(count),
     Stream.mapEffect((message) =>
       client.Settle({
@@ -199,11 +207,76 @@ const receiveAndSettle = (
 
 /** Receives `count` messages and drops the session without settling any of them. */
 const receiveOnly = (client: Inbox, session: Identity.SessionId, count: number) =>
-  client.Subscribe({ sessionId: session }).pipe(Stream.take(count), Stream.runCollect)
+  client.Subscribe({ sessionId: session }).pipe(storedMessages, Stream.take(count), Stream.runCollect)
 
 const ids = (messages: ReadonlyArray<PeerRpc.StoredMessage>) => messages.map((message) => message.relayMessageId)
 
+const transient = (value: number): PeerRpc.TransientMessage =>
+  PeerRpc.TransientMessage.make({
+    sender: {
+      tenantId: "tenant-a",
+      subjectId: "sender-a",
+      peerId: peer("00000000aaa1")
+    },
+    document: { documentId: documentId("00000000dddd"), documentType: "note" },
+    payload: Uint8Array.of(value)
+  })
+
 describe("RelayInbox", () => {
+  it.effect("delivers transient messages only to the live subscriber", () =>
+    Effect.gen(function*() {
+      const client = yield* inbox
+      const currentSession = sessionId("000000000001")
+      const receivedFiber = yield* client.Subscribe({ sessionId: currentSession }).pipe(
+        Stream.filter((event) => event._tag === "TransientMessage"),
+        Stream.runHead,
+        Effect.forkChild
+      )
+      yield* Effect.yieldNow
+
+      yield* client.Transient({ message: transient(1) })
+      const received = yield* Fiber.join(receivedFiber)
+      assert.deepStrictEqual(Option.getOrThrow(received), transient(1))
+    }).pipe(Effect.provide(layer)))
+
+  it.effect("drops transient messages sent while offline without replay", () =>
+    Effect.gen(function*() {
+      const client = yield* inbox
+      yield* client.Transient({ message: transient(1) })
+
+      const fiber = yield* client.Subscribe({ sessionId: sessionId("000000000001") }).pipe(
+        Stream.filter((event) => event._tag === "TransientMessage"),
+        Stream.runHead,
+        Effect.forkChild
+      )
+      yield* Effect.yieldNow
+      assert.isUndefined(fiber.pollUnsafe())
+
+      yield* client.Transient({ message: transient(2) })
+      assert.deepStrictEqual(Option.getOrThrow(yield* Fiber.join(fiber)), transient(2))
+    }).pipe(Effect.provide(layer)))
+
+  it.effect("drops overflow without blocking the sender", () =>
+    Effect.gen(function*() {
+      const client = yield* inbox
+      const blocked = yield* Deferred.make<void>()
+      const subscriber = yield* client.Subscribe({ sessionId: sessionId("000000000001") }).pipe(
+        Stream.filter((event) => event._tag === "TransientMessage"),
+        Stream.runForEach(() => Deferred.await(blocked)),
+        Effect.forkChild
+      )
+      yield* Effect.yieldNow
+
+      for (
+        let value = 0;
+        value <= PeerRelayLimits.defaults.transientRecipientQueueCapacity + 1;
+        value++
+      ) {
+        yield* client.Transient({ message: transient(value) })
+      }
+      yield* Fiber.interrupt(subscriber)
+    }).pipe(Effect.provide(layer)))
+
   it.effect("delivers a message admitted while the recipient had no session", () =>
     Effect.gen(function*() {
       const client = yield* inbox
@@ -353,6 +426,7 @@ describe("RelayInbox", () => {
       // The stale head crosses half of its four second TTL after the first live settlement.
       const session = sessionId("000000000001")
       const received = yield* client.Subscribe({ sessionId: session }).pipe(
+        storedMessages,
         Stream.take(3),
         Stream.mapEffect((message) =>
           client.Settle({
@@ -493,7 +567,7 @@ describe("RelayInbox", () => {
       const delivered = yield* Queue.unbounded<PeerRpc.StoredMessage>()
       const stream = yield* Effect.forkChild(
         Stream.runForEach(
-          client.Subscribe({ sessionId: incumbent }),
+          client.Subscribe({ sessionId: incumbent }).pipe(storedMessages),
           (message) => Queue.offer(delivered, message)
         )
       )
@@ -575,6 +649,7 @@ describe("RelayInbox", () => {
       // it either — a forked fiber's defect never reaches the entity's own defect restart — so the
       // dispatcher has to hand its cause to the one thing the recipient is watching.
       const exit = yield* client.Subscribe({ sessionId: sessionId("000000000001") }).pipe(
+        storedMessages,
         Stream.runDrain,
         Effect.exit
       )
@@ -599,7 +674,7 @@ describe("RelayInbox", () => {
       const session = sessionId("000000000001")
 
       const subscriber = yield* Effect.forkChild(
-        Stream.runCollect(client.Subscribe({ sessionId: session }))
+        Stream.runCollect(client.Subscribe({ sessionId: session }).pipe(storedMessages))
       )
       yield* TestClock.adjust(10)
 
@@ -621,6 +696,7 @@ describe("RelayInbox", () => {
 
       const session = sessionId("000000000001")
       const outcome = yield* client.Subscribe({ sessionId: session }).pipe(
+        storedMessages,
         Stream.take(1),
         Stream.mapEffect((message) =>
           client.Settle({
@@ -651,6 +727,7 @@ describe("RelayInbox", () => {
 
       const session = sessionId("000000000001")
       const outcome = yield* client.Subscribe({ sessionId: session }).pipe(
+        storedMessages,
         Stream.take(1),
         Stream.mapEffect((message) =>
           client.Settle({
@@ -681,6 +758,7 @@ describe("RelayInbox", () => {
       // would be refused by the stale token and prove nothing about this guard.
       const session = sessionId("000000000001")
       const outcome = yield* client.Subscribe({ sessionId: session }).pipe(
+        storedMessages,
         Stream.take(1),
         Stream.mapEffect((message) =>
           client.Settle({
@@ -709,6 +787,7 @@ describe("RelayInbox", () => {
       // The recipient prunes its own relay receipt on a successful acknowledgement, so replying
       // before the row is terminal would leave neither side holding the message.
       const outcome = yield* client.Subscribe({ sessionId: session }).pipe(
+        storedMessages,
         Stream.take(1),
         Stream.mapEffect((message) =>
           client.Settle({
@@ -766,6 +845,7 @@ describe("RelayInbox", () => {
       // fiber would hold this channel for the whole session and nothing behind it would flow.
       const session = sessionId("000000000001")
       const collector = yield* client.Subscribe({ sessionId: session }).pipe(
+        storedMessages,
         Stream.take(2),
         Stream.runCollect,
         Effect.forkChild

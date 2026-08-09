@@ -42,6 +42,10 @@ export class SessionOverloaded extends Schema.TaggedErrorClass<SessionOverloaded
   "@lucas-barake/effect-local-rpc/PeerRpcError/SessionOverloaded"
 )("SessionOverloaded", {}) {}
 
+export class TransientRateLimitExceeded extends Schema.TaggedErrorClass<TransientRateLimitExceeded>(
+  "@lucas-barake/effect-local-rpc/PeerRpcError/TransientRateLimitExceeded"
+)("TransientRateLimitExceeded", {}) {}
+
 export class ServerUnavailable extends Schema.TaggedErrorClass<ServerUnavailable>(
   "@lucas-barake/effect-local-rpc/PeerRpcError/ServerUnavailable"
 )("ServerUnavailable", {}) {}
@@ -65,6 +69,7 @@ export const PeerRpcError = Schema.Union([
   RequestCapacityExceeded,
   SessionUnavailable,
   SessionOverloaded,
+  TransientRateLimitExceeded,
   ServerUnavailable,
   DocumentLineageChanged
 ])

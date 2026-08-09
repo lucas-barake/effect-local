@@ -22,7 +22,7 @@ import * as ReplicaClient from "../src/ReplicaClient.js"
 import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
-import { definition, DeliveryPublisher, documentId, replica, Task } from "./fixtures.js"
+import { definition, DeliveryPublisher, documentId, PeerRelayRuntime, replica, Task } from "./fixtures.js"
 
 it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
   const limits = {
@@ -82,6 +82,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
     DeliveryPublisher
   )
   const Owner = ReplicaOwner.layerHandlers(definition).pipe(
+    Layer.provide(PeerRelayRuntime),
     Layer.provide(PeerConnectionStatus.layer),
     Layer.provide(RelayConnectionStatus.layerNotConfigured),
     Layer.provideMerge(Sessions),

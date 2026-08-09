@@ -1,5 +1,6 @@
 import * as CommandDeliveryPublisher from "@lucas-barake/effect-local-sql/CommandDeliveryPublisher"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
+import * as PeerRelayClientRuntime from "@lucas-barake/effect-local-sql/PeerRelayClientRuntime"
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as CommandDelivery from "@lucas-barake/effect-local/CommandDelivery"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
@@ -126,3 +127,28 @@ export const DeliveryPublisher = Layer.succeed(
     changes: () => Stream.die("unexpected command delivery subscription")
   })
 )
+
+export const peerRelayRuntimeService = PeerRelayClientRuntime.PeerRelayClientRuntime.of({
+  admit: () => Effect.die("unexpected relay outbox admission"),
+  dueForEndpoint: () => Effect.die("unexpected relay outbox replay"),
+  maximumPendingHorizon: () => Effect.die("unexpected relay outbox horizon lookup"),
+  markCustody: () => Effect.die("unexpected relay custody update"),
+  validateReplicaIncarnation: () => Effect.die("unexpected replica incarnation validation"),
+  validateConnectionConfiguration: () => Effect.die("unexpected connection configuration validation"),
+  signalReceiptPrune: Effect.die("unexpected relay receipt prune"),
+  health: Effect.void,
+  awaitFatal: Effect.never,
+  register: () => Effect.die("unexpected peer session registration"),
+  send: () => Effect.void,
+  transients: Stream.empty
+})
+
+export const PeerRelayRuntime = Layer.succeed(
+  PeerRelayClientRuntime.PeerRelayClientRuntime,
+  peerRelayRuntimeService
+)
+
+export const transientClient = {
+  transient: () => Effect.void,
+  transients: Stream.never
+}

@@ -48,6 +48,19 @@ export const protocolVersion = 2
 export const commandDeliveryInvalidationKey = "@lucas-barake/effect-local/command-delivery"
 const DeliveryEventSequence = Schema.Int.check(Schema.isGreaterThan(0))
 const DeliveryCursor = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+export const maximumTransientPayloadBytes = 4 * 1024
+export const TransientPayload = Schema.Uint8Array.check(
+  Schema.makeFilter(
+    (payload) => payload.byteLength <= maximumTransientPayloadBytes,
+    { expected: `Uint8Array with at most ${maximumTransientPayloadBytes} bytes` }
+  )
+)
+export const TransientMessage = Schema.Struct({
+  peerId: Identity.PeerId,
+  documentId: Identity.DocumentId,
+  payload: TransientPayload
+})
+export type TransientMessage = typeof TransientMessage.Type
 const SessionLease = Schema.Struct({ leaseMillis: Schema.Int })
 export const ConflictLimits = Schema.Struct({
   maxConflictDepth: Schema.Int,
@@ -270,6 +283,21 @@ export const group = RpcGroup.make(
   Rpc.make("RelayConnectionStatus", {
     payload: { sessionId: Identity.SessionId },
     success: RelayConnectionStatus.Status,
+    error: ReplicaError.ReplicaError,
+    stream: true
+  }),
+  Rpc.make("Transient", {
+    payload: {
+      sessionId: Identity.SessionId,
+      peerId: Identity.PeerId,
+      documentId: Identity.DocumentId,
+      payload: TransientPayload
+    },
+    error: ReplicaError.ReplicaError
+  }),
+  Rpc.make("Transients", {
+    payload: { sessionId: Identity.SessionId },
+    success: TransientMessage,
     error: ReplicaError.ReplicaError,
     stream: true
   }),

@@ -21,7 +21,7 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as ReplicaAtom from "../src/ReplicaAtom.js"
 import * as ReplicaClient from "../src/ReplicaClient.js"
 import type * as ReplicaRpc from "../src/ReplicaRpc.js"
-import { peerConnectionStatus, relayConnectionStatus, Rename, replica, Task } from "./fixtures.js"
+import { peerConnectionStatus, relayConnectionStatus, Rename, replica, Task, transientClient } from "./fixtures.js"
 
 describe("ReplicaAtom", () => {
   it.effect("reads documents through documentFamily", () =>
@@ -603,6 +603,7 @@ describe("ReplicaAtom", () => {
       let executions = 0
       const client: ReplicaClient.ReplicaClient["Service"] = {
         ...replica,
+        ...transientClient,
         ownerEpoch: "owner",
         peerConnectionStatus,
         relayConnectionStatus,
@@ -647,6 +648,7 @@ describe("ReplicaAtom", () => {
 
       const client = (ownerEpoch: string, key: string): ReplicaClient.ReplicaClient["Service"] => ({
         ...replica,
+        ...transientClient,
         ownerEpoch,
         peerConnectionStatus,
         relayConnectionStatus,
@@ -683,6 +685,7 @@ describe("ReplicaAtom", () => {
       reactivity.registerUnsafe(["retry-key"], () => invalidations++)
       const client: ReplicaClient.ReplicaClient["Service"] = {
         ...replica,
+        ...transientClient,
         ownerEpoch: "owner",
         peerConnectionStatus,
         relayConnectionStatus,
@@ -729,6 +732,7 @@ describe("ReplicaAtom", () => {
       reactivity.registerUnsafe(["retry-key"], () => invalidations++)
       const client: ReplicaClient.ReplicaClient["Service"] = {
         ...replica,
+        ...transientClient,
         ownerEpoch: "owner",
         peerConnectionStatus,
         relayConnectionStatus,

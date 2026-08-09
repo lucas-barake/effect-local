@@ -4,8 +4,8 @@ Effect Local is a local first data engine for Effect v4 applications. Automerge 
 convergence. SQLite persists the canonical store and rebuildable query projections, in Node and in the browser
 through OPFS. Effect Cluster serializes commands and stores their replies, Effect Workflow resumes long running
 maintenance, and Effect Atom exposes reactive views. An optional RPC package synchronizes replicas through a
-durable store and forward relay. Application reads and writes commit against the local replica; synchronization
-never blocks a local commit.
+relay with durable store and forward plus a bounded transient channel. Application reads and writes commit against
+the local replica; synchronization never blocks a local commit.
 
 > **Beta:** Effect Local targets Effect `4.0.0-beta.101` and Automerge `3.3.2`. Durable formats, worker protocols,
 > and public APIs can still change. Read [Guarantees and limitations](#guarantees-and-limitations) before storing
@@ -50,13 +50,13 @@ pnpm add -D @lucas-barake/effect-local-test @effect/vitest@4.0.0-beta.101 vitest
 pnpm add -D @effect/platform-node@4.0.0-beta.101 @effect/platform-node-shared@4.0.0-beta.101
 ```
 
-| Package                              | Purpose                                                                                           |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------- |
-| `@lucas-barake/effect-local`         | Documents, mutations, projections, queries, command outcomes, backups, sync transport, `Replica`  |
-| `@lucas-barake/effect-local-sql`     | SQLite persistence, durable execution, recovery, compaction, peer sync, relay outbox and receipts |
-| `@lucas-barake/effect-local-browser` | Worker and RPC composition, OPFS ports, ownership, sessions, presence, Atom builders              |
-| `@lucas-barake/effect-local-rpc`     | Durable relay protocol, injectable custody, policies, bounded server, client adapter              |
-| `@lucas-barake/effect-local-test`    | Production shaped in memory replicas and deterministic bounded peer faults                        |
+| Package                              | Purpose                                                                                          |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `@lucas-barake/effect-local`         | Documents, mutations, projections, queries, backups, durable and transient peer transport        |
+| `@lucas-barake/effect-local-sql`     | SQLite persistence, durable execution, peer sync, relay outbox, receipts, and transient sessions |
+| `@lucas-barake/effect-local-browser` | Worker and RPC composition, OPFS ports, ownership, sessions, transient messaging, Atom builders  |
+| `@lucas-barake/effect-local-rpc`     | Durable custody and transient relay protocol, policies, bounded server, and client adapter       |
+| `@lucas-barake/effect-local-test`    | Production shaped replicas and deterministic durable and transient peer transport                |
 
 Every module is importable as a public subpath, for example `@lucas-barake/effect-local/Replica` and
 `@lucas-barake/effect-local-sql/SqlReplica`. Paths under `internal/*` are private and unsupported.
@@ -969,10 +969,17 @@ including command receipt lookups. Restore uses one end to end deadline across t
 invalidation, and backup export streams are intentionally unbounded. The owner side session lease is 60 seconds
 (`SessionManager.leaseDurationMillis`) and the client renews it automatically.
 
+`BrowserReplica` also provides the advanced `ReplicaClient` service. Its `transient(peerId, documentId, payload)`
+operation sends once through the currently registered relay session and is never replayed after a page to owner
+session replacement. Its `transients` stream carries authenticated sender, document, and payload values from the
+owner. The stream reconnects after retryable page to owner failures, but the channel has no replay: values sent while
+the page stream or remote device is absent are lost.
+
 Each mounted remote peer connection Atom holds one global queued RPC admission, one stream permit, and one in
-flight permit for its session. Each mounted `ReplicaAtom.commandDeliveryFamily` Atom holds one more stream permit
+flight permit for its session. A mounted `ReplicaClient.transients` consumer holds another stream and in flight
+permit. Each mounted `ReplicaAtom.commandDeliveryFamily` Atom holds one more stream permit
 and one more in flight permit for as long as it stays mounted. Size `maxStreamsPerSession` for the invalidation
-stream, an optional replica status stream, all mounted peer status streams, and all mounted command delivery
+stream, the transient stream, an optional replica status stream, all mounted peer status streams, and all mounted command delivery
 streams. Size `maxInFlightPerSession` for those streams plus the
 unary operations that must run concurrently. Size `maxQueuedRpc` for all active unary and stream RPCs across
 sessions. Backup restore uses the separate `maxRestoresPerSession` and `maxActiveRestores` limits.
@@ -1234,8 +1241,12 @@ export interface Connection {
   readonly peerId: Identity.PeerId
   readonly relayPeerId: Identity.PeerId
   readonly capabilities: Capabilities
-  readonly receive: Stream.Stream<AcknowledgedDelivery, ReplicaError.ReplicaError>
+  readonly receive: Stream.Stream<Inbound, ReplicaError.ReplicaError>
   readonly send: (message: Uint8Array) => Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly transient: (
+    documentId: Identity.DocumentId,
+    payload: Uint8Array
+  ) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly close: Effect.Effect<void>
 }
 
@@ -1245,9 +1256,12 @@ export class PeerTransport extends Context.Service<PeerTransport, {
 }>() {}
 ```
 
-The adapter returns one scoped `Connection` per connection epoch. Its scope must release every transport
-resource. `capabilities.lineageAware` describes the REMOTE peer: set it only when that peer compares document
-lineage before merging, because the send path refuses to emit a rewritten document to a peer that does not.
+`Inbound` is tagged `Durable` or `Transient`. Durable values contain an `AcknowledgedDelivery` with settlement
+effects. Transient values contain authenticated `peerId`, selected `documentId`, and opaque `payload`, with no
+acknowledgement or rejection operation. The adapter returns one scoped `Connection` per connection epoch. Its scope
+must release every transport resource. `capabilities.lineageAware` describes the REMOTE peer: set it only when that
+peer compares document lineage before merging, because the durable send path refuses to emit a rewritten document
+to a peer that does not.
 
 `PeerSession` binds one connection to selected whole documents and drives both directions:
 
@@ -1263,6 +1277,7 @@ const syncTask = (peerId: Identity.PeerId, documentId: Identity.DocumentId) =>
       peerId,
       documents: [{ document: TaskDocument, documentId }]
     })
+    yield* session.transient(documentId, new TextEncoder().encode("cursor:42"))
     yield* session.flush
   }))
 ```
@@ -1273,12 +1288,15 @@ const syncTask = (peerId: Identity.PeerId, documentId: Identity.DocumentId) =>
 | `PeerSession.makeSupervised` | Adds `awaitDisconnect`, the terminal replica failure without a commit subscription |
 | `PeerSession.makeLive`       | Subscribes to commit events and flushes automatically on local commits             |
 
-The session exposes `peerId`, `connectionEpoch`, `markDirty`, `flush`, `observedByPeer(documentId)`, and
-`durableConfirmation(documentId)`. `observedByPeer` reports Automerge sync state only: the peer has all current
-local changes. For a relay connection, `durableConfirmation` reports whether relay custody has been accepted for
-every current local change in that document for the exact connected endpoint. Direct connections still return
-`false`. Command scoped applications should prefer `lookupCommandDelivery`, since document confirmation combines
-all current local changes and is not tied to one command.
+The session exposes `peerId`, `connectionEpoch`, `markDirty`, `flush`, `observedByPeer(documentId)`,
+`durableConfirmation(documentId)`, `transient(documentId, payload)`, and `transients`. `transients` is a scoped,
+multicast, no replay stream with a sliding capacity of 64. A slow local subscriber loses intermediate values and
+converges on the newest values without blocking the receive loop. `observedByPeer` reports Automerge sync state only:
+the peer has all current local changes. For a relay connection, `durableConfirmation` reports whether relay custody
+has been accepted for every current local change in that document for the exact connected endpoint. Direct
+connections still return `false`. Transient sends never affect either durable signal. Command scoped applications
+should prefer `lookupCommandDelivery`, since document confirmation combines all current local changes and is not tied
+to one command.
 
 One socket carries every session. `RpcPeerTransport.layer` takes an already built `PeerRpc.RpcClient` and never
 opens a connection of its own, and the relay tracks each `Open` by its own session id independently of which
@@ -1378,6 +1396,10 @@ Semantics to build on:
   validation failures raise `ReplicaError` / `ProtocolMismatch`, which fails the supervised session. Reconnect
   with a fresh scope; the durable outbox replays what the peer still needs.
 - Selection is a nonempty set of unique whole documents. Subtree synchronization is unsupported.
+- Transient delivery is best effort and current-session only. It has no outbox, custody, receipt, settlement, replay,
+  or Automerge state. An offline recipient or a full transient queue drops the value without failing the sender.
+- The application owns transient payload encoding and receiver side expiry. Never use a transient value for
+  authorization or correctness state that must survive disconnect, overload, restart, or a slow subscriber.
 
 Presence is a separate best effort channel with expiry, for cursors and online state:
 
@@ -1401,9 +1423,11 @@ sequencing, lifecycle, and transport cleanup. See [docs/sync.md](docs/sync.md) f
 
 ## RPC relay
 
-The RPC package synchronizes independent canonical replicas through one durable store and forward protocol,
-`PeerRpc` version `1`. Its procedures are `Open` (a stream that starts with `Opened` and then emits
-`StoredMessage` deliveries), `Push`, `Acknowledge`, and `Reject`. There is no direct in memory RPC topology.
+The RPC package synchronizes independent canonical replicas through one relay protocol, `PeerRpc` version `1`.
+Its procedures are `Open` (a stream that starts with `Opened` and then emits tagged `StoredMessage` or
+`TransientMessage` values), `Push`, `Transient`, `Acknowledge`, and `Reject`. Durable store and forward messages and
+best effort transient messages share the authenticated session and socket. There is no separate direct in memory RPC
+topology.
 
 Delivery is at least once. A successful `Push` means the relay's SQL store committed the complete envelope
 before replying. A lost response, expired claim, interrupted acknowledgement, or reconnect can redeliver a
@@ -1471,6 +1495,30 @@ principal, relay peer, remote subject and peer, selected documents, sender repli
 retention, retry horizon, and replay batch size. A restore advances the incarnation, so rebuild options from
 `ReplicaGate.current` on every reconnect attempt rather than caching one value.
 
+### Transient delivery
+
+`PeerSession.transient(documentId, payload)` sends an opaque value over the existing live relay session.
+`PeerSession.transients` receives values for the selected documents. `PeerRelayClientRuntime` registers each live
+session by remote peer and document, exposes `send(peerId, documentId, payload)` for owner side routing, and multicasts
+accepted inbound values through its own sliding, no replay stream. A duplicate live route for the same peer and
+document fails instead of choosing an arbitrary session.
+
+The transient contract is deliberately weaker than `Push`:
+
+- `PeerRpc.maximumTransientPayloadBytes` is 4 KiB and is checked by a distinct `TransientPayload` schema.
+- Sender identity, remote endpoint, and selected document come from the authenticated live session. The opaque
+  payload cannot select or impersonate a sender.
+- The relay checks `Send` authorization before routing and `Receive` authorization before publishing to the
+  recipient. Transient values do not require the separate Automerge decode risk grant because the library never
+  decodes them as Automerge.
+- Each live sender session has a token bucket. Defaults are 16 messages per second with a burst of 32. Exhaustion
+  fails that send with `TransientRateLimitExceeded`, mapped by `RpcPeerTransport` to `ReplicaError` /
+  `QuotaExceeded { resource: "relay transient rate" }`.
+- Each currently attached recipient stream has a nonblocking dropping queue. Its default capacity is 64. An offline
+  recipient, a denied receive, or a full queue loses the value. A successful send never means custody or observation.
+- No transient value enters `RelayInboxStore`, `SqlRelayInboxStore`, `PeerRelayOutbox`, recipient receipts,
+  acknowledgements, rejection, settlement, backup, or Automerge history. Reconnect never replays it.
+
 The full composition, custody boundaries, capacity rules, and operational requirements are in
 [docs/store-and-forward.md](docs/store-and-forward.md), including the transport scoping mistake that leaves a
 client waiting on a released socket.
@@ -1493,22 +1541,23 @@ client waiting on a released socket.
 
 Every procedure can fail with a fieldless `PeerRpcError`:
 
-| Variant                   | Cause                                                                            | Classification |
-| ------------------------- | -------------------------------------------------------------------------------- | -------------- |
-| `AuthenticationFailure`   | Missing or rejected credential, expired grant, or any authenticator failure      | Terminal       |
-| `AccessDenied`            | Authorization or the unsafe decode grant refused                                 | Terminal       |
-| `UnsupportedVersion`      | Protocol version mismatch at the handshake                                       | Terminal       |
-| `PeerMismatch`            | The connected peer is not the configured one                                     | Terminal       |
-| `DefinitionMismatch`      | Definition hash mismatch                                                         | Terminal       |
-| `InvalidRequest`          | Malformed envelope, digest, routing, or selection                                | Terminal       |
-| `RequestLimitExceeded`    | A negotiated or configured limit was breached                                    | Terminal       |
-| `RequestCapacityExceeded` | Authentication rate limit, verifier saturation, or inbox admission quota         | Live resource  |
-| `SessionUnavailable`      | No live session, or the session belongs to another principal (one shared answer) | Live resource  |
-| `SessionOverloaded`       | Per subject session cap                                                          | Live resource  |
-| `ServerUnavailable`       | Backend store unavailable                                                        | Live resource  |
-| `DocumentLineageChanged`  | The remote holds a superseded document lineage                                   | Terminal       |
+| Variant                      | Cause                                                                            | Classification |
+| ---------------------------- | -------------------------------------------------------------------------------- | -------------- |
+| `AuthenticationFailure`      | Missing or rejected credential, expired grant, or any authenticator failure      | Terminal       |
+| `AccessDenied`               | Authorization or the unsafe decode grant refused                                 | Terminal       |
+| `UnsupportedVersion`         | Protocol version mismatch at the handshake                                       | Terminal       |
+| `PeerMismatch`               | The connected peer is not the configured one                                     | Terminal       |
+| `DefinitionMismatch`         | Definition hash mismatch                                                         | Terminal       |
+| `InvalidRequest`             | Malformed envelope, digest, routing, or selection                                | Terminal       |
+| `RequestLimitExceeded`       | A negotiated or configured limit was breached                                    | Terminal       |
+| `RequestCapacityExceeded`    | Authentication rate limit, verifier saturation, or inbox admission quota         | Live resource  |
+| `SessionUnavailable`         | No live session, or the session belongs to another principal (one shared answer) | Live resource  |
+| `SessionOverloaded`          | Per subject session cap or relay entity mailbox and processing saturation        | Live resource  |
+| `TransientRateLimitExceeded` | The current live session exhausted its transient token bucket                    | Caller pacing  |
+| `ServerUnavailable`          | Backend store unavailable                                                        | Live resource  |
+| `DocumentLineageChanged`     | The remote holds a superseded document lineage                                   | Terminal       |
 
-The wire errors are fieldless by design so authorization and storage failures do not disclose message
+The thirteen wire errors are fieldless by design so authorization and storage failures do not disclose message
 existence. Unexpected defects encode only `{ _tag: "InternalError" }`.
 
 `RpcPeerTransport` classifies every wire error and transport failure into the local error model. Live resource
@@ -1519,10 +1568,11 @@ failures and `RpcClientError` become `ReplicaError` / `StorageUnavailable`. Ever
 export const isRetryable = (error: ReplicaError.ReplicaError) => error.reason._tag === "StorageUnavailable"
 ```
 
-Retry only `StorageUnavailable`, and retry by rebuilding the complete connection scope with fresh options.
-Policy and protocol mismatches are not transient; fix the cause instead. `SupervisedPeerSession.awaitDisconnect`
-reports the terminal failure, and the retry schedule is the application's deployment policy, not a library
-default.
+Retry a failed connection only for `StorageUnavailable`, and retry by rebuilding the complete connection scope with
+fresh options. A transient rate rejection is `QuotaExceeded`, not a connection failure: pace later application sends
+without replaying the rejected value automatically. Policy and protocol mismatches are not transient; fix the cause
+instead. `SupervisedPeerSession.awaitDisconnect` reports the terminal failure, and the retry schedule is the
+application's deployment policy, not a library default.
 
 Malformed peer traffic is terminal, never retried in place. Envelope, digest, endpoint, or selection validation
 failures reject the exchange. On the relay the recipient settles a permanently invalid message with
@@ -1696,6 +1746,11 @@ Invalid bounds fail in the error channel, not as defects: `TestPeer.make` and `T
 `ConnectionClosed`. `TestReplica.defaultLimits` is the only exported limits preset and is intended for tests,
 not production capacity planning.
 
+`TestPeer` also implements the transport's transient path. It routes only to a currently connected peer, uses a
+nonblocking dropping queue with the configured `queueCapacity`, and never holds or replays a transient value across a
+partition, disconnect, or replacement connection. The durable fault sequence remains the tool for retry, copy,
+delay, and reorder tests.
+
 ## Error reference
 
 Failures beside the operations that produce them are documented in each section above. This is the consolidated
@@ -1851,8 +1906,8 @@ Domain model and the application capability.
   `ExportedDocument`.
 - `Commit`: `Heads`, `Commit` and their inferred types.
 - `Canonical`: `stringify`, `hash`, `digest`. Deterministic encoding utilities, not the canonical store.
-- `PeerTransport`: the `PeerTransport` service; types `Connection`, `ConnectOptions`, `Capabilities`,
-  `AcknowledgedDelivery`, `RelayDeliveryIdentity`, `PermanentRejectReason`.
+- `PeerTransport`: the `PeerTransport` service; types `Connection`, `ConnectOptions`, `Capabilities`, `Inbound`,
+  `TransientDelivery`, `AcknowledgedDelivery`, `RelayDeliveryIdentity`, `PermanentRejectReason`.
 - `SchemaDescriptor`: `make`. Encoded schema fingerprints used in hashes and checksums.
 
 ### `@lucas-barake/effect-local-sql`
@@ -1884,8 +1939,9 @@ rest are advanced assembly for custom runtimes.
   `Recovery`, `ReplicaBootstrap`, `ReplicaGate`. These own bootstrap, fencing, storage, execution, and recovery
   internals behind `SqlReplica`; call them only when assembling a custom runtime. Their service surfaces are
   documented in [docs/durability.md](docs/durability.md) and [docs/architecture.md](docs/architecture.md).
-- Relay client state (used by `RpcPeerTransport`, not called directly): `PeerRelayClientRuntime`
-  (`layer`, `layerSql`, `makeScoped`, `ConnectionConfiguration`), `PeerRelayOutbox` (`layerSql` and its
+- Relay client state (used by `RpcPeerTransport`, or by an owner routing browser requests):
+  `PeerRelayClientRuntime` (`layer`, `layerSql`, `makeScoped`, `ConnectionConfiguration`, `TransientMessage`,
+  `Registration`; service operations `register`, `send`, and `transients`), `PeerRelayOutbox` (`layerSql` and its
   service), `PeerRelayOutboxLimits` (`Values`, `defaults`, `make`, `layer`, `layerDefaults`,
   `maximumRetryHorizonMillis`), `PeerRelayReceiptLimits` (same shape plus `maximumReceiptRetentionMillis`).
 - `PeerSync` and `PeerSyncEnvelope`: the durable protocol service and the envelope schemas, validation,
@@ -1910,19 +1966,22 @@ and `Presence`.
 - `PeerSession`: compatibility reexport of the SQL package session API. New code should import
   `@lucas-barake/effect-local-sql/PeerSession`.
 - Advanced assembly: `ReplicaClient` (`fromRpcClient`, `layer`, `Options`, `defaultSessionTimeout`,
-  `defaultOperationTimeout`, the `ReplicaClient` service), `ReplicaOwner` (`layerHandlers`, `layer`,
-  `layerWorker`), `ReplicaRpc` (the page to owner protocol group and its schemas), `SessionManager` (`layer`,
-  `leaseDurationMillis`, the service). These are wired by `BrowserReplica` and `OwnershipCoordinator`.
+  `defaultOperationTimeout`, the `ReplicaClient` service with `transient` and `transients`), `ReplicaOwner`
+  (`layerHandlers`, `layer`, `layerWorker`), `ReplicaRpc` (the page to owner protocol group, `Transient`,
+  `Transients`, and their schemas), `SessionManager` (`layer`, `leaseDurationMillis`, the service). These are wired by
+  `BrowserReplica` and `OwnershipCoordinator`.
 
 ### `@lucas-barake/effect-local-rpc`
 
 Relay protocol and policies. See [RPC relay](#rpc-relay) for composition and failure semantics.
 
 - `PeerRpc`: `protocolVersion`, `maximumNegotiatedDurationMillis`, `maximumRelayPayloadBytes`,
-  `maximumRequestedDocuments`, the `Open` / `Push` / `Acknowledge` / `Reject` RPC classes, `Rpcs`,
-  `makeRpcClient`; types `RpcClient`, `Opened`, `StoredMessage`, `OpenEvent`, `RequestedDocument`, `ClaimToken`,
+  `maximumTransientPayloadBytes`, `maximumRequestedDocuments`, the `Open` / `Push` / `Transient` /
+  `Acknowledge` / `Reject` RPC classes, `Rpcs`, `makeRpcClient`; schemas and types `TransientPayload`,
+  `TransientMessage`, `RelayMessage`, `Opened`, `StoredMessage`, `OpenEvent`, `RequestedDocument`, `ClaimToken`,
   `RelayDigest`, `RejectReason`.
-- `PeerRpcError`: the twelve fieldless error classes, the `PeerRpcError` union, and the `Defect` schema that
+- `PeerRpcError`: the thirteen fieldless error classes, including `TransientRateLimitExceeded`, the `PeerRpcError`
+  union, and the `Defect` schema that
   encodes unexpected defects as `{ _tag: "InternalError" }`.
 - `PeerAuthentication`: `layerClient`, `layerServer`, the `PeerAuthentication` middleware, `AuthenticatedPeer`,
   `PeerPrincipal`.
@@ -1945,8 +2004,9 @@ Relay protocol and policies. See [RPC relay](#rpc-relay) for composition and fai
 ### `@lucas-barake/effect-local-test`
 
 - `TestReplica`: `layer`, `layerWithLimits`, `layerWithSync`, `layerWithSyncAndLimits`, `defaultLimits`.
-- `TestPeer`: `make`, `layer`, `transportLayer`; the `TestPeer` service; errors `InvalidOptions`,
-  `InvalidFault`, `QueueFull`, `ConnectionClosed`; types `Options`, `Connection`, `TestPeerError`.
+- `TestPeer`: `make`, `layer`, `transportLayer`; durable fault injection and current connection transient delivery;
+  the `TestPeer` service; errors `InvalidOptions`, `InvalidFault`, `QueueFull`, `ConnectionClosed`; types `Options`,
+  `Connection`, `TestPeerError`.
 - `FaultInjection`: `layer`, `none`, `layerSequence`; the service; types `Packet`, `Decision`.
 
 ## Guarantees and limitations
@@ -1968,11 +2028,15 @@ Guarantees:
   previous incarnation untouched.
 - Relay delivery is at least once within configured retry, expiry, retention, authorization, and capacity
   boundaries. A successful `Push` is durable custody.
+- Transient relay delivery is authenticated, document scoped, payload bounded, rate limited, and nonblocking. It
+  deliberately has no durability or observation guarantee.
 - Compaction never discards logical history.
 
 Limitations:
 
 - Presence is expiring best effort state. It is never durable and never authorizes anything.
+- Transient values are current-session best effort state. Offline recipients, denied receive authorization, full
+  queues, reconnects, and process restarts can lose them, and a successful send is not a receipt.
 - Relay custody confirmation proves storage by the configured relay. It does not prove destination application,
   destination observation, or end user visibility. Direct peer sessions have no durable confirmation signal.
 - Browser storage starts as best effort and can be evicted or cleared. Request `navigator.storage.persist()`,

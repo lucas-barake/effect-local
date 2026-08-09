@@ -9,7 +9,7 @@ import { TestClock } from "effect/testing"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as ReplicaAtom from "../src/ReplicaAtom.js"
 import * as ReplicaClient from "../src/ReplicaClient.js"
-import { peerConnectionStatus, relayConnectionStatus, replica } from "./fixtures.js"
+import { peerConnectionStatus, relayConnectionStatus, replica, transientClient } from "./fixtures.js"
 
 describe("ReplicaAtom reactivity bridge", () => {
   it.effect("resubscribes after the invalidation stream dies", () =>
@@ -22,6 +22,7 @@ describe("ReplicaAtom reactivity bridge", () => {
       reactivity.registerUnsafe(["defect-key"], () => invalidations++)
       const client: ReplicaClient.ReplicaClient["Service"] = {
         ...replica,
+        ...transientClient,
         ownerEpoch: "owner",
         peerConnectionStatus,
         relayConnectionStatus,
@@ -61,6 +62,7 @@ describe("ReplicaAtom reactivity bridge", () => {
       let subscriptions = 0
       const client: ReplicaClient.ReplicaClient["Service"] = {
         ...replica,
+        ...transientClient,
         ownerEpoch: "owner",
         peerConnectionStatus,
         relayConnectionStatus,

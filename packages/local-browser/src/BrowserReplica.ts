@@ -2,7 +2,6 @@ import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnec
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
-import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import { RpcClient } from "effect/unstable/rpc"
@@ -17,14 +16,15 @@ type WorkerOptions = Parameters<typeof RpcClient.layerProtocolWorker>[0]
  * memo map is shared app wide - would otherwise both resolve to the first graph's build, and the
  * second replica's `Replica` and `PeerConnectionStatus` would silently answer for the first one.
  */
-const clientServices = Layer.effectContext(
-  ReplicaClient.ReplicaClient.pipe(
-    Effect.map((client) =>
-      Context.make(Replica.Replica, client).pipe(
-        Context.add(PeerConnectionStatus.PeerConnectionStatus, client.peerConnectionStatus),
-        Context.add(RelayConnectionStatus.RelayConnectionStatus, client.relayConnectionStatus)
-      )
-    )
+const clientServices = Layer.mergeAll(
+  Layer.effect(Replica.Replica, ReplicaClient.ReplicaClient),
+  Layer.effect(
+    PeerConnectionStatus.PeerConnectionStatus,
+    ReplicaClient.ReplicaClient.pipe(Effect.map((client) => client.peerConnectionStatus))
+  ),
+  Layer.effect(
+    RelayConnectionStatus.RelayConnectionStatus,
+    ReplicaClient.ReplicaClient.pipe(Effect.map((client) => client.relayConnectionStatus))
   )
 ).pipe(Layer.fresh)
 
@@ -34,7 +34,7 @@ export const layerWith = (
   clientOptions?: ReplicaClient.Options
 ) =>
   clientServices.pipe(
-    Layer.provide(ReplicaClient.layer(definition, clientOptions)),
+    Layer.provideMerge(ReplicaClient.layer(definition, clientOptions)),
     Layer.provide(RpcClient.layerProtocolWorker(options))
   )
 
@@ -50,7 +50,7 @@ export const layerWithReactivityOptions = (
     clientServices,
     ReplicaAtom.layerReactivity
   ).pipe(
-    Layer.provide(ReplicaClient.layer(definition, clientOptions)),
+    Layer.provideMerge(ReplicaClient.layer(definition, clientOptions)),
     Layer.provide(RpcClient.layerProtocolWorker(options))
   )
 

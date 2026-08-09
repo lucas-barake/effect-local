@@ -1,4 +1,5 @@
 import type * as Identity from "@lucas-barake/effect-local/Identity"
+import type * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
@@ -9,14 +10,18 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as PubSub from "effect/PubSub"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
+import type * as Scope from "effect/Scope"
+import * as Stream from "effect/Stream"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as OutboxMaintenance from "./internal/peerRelayOutboxMaintenance.js"
 import * as ReceiptMaintenance from "./internal/peerRelayReceiptMaintenance.js"
 import * as PeerRelayOutbox from "./PeerRelayOutbox.js"
 import * as PeerRelayOutboxLimits from "./PeerRelayOutboxLimits.js"
 import * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
+import type * as PeerSession from "./PeerSession.js"
 import * as PeerSync from "./PeerSync.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
@@ -24,6 +29,12 @@ export interface ConnectionConfiguration {
   readonly replicaIncarnation: Identity.ReplicaIncarnation
   readonly retryHorizonMillis: number
   readonly replayBatchSize: number
+}
+
+export interface TransientMessage extends PeerTransport.TransientDelivery {}
+
+export interface Registration {
+  readonly unregister: Effect.Effect<void>
 }
 
 type RuntimeState =
@@ -46,6 +57,16 @@ export class PeerRelayClientRuntime extends Context.Service<PeerRelayClientRunti
   readonly signalReceiptPrune: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly health: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly awaitFatal: Effect.Effect<never, ReplicaError.ReplicaError>
+  readonly register: (
+    session: PeerSession.PeerSession,
+    documents: ReadonlyArray<PeerSession.SelectedDocument>
+  ) => Effect.Effect<Registration, ReplicaError.ReplicaError, Scope.Scope>
+  readonly send: (
+    peerId: Identity.PeerId,
+    documentId: Identity.DocumentId,
+    payload: Uint8Array
+  ) => Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly transients: Stream.Stream<TransientMessage>
 }>()("@lucas-barake/effect-local-sql/PeerRelayClientRuntime") {}
 
 const unexpectedExit = (
@@ -79,6 +100,17 @@ export const makeScoped = Effect.gen(function*() {
     Queue.dropping<void>(1),
     Queue.shutdown
   )
+  const transientPubSub = yield* Effect.acquireRelease(
+    PubSub.sliding<TransientMessage>(64),
+    PubSub.shutdown
+  )
+  interface Route {
+    readonly token: symbol
+    readonly session: PeerSession.PeerSession
+  }
+  const routes = yield* Ref.make(
+    new Map<Identity.PeerId, ReadonlyMap<Identity.DocumentId, Route>>()
+  )
 
   const awaitFatal: Effect.Effect<never, ReplicaError.ReplicaError> = Deferred.await(fatal).pipe(
     Effect.flatMap(Effect.failCause)
@@ -97,9 +129,9 @@ export const makeScoped = Effect.gen(function*() {
     })
   )
 
-  const guarded = <A, E extends ReplicaError.ReplicaError,>(
-    effect: Effect.Effect<A, E>
-  ): Effect.Effect<A, E | ReplicaError.ReplicaError> =>
+  const guarded = <A, E extends ReplicaError.ReplicaError, R,>(
+    effect: Effect.Effect<A, E, R>
+  ): Effect.Effect<A, E | ReplicaError.ReplicaError, R> =>
     health.pipe(
       Effect.andThen(effect),
       Effect.raceFirst(awaitFatal)
@@ -194,6 +226,91 @@ export const makeScoped = Effect.gen(function*() {
       }
     }))
 
+  const unregister = (
+    peerId: Identity.PeerId,
+    documentIds: ReadonlyArray<Identity.DocumentId>,
+    token: symbol
+  ) =>
+    Ref.update(routes, (current) => {
+      const peerRoutes = current.get(peerId)
+      if (peerRoutes === undefined) return current
+      const nextPeerRoutes = new Map(peerRoutes)
+      for (const documentId of documentIds) {
+        if (nextPeerRoutes.get(documentId)?.token === token) nextPeerRoutes.delete(documentId)
+      }
+      const next = new Map(current)
+      if (nextPeerRoutes.size === 0) next.delete(peerId)
+      else next.set(peerId, nextPeerRoutes)
+      return next
+    })
+
+  const register = (
+    session: PeerSession.PeerSession,
+    documents: ReadonlyArray<PeerSession.SelectedDocument>
+  ): Effect.Effect<Registration, ReplicaError.ReplicaError, Scope.Scope> =>
+    guarded(Effect.gen(function*() {
+      const documentIds = documents.map((entry) => entry.documentId)
+      if (new Set(documentIds).size !== documentIds.length) {
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.ProtocolMismatch({
+            expected: "unique selected transient routes",
+            observed: String(documents.length)
+          })
+        })
+      }
+      const token = Symbol("peer relay transient registration")
+      const registered = yield* Ref.modify(routes, (current) => {
+        const peerRoutes = current.get(session.peerId) ?? new Map<Identity.DocumentId, Route>()
+        const duplicate = documentIds.find((documentId) => peerRoutes.has(documentId))
+        if (duplicate !== undefined) return [duplicate, current] as const
+        const nextPeerRoutes = new Map(peerRoutes)
+        for (const documentId of documentIds) nextPeerRoutes.set(documentId, { token, session })
+        return [undefined, new Map(current).set(session.peerId, nextPeerRoutes)] as const
+      })
+      if (registered !== undefined) {
+        return yield* new ReplicaError.ReplicaError({
+          reason: new ReplicaError.ProtocolMismatch({
+            expected: "one live transient route per peer and document",
+            observed: `${session.peerId}:${registered}`
+          })
+        })
+      }
+      const unregisterRoute = unregister(session.peerId, documentIds, token)
+      yield* Effect.addFinalizer(() => unregisterRoute)
+      const fiber = yield* session.transients.pipe(
+        Stream.runForEachArray((messages) => PubSub.publishAll(transientPubSub, messages)),
+        Effect.forkScoped({ startImmediately: true })
+      )
+      return {
+        unregister: unregisterRoute.pipe(
+          Effect.andThen(Fiber.interrupt(fiber)),
+          Effect.asVoid
+        )
+      }
+    }))
+
+  const send = (
+    peerId: Identity.PeerId,
+    documentId: Identity.DocumentId,
+    payload: Uint8Array
+  ) =>
+    guarded(
+      Ref.get(routes).pipe(
+        Effect.flatMap((current) => {
+          const route = current.get(peerId)?.get(documentId)
+          return route === undefined
+            ? Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageUnavailable({
+                  cause: new Error("Peer transient route is unavailable")
+                })
+              })
+            )
+            : route.session.transient(documentId, payload)
+        })
+      )
+    )
+
   return {
     admit: (input: PeerRelayOutbox.AdmitInput) => guarded(outbox.admit(input)),
     dueForEndpoint: (input: PeerRelayOutbox.ReplayInput) => guarded(outbox.dueForEndpoint(input)),
@@ -208,7 +325,10 @@ export const makeScoped = Effect.gen(function*() {
       Effect.raceFirst(awaitFatal)
     ),
     health,
-    awaitFatal
+    awaitFatal,
+    register,
+    send,
+    transients: Stream.fromPubSub(transientPubSub)
   }
 })
 

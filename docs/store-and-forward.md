@@ -2,9 +2,10 @@
 
 ## Contract
 
-Store and forward is the RPC synchronization topology for SQL replicas. Protocol version `1` adds durable sender
-admission, durable relay custody, reconnect delivery, and durable recipient receipts. There is no separate direct
-protocol or topology.
+Store and forward is the RPC synchronization topology for SQL replicas. Protocol version `1` carries two delivery
+classes over the same authenticated session. Durable delivery has sender admission, relay custody, reconnect delivery,
+and recipient receipts. Transient delivery is bounded, rate limited, current-session only, and best effort. There is no
+separate direct protocol or topology.
 
 The delivery guarantee is at least once. A successful `Push` means the relay SQL authority committed
 the complete envelope before replying. A recipient can therefore see a duplicate after a lost response, expired
@@ -14,6 +15,10 @@ negotiated receipt retention window. Effect Local does not claim exactly once de
 Store and forward does not make the relay authoritative for document contents. Each replica remains authoritative for
 its local writes. Automerge remains responsible for convergence after valid changes reach a replica.
 
+Transient delivery has no delivery guarantee. A successful send means only that the relay accepted the live request.
+The value is not stored, acknowledged, settled, replayed, backed up, or added to Automerge history. An offline
+recipient, denied receive, full queue, reconnect, or process restart can lose it.
+
 ## Composition
 
 The application supplies relay policy, custody, limits, authentication, SQL, a socket, and a cluster. The server
@@ -22,9 +27,10 @@ retention singleton. The relay requires a `Sharding` and never builds one, so th
 in memory, one runner over SQL, or many sharded runners — stays the application's choice.
 
 On the client, `SqlReplica.layerRelay` (or `layerRelayWithBindings` when there are projections) installs relay receipt
-support. `PeerRelayClientRuntime.layerSql` stores stable sender admissions in the SQL outbox and supervises sender
-outbox and receipt maintenance. `RpcPeerTransport.makeSession` binds the generated relay client to the ordinary
-`PeerSession`.
+support. `PeerRelayClientRuntime.layerSql` stores stable sender admissions in the SQL outbox, supervises sender outbox
+and receipt maintenance, and owns the in-memory transient route registry and multicast stream.
+`RpcPeerTransport.makeSession` binds the generated relay client to the ordinary `PeerSession` and registers its
+selected peer and document routes for that scope.
 
 This example shows the server and client composition. The named application values provide SQL, Crypto,
 authentication, socket, cluster, definition, projection, and mutation or query Layers.
@@ -149,6 +155,11 @@ tab to SharedWorker RPC, not a network transport; the owner's runtime is the onl
 `ReplicaGate`, `PeerSync`, `CommitPublisher` and a `Sharding`, which is exactly what `RpcPeerTransport.makeSession`
 requires. Opening a session per attached tab would make one device several senders.
 
+The owner also routes page transient calls through `PeerRelayClientRuntime`. `BrowserReplica` retains the
+`ReplicaClient` service in its Layer, so a page can call `transient(peerId, documentId, payload)` and consume the
+reconnecting `transients` stream. Unary transient calls are not replayed when the page to owner session is replaced,
+and reconnecting the stream exposes only future values.
+
 The owner's replica has to be built relay flavoured. A browser app almost always has projections, so that means
 `SqlReplica.layerRelayWithBindings`. `PeerRelayClientRuntime` fails at construction on a direct `PeerSync` rather than
 degrading, so this is caught immediately, but it is caught in a service the consumer did not think it was choosing.
@@ -215,11 +226,11 @@ policy, not a library default. One detail is easy to get wrong: `senderReplicaIn
 supervisor that holds one options value across attempts works until the first restore and then fails every reconnect,
 so rebuild the options from `gate.current` on each attempt.
 
-## Protocol and durable identity
+## Protocol and identity
 
-`PeerRpc.Rpcs` contains `Open`, `Push`, `Acknowledge`, and `Reject`. Every request uses the
-same required authentication middleware. The first `Open` stream value is `Opened`. Later
-values are `StoredMessage` deliveries.
+`PeerRpc.Rpcs` contains `Open`, `Push`, `Transient`, `Acknowledge`, and `Reject`. Every request uses the same required
+authentication middleware. The first `Open` stream value is `Opened`. Later values are tagged `StoredMessage` or
+`TransientMessage` deliveries.
 
 Each sender admission has one stable `RelayMessageId`. The sender outbox persists that identity, the exact relay and
 recipient endpoint, the sender replica incarnation and connection sequence, document identity, writer provenance,
@@ -229,6 +240,25 @@ same identity and envelope to the same relay endpoint.
 The relay admits an envelope only after Schema decoding, authentication, send authorization, digest verification,
 payload validation, document selection validation, and quota reservation. Duplicate admission with the same identity
 and digest is safe. Conflicting reuse is rejected.
+
+### Transient boundary
+
+`Transient` carries the live session ID, one selected document, and a `TransientPayload` bounded by
+`PeerRpc.maximumTransientPayloadBytes` at 4 KiB. It carries no sender field. The relay derives the sender and remote
+endpoint from the authenticated session, confirms the document was negotiated by that session, checks `Send`
+authorization, and admits one token from that session's bucket before routing.
+
+The recipient inbox only offers the message to its currently installed transient queue. The front door checks
+`Receive` authorization before the value enters the public `Open` stream. There is no `RelayMessageId`, claim token,
+digest, durable row, receipt, or settlement operation for a transient message. The separate unsafe Automerge decode
+grant is not consulted because Effect Local treats the payload as opaque application bytes and never decodes it as
+Automerge.
+
+The defaults are 16 transient messages per second, burst 32, and a dropping queue of 64 values per attached recipient
+stream. The bucket is local to one live relay session and begins full. Exhaustion fails with the fieldless
+`TransientRateLimitExceeded`, which `RpcPeerTransport` maps to `ReplicaError` / `QuotaExceeded`. An absent recipient or
+full recipient queue is a successful drop. A cluster mailbox or entity availability failure can still fail the RPC as
+session or server unavailability.
 
 ## Acknowledgement boundary
 
@@ -332,14 +362,17 @@ single writer story.
 Connection and frame accounting is likewise not enforced here. It bounded the bespoke length prefixed framing that
 standard Effect RPC over a socket replaces. A single relayed payload is still bounded, by `PeerRpc`'s schema check
 against `maximumRelayPayloadBytes`; concurrent connections and in flight bytes are the deployment's socket server to
-bound. `PeerRelayLimits` retains the negotiation windows, the authentication rate limits, and
-`maxSessionsPerSubject`.
+bound. A transient payload has its own smaller `maximumTransientPayloadBytes` bound of 4 KiB.
+`PeerRelayLimits` retains the negotiation windows, authentication rate limits, `maxSessionsPerSubject`, and the
+transient sustained rate, burst, and recipient queue capacity. Defaults are 16 per second, burst 32, and queue 64.
+Construction rejects nonpositive values and a transient burst smaller than the sustained per second rate.
 
 `PeerRelayOutboxLimits` independently bounds pending sender rows and encoded bytes per remote and per replica. It also
 bounds retry horizon, pruning batch, pruning rate, and maintenance interval.
 
 Capacity failures are explicit. They do not imply custody. An application may retry
 `RequestCapacityExceeded` only with its own bounded backoff and the same stable sender admission.
+`TransientRateLimitExceeded` is caller pacing, not a reason to rebuild the connection or replay the rejected value.
 
 ## Security
 
@@ -347,7 +380,8 @@ The application remains responsible for credentials, identity issuance, TLS, end
 policy. `PeerAuthenticator` derives a fresh request principal for every RPC operation.
 `PeerRelayAuthorization.authorize` receives the direction, authenticated principal, exact remote subject and peer,
 and selected whole documents. The server checks send authorization before custody and receive authorization before
-disclosure.
+disclosure. The same directional checks surround transient routing. Sender identity and the remote endpoint always
+come from the authenticated session rather than the opaque transient payload.
 
 ### Unsafe Automerge resource trust
 
@@ -437,8 +471,9 @@ time, and ownership moves with the shard. `SqlRelayInboxStore.layer` supports SQ
 Replication and failover remain properties of the selected database deployment.
 
 Because the owning entity is the sole writer for its inbox, there is no claim ledger, lease deadline, or session
-generation to recover. Nothing in flight is persisted: a lost runner loses only memory, and the next owner finds the
-same `Pending` rows.
+generation to recover. Nothing in flight is persisted: a lost runner loses durable delivery attempts but the next
+owner finds the same `Pending` rows. Transient values exist only in the attached session queue and are lost with the
+runner or session.
 
 When the SQL authority is unavailable, new custody stops and delivery pauses. Durable pending rows remain
 discoverable after recovery. Retention runs as a cluster singleton so expiry and collection have exactly one owner
@@ -479,8 +514,10 @@ The relay exposes Effect services and spans. It does not install a metrics expor
 | `PeerRelayOutbox.usage`     | Remote and replica `messageCount` and `encodedBytes`              |
 
 Store operations use spans named `SqlRelayInboxStore.admit`, `pendingHeads`, `recordDelivery`, `settle`, `usage`,
-`abandoned`, `expire`, and `collect`. Entity spans are `RelayInbox.Deliver`, `Subscribe`, `Settle`, `Release`,
-`Heartbeat`, and `EndSession`. Front door spans are `RelayServer.Open`, `RelayServer.Push`, and `RelayServer.Settle`.
+`abandoned`, `expire`, and `collect`. Entity spans are `RelayInbox.Deliver`, `RelayInbox.Transient`,
+`RelayInbox.Subscribe`, `RelayInbox.Settle`, `RelayInbox.Release`, `RelayInbox.Heartbeat`, and
+`RelayInbox.EndSession`. Front door spans are `RelayServer.Open`, `RelayServer.Push`,
+`RelayServer.Transient`, and `RelayServer.Settle`.
 Retention sweeps use `RelayInboxMaintenance.sweep`. Client relay spans are
 `effect_local_rpc.adapter.relay_open` with `rpc.selected_documents` and
 `effect_local_rpc.adapter.relay_push` with `rpc.payload_bytes`.

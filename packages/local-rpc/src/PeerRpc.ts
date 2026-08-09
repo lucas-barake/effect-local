@@ -17,6 +17,7 @@ export const protocolVersion = PeerSyncEnvelope.relayProtocolVersion
 
 export const maximumNegotiatedDurationMillis = PeerRpcProtocol.maximumNegotiatedDurationMillis
 export const maximumRelayPayloadBytes = PeerRpcProtocol.maximumRelayPayloadBytes
+export const maximumTransientPayloadBytes = 4_096
 export const maximumRequestedDocuments = 1_000
 
 const DurationMillis = Schema.Int.check(
@@ -29,6 +30,12 @@ const BoundedName = Schema.NonEmptyString.check(Schema.isMaxLength(256))
 const BoundedPeerPrincipal = PeerSyncEnvelope.RelayPeerPrincipal
 const MessageHash = PeerSyncEnvelope.RelayOuterEnvelope.fields.messageHash
 const Payload = PeerSyncEnvelope.RelayOuterEnvelope.fields.payload
+export const TransientPayload = Schema.Uint8Array.check(
+  Schema.makeFilter((payload) => payload.byteLength <= maximumTransientPayloadBytes, {
+    expected: `a Uint8Array no larger than ${maximumTransientPayloadBytes} bytes`
+  })
+)
+export type TransientPayload = typeof TransientPayload.Type
 
 export const RequestedDocument = Schema.Struct({
   documentType: Schema.NonEmptyString,
@@ -74,7 +81,17 @@ export const StoredMessage = Schema.TaggedStruct("StoredMessage", {
 })
 export type StoredMessage = typeof StoredMessage.Type
 
-export const OpenEvent = Schema.Union([Opened, StoredMessage])
+export const TransientMessage = Schema.TaggedStruct("TransientMessage", {
+  sender: BoundedPeerPrincipal,
+  document: RequestedDocument,
+  payload: TransientPayload
+})
+export type TransientMessage = typeof TransientMessage.Type
+
+export const RelayMessage = Schema.Union([StoredMessage, TransientMessage])
+export type RelayMessage = typeof RelayMessage.Type
+
+export const OpenEvent = Schema.Union([Opened, RelayMessage])
 export type OpenEvent = typeof OpenEvent.Type
 
 export const RejectReason = Schema.Literals(["ProtocolInvalid", "ApplicationRejected"])
@@ -115,6 +132,17 @@ export class PushRpc extends Rpc.make("Push", {
   defect: PeerRpcError.Defect
 }) {}
 
+export class TransientRpc extends Rpc.make("Transient", {
+  payload: {
+    sessionId: Identity.SessionId,
+    document: RequestedDocument,
+    payload: TransientPayload,
+    credential: Credential
+  },
+  error: PeerRpcError.PeerRpcError,
+  defect: PeerRpcError.Defect
+}) {}
+
 const TerminalPayload = {
   sessionId: Identity.SessionId,
   relayMessageId: Identity.RelayMessageId,
@@ -141,6 +169,7 @@ export class RejectRpc extends Rpc.make("Reject", {
 export class Rpcs extends RpcGroup.make(
   OpenRpc,
   PushRpc,
+  TransientRpc,
   AcknowledgeRpc,
   RejectRpc
 ).middleware(PeerAuthentication.PeerAuthentication) {}
