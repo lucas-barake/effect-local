@@ -28,6 +28,8 @@ import * as Worker from "effect/unstable/workers/Worker"
 import * as NodeFs from "node:fs"
 import * as NodeOs from "node:os"
 import * as NodePath from "node:path"
+import { DatabaseSync } from "node:sqlite"
+import * as BrowserSqlite from "../src/BrowserSqlite.js"
 import * as OwnershipProtocol from "../src/internal/ownershipProtocol.js"
 import * as OwnershipCoordinator from "../src/OwnershipCoordinator.js"
 import * as ReplicaClient from "../src/ReplicaClient.js"
@@ -953,6 +955,113 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
       )
     }))
 
+  it.effect("keeps a live engine whose transaction outlives the deadline while the database keeps answering", () =>
+    Effect.gen(function*() {
+      // A real SQLite behind the real driver protocol: replies on the database port are the only
+      // liveness evidence available while a transaction monopolizes the client's single permit.
+      const database = new DatabaseSync(":memory:")
+      const channel = new MessageChannel()
+      const workerPort = channel.port2
+      workerPort.addEventListener("message", (event) => {
+        const request = event.data as ReadonlyArray<unknown>
+        if (!Array.isArray(request) || typeof request[0] !== "number") return
+        const [id, statementSql, params] = request as [number, string, ReadonlyArray<unknown>]
+        try {
+          const statement = database.prepare(statementSql)
+          const columns = statement.columns().map((column) => column.column ?? column.name)
+          const rows = statement.all(...(params ?? []) as Array<never>) as Array<Record<string, unknown>>
+          workerPort.postMessage([id, undefined, [columns, rows.map((row) => columns.map((name) => row[name!]))]])
+        } catch (error) {
+          workerPort.postMessage([id, String(error)])
+        }
+      })
+      workerPort.start()
+      workerPort.postMessage(["ready", undefined, undefined])
+
+      const runtimes: Array<ManagedRuntime.ManagedRuntime<OwnershipCoordinator.EngineServices, unknown>> = []
+      const Coordinator = OwnershipCoordinator.layerSharedWorker({
+        name: "effect-local-ownership-busy-liveness-test",
+        definition,
+        engine: (databasePort: MessagePort) => {
+          const runtime = ManagedRuntime.make(
+            Layer.merge(
+              SqlReplica.layerWithBindings(definition, { projections: [] }),
+              SessionManager.layer
+            ).pipe(
+              Layer.provideMerge(Layer.mergeAll(
+                BrowserSqlite.layerMessagePort(databasePort),
+                NodeCrypto.layer,
+                ReplicaLimits.layer(limits)
+              ))
+            )
+          )
+          runtimes.push(runtime)
+          return runtime
+        },
+        info: ownerInfo,
+        provisionTimeout: "500 millis",
+        engineStartTimeout: "5 seconds",
+        engineDisposeTimeout: "100 millis",
+        healthCheck: { interval: "100 millis", timeout: "200 millis", deadline: "1 second" }
+      })
+      yield* Effect.gen(function*() {
+        const tab = yield* attachTab
+        const provision = yield* takeFrame(tab, "Provision")
+        postToOwner(tab, { _tag: "Provision", nonce: provision.nonce, databasePort: channel.port1 })
+        yield* takeFrame(tab, "ProvisionAccepted")
+        yield* takeFrame(tab, "Attached")
+        assert.strictEqual(runtimes.length, 1)
+
+        // A backlog drain: one transaction holds the client's only permit far past the health
+        // deadline, but every statement inside it keeps round-tripping through the database
+        // worker. The queued probe cannot settle; the port traffic is the proof of life.
+        const context = yield* runtimes[0].contextEffect
+        const steps = yield* Effect.forEach(
+          Array.from({ length: 12 }),
+          () =>
+            Effect.all({
+              go: Deferred.make<void>(),
+              done: Deferred.make<void>()
+            })
+        )
+        const busy = yield* Effect.gen(function*() {
+          const sql = yield* SqlClient.SqlClient
+          yield* sql.withTransaction(
+            Effect.forEach(steps, (step) =>
+              Deferred.await(step.go).pipe(
+                Effect.andThen(sql`SELECT 1 AS ok`),
+                Effect.andThen(Deferred.succeed(step.done, undefined))
+              ), { discard: true })
+          )
+        }).pipe(Effect.provide(context), Effect.forkChild({ startImmediately: true }))
+
+        // 12 statements over 2.4 virtual seconds: the deadline (1s) elapses twice over with the
+        // probe still queued, while a statement answers within every deadline window.
+        for (const step of steps) {
+          yield* Deferred.succeed(step.go, undefined)
+          yield* Deferred.await(step.done)
+          yield* TestClock.adjust("200 millis")
+        }
+        yield* Fiber.join(busy)
+        yield* TestClock.adjust("100 millis")
+
+        // The engine was busy, never dead: resetting it would restart the very drain that made
+        // it busy and loop forever.
+        assert.isFalse(tab.receivedTags.includes("Reattach"))
+        assert.strictEqual(runtimes.length, 1)
+        const lease = yield* openSession(tab.rpcChannel.port2)
+        assert.isTrue(lease.ownerEpoch.length > 0)
+      }).pipe(
+        Effect.provide(Coordinator),
+        Effect.scoped,
+        Effect.ensuring(Effect.sync(() => {
+          channel.port1.close()
+          workerPort.close()
+          database.close()
+        }))
+      )
+    }))
+
   it.effect("resets an engine whose round trips never complete within the deadline", () =>
     Effect.gen(function*() {
       const started: Array<StartedEngine> = []
@@ -987,7 +1096,10 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
 
         yield* TestClock.adjust("1 second")
         yield* TestClock.adjust("200 millis")
-        yield* takeFrame(tab, "Reattach")
+        // A failure reset must never be silent: the tab-side rpc error for a torn port carries no
+        // cause, so the reattach reason is the only way the page learns why its session just died.
+        const reattached = yield* takeFrame(tab, "Reattach")
+        assert.strictEqual(reattached.reason, "the database worker health check failed")
       }).pipe(
         Effect.provide(Coordinator),
         Effect.scoped

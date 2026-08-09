@@ -130,6 +130,9 @@ interface EngineSnapshot {
   readonly scope: Scope.Closeable
   readonly ownerId: string
   readonly info: unknown
+  /** Messages observed arriving on the database port; see `EngineHealth.observedReplies`. */
+  readonly databaseReplies: { count: number }
+  readonly detachDatabaseObserver: () => void
 }
 
 interface EngineHealth {
@@ -137,6 +140,7 @@ interface EngineHealth {
   lastProbeTickAt: number
   probeStartedAt: number | undefined
   warned: boolean
+  observedReplies: number
 }
 
 interface LiveEngine extends EngineSnapshot {
@@ -319,6 +323,15 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
         databasePort: MessagePort
       ) => {
         const start = Effect.gen(function*() {
+          // Any message arriving on the database port proves the worker is processing work, even
+          // while a long transaction keeps the periodic probe queued. Never `start()` the port
+          // here — the driver owns dispatch.
+          const databaseReplies = { count: 0 }
+          const onDatabaseReply = () => {
+            databaseReplies.count++
+          }
+          databasePort.addEventListener("message", onDatabaseReply)
+          const detachDatabaseObserver = () => databasePort.removeEventListener("message", onDatabaseReply)
           const runtime = yield* Effect.sync(() => options.engine(databasePort))
           const engineScope = yield* Scope.make()
           // A candidate that detaches mid start has this fiber interrupted, and the engine it
@@ -330,7 +343,10 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
               Effect.andThen(
                 runtime.disposeEffect.pipe(Effect.timeout(engineDisposeTimeoutMillis), Effect.ignore)
               ),
-              Effect.andThen(Effect.sync(() => databasePort.close()))
+              Effect.andThen(Effect.sync(() => {
+                detachDatabaseObserver()
+                databasePort.close()
+              }))
             )
           const started = yield* Effect.exit(
             Effect.gen(function*() {
@@ -346,7 +362,14 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                 info = yield* Schema.encodeEffect(options.info.schema)(value)
               }
               const ownerId = yield* Effect.orDie(crypto.randomUUIDv4)
-              const snapshot: EngineSnapshot = { runtime, scope: engineScope, ownerId, info }
+              const snapshot: EngineSnapshot = {
+                runtime,
+                scope: engineScope,
+                ownerId,
+                info,
+                databaseReplies,
+                detachDatabaseObserver
+              }
               return snapshot
             })
           ).pipe(Effect.onInterrupt(() => discardEngine(Exit.interrupt())))
@@ -462,7 +485,8 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
         Scope.close(engine.scope, exit).pipe(
           Effect.andThen(engine.runtime.disposeEffect),
           Effect.timeout(engineDisposeTimeoutMillis),
-          Effect.ignore
+          Effect.ignore,
+          Effect.ensuring(Effect.sync(engine.detachDatabaseObserver))
         )
 
       const resetEngine = (reason: string, mode?: { readonly failure: boolean }): Effect.Effect<void> =>
@@ -477,7 +501,13 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
             // Only a tab whose server just died is told to re-attach. A tab still waiting for
             // its first serve has nothing to re-establish; the next engine serves it as is.
             if (client.served && client.rpcPort !== undefined) {
-              reattach.push(post(client.controlPort, { _tag: "Reattach", ownerId: engine.ownerId }))
+              // The rpc error a tab sees for its torn port is cause-free, so this reason is the
+              // only way the page learns why its session died.
+              reattach.push(post(client.controlPort, {
+                _tag: "Reattach",
+                ownerId: engine.ownerId,
+                ...(mode?.failure === true ? { reason } : {})
+              }))
             }
             client.served = false
           }
@@ -661,7 +691,13 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                   epoch: event.epoch,
                   provider: event.candidate,
                   // The start itself just proved a round trip, so the deadline counts from here.
-                  health: { lastRoundTripAt: now, lastProbeTickAt: now, probeStartedAt: undefined, warned: false }
+                  health: {
+                    lastRoundTripAt: now,
+                    lastProbeTickAt: now,
+                    probeStartedAt: undefined,
+                    warned: false,
+                    observedReplies: snapshot.databaseReplies.count
+                  }
                 }
                 current.engine = Option.some(engine)
                 current.tried.clear()
@@ -703,11 +739,19 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                     health.warned = false
                   }
                 }
+                // A long transaction keeps the probe queued behind the single connection permit,
+                // so observed port replies count as round trips: only a worker that answers
+                // nobody can reach the deadline.
+                const replies = engine.databaseReplies.count
+                if (replies !== health.observedReplies) {
+                  health.observedReplies = replies
+                  health.lastRoundTripAt = now
+                }
                 if (health.probeStartedAt !== undefined) {
-                  // The probe shares the engine's single connection queue, so it cannot tell a
-                  // busy worker from a dead one by lateness alone: only a round trip that never
-                  // completes within the deadline is death. Plain lateness is worth a warning,
-                  // once per probe, because it usually means a long drain is in progress.
+                  // Lateness alone cannot tell a busy worker from a dead one: only a deadline with
+                  // neither a settled probe nor any observed port reply is death. Plain lateness is
+                  // worth a warning, once per probe, because it usually means a long drain is in
+                  // progress.
                   if (now - health.lastRoundTripAt >= healthDeadlineMillis) {
                     return Queue.offer(events, { _tag: "HealthFailed", epoch: engine.epoch })
                   }
@@ -1093,6 +1137,15 @@ const layerTabImpl = (
             return
           }
           case "Reattach": {
+            // A reason means a failure takeover, not an ordinary ownership move. Unlike an
+            // `OwnerError` frame this must not tear the connection down: the coordinator is
+            // already re-provisioning and this tab may be the next provider.
+            if (frame.reason !== undefined) {
+              options.onOwnerError?.(`the replica owner engine was reset: ${frame.reason}`, {
+                _tag: "EngineReset",
+                reason: frame.reason
+              })
+            }
             failRpcPorts(current, `replica ownership moved from ${frame.ownerId}`)
             return
           }
@@ -1161,6 +1214,31 @@ const layerTabImpl = (
         const current = connection ?? establish()
         current.rpcPorts.get(id)?.close()
         const channel = new MessageChannel()
+        channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
+          const data = event.data
+          if (!Array.isArray(data) || data[0] !== 1) return
+          const message = data[1] as { readonly _tag?: string; readonly defect?: unknown } | undefined
+          if (message === undefined || message._tag !== "Defect") return
+          const defect = message.defect as Record<string, unknown> | undefined
+          const target = globalThis as unknown as { __rpcDefects?: Array<unknown> }
+          target.__rpcDefects = target.__rpcDefects ?? []
+          target.__rpcDefects.push({
+            at: Date.now(),
+            brand: Object.prototype.toString.call(defect),
+            keys: defect === null || defect === undefined ? [] : Object.keys(defect),
+            messageType: typeof defect?.message,
+            message: String(defect?.message).slice(0, 400),
+            name: String(defect?.name).slice(0, 200),
+            stack: String(defect?.stack).slice(0, 2000),
+            json: (() => {
+              try {
+                return JSON.stringify(defect)?.slice(0, 2000)
+              } catch (cause) {
+                return `unserializable: ${String(cause)}`
+              }
+            })()
+          })
+        })
         current.rpcPorts.set(id, channel.port2)
         postFrame(current, {
           _tag: "Attach",
