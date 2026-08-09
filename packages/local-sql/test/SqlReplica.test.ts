@@ -1,6 +1,7 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import type * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Document from "@lucas-barake/effect-local/Document"
@@ -32,6 +33,7 @@ import * as CommandDeliveryPublisher from "../src/CommandDeliveryPublisher.js"
 import * as CommandDeliveryStore from "../src/CommandDeliveryStore.js"
 import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as CommitPublisher from "../src/CommitPublisher.js"
+import * as Compaction from "../src/Compaction.js"
 import * as DocumentStore from "../src/DocumentStore.js"
 import * as ClusterStorage from "../src/internal/clusterStorage.js"
 import * as PeerRelayClientRuntime from "../src/PeerRelayClientRuntime.js"
@@ -48,6 +50,37 @@ import * as SqlProjection from "../src/SqlProjection.js"
 import * as SqlReplica from "../src/SqlReplica.js"
 
 describe("SqlReplica", () => {
+  const concatenate = (chunks: ReadonlyArray<Uint8Array>) => {
+    const length = chunks.reduce((total, chunk) => total + chunk.byteLength, 0)
+    const result = new Uint8Array(length)
+    let offset = 0
+    for (const chunk of chunks) {
+      result.set(chunk, offset)
+      offset += chunk.byteLength
+    }
+    return result
+  }
+  const archiveLines = (chunks: ReadonlyArray<Uint8Array>) =>
+    new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n").map((line) => JSON.parse(line))
+  const encodeArchive = (lines: Array<any>) =>
+    Effect.gen(function*() {
+      const manifest = lines[0]!
+      const records = lines.slice(1, -1)
+      const end = lines.at(-1)!
+      for (const record of records) record.checksum = yield* Canonical.digest(record.value)
+      end.value.recordCount = records.length
+      end.value.recordsChecksum = yield* Canonical.digest(records.map((record) => record.checksum))
+      end.checksum = yield* Canonical.digest(end.value)
+      manifest.value.recordCount = records.length
+      for (let attempt = 0; attempt < 8; attempt++) {
+        manifest.checksum = yield* Canonical.digest(manifest.value)
+        const encoded = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+        if (manifest.value.declaredBytes === encoded.byteLength) return encoded
+        manifest.value.declaredBytes = encoded.byteLength
+      }
+      manifest.checksum = yield* Canonical.digest(manifest.value)
+      return new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+    })
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
   const Rename = Mutation.make("Rename", { document: Task, payload: Schema.String })
   const Noop = Mutation.make("Noop", { document: Task })
@@ -581,6 +614,423 @@ describe("SqlReplica", () => {
       FROM task_title_v1`
       assert.deepStrictEqual(rows, [{ sourceDocumentId: created, title: "projected" }])
     }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive))
+
+  it.effect("installs and publishes one missing archive document without changing existing replica state", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const archive = yield* Effect.gen(function*() {
+          const replica = yield* Replica.Replica
+          const selectedId = yield* replica.create(Task, {
+            commandId: yield* Identity.makeCommandId,
+            value: { title: "selected" }
+          })
+          const omittedId = yield* replica.create(Task, {
+            commandId: yield* Identity.makeCommandId,
+            value: { title: "omitted" }
+          })
+          const chunks = yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+          return { chunks, omittedId, selectedId }
+        }).pipe(Effect.provide(Layer.fresh(ProjectedLive)))
+
+        const replica = yield* Replica.Replica
+        const gate = yield* ReplicaGate.ReplicaGate
+        const existingId = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "existing" }
+        })
+        yield* replica.mutate(Rename, {
+          commandId: yield* Identity.makeCommandId,
+          documentId: existingId,
+          payload: "local write"
+        })
+        const identityBefore = yield* gate.current
+        const publisher = yield* CommitPublisher.CommitPublisher
+        const subscription = yield* publisher.subscribe
+        const commitFiber = yield* Stream.runHead(subscription.events).pipe(Effect.forkChild)
+
+        yield* replica.installBackupDocument(Task, {
+          documentId: archive.selectedId,
+          expectedDefinitionHash: projectedDefinition.hash,
+          installationId: yield* Identity.makeBackupInstallationId,
+          maxBytes: limits.maxBackupBytes,
+          source: Stream.fromIterable(archive.chunks)
+        })
+
+        assert.deepStrictEqual(Option.getOrThrow(yield* Fiber.join(commitFiber)), {
+          _tag: "Commit",
+          commitSequence: Identity.CommitSequence.make(subscription.watermark + 1),
+          documentId: archive.selectedId,
+          keys: [
+            Task.name,
+            ReplicaDefinition.documentInstanceKey(Task.name, archive.selectedId),
+            TaskTitle.name
+          ],
+          refreshGeneration: subscription.refreshGeneration
+        })
+
+        assert.deepStrictEqual(yield* gate.current, identityBefore)
+        assert.strictEqual((yield* replica.get(Task, existingId)).value.title, "local write")
+        assert.strictEqual((yield* replica.get(Task, archive.selectedId)).value.title, "selected")
+        const omitted = yield* Effect.flip(replica.get(Task, archive.omittedId))
+        assert.strictEqual(omitted.reason._tag, "DocumentNotFound")
+        const sql = yield* SqlClient.SqlClient
+        assert.deepStrictEqual(
+          yield* sql`SELECT source_document_id, title FROM task_title_v1 ORDER BY source_document_id`,
+          [
+            { source_document_id: existingId, title: "local write" },
+            { source_document_id: archive.selectedId, title: "selected" }
+          ].toSorted((left, right) => String(left.source_document_id).localeCompare(String(right.source_document_id)))
+        )
+      }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive)
+    ))
+
+  it.effect("makes an exact selective installation retry a no-op and rejects document collisions", () =>
+    Effect.gen(function*() {
+      const archive = yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const documentId = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "archived" }
+        })
+        const chunks = yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+        return { chunks, documentId }
+      }).pipe(Effect.provide(Layer.fresh(ProjectedLive)))
+
+      const replica = yield* Replica.Replica
+      const sql = yield* SqlClient.SqlClient
+      const installationId = yield* Identity.makeBackupInstallationId
+      const install = (nextInstallationId: Identity.BackupInstallationId) =>
+        replica.installBackupDocument(Task, {
+          documentId: archive.documentId,
+          expectedDefinitionHash: projectedDefinition.hash,
+          installationId: nextInstallationId,
+          maxBytes: limits.maxBackupBytes,
+          source: Stream.fromIterable(archive.chunks)
+        })
+
+      yield* install(installationId)
+      const afterInstall = yield* sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`
+      yield* install(installationId)
+      assert.deepStrictEqual(
+        yield* sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`,
+        afterInstall
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT mode, document_id FROM effect_local_backup_installations`,
+        [{ mode: "document", document_id: archive.documentId }]
+      )
+
+      const collision = yield* Effect.flip(install(yield* Identity.makeBackupInstallationId))
+      assert.strictEqual(collision.reason._tag, "BackupInvalid")
+      assert.deepStrictEqual(
+        yield* sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`,
+        afterInstall
+      )
+      assert.strictEqual((yield* replica.get(Task, archive.documentId)).value.title, "archived")
+    }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive))
+
+  it.effect("rejects a selective archive with duplicate records outside the selected document", () =>
+    Effect.gen(function*() {
+      const archive = yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const selectedId = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "selected" }
+        })
+        const omittedId = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "omitted" }
+        })
+        const chunks = yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+        return { chunks, omittedId, selectedId }
+      }).pipe(Effect.provide(Layer.fresh(ProjectedLive)))
+      const lines = archiveLines(archive.chunks)
+      const duplicate = structuredClone(
+        lines.find((line) => line.kind === "Document" && line.value.document_id === archive.omittedId)
+      )
+      lines.splice(-1, 0, duplicate)
+      const tampered = yield* encodeArchive(lines)
+      const replica = yield* Replica.Replica
+      const sql = yield* SqlClient.SqlClient
+      const before = yield* sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`
+
+      const error = yield* Effect.flip(replica.installBackupDocument(Task, {
+        documentId: archive.selectedId,
+        expectedDefinitionHash: projectedDefinition.hash,
+        installationId: yield* Identity.makeBackupInstallationId,
+        maxBytes: limits.maxBackupBytes,
+        source: Stream.make(tampered)
+      }))
+
+      assert.strictEqual(error.reason._tag, "BackupInvalid")
+      assert.deepStrictEqual(
+        yield* sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`,
+        before
+      )
+    }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive))
+
+  it.effect("reports malformed selective archive history as BackupInvalid without mutation", () =>
+    Effect.gen(function*() {
+      const archive = yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const documentId = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "archived" }
+        })
+        const chunks = yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+        return { chunks, documentId }
+      }).pipe(Effect.provide(Layer.fresh(ProjectedLive)))
+      const lines = archiveLines(archive.chunks)
+      lines.find((line) => line.kind === "Document")!.value.accepted_heads = "not-json"
+      const tampered = yield* encodeArchive(lines)
+      const replica = yield* Replica.Replica
+      const sql = yield* SqlClient.SqlClient
+      const before = yield* sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`
+
+      const error = yield* Effect.flip(replica.installBackupDocument(Task, {
+        documentId: archive.documentId,
+        expectedDefinitionHash: projectedDefinition.hash,
+        installationId: yield* Identity.makeBackupInstallationId,
+        maxBytes: limits.maxBackupBytes,
+        source: Stream.make(tampered)
+      }))
+
+      assert.strictEqual(error.reason._tag, "BackupInvalid")
+      assert.deepStrictEqual(
+        yield* sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`,
+        before
+      )
+    }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive))
+
+  it.effect("validates canonical metadata for documents omitted from selective installation", () =>
+    Effect.gen(function*() {
+      const archive = yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const selectedId = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "selected" }
+        })
+        const omittedId = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "omitted" }
+        })
+        const chunks = yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+        return { chunks, omittedId, selectedId }
+      }).pipe(Effect.provide(Layer.fresh(ProjectedLive)))
+      const lines = archiveLines(archive.chunks)
+      lines.find((line) => line.kind === "Document" && line.value.document_id === archive.omittedId)!.value
+        .accepted_heads = "not-json"
+      const tampered = yield* encodeArchive(lines)
+      const replica = yield* Replica.Replica
+
+      const error = yield* Effect.flip(replica.installBackupDocument(Task, {
+        documentId: archive.selectedId,
+        expectedDefinitionHash: projectedDefinition.hash,
+        installationId: yield* Identity.makeBackupInstallationId,
+        maxBytes: limits.maxBackupBytes,
+        source: Stream.make(tampered)
+      }))
+
+      assert.strictEqual(error.reason._tag, "BackupInvalid")
+    }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive))
+
+  it.effect("reports an unsupported selective archive version as BackupInvalid", () =>
+    Effect.gen(function*() {
+      const archive = yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const documentId = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "archived" }
+        })
+        const chunks = yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+        return { chunks, documentId }
+      }).pipe(Effect.provide(Layer.fresh(ProjectedLive)))
+      const lines = archiveLines(archive.chunks)
+      lines.find((line) => line.kind === "Document")!.value.schema_version = 999
+      const tampered = yield* encodeArchive(lines)
+      const replica = yield* Replica.Replica
+
+      const error = yield* Effect.flip(replica.installBackupDocument(Task, {
+        documentId: archive.documentId,
+        expectedDefinitionHash: projectedDefinition.hash,
+        installationId: yield* Identity.makeBackupInstallationId,
+        maxBytes: limits.maxBackupBytes,
+        source: Stream.make(tampered)
+      }))
+
+      assert.strictEqual(error.reason._tag, "BackupInvalid")
+    }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive))
+
+  it.effect("rejects installation id reuse for different archive contents", () =>
+    Effect.gen(function*() {
+      const archive = yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const documentId = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "archived" }
+        })
+        const chunks = yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+        return { chunks, documentId }
+      }).pipe(Effect.provide(Layer.fresh(ProjectedLive)))
+      const lines = archiveLines(archive.chunks)
+      const manifestChecksum = lines[0]!.checksum
+      const change = lines.find((line) => line.kind === "Change")!
+      change.value.accepted_at = "2026-01-01T00:00:00.000Z"
+      const changed = yield* encodeArchive(lines)
+      assert.strictEqual(lines[0]!.checksum, manifestChecksum)
+      const replica = yield* Replica.Replica
+      const sql = yield* SqlClient.SqlClient
+      const installationId = yield* Identity.makeBackupInstallationId
+      const install = (source: Stream.Stream<Uint8Array>) =>
+        replica.installBackupDocument(Task, {
+          documentId: archive.documentId,
+          expectedDefinitionHash: projectedDefinition.hash,
+          installationId,
+          maxBytes: limits.maxBackupBytes,
+          source
+        })
+      yield* install(Stream.fromIterable(archive.chunks))
+      const before = yield* sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`
+
+      const error = yield* Effect.flip(install(Stream.make(changed)))
+
+      assert.strictEqual(error.reason._tag, "BackupInvalid")
+      assert.deepStrictEqual(
+        yield* sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`,
+        before
+      )
+    }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive))
+
+  it.effect("keeps a selectively installed pruned checkpoint document writable", () =>
+    Effect.gen(function*() {
+      const archive = yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const compaction = yield* Compaction.Compaction
+        const documentId = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "created" }
+        })
+        yield* compaction.compact(Task, documentId)
+        yield* replica.mutate(Rename, {
+          commandId: yield* Identity.makeCommandId,
+          documentId,
+          payload: "after checkpoint"
+        })
+        yield* compaction.compact(Task, documentId)
+        assert.isAbove(yield* compaction.prune(documentId), 0)
+        const chunks = yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+        return { chunks, documentId }
+      }).pipe(Effect.provide(Layer.fresh(DirectLive)))
+
+      const replica = yield* Replica.Replica
+      yield* replica.installBackupDocument(Task, {
+        documentId: archive.documentId,
+        expectedDefinitionHash: definition.hash,
+        installationId: yield* Identity.makeBackupInstallationId,
+        maxBytes: limits.maxBackupBytes,
+        source: Stream.fromIterable(archive.chunks)
+      })
+      yield* replica.mutate(Rename, {
+        commandId: yield* Identity.makeCommandId,
+        documentId: archive.documentId,
+        payload: "still writable"
+      })
+      assert.strictEqual((yield* replica.get(Task, archive.documentId)).value.title, "still writable")
+    }).pipe(Effect.provide(DirectLive), Effect.provide(Database), TestClock.withLive))
+
+  it.effect("rejects pending rows already materialized by the selected checkpoint", () =>
+    Effect.gen(function*() {
+      const archive = yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const compaction = yield* Compaction.Compaction
+        const documentId = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "checkpointed" }
+        })
+        yield* compaction.compact(Task, documentId)
+        const chunks = yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+        return { chunks, documentId }
+      }).pipe(Effect.provide(Layer.fresh(DirectLive)))
+      const lines = archiveLines(archive.chunks)
+      const checkpoint = lines.find((line) => line.kind === "Checkpoint")!
+      const covered = new Set(
+        checkpoint.value.writer_provenance.map((entry: { readonly changeHash: string }) => entry.changeHash)
+      )
+      lines.find((line) => line.kind === "Change" && covered.has(line.value.change_hash))!.value.applied = 0
+      const tampered = yield* encodeArchive(lines)
+      const replica = yield* Replica.Replica
+      const sql = yield* SqlClient.SqlClient
+      const before = yield* sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`
+
+      const error = yield* Effect.flip(replica.installBackupDocument(Task, {
+        documentId: archive.documentId,
+        expectedDefinitionHash: definition.hash,
+        installationId: yield* Identity.makeBackupInstallationId,
+        maxBytes: limits.maxBackupBytes,
+        source: Stream.make(tampered)
+      }))
+
+      assert.strictEqual(error.reason._tag, "BackupInvalid")
+      assert.deepStrictEqual(
+        yield* sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`,
+        before
+      )
+      assert.deepStrictEqual(yield* sql`SELECT * FROM effect_local_changes`, [])
+    }).pipe(Effect.provide(DirectLive), Effect.provide(Database), TestClock.withLive))
+
+  it.effect("batches selective change insertion", () => {
+    let changeInsertStatements = 0
+    const baseDatabase = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+    const countingDatabase = Layer.effect(
+      SqlClient.SqlClient,
+      Effect.gen(function*() {
+        const sql = yield* SqlClient.SqlClient
+        return Object.assign(
+          ((...args: ReadonlyArray<unknown>) => {
+            const strings = args[0]
+            if (Array.isArray(strings) && String(strings[0]).includes("INSERT INTO effect_local_changes")) {
+              changeInsertStatements++
+            }
+            return (sql as any)(...args)
+          }) as SqlClient.SqlClient,
+          sql
+        )
+      })
+    ).pipe(Layer.provide(baseDatabase))
+    const CountingDatabase = Layer.merge(countingDatabase, NodeCrypto.layer)
+    const CountingLive = SqlReplica.layerWithBindings(projectedDefinition, { projections: [TaskTitleSql] }).pipe(
+      Layer.provide(Layer.mergeAll(CountingDatabase, Handler, Limits))
+    )
+    return Effect.gen(function*() {
+      const archive = yield* Effect.gen(function*() {
+        const replica = yield* Replica.Replica
+        const documentId = yield* replica.create(Task, {
+          commandId: yield* Identity.makeCommandId,
+          value: { title: "change 0" }
+        })
+        for (let index = 1; index < 51; index++) {
+          yield* replica.mutate(Rename, {
+            commandId: yield* Identity.makeCommandId,
+            documentId,
+            payload: `change ${index}`
+          })
+        }
+        const chunks = yield* replica.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+        return { chunks, documentId }
+      }).pipe(Effect.provide(Layer.fresh(ProjectedLive)))
+
+      const replica = yield* Replica.Replica
+      yield* replica.installBackupDocument(Task, {
+        documentId: archive.documentId,
+        expectedDefinitionHash: projectedDefinition.hash,
+        installationId: yield* Identity.makeBackupInstallationId,
+        maxBytes: limits.maxBackupBytes,
+        source: Stream.fromIterable(archive.chunks)
+      })
+
+      assert.isBelow(changeInsertStatements, 51)
+    }).pipe(Effect.provide(CountingLive), Effect.provide(Database), TestClock.withLive)
+  })
 
   // Deleting a document replaces its projection rows with none, driven by the
   // tombstone the commit reports. Nothing else in the suite exercises a delete

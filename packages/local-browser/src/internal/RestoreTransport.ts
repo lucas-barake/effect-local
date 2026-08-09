@@ -1,4 +1,5 @@
 import type * as Backup from "@lucas-barake/effect-local/Backup"
+import type * as Document from "@lucas-barake/effect-local/Document"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -19,10 +20,18 @@ import * as Stream from "effect/Stream"
 import * as SessionManager from "../SessionManager.js"
 import * as RestoreProtocol from "./restoreProtocol.js"
 
-export interface BeginOptions extends Omit<Backup.RestoreOptions<never>, "source"> {
-  readonly sessionId: Identity.SessionId
-  readonly clientId: number
-}
+export type BeginOptions =
+  & {
+    readonly sessionId: Identity.SessionId
+    readonly clientId: number
+  }
+  & (
+    | Omit<Backup.RestoreOptions<never>, "source">
+    | (Omit<Backup.InstallDocumentOptions<never>, "source"> & {
+      readonly mode: "document"
+      readonly document: Document.Any
+    })
+  )
 
 export interface BeginResult {
   readonly nonce: RestoreProtocol.RestoreNonce
@@ -481,13 +490,21 @@ const makeLayer = Layer.effect(
             yield* awaitStart(controller)
             yield* awaitResultClaim(controller)
             controller.phase = "Running"
-            return yield* replica.restoreBackup({
-              source: source(controller),
-              mode: controller.options.mode,
-              maxBytes: controller.options.maxBytes,
-              expectedDefinitionHash: controller.options.expectedDefinitionHash,
-              installationId: controller.options.installationId
-            })
+            return yield* controller.options.mode === "document"
+              ? replica.installBackupDocument(controller.options.document, {
+                source: source(controller),
+                documentId: controller.options.documentId,
+                maxBytes: controller.options.maxBytes,
+                expectedDefinitionHash: controller.options.expectedDefinitionHash,
+                installationId: controller.options.installationId
+              })
+              : replica.restoreBackup({
+                source: source(controller),
+                mode: controller.options.mode,
+                maxBytes: controller.options.maxBytes,
+                expectedDefinitionHash: controller.options.expectedDefinitionHash,
+                installationId: controller.options.installationId
+              })
           }).pipe(
             Effect.catchCause((cause) =>
               Effect.failCause(Cause.map(

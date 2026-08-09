@@ -100,6 +100,10 @@ export class Replica extends Context.Service<Replica, {
   readonly restoreBackup: <R,>(
     options: Backup.RestoreOptions<R>
   ) => Effect.Effect<void, ReplicaError.ReplicaError, R>
+  readonly installBackupDocument: <D extends Document.Any, R,>(
+    document: D,
+    options: Backup.InstallDocumentOptions<R>
+  ) => Effect.Effect<void, ReplicaError.ReplicaError, R>
   readonly exportDocument: <D extends Document.Any,>(
     document: D,
     documentId: Identity.DocumentId

@@ -2,8 +2,9 @@ import * as Automerge from "@automerge/automerge"
 import * as Backup from "@lucas-barake/effect-local/Backup"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Conflict from "@lucas-barake/effect-local/Conflict"
+import * as Document from "@lucas-barake/effect-local/Document"
 import * as Identity from "@lucas-barake/effect-local/Identity"
-import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
+import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Context from "effect/Context"
@@ -110,6 +111,8 @@ const StoredReceiptRecord = Schema.Struct({ ...ReceiptRecord.fields, result: Sch
 
 const EndRecord = Schema.Struct({ recordCount: Schema.Int, recordsChecksum: Schema.String })
 const Envelope = Schema.Struct({ kind: Schema.String, checksum: Schema.String, value: Schema.Unknown })
+const Heads = Schema.fromJsonString(Schema.Array(Schema.String))
+const ObservedVersions = Schema.fromJsonString(Schema.Array(Schema.Int))
 const BackupSizingRow = Schema.Struct({ raw_bytes: Schema.Int, record_count: Schema.Int })
 const SqliteTableRow = Schema.Struct({ name: Schema.String })
 const ForeignKeyViolationRow = Schema.Struct({
@@ -177,6 +180,10 @@ const exceedsJsonDepth = (value: unknown, limit: number) => {
 export class BackupStore extends Context.Service<BackupStore, {
   readonly export: (options: Backup.ExportOptions) => Stream.Stream<Uint8Array, ReplicaError.ReplicaError>
   readonly restore: <R,>(options: Backup.RestoreOptions<R>) => Effect.Effect<void, ReplicaError.ReplicaError, R>
+  readonly installDocument: <D extends Document.Any, R,>(
+    document: D,
+    options: Backup.InstallDocumentOptions<R>
+  ) => Effect.Effect<void, ReplicaError.ReplicaError, R>
 }>()("@lucas-barake/effect-local-sql/BackupStore") {}
 
 export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
@@ -269,12 +276,32 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       const findInstallation = SqlSchema.findOneOption({
         Request: Identity.BackupInstallationId,
         Result: Schema.Struct({
+          document_id: Schema.NullOr(Identity.DocumentId),
           manifest_checksum: Schema.String,
-          mode: Schema.Literals(["clone", "replace"])
+          mode: Schema.Literals(["clone", "replace", "document"])
         }),
         execute: (installationId) =>
-          sql`SELECT mode, manifest_checksum FROM effect_local_backup_installations
+          sql`SELECT mode, manifest_checksum, document_id FROM effect_local_backup_installations
             WHERE installation_id = ${installationId}`
+      })
+      const findDocumentExists = SqlSchema.findOne({
+        Request: Identity.DocumentId,
+        Result: Schema.Struct({ present: Schema.Int }),
+        execute: (documentId) =>
+          sql`SELECT EXISTS (
+            SELECT 1 FROM effect_local_documents WHERE document_id = ${documentId}
+          ) AS present`
+      })
+      const incrementCommitSequence = SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: Schema.Struct({
+          commit_sequence: Identity.CommitSequence,
+          prior_sequence: Identity.CommitSequence
+        }),
+        execute: () =>
+          sql`UPDATE effect_local_metadata SET commit_sequence = commit_sequence + 1
+            WHERE singleton = 1
+            RETURNING commit_sequence, commit_sequence - 1 AS prior_sequence`
       })
       const recovery = yield* Recovery.make
       const digest = (value: unknown) => Canonical.digest(value).pipe(Effect.provideService(Crypto.Crypto, crypto))
@@ -401,8 +428,14 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           )
         )
 
-      const restore = <R,>(
-        options: Backup.RestoreOptions<R>
+      type ArchiveOperation<R,> =
+        | Backup.RestoreOptions<R>
+        | (
+          Backup.InstallDocumentOptions<R> & { readonly mode: "document"; readonly document: Document.Any }
+        )
+
+      const processArchive = <R,>(
+        options: ArchiveOperation<R>
       ): Effect.Effect<void, ReplicaError.ReplicaError, R> =>
         Effect.gen(function*() {
           const reporter = yield* health.restoring
@@ -541,6 +574,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               })
             })
           }
+          const archiveChecksum = yield* digest(envelopes.map((envelope) => envelope.checksum))
           const rawDecoded = yield* Effect.gen(function*() {
             const decoded: Array<RawDecodedRecord> = []
             for (const record of records) {
@@ -601,6 +635,58 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               record.kind === "Document" ? [[record.value.document_id, record.value] as const] : []
             )
           )
+          const documentIds = new Set<string>()
+          const changeHashes = new Set<string>()
+          const changeActors = new Set<string>()
+          const checkpointHashes = new Set<string>()
+          const receiptIds = new Set<string>()
+          for (const record of rawDecoded) {
+            let key: string
+            let keys: ReadonlyArray<Set<string>>
+            switch (record.kind) {
+              case "Document":
+                key = record.value.document_id
+                keys = [documentIds]
+                break
+              case "Change":
+                key = record.value.change_hash
+                keys = [changeHashes]
+                if (changeActors.has(`${record.value.document_id}:${record.value.actor}:${record.value.sequence}`)) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.BackupInvalid({
+                      cause: new Error(`Duplicate archive change sequence: ${record.value.document_id}`)
+                    })
+                  })
+                }
+                changeActors.add(`${record.value.document_id}:${record.value.actor}:${record.value.sequence}`)
+                break
+              case "Checkpoint":
+                key = record.value.checkpoint_hash
+                keys = [checkpointHashes]
+                break
+              case "Receipt":
+                key = `${record.value.replica_incarnation}:${record.value.command_id}`
+                keys = [receiptIds]
+                break
+            }
+            if (keys.some((entries) => entries.has(key))) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.BackupInvalid({
+                  cause: new Error(`Duplicate archive ${record.kind.toLowerCase()} record: ${key}`)
+                })
+              })
+            }
+            for (const entries of keys) entries.add(key)
+          }
+          for (const record of rawDecoded) {
+            if (record.kind !== "Document" && !documentIds.has(record.value.document_id)) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.BackupInvalid({
+                  cause: new Error(`Archive ${record.kind.toLowerCase()} references an unknown document`)
+                })
+              })
+            }
+          }
           const changeProvenanceByDocument = new Map<string, Array<WriterProvenance.ChangeProvenance>>()
           for (const record of rawDecoded) {
             if (record.kind !== "Change") continue
@@ -613,6 +699,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             if (existing === undefined) changeProvenanceByDocument.set(record.value.document_id, [entry])
             else existing.push(entry)
           }
+          const checkpointHistoryByHash = new Map<string, HistoryCounters.HistoryCounters>()
           const decoded = yield* Effect.forEach(rawDecoded, (record): Effect.Effect<
             DecodedRecord,
             ReplicaError.ReplicaError
@@ -629,7 +716,18 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               (document) =>
                 Effect.try({
                   try: () => {
-                    const changeHashes = WriterProvenance.changeHashes(document)
+                    const checkpointChanges = Automerge.getAllChanges(document).map((bytes) => ({
+                      bytes,
+                      decoded: Automerge.decodeChange(bytes)
+                    }))
+                    const declaredHeads = Schema.decodeUnknownSync(Heads)(record.value.heads)
+                      .toSorted(Conflict.compareCodeUnits)
+                    const actualHeads = Automerge.getHeads(document).toSorted(Conflict.compareCodeUnits)
+                    if (
+                      declaredHeads.length !== actualHeads.length ||
+                      declaredHeads.some((head, index) => head !== actualHeads[index])
+                    ) throw new TypeError(`Checkpoint heads mismatch: ${record.value.checkpoint_hash}`)
+                    const changeHashes = checkpointChanges.map((change) => change.decoded.hash).toSorted()
                     const stored = changeProvenanceByDocument.get(record.value.document_id) ?? []
                     const storedDocument = documentById.get(record.value.document_id)
                     if (storedDocument === undefined) {
@@ -646,6 +744,14 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                       )
                     WriterProvenance.validateExact(changeHashes, provenance)
                     WriterProvenance.resolve(changeHashes, [...provenance, ...stored])
+                    checkpointHistoryByHash.set(record.value.checkpoint_hash, {
+                      changes: checkpointChanges.length,
+                      operations: checkpointChanges.reduce(
+                        (total, change) => total + change.decoded.ops.length,
+                        0
+                      ),
+                      bytes: checkpointChanges.reduce((total, change) => total + change.bytes.byteLength, 0)
+                    })
                     return {
                       kind: "Checkpoint" as const,
                       value: { ...record.value, writer_provenance: provenance }
@@ -659,6 +765,26 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               (document) => Effect.sync(() => InternalAutomerge.free(document))
             )
           })
+          const checkpointByHash = new Map(
+            decoded.flatMap((record) =>
+              record.kind === "Checkpoint" ? [[record.value.checkpoint_hash, record.value] as const] : []
+            )
+          )
+          for (const document of documentById.values()) {
+            if (document.checkpoint_hash === null) continue
+            const checkpoint = checkpointByHash.get(document.checkpoint_hash)
+            if (
+              checkpoint === undefined ||
+              checkpoint.document_id !== document.document_id ||
+              checkpoint.lineage !== document.lineage
+            ) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.BackupInvalid({
+                  cause: new Error(`Invalid active checkpoint for ${document.document_id}`)
+                })
+              })
+            }
+          }
           const metadataByChange = new Map<string, {
             readonly dependencies: ReadonlyArray<string>
             readonly operations: number
@@ -666,8 +792,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           for (const record of decoded) {
             switch (record.kind) {
               case "Document": {
+                const document = definition.documents.byName.get(record.value.document_type)
                 if (
-                  !definition.documents.byName.has(record.value.document_type) ||
+                  document === undefined ||
+                  !Document.supportsStoredVersion(document, record.value.schema_version) ||
                   (record.value.tombstone !== 0 && record.value.tombstone !== 1)
                 ) {
                   return yield* new ReplicaError.ReplicaError({
@@ -676,6 +804,17 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                     })
                   })
                 }
+                yield* Effect.all([
+                  Schema.decodeUnknownEffect(ObservedVersions)(record.value.observed_versions),
+                  Schema.decodeUnknownEffect(Heads)(record.value.materialized_heads),
+                  Schema.decodeUnknownEffect(Heads)(record.value.accepted_heads)
+                ], { discard: true }).pipe(
+                  Effect.mapError((cause) =>
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.BackupInvalid({ cause })
+                    })
+                  )
+                )
                 break
               }
               case "Change": {
@@ -819,6 +958,213 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             )
             historyByDocument.set(document.document_id, counters)
           }
+          if (options.mode === "document") {
+            const selectedDocuments = decoded.flatMap((record) =>
+              record.kind === "Document" && record.value.document_id === options.documentId ? [record.value] : []
+            )
+            if (selectedDocuments.length !== 1) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.BackupInvalid({
+                  cause: new Error(`Backup must contain exactly one document record for ${options.documentId}`)
+                })
+              })
+            }
+            const selectedDocument = selectedDocuments[0]!
+            if (selectedDocument.document_type !== options.document.name) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.BackupInvalid({
+                  cause: new Error(`Backup document type does not match ${options.document.name}`)
+                })
+              })
+            }
+            const selectedChanges = decoded.flatMap((record) =>
+              record.kind === "Change" && record.value.document_id === options.documentId ? [record.value] : []
+            )
+            if (selectedChanges.some((change) => change.document_type !== selectedDocument.document_type)) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.BackupInvalid({
+                  cause: new Error(`Backup changes do not match document ${options.documentId}`)
+                })
+              })
+            }
+            const selectedCheckpoints = decoded.flatMap((record) =>
+              record.kind === "Checkpoint" && record.value.document_id === options.documentId ? [record.value] : []
+            )
+            const activeCheckpoints = selectedDocument.checkpoint_hash === null
+              ? []
+              : selectedCheckpoints.filter((checkpoint) =>
+                checkpoint.checkpoint_hash === selectedDocument.checkpoint_hash
+              )
+            if (selectedDocument.checkpoint_hash !== null && activeCheckpoints.length !== 1) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.BackupInvalid({
+                  cause: new Error(`Backup active checkpoint is missing or duplicated for ${options.documentId}`)
+                })
+              })
+            }
+            const activeCheckpoint = activeCheckpoints[0]
+            const checkpointChanges = new Set(
+              activeCheckpoint?.writer_provenance.map((entry) => entry.changeHash) ?? []
+            )
+            if (selectedChanges.some((change) => checkpointChanges.has(change.change_hash) && change.applied !== 1)) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.BackupInvalid({
+                  cause: new Error(`Checkpoint materialized change is not applied: ${options.documentId}`)
+                })
+              })
+            }
+            let selectedHistory = historyByDocument.get(options.documentId)
+            if (selectedHistory === null || selectedHistory === undefined) {
+              if (activeCheckpoint === undefined) {
+                return yield* new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.BackupInvalid({
+                    cause: new Error(`Backup history cannot be measured for ${options.documentId}`)
+                  })
+                })
+              }
+              const checkpointHistory = checkpointHistoryByHash.get(activeCheckpoint.checkpoint_hash)
+              if (checkpointHistory === undefined) {
+                return yield* new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.BackupInvalid({
+                    cause: new Error(`Checkpoint history is missing: ${activeCheckpoint.checkpoint_hash}`)
+                  })
+                })
+              }
+              const retainedHistory = HistoryCounters.measureDecoded(
+                selectedChanges.flatMap((change) =>
+                  checkpointChanges.has(change.change_hash)
+                    ? []
+                    : [{ bytes: change.bytes, operations: metadataByChange.get(change.change_hash)!.operations }]
+                )
+              )
+              selectedHistory = yield* HistoryCounters.check({
+                changes: checkpointHistory.changes + retainedHistory.changes,
+                operations: checkpointHistory.operations + retainedHistory.operations,
+                bytes: checkpointHistory.bytes + retainedHistory.bytes
+              }, limits)
+            }
+            const installed = yield* Effect.scoped(gate.admit.pipe(
+              Effect.flatMap((permit) =>
+                sql.withTransaction(Effect.gen(function*() {
+                  const priorInstallation = yield* findInstallation(options.installationId)
+                  if (priorInstallation._tag === "Some") {
+                    if (
+                      priorInstallation.value.manifest_checksum === archiveChecksum &&
+                      priorInstallation.value.mode === "document" &&
+                      priorInstallation.value.document_id === options.documentId
+                    ) return false
+                    return yield* new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.BackupInvalid({
+                        cause: new Error("Backup installation id was already used for a different request")
+                      })
+                    })
+                  }
+                  const existingDocument = yield* findDocumentExists(options.documentId).pipe(
+                    Effect.catchTag("NoSuchElementError", () =>
+                      Effect.fail(
+                        new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.StorageCorrupt({
+                            cause: new Error("Document existence query returned no row")
+                          })
+                        })
+                      ))
+                  )
+                  if (existingDocument.present === 1) {
+                    return yield* new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.BackupInvalid({
+                        cause: new Error(`Document already exists: ${options.documentId}`)
+                      })
+                    })
+                  }
+                  const sequence = yield* incrementCommitSequence(undefined).pipe(
+                    Effect.catchTag("NoSuchElementError", () =>
+                      Effect.fail(
+                        new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.ReplicaMetadataMissing({
+                            operation: "BackupStore.installDocument"
+                          })
+                        })
+                      ))
+                  )
+                  yield* sql`INSERT INTO effect_local_documents (
+                    document_id, document_type, schema_version, observed_versions,
+                    materialized_heads, accepted_heads, tombstone, projection_status,
+                    checkpoint_hash, lineage, history_changes, history_operations, history_bytes
+                  ) VALUES (
+                    ${selectedDocument.document_id}, ${selectedDocument.document_type},
+                    ${selectedDocument.schema_version}, ${selectedDocument.observed_versions},
+                    ${selectedDocument.materialized_heads}, ${selectedDocument.accepted_heads},
+                    ${selectedDocument.tombstone}, 'Blocked', ${selectedDocument.checkpoint_hash},
+                    ${selectedDocument.lineage}, ${selectedHistory.changes},
+                    ${selectedHistory.operations}, ${selectedHistory.bytes}
+                  )`
+                  const installedChanges = selectedChanges.map((change) =>
+                    Object.assign({}, change, {
+                      commit_sequence: checkpointChanges.has(change.change_hash)
+                        ? sequence.prior_sequence
+                        : sequence.commit_sequence
+                    })
+                  )
+                  for (let index = 0; index < installedChanges.length; index += 50) {
+                    yield* sql`INSERT INTO effect_local_changes ${
+                      sql.insert(
+                        installedChanges.slice(index, index + 50)
+                      )
+                    }`
+                  }
+                  if (activeCheckpoint !== undefined) {
+                    const writerProvenance = yield* Schema.encodeEffect(
+                      WriterProvenance.StoredChangeProvenances
+                    )(activeCheckpoint.writer_provenance)
+                    yield* sql`INSERT INTO effect_local_checkpoints (
+                      checkpoint_hash, document_id, heads, bytes, checksum, commit_sequence,
+                      verified, writer_provenance, lineage
+                    ) VALUES (
+                      ${activeCheckpoint.checkpoint_hash}, ${activeCheckpoint.document_id},
+                      ${activeCheckpoint.heads}, ${activeCheckpoint.bytes}, ${activeCheckpoint.checksum},
+                      ${sequence.prior_sequence}, ${activeCheckpoint.verified},
+                      ${writerProvenance}, ${activeCheckpoint.lineage}
+                    )`
+                  }
+                  const invalidationKeys = yield* Schema.encodeEffect(
+                    Schema.fromJsonString(Schema.Array(Schema.String))
+                  )(ReplicaDefinition.documentCommitKeys(options.document.name, options.documentId))
+                  yield* sql`INSERT INTO effect_local_commit_outbox (
+                    commit_sequence, document_id, invalidation_keys, published
+                  ) VALUES (
+                    ${sequence.commit_sequence}, ${options.documentId},
+                    ${invalidationKeys}, 0
+                  )`
+                  const stored = yield* recovery.recoverWithPermit(options.document, options.documentId, permit).pipe(
+                    Effect.mapError((error) =>
+                      error.reason._tag === "StorageCorrupt"
+                        ? new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.BackupInvalid({ cause: error })
+                        })
+                        : error
+                    )
+                  )
+                  yield* projections.replaceDocument(
+                    options.document,
+                    stored.snapshot,
+                    sequence.commit_sequence,
+                    "Fresh"
+                  ).pipe(Effect.ensuring(Effect.sync(() => InternalAutomerge.free(stored.automerge))))
+                  yield* sql`INSERT INTO effect_local_backup_installations (
+                    installation_id, mode, manifest_checksum, installed_at,
+                    replica_incarnation, document_id
+                  ) VALUES (
+                    ${options.installationId}, 'document', ${archiveChecksum},
+                    ${DateTime.formatIso(yield* DateTime.now)}, ${permit.incarnation}, ${options.documentId}
+                  )`
+                  yield* gate.validate(permit)
+                  return true
+                }))
+              )
+            ))
+            if (!installed) return
+            return
+          }
           const nextReplicaId = options.mode === "clone"
             ? yield* Identity.makeReplicaId.pipe(
               Effect.provideService(Crypto.Crypto, crypto),
@@ -845,7 +1191,8 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 if (installed._tag === "Some") {
                   if (
                     installed.value.manifest_checksum !== manifestEnvelope.checksum ||
-                    installed.value.mode !== options.mode
+                    installed.value.mode !== options.mode ||
+                    installed.value.document_id !== null
                   ) {
                     return yield* new ReplicaError.ReplicaError({
                       reason: new ReplicaError.BackupInvalid({
@@ -999,6 +1346,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           Effect.asVoid
         )
 
-      return BackupStore.of({ export: exportBackup, restore })
+      return BackupStore.of({
+        export: exportBackup,
+        restore: processArchive,
+        installDocument: (document, options) => processArchive({ ...options, document, mode: "document" })
+      })
     })
   )

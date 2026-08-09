@@ -88,6 +88,7 @@ export const replica: Replica.Replica["Service"] = {
   status: Stream.make({ _tag: "Ready" as const, pendingCommands: 0 }),
   exportBackup: () => Stream.make(Uint8Array.of(1, 2, 3)),
   restoreBackup: () => Effect.void,
+  installBackupDocument: () => Effect.void,
   exportDocument: (document, _documentId) =>
     Effect.succeed({
       documentName: document.name,

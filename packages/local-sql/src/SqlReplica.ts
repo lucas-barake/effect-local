@@ -241,6 +241,11 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
               return yield* Exit.asVoidAll([restored, refreshed])
             })
           ),
+        installBackupDocument: (document, options) =>
+          Effect.gen(function*() {
+            yield* backups.installDocument(document, options)
+            yield* publisher.publishPending
+          }),
         exportDocument: (document, documentId) =>
           withPermit(() =>
             Effect.acquireUseRelease(

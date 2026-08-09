@@ -251,7 +251,8 @@ describe("Migrations", () => {
         [9, "history_rewrite_markers"],
         [10, "peer_relay_state"],
         [11, "command_delivery"],
-        [12, "document_history_counters"]
+        [12, "document_history_counters"],
+        [13, "backup_document_installations"]
       ])
 
       const outbox = yield* sql<{
@@ -393,6 +394,11 @@ describe("Migrations", () => {
           migration_id: 12,
           name: "document_history_counters",
           checksum: Migrations.documentHistoryCountersChecksum
+        },
+        {
+          migration_id: 13,
+          name: "backup_document_installations",
+          checksum: Migrations.backupDocumentInstallationsChecksum
         }
       ])
 
@@ -654,7 +660,11 @@ describe("Migrations", () => {
         FROM effect_local_peer_relay_outbox_replica_usage
         ORDER BY replica_incarnation`
 
-      assert.deepStrictEqual(yield* Migrations.run, [[11, "command_delivery"], [12, "document_history_counters"]])
+      assert.deepStrictEqual(yield* Migrations.run, [
+        [11, "command_delivery"],
+        [12, "document_history_counters"],
+        [13, "backup_document_installations"]
+      ])
       assert.deepStrictEqual(yield* selectDurableOutbox, outboxBefore)
       assert.deepStrictEqual(
         yield* sql`SELECT *
@@ -763,7 +773,8 @@ describe("Migrations", () => {
           { migration_id: 9, name: "history_rewrite_markers" },
           { migration_id: 10, name: "peer_relay_state" },
           { migration_id: 11, name: "command_delivery" },
-          { migration_id: 12, name: "document_history_counters" }
+          { migration_id: 12, name: "document_history_counters" },
+          { migration_id: 13, name: "backup_document_installations" }
         ]
       )
       assert.deepStrictEqual(
@@ -1019,7 +1030,10 @@ describe("Migrations", () => {
           '[]', 0, 'Ready', NULL, ''
         )`
 
-      assert.deepStrictEqual(yield* Migrations.run, [[12, "document_history_counters"]])
+      assert.deepStrictEqual(yield* Migrations.run, [
+        [12, "document_history_counters"],
+        [13, "backup_document_installations"]
+      ])
       const counters = yield* sql<{
         readonly document_id: string
         readonly history_bytes: number | null
@@ -1086,7 +1100,10 @@ describe("Migrations", () => {
         )
         SELECT printf('document-%02d', id), 'Task', 1, '[1]', '[]', '[]', 0, 'Ready', NULL, ''
         FROM documents`
-      assert.deepStrictEqual(yield* Migrations.run, [[12, "document_history_counters"]])
+      assert.deepStrictEqual(yield* Migrations.run, [
+        [12, "document_history_counters"],
+        [13, "backup_document_installations"]
+      ])
       const counters = yield* sql<{
         readonly document_id: string
         readonly history_bytes: number | null
@@ -1130,7 +1147,10 @@ describe("Migrations", () => {
         ('valid', 'Task', 1, '[1]', '[]', '[]', 0, 'Ready', NULL, ''),
         (${new Uint8Array([1])}, 'Task', 1, '[1]', '[]', '[]', 0, 'Ready', NULL, '')`
 
-      assert.deepStrictEqual(yield* Migrations.run, [[12, "document_history_counters"]])
+      assert.deepStrictEqual(yield* Migrations.run, [
+        [12, "document_history_counters"],
+        [13, "backup_document_installations"]
+      ])
       const counters = yield* sql<{
         readonly document_id_type: string
         readonly history_bytes: number | null
