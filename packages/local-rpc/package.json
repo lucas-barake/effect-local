@@ -58,16 +58,16 @@
     "@lucas-barake/effect-local-sql": "workspace:^"
   },
   "peerDependencies": {
-    "effect": ">=4.0.0-beta.99 <4.0.1"
+    "effect": ">=4.0.0-beta.101 <4.0.1"
   },
   "devDependencies": {
-    "@effect/platform-node": "4.0.0-beta.99",
-    "@effect/sql-mysql2": "4.0.0-beta.99",
-    "@effect/sql-pg": "4.0.0-beta.99",
-    "@effect/sql-sqlite-node": "4.0.0-beta.99",
+    "@effect/platform-node": "4.0.0-beta.101",
+    "@effect/sql-mysql2": "4.0.0-beta.101",
+    "@effect/sql-pg": "4.0.0-beta.101",
+    "@effect/sql-sqlite-node": "4.0.0-beta.101",
     "@lucas-barake/effect-local-test": "workspace:^",
     "@testcontainers/mysql": "11.14.0",
     "@testcontainers/postgresql": "11.14.0",
-    "effect": "4.0.0-beta.99"
+    "effect": "4.0.0-beta.101"
   }
 }
