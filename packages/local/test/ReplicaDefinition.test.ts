@@ -6,6 +6,7 @@ import * as Mutation from "../src/Mutation.js"
 import * as Projection from "../src/Projection.js"
 import * as Query from "../src/Query.js"
 import * as ReplicaDefinition from "../src/ReplicaDefinition.js"
+import * as Transient from "../src/Transient.js"
 
 describe("ReplicaDefinition", () => {
   const makeFixture = (version = 1) => {
@@ -52,6 +53,37 @@ describe("ReplicaDefinition", () => {
         projections: [],
         queries: []
       }).hash
+    )
+  })
+
+  it("registers transient contracts in compatibility", () => {
+    const { Task } = makeFixture()
+    const Typing = Transient.make("Typing", { document: Task, payload: Schema.Struct({ userId: Schema.String }) })
+    const definition = ReplicaDefinition.make({
+      name: "tasks",
+      documents: DocumentSet.make(Task),
+      transients: [Typing]
+    })
+    assert.deepStrictEqual(definition.transients, [Typing])
+    assert.notStrictEqual(
+      definition.hash,
+      ReplicaDefinition.make({ name: "tasks", documents: DocumentSet.make(Task) }).hash
+    )
+    assert.throws(() =>
+      ReplicaDefinition.make({
+        name: "tasks",
+        documents: DocumentSet.make(Task),
+        transients: [Typing, Typing]
+      })
+    )
+    const Other = Document.make("Other", { schema: Schema.Struct({ value: Schema.String }), version: 1 })
+    const Unknown = Transient.make("Unknown", { document: Other, payload: Schema.String })
+    assert.throws(() =>
+      ReplicaDefinition.make({
+        name: "tasks",
+        documents: DocumentSet.make(Task),
+        transients: [Unknown]
+      })
     )
   })
 

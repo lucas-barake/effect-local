@@ -23,7 +23,8 @@ describe("public API", () => {
       "ReplicaLimits",
       "ReplicaStatus",
       "SchemaDescriptor",
-      "Snapshot"
+      "Snapshot",
+      "Transient"
     ])
   })
 })

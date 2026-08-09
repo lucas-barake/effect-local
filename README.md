@@ -1398,8 +1398,56 @@ Semantics to build on:
 - Selection is a nonempty set of unique whole documents. Subtree synchronization is unsupported.
 - Transient delivery is best effort and current-session only. It has no outbox, custody, receipt, settlement, replay,
   or Automerge state. An offline recipient or a full transient queue drops the value without failing the sender.
-- The application owns transient payload encoding and receiver side expiry. Never use a transient value for
-  authorization or correctness state that must survive disconnect, overload, restart, or a slow subscriber.
+- Typed transient contracts own payload encoding and decoding. The application still owns receiver side expiry.
+  Never use a transient value for authorization or correctness state that must survive disconnect, overload,
+  restart, or a slow subscriber.
+
+Define transient events as tagged schemas, register the contract with the replica, then acquire its document scoped
+client. `publish` accepts only the declared union and `messages` decodes it before user code sees it.
+
+```ts
+import * as Transient from "@lucas-barake/effect-local/Transient"
+import * as Effect from "effect/Effect"
+import * as Schema from "effect/Schema"
+import * as Stream from "effect/Stream"
+
+class Typing extends Schema.TaggedClass<Typing>()("Typing", {
+  userId: Schema.String
+}) {}
+
+class ReadPosition extends Schema.TaggedClass<ReadPosition>()("ReadPosition", {
+  messageId: Schema.String
+}) {}
+
+export const ChatTransient = Transient.make("ChatActivity", {
+  document: ChatDocument,
+  payload: Schema.Union([Typing, ReadPosition])
+})
+
+export const definition = ReplicaDefinition.make({
+  name: "chat",
+  documents: DocumentSet.make(ChatDocument),
+  transients: [ChatTransient]
+})
+
+const program = Effect.gen(function*() {
+  const forDocument = yield* ChatTransient.client
+  const chat = forDocument(documentId)
+
+  yield* chat.publish(peerId, new Typing({ userId }))
+  yield* chat.messages.pipe(
+    Stream.runForEach(({ peerId, payload }) => Effect.log(payload._tag, peerId))
+  )
+})
+```
+
+The name, document, and payload schema are part of `definition.hash`, so incompatible peers fail the existing
+definition handshake instead of exchanging undecodable events. `BrowserReplica.layer*` provides the runtime used by
+`ChatTransient.client`. A custom runtime can provide `Transient.Transport` and `Transient.layer(definition.transients)`.
+
+The raw byte APIs on `PeerTransport`, `PeerSession`, `PeerRelayClientRuntime`, and advanced `ReplicaClient` remain
+public for transport authors, like Effect RPC's protocol layer. Application code should use typed contracts. Codec
+helpers are internal, so choosing the raw API means owning the complete protocol.
 
 Presence is a separate best effort channel with expiry, for cursors and online state:
 

@@ -21,6 +21,22 @@ export class DocumentEncodeError extends Schema.TaggedErrorClass<DocumentEncodeE
   cause: Schema.Defect()
 }) {}
 
+export class TransientDecodeError extends Schema.TaggedErrorClass<TransientDecodeError>(
+  "@lucas-barake/effect-local/ReplicaError/TransientDecodeError"
+)("TransientDecodeError", {
+  topic: Schema.String,
+  documentId: Identity.DocumentId,
+  cause: Schema.Defect()
+}) {}
+
+export class TransientEncodeError extends Schema.TaggedErrorClass<TransientEncodeError>(
+  "@lucas-barake/effect-local/ReplicaError/TransientEncodeError"
+)("TransientEncodeError", {
+  topic: Schema.String,
+  documentId: Identity.DocumentId,
+  cause: Schema.Defect()
+}) {}
+
 export class UnsupportedDocumentVersion extends Schema.TaggedErrorClass<UnsupportedDocumentVersion>(
   "@lucas-barake/effect-local/ReplicaError/UnsupportedDocumentVersion"
 )("UnsupportedDocumentVersion", {
@@ -177,6 +193,8 @@ export const Reason = Schema.Union([
   DocumentNotFound,
   DocumentDecodeError,
   DocumentEncodeError,
+  TransientDecodeError,
+  TransientEncodeError,
   UnsupportedDocumentVersion,
   ProjectionBlocked,
   CommandIdConflict,

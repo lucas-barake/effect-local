@@ -2,6 +2,7 @@ import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Transient from "@lucas-barake/effect-local/Transient"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import type * as Crypto from "effect/Crypto"
@@ -332,14 +333,28 @@ export const makeScoped = Effect.gen(function*() {
   }
 })
 
-export const layer = Layer.effect(PeerRelayClientRuntime, makeScoped)
+export const layer = Layer.effectContext(
+  makeScoped.pipe(
+    Effect.map((runtime) =>
+      Context.make(PeerRelayClientRuntime, runtime).pipe(
+        Context.add(
+          Transient.Transport,
+          Transient.Transport.of({
+            send: runtime.send,
+            messages: runtime.transients
+          })
+        )
+      )
+    )
+  )
+)
 
 /**
  * `layer` leaves `PeerRelayOutbox` to the consumer, so every relay client had to rediscover that
  * it is satisfied by `layerSql` and that both want the same gate, limits and client.
  */
 export const layerSql: Layer.Layer<
-  PeerRelayClientRuntime,
+  PeerRelayClientRuntime | Transient.Transport,
   ReplicaError.ReplicaError,
   | SqlClient.SqlClient
   | Crypto.Crypto

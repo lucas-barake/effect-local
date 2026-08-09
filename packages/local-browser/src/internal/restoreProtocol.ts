@@ -39,6 +39,16 @@ export const RestoreWireError = Schema.TaggedUnion({
     documentId: Identity.DocumentId,
     cause: BoundedErrorDescription
   },
+  TransientDecodeError: {
+    topic: Schema.String,
+    documentId: Identity.DocumentId,
+    cause: BoundedErrorDescription
+  },
+  TransientEncodeError: {
+    topic: Schema.String,
+    documentId: Identity.DocumentId,
+    cause: BoundedErrorDescription
+  },
   UnsupportedDocumentVersion: {
     documentId: Identity.DocumentId,
     observedVersion: Schema.Int,
@@ -334,6 +344,23 @@ export const encodeReplicaError = (
           cause: defect(reason.cause)
         })
       )
+    case "TransientDecodeError":
+    case "TransientEncodeError":
+      return encodeWithinBudget(
+        maxBytes,
+        {
+          _tag: reason._tag,
+          topic: "",
+          documentId: reason.documentId,
+          cause: emptyErrorDescription
+        },
+        ({ text, defect }) => ({
+          _tag: reason._tag,
+          topic: text(reason.topic),
+          documentId: reason.documentId,
+          cause: defect(reason.cause)
+        })
+      )
     case "UnsupportedDocumentVersion":
       return encodeWithinBudget(
         maxBytes,
@@ -546,6 +573,20 @@ export const replicaErrorFromWire = (wire: RestoreWireError): ReplicaError.Repli
       break
     case "DocumentEncodeError":
       reason = new ReplicaError.DocumentEncodeError({
+        documentId: wire.documentId,
+        cause: decodeDefect(wire.cause)
+      })
+      break
+    case "TransientDecodeError":
+      reason = new ReplicaError.TransientDecodeError({
+        topic: wire.topic,
+        documentId: wire.documentId,
+        cause: decodeDefect(wire.cause)
+      })
+      break
+    case "TransientEncodeError":
+      reason = new ReplicaError.TransientEncodeError({
+        topic: wire.topic,
         documentId: wire.documentId,
         cause: decodeDefect(wire.cause)
       })
