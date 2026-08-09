@@ -125,11 +125,19 @@ interface Client {
   served: boolean
 }
 
+const DatabaseActivityFrame = Schema.Union([
+  Schema.Tuple([Schema.Int, Schema.Unknown, Schema.Unknown]),
+  Schema.Tuple([Schema.Literal("update_hook"), Schema.String, Schema.Number])
+])
+const isDatabaseActivityFrame = Schema.is(DatabaseActivityFrame)
+
 interface EngineSnapshot {
   readonly runtime: ManagedRuntime.ManagedRuntime<EngineServices, unknown>
   readonly scope: Scope.Closeable
   readonly ownerId: string
   readonly info: unknown
+  readonly databaseReplies: { count: number }
+  readonly detachDatabaseObserver: () => void
 }
 
 interface EngineHealth {
@@ -137,6 +145,7 @@ interface EngineHealth {
   lastProbeTickAt: number
   probeStartedAt: number | undefined
   warned: boolean
+  observedReplies: number
 }
 
 interface LiveEngine extends EngineSnapshot {
@@ -319,8 +328,16 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
         databasePort: MessagePort
       ) => {
         const start = Effect.gen(function*() {
+          // Database replies prove liveness while the connection permit blocks the probe. The
+          // driver remains responsible for starting the port.
+          const databaseReplies = { count: 0 }
           const runtime = yield* Effect.sync(() => options.engine(databasePort))
           const engineScope = yield* Scope.make()
+          const onDatabaseReply = (event: MessageEvent<unknown>) => {
+            if (isDatabaseActivityFrame(event.data)) databaseReplies.count++
+          }
+          databasePort.addEventListener("message", onDatabaseReply)
+          const detachDatabaseObserver = () => databasePort.removeEventListener("message", onDatabaseReply)
           // A candidate that detaches mid start has this fiber interrupted, and the engine it
           // already built is reachable from nowhere else: it never became an `EngineStarted` event,
           // so `disposeEngine` can never see it.
@@ -330,7 +347,10 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
               Effect.andThen(
                 runtime.disposeEffect.pipe(Effect.timeout(engineDisposeTimeoutMillis), Effect.ignore)
               ),
-              Effect.andThen(Effect.sync(() => databasePort.close()))
+              Effect.andThen(Effect.sync(() => {
+                detachDatabaseObserver()
+                databasePort.close()
+              }))
             )
           const started = yield* Effect.exit(
             Effect.gen(function*() {
@@ -346,7 +366,14 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                 info = yield* Schema.encodeEffect(options.info.schema)(value)
               }
               const ownerId = yield* Effect.orDie(crypto.randomUUIDv4)
-              const snapshot: EngineSnapshot = { runtime, scope: engineScope, ownerId, info }
+              const snapshot: EngineSnapshot = {
+                runtime,
+                scope: engineScope,
+                ownerId,
+                info,
+                databaseReplies,
+                detachDatabaseObserver
+              }
               return snapshot
             })
           ).pipe(Effect.onInterrupt(() => discardEngine(Exit.interrupt())))
@@ -462,7 +489,8 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
         Scope.close(engine.scope, exit).pipe(
           Effect.andThen(engine.runtime.disposeEffect),
           Effect.timeout(engineDisposeTimeoutMillis),
-          Effect.ignore
+          Effect.ignore,
+          Effect.ensuring(Effect.sync(engine.detachDatabaseObserver))
         )
 
       const resetEngine = (reason: string, mode?: { readonly failure: boolean }): Effect.Effect<void> =>
@@ -477,7 +505,12 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
             // Only a tab whose server just died is told to re-attach. A tab still waiting for
             // its first serve has nothing to re-establish; the next engine serves it as is.
             if (client.served && client.rpcPort !== undefined) {
-              reattach.push(post(client.controlPort, { _tag: "Reattach", ownerId: engine.ownerId }))
+              // Reattach carries the reset cause because closing the RPC port loses it.
+              reattach.push(post(client.controlPort, {
+                _tag: "Reattach",
+                ownerId: engine.ownerId,
+                ...(mode?.failure === true ? { reason } : {})
+              }))
             }
             client.served = false
           }
@@ -661,7 +694,13 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                   epoch: event.epoch,
                   provider: event.candidate,
                   // The start itself just proved a round trip, so the deadline counts from here.
-                  health: { lastRoundTripAt: now, lastProbeTickAt: now, probeStartedAt: undefined, warned: false }
+                  health: {
+                    lastRoundTripAt: now,
+                    lastProbeTickAt: now,
+                    probeStartedAt: undefined,
+                    warned: false,
+                    observedReplies: snapshot.databaseReplies.count
+                  }
                 }
                 current.engine = Option.some(engine)
                 current.tried.clear()
@@ -703,11 +742,14 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                     health.warned = false
                   }
                 }
+                // Database replies prove liveness while a long transaction blocks the queued probe.
+                const replies = engine.databaseReplies.count
+                if (replies !== health.observedReplies) {
+                  health.observedReplies = replies
+                  health.lastRoundTripAt = now
+                }
                 if (health.probeStartedAt !== undefined) {
-                  // The probe shares the engine's single connection queue, so it cannot tell a
-                  // busy worker from a dead one by lateness alone: only a round trip that never
-                  // completes within the deadline is death. Plain lateness is worth a warning,
-                  // once per probe, because it usually means a long drain is in progress.
+                  // Probe age warns about backlog. Only complete database silence triggers takeover.
                   if (now - health.lastRoundTripAt >= healthDeadlineMillis) {
                     return Queue.offer(events, { _tag: "HealthFailed", epoch: engine.epoch })
                   }
@@ -1093,7 +1135,14 @@ const layerTabImpl = (
             return
           }
           case "Reattach": {
+            // Fail stale RPC ports before reporting so a consumer callback cannot block recovery.
             failRpcPorts(current, `replica ownership moved from ${frame.ownerId}`)
+            if (frame.reason !== undefined) {
+              options.onOwnerError?.(`the replica owner engine was reset: ${frame.reason}`, {
+                _tag: "EngineReset",
+                reason: frame.reason
+              })
+            }
             return
           }
           case "OwnerError": {

@@ -56,7 +56,9 @@ export const ProvisionRejected = Schema.TaggedStruct("ProvisionRejected", {
 export type ProvisionRejected = typeof ProvisionRejected.Type
 
 export const Reattach = Schema.TaggedStruct("Reattach", {
-  ownerId: Schema.String
+  ownerId: Schema.String,
+  /** Present when the reset was a failure takeover; the page surfaces it as an owner error. */
+  reason: Schema.optional(Schema.String)
 })
 export type Reattach = typeof Reattach.Type
 
