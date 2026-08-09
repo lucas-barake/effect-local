@@ -160,21 +160,22 @@ export const make = (
       undefined
 
     const makeConnection = Effect.gen(function*() {
-      const db = yield* Effect.tryPromise({
-        try: () => SQLite.openDatabaseAsync(options.databaseName, options.options, options.directory),
-        catch: (cause) =>
-          new SqlError({
-            reason: classifySqliteError(cause, { message: "Failed to open database", operation: "open" })
-          })
-      })
-      yield* Effect.addFinalizer(() =>
+      const db = yield* Effect.acquireRelease(
         Effect.tryPromise({
-          try: () => db.closeAsync(),
+          try: () => SQLite.openDatabaseAsync(options.databaseName, options.options, options.directory),
           catch: (cause) =>
             new SqlError({
-              reason: classifySqliteError(cause, { message: "Failed to close database", operation: "close" })
+              reason: classifySqliteError(cause, { message: "Failed to open database", operation: "open" })
             })
-        }).pipe(Effect.orDie)
+        }),
+        (db) =>
+          Effect.tryPromise({
+            try: () => db.closeAsync(),
+            catch: (cause) =>
+              new SqlError({
+                reason: classifySqliteError(cause, { message: "Failed to close database", operation: "close" })
+              })
+          }).pipe(Effect.orDie)
       )
       if (options.disableWAL !== true) {
         yield* Effect.tryPromise({

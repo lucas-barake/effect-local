@@ -191,6 +191,38 @@ describe("ExpoSqlite", () => {
       assert.strictEqual(ExpoSqliteNode.openHandleCount(), before)
     }))
 
+  it.effect("closes a database whose open finishes after layer interruption", () =>
+    Effect.gen(function*() {
+      const before = ExpoSqliteNode.openHandleCount()
+      const openEntered = Deferred.makeUnsafe<void>()
+      const openFinished = Deferred.makeUnsafe<void>()
+      let releaseOpen!: () => void
+      const openGate = new Promise<void>((resolve) => {
+        releaseOpen = resolve
+      })
+      ExpoSqliteNode.setOpenProbe({
+        beforeOpen: () => {
+          Deferred.doneUnsafe(openEntered, Effect.void)
+          return openGate
+        },
+        afterOpen: () => {
+          Deferred.doneUnsafe(openFinished, Effect.void)
+        }
+      })
+      try {
+        const build = yield* Layer.build(ExpoSqlite.layer({ databaseName: ":memory:" })).pipe(Effect.forkChild)
+        yield* Deferred.await(openEntered)
+        build.interruptUnsafe()
+        releaseOpen()
+        yield* Deferred.await(openFinished)
+        yield* Fiber.await(build)
+        assert.strictEqual(ExpoSqliteNode.openHandleCount(), before)
+      } finally {
+        releaseOpen()
+        ExpoSqliteNode.setOpenProbe(undefined)
+      }
+    }))
+
   it.effect("streams exact big integers under SafeIntegers", () =>
     Effect.gen(function*() {
       const sql = yield* Client.SqlClient
