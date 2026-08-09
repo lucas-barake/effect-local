@@ -2000,13 +2000,10 @@ export const layer = (definition: ReplicaDefinition.Any, options?: Options) =>
       Effect.flatMap((rpc) => fromRpcClient(definition, rpc, options)),
       Effect.map((client) =>
         Context.make(ReplicaClient, client).pipe(
-          Context.add(
-            Transient.Transport,
-            Transient.Transport.of({
-              send: client.transient,
-              messages: client.transients
-            })
-          )
+          Context.add(Transient.Transport, {
+            send: client.transient,
+            messages: client.transients
+          })
         )
       )
     )
