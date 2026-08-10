@@ -666,7 +666,7 @@ vitestIt.layer(Layer.merge(NodeCrypto.layer, NodeFileSystem.layer))("OwnershipCo
         definition,
         engine: (databasePort) => {
           Deferred.doneUnsafe(factoryCalled, Effect.succeed(databasePort))
-          return throwDefect("engine factory failed")
+          return throwDefect(nativeError("engine factory failed"))
         },
         provisionTimeout: "500 millis",
         engineStartTimeout: "5 seconds",
@@ -899,7 +899,7 @@ vitestIt.layer(Layer.merge(NodeCrypto.layer, NodeFileSystem.layer))("OwnershipCo
       const engine = makeEngineFactory(
         started,
         ":memory:",
-        () => Effect.die("corrupt replica database")
+        () => Effect.die(nativeError("corrupt replica database"))
       )
       const Coordinator = OwnershipCoordinator.layerSharedWorker({
         name: "effect-local-ownership-backoff-test",
@@ -977,7 +977,7 @@ vitestIt.layer(Layer.merge(NodeCrypto.layer, NodeFileSystem.layer))("OwnershipCo
         started,
         ":memory:",
         (attempt) => {
-          if (attempt <= 2) return Effect.die("transient start failure")
+          if (attempt <= 2) return Effect.die(nativeError("transient start failure"))
           return Effect.void
         }
       )
@@ -1043,7 +1043,7 @@ vitestIt.layer(Layer.merge(NodeCrypto.layer, NodeFileSystem.layer))("OwnershipCo
       const engine = makeEngineFactory(
         started,
         ":memory:",
-        () => Effect.die("corrupt replica database")
+        () => Effect.die(nativeError("corrupt replica database"))
       )
       const Coordinator = OwnershipCoordinator.layerSharedWorker({
         name: "effect-local-ownership-exhaustion-test",

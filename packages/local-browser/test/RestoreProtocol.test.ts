@@ -329,12 +329,12 @@ it("bounds redacted defects and rejects hostile preflight values", () => {
   const throwing = Object.create(null)
   Object.defineProperty(throwing, "name", {
     get() {
-      return throwDefect("name getter")
+      return throwDefect(nativeError("name getter"))
     }
   })
   Object.defineProperty(throwing, "message", {
     get() {
-      return throwDefect("message getter")
+      return throwDefect(nativeError("message getter"))
     }
   })
   const description = RestoreProtocol.encodeDefect(throwing, 32)
@@ -350,7 +350,7 @@ it("bounds redacted defects and rejects hostile preflight values", () => {
   Object.defineProperty(hostile, "value", {
     enumerable: true,
     get() {
-      return throwDefect("hostile getter")
+      return throwDefect(nativeError("hostile getter"))
     }
   })
   assert.isFalse(RestoreProtocol.preflight(hostile, 4_096))
@@ -377,7 +377,7 @@ it.effect("guards transferred MessagePort values", () =>
     const hostile = Object.create(null)
     Object.defineProperty(hostile, "postMessage", {
       get() {
-        return throwDefect("hostile getter")
+        return throwDefect(nativeError("hostile getter"))
       }
     })
     const decoded = yield* Effect.exit(Schema.decodeUnknownEffect(ReplicaRpc.MessagePortSchema)(hostile))

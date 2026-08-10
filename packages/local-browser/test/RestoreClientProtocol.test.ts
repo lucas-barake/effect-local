@@ -115,7 +115,7 @@ layeredIt.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
           case "SourceFailure":
             Deferred.doneUnsafe(
               completed,
-              Effect.die(`unexpected source failure: ${frame.error._tag}`)
+              Effect.die(nativeError(`unexpected source failure: ${frame.error._tag}`))
             )
         }
       })

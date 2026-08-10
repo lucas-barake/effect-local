@@ -18,6 +18,7 @@ import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
 import { definition, PeerRelayRuntime, Read, Rename, Task } from "./fixtures.js"
+import { nativeTypeError } from "./TestErrors.js"
 
 const limits = {
   maxBackupBytes: 1024,
@@ -81,7 +82,7 @@ layeredIt.layer(NodeCrypto.layer)("ReplicaOwner defect isolation", (it) => {
           Read.toLayer((payload) =>
             Effect.suspend(() => {
               queryCalls++
-              if (queryCalls === 1) return Effect.die("poisoned query")
+              if (queryCalls === 1) return Effect.die(nativeTypeError("poisoned query"))
               return Effect.succeed([{ title: payload }])
             })
           )

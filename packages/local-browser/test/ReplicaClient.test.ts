@@ -366,7 +366,7 @@ vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
   it.effect("decodes and rejects owners using an older protocol", () =>
     Effect.scoped(Effect.gen(function*() {
       const open = ReplicaRpc.group.requests.get("OpenSession")
-      if (open?._tag !== "OpenSession") yield* Effect.die("OpenSession RPC not found")
+      if (open?._tag !== "OpenSession") yield* Effect.die(nativeError("OpenSession RPC not found"))
       yield* Schema.decodeUnknownEffect(open.successSchema)({
         leaseMillis: 1_000,
         protocolVersion: ReplicaRpc.protocolVersion - 1,

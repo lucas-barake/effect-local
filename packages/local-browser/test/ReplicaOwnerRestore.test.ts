@@ -23,7 +23,7 @@ import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
 import { definition, DeliveryPublisher, PeerRelayRuntime, replica } from "./fixtures.js"
-import { throwDefect } from "./TestErrors.js"
+import { nativeError, throwDefect } from "./TestErrors.js"
 
 layeredIt.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
   const limits = {
@@ -152,13 +152,13 @@ layeredIt.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
         enumerable: true,
         get() {
           chunksRead = true
-          return throwDefect("legacy chunks were read")
+          return throwDefect(nativeError("legacy chunks were read"))
         }
       })
 
       const restoreRpc = ReplicaRpc.group.requests.get("RestoreBackup")
       if (restoreRpc?._tag !== "RestoreBackup") {
-        yield* Effect.die("RestoreBackup RPC not found")
+        yield* Effect.die(nativeError("RestoreBackup RPC not found"))
       }
       assert.deepStrictEqual(
         yield* Schema.decodeUnknownEffect(restoreRpc.payloadSchema)(payload),

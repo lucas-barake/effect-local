@@ -10,6 +10,7 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as ReplicaAtom from "../src/ReplicaAtom.js"
 import * as ReplicaClient from "../src/ReplicaClient.js"
 import { peerConnectionStatus, relayConnectionStatus, replica, transientClient } from "./fixtures.js"
+import { nativeTypeError } from "./TestErrors.js"
 
 describe("ReplicaAtom reactivity bridge", () => {
   it.effect("resubscribes after the invalidation stream dies", () =>
@@ -30,7 +31,7 @@ describe("ReplicaAtom reactivity bridge", () => {
           subscriptions++
           if (subscriptions < 2) {
             return Stream.fromEffect(Deferred.succeed(died, undefined)).pipe(
-              Stream.flatMap(() => Stream.die("owner defect"))
+              Stream.flatMap(() => Stream.die(nativeTypeError("owner defect")))
             )
           }
           return Stream.make({
