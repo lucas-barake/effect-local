@@ -1240,8 +1240,7 @@ const make = (
       session: Session,
       documentId: Identity.DocumentId,
       message: Uint8Array,
-      heads: ReadonlyArray<string>,
-      receiptReplyId?: number
+      heads: ReadonlyArray<string>
     ) =>
       Effect.gen(function*() {
         const writerProvenance = yield* loadWriterProvenance(documentId, message)
@@ -1281,23 +1280,13 @@ const make = (
         const createdAt = new Date(yield* Clock.currentTimeMillis).toISOString()
         yield* sql`INSERT INTO effect_local_peer_outbox (
           replica_incarnation, peer_id, connection_epoch, document_id, send_sequence,
-          message, message_hash, heads, status, created_at, writer_provenance, lineage, receipt_reply_id
+          message, message_hash, heads, status, created_at, writer_provenance, lineage
         ) VALUES (
           ${session.replicaIncarnation}, ${session.peerId}, ${session.connectionEpoch}, ${documentId}, ${sendSequence},
           ${message}, ${messageHash}, ${Schema.encodeSync(Heads)(heads)}, 'Pending', ${createdAt},
-          ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(writerProvenance)}, ${lineage},
-          ${receiptReplyId ?? null}
+          ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(writerProvenance)}, ${lineage}
         )`
-        return {
-          sendSequence,
-          documentId,
-          message,
-          messageHash,
-          heads,
-          lineage,
-          writerProvenance,
-          ...(receiptReplyId === undefined ? {} : { receiptReplyId })
-        } satisfies Outbound
+        return { sendSequence, documentId, message, messageHash, heads, lineage, writerProvenance } satisfies Outbound
       })
 
     const enqueue = (session: Session, reply: Reply) =>
