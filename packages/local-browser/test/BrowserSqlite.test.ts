@@ -213,7 +213,7 @@ describe("BrowserSqlite", () => {
   it.effect("exposes database port startup failures", () => {
     const channel = new MessageChannel()
     channel.port1.start = () => {
-      Effect.runSync(Effect.die(new Error("start failed")))
+      throw new Error("start failed") // oxlint-disable-line effect/noThrowStatement, effect/noNewError -- This injected host method must throw so the production boundary's defect capture is tested.
     }
 
     return Effect.gen(function*() {

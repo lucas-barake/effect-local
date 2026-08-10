@@ -1,6 +1,4 @@
-import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
-import * as Exit from "effect/Exit"
 import * as Schema from "effect/Schema"
 // oxlint-disable-next-line effect/noNodeBuiltinImport -- This fixture is a real Node-only package registry process and must preserve its child-process, archive, and HTTP boundaries.
 import { execFileSync } from "node:child_process"
@@ -10,11 +8,15 @@ import * as fs from "node:fs"
 import * as http from "node:http"
 // oxlint-disable-next-line effect/noNodeBuiltinImport -- Registry URLs and archive paths must use the host path implementation.
 import * as path from "node:path"
-const nodeProcess = globalThis.process
+import nodeProcess from "node:process"
 
+// oxlint-disable-next-line effect/noNodeBuiltinImport -- The registry must read its roots from the real host process arguments.
 const [repoRoot, registryRoot] = nodeProcess.argv.slice(2)
 if (repoRoot === undefined || registryRoot === undefined) {
-  Effect.runSync(Effect.die(new Error("Expected repository and registry roots")))
+  // oxlint-disable-next-line effect/noNodeBuiltinImport -- Invalid registry startup diagnostics must use the real host stderr stream.
+  nodeProcess.stderr.write("Expected repository and registry roots\n")
+  // oxlint-disable-next-line effect/noNodeBuiltinImport -- Invalid registry startup must use the real host process exit behavior.
+  nodeProcess.exit(1)
 }
 
 const packages = new Map()
@@ -45,33 +47,37 @@ for (const entry of fs.readdirSync(pnpmModules)) {
 const tarballs = path.join(registryRoot, "tarballs")
 fs.mkdirSync(tarballs, { recursive: true })
 const packed = new Map()
-const runSyncThrowing = (thunk) =>
-  Effect.runSync(Effect.try({ try: thunk, catch: (cause) => cause }).pipe(Effect.orDie))
 
 const tarballFilename = (name, version) => `${name.replace(/^@/, "").replaceAll("/", "-")}-${version}.tgz`
 
 const pack = (name, version, packageDirectory) => {
   const key = `${name}@${version}`
   const existing = packed.get(key)
-  if (existing !== undefined) return existing
+  if (existing !== undefined) return Effect.succeed(existing)
   const filename = tarballFilename(name, version)
   const tarball = path.join(tarballs, filename)
-  const staging = runSyncThrowing(() => fs.mkdtempSync(path.join(registryRoot, "pack-")))
-  const result = Effect.runSyncExit(Effect.try({
-    try: () => {
-      fs.cpSync(packageDirectory, path.join(staging, "package"), {
-        recursive: true,
-        filter: (source) => path.basename(source) !== "node_modules"
-      })
-      execFileSync("tar", ["-czf", tarball, "-C", staging, "package"])
-      packed.set(key, tarball)
-      return tarball
-    },
-    catch: (cause) => cause
-  }).pipe(Effect.orDie))
-  runSyncThrowing(() => fs.rmSync(staging, { recursive: true, force: true }))
-  if (Exit.isFailure(result)) Effect.runSync(Effect.die(Cause.squash(result.cause)))
-  return result.value
+  return Effect.acquireUseRelease(
+    Effect.try({
+      try: () => fs.mkdtempSync(path.join(registryRoot, "pack-")),
+      catch: (cause) => cause
+    }),
+    (staging) => Effect.try({
+      try: () => {
+        fs.cpSync(packageDirectory, path.join(staging, "package"), {
+          recursive: true,
+          filter: (source) => path.basename(source) !== "node_modules"
+        })
+        execFileSync("tar", ["-czf", tarball, "-C", staging, "package"])
+        packed.set(key, tarball)
+        return tarball
+      },
+      catch: (cause) => cause
+    }),
+    (staging) => Effect.try({
+      try: () => fs.rmSync(staging, { recursive: true, force: true }),
+      catch: (cause) => cause
+    })
+  )
 }
 
 const jsonText = (value) => Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(value)
@@ -81,72 +87,106 @@ const errorMessage = (error) => {
 }
 const errorValue = (error) => {
   if (error instanceof Error) return error
-  return globalThis.Error(String(error))
+  return new Error(String(error)) // oxlint-disable-line effect/noNewError -- response.destroy requires an Error instance and the failure may be any value from the handler Effect.
 }
 
-const server = http.createServer((request, response) => {
-  const result = Effect.runSyncExit(Effect.try({
-    try: () => {
-      const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1")
-      const tarballSeparator = requestUrl.pathname.indexOf("/-/")
-      if (tarballSeparator !== -1) {
-        const name = decodeURIComponent(requestUrl.pathname.slice(1, tarballSeparator))
-        const filename = path.basename(requestUrl.pathname)
-        const found = Array.from(packages.get(name)?.entries() ?? [])
-          .find(([version]) => tarballFilename(name, version) === filename)
-        if (found === undefined) {
-          response.writeHead(404).end()
-          return
-        }
-        const tarball = pack(name, found[0], found[1].packageDirectory)
-        response.writeHead(200, { "content-type": "application/octet-stream" })
-        fs.createReadStream(tarball).pipe(response)
-        return
-      }
-
-      const name = decodeURIComponent(requestUrl.pathname.slice(1))
-      const versions = packages.get(name)
-      if (versions === undefined) {
-        response.writeHead(404, { "content-type": "application/json" }).end(
-          jsonText({ error: "not_found" })
-        )
-        return
-      }
-      const entries = Array.from(versions.entries())
-      const metadata = Object.fromEntries(entries.map(([version, value]) => {
-        return [version, {
-          ...value.manifest,
-          dist: {
-            tarball: `${registryUrl}/${encodeURIComponent(name)}/-/${tarballFilename(name, version)}`
-          }
-        }]
-      }))
-      response.writeHead(200, { "content-type": "application/json" }).end(jsonText({
-        name,
-        "dist-tags": { latest: entries.at(-1)?.[0] },
-        versions: metadata
-      }))
-    },
+const handleRequest = (request, response) => Effect.gen(function*() {
+  const requestUrl = yield* Effect.try({
+    try: () => new URL(request.url ?? "/", "http://127.0.0.1"),
     catch: (cause) => cause
-  }).pipe(Effect.orDie))
-  if (Exit.isFailure(result)) {
-    const error = Cause.squash(result.cause)
+  })
+  const tarballSeparator = requestUrl.pathname.indexOf("/-/")
+  if (tarballSeparator !== -1) {
+    const name = yield* Effect.try({
+      try: () => decodeURIComponent(requestUrl.pathname.slice(1, tarballSeparator)),
+      catch: (cause) => cause
+    })
+    const filename = path.basename(requestUrl.pathname)
+    const found = Array.from(packages.get(name)?.entries() ?? [])
+      .find(([version]) => tarballFilename(name, version) === filename)
+    if (found === undefined) {
+      yield* Effect.try({
+        try: () => response.writeHead(404).end(),
+        catch: (cause) => cause
+      })
+      return
+    }
+    const tarball = yield* pack(name, found[0], found[1].packageDirectory)
+    yield* Effect.try({
+      try: () => response.writeHead(200, { "content-type": "application/octet-stream" }),
+      catch: (cause) => cause
+    })
+    yield* Effect.try({
+      try: () => fs.createReadStream(tarball).pipe(response),
+      catch: (cause) => cause
+    })
+    return
+  }
+
+  const name = yield* Effect.try({
+    try: () => decodeURIComponent(requestUrl.pathname.slice(1)),
+    catch: (cause) => cause
+  })
+  const versions = packages.get(name)
+  if (versions === undefined) {
+    const body = yield* Effect.try({
+      try: () => jsonText({ error: "not_found" }),
+      catch: (cause) => cause
+    })
+    yield* Effect.try({
+      try: () => response.writeHead(404, { "content-type": "application/json" }).end(body),
+      catch: (cause) => cause
+    })
+    return
+  }
+  const entries = Array.from(versions.entries())
+  const metadata = Object.fromEntries(entries.map(([version, value]) => {
+    return [version, {
+      ...value.manifest,
+      dist: {
+        tarball: `${registryUrl}/${encodeURIComponent(name)}/-/${tarballFilename(name, version)}`
+      }
+    }]
+  }))
+  const body = yield* Effect.try({
+    try: () => jsonText({
+      name,
+      "dist-tags": { latest: entries.at(-1)?.[0] },
+      versions: metadata
+    }),
+    catch: (cause) => cause
+  })
+  yield* Effect.try({
+    try: () => response.writeHead(200, { "content-type": "application/json" }).end(body),
+    catch: (cause) => cause
+  })
+})
+
+const server = http.createServer((request, response) => {
+  Effect.runPromise(handleRequest(request, response)).catch((error) => {
     const body = jsonText({ error: errorMessage(error) })
     if (response.headersSent) response.destroy(errorValue(error))
     else response.writeHead(500, { "content-type": "application/json" }).end(body)
-  }
+  })
 })
 
 let registryUrl
 server.listen(0, "127.0.0.1", () => {
   const address = server.address()
   if (address === null || typeof address === "string") {
-    Effect.runSync(Effect.die(new Error("Registry did not bind a TCP port")))
+    // oxlint-disable-next-line effect/noNodeBuiltinImport -- Registry startup diagnostics must use the real host stderr stream.
+    nodeProcess.stderr.write("Registry did not bind a TCP port\n")
+    // oxlint-disable-next-line effect/noNodeBuiltinImport -- Registry startup must use the real host process exit behavior.
+    nodeProcess.exit(1)
   }
   registryUrl = `http://127.0.0.1:${address.port}`
+  // oxlint-disable-next-line effect/noNodeBuiltinImport -- The parent test process discovers the real registry through the host stdout stream.
   nodeProcess.stdout.write(`${registryUrl}\n`)
 })
 
-const close = () => server.close(() => nodeProcess.exit(0))
+const close = () => server.close(() => {
+  // oxlint-disable-next-line effect/noNodeBuiltinImport -- Signal shutdown must use the real host process exit behavior.
+  nodeProcess.exit(0)
+})
 nodeProcess.on("SIGTERM", close)
 nodeProcess.on("SIGINT", close)

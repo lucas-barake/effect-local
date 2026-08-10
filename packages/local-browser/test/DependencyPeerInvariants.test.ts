@@ -1,4 +1,4 @@
-import { describe, expect, it } from "@effect/vitest"
+import { assert, describe, expect, it } from "@effect/vitest"
 import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -12,6 +12,7 @@ import * as NodeModule from "node:module"
 import * as os from "node:os"
 // oxlint-disable-next-line effect/noNodeBuiltinImport -- The package installation harness must construct host paths for real npm and pnpm processes.
 import * as path from "node:path"
+import nodeProcess from "node:process"
 import { fileURLToPath } from "node:url"
 
 interface Pkg {
@@ -49,19 +50,17 @@ const ChildProcessFailureSchema = Schema.Struct({
   stdout: Schema.optional(Schema.String)
 })
 const require_ = NodeModule.createRequire(import.meta.url)
-const die = (message: string): never => Effect.runSync(Effect.die(new Error(message)))
 const runSyncThrowing = <A,>(thunk: () => A): A =>
   Effect.runSync(Effect.try({ try: thunk, catch: (cause) => cause }).pipe(Effect.orDie))
 const readPkg = (file: string): Pkg =>
   runSyncThrowing(() => Schema.decodeUnknownSync(Schema.fromJsonString(PkgSchema))(fs.readFileSync(file, "utf8")))
 const resolvePkg = (specifier: string): Pkg & { readonly version: string } => {
   const pkg = readPkg(require_.resolve(specifier))
-  if (pkg.version === undefined) return die(`Missing version in ${specifier}`)
+  if (pkg.version === undefined) assert.fail(`Missing version in ${specifier}`)
   return { ...pkg, version: pkg.version }
 }
 
 const repoRoot = runSyncThrowing(() => fileURLToPath(new URL("../../..", import.meta.url)))
-const nodeProcess = globalThis.process
 const readme = runSyncThrowing(() => fs.readFileSync(path.join(repoRoot, "README.md"), "utf8"))
 const rootPkg = readPkg(path.join(repoRoot, "package.json"))
 const browserPkg = readPkg(path.join(repoRoot, "packages/local-browser/package.json"))
@@ -78,7 +77,7 @@ const platformNodeShared = readPkg(platformNodeSharedRequire.resolve("@effect/pl
 
 const entry = (record: Record<string, string> | undefined, key: string): string => {
   const value = record?.[key]
-  if (value === undefined) return die(`Missing ${key}`)
+  if (value === undefined) assert.fail(`Missing ${key}`)
   return value
 }
 
@@ -90,7 +89,7 @@ const packageSpec = (token: string): readonly [name: string, version: string] =>
 
 const match1 = (source: string, pattern: RegExp): string => {
   const matched = source.match(pattern)
-  if (matched === null) return die(`No match for ${pattern}`)
+  if (matched === null) assert.fail(`No match for ${pattern}`)
   return matched[1]
 }
 
@@ -113,7 +112,7 @@ const documentedInstallCommands: ReadonlyArray<ReadonlyArray<string>> = [
 
 const commandContaining = (token: string): ReadonlyArray<string> => {
   const command = documentedInstallCommands.find((candidate) => candidate.includes(token))
-  if (command === undefined) return die(`No install command contains ${token}`)
+  if (command === undefined) assert.fail(`No install command contains ${token}`)
   return command
 }
 
@@ -195,7 +194,7 @@ const startLocalRegistry = (
 ): Promise<{ readonly close: () => Promise<void>; readonly url: string }> =>
   Effect.runPromise(Effect.callback((resume) => {
     const registry = spawn(
-      process.execPath,
+      nodeProcess.execPath,
       [
         fileURLToPath(new URL("fixtures/local-package-registry.mjs", import.meta.url)),
         repoRoot,
@@ -250,7 +249,7 @@ const assertEntrypointLoads = (
   const expectedExportJson = Schema.encodeSync(Schema.fromJsonString(Schema.String))(expectedExport)
   runSyncThrowing(() =>
     execFileSync(
-      process.execPath,
+      nodeProcess.execPath,
       [
         "--input-type=module",
         "--eval",
@@ -369,6 +368,7 @@ describe("dependency peer invariants", () => {
                         maxBuffer: 10 * 1024 * 1024,
                         stdio: "pipe",
                         env: {
+                          // oxlint-disable-next-line effect/noNodeBuiltinImport -- Package-manager installs must inherit the real host process environment.
                           ...nodeProcess.env,
                           HTTP_PROXY: "http://127.0.0.1:9",
                           HTTPS_PROXY: "http://127.0.0.1:9",
