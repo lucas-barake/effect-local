@@ -4,6 +4,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
+import type * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -11,13 +12,14 @@ import * as Fiber from "effect/Fiber"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
+import type { Headers } from "effect/unstable/http"
 import type * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type * as RpcClientError from "effect/unstable/rpc/RpcClientError"
 import * as RestoreProtocol from "../src/internal/restoreProtocol.js"
 import * as ReplicaClient from "../src/ReplicaClient.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import { definition } from "./fixtures.js"
-import { nativeError, throwDefect } from "./TestErrors.js"
+import { nativeError, nullPrototype, throwDefect } from "./TestErrors.js"
 
 const installationId = Identity.BackupInstallationId.make("bak_43c8d2f4-58ce-4c9a-9155-9d21019f5e9d")
 const nonce = RestoreProtocol.RestoreNonce.make("rst_43c8d2f4-58ce-4c9a-9155-9d21019f5e9d")
@@ -31,6 +33,17 @@ const conflictLimits: ReplicaRpc.ConflictLimits = {
   maxConflictValueBytes: 1024 * 1024
 }
 
+type TestRpcClient = RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>
+type RpcOptions<Discard,> = {
+  readonly headers?: Headers.Input | undefined
+  readonly context?: Context.Context<never> | undefined
+  readonly discard?: Discard | undefined
+}
+type OpenSessionInput = Parameters<TestRpcClient["OpenSession"]>[0]
+type RenewSessionInput = Parameters<TestRpcClient["RenewSession"]>[0]
+type BeginRestoreInput = Parameters<TestRpcClient["BeginRestoreBackup"]>[0]
+type FinishRestoreInput = Parameters<TestRpcClient["FinishRestoreBackup"]>[0]
+
 const rpcClient = (
   begin: () => Effect.Effect<{
     readonly nonce: RestoreProtocol.RestoreNonce
@@ -38,25 +51,102 @@ const rpcClient = (
   }>,
   maxRestoreErrorBytes = 4_096,
   maxChunkBytes = 4,
-  finish: () => Effect.Effect<void, RestoreProtocol.RestoreResultFailure> = () => Effect.void
-) =>
-  Object.assign(Object.create<RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>>(null), {
-    OpenSession: () =>
-      Effect.succeed({
-        leaseMillis: 10_000,
-        protocolVersion: ReplicaRpc.protocolVersion,
-        definitionHash: definition.hash,
-        ownerEpoch: "owner",
-        conflictLimits,
-        maxChunkBytes,
-        maxRestoreCoalesceMillis: 25,
-        maxRestoreErrorBytes
-      }),
-    RenewSession: () => Effect.succeed({ leaseMillis: 10_000 }),
-    CloseSession: () => Effect.void,
-    BeginRestoreBackup: begin,
-    FinishRestoreBackup: finish
+  finish: () => Effect.Effect<void, RestoreProtocol.RestoreResultFailure | RpcClientError.RpcClientError> = () =>
+    Effect.void,
+  open: () => Effect.Effect<ReplicaRpc.SessionHandshake, ReplicaError.ReplicaError> = () =>
+    Effect.succeed({
+      leaseMillis: 10_000,
+      protocolVersion: ReplicaRpc.protocolVersion,
+      definitionHash: definition.hash,
+      ownerEpoch: "owner",
+      conflictLimits,
+      maxChunkBytes,
+      maxRestoreCoalesceMillis: 25,
+      maxRestoreErrorBytes
+    }),
+  close: () => Effect.Effect<void, ReplicaError.ReplicaError> = () => Effect.void
+) => {
+  function OpenSession<const Discard = false,>(
+    _input: OpenSessionInput,
+    options?: RpcOptions<Discard>
+  ): Effect.Effect<
+    Discard extends true ? void : ReplicaRpc.SessionHandshake,
+    RpcClientError.RpcClientError | (Discard extends true ? never : ReplicaError.ReplicaError)
+  >
+  function OpenSession(
+    _input: OpenSessionInput,
+    options?: RpcOptions<boolean>
+  ): Effect.Effect<ReplicaRpc.SessionHandshake | void, RpcClientError.RpcClientError | ReplicaError.ReplicaError> {
+    if (options?.discard === true) return Effect.void
+    return open()
+  }
+
+  function RenewSession<const Discard = false,>(
+    _input: RenewSessionInput,
+    options?: RpcOptions<Discard>
+  ): Effect.Effect<
+    Discard extends true ? void : { readonly leaseMillis: number },
+    RpcClientError.RpcClientError | (Discard extends true ? never : ReplicaError.ReplicaError)
+  >
+  function RenewSession(
+    _input: RenewSessionInput,
+    options?: RpcOptions<boolean>
+  ): Effect.Effect<{ readonly leaseMillis: number } | void, RpcClientError.RpcClientError | ReplicaError.ReplicaError> {
+    if (options?.discard === true) return Effect.void
+    return Effect.succeed({ leaseMillis: 10_000 })
+  }
+
+  function CloseSession<const Discard = false,>(
+    _input: Parameters<TestRpcClient["CloseSession"]>[0],
+    options?: RpcOptions<Discard>
+  ): Effect.Effect<void, RpcClientError.RpcClientError | (Discard extends true ? never : ReplicaError.ReplicaError)>
+  function CloseSession(
+    _input: Parameters<TestRpcClient["CloseSession"]>[0],
+    _options?: RpcOptions<boolean>
+  ): Effect.Effect<void, RpcClientError.RpcClientError | ReplicaError.ReplicaError> {
+    return close()
+  }
+
+  function BeginRestoreBackup<const Discard = false,>(
+    _input: BeginRestoreInput,
+    options?: RpcOptions<Discard>
+  ): Effect.Effect<
+    Discard extends true ? void : { readonly nonce: RestoreProtocol.RestoreNonce; readonly port: MessagePort },
+    RpcClientError.RpcClientError | (Discard extends true ? never : ReplicaError.ReplicaError)
+  >
+  function BeginRestoreBackup(
+    _input: BeginRestoreInput,
+    options?: RpcOptions<boolean>
+  ): Effect.Effect<
+    { readonly nonce: RestoreProtocol.RestoreNonce; readonly port: MessagePort } | void,
+    RpcClientError.RpcClientError | ReplicaError.ReplicaError
+  > {
+    if (options?.discard === true) return Effect.void
+    return begin()
+  }
+
+  function FinishRestoreBackup<const Discard = false,>(
+    _input: FinishRestoreInput,
+    options?: RpcOptions<Discard>
+  ): Effect.Effect<
+    void,
+    RpcClientError.RpcClientError | (Discard extends true ? never : RestoreProtocol.RestoreResultFailure)
+  >
+  function FinishRestoreBackup(
+    _input: FinishRestoreInput,
+    _options?: RpcOptions<boolean>
+  ): Effect.Effect<void, RpcClientError.RpcClientError | RestoreProtocol.RestoreResultFailure> {
+    return finish()
+  }
+
+  return nullPrototype<TestRpcClient>({
+    OpenSession,
+    RenewSession,
+    CloseSession,
+    BeginRestoreBackup,
+    FinishRestoreBackup
   })
+}
 
 layeredIt.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
   it.effect("coalesces within the advertised bound without transferring caller storage", () =>
@@ -1591,11 +1681,18 @@ layeredIt.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
         } else {
           advertised[invalid.field] = invalid.value
         }
-        const invalidRpc = Object.assign(
-          Object.create<RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>>(null),
-          {
-            OpenSession: () =>
-              Effect.succeed({
+        const invalidRpc = rpcClient(
+          () =>
+            Effect.sync(() => {
+              beginCalls++
+              return { nonce, port: new MessageChannel().port1 }
+            }),
+          4_096,
+          4,
+          undefined,
+          () =>
+            Effect.succeed(
+              {
                 leaseMillis: 10_000,
                 protocolVersion: ReplicaRpc.protocolVersion,
                 definitionHash: definition.hash,
@@ -1603,14 +1700,9 @@ layeredIt.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
                 conflictLimits,
                 ...advertised,
                 maxRestoreErrorBytes: 4_096
-              }),
-            CloseSession: () => Effect.sync(() => closeCalls++),
-            BeginRestoreBackup: () =>
-              Effect.sync(() => {
-                beginCalls++
-                return { nonce, port: new MessageChannel().port1 }
-              })
-          }
+              } satisfies ReplicaRpc.SessionHandshake
+            ),
+          () => Effect.sync(() => closeCalls++)
         )
 
         const exit = yield* Effect.scoped(
@@ -1645,11 +1737,14 @@ layeredIt.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
         let closeCalls = 0
         const restoreErrorLimit: { maxRestoreErrorBytes?: number } = {}
         if (maxRestoreErrorBytes !== undefined) restoreErrorLimit.maxRestoreErrorBytes = maxRestoreErrorBytes
-        const invalidRpc = Object.assign(
-          Object.create<RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>>(null),
-          {
-            OpenSession: () =>
-              Effect.succeed({
+        const invalidRpc = rpcClient(
+          () => Effect.die(nativeError("begin should not be called")),
+          4_096,
+          4,
+          undefined,
+          () =>
+            Effect.succeed(
+              {
                 leaseMillis: 10_000,
                 protocolVersion: ReplicaRpc.protocolVersion,
                 definitionHash: definition.hash,
@@ -1658,9 +1753,9 @@ layeredIt.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
                 maxChunkBytes: 4,
                 maxRestoreCoalesceMillis: 25,
                 ...restoreErrorLimit
-              }),
-            CloseSession: () => Effect.sync(() => closeCalls++)
-          }
+              } satisfies ReplicaRpc.SessionHandshake
+            ),
+          () => Effect.sync(() => closeCalls++)
         )
         const exit = yield* Effect.scoped(
           ReplicaClient.fromRpcClient(definition, invalidRpc)

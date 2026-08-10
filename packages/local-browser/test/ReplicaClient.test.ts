@@ -50,7 +50,7 @@ import {
   replica,
   Task
 } from "./fixtures.js"
-import { nativeError } from "./TestErrors.js"
+import { nativeError, nullPrototype } from "./TestErrors.js"
 
 const ReplicaOwner = {
   ...ReplicaOwnerModule,
@@ -58,8 +58,8 @@ const ReplicaOwner = {
     ReplicaOwnerModule.layerHandlers(candidateDefinition).pipe(Layer.provide(PeerRelayRuntime))
 }
 
-const mockReplica = (overrides: object): Replica.Replica["Service"] =>
-  Object.assign(Object.create<Replica.Replica["Service"]>(null), overrides)
+const mockReplica = (overrides: Partial<Replica.Replica["Service"]>): Replica.Replica["Service"] =>
+  nullPrototype<Replica.Replica["Service"]>(overrides)
 
 vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
   const limits = {
@@ -244,7 +244,7 @@ vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     })
     const visible = Conflict.AlternativeId.make("2@actor")
     const other = Conflict.AlternativeId.make("1@actor")
-    const path = { parents: [], target: { _tag: "Key" satisfies "Key", key: "title" } }
+    const path = { parents: [], target: { _tag: "Key", key: "title" } } satisfies Conflict.Path
     const resolution = Conflict.Resolution.make({
       heads: ["head"],
       path,
@@ -366,7 +366,10 @@ vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
   it.effect("decodes and rejects owners using an older protocol", () =>
     Effect.scoped(Effect.gen(function*() {
       const open = ReplicaRpc.group.requests.get("OpenSession")
-      if (open?._tag !== "OpenSession") yield* Effect.die(nativeError("OpenSession RPC not found"))
+      if (open?._tag !== "OpenSession") {
+        yield* Effect.die(nativeError("OpenSession RPC not found"))
+        return
+      }
       yield* Schema.decodeUnknownEffect(open.successSchema)({
         leaseMillis: 1_000,
         protocolVersion: ReplicaRpc.protocolVersion - 1,
@@ -379,10 +382,12 @@ vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           const value = Reflect.get(target, property, receiver)
           if (property !== "OpenSession") return value
           return (payload: never) =>
-            value(payload).pipe(Effect.map((lease) => ({
-              ...lease,
-              protocolVersion: ReplicaRpc.protocolVersion - 1
-            })))
+            value(payload).pipe(
+              Effect.map((lease) => ({
+                ...Schema.decodeUnknownSync(open.successSchema)(lease),
+                protocolVersion: ReplicaRpc.protocolVersion - 1
+              }))
+            )
         }
       })
       const error = yield* Effect.flip(ReplicaClient.fromRpcClient(definition, older))
@@ -1015,7 +1020,7 @@ vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         }
       })
       const client = yield* ReplicaClient.fromRpcClient(definition, observed)
-      const invalid = Object.assign(Object.create<Conflict.Resolution>(null), {
+      const invalid = nullPrototype<Conflict.Resolution>({
         heads: [],
         path: { parents: [], target: { _tag: "Key", key: "title" } },
         choice: { _tag: "ReplaceValue", value: Number.NaN }
@@ -1346,8 +1351,10 @@ vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         requestId: RequestId(requestId),
         headers: Headers.empty
       })
-      const unary = <A, E, R,>(effect: Effect.Effect<A | Deferred.Deferred<A, E>, E, R>) =>
-        Effect.flatMap(effect, (value) => {
+      const unary = <A, E, R,>(
+        effect: Effect.Effect<A | Deferred.Deferred<A, E>, E, R>
+      ): Effect.Effect<A, E, R> =>
+        Effect.flatMap(effect, (value): Effect.Effect<A, E, R> => {
           if (Deferred.isDeferred<A, E>(value)) return Deferred.await(value)
           return Effect.succeed(value)
         })
@@ -1407,7 +1414,10 @@ vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       )
 
       const otherTransients = transients({ sessionId }, options(other, "transients-other"))
-      if (!Stream.isStream(otherTransients)) yield* Effect.die("expected transient stream")
+      if (!Stream.isStream(otherTransients)) {
+        yield* Effect.die("expected transient stream")
+        return
+      }
       const transientStreamError = yield* otherTransients.pipe(
         Stream.runDrain,
         Effect.flip
@@ -1415,7 +1425,10 @@ vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       assert.strictEqual(transientStreamError.reason._tag, "ProtocolMismatch")
 
       const otherStatus = status({ sessionId }, options(other, "status-other"))
-      assert.isTrue(Stream.isStream(otherStatus))
+      if (!Stream.isStream(otherStatus)) {
+        yield* Effect.die("expected status stream")
+        return
+      }
       const streamError = yield* otherStatus.pipe(
         Stream.runDrain,
         Effect.flip
@@ -1428,7 +1441,10 @@ vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       ))
       assert.strictEqual(snapshot.documentId, documentId)
       const ownerStatus = status({ sessionId }, options(owner, "status-owner"))
-      assert.isTrue(Stream.isStream(ownerStatus))
+      if (!Stream.isStream(ownerStatus)) {
+        yield* Effect.die("expected owner status stream")
+        return
+      }
       assert.lengthOf(
         Array.from(yield* Stream.runCollect(ownerStatus)),
         1
@@ -1442,9 +1458,12 @@ vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         },
         options(owner, "transient-owner")
       ))
-      yield* Stream.runDrain(
-        transients({ sessionId }, options(owner, "transients-owner"))
-      )
+      const ownerTransients = transients({ sessionId }, options(owner, "transients-owner"))
+      if (!Stream.isStream(ownerTransients)) {
+        yield* Effect.die("expected owner transient stream")
+        return
+      }
+      yield* Stream.runDrain(ownerTransients)
 
       yield* TestClock.adjust(SessionManager.leaseDurationMillis + 1)
       assert.strictEqual(
@@ -1460,6 +1479,10 @@ vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         "ProtocolMismatch"
       )
       const expiredTransients = transients({ sessionId }, options(owner, "transients-expired"))
+      if (!Stream.isStream(expiredTransients)) {
+        yield* Effect.die("expected expired transient stream")
+        return
+      }
       const expiredStreamError = yield* expiredTransients.pipe(
         Stream.runDrain,
         Effect.flip
@@ -1665,10 +1688,30 @@ vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       const finishDelivered = yield* Deferred.make<void>()
       const terminalDropped = yield* Deferred.make<void>()
-      const finish: FinishRestore = (payload) =>
-        rpc.FinishRestoreBackup(payload).pipe(
+      function finish<const Discard = false,>(
+        payload: Parameters<FinishRestore>[0],
+        options?: {
+          readonly headers?: Headers.Input | undefined
+          readonly context?: Context.Context<never> | undefined
+          readonly discard?: Discard | undefined
+        }
+      ): Effect.Effect<
+        void,
+        | RpcClientError.RpcClientError
+        | (Discard extends true ? never : RestoreProtocol.RestoreResultFailure)
+      >
+      function finish(
+        payload: Parameters<FinishRestore>[0],
+        options?: {
+          readonly headers?: Headers.Input | undefined
+          readonly context?: Context.Context<never> | undefined
+          readonly discard?: boolean | undefined
+        }
+      ): Effect.Effect<void, RpcClientError.RpcClientError | RestoreProtocol.RestoreResultFailure> {
+        return rpc.FinishRestoreBackup(payload, options).pipe(
           Effect.tap(() => Deferred.succeed(finishDelivered, undefined))
         )
+      }
       const bridged = dropTerminalReady(
         rpc,
         terminalDropped,
@@ -2885,8 +2928,22 @@ vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         }).pipe(Effect.forkChild)
 
         const pulled = yield* Effect.raceFirst(
-          Deferred.await(start).pipe(Effect.map((sessionId) => ({ _tag: "Start" satisfies "Start", sessionId }))),
-          Fiber.await(restored).pipe(Effect.map((exit) => ({ _tag: "Exit" satisfies "Exit", exit })))
+          Deferred.await(start).pipe(
+            Effect.map((
+              sessionId
+            ) => ({ _tag: "Start", sessionId } satisfies {
+              readonly _tag: "Start"
+              readonly sessionId: Identity.SessionId
+            }))
+          ),
+          Fiber.await(restored).pipe(
+            Effect.map((
+              exit
+            ) => ({ _tag: "Exit", exit } satisfies {
+              readonly _tag: "Exit"
+              readonly exit: Exit.Exit<void, ReplicaError.ReplicaError>
+            }))
+          )
         )
         assert.strictEqual(pulled._tag, "Start")
         if (pulled._tag !== "Start") return

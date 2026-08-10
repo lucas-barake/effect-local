@@ -3,6 +3,7 @@ import { assert, it as layeredIt } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
+import type * as Backup from "@lucas-barake/effect-local/Backup"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
@@ -95,17 +96,19 @@ layeredIt.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
       ))
     )
   const restoreOptions = {
-    mode: "replace" satisfies "replace",
+    mode: "replace",
     maxBytes: limits.maxBackupBytes,
     expectedDefinitionHash: definition.hash,
     installationId: Identity.BackupInstallationId.make("bak_43c8d2f4-58ce-4c9a-9155-9d21019f5e9d")
-  }
+  } satisfies Omit<Backup.RestoreOptions<never>, "source">
   const options = (client: Rpc.ServerClient, requestId: string) => ({
     client,
     requestId: RequestId(requestId),
     headers: Headers.empty
   })
-  const unary = <A, E, R,>(effect: Effect.Effect<A | Deferred.Deferred<A, E>, E, R>) =>
+  const unary = <A, E, R,>(
+    effect: Effect.Effect<A | Deferred.Deferred<A, E>, E, R>
+  ): Effect.Effect<A, E, R> =>
     Effect.flatMap(effect, (value) => {
       if (Deferred.isDeferred<A, E>(value)) return Deferred.await(value)
       return Effect.succeed(value)
@@ -159,6 +162,7 @@ layeredIt.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
       const restoreRpc = ReplicaRpc.group.requests.get("RestoreBackup")
       if (restoreRpc?._tag !== "RestoreBackup") {
         yield* Effect.die(nativeError("RestoreBackup RPC not found"))
+        return
       }
       assert.deepStrictEqual(
         yield* Schema.decodeUnknownEffect(restoreRpc.payloadSchema)(payload),

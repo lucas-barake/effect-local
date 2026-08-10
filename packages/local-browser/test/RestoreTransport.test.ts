@@ -1318,8 +1318,12 @@ it.effect("cleans up a messageerror before Start without applying restore", () =
 
     return yield* Effect.gen(function*() {
       const { result, sessions, started, transport } = yield* begin
-      if (ownerPort === undefined) yield* Effect.die(nativeError("owner endpoint was not created"))
-      ownerPort.dispatchEvent(new MessageEvent("messageerror"))
+      const owner = ownerPort
+      if (owner === undefined) {
+        yield* Effect.die(nativeError("owner endpoint was not created"))
+        return
+      }
+      owner.dispatchEvent(new MessageEvent("messageerror"))
 
       const exit = yield* Deferred.await(result).pipe(Effect.exit)
       const error = restoreResultError(exit)
@@ -1381,8 +1385,12 @@ it.effect("cleans up an active Pull messageerror and finalizes the restore sourc
         } satisfies RestoreProtocol.Start
       )
       yield* Deferred.await(pull)
-      if (ownerPort === undefined) yield* Effect.die(nativeError("owner endpoint was not created"))
-      ownerPort.dispatchEvent(new MessageEvent("messageerror"))
+      const owner = ownerPort
+      if (owner === undefined) {
+        yield* Effect.die(nativeError("owner endpoint was not created"))
+        return
+      }
+      owner.dispatchEvent(new MessageEvent("messageerror"))
 
       const exit = yield* Deferred.await(result).pipe(Effect.exit)
       const error = restoreResultError(exit)
@@ -1448,11 +1456,15 @@ for (const disconnect of disconnects) {
         )
         yield* Deferred.await(startObserved)
         yield* Effect.yieldNow
-        if (ownerPort === undefined) yield* Effect.die(nativeError("owner endpoint was not created"))
+        const owner = ownerPort
+        if (owner === undefined) {
+          yield* Effect.die(nativeError("owner endpoint was not created"))
+          return
+        }
         let event: Event
         if (disconnect === "close") event = new Event("close")
         else event = new MessageEvent("messageerror")
-        ownerPort.dispatchEvent(event)
+        owner.dispatchEvent(event)
 
         yield* waitForControllerCount(transport, 0)
         assert.strictEqual(applications, 0)
@@ -1511,11 +1523,15 @@ for (const disconnect of disconnects) {
         yield* Deferred.await(terminal)
         const resultExit = yield* Deferred.await(result).pipe(Effect.exit)
         assert.isTrue(Exit.isSuccess(resultExit))
-        if (ownerPort === undefined) yield* Effect.die(nativeError("owner endpoint was not created"))
+        const owner = ownerPort
+        if (owner === undefined) {
+          yield* Effect.die(nativeError("owner endpoint was not created"))
+          return
+        }
         let event: Event
         if (disconnect === "close") event = new Event("close")
         else event = new MessageEvent("messageerror")
-        ownerPort.dispatchEvent(event)
+        owner.dispatchEvent(event)
 
         yield* waitForControllerCount(transport, 0)
         assert.strictEqual(applications, 1)
@@ -1585,11 +1601,15 @@ for (const disconnect of disconnects) {
         const resultExit = yield* Deferred.await(result).pipe(Effect.exit)
         assert.isTrue(Exit.isSuccess(resultExit))
         assert.strictEqual(yield* sessions.activeRestoreCount, 0)
-        if (ownerPort === undefined) yield* Effect.die(nativeError("owner endpoint was not created"))
+        const owner = ownerPort
+        if (owner === undefined) {
+          yield* Effect.die(nativeError("owner endpoint was not created"))
+          return
+        }
         let event: Event
         if (disconnect === "close") event = new Event("close")
         else event = new MessageEvent("messageerror")
-        ownerPort.dispatchEvent(event)
+        owner.dispatchEvent(event)
 
         yield* waitForControllerCount(transport, 0)
         assert.strictEqual(applications, 1)

@@ -10,3 +10,6 @@ export const throwDefect = (defect: unknown): never => {
   // oxlint-disable-next-line effect/noThrowStatement -- These tests intentionally exercise hostile synchronous callbacks and getters.
   throw defect
 }
+
+export const nullPrototype = <const A extends object,>(overrides: Partial<A>): A =>
+  Object.assign(Object.create(null), overrides)

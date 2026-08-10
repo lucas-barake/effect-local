@@ -28,7 +28,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as Worker from "effect/unstable/workers/Worker"
 import { getEventListeners } from "node:events"
-import { DatabaseSync } from "node:sqlite"
+import { DatabaseSync, type SQLInputValue } from "node:sqlite"
 import * as BrowserSqlite from "../src/BrowserSqlite.js"
 import * as OwnershipProtocol from "../src/internal/ownershipProtocol.js"
 import * as OwnershipCoordinator from "../src/OwnershipCoordinator.js"
@@ -36,7 +36,7 @@ import * as ReplicaClient from "../src/ReplicaClient.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
 import { PeerRelayRuntime, Task } from "./fixtures.js"
-import { nativeError, throwDefect } from "./TestErrors.js"
+import { nativeError, nullPrototype, throwDefect } from "./TestErrors.js"
 
 const definition = ReplicaDefinition.make({
   name: "ownership-test",
@@ -247,7 +247,7 @@ const openSession = (rpcPort: MessagePort) =>
     Effect.provide(BrowserWorker.layerPlatform)
   )
 
-type SqliteRequest = [id: number, sql: string, params: ReadonlyArray<unknown>]
+type SqliteRequest = [id: number, sql: string, params: ReadonlyArray<SQLInputValue>]
 
 const makeSqliteWorker = (onIgnoredRequest?: (request: SqliteRequest) => void) => {
   const database = new DatabaseSync(":memory:")
@@ -303,7 +303,14 @@ const isSqliteRequest = (value: unknown): value is SqliteRequest =>
   Array.isArray(value) &&
   typeof value[0] === "number" &&
   typeof value[1] === "string" &&
-  Array.isArray(value[2])
+  Array.isArray(value[2]) &&
+  value[2].every((item) =>
+    item === null ||
+    typeof item === "number" ||
+    typeof item === "bigint" ||
+    typeof item === "string" ||
+    ArrayBuffer.isView(item)
+  )
 
 const makeBrowserEngineRuntime = (databasePort: MessagePort) =>
   ManagedRuntime.make(
@@ -349,7 +356,7 @@ const makeTestControlPort = () => {
     start() {},
     close() {}
   }
-  const messagePort = Object.assign(Object.create<MessagePort>(null), port)
+  const messagePort = nullPrototype<MessagePort>(port)
   return {
     port: messagePort,
     dispatch(frame: OwnershipProtocol.OwnerToPageFrame) {
@@ -363,25 +370,25 @@ const makeTestControlPort = () => {
 }
 
 class TestWorker extends EventTarget {
-  onerror: ((this: globalThis.Worker, event: ErrorEvent) => unknown) | null = null
-  onmessage: ((this: globalThis.Worker, event: MessageEvent) => unknown) | null = null
-  onmessageerror: ((this: globalThis.Worker, event: MessageEvent) => unknown) | null = null
+  onerror: AbstractWorker["onerror"] = null
+  onmessage: Worker["onmessage"] = null
+  onmessageerror: Worker["onmessageerror"] = null
   postMessage() {}
   terminate() {}
 }
 
 class TestSharedWorker extends EventTarget {
   onconnect: ((this: SharedWorker, event: MessageEvent) => unknown) | null = null
-  onerror: ((this: SharedWorker, event: ErrorEvent) => unknown) | null = null
+  onerror: AbstractWorker["onerror"] = null
 
   constructor(readonly port: MessagePort) {
     super()
   }
 }
 
-const mockWorker = (overrides: object) => Object.assign(new TestWorker(), overrides)
+const mockWorker = (overrides: Partial<Worker>): Worker => Object.assign(new TestWorker(), overrides)
 
-const mockSharedWorker = (overrides: { readonly port: MessagePort } & object) =>
+const mockSharedWorker = (overrides: { readonly port: MessagePort } & Partial<SharedWorker>): SharedWorker =>
   Object.assign(new TestSharedWorker(overrides.port), overrides)
 
 const installErrorEvent = (constructor: typeof ErrorEvent) => {
@@ -438,6 +445,10 @@ vitestIt.layer(Layer.merge(NodeCrypto.layer, NodeFileSystem.layer))("OwnershipCo
       )
       const spawn = yield* Worker.Spawner.pipe(Effect.provide(context))
       const rpcPort = spawn(0)
+      if (!ReplicaRpc.isMessagePort(rpcPort)) {
+        yield* Effect.die(nativeError("worker spawner returned an invalid port"))
+        return
+      }
       rpcPort.addEventListener("error", () => {
         sharedWorker.dispatchEvent(new TestErrorEvent("error", { message: "connection closed" }))
       })
@@ -475,6 +486,10 @@ vitestIt.layer(Layer.merge(NodeCrypto.layer, NodeFileSystem.layer))("OwnershipCo
       )
       const spawn = yield* Worker.Spawner.pipe(Effect.provide(context))
       const rpcPort = spawn(0)
+      if (!ReplicaRpc.isMessagePort(rpcPort)) {
+        yield* Effect.die(nativeError("worker spawner returned an invalid port"))
+        return
+      }
       let rpcErrors = 0
       rpcPort.addEventListener("error", () => {
         rpcErrors++
@@ -517,6 +532,10 @@ vitestIt.layer(Layer.merge(NodeCrypto.layer, NodeFileSystem.layer))("OwnershipCo
       )
       const spawn = yield* Worker.Spawner.pipe(Effect.provide(context))
       const rpcPort = spawn(0)
+      if (!ReplicaRpc.isMessagePort(rpcPort)) {
+        yield* Effect.die(nativeError("worker spawner returned an invalid port"))
+        return
+      }
       rpcPort.dispatchEvent(
         new MessageEvent("message", {
           data: [1, {

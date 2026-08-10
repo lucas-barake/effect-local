@@ -39,6 +39,9 @@ class CountingMap<K, V,> extends NativeMap<K, V> {
       next: () => {
         if (counting) operations++
         return inner.next()
+      },
+      [Symbol.dispose]() {
+        inner[Symbol.dispose]()
       }
     }
     return iterator

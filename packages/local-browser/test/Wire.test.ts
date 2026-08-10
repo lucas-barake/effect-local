@@ -246,7 +246,7 @@ layeredIt.layer(NodeCrypto.layer)("browser wire", (it) => {
         heads: [],
         path: { parents: [], target: { _tag: "Key", key: "value" } },
         choice: { _tag: "ReplaceValue", value: Number.NaN }
-      }
+      } satisfies Conflict.Resolution
       const exit = yield* Effect.exit(
         Wire.encodeConflict(Conflict.Resolution, invalid, conflictLimits)
       )

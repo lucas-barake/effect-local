@@ -10,6 +10,7 @@ import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import type * as Snapshot from "@lucas-barake/effect-local/Snapshot"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -23,13 +24,14 @@ import * as ReplicaAtom from "../src/ReplicaAtom.js"
 import * as ReplicaClient from "../src/ReplicaClient.js"
 import type * as ReplicaRpc from "../src/ReplicaRpc.js"
 import { peerConnectionStatus, relayConnectionStatus, Rename, replica, Task, transientClient } from "./fixtures.js"
-import { nativeError } from "./TestErrors.js"
+import { nativeError, nullPrototype } from "./TestErrors.js"
 
-const mockReplica = (overrides: object): Replica.Replica["Service"] =>
-  Object.assign(Object.create<Replica.Replica["Service"]>(null), overrides)
+const mockReplica = (overrides: Partial<Replica.Replica["Service"]>): Replica.Replica["Service"] =>
+  nullPrototype<Replica.Replica["Service"]>(overrides)
 
-const mockClient = (overrides: object): ReplicaClient.ReplicaClient["Service"] =>
-  Object.assign(Object.create<ReplicaClient.ReplicaClient["Service"]>(null), overrides)
+const mockClient = (
+  overrides: Partial<ReplicaClient.ReplicaClient["Service"]>
+): ReplicaClient.ReplicaClient["Service"] => nullPrototype<ReplicaClient.ReplicaClient["Service"]>(overrides)
 
 describe("ReplicaAtom", () => {
   it.effect("reads documents through documentFamily", () =>
@@ -42,7 +44,7 @@ describe("ReplicaAtom", () => {
         heads: [],
         tombstone: false,
         projection: "Ready" satisfies "Ready"
-      }
+      } satisfies Snapshot.FromDocument<typeof Task>
       const atomRuntime = Atom.runtime(Layer.succeed(
         Replica.Replica,
         mockReplica({
@@ -122,11 +124,7 @@ describe("ReplicaAtom", () => {
 
   it.effect("executes mutations through mutation atoms", () =>
     Effect.gen(function*() {
-      const called = yield* Deferred.make<{
-        readonly commandId: Identity.CommandId
-        readonly documentId: Identity.DocumentId
-        readonly payload: { readonly title: string }
-      }>()
+      const called = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
       const commandId = Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000010")
       const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000010")
@@ -137,7 +135,8 @@ describe("ReplicaAtom", () => {
         mockReplica({
           ...replica,
           mutate: (_mutation, received) =>
-            Deferred.succeed(called, received).pipe(
+            Effect.sync(() => assert.deepStrictEqual(received, options)).pipe(
+              Effect.andThen(Deferred.succeed(called, undefined)),
               Effect.andThen(Deferred.await(release)),
               Effect.as(committed)
             )
@@ -147,7 +146,7 @@ describe("ReplicaAtom", () => {
       const atom = ReplicaAtom.mutation(atomRuntime, Rename)
       const unmount = registry.mount(atom)
       registry.set(atom, options)
-      assert.deepStrictEqual(yield* Deferred.await(called), options)
+      yield* Deferred.await(called)
       yield* Deferred.succeed(release, undefined)
       yield* Effect.yieldNow
       yield* Effect.yieldNow
@@ -309,7 +308,7 @@ describe("ReplicaAtom", () => {
       const commandId = Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000020")
       const resolution = Conflict.Resolution.make({
         heads: [],
-        path: { parents: [], target: { _tag: "Key", key: "title" } },
+        path: { parents: [], target: { _tag: "Key" satisfies "Key", key: "title" } },
         choice: { _tag: "DeleteValue" }
       })
       const noteInitialRead = Effect.sync(() => {
@@ -403,7 +402,10 @@ describe("ReplicaAtom", () => {
       let conflictReads = 0
       const commandId = Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000021")
       const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000021")
-      const path = { parents: [], target: { _tag: "Key" satisfies "Key", key: "title" } }
+      const path = {
+        parents: [],
+        target: { _tag: "Key", key: "title" }
+      } satisfies Conflict.Path
       const resolution = Conflict.Resolution.make({
         heads: [],
         path,
@@ -415,8 +417,8 @@ describe("ReplicaAtom", () => {
         version: 1,
         heads: [],
         tombstone: false,
-        projection: "Ready" satisfies "Ready"
-      }
+        projection: "Ready"
+      } satisfies Snapshot.FromDocument<typeof Task>
       const atomRuntime = Atom.runtime(Layer.succeed(
         Replica.Replica,
         mockReplica({

@@ -103,7 +103,7 @@ layeredIt.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
   it.effect("recovers the status stream after a transient failure and surfaces a degraded status", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
+      const ready = { _tag: "Ready", pendingCommands: 0 } satisfies ReplicaStatus.Ready
       let statusCalls = 0
       let activeStatus = 0
       let concurrentStatus = 0
@@ -153,7 +153,7 @@ layeredIt.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
   it.effect("spaces repeated transient status failures and reuses the session", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
+      const ready = { _tag: "Ready", pendingCommands: 0 } satisfies ReplicaStatus.Ready
       const queued = new ReplicaError.ReplicaError({
         reason: new ReplicaError.QuotaExceeded({ resource: "queued RPCs", limit: 4 })
       })
@@ -235,7 +235,7 @@ layeredIt.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
   it.effect("retries an HTTP transport failure and recovers status", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
+      const ready = { _tag: "Ready", pendingCommands: 0 } satisfies ReplicaStatus.Ready
       const transport = new RpcClientError.RpcClientError({
         reason: new HttpClientError.HttpClientErrorSchema({
           _tag: "HttpError",
@@ -338,7 +338,7 @@ layeredIt.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
   it.effect("reopens the session when status reports a protocol mismatch before emitting", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
+      const ready = { _tag: "Ready", pendingCommands: 0 } satisfies ReplicaStatus.Ready
       const opened: Array<Identity.SessionId> = []
       const observed: Array<Identity.SessionId> = []
       const replacing = new Proxy(rpc, {
@@ -372,7 +372,7 @@ layeredIt.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
   it.effect("counts statuses emitted by a replacement before a later mismatch", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
+      const ready = { _tag: "Ready", pendingCommands: 0 } satisfies ReplicaStatus.Ready
       let openSessions = 0
       let statusCalls = 0
       const attempts = yield* Queue.unbounded<number>()
@@ -475,7 +475,7 @@ layeredIt.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
       const sessions = yield* SessionManager.SessionManager
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       const ambiguousOpen = yield* Deferred.make<void>()
-      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
+      const ready = { _tag: "Ready", pendingCommands: 0 } satisfies ReplicaStatus.Ready
       const opened: Array<Identity.SessionId> = []
       const observed: Array<Identity.SessionId> = []
       let candidateCleanupFailed = false
@@ -587,7 +587,7 @@ layeredIt.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
       const staleGetStarted = yield* Deferred.make<void>()
       const releaseStaleGet = yield* Deferred.make<void>()
       const ambiguousOpen = yield* Deferred.make<void>()
-      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
+      const ready = { _tag: "Ready", pendingCommands: 0 } satisfies ReplicaStatus.Ready
       const opened: Array<Identity.SessionId> = []
       let candidateCleanupFailed = false
       const replacing = new Proxy(rpc, {
@@ -842,7 +842,7 @@ layeredIt.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       let statusCalls = 0
       let openSessions = 0
-      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
+      const ready = { _tag: "Ready", pendingCommands: 0 } satisfies ReplicaStatus.Ready
       const flaky = new Proxy(rpc, {
         get(target, property, receiver) {
           const value = Reflect.get(target, property, receiver)
@@ -880,7 +880,7 @@ layeredIt.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       const replacementFailed = yield* Deferred.make<void>()
-      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
+      const ready = { _tag: "Ready", pendingCommands: 0 } satisfies ReplicaStatus.Ready
       let openSessions = 0
       let statusCalls = 0
       const flaky = new Proxy(rpc, {
@@ -934,7 +934,7 @@ layeredIt.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       const firstReplacementFailed = yield* Deferred.make<void>()
-      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
+      const ready = { _tag: "Ready", pendingCommands: 0 } satisfies ReplicaStatus.Ready
       let openSessions = 0
       let statusCalls = 0
       const replacing = new Proxy(rpc, {
