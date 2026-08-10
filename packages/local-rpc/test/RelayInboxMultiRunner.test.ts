@@ -31,6 +31,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as PeerRelayLimits from "../src/PeerRelayLimits.js"
 import type * as PeerRpc from "../src/PeerRpc.js"
 import * as RelayInbox from "../src/RelayInbox.js"
+import type * as RelayInboxStore from "../src/RelayInboxStore.js"
 import * as SqlRelayInboxStore from "../src/SqlRelayInboxStore.js"
 import { PgContainer } from "./PgContainer.js"
 
@@ -167,7 +168,11 @@ const channel = {
   senderConnectionEpoch: "epoch-1"
 }
 
-const deliver = (id: string, sequence: number) => ({
+const deliver = (id: string, sequence: number): {
+  readonly channel: RelayInboxStore.ChannelKey
+  readonly envelope: RelayInboxStore.InboxEnvelope
+  readonly senderRetryHorizonMillis: number
+} => ({
   channel,
   envelope: {
     relayMessageId: relayId(id),

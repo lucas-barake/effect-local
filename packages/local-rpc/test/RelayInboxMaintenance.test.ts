@@ -61,7 +61,7 @@ const channel = {
   senderConnectionEpoch: "epoch-1"
 }
 
-const admission = (now: number, ttl: number) => ({
+const admission = (now: number, ttl: number): RelayInboxStore.AdmissionRequest => ({
   inboxKey,
   channel,
   envelope: {

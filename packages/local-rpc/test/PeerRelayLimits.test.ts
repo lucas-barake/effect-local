@@ -97,7 +97,12 @@ describe("PeerRelayLimits", () => {
     Effect.gen(function*() {
       // The point of taking `Duration.Input` rather than a number of milliseconds: a deployment
       // writes whichever form reads best, and none of them is a different amount of time.
-      for (const horizon of [Duration.days(7), "7 days", 7 * 24 * 60 * 60 * 1_000]) {
+      const horizons: ReadonlyArray<Duration.Input> = [
+        Duration.days(7),
+        "7 days",
+        7 * 24 * 60 * 60 * 1_000
+      ]
+      for (const horizon of horizons) {
         const values = yield* PeerRelayLimits.make({
           ...PeerRelayLimits.defaults,
           maximumSenderRetryHorizon: horizon

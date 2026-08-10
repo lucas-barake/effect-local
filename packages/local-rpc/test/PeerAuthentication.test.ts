@@ -13,7 +13,6 @@ import * as Option from "effect/Option"
 import * as Redacted from "effect/Redacted"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
-import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as Tracer from "effect/Tracer"
@@ -46,18 +45,17 @@ const invoke = (
   clientId: number,
   headers = Headers.empty,
   rpc: typeof PeerRpc.OpenRpc | typeof PeerRpc.PushRpc = PeerRpc.PushRpc
-) =>
-  middleware(PeerAuthentication.AuthenticatedPeer, {
-    client: new Rpc.ServerClient(clientId),
-    requestId: RpcMessage.RequestId(clientId),
-    rpc,
-    payload,
-    headers
-  }) satisfies Effect.Effect<
-    PeerAuthentication.AuthenticatedPeer["Service"],
-    PeerRpcError.AuthenticationFailure | PeerRpcError.RequestCapacityExceeded,
-    Scope.Scope
-  >
+): ReturnType<PeerAuthentication.PeerAuthentication["Service"]> =>
+  Reflect.apply(middleware, undefined, [
+    PeerAuthentication.AuthenticatedPeer.pipe(Effect.asVoid),
+    {
+      client: new Rpc.ServerClient(clientId),
+      requestId: RpcMessage.RequestId(clientId),
+      rpc,
+      payload,
+      headers
+    }
+  ])
 
 const authenticated = {
   principal,
@@ -421,7 +419,7 @@ describe("PeerAuthentication", () => {
         const result = yield* Effect.result(invoke(middleware, { credential: Redacted.make("second") }, 1))
         let observed = "Failure"
         if (Result.isSuccess(result)) observed = "Authenticated"
-        else if (result.failure._tag === "RequestCapacityExceeded") observed = "Capacity"
+        else if (result.failure instanceof PeerRpcError.RequestCapacityExceeded) observed = "Capacity"
         assert.strictEqual(observed, expected)
       }))
   }
@@ -491,7 +489,7 @@ describe("PeerAuthentication", () => {
       assert.strictEqual(span.status._tag, "Ended")
       if (span.status._tag === "Ended") assert.isTrue(Exit.isSuccess(span.status.exit))
       assert.deepStrictEqual(span.events, [])
-      let status = span.status._tag
+      let status: string = span.status._tag
       if (span.status._tag === "Ended" && Exit.isFailure(span.status.exit)) {
         status = Cause.pretty(span.status.exit.cause)
       }

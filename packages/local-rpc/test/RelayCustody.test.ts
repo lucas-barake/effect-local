@@ -38,6 +38,8 @@ import * as Runners from "effect/unstable/cluster/Runners"
 import * as RunnerStorage from "effect/unstable/cluster/RunnerStorage"
 import * as Sharding from "effect/unstable/cluster/Sharding"
 import * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
+import type * as Headers from "effect/unstable/http/Headers"
+import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
 import * as RpcTest from "effect/unstable/rpc/RpcTest"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import { encodeInboxKey } from "../src/internal/relayInboxKey.js"
@@ -52,6 +54,56 @@ import type * as RelayInbox from "../src/RelayInbox.js"
 import * as RelayInboxStore from "../src/RelayInboxStore.js"
 import * as RelayServer from "../src/RelayServer.js"
 import * as RpcPeerTransport from "../src/RpcPeerTransport.js"
+
+type RelayClientError = PeerRpcError.PeerRpcError | RpcClientError
+
+type RelayRpcOptions<Discard,> = {
+  readonly headers?: Headers.Input | undefined
+  readonly context?: Context.Context<never> | undefined
+  readonly discard?: Discard | undefined
+}
+
+type RelayDiscardError<Discard,> =
+  | PeerRpcError.AuthenticationFailure
+  | PeerRpcError.RequestCapacityExceeded
+  | RpcClientError
+  | (Discard extends true ? never : PeerRpcError.PeerRpcError)
+
+function failPush<const Discard = false,>(
+  request: typeof PeerRpc.PushRpc.payloadSchema.Type,
+  options?: RelayRpcOptions<Discard>
+): Effect.Effect<void, RelayDiscardError<Discard>>
+function failPush(
+  _request: typeof PeerRpc.PushRpc.payloadSchema.Type,
+  options?: RelayRpcOptions<boolean>
+): Effect.Effect<never, RelayClientError> {
+  if (options?.discard === true) return Effect.fail(new PeerRpcError.AuthenticationFailure())
+  return Effect.fail(new PeerRpcError.ServerUnavailable())
+}
+
+function failAcknowledge<const Discard = false,>(
+  request: typeof PeerRpc.AcknowledgeRpc.payloadSchema.Type,
+  options?: RelayRpcOptions<Discard>
+): Effect.Effect<void, RelayDiscardError<Discard>>
+function failAcknowledge(
+  _request: typeof PeerRpc.AcknowledgeRpc.payloadSchema.Type,
+  options?: RelayRpcOptions<boolean>
+): Effect.Effect<never, RelayClientError> {
+  if (options?.discard === true) return Effect.fail(new PeerRpcError.AuthenticationFailure())
+  return Effect.fail(new PeerRpcError.ServerUnavailable())
+}
+
+function failReject<const Discard = false,>(
+  request: typeof PeerRpc.RejectRpc.payloadSchema.Type,
+  options?: RelayRpcOptions<Discard>
+): Effect.Effect<void, RelayDiscardError<Discard>>
+function failReject(
+  _request: typeof PeerRpc.RejectRpc.payloadSchema.Type,
+  options?: RelayRpcOptions<boolean>
+): Effect.Effect<never, RelayClientError> {
+  if (options?.discard === true) return Effect.fail(new PeerRpcError.AuthenticationFailure())
+  return Effect.fail(new PeerRpcError.ServerUnavailable())
+}
 import * as SqlRelayInboxStore from "../src/SqlRelayInboxStore.js"
 
 const Task = Document.make("Task", {
@@ -502,19 +554,20 @@ describe("relay custody against a real relay", () => {
             ORDER BY command_id, change_hash`
           assert.strictEqual(commandHashes.length, 2)
           const expectedChangeHashes = new Set(commandHashes.map((row) => row.change_hash))
+          const unavailablePush: PeerRpc.RpcClient["Push"] = (request, options) =>
+            PeerSyncEnvelope.decodeSyncEnvelope(request.payload, replicaLimits).pipe(
+              Effect.provideService(Crypto.Crypto, backend.crypto),
+              Effect.orDie,
+              Effect.flatMap((envelope) => {
+                if (envelope.writerProvenance.some((entry) => expectedChangeHashes.has(entry.changeHash))) {
+                  return failPush(request, options)
+                }
+                return client.Push(request, options)
+              })
+            )
           const unavailable: PeerRpc.RpcClient = {
             ...client,
-            Push: (request) =>
-              PeerSyncEnvelope.decodeSyncEnvelope(request.payload, replicaLimits).pipe(
-                Effect.provideService(Crypto.Crypto, backend.crypto),
-                Effect.orDie,
-                Effect.flatMap((envelope) => {
-                  if (envelope.writerProvenance.some((entry) => expectedChangeHashes.has(entry.changeHash))) {
-                    return Effect.fail<PeerRpcError.PeerRpcError>(new PeerRpcError.ServerUnavailable())
-                  }
-                  return client.Push(request)
-                })
-              )
+            Push: unavailablePush
           }
           const attempt = yield* Effect.exit(Effect.scoped(Effect.gen(function*() {
             yield* connectRecipient(recipientClient, recipient, documentId)
@@ -1074,8 +1127,8 @@ describe("relay custody against a real relay", () => {
         // A session that takes the head and cannot settle it spends the head's whole budget.
         const failingSettles: PeerRpc.RpcClient = {
           ...recipientClient,
-          Acknowledge: () => Effect.fail(new PeerRpcError.ServerUnavailable()),
-          Reject: () => Effect.fail(new PeerRpcError.ServerUnavailable())
+          Acknowledge: failAcknowledge,
+          Reject: failReject
         }
         yield* Effect.exit(Effect.scoped(Effect.gen(function*() {
           yield* connectRecipient(failingSettles, recipient, documentId)
@@ -1134,15 +1187,16 @@ describe("relay custody against a real relay", () => {
         // settle retries cannot heal it — this exercises the swallow path. The message stays in
         // relay custody; what must not happen is the session dying with the backlog unread.
         const failing = new Set<string>()
+        const flakyAcknowledge: PeerRpc.RpcClient["Acknowledge"] = (request, options) => {
+          if (failing.size === 0 || failing.has(request.relayMessageId)) {
+            failing.add(request.relayMessageId)
+            return failAcknowledge(request, options)
+          }
+          return recipientClient.Acknowledge(request, options)
+        }
         const flakySettles: PeerRpc.RpcClient = {
           ...recipientClient,
-          Acknowledge: ((request) => {
-            if (failing.size === 0 || failing.has(request.relayMessageId)) {
-              failing.add(request.relayMessageId)
-              return Effect.fail(new PeerRpcError.ServerUnavailable())
-            }
-            return recipientClient.Acknowledge(request)
-          })
+          Acknowledge: flakyAcknowledge
         }
         yield* Effect.scoped(Effect.gen(function*() {
           yield* connectRecipient(flakySettles, recipient, documentId)
@@ -1188,7 +1242,7 @@ describe("relay custody against a real relay", () => {
         // here would lose it with nobody holding a copy.
         const unavailable: PeerRpc.RpcClient = {
           ...client,
-          Push: () => Effect.fail(new PeerRpcError.ServerUnavailable())
+          Push: failPush
         }
         // A failed push is fatal to the connection, so closing the scope reports it too.
         const attempt = yield* Effect.exit(Effect.scoped(Effect.gen(function*() {

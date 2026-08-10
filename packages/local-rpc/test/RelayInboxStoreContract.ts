@@ -45,7 +45,7 @@ const envelope = (options: {
   readonly digest?: string
   readonly epoch?: string
   readonly subject?: string
-}) => {
+}): RelayInboxStore.InboxEnvelope => {
   const source = channel({ epoch: options.epoch, subject: options.subject })
   return {
     relayMessageId: relayId(options.id),
@@ -83,7 +83,7 @@ const admission = (options: {
   readonly epoch?: string
   readonly subject?: string
   readonly quota?: RelayInboxStore.AdmissionQuota
-}) => ({
+}): RelayInboxStore.AdmissionRequest => ({
   inboxKey: options.inboxKey,
   channel: channel({ epoch: options.epoch, subject: options.subject }),
   envelope: envelope(options),
@@ -543,7 +543,12 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
     run: Effect.gen(function*() {
       const store = yield* RelayInboxStore.RelayInboxStore
       yield* store.admit(admission({ inboxKey: "resettle", id: "000000000001", sequence: 0, now: 0 }))
-      const options = {
+      const options: {
+        readonly outcome: RelayInboxStore.TerminalOutcome
+        readonly messageHash: string
+        readonly now: number
+        readonly terminalRetentionMillis: number
+      } = {
         outcome: "Acknowledged",
         messageHash: "a".repeat(64),
         now: 10,

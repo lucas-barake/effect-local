@@ -81,6 +81,20 @@ const unsafeRequest = (
   documents: selectedDocuments
 })
 
+const malformedRequest = (mutate: (input: PeerRelayAuthorization.Request) => void) => {
+  const input = request("Send")
+  mutate(input)
+  return input
+}
+
+const malformedUnsafeRequest = (
+  mutate: (input: PeerRelayAuthorization.UnsafeUnboundedAutomerge3DecodeRequest) => void
+) => {
+  const input = unsafeRequest("Send")
+  mutate(input)
+  return input
+}
+
 const unsafeGrant = (
   overrides: Partial<PeerRelayAuthorization.UnsafeUnboundedAutomerge3DecodeGrant> = {}
 ): PeerRelayAuthorization.UnsafeUnboundedAutomerge3DecodeGrant => ({
@@ -166,40 +180,28 @@ describe("PeerRelayAuthorization", () => {
 
   it.effect("rejects malformed and duplicate unsafe requests before policy evaluation", () => {
     let calls = 0
-    const cases = [
-      { ...unsafeRequest("Send"), risk: "AutomergeDecodeIsSafe" },
-      { ...unsafeRequest("Send"), direction: "Forward" },
-      { ...unsafeRequest("Send"), principal: { ...principal, tenantId: "" } },
-      { ...unsafeRequest("Send"), remote: { ...remote, subjectId: "" } },
-      { ...unsafeRequest("Send"), documents: [] },
-      {
-        ...unsafeRequest("Send"),
-        documents: [documents[0], documents[0]]
-      },
-      {
-        ...unsafeRequest("Send"),
-        documents: [
+    const cases: ReadonlyArray<PeerRelayAuthorization.UnsafeUnboundedAutomerge3DecodeRequest> = [
+      malformedUnsafeRequest((input) => Reflect.set(input, "risk", "AutomergeDecodeIsSafe")),
+      malformedUnsafeRequest((input) => Reflect.set(input, "direction", "Forward")),
+      malformedUnsafeRequest((input) => Reflect.set(input, "principal", { ...principal, tenantId: "" })),
+      malformedUnsafeRequest((input) => Reflect.set(input, "remote", { ...remote, subjectId: "" })),
+      malformedUnsafeRequest((input) => Reflect.set(input, "documents", [])),
+      malformedUnsafeRequest((input) => Reflect.set(input, "documents", [documents[0], documents[0]])),
+      malformedUnsafeRequest((input) =>
+        Reflect.set(input, "documents", [
           documents[0],
           { documentType: note.name, documentId: taskId }
-        ]
-      },
-      {
-        ...unsafeRequest("Send"),
-        documents: [{ ...documents[0], documentType: "" }]
-      },
-      {
-        ...unsafeRequest("Send"),
-        documents: [{ ...documents[0], documentId: "doc_invalid" }]
-      }
-    ] satisfies ReadonlyArray<unknown>
+        ])
+      ),
+      malformedUnsafeRequest((input) => Reflect.set(input, "documents", [{ ...documents[0], documentType: "" }])),
+      malformedUnsafeRequest((input) =>
+        Reflect.set(input, "documents", [{ ...documents[0], documentId: "doc_invalid" }])
+      )
+    ]
     return Effect.gen(function*() {
       const authorization = yield* PeerRelayAuthorization.PeerRelayAuthorization
       for (const invalid of cases) {
-        const error = yield* Reflect.apply(
-          authorization.authorizeUnsafeUnboundedAutomerge3Decode,
-          undefined,
-          [invalid]
-        ).pipe(Effect.flip)
+        const error = yield* authorization.authorizeUnsafeUnboundedAutomerge3Decode(invalid).pipe(Effect.flip)
         assert.deepStrictEqual(error, new PeerRpcError.AccessDenied())
       }
       assert.strictEqual(calls, 0)
@@ -209,7 +211,7 @@ describe("PeerRelayAuthorization", () => {
           () => Effect.succeed(result()),
           () => {
             calls++
-            return Effect.never
+            return Effect.fail(new PeerRpcError.ServerUnavailable())
           }
         )
       )
@@ -263,9 +265,11 @@ describe("PeerRelayAuthorization", () => {
       }
     }))
 
-  const missingTagGrant = Object.fromEntries(
-    Object.entries(unsafeGrant()).filter(([key]) => key !== "_tag")
-  )
+  const malformedGrant = (mutate: (grant: PeerRelayAuthorization.UnsafeUnboundedAutomerge3DecodeGrant) => void) => {
+    const grant = unsafeGrant()
+    mutate(grant)
+    return grant
+  }
 
   it.effect.each(
     [
@@ -274,12 +278,12 @@ describe("PeerRelayAuthorization", () => {
       ["NaN", unsafeGrant({ validUntil: Number.NaN })],
       ["positive infinity", unsafeGrant({ validUntil: Number.POSITIVE_INFINITY })],
       ["negative infinity", unsafeGrant({ validUntil: Number.NEGATIVE_INFINITY })],
-      ["missing tag", missingTagGrant],
-      ["wrong tag", { ...unsafeGrant(), _tag: "UnsafeAutomergeGrant" }],
-      ["wrong risk", { ...unsafeGrant(), risk: "AutomergeDecodeIsSafe" }],
-      ["missing invalidation", { ...unsafeGrant(), invalidated: undefined }],
-      ["malformed invalidation", { ...unsafeGrant(), invalidated: "not-an-effect" }]
-    ] satisfies ReadonlyArray<unknown>
+      ["missing tag", malformedGrant((grant) => Reflect.deleteProperty(grant, "_tag"))],
+      ["wrong tag", malformedGrant((grant) => Reflect.set(grant, "_tag", "UnsafeAutomergeGrant"))],
+      ["wrong risk", malformedGrant((grant) => Reflect.set(grant, "risk", "AutomergeDecodeIsSafe"))],
+      ["missing invalidation", malformedGrant((grant) => Reflect.deleteProperty(grant, "invalidated"))],
+      ["malformed invalidation", malformedGrant((grant) => Reflect.set(grant, "invalidated", "not-an-effect"))]
+    ] satisfies ReadonlyArray<readonly [string, PeerRelayAuthorization.UnsafeUnboundedAutomerge3DecodeGrant]>
   )("rejects an unsafe grant with %s", ([, grant]) =>
     Effect.gen(function*() {
       yield* TestClock.setTime(1_000)
@@ -292,10 +296,7 @@ describe("PeerRelayAuthorization", () => {
       Effect.provide(
         authorizationLayer(
           () => Effect.succeed(result()),
-          () =>
-            Effect.succeed(
-              Reflect.apply(Effect.succeed, undefined, [grant])
-            )
+          () => Effect.succeed(grant)
         )
       )
     ))
@@ -329,27 +330,23 @@ describe("PeerRelayAuthorization", () => {
 
   it.effect("rejects invalid direction endpoint and duplicate request shapes before policy evaluation", () => {
     let calls = 0
-    const cases = [
-      { ...request("Send"), direction: "Forward" },
-      { ...request("Send"), remote: { ...remote, subjectId: "" } },
-      { ...request("Send"), remote: { ...remote, peerId: "peer_invalid" } },
-      {
-        ...request("Send"),
-        documents: [documents[0], documents[0]]
-      },
-      {
-        ...request("Send"),
-        documents: [
+    const cases: ReadonlyArray<PeerRelayAuthorization.Request> = [
+      malformedRequest((input) => Reflect.set(input, "direction", "Forward")),
+      malformedRequest((input) => Reflect.set(input, "remote", { ...remote, subjectId: "" })),
+      malformedRequest((input) => Reflect.set(input, "remote", { ...remote, peerId: "peer_invalid" })),
+      malformedRequest((input) => Reflect.set(input, "documents", [documents[0], documents[0]])),
+      malformedRequest((input) =>
+        Reflect.set(input, "documents", [
           documents[0],
           { documentType: note.name, documentId: taskId }
-        ]
-      }
-    ] satisfies ReadonlyArray<unknown>
+        ])
+      )
+    ]
 
     return Effect.gen(function*() {
       const authorization = yield* PeerRelayAuthorization.PeerRelayAuthorization
       for (const invalid of cases) {
-        const error = yield* Reflect.apply(authorization.authorize, undefined, [invalid]).pipe(Effect.flip)
+        const error = yield* authorization.authorize(invalid).pipe(Effect.flip)
         assert.deepStrictEqual(error, new PeerRpcError.AccessDenied())
       }
       assert.strictEqual(calls, 0)
@@ -357,7 +354,7 @@ describe("PeerRelayAuthorization", () => {
       Effect.provide(
         authorizationLayer(() => {
           calls++
-          return Effect.never
+          return Effect.fail(new PeerRpcError.ServerUnavailable())
         })
       )
     )

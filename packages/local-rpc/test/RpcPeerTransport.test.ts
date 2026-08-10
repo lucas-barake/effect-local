@@ -25,8 +25,11 @@ import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
+import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as Tracer from "effect/Tracer"
+import type * as Headers from "effect/unstable/http/Headers"
+import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
 import * as PeerRpc from "../src/PeerRpc.js"
 import * as PeerRpcError from "../src/PeerRpcError.js"
 import * as RpcPeerTransport from "../src/RpcPeerTransport.js"
@@ -79,30 +82,100 @@ const relayOpened = PeerRpc.Opened.make({
   authenticatedLocal: relayOptions.expectedLocal
 })
 
+type RelayClientError = PeerRpcError.PeerRpcError | RpcClientError
+
+type RelayDiscardError<Discard,> =
+  | PeerRpcError.AuthenticationFailure
+  | PeerRpcError.RequestCapacityExceeded
+  | RpcClientError
+  | (Discard extends true ? never : PeerRpcError.PeerRpcError)
+
+type RelayRpcOptions<Discard,> = {
+  readonly headers?: Headers.Input | undefined
+  readonly context?: Context.Context<never> | undefined
+  readonly discard?: Discard | undefined
+}
+
+type RelayOpenOptions<AsQueue,> = RelayRpcOptions<boolean> & {
+  readonly asQueue?: AsQueue | undefined
+  readonly streamBufferSize?: number | undefined
+}
+
+type RelayOpenResult<AsQueue,> = AsQueue extends true
+  ? Effect.Effect<Queue.Dequeue<PeerRpc.OpenEvent, RelayClientError | Cause.Done>, never, Scope.Scope>
+  : Stream.Stream<PeerRpc.OpenEvent, RelayClientError>
+
+const adaptOpen = (
+  open: (
+    request: typeof PeerRpc.OpenRpc.payloadSchema.Type,
+    options: { readonly streamBufferSize?: number | undefined }
+  ) => Stream.Stream<PeerRpc.OpenEvent, RelayClientError>
+) => {
+  function invokeOpen<const AsQueue extends boolean = false,>(
+    request: typeof PeerRpc.OpenRpc.payloadSchema.Type,
+    options?: RelayOpenOptions<AsQueue>
+  ): RelayOpenResult<AsQueue>
+  function invokeOpen(
+    request: typeof PeerRpc.OpenRpc.payloadSchema.Type,
+    options?: RelayOpenOptions<boolean>
+  ):
+    | Stream.Stream<PeerRpc.OpenEvent, RelayClientError>
+    | Effect.Effect<
+      Queue.Dequeue<PeerRpc.OpenEvent, RelayClientError | Cause.Done>,
+      never,
+      Scope.Scope
+    >
+  {
+    const stream = open(request, { streamBufferSize: options?.streamBufferSize })
+    if (options?.asQueue === true) {
+      return Stream.toQueue(stream, { capacity: options?.streamBufferSize ?? 16 })
+    }
+    return stream
+  }
+  return invokeOpen
+}
+
+const adaptCommand = <Request,>(
+  handler: (request: Request) => Effect.Effect<void, RelayClientError>
+) => {
+  function invokeCommand<const Discard = false,>(
+    request: Request,
+    options?: RelayRpcOptions<Discard>
+  ): Effect.Effect<void, RelayDiscardError<Discard>>
+  function invokeCommand(
+    request: Request,
+    options?: RelayRpcOptions<boolean>
+  ): Effect.Effect<void, RelayClientError> {
+    if (options?.discard === true) return Effect.fail(new PeerRpcError.AuthenticationFailure())
+    return handler(request)
+  }
+  return invokeCommand
+}
+
 const makeRelayClient = (
   open: (
     request: typeof PeerRpc.OpenRpc.payloadSchema.Type,
     options: { readonly streamBufferSize?: number | undefined }
-  ) => Stream.Stream<PeerRpc.OpenEvent, unknown>,
+  ) => Stream.Stream<PeerRpc.OpenEvent, RelayClientError>,
   push: (
     request: typeof PeerRpc.PushRpc.payloadSchema.Type
-  ) => Effect.Effect<void, unknown> = () => Effect.void,
+  ) => Effect.Effect<void, RelayClientError> = () => Effect.void,
   acknowledge: (
     request: typeof PeerRpc.AcknowledgeRpc.payloadSchema.Type
-  ) => Effect.Effect<void, unknown> = () => Effect.void,
+  ) => Effect.Effect<void, RelayClientError> = () => Effect.void,
   reject: (
     request: typeof PeerRpc.RejectRpc.payloadSchema.Type
-  ) => Effect.Effect<void, unknown> = () => Effect.void,
+  ) => Effect.Effect<void, RelayClientError> = () => Effect.void,
   transient: (
     request: typeof PeerRpc.TransientRpc.payloadSchema.Type
-  ) => Effect.Effect<void, unknown> = () => Effect.void
+  ) => Effect.Effect<void, RelayClientError> = () => Effect.void
 ): PeerRpc.RpcClient =>
   ({
-    Open: open,
-    Push: push,
-    Transient: transient,
-    Acknowledge: acknowledge,
-    Reject: reject
+    Open: adaptOpen(open),
+    Push: adaptCommand(push),
+    Transient: adaptCommand(transient),
+    Acknowledge: adaptCommand(acknowledge),
+    Reject: adaptCommand(reject)
   }) satisfies PeerRpc.RpcClient
 
 const relayEntry = (payload: Uint8Array): PeerRelayOutbox.Entry => ({

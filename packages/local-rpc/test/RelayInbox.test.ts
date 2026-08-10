@@ -136,7 +136,11 @@ interface Message {
   readonly subject?: string
 }
 
-const deliver = (message: Message) => {
+const deliver = (message: Message): {
+  readonly channel: RelayInboxStore.ChannelKey
+  readonly envelope: RelayInboxStore.InboxEnvelope
+  readonly senderRetryHorizonMillis: number
+} => {
   const source = channel(message)
   return {
     channel: source,
@@ -929,13 +933,16 @@ describe("RelayInbox", () => {
       const store = yield* RelayInboxStore.RelayInboxStore
       const pending = yield* store.pendingHeads(inboxKey, { limit: 10, now: 0 })
       assert.deepStrictEqual(
-        pending.map((message) => [message.relayMessageId, message.deliveries]).toSorted((left, right) =>
-          left[0].localeCompare(right[0])
-        ),
-        [
+        pending.map((message): readonly [string, number] => [message.relayMessageId, message.deliveries]).toSorted((
+          left,
+          right
+        ) => left[0].localeCompare(right[0])),
+        ([
           [relayId("000000000001"), 1],
           [relayId("000000000003"), 1]
-        ].toSorted((left, right) => left[0].localeCompare(right[0])),
+        ] satisfies ReadonlyArray<readonly [string, number]>).toSorted((left, right) =>
+          left[0].localeCompare(right[0])
+        ),
         "each transmitted head is charged exactly once"
       )
 
