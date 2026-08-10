@@ -16,8 +16,11 @@ flowchart LR
   R --> L["Local SQLite"]
   L --> P["Pending mutations"]
   L --> V["Visible state"]
-  P --> W["WebSocket RPC"]
-  W --> S["Server admission"]
+  P --> F["Finite reconciliation Workflow"]
+  F --> W
+  W["WebSocket RPC"]
+  W --> E["Cluster space entity"]
+  E --> S["Server admission"]
   S --> O["Authoritative total order"]
   O --> W
   W --> L
@@ -27,9 +30,14 @@ flowchart LR
 
 One local transaction allocates a stable mutation identity, runs the handler, stores the pending envelope and write
 set, and updates visible state. The server authenticates and authorizes the mutation, deduplicates exact retries,
-executes the same handler, and either stores a terminal rejection or appends an accepted mutation with the next dense
-sequence. A client installs contiguous accepted entries into canonical state and then replays its remaining pending
-mutations over that state.
+executes the same handler, and either stores a terminal rejection or appends public mutation identity plus canonical
+changes at the next dense sequence. The submitting client's result remains in its private receipt. A client installs
+contiguous accepted entries into canonical state and then replays its remaining pending mutations over that state.
+
+Effect Cluster owns deployment neutral routing. One volatile entity per space gives every runner the same wake and
+presence owner without copying application data into Cluster storage. Effect Workflow owns durable client scheduling
+through finite reconciliation generations. SQLite remains the only authority for mutations, receipts, log entries,
+canonical state, and reconciliation progress.
 
 Ordinary fields store ordinary values. Applications that need concurrent intent for a specific field can use an
 explicit `Field.Semantics` such as a counter or grow only set. Every other model avoids causal metadata.
@@ -42,8 +50,8 @@ invariants and failure model.
 | Package                              | Purpose                                                           |
 | ------------------------------------ | ----------------------------------------------------------------- |
 | `@lucas-barake/effect-local`         | Models, mutations, queries, field semantics, protocol, and errors |
-| `@lucas-barake/effect-local-sql`     | Client SQLite state, authoritative server log, and reconciliation |
-| `@lucas-barake/effect-local-rpc`     | Authenticated Effect RPC over WebSockets, including presence      |
+| `@lucas-barake/effect-local-sql`     | SQLite state, server log, and Workflow reconciliation             |
+| `@lucas-barake/effect-local-rpc`     | WebSocket RPC, Cluster space routing, and presence                |
 | `@lucas-barake/effect-local-browser` | Browser SQLite ports, Effect Atom graph, and local presence       |
 | `@lucas-barake/effect-local-test`    | Production shaped test layers and deterministic network faults    |
 
@@ -157,7 +165,14 @@ const program = Replica.Replica.use((replica) =>
 
 `SyncLive` can be the RPC client Layer from the next section or any implementation of `SyncEngine`. Local commits do
 not wait for it. The scoped reconciler retries pending mutations with their stable identity and resumes pulls from the
-durable server cursor.
+durable server cursor. The explicit Workflow composition persists only reconciliation execution control. Application
+data stays in the same SQLite tables used by the in memory composition.
+
+Use `SqlReplica.layerWorkflow` when reconciliation must recover through Effect Workflow. Supply
+`ClusterWorkflowEngine.layer` and the official runner Layer separately. For one SQLite owner this is normally
+`SingleRunner.layer({ runnerStorage: "sql" })`. Configure `retryDelay`, `maximumRetryDelay`, and `maximumAttempts` on
+`layerWorkflow` to bound one execution's exponential retry history. A later local mutation or server wake creates a
+new generation after a terminal failure. `SqlReplica.layer` remains the explicit lightweight in memory choice.
 
 ## Server and WebSocket RPC
 
@@ -166,14 +181,20 @@ authoritative entity state. Its mutation path acquires the space row inside the 
 materialization, and sequence allocation share one order. SQLite and PostgreSQL both support the required
 `UPDATE ... RETURNING` operation.
 
-Use `authorize` for mutation admission and `authorizeRead` for pull and watch access. Rejections consume the client's
-local sequence and persist an exact retry receipt, but do not consume a server sequence.
+`ServerStore.layer` requires `authorizeAccess`, `authorizeMutation`, and `authorizeRead`. Access authorization runs
+before retry receipt lookup. Mutation admission rejection consumes the client's local sequence and persists an exact
+retry receipt, but does not consume a server sequence. `ServerStore.layerTrusted` is the explicit allow all Layer for
+tests and already trusted processes.
 
 `SyncRpc.Rpcs` multiplexes submit, pull, watch, and presence on one Effect RPC WebSocket. The server uses
 `Authentication.layerServer`; the client uses `Authentication.layerClient`, which writes a redacted bearer credential
-to the request headers. `SyncServer.layer` and `SyncClient.layer` contain the typed handler and client adapters. The
-application remains responsible for its HTTP server, WebSocket path, TLS, Origin policy, credential verification, and
-tenant authorization.
+to the request headers. The authenticated server facade sends all five operations to the Cluster entity for the
+requested space. Cluster supplies the unique live owner and cross runner stream routing. SQL remains the durable
+submit and pull boundary. The application chooses Effect's runner storage, message storage, runner transport, and
+deployment Layers. It also remains responsible for its HTTP server, WebSocket path, TLS, Origin policy, credential
+verification, and tenant authorization. Provide `SyncRpc.layerJson` on both sides. It bounds and sanitizes complete
+JSON frames. A reverse proxy or lower level WebSocket upgrade handler must enforce the same native ingress payload
+limit.
 
 ## Effect Atom
 
@@ -188,9 +209,10 @@ export const putTaskAtom = graph.mutation(PutTask)
 export const replicaStatusAtom = graph.status
 ```
 
-One `Atom.context` and memo map own the runtime. Entity and query atoms register Effect `Reactivity` keys and refresh
-after local commits and reconciliation transactions. Mutation atoms are concurrent and preserve their typed result.
-Pass an application factory with `options.factory` when the application already owns an Atom context.
+The graph defaults to Effect's shared `Atom.runtime`, so every graph participates in one application memo map. Entity
+and query atoms register deduplicated Effect `Reactivity` keys and refresh after local commits and reconciliation
+transactions. Mutation atoms are concurrent and preserve their typed result. Pass an application factory with
+`options.factory` when the application already owns a deliberate custom runtime.
 
 ## Selective field semantics
 
@@ -227,9 +249,15 @@ pnpm bench
 - Local mutation commit is atomic in SQLite and does not require a network.
 - Exact mutation retries are idempotent. Reusing an identity with different canonical bytes fails.
 - Accepted server sequences are dense per space. Clients install only contiguous entries.
+- Pull entries expose only public mutation identity and canonical changes. Payloads and success results are not in the
+  shared authoritative log.
 - A terminal rejection rolls back its optimistic write set and replays remaining pending mutations.
 - Queues, mutation payloads, presence payloads, pull counts, and pull bytes are bounded.
 - Presence is best effort, bounded, TTL based, and never enters the durable mutation log.
+- Cluster routes each space to one live owner across runners. Cluster messages stay volatile because SQL already owns
+  submit idempotency and durability.
+- Workflow executions are finite and generation keyed. SQLite progress repairs lost wakes and browser termination when
+  a runner starts again.
 - The server is an authority, not a peer. Conflict behavior is arrival order unless a handler explicitly applies field
   semantics.
 - There is no protocol version negotiation, migration framework, compaction protocol, multi writer browser ownership

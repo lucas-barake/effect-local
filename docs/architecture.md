@@ -14,7 +14,8 @@ terminal receipt. Accepted mutations alone receive the next dense server sequenc
 
 Client SQLite contains:
 
-- replica identity, definition hash, next local sequence, server cursor, and visible revision
+- replica identity, definition hash, next local sequence, server cursor, visible revision, and requested and completed
+  reconciliation generations
 - canonical entities from accepted server entries
 - visible entities after optimistic pending mutations
 - pending envelopes, results, and write sets ordered by local sequence
@@ -29,22 +30,27 @@ Server SQL contains:
 - accepted entries keyed by server sequence
 - authoritative materialized entities
 
-In memory queues and publications are wake signals. They are never authority.
+Workflow storage contains reconciliation execution control only. It does not contain mutation payloads, receipts, log
+entries, or canonical state. Cluster messages and publications are routed wake and presence signals. They are never
+application data authority.
 
 ## Mutation lifecycle
 
 1. The client reads its durable cursor as the mutation basis.
 2. One SQLite transaction allocates the next local sequence, runs the handler, stores the pending envelope and write
    set, and changes visible entities.
-3. The reconciler submits pending envelopes in local sequence order. Retry always uses the same bytes and identity.
+3. The same transaction increments the requested reconciliation generation. A finite Workflow coalesces durable
+   generations and runs an idempotent reconciliation pass. Retry always uses the same envelope bytes and identity.
 4. The server locks the space order row inside its transaction. It returns an existing exact receipt or processes the
    next client sequence.
-5. A rejection is stored without advancing the accepted sequence. An acceptance appends its exact write set and
-   result at the next sequence.
+5. A rejection is stored without advancing the accepted sequence. An acceptance appends public mutation identity and
+   its exact write set at the next sequence. The success result remains only in the submitter's receipt.
 6. The client pulls from its durable cursor. It installs only contiguous entries into canonical state.
 7. The client removes settled pending mutations, restores touched visible entities from canonical state, and replays
    remaining pending mutations in local order.
-8. Effect `Reactivity` invalidates affected models, receipts, and status after the SQL transaction commits.
+8. Successful reconciliation advances the completed generation idempotently. A newer requested generation starts a
+   new finite Workflow.
+9. Effect `Reactivity` invalidates affected models, receipts, and status after the SQL transaction commits.
 
 ## Handler contract
 
@@ -71,14 +77,28 @@ A terminal rejection advances the server's client sequence watermark but does no
 ## Effect runtime
 
 Public capabilities are `Context.Service` values. Implementations are scoped Layers. SQL transactions and errors stay
-in Effects. The reconciler owns bounded wake queues, a single permit, a watch fiber, and a retrying worker fiber. Scope
-closure interrupts workers and releases subscriptions.
+in Effects. Callers select either the lightweight in memory reconciliation Layer or the finite Workflow Layer. The
+Workflow payload contains only definition, space, client, and generation identity. Activities call the same
+idempotent reconciliation operation as the in memory scheduler.
 
-The browser graph uses one `Atom.context` and memo map. The replica Layer and `factory.withReactivity` therefore share
-one memoized `Reactivity` service. Entity keys invalidate exact records. Query dependencies invalidate by model.
+The server front door is an authenticated WebSocket RPC facade. It routes submit, pull, watch, presence publish, and
+presence watch through one volatile Effect Cluster entity keyed by space. That owner holds the per-space wake and
+presence hubs, so a client connected to one runner observes work admitted through another. Cluster does not wrap the
+server SQL transaction. This keeps durable receipt insertion, canonical writes, log insertion, sequence allocation,
+and post-commit wake ordering under one transaction owner.
+
+Applications provide Effect's Cluster runner, storage, and transport Layers. A single process can use
+`SingleRunner`. Sharded deployments can use shared runner storage and the Node runner transport. The authoritative
+server SQL database must remain reachable after shard reassignment. Pod-local SQLite is valid only when deployment
+placement keeps that database with its space owner.
+
+The browser graph defaults to Effect's shared `Atom.runtime`. The replica Layer and `factory.withReactivity` therefore
+share one application memo map and memoized `Reactivity` service. Entity keys invalidate exact records. Query
+dependencies invalidate once per model.
 
 ## Capacity
 
 Protocol limits bound a mutation, a pull page by count and encoded bytes, and a presence update. Local pending count,
-server wake publication, presence publication, and reconciler wakeup are bounded or sliding. Pull pages contain
-authoritative entries. Streams and publications carry only notifications.
+server wake publication, presence publication, and in memory reconciler wakeup are bounded or sliding. Workflow
+generations coalesce durable requests. Pull pages contain authoritative entries. Streams and publications carry only
+notifications.
