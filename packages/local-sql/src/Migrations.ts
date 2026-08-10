@@ -1156,7 +1156,7 @@ const batchedSyncRepliesMigration = Effect.gen(function*() {
   yield* sql`CREATE INDEX effect_local_migration_15_receipt_match
     ON effect_local_peer_receipts(
       replica_incarnation, peer_id, document_id, reply_hash, row_id
-    ) WHERE reply IS NOT NULL AND reply_hash IS NOT NULL`
+    ) WHERE reply_hash IS NOT NULL`
   yield* sql`CREATE INDEX effect_local_migration_15_outbox_match
     ON effect_local_peer_outbox(
       replica_incarnation, peer_id, document_id, message_hash,
