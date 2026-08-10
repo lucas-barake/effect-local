@@ -16,6 +16,7 @@ const limits: PeerSyncEnvelope.SyncEnvelopeLimits = {
   maxSyncOperationsPerMessage: 10_000
 }
 
+const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
 const rewrittenLineage = Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000011")
 const priorLineage = Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000012")
 
@@ -23,7 +24,7 @@ const checkpointTransfer = PeerSyncEnvelope.CheckpointTransfer.make({
   snapshot: Uint8Array.of(1, 2, 3),
   manifest: {
     purpose: CheckpointAuthority.manifestPurpose,
-    documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001"),
+    documentId,
     lineage: rewrittenLineage,
     checkpointHash: "a".repeat(64),
     heads: Conflict.Heads.make(["z", "a", "z"]),
@@ -34,7 +35,7 @@ const checkpointTransfer = PeerSyncEnvelope.CheckpointTransfer.make({
   },
   transitions: [{
     purpose: CheckpointAuthority.transitionPurpose,
-    documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001"),
+    documentId,
     priorLineage,
     priorCheckpointHash: "b".repeat(64),
     priorHeads: Conflict.Heads.make(["c", "a", "c"]),
@@ -47,6 +48,11 @@ const checkpointTransfer = PeerSyncEnvelope.CheckpointTransfer.make({
     authorization: Uint8Array.of(6, 7)
   }]
 })
+
+const encodedCheckpointTransfer = PeerSyncEnvelope.encodeCheckpointTransfer(
+  checkpointTransfer,
+  limits.maxSyncMessageBytes
+)
 
 const makeSyncEnvelope = Effect.gen(function*() {
   let source = Automerge.from(
@@ -67,7 +73,7 @@ const makeSyncEnvelope = Effect.gen(function*() {
   const envelope = PeerSyncEnvelope.SyncEnvelope.make({
     connectionEpoch: "epoch-1",
     sequence: 1,
-    documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001"),
+    documentId,
     documentType: "Task",
     messageHash: yield* Canonical.digest(message),
     message,
@@ -82,10 +88,7 @@ const makeSyncEnvelope = Effect.gen(function*() {
 describe("PeerSyncEnvelope", () => {
   it.effect("round trips checkpoint transfers with canonical heads", () =>
     Effect.gen(function*() {
-      const bytes = yield* PeerSyncEnvelope.encodeCheckpointTransfer(
-        checkpointTransfer,
-        limits.maxSyncMessageBytes
-      )
+      const bytes = yield* encodedCheckpointTransfer
       const decoded = yield* PeerSyncEnvelope.decodeCheckpointTransfer(
         bytes,
         limits.maxSyncMessageBytes
@@ -110,15 +113,18 @@ describe("PeerSyncEnvelope", () => {
 
   it.effect("admits maximum ordinary and checkpoint payload envelopes", () =>
     Effect.gen(function*() {
-      const ordinaryMessage = new Uint8Array(limits.maxSyncMessageBytes)
-      const ordinaryEnvelope = PeerSyncEnvelope.SyncEnvelope.make({
+      const maximumHeader = {
         connectionEpoch: "x".repeat(256),
         sequence: Number.MAX_SAFE_INTEGER,
-        documentId: checkpointTransfer.manifest.documentId,
+        documentId,
         documentType: "x".repeat(256),
+        lineage: rewrittenLineage
+      }
+      const ordinaryMessage = new Uint8Array(limits.maxSyncMessageBytes)
+      const ordinaryEnvelope = PeerSyncEnvelope.SyncEnvelope.make({
+        ...maximumHeader,
         messageHash: yield* Canonical.digest(ordinaryMessage),
         message: ordinaryMessage,
-        lineage: rewrittenLineage,
         writerProvenance: Array.from(
           { length: limits.maxSyncChangesPerMessage },
           (_, index) => ({
@@ -136,13 +142,9 @@ describe("PeerSyncEnvelope", () => {
 
       const emptyMessage = new Uint8Array()
       const checkpointEnvelope = PeerSyncEnvelope.SyncEnvelope.make({
-        connectionEpoch: "x".repeat(256),
-        sequence: Number.MAX_SAFE_INTEGER,
-        documentId: checkpointTransfer.manifest.documentId,
-        documentType: "x".repeat(256),
+        ...maximumHeader,
         messageHash: yield* Canonical.digest(emptyMessage),
         message: emptyMessage,
-        lineage: rewrittenLineage,
         writerProvenance: [],
         checkpointTransfer: new Uint8Array(limits.maxSyncMessageBytes)
       })
@@ -175,10 +177,7 @@ describe("PeerSyncEnvelope", () => {
 
   it.effect("bounds checkpoint transfer bytes, transitions, and authorization tokens", () =>
     Effect.gen(function*() {
-      const encoded = yield* PeerSyncEnvelope.encodeCheckpointTransfer(
-        checkpointTransfer,
-        limits.maxSyncMessageBytes
-      )
+      const encoded = yield* encodedCheckpointTransfer
       assert.strictEqual(
         (yield* Effect.exit(PeerSyncEnvelope.encodeCheckpointTransfer(
           checkpointTransfer,
@@ -246,15 +245,12 @@ describe("PeerSyncEnvelope", () => {
 
   it.effect("requires checkpoint envelopes to carry only the hash-bound empty message", () =>
     Effect.gen(function*() {
-      const transferBytes = yield* PeerSyncEnvelope.encodeCheckpointTransfer(
-        checkpointTransfer,
-        limits.maxSyncMessageBytes
-      )
+      const transferBytes = yield* encodedCheckpointTransfer
       const emptyMessage = new Uint8Array()
       const base = PeerSyncEnvelope.SyncEnvelope.make({
         connectionEpoch: "epoch-1",
         sequence: 2,
-        documentId: checkpointTransfer.manifest.documentId,
+        documentId,
         documentType: "Task",
         messageHash: yield* Canonical.digest(emptyMessage),
         message: emptyMessage,
