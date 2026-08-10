@@ -20,101 +20,71 @@ describe("ReplicaOperationScheduler", () => {
       Layer.provide(ReplicaLimits.layer({ ...gateLimits, maxQueuedRpc }))
     )
 
-  const lane = (
-    scheduler: ReplicaOperationScheduler.ReplicaOperationScheduler["Service"],
-    value: "interactive" | "background"
-  ) => value === "interactive" ? scheduler.interactive : scheduler.background
-
-  const start = (
-    scheduler: ReplicaOperationScheduler.ReplicaOperationScheduler["Service"],
-    value: "interactive" | "background",
-    label: string,
-    attempted: Queue.Queue<string>,
-    acquired: Queue.Queue<string>,
-    release: Deferred.Deferred<void>
-  ) =>
-    Effect.forkChild(
-      Queue.offer(attempted, label).pipe(
-        Effect.andThen(Effect.scoped(Effect.gen(function*() {
-          yield* lane(scheduler, value)
-          yield* Queue.offer(acquired, label)
-          yield* Deferred.await(release)
-        })))
-      ),
-      { startImmediately: true }
-    )
+  /**
+   * Each started operation offers its label when its fiber first runs, offers it again once admitted,
+   * and then parks until the test releases that label. Releases are keyed by label rather than by
+   * position so a test names the operation it is letting go of, and so inserting an operation earlier
+   * in a test cannot silently renumber the ones after it.
+   */
+  const makeProbe = Effect.gen(function*() {
+    const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
+    const attempted = yield* Queue.unbounded<string>()
+    const acquired = yield* Queue.unbounded<string>()
+    const releases = new Map<string, Deferred.Deferred<void>>()
+    const start = (lane: "interactive" | "background", label: string) =>
+      Effect.gen(function*() {
+        const release = yield* Deferred.make<void>()
+        releases.set(label, release)
+        return yield* Effect.forkChild(
+          Queue.offer(attempted, label).pipe(
+            Effect.andThen(Effect.scoped(Effect.gen(function*() {
+              yield* scheduler[lane]
+              yield* Queue.offer(acquired, label)
+              yield* Deferred.await(release)
+            })))
+          ),
+          { startImmediately: true }
+        )
+      })
+    const release = (label: string) => Deferred.succeed(releases.get(label)!, undefined)
+    return { scheduler, attempted, acquired, start, release } as const
+  })
 
   it.effect("prioritizes interactive admission and preserves FIFO within each lane", () =>
     Effect.gen(function*() {
-      const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
-      const attempted = yield* Queue.unbounded<string>()
-      const acquired = yield* Queue.unbounded<string>()
-      const releases = yield* Effect.all(Array.from({ length: 4 }, () => Deferred.make<void>()))
-
-      const holder = yield* start(scheduler, "background", "holder", attempted, acquired, releases[0]!)
-      assert.strictEqual(yield* Queue.take(acquired), "holder")
-      const backgroundOne = yield* start(
-        scheduler,
-        "background",
-        "background-1",
-        attempted,
-        acquired,
-        releases[1]!
-      )
-      const backgroundTwo = yield* start(
-        scheduler,
-        "background",
-        "background-2",
-        attempted,
-        acquired,
-        releases[2]!
-      )
-      const interactive = yield* start(
-        scheduler,
-        "interactive",
-        "interactive",
-        attempted,
-        acquired,
-        releases[3]!
-      )
-      assert.deepStrictEqual(yield* Queue.takeN(attempted, 4), [
+      const probe = yield* makeProbe
+      const holder = yield* probe.start("background", "holder")
+      assert.strictEqual(yield* Queue.take(probe.acquired), "holder")
+      const backgroundOne = yield* probe.start("background", "background-1")
+      const backgroundTwo = yield* probe.start("background", "background-2")
+      const interactive = yield* probe.start("interactive", "interactive")
+      assert.deepStrictEqual(yield* Queue.takeN(probe.attempted, 4), [
         "holder",
         "background-1",
         "background-2",
         "interactive"
       ])
 
-      yield* Deferred.succeed(releases[0]!, undefined)
-      assert.strictEqual(yield* Queue.take(acquired), "interactive")
-      yield* Deferred.succeed(releases[3]!, undefined)
-      assert.strictEqual(yield* Queue.take(acquired), "background-1")
-      yield* Deferred.succeed(releases[1]!, undefined)
-      assert.strictEqual(yield* Queue.take(acquired), "background-2")
-      yield* Deferred.succeed(releases[2]!, undefined)
+      yield* probe.release("holder")
+      assert.strictEqual(yield* Queue.take(probe.acquired), "interactive")
+      yield* probe.release("interactive")
+      assert.strictEqual(yield* Queue.take(probe.acquired), "background-1")
+      yield* probe.release("background-1")
+      assert.strictEqual(yield* Queue.take(probe.acquired), "background-2")
+      yield* probe.release("background-2")
       yield* Effect.forEach([holder, backgroundOne, backgroundTwo, interactive], Fiber.join, { discard: true })
     }).pipe(Effect.provide(live(4))))
 
   it.effect("bounds lanes independently and recovers capacity after cancellation", () =>
     Effect.gen(function*() {
-      const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
-      const attempted = yield* Queue.unbounded<string>()
-      const acquired = yield* Queue.unbounded<string>()
-      const holderRelease = yield* Deferred.make<void>()
-      const waiterRelease = yield* Deferred.make<void>()
-      const holder = yield* start(scheduler, "background", "holder", attempted, acquired, holderRelease)
-      assert.strictEqual(yield* Queue.take(acquired), "holder")
-      const background = yield* start(
-        scheduler,
-        "background",
-        "background",
-        attempted,
-        acquired,
-        waiterRelease
-      )
-      assert.strictEqual(yield* Queue.take(attempted), "holder")
-      assert.strictEqual(yield* Queue.take(attempted), "background")
+      const probe = yield* makeProbe
+      const holder = yield* probe.start("background", "holder")
+      assert.strictEqual(yield* Queue.take(probe.acquired), "holder")
+      const background = yield* probe.start("background", "background")
+      assert.strictEqual(yield* Queue.take(probe.attempted), "holder")
+      assert.strictEqual(yield* Queue.take(probe.attempted), "background")
 
-      const rejected = yield* Effect.result(Effect.scoped(scheduler.background))
+      const rejected = yield* Effect.result(Effect.scoped(probe.scheduler.background))
       assert.isTrue(Result.isFailure(rejected))
       if (Result.isFailure(rejected)) {
         assert.strictEqual(rejected.failure.reason._tag, "QuotaExceeded")
@@ -124,104 +94,82 @@ describe("ReplicaOperationScheduler", () => {
         }
       }
 
-      const interactive = yield* start(
-        scheduler,
-        "interactive",
-        "interactive",
-        attempted,
-        acquired,
-        waiterRelease
-      )
-      assert.strictEqual(yield* Queue.take(attempted), "interactive")
+      const interactive = yield* probe.start("interactive", "interactive")
+      assert.strictEqual(yield* Queue.take(probe.attempted), "interactive")
       yield* Fiber.interrupt(background)
-      const replacement = yield* start(
-        scheduler,
-        "background",
-        "replacement",
-        attempted,
-        acquired,
-        waiterRelease
-      )
-      assert.strictEqual(yield* Queue.take(attempted), "replacement")
+      const replacement = yield* probe.start("background", "replacement")
+      assert.strictEqual(yield* Queue.take(probe.attempted), "replacement")
 
-      yield* Deferred.succeed(holderRelease, undefined)
-      assert.strictEqual(yield* Queue.take(acquired), "interactive")
-      yield* Deferred.succeed(waiterRelease, undefined)
-      assert.strictEqual(yield* Queue.take(acquired), "replacement")
+      yield* probe.release("holder")
+      assert.strictEqual(yield* Queue.take(probe.acquired), "interactive")
+      yield* probe.release("interactive")
+      assert.strictEqual(yield* Queue.take(probe.acquired), "replacement")
+      yield* probe.release("replacement")
       yield* Effect.forEach([holder, interactive, replacement], Fiber.join, { discard: true })
     }).pipe(Effect.provide(live(1))))
 
   it.effect("closes an interactive batch when background starts waiting", () =>
     Effect.gen(function*() {
-      const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
-      const attempted = yield* Queue.unbounded<string>()
-      const acquired = yield* Queue.unbounded<string>()
-      const releases = yield* Effect.all(Array.from({ length: 3 }, () => Deferred.make<void>()))
-      const first = yield* start(scheduler, "interactive", "interactive-1", attempted, acquired, releases[0]!)
-      assert.strictEqual(yield* Queue.take(acquired), "interactive-1")
-      const background = yield* start(scheduler, "background", "background", attempted, acquired, releases[1]!)
-      const second = yield* start(scheduler, "interactive", "interactive-2", attempted, acquired, releases[2]!)
+      const probe = yield* makeProbe
+      const first = yield* probe.start("interactive", "interactive-1")
+      assert.strictEqual(yield* Queue.take(probe.acquired), "interactive-1")
+      const background = yield* probe.start("background", "background")
+      const second = yield* probe.start("interactive", "interactive-2")
 
-      yield* Deferred.succeed(releases[0]!, undefined)
-      assert.strictEqual(yield* Queue.take(acquired), "background")
-      yield* Deferred.succeed(releases[1]!, undefined)
-      assert.strictEqual(yield* Queue.take(acquired), "interactive-2")
-      yield* Deferred.succeed(releases[2]!, undefined)
+      yield* probe.release("interactive-1")
+      assert.strictEqual(yield* Queue.take(probe.acquired), "background")
+      yield* probe.release("background")
+      assert.strictEqual(yield* Queue.take(probe.acquired), "interactive-2")
+      yield* probe.release("interactive-2")
       yield* Effect.forEach([first, background, second], Fiber.join, { discard: true })
     }).pipe(Effect.provide(live(3))))
 
   it.effect("reopens the interactive batch when the final background waiter is cancelled", () =>
     Effect.gen(function*() {
-      const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
-      const attempted = yield* Queue.unbounded<string>()
-      const acquired = yield* Queue.unbounded<string>()
-      const releases = yield* Effect.all(Array.from({ length: 4 }, () => Deferred.make<void>()))
-      const first = yield* start(scheduler, "interactive", "interactive-1", attempted, acquired, releases[0]!)
-      assert.strictEqual(yield* Queue.take(acquired), "interactive-1")
-      const second = yield* start(scheduler, "interactive", "interactive-2", attempted, acquired, releases[1]!)
-      assert.strictEqual(yield* Queue.take(acquired), "interactive-2")
+      const probe = yield* makeProbe
+      const first = yield* probe.start("interactive", "interactive-1")
+      assert.strictEqual(yield* Queue.take(probe.acquired), "interactive-1")
+      const second = yield* probe.start("interactive", "interactive-2")
+      assert.strictEqual(yield* Queue.take(probe.acquired), "interactive-2")
 
-      const background = yield* start(scheduler, "background", "background", attempted, acquired, releases[2]!)
-      const third = yield* start(scheduler, "interactive", "interactive-3", attempted, acquired, releases[3]!)
-      assert.deepStrictEqual(yield* Queue.takeN(attempted, 4), [
+      const background = yield* probe.start("background", "background")
+      const third = yield* probe.start("interactive", "interactive-3")
+      assert.deepStrictEqual(yield* Queue.takeN(probe.attempted, 4), [
         "interactive-1",
         "interactive-2",
         "background",
         "interactive-3"
       ])
       yield* Fiber.interrupt(background)
-      yield* Deferred.succeed(releases[0]!, undefined)
-      assert.strictEqual(yield* Queue.take(acquired), "interactive-3")
+      yield* probe.release("interactive-1")
+      assert.strictEqual(yield* Queue.take(probe.acquired), "interactive-3")
 
-      yield* Effect.forEach(
-        [releases[1]!, releases[3]!],
-        (release) => Deferred.succeed(release, undefined),
-        { discard: true }
-      )
+      yield* probe.release("interactive-2")
+      yield* probe.release("interactive-3")
       yield* Effect.forEach([first, second, third], Fiber.join, { discard: true })
     }).pipe(Effect.provide(live(1))))
 
   it.effect("bounds the active interactive batch and its waiting queue", () =>
     Effect.gen(function*() {
-      const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
-      const attempted = yield* Queue.unbounded<string>()
-      const acquired = yield* Queue.unbounded<string>()
-      const releases = yield* Effect.all(Array.from({ length: 3 }, () => Deferred.make<void>()))
-      const first = yield* start(scheduler, "interactive", "interactive-1", attempted, acquired, releases[0]!)
-      assert.strictEqual(yield* Queue.take(acquired), "interactive-1")
-      const second = yield* start(scheduler, "interactive", "interactive-2", attempted, acquired, releases[1]!)
-      assert.strictEqual(yield* Queue.take(acquired), "interactive-2")
-      const queued = yield* start(scheduler, "interactive", "interactive-3", attempted, acquired, releases[2]!)
-      assert.deepStrictEqual(yield* Queue.takeN(attempted, 3), ["interactive-1", "interactive-2", "interactive-3"])
-      assert.isTrue(Option.isNone(yield* Queue.poll(acquired)))
+      const probe = yield* makeProbe
+      const first = yield* probe.start("interactive", "interactive-1")
+      assert.strictEqual(yield* Queue.take(probe.acquired), "interactive-1")
+      const second = yield* probe.start("interactive", "interactive-2")
+      assert.strictEqual(yield* Queue.take(probe.acquired), "interactive-2")
+      const queued = yield* probe.start("interactive", "interactive-3")
+      assert.deepStrictEqual(yield* Queue.takeN(probe.attempted, 3), [
+        "interactive-1",
+        "interactive-2",
+        "interactive-3"
+      ])
+      assert.isTrue(Option.isNone(yield* Queue.poll(probe.acquired)))
 
-      const rejected = yield* Effect.result(Effect.scoped(scheduler.interactive))
+      const rejected = yield* Effect.result(Effect.scoped(probe.scheduler.interactive))
       assert.isTrue(Result.isFailure(rejected))
-      yield* Deferred.succeed(releases[0]!, undefined)
-      assert.strictEqual(yield* Queue.take(acquired), "interactive-3")
-      yield* Effect.forEach([releases[1]!, releases[2]!], (release) => Deferred.succeed(release, undefined), {
-        discard: true
-      })
+      yield* probe.release("interactive-1")
+      assert.strictEqual(yield* Queue.take(probe.acquired), "interactive-3")
+      yield* probe.release("interactive-2")
+      yield* probe.release("interactive-3")
       yield* Effect.forEach([first, second, queued], Fiber.join, { discard: true })
     }).pipe(Effect.provide(live(1))))
 
