@@ -16,6 +16,38 @@ import { tables } from "../src/internal/schema.js"
 import * as Migrations from "../src/Migrations.js"
 import * as PeerSyncEnvelope from "../src/PeerSyncEnvelope.js"
 
+/**
+ * Every migration in order, with the checksum each one is expected to record. One list keeps the
+ * applied sets, the upgrade history, and the catalog from drifting apart.
+ */
+const migrationCatalog = [
+  { migration_id: 1, name: "canonical_store", checksum: Migrations.canonicalStoreChecksum },
+  { migration_id: 2, name: "peer_sync", checksum: Migrations.peerSyncChecksum },
+  { migration_id: 3, name: "durability_indexes", checksum: Migrations.durabilityIndexesChecksum },
+  { migration_id: 4, name: "projection_readiness", checksum: Migrations.projectionReadinessChecksum },
+  { migration_id: 5, name: "pending_receipt_indexes", checksum: Migrations.pendingReceiptIndexesChecksum },
+  { migration_id: 6, name: "peer_writer_provenance", checksum: Migrations.peerWriterProvenanceChecksum },
+  { migration_id: 7, name: "replica_health_indexes", checksum: Migrations.replicaHealthIndexesChecksum },
+  { migration_id: 8, name: "document_lineage", checksum: Migrations.documentLineageChecksum },
+  { migration_id: 9, name: "history_rewrite_markers", checksum: Migrations.historyRewriteMarkersChecksum },
+  { migration_id: 10, name: "peer_relay_state", checksum: Migrations.peerRelayStateChecksum },
+  { migration_id: 11, name: "command_delivery", checksum: Migrations.commandDeliveryChecksum },
+  { migration_id: 12, name: "document_history_counters", checksum: Migrations.documentHistoryCountersChecksum },
+  {
+    migration_id: 13,
+    name: "backup_document_installations",
+    checksum: Migrations.backupDocumentInstallationsChecksum
+  },
+  { migration_id: 14, name: "checkpoint_shipping", checksum: Migrations.checkpointShippingChecksum }
+]
+
+const migrationsAfter = (appliedThroughId: number) =>
+  migrationCatalog
+    .filter((migration) => migration.migration_id > appliedThroughId)
+    .map((migration) => [migration.migration_id, migration.name] as const)
+
+const migrationHistory = migrationCatalog.map(({ checksum: _, ...row }) => row)
+
 describe("Migrations", () => {
   it.effect("creates every canonical table", () =>
     Effect.gen(function*() {
@@ -111,24 +143,32 @@ describe("Migrations", () => {
         FROM documents`
       yield* sql`UPDATE effect_local_documents SET projection_status = 'Blocked'
         WHERE document_id = 'document-10000'`
-      yield* sql`INSERT INTO effect_local_lineage_transitions (
-        document_id, prior_lineage, prior_checkpoint_hash, prior_heads, prior_snapshot,
-        lineage, checkpoint_hash, heads, schema_version, writer_definition_hash,
-        authorization, created_at
-      ) VALUES (
-        'document-00001', 'prior-lineage', 'prior-checkpoint', '["a"]', ${new Uint8Array([1])},
-        'lineage', 'checkpoint', '["b"]', 1, 'definition', ${new Uint8Array([2])},
-        '2026-01-01T00:00:00.000Z'
-      )`
-      const ambiguousFork = yield* Effect.exit(sql`INSERT INTO effect_local_lineage_transitions (
-        document_id, prior_lineage, prior_checkpoint_hash, prior_heads, prior_snapshot,
-        lineage, checkpoint_hash, heads, schema_version, writer_definition_hash,
-        authorization, created_at
-      ) VALUES (
-        'document-00001', 'prior-lineage', 'other-prior-checkpoint', '["a"]', ${new Uint8Array([1])},
-        'other-lineage', 'other-checkpoint', '["c"]', 1, 'definition', NULL,
-        '2026-01-01T00:00:01.000Z'
-      )`)
+      const transitionRow = {
+        document_id: "document-00001",
+        prior_lineage: "prior-lineage",
+        prior_checkpoint_hash: "prior-checkpoint",
+        prior_heads: "[\"a\"]",
+        prior_snapshot: new Uint8Array([1]),
+        lineage: "lineage",
+        checkpoint_hash: "checkpoint",
+        heads: "[\"b\"]",
+        schema_version: 1,
+        writer_definition_hash: "definition",
+        authorization: new Uint8Array([2]) as Uint8Array | null,
+        created_at: "2026-01-01T00:00:00.000Z"
+      }
+      const insertTransition = (overrides: Partial<typeof transitionRow>) =>
+        sql`INSERT INTO effect_local_lineage_transitions ${sql.insert({ ...transitionRow, ...overrides })}`
+      yield* insertTransition({})
+      // A second transition off the same prior lineage that anchors somewhere else forks the chain.
+      const ambiguousFork = yield* Effect.exit(insertTransition({
+        prior_checkpoint_hash: "other-prior-checkpoint",
+        lineage: "other-lineage",
+        checkpoint_hash: "other-checkpoint",
+        heads: "[\"c\"]",
+        authorization: null,
+        created_at: "2026-01-01T00:00:01.000Z"
+      }))
       assert.strictEqual(ambiguousFork._tag, "Failure")
       const oversizedAuthorizationRow = yield* Effect.exit(
         Schema.decodeUnknownEffect(Rows.LineageTransitionRow)({
@@ -147,15 +187,12 @@ describe("Migrations", () => {
         })
       )
       assert.strictEqual(oversizedAuthorizationRow._tag, "Failure")
-      const oversizedAuthorization = yield* Effect.exit(sql`INSERT INTO effect_local_lineage_transitions (
-        document_id, prior_lineage, prior_checkpoint_hash, prior_heads, prior_snapshot,
-        lineage, checkpoint_hash, heads, schema_version, writer_definition_hash,
-        authorization, created_at
-      ) VALUES (
-        'document-00001', 'another-prior-lineage', 'prior-checkpoint', '["a"]', ${new Uint8Array([1])},
-        'another-lineage', 'checkpoint', '["b"]', 1, 'definition', ${new Uint8Array(16_385)},
-        '2026-01-01T00:00:02.000Z'
-      )`)
+      const oversizedAuthorization = yield* Effect.exit(insertTransition({
+        prior_lineage: "another-prior-lineage",
+        lineage: "another-lineage",
+        authorization: new Uint8Array(16_385),
+        created_at: "2026-01-01T00:00:02.000Z"
+      }))
       assert.strictEqual(oversizedAuthorization._tag, "Failure")
       yield* sql`ANALYZE`
       const blockedDocumentPlan = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN
@@ -331,20 +368,7 @@ describe("Migrations", () => {
         )`
 
       const applied = yield* Migrations.run
-      assert.deepStrictEqual(applied, [
-        [3, "durability_indexes"],
-        [4, "projection_readiness"],
-        [5, "pending_receipt_indexes"],
-        [6, "peer_writer_provenance"],
-        [7, "replica_health_indexes"],
-        [8, "document_lineage"],
-        [9, "history_rewrite_markers"],
-        [10, "peer_relay_state"],
-        [11, "command_delivery"],
-        [12, "document_history_counters"],
-        [13, "backup_document_installations"],
-        [14, "checkpoint_shipping"]
-      ])
+      assert.deepStrictEqual(applied, migrationsAfter(2))
 
       const outbox = yield* sql<{
         readonly checkpoint_transfer: Uint8Array | null
@@ -472,38 +496,7 @@ describe("Migrations", () => {
         readonly migration_id: number
         readonly name: string
       }>`SELECT migration_id, name, checksum FROM effect_local_migration_catalog ORDER BY migration_id`
-      assert.deepStrictEqual(catalog, [
-        { migration_id: 1, name: "canonical_store", checksum: Migrations.canonicalStoreChecksum },
-        { migration_id: 2, name: "peer_sync", checksum: Migrations.peerSyncChecksum },
-        { migration_id: 3, name: "durability_indexes", checksum: Migrations.durabilityIndexesChecksum },
-        { migration_id: 4, name: "projection_readiness", checksum: Migrations.projectionReadinessChecksum },
-        { migration_id: 5, name: "pending_receipt_indexes", checksum: Migrations.pendingReceiptIndexesChecksum },
-        { migration_id: 6, name: "peer_writer_provenance", checksum: Migrations.peerWriterProvenanceChecksum },
-        { migration_id: 7, name: "replica_health_indexes", checksum: Migrations.replicaHealthIndexesChecksum },
-        { migration_id: 8, name: "document_lineage", checksum: Migrations.documentLineageChecksum },
-        {
-          migration_id: 9,
-          name: "history_rewrite_markers",
-          checksum: Migrations.historyRewriteMarkersChecksum
-        },
-        { migration_id: 10, name: "peer_relay_state", checksum: Migrations.peerRelayStateChecksum },
-        { migration_id: 11, name: "command_delivery", checksum: Migrations.commandDeliveryChecksum },
-        {
-          migration_id: 12,
-          name: "document_history_counters",
-          checksum: Migrations.documentHistoryCountersChecksum
-        },
-        {
-          migration_id: 13,
-          name: "backup_document_installations",
-          checksum: Migrations.backupDocumentInstallationsChecksum
-        },
-        {
-          migration_id: 14,
-          name: "checkpoint_shipping",
-          checksum: Migrations.checkpointShippingChecksum
-        }
-      ])
+      assert.deepStrictEqual(catalog, migrationCatalog)
 
       const indexes = yield* sql<{ readonly name: string }>`
         SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (
@@ -763,12 +756,7 @@ describe("Migrations", () => {
         FROM effect_local_peer_relay_outbox_replica_usage
         ORDER BY replica_incarnation`
 
-      assert.deepStrictEqual(yield* Migrations.run, [
-        [11, "command_delivery"],
-        [12, "document_history_counters"],
-        [13, "backup_document_installations"],
-        [14, "checkpoint_shipping"]
-      ])
+      assert.deepStrictEqual(yield* Migrations.run, migrationsAfter(10))
       assert.deepStrictEqual(yield* selectDurableOutbox, outboxBefore)
       assert.deepStrictEqual(
         yield* sql`SELECT *
@@ -865,22 +853,7 @@ describe("Migrations", () => {
         yield* sql`SELECT migration_id, name
           FROM effect_local_migrations
           ORDER BY migration_id`,
-        [
-          { migration_id: 1, name: "canonical_store" },
-          { migration_id: 2, name: "peer_sync" },
-          { migration_id: 3, name: "durability_indexes" },
-          { migration_id: 4, name: "projection_readiness" },
-          { migration_id: 5, name: "pending_receipt_indexes" },
-          { migration_id: 6, name: "peer_writer_provenance" },
-          { migration_id: 7, name: "replica_health_indexes" },
-          { migration_id: 8, name: "document_lineage" },
-          { migration_id: 9, name: "history_rewrite_markers" },
-          { migration_id: 10, name: "peer_relay_state" },
-          { migration_id: 11, name: "command_delivery" },
-          { migration_id: 12, name: "document_history_counters" },
-          { migration_id: 13, name: "backup_document_installations" },
-          { migration_id: 14, name: "checkpoint_shipping" }
-        ]
+        migrationHistory
       )
       assert.deepStrictEqual(
         yield* sql`SELECT migration_id, name, checksum
@@ -1135,11 +1108,7 @@ describe("Migrations", () => {
           '[]', 0, 'Ready', NULL, ''
         )`
 
-      assert.deepStrictEqual(yield* Migrations.run, [
-        [12, "document_history_counters"],
-        [13, "backup_document_installations"],
-        [14, "checkpoint_shipping"]
-      ])
+      assert.deepStrictEqual(yield* Migrations.run, migrationsAfter(11))
       const counters = yield* sql<{
         readonly document_id: string
         readonly history_bytes: number | null
@@ -1206,11 +1175,7 @@ describe("Migrations", () => {
         )
         SELECT printf('document-%02d', id), 'Task', 1, '[1]', '[]', '[]', 0, 'Ready', NULL, ''
         FROM documents`
-      assert.deepStrictEqual(yield* Migrations.run, [
-        [12, "document_history_counters"],
-        [13, "backup_document_installations"],
-        [14, "checkpoint_shipping"]
-      ])
+      assert.deepStrictEqual(yield* Migrations.run, migrationsAfter(11))
       const counters = yield* sql<{
         readonly document_id: string
         readonly history_bytes: number | null
@@ -1254,11 +1219,7 @@ describe("Migrations", () => {
         ('valid', 'Task', 1, '[1]', '[]', '[]', 0, 'Ready', NULL, ''),
         (${new Uint8Array([1])}, 'Task', 1, '[1]', '[]', '[]', 0, 'Ready', NULL, '')`
 
-      assert.deepStrictEqual(yield* Migrations.run, [
-        [12, "document_history_counters"],
-        [13, "backup_document_installations"],
-        [14, "checkpoint_shipping"]
-      ])
+      assert.deepStrictEqual(yield* Migrations.run, migrationsAfter(11))
       const counters = yield* sql<{
         readonly document_id_type: string
         readonly history_bytes: number | null

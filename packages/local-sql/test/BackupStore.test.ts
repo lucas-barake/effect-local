@@ -41,6 +41,39 @@ describe("BackupStore", () => {
     }
     return bytes
   }
+  /**
+   * The archive lines of a completed export, parsed. Every lineage assertion below reads the
+   * archive itself rather than the database it came from: the documented remedy for a peer refused
+   * on a lineage mismatch is to carry an archive to that peer, so a value the archive does not
+   * contain is a value the remedy cannot deliver.
+   */
+  const archiveLinesOf = (chunks: ReadonlyArray<Uint8Array>) =>
+    new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n").map((line) => JSON.parse(line))
+  /**
+   * Reseals edited archive lines back into archive bytes. Record checksums, the end record roll-up,
+   * and the manifest are all recomputed, so a restore rejects the edit under test rather than the
+   * framing around it. The manifest loop exists because `declaredBytes` counts the manifest line
+   * that carries it, so writing it can change the size it declares.
+   */
+  const encodeArchive = (lines: Array<any>) =>
+    Effect.gen(function*() {
+      const manifest = lines[0]!
+      const records = lines.slice(1, -1)
+      const end = lines.at(-1)!
+      for (const record of records) record.checksum = yield* Canonical.digest(record.value)
+      end.value.recordCount = records.length
+      end.value.recordsChecksum = yield* Canonical.digest(records.map((record) => record.checksum))
+      end.checksum = yield* Canonical.digest(end.value)
+      manifest.value.recordCount = records.length
+      for (let attempt = 0; attempt < 8; attempt++) {
+        manifest.checksum = yield* Canonical.digest(manifest.value)
+        const encoded = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+        if (manifest.value.declaredBytes === encoded.byteLength) return encoded
+        manifest.value.declaredBytes = encoded.byteLength
+      }
+      manifest.checksum = yield* Canonical.digest(manifest.value)
+      return new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+    })
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
   const definition = ReplicaDefinition.make({
     name: "backup-tasks",
@@ -126,31 +159,29 @@ describe("BackupStore", () => {
   )
   const Limits = ReplicaLimits.layer(limits)
   const authorityToken = Uint8Array.of(7, 8, 9) as CheckpointAuthority.AuthorizationToken
+  const issuedByAuthority = (token: CheckpointAuthority.AuthorizationToken) =>
+    Encoding.encodeBase64(token) === Encoding.encodeBase64(authorityToken)
   const checkpointAuthority: CheckpointAuthority.Implementation = {
     signManifest: () => Effect.succeed(Option.some(authorityToken)),
     verifyManifest: (claims, token) =>
-      token.length === authorityToken.length && token.every((byte, index) => byte === authorityToken[index])
-        ? Effect.void
-        : Effect.fail(
-          new ReplicaError.ReplicaError({
-            reason: new ReplicaError.CheckpointRejected({
-              documentId: claims.documentId,
-              reason: "Invalid backup checkpoint authorization"
-            })
+      issuedByAuthority(token) ? Effect.void : Effect.fail(
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.CheckpointRejected({
+            documentId: claims.documentId,
+            reason: "Invalid backup checkpoint authorization"
           })
-        ),
+        })
+      ),
     signTransition: () => Effect.succeed(Option.some(authorityToken)),
     verifyTransition: (claims, token) =>
-      token.length === authorityToken.length && token.every((byte, index) => byte === authorityToken[index])
-        ? Effect.void
-        : Effect.fail(
-          new ReplicaError.ReplicaError({
-            reason: new ReplicaError.CheckpointRejected({
-              documentId: claims.documentId,
-              reason: "Invalid backup transition authorization"
-            })
+      issuedByAuthority(token) ? Effect.void : Effect.fail(
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.CheckpointRejected({
+            documentId: claims.documentId,
+            reason: "Invalid backup transition authorization"
           })
-        )
+        })
+      )
   }
   const Live = SqlReplica.servicesLayerWithBindings(definition, { projections: [] }).pipe(
     Layer.provideMerge(Layer.mergeAll(Database, Limits))
@@ -341,26 +372,12 @@ describe("BackupStore", () => {
       const created = yield* store.create(Task, documentId, { title: "legacy" })
       yield* compaction.compact(Task, documentId)
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
-      const lines = new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n")
-        .map((line) => JSON.parse(line))
+      const lines = archiveLinesOf(chunks)
       const checkpoint = lines.find((line) => line.kind === "Checkpoint")!
       delete checkpoint.value.writer_provenance
-      checkpoint.checksum = yield* Canonical.digest(checkpoint.value)
       const change = lines.find((line) => line.kind === "Change")!
       change.value.writer_definition_hash = "local"
-      change.checksum = yield* Canonical.digest(change.value)
-      const end = lines.at(-1)!
-      end.value.recordsChecksum = yield* Canonical.digest(lines.slice(1, -1).map((line) => line.checksum))
-      end.checksum = yield* Canonical.digest(end.value)
-      const manifest = lines[0]!
-      for (let attempt = 0; attempt < 8; attempt++) {
-        manifest.checksum = yield* Canonical.digest(manifest.value)
-        const encoded = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
-        if (manifest.value.declaredBytes === encoded.byteLength) break
-        manifest.value.declaredBytes = encoded.byteLength
-      }
-      manifest.checksum = yield* Canonical.digest(manifest.value)
-      const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+      const archive = yield* encodeArchive(lines)
 
       yield* backups.restore({
         installationId: yield* Identity.makeBackupInstallationId,
@@ -387,15 +404,6 @@ describe("BackupStore", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(Live)))
 
-  /**
-   * The archive lines of a completed export, parsed. Every lineage assertion below reads the
-   * archive itself rather than the database it came from: the documented remedy for a peer refused
-   * on a lineage mismatch is to carry an archive to that peer, so a value the archive does not
-   * contain is a value the remedy cannot deliver.
-   */
-  const archiveLinesOf = (chunks: ReadonlyArray<Uint8Array>) =>
-    new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n").map((line) => JSON.parse(line))
-
   it.effect("recomputes complete checkpoint backed history instead of trusting archive counters", () =>
     Effect.gen(function*() {
       const backups = yield* BackupStore.BackupStore
@@ -410,19 +418,7 @@ describe("BackupStore", () => {
       document.value.history_changes = null
       document.value.history_operations = "malformed"
       delete document.value.history_bytes
-      document.checksum = yield* Canonical.digest(document.value)
-      const end = lines.at(-1)!
-      end.value.recordsChecksum = yield* Canonical.digest(lines.slice(1, -1).map((line) => line.checksum))
-      end.checksum = yield* Canonical.digest(end.value)
-      const manifest = lines[0]!
-      for (let attempt = 0; attempt < 8; attempt++) {
-        manifest.checksum = yield* Canonical.digest(manifest.value)
-        const encoded = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
-        if (manifest.value.declaredBytes === encoded.byteLength) break
-        manifest.value.declaredBytes = encoded.byteLength
-      }
-      manifest.checksum = yield* Canonical.digest(manifest.value)
-      const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+      const archive = yield* encodeArchive(lines)
 
       yield* backups.restore({
         installationId: yield* Identity.makeBackupInstallationId,
@@ -721,19 +717,7 @@ describe("BackupStore", () => {
       const lines = archiveLinesOf(chunks)
       const transition = lines.find((line) => line.kind === "Transition")!
       transition.value.authorization = Encoding.encodeBase64(Uint8Array.of(8))
-      transition.checksum = yield* Canonical.digest(transition.value)
-      const end = lines.at(-1)!
-      end.value.recordsChecksum = yield* Canonical.digest(lines.slice(1, -1).map((line) => line.checksum))
-      end.checksum = yield* Canonical.digest(end.value)
-      const manifest = lines[0]!
-      for (let attempt = 0; attempt < 8; attempt++) {
-        manifest.checksum = yield* Canonical.digest(manifest.value)
-        const encoded = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
-        if (manifest.value.declaredBytes === encoded.byteLength) break
-        manifest.value.declaredBytes = encoded.byteLength
-      }
-      manifest.checksum = yield* Canonical.digest(manifest.value)
-      const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+      const archive = yield* encodeArchive(lines)
       yield* sql`DELETE FROM effect_local_documents WHERE document_id = ${documentId}`
 
       const result = yield* Effect.result(backups.installDocument(Task, {
@@ -759,15 +743,22 @@ describe("BackupStore", () => {
       const created = yield* store.create(Task, documentId, { title: "replacement" })
       InternalAutomerge.free(created.automerge)
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
-      yield* sql`INSERT INTO effect_local_lineage_transitions (
-        document_id, prior_lineage, prior_checkpoint_hash, prior_heads, prior_snapshot,
-        lineage, checkpoint_hash, heads, schema_version, writer_definition_hash,
-        authorization, created_at
-      ) VALUES (
-        ${documentId}, ${Identity.genesisLineage}, ${"1".repeat(64)}, '[]', ${Uint8Array.of(1)},
-        ${Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000099")}, ${"2".repeat(64)},
-        '[]', ${Task.version}, ${definition.hash}, NULL, '2026-08-09T00:00:00.000Z'
-      )`
+      yield* sql`INSERT INTO effect_local_lineage_transitions ${
+        sql.insert({
+          document_id: documentId,
+          prior_lineage: Identity.genesisLineage,
+          prior_checkpoint_hash: "1".repeat(64),
+          prior_heads: "[]",
+          prior_snapshot: Uint8Array.of(1),
+          lineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000099"),
+          checkpoint_hash: "2".repeat(64),
+          heads: "[]",
+          schema_version: Task.version,
+          writer_definition_hash: definition.hash,
+          authorization: null,
+          created_at: "2026-08-09T00:00:00.000Z"
+        })
+      }`
 
       yield* backups.restore({
         installationId: yield* Identity.makeBackupInstallationId,
@@ -803,19 +794,7 @@ describe("BackupStore", () => {
       const transitions = lines.filter((line) => line.kind === "Transition")
       assert.strictEqual(transitions.length, 2)
       transitions[1]!.value.prior_lineage = transitions[0]!.value.prior_lineage
-      transitions[1]!.checksum = yield* Canonical.digest(transitions[1]!.value)
-      const end = lines.at(-1)!
-      end.value.recordsChecksum = yield* Canonical.digest(lines.slice(1, -1).map((line) => line.checksum))
-      end.checksum = yield* Canonical.digest(end.value)
-      const manifest = lines[0]!
-      for (let attempt = 0; attempt < 8; attempt++) {
-        manifest.checksum = yield* Canonical.digest(manifest.value)
-        const encoded = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
-        if (manifest.value.declaredBytes === encoded.byteLength) break
-        manifest.value.declaredBytes = encoded.byteLength
-      }
-      manifest.checksum = yield* Canonical.digest(manifest.value)
-      const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+      const archive = yield* encodeArchive(lines)
 
       const error = yield* Effect.flip(backups.restore({
         installationId: yield* Identity.makeBackupInstallationId,
@@ -1257,30 +1236,10 @@ describe("BackupStore", () => {
       const created = yield* store.create(Task, documentId, { title: "preserved" })
       InternalAutomerge.free(created.automerge)
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
-      const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.byteLength, 0))
-      let offset = 0
-      for (const chunk of chunks) {
-        bytes.set(chunk, offset)
-        offset += chunk.byteLength
-      }
-      const lines = new TextDecoder().decode(bytes).trimEnd().split("\n")
-        .map((line) => JSON.parse(line))
+      const lines = archiveLinesOf(chunks)
       const document = lines.find((line) => line.kind === "Document")!
       lines.splice(-1, 0, { ...document, value: { ...document.value } })
-      const manifest = lines[0]!
-      const end = lines.at(-1)!
-      manifest.value.recordCount = lines.length - 2
-      end.value.recordCount = lines.length - 2
-      end.value.recordsChecksum = yield* Canonical.digest(lines.slice(1, -1).map((line) => line.checksum))
-      end.checksum = yield* Canonical.digest(end.value)
-      for (let attempt = 0; attempt < 8; attempt++) {
-        manifest.checksum = yield* Canonical.digest(manifest.value)
-        const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
-        if (manifest.value.declaredBytes === archive.byteLength) break
-        manifest.value.declaredBytes = archive.byteLength
-      }
-      manifest.checksum = yield* Canonical.digest(manifest.value)
-      const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+      const archive = yield* encodeArchive(lines)
       const before = yield* sql<{
         readonly replica_incarnation: number
         readonly writer_generation: number
@@ -1319,21 +1278,10 @@ describe("BackupStore", () => {
       const created = yield* store.create(Task, documentId, { title: "preserved" })
       InternalAutomerge.free(created.automerge)
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
-      const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.byteLength, 0))
-      let offset = 0
-      for (const chunk of chunks) {
-        bytes.set(chunk, offset)
-        offset += chunk.byteLength
-      }
-      const lines = new TextDecoder().decode(bytes).trimEnd().split("\n")
-        .map((line) => JSON.parse(line))
+      const lines = archiveLinesOf(chunks)
       const change = lines.find((line) => line.kind === "Change")!
       change.value.bytes = change.value.bytes.replace(/[^=]/g, "A")
-      change.checksum = yield* Canonical.digest(change.value)
-      const end = lines.at(-1)!
-      end.value.recordsChecksum = yield* Canonical.digest(lines.slice(1, -1).map((line) => line.checksum))
-      end.checksum = yield* Canonical.digest(end.value)
-      const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+      const archive = yield* encodeArchive(lines)
 
       const restored = yield* Effect.exit(backups.restore({
         installationId: yield* Identity.makeBackupInstallationId,
@@ -1356,34 +1304,11 @@ describe("BackupStore", () => {
       const created = yield* store.create(Task, documentId, { title: "preserved" })
       InternalAutomerge.free(created.automerge)
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
-      const lines = new TextDecoder()
-        .decode(concatenate(chunks))
-        .trimEnd()
-        .split("\n")
-        .map((line) => JSON.parse(line))
-      const records = lines.slice(1, -1)
-
-      for (const record of records) {
-        if ("document_id" in record.value) {
-          record.value.document_id = "invalid-document-id"
-          record.checksum = yield* Canonical.digest(record.value)
-        }
+      const lines = archiveLinesOf(chunks)
+      for (const record of lines.slice(1, -1)) {
+        if ("document_id" in record.value) record.value.document_id = "invalid-document-id"
       }
-
-      const end = lines.at(-1)!
-      end.value.recordsChecksum = yield* Canonical.digest(records.map((record) => record.checksum))
-      end.checksum = yield* Canonical.digest(end.value)
-      const manifest = lines[0]!
-
-      for (let attempt = 0; attempt < 8; attempt++) {
-        manifest.checksum = yield* Canonical.digest(manifest.value)
-        const bytes = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
-        if (manifest.value.declaredBytes === bytes.byteLength) break
-        manifest.value.declaredBytes = bytes.byteLength
-      }
-
-      manifest.checksum = yield* Canonical.digest(manifest.value)
-      const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+      const archive = yield* encodeArchive(lines)
 
       const result = yield* Effect.result(backups.restore({
         installationId: yield* Identity.makeBackupInstallationId,
@@ -1409,12 +1334,7 @@ describe("BackupStore", () => {
       const created = yield* store.create(Task, documentId, { title: "preserved" })
       InternalAutomerge.free(created.automerge)
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
-      const archive = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.byteLength, 0))
-      let offset = 0
-      for (const chunk of chunks) {
-        archive.set(chunk, offset)
-        offset += chunk.byteLength
-      }
+      const archive = concatenate(chunks)
       const sourceLines = new TextDecoder().decode(archive).trimEnd().split("\n")
 
       const declaredLines = sourceLines.map((line) => JSON.parse(line))
@@ -1589,24 +1509,13 @@ describe("BackupStore", () => {
   it.effect("rejects archive JSON deeper than the configured limit", () =>
     Effect.gen(function*() {
       const backups = yield* BackupStore.BackupStore
-      const archiveText = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(
-        Stream.decodeText(),
-        Stream.runFold(() => "", (text, chunk) => text + chunk)
+      const lines = archiveLinesOf(
+        yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
       )
-      const lines = archiveText.trimEnd()
-        .split("\n")
-        .map((line) => JSON.parse(line))
       let padding: unknown = "leaf"
       for (let depth = 0; depth <= limits.maxJsonDepth; depth++) padding = { value: padding }
       lines[0]!.value.padding = padding
-      for (let attempt = 0; attempt < 8; attempt++) {
-        lines[0]!.checksum = yield* Canonical.digest(lines[0]!.value)
-        const bytes = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
-        if (lines[0]!.value.declaredBytes === bytes.byteLength) break
-        lines[0]!.value.declaredBytes = bytes.byteLength
-      }
-      lines[0]!.checksum = yield* Canonical.digest(lines[0]!.value)
-      const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+      const archive = yield* encodeArchive(lines)
       const result = yield* Effect.exit(backups.restore({
         installationId: yield* Identity.makeBackupInstallationId,
         source: Stream.make(archive),
@@ -1622,8 +1531,7 @@ describe("BackupStore", () => {
       const backups = yield* BackupStore.BackupStore
       const source = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
       const manifest = (chunks: ReadonlyArray<Uint8Array>) =>
-        JSON.parse(new TextDecoder().decode(concatenate(chunks)).split("\n")[0]!)
-          .value as { readonly replicaId: string; readonly incarnation: number }
+        archiveLinesOf(chunks)[0]!.value as { readonly replicaId: string; readonly incarnation: number }
       const initial = manifest(source)
 
       yield* backups.restore({
@@ -1724,23 +1632,10 @@ describe("BackupStore", () => {
         value: { title: "archived" }
       })
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
-      const lines = new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n")
-        .map((line) => JSON.parse(line))
-      const manifest = lines[0]!
+      const lines = archiveLinesOf(chunks)
       const receipt = lines.find((line) => line.kind === "Receipt")!
-      receipt.value.replica_incarnation = manifest.value.incarnation + 5
-      receipt.checksum = yield* Canonical.digest(receipt.value)
-      const end = lines.at(-1)!
-      end.value.recordsChecksum = yield* Canonical.digest(lines.slice(1, -1).map((line) => line.checksum))
-      end.checksum = yield* Canonical.digest(end.value)
-      for (let attempt = 0; attempt < 8; attempt++) {
-        manifest.checksum = yield* Canonical.digest(manifest.value)
-        const bytes = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
-        if (manifest.value.declaredBytes === bytes.byteLength) break
-        manifest.value.declaredBytes = bytes.byteLength
-      }
-      manifest.checksum = yield* Canonical.digest(manifest.value)
-      const tampered = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+      receipt.value.replica_incarnation = lines[0]!.value.incarnation + 5
+      const tampered = yield* encodeArchive(lines)
       const before = yield* sql<{
         readonly replica_incarnation: number
         readonly writer_generation: number

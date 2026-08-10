@@ -28,23 +28,13 @@ import { TestClock } from "effect/testing"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
-import * as BackupStore from "../src/BackupStore.js"
-import * as CommandDeliveryPublisher from "../src/CommandDeliveryPublisher.js"
-import * as CommandDeliveryStore from "../src/CommandDeliveryStore.js"
-import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as CommitPublisher from "../src/CommitPublisher.js"
 import * as Compaction from "../src/Compaction.js"
-import * as DocumentStore from "../src/DocumentStore.js"
 import * as ClusterStorage from "../src/internal/clusterStorage.js"
 import * as PeerRelayClientRuntime from "../src/PeerRelayClientRuntime.js"
 import * as PeerRelayOutboxLimits from "../src/PeerRelayOutboxLimits.js"
 import * as PeerRelayReceiptLimits from "../src/PeerRelayReceiptLimits.js"
-import * as ProjectionStore from "../src/ProjectionStore.js"
-import * as QueryExecutor from "../src/QueryExecutor.js"
-import * as Recovery from "../src/Recovery.js"
-import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
-import * as ReplicaHealth from "../src/ReplicaHealth.js"
 import * as ReplicaWorkflow from "../src/ReplicaWorkflow.js"
 import * as SqlProjection from "../src/SqlProjection.js"
 import * as SqlReplica from "../src/SqlReplica.js"
@@ -173,12 +163,16 @@ describe("SqlReplica", () => {
   const Live = SqlReplica.layerWithBindings(definition, { projections: [] }).pipe(
     Layer.provide(Layer.mergeAll(Database, Handler, Limits))
   )
-  const DirectLive = SqlReplica.layerFromServices(definition).pipe(
-    Layer.provideMerge(
-      SqlReplica.servicesLayerWithBindings(definition, { projections: [] })
-    ),
-    Layer.provide(Layer.mergeAll(Database, Handler, Limits))
-  )
+  /** The direct replica stack, over a caller supplied database so a test can instrument the client. */
+  const directServices = (database: typeof Database, replicaLimits: typeof Limits = Limits) =>
+    SqlReplica.layerFromServices(definition).pipe(
+      Layer.provideMerge(
+        SqlReplica.servicesLayerWithBindings(definition, { projections: [] })
+      ),
+      Layer.provideMerge(Layer.merge(database, replicaLimits)),
+      Layer.provide(Handler)
+    )
+  const DirectLive = directServices(Database)
   const SlowHealthLive = SqlReplica.layerWithBindings(definition, {
     health: { sampleInterval: "5 seconds" },
     projections: []
@@ -499,12 +493,7 @@ describe("SqlReplica", () => {
         })
       ).pipe(Layer.provide(baseDatabase))
       const database = Layer.merge(instrumentedDatabase, NodeCrypto.layer)
-      const services = SqlReplica.layerFromServices(definition).pipe(
-        Layer.provideMerge(
-          SqlReplica.servicesLayerWithBindings(definition, { projections: [] })
-        ),
-        Layer.provide(Layer.mergeAll(database, Handler, Limits))
-      )
+      const services = directServices(database)
 
       yield* Effect.gen(function*() {
         const replica = yield* Replica.Replica
@@ -1116,29 +1105,7 @@ describe("SqlReplica", () => {
         })
       ).pipe(Layer.provideMerge(baseDatabase))
       const database = Layer.merge(instrumentedDatabase, NodeCrypto.layer)
-      const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provideMerge(database))
-      const infrastructure = Layer.merge(bootstrap, ReplicaLimits.layer({ ...limits, maxQueuedPermits: 1 }))
-      const gate = ReplicaGate.layer.pipe(Layer.provideMerge(infrastructure))
-      const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
-      const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
-      const projections = ProjectionStore.layer([]).pipe(Layer.provideMerge(store))
-      const health = ReplicaHealth.layer(definition, ReplicaHealth.defaultOptions).pipe(Layer.provideMerge(projections))
-      const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(health))
-      const queries = QueryExecutor.layer(definition).pipe(
-        Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
-      )
-      const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
-      const deliveryStore = CommandDeliveryStore.layer.pipe(Layer.provideMerge(gate))
-      const deliveryPublisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
-        Layer.provideMerge(deliveryStore)
-      )
-      const backups = BackupStore.layerRejectAll(definition).pipe(
-        Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
-      )
-      const direct = SqlReplica.layerFromServices(definition).pipe(
-        Layer.provideMerge(Layer.mergeAll(backups, deliveryStore, deliveryPublisher))
-      )
-      const services = Layer.merge(direct, Reactivity.layer).pipe(Layer.provide(Handler))
+      const services = directServices(database, ReplicaLimits.layer({ ...limits, maxQueuedPermits: 1 }))
 
       yield* Effect.gen(function*() {
         const replica = yield* Replica.Replica
@@ -1238,29 +1205,7 @@ describe("SqlReplica", () => {
         })
       ).pipe(Layer.provideMerge(baseDatabase))
       const database = Layer.merge(instrumentedDatabase, NodeCrypto.layer)
-      const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provideMerge(database))
-      const infrastructure = Layer.merge(bootstrap, Limits)
-      const gate = ReplicaGate.layer.pipe(Layer.provideMerge(infrastructure))
-      const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
-      const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
-      const projections = ProjectionStore.layer([]).pipe(Layer.provideMerge(store))
-      const health = ReplicaHealth.layer(definition, ReplicaHealth.defaultOptions).pipe(Layer.provideMerge(projections))
-      const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(health))
-      const queries = QueryExecutor.layer(definition).pipe(
-        Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
-      )
-      const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
-      const deliveryStore = CommandDeliveryStore.layer.pipe(Layer.provideMerge(gate))
-      const deliveryPublisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
-        Layer.provideMerge(deliveryStore)
-      )
-      const backups = BackupStore.layerRejectAll(definition).pipe(
-        Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
-      )
-      const direct = SqlReplica.layerFromServices(definition).pipe(
-        Layer.provideMerge(Layer.mergeAll(backups, deliveryStore, deliveryPublisher))
-      )
-      const services = Layer.merge(direct, Reactivity.layer).pipe(Layer.provide(Handler))
+      const services = directServices(database)
 
       yield* Effect.gen(function*() {
         const replica = yield* Replica.Replica
@@ -1365,39 +1310,16 @@ describe("SqlReplica", () => {
         assert.strictEqual(remaining.length, 0)
       }).pipe(Effect.scoped, Effect.provide(services))
     }))
-  const statusServices = Effect.gen(function*() {
-    const database = Layer.merge(
+  // Called per test: `Effect.provide` shares a built layer between calls, and each status test needs
+  // its own database.
+  const statusServices = () =>
+    directServices(Layer.merge(
       SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
       NodeCrypto.layer
-    )
-    const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provideMerge(database))
-    const infrastructure = Layer.merge(bootstrap, Limits)
-    const gate = ReplicaGate.layer.pipe(Layer.provideMerge(infrastructure))
-    const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
-    const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
-    const projections = ProjectionStore.layer([]).pipe(Layer.provideMerge(store))
-    const health = ReplicaHealth.layer(definition, ReplicaHealth.defaultOptions).pipe(Layer.provideMerge(projections))
-    const commands = CommandExecutor.layer(definition).pipe(Layer.provideMerge(health))
-    const queries = QueryExecutor.layer(definition).pipe(
-      Layer.provideMerge(Layer.merge(commands, Reactivity.layer))
-    )
-    const publisher = CommitPublisher.layer.pipe(Layer.provideMerge(queries))
-    const deliveryStore = CommandDeliveryStore.layer.pipe(Layer.provideMerge(gate))
-    const deliveryPublisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
-      Layer.provideMerge(deliveryStore)
-    )
-    const backups = BackupStore.layerRejectAll(definition).pipe(
-      Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
-    )
-    const direct = SqlReplica.layerFromServices(definition).pipe(
-      Layer.provideMerge(Layer.mergeAll(backups, deliveryStore, deliveryPublisher))
-    )
-    return Layer.merge(direct, Reactivity.layer).pipe(Layer.provide(Handler))
-  })
+    ))
 
   it.effect("reports unpublished commits as pending commands", () =>
     Effect.gen(function*() {
-      const services = yield* statusServices
       yield* Effect.gen(function*() {
         const replica = yield* Replica.Replica
         const sql = yield* SqlClient.SqlClient
@@ -1416,12 +1338,11 @@ describe("SqlReplica", () => {
           yield* Stream.runHead(replica.status),
           Option.some<ReplicaStatus.ReplicaStatus>({ _tag: "Ready", pendingCommands: 0 })
         )
-      }).pipe(Effect.scoped, Effect.provide(services))
+      }).pipe(Effect.scoped, Effect.provide(statusServices()))
     }))
 
   it.effect("keeps the status stream open", () =>
     Effect.gen(function*() {
-      const services = yield* statusServices
       yield* Effect.gen(function*() {
         const replica = yield* Replica.Replica
         const ended = yield* Deferred.make<void>()
@@ -1433,7 +1354,7 @@ describe("SqlReplica", () => {
         yield* Effect.yieldNow
         assert.isTrue(Option.isNone(yield* Deferred.poll(ended)))
         yield* Fiber.interrupt(consumer)
-      }).pipe(Effect.scoped, Effect.provide(services))
+      }).pipe(Effect.scoped, Effect.provide(statusServices()))
     }))
   it.effect("reports pending commands through the sharded replica layer", () =>
     Effect.gen(function*() {
