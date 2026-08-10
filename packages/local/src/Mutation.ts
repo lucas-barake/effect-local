@@ -1,124 +1,105 @@
-import type * as Automerge from "@automerge/automerge"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
-import type * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
-import type * as Scope from "effect/Scope"
-import type * as Document from "./Document.js"
+import * as Scope from "effect/Scope"
 import * as SchemaInput from "./internal/schemaInput.js"
-import type * as TaggedError from "./internal/taggedError.js"
+import type * as ReplicaError from "./ReplicaError.js"
+import type * as Transaction from "./Transaction.js"
 
-export type DraftValue<A,> = A extends Automerge.ScalarValue ? A
-  : A extends ReadonlyArray<infer Item> ? Array<DraftValue<Item>>
-  : A extends object ? { -readonly [Key in keyof A]: DraftValue<A[Key]> }
-  : A
-
-export type Draft<D extends Document.Any,> = DraftValue<D["schema"]["Encoded"]>
-
-export type SuccessResult<A,> = [A] extends [void] ? undefined : A
-
-export type HandlerResult<A, E,> = [E] extends [never] ? SuccessResult<A> : Result.Result<A, E>
-
-export interface HandlerOptions<D extends Document.Any, P,> {
-  readonly draft: Draft<D>
+export type Handler<P, A, E, R,> = (options: {
+  readonly transaction: Transaction.Transaction
   readonly payload: P
-  readonly current: D["schema"]["Type"]
-}
-
-export type Handler<D extends Document.Any, P, A, E,> = (
-  options: HandlerOptions<D, P>
-) => HandlerResult<A, E>
-
-let handlerId = 0
+}) => Effect.Effect<A, E | ReplicaError.StorageError, R>
 
 export interface HandlerService<
   Name extends string,
-  D extends Document.Any,
-  P extends Document.WireSchema,
-  A extends Document.WireSchema,
-  E extends TaggedError.Schema,
+  P extends Schema.Top,
+  A extends Schema.Top,
+  E extends Schema.Top,
 > {
-  readonly mutation: Mutation<Name, D, P, A, E>
+  readonly mutation: Mutation<Name, P, A, E>
+  readonly execute: Handler<P["Type"], A["Type"], E["Type"], never>
 }
 
-export interface Mutation<
-  Name extends string,
-  D extends Document.Any,
-  P extends Document.WireSchema,
-  A extends Document.WireSchema,
-  E extends TaggedError.Schema,
-> {
+export interface Mutation<Name extends string, P extends Schema.Top, A extends Schema.Top, E extends Schema.Top,> {
   readonly name: Name
-  readonly version: number
-  readonly document: D
   readonly payloadSchema: P
   readonly successSchema: A
-  readonly errorSchema: E
-  readonly handler: Context.Service<
-    HandlerService<Name, D, P, A, E>,
-    Handler<D, P["Type"], A["Type"], E["Type"]>
-  >
-  readonly of: (implementation: Handler<D, P["Type"], A["Type"], E["Type"]>) => Handler<
-    D,
-    P["Type"],
-    A["Type"],
-    E["Type"]
-  >
-  readonly toLayer: <EX = never, RX = never,>(
+  readonly rejectionSchema: E
+  readonly handler: Context.Service<HandlerService<Name, P, A, E>, HandlerService<Name, P, A, E>>
+  readonly of: <R,>(
+    implementation: Handler<P["Type"], A["Type"], E["Type"], R>
+  ) => Handler<P["Type"], A["Type"], E["Type"], R>
+  readonly toLayer: <R, EX = never, RX = never,>(
     build:
-      | Handler<D, P["Type"], A["Type"], E["Type"]>
-      | Effect.Effect<Handler<D, P["Type"], A["Type"], E["Type"]>, EX, RX>
-  ) => Layer.Layer<HandlerService<Name, D, P, A, E>, EX, Exclude<RX, Scope.Scope>>
+      | Handler<P["Type"], A["Type"], E["Type"], R>
+      | Effect.Effect<Handler<P["Type"], A["Type"], E["Type"], R>, EX, RX>
+  ) => Layer.Layer<HandlerService<Name, P, A, E>, EX, Exclude<R | RX, Scope.Scope>>
 }
 
 export interface Any {
   readonly name: string
-  readonly version: number
-  readonly document: Document.Any
-  readonly payloadSchema: Document.WireSchema
-  readonly successSchema: Document.WireSchema
-  readonly errorSchema: TaggedError.Schema
+  readonly payloadSchema: Schema.Top
+  readonly successSchema: Schema.Top
+  readonly rejectionSchema: Schema.Top
   readonly handler: Context.Service.Any
 }
 
+let handlerId = 0
+
 export const make = <
   const Name extends string,
-  D extends Document.Any,
-  P extends SchemaInput.Input = typeof Schema.Void,
-  A extends Document.WireSchema = typeof Schema.Void,
-  E extends TaggedError.Schema = typeof Schema.Never,
->(
-  name: Name,
-  options: {
-    readonly document: D
-    readonly version?: number
-    readonly payload?: SchemaInput.Valid<P>
-    readonly success?: A
-    readonly error?: E
-  }
-): Mutation<Name, D, SchemaInput.Wire<P>, A, E> => {
+  P extends SchemaInput.Input = typeof SchemaInput.Void,
+  A extends SchemaInput.WireSchema = typeof SchemaInput.Void,
+  E extends SchemaInput.WireSchema = typeof Schema.Never,
+>(name: Name, options?: {
+  readonly payload?: SchemaInput.Valid<P>
+  readonly success?: A
+  readonly rejection?: E
+}): Mutation<Name, SchemaInput.Wire<P>, A, E> => {
   if (name.length === 0) throw new TypeError("Mutation name must be nonempty")
-  if (name.startsWith("$")) {
-    throw new TypeError(`Mutation name must not start with "$", it is reserved for operation sentinels: ${name}`)
-  }
-  const version = options.version ?? 1
-  if (!Number.isSafeInteger(version) || version < 1) throw new TypeError("Mutation version must be a positive integer")
+  if (name.startsWith("$")) throw new TypeError(`Mutation name must not start with $: ${name}`)
+  const payloadSchema = options?.payload === undefined ?
+    SchemaInput.Void as unknown as SchemaInput.Wire<P> :
+    (Schema.isSchema(options.payload) ? options.payload : Schema.Struct(options.payload)) as SchemaInput.Wire<P>
+  const successSchema = (options?.success ?? SchemaInput.Void) as A
+  const rejectionSchema = (options?.rejection ?? Schema.Never) as E
   const handler = Context.Service<
-    HandlerService<Name, D, SchemaInput.Wire<P>, A, E>,
-    Handler<D, SchemaInput.Wire<P>["Type"], A["Type"], E["Type"]>
-  >(`@lucas-barake/effect-local/Mutation/${options.document.name}/${name}/${handlerId++}`)
-  return {
+    HandlerService<Name, SchemaInput.Wire<P>, A, E>,
+    HandlerService<Name, SchemaInput.Wire<P>, A, E>
+  >(
+    `@lucas-barake/effect-local/Mutation/${name}/${handlerId++}`
+  )
+  const toLayer = <R, EX = never, RX = never,>(
+    build:
+      | Handler<SchemaInput.Wire<P>["Type"], A["Type"], E["Type"], R>
+      | Effect.Effect<Handler<SchemaInput.Wire<P>["Type"], A["Type"], E["Type"], R>, EX, RX>
+  ): Layer.Layer<HandlerService<Name, SchemaInput.Wire<P>, A, E>, EX, Exclude<R | RX, Scope.Scope>> =>
+    Layer.effect(
+      handler,
+      Effect.gen(function*() {
+        const context = (yield* Effect.context<R | Scope.Scope>()).pipe(Context.omit(Scope.Scope)) as Context.Context<R>
+        const implementation = Effect.isEffect(build) ? yield* build : build
+        return {
+          mutation,
+          execute: (input: Parameters<typeof implementation>[0]) =>
+            implementation(input).pipe(Effect.provide(context), Effect.scoped)
+        }
+      })
+    )
+  const mutation: Mutation<Name, SchemaInput.Wire<P>, A, E> = {
     name,
-    version,
-    document: options.document,
-    payloadSchema: options.payload === undefined
-      ? Schema.Void as SchemaInput.Wire<P>
-      : SchemaInput.normalize(options.payload),
-    successSchema: (options.success ?? Schema.Void) as unknown as A,
-    errorSchema: (options.error ?? Schema.Never) as unknown as E,
+    payloadSchema,
+    successSchema,
+    rejectionSchema,
     handler,
-    of: handler.of,
-    toLayer: (build) => Layer.effect(handler, Effect.isEffect(build) ? build : Effect.succeed(build))
+    of: (implementation) => implementation,
+    toLayer
   }
+  return mutation
 }
+
+export type Payload<M extends Any,> = M["payloadSchema"]["Type"]
+export type Success<M extends Any,> = M["successSchema"]["Type"]
+export type Rejection<M extends Any,> = M["rejectionSchema"]["Type"]
