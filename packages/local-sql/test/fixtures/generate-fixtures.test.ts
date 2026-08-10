@@ -1,6 +1,8 @@
 import { NodeFileSystem } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as Config from "effect/Config"
+import * as ConfigProvider from "effect/ConfigProvider"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import { FileSystem } from "effect/FileSystem"
@@ -9,13 +11,12 @@ import * as Schema from "effect/Schema"
 import * as Migrator from "effect/unstable/sql/Migrator"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
-import * as NFS from "node:fs"
 import * as Migrations from "../../src/Migrations.js"
 import type { FixtureSpec } from "./versions.js"
 import { fixtureDirectory, fixtures } from "./versions.js"
 
 const fixedMigrationCreatedAt = "2020-01-01 00:00:00"
-const generatorRuntime = { node: "24.15.0", sqlite: "3.51.3" } as const
+const generatorRuntime = { node: "24.15.0", sqlite: "3.51.3" } satisfies Readonly<Record<"node" | "sqlite", string>>
 
 const generateFixture = (spec: FixtureSpec, database: string) =>
   Effect.gen(function*() {
@@ -58,12 +59,8 @@ const generateFixtureSet = (directory: string, specs: ReadonlyArray<FixtureSpec>
     { discard: true }
   )
 
-// A cancel-less link syscall can outlive the fiber that issued it, so `Fiber.interrupt`
-// reporting success does not prove the kernel stopped publishing. Effect level tracking
-// (`Ref`, `ensuring`) never observes that, because an abandoned fiber runs nothing else.
-// The probe hooks the node callback itself, so syscall completion is seen from the event
-// loop even after the fiber is gone. The gate holds back every link after the first, so a
-// test interrupts inside one deterministic interleaving instead of racing real time.
+// The gate holds back every link after the first, so interruption is tested at one
+// deterministic interleaving instead of racing real time.
 interface LinkProbe {
   readonly awaitStarted: (index: number) => Effect.Effect<void>
   readonly awaitCompleted: (index: number) => Effect.Effect<void>
@@ -72,36 +69,27 @@ interface LinkProbe {
   readonly link: (index: number, path: string, destination: string) => Effect.Effect<void>
 }
 
-const makeLinkProbe = (): LinkProbe => {
+const makeLinkProbe = (fs: FileSystem.FileSystem): LinkProbe => {
   const started = fixtures.map(() => Latch.makeUnsafe())
   const completed = fixtures.map(() => Latch.makeUnsafe())
   const quiescent = Latch.makeUnsafe(true)
+  const releaseGate = Latch.makeUnsafe()
   let inFlight = 0
-  let releaseGate!: () => void
-  const gate = new Promise<void>((resolve) => {
-    releaseGate = resolve
-  })
   return {
-    awaitStarted: (index) => started[index]!.await,
-    awaitCompleted: (index) => completed[index]!.await,
+    awaitStarted: (index) => started[index].await,
+    awaitCompleted: (index) => completed[index].await,
     awaitQuiescent: quiescent.await,
-    release: Effect.sync(() => releaseGate()),
+    release: Effect.sync(() => Latch.openUnsafe(releaseGate)),
     link: (index, path, destination) =>
-      // Same shape as `FileSystem.link` (`effectify(NFS.link, ...)`): a callback with no
-      // canceler, so an interrupted fiber is abandoned while the syscall keeps going.
-      Effect.callback<void>((resume) => {
+      Effect.gen(function*() {
         inFlight++
         Latch.closeUnsafe(quiescent)
-        Latch.openUnsafe(started[index]!)
-        const issue = () =>
-          NFS.link(path, destination, (error) => {
-            inFlight--
-            if (inFlight === 0) Latch.openUnsafe(quiescent)
-            Latch.openUnsafe(completed[index]!)
-            resume(error === null ? Effect.void : Effect.die(error))
-          })
-        if (index === 0) issue()
-        else gate.then(issue)
+        Latch.openUnsafe(started[index])
+        if (index > 0) yield* releaseGate.await
+        yield* fs.link(path, destination)
+        inFlight--
+        if (inFlight === 0) Latch.openUnsafe(quiescent)
+        Latch.openUnsafe(completed[index])
       })
   }
 }
@@ -114,7 +102,7 @@ const publishMissingFixtures = (destinationDirectory: string, probe?: LinkProbe)
       (spec) => fs.exists(`${destinationDirectory}/${spec.file}`)
     )
     const firstMissing = existing.indexOf(false)
-    if (firstMissing === -1) return [] as ReadonlyArray<string>
+    if (firstMissing === -1) return []
     if (existing.slice(firstMissing).some(Boolean)) {
       return yield* Effect.die("Existing migration fixtures must form a complete version prefix")
     }
@@ -141,9 +129,10 @@ const publishMissingFixtures = (destinationDirectory: string, probe?: LinkProbe)
     yield* Effect.forEach(
       pending,
       ({ path, published: destination }, index) =>
-        Effect.uninterruptible(
-          probe === undefined ? fs.link(path, destination) : probe.link(index, path, destination)
-        ).pipe(
+        Effect.uninterruptible(Effect.gen(function*() {
+          if (probe === undefined) return yield* fs.link(path, destination)
+          return yield* probe.link(index, path, destination)
+        })).pipe(
           Effect.andThen(Effect.yieldNow)
         ),
       { discard: true }
@@ -174,7 +163,7 @@ describe("migration fixture generation", () => {
       const directory = yield* fs.makeTempDirectoryScoped()
       assert.deepStrictEqual(yield* publishMissingFixtures(directory), fixtures.map((spec) => spec.file))
 
-      const frozen = `${directory}/${fixtures[0]!.file}`
+      const frozen = `${directory}/${fixtures[0].file}`
       yield* fs.writeFile(frozen, Uint8Array.of(99))
       assert.deepStrictEqual(yield* publishMissingFixtures(directory), [])
       assert.deepStrictEqual(yield* fs.readFile(frozen), Uint8Array.of(99))
@@ -185,7 +174,7 @@ describe("migration fixture generation", () => {
       const fs = yield* FileSystem
       const directory = yield* fs.makeTempDirectoryScoped()
       const publisher = yield* publishMissingFixtures(directory).pipe(Effect.forkChild)
-      const first = `${directory}/${fixtures[0]!.file}`
+      const first = `${directory}/${fixtures[0].file}`
       while (!(yield* fs.exists(first))) yield* Effect.yieldNow
       yield* Fiber.interrupt(publisher)
 
@@ -206,7 +195,7 @@ describe("migration fixture generation", () => {
     Effect.gen(function*() {
       const fs = yield* FileSystem
       const directory = yield* fs.makeTempDirectoryScoped()
-      const probe = makeLinkProbe()
+      const probe = makeLinkProbe(fs)
       const publisher = yield* publishMissingFixtures(directory, probe).pipe(Effect.forkChild)
 
       // Interrupt with the second link mid flight, the one interleaving where a cancel-less
@@ -218,7 +207,7 @@ describe("migration fixture generation", () => {
       yield* Fiber.join(interruption)
 
       const published = (files: ReadonlyArray<string>) =>
-        files.filter((file) => fixtures.some((spec) => spec.file === file)).sort()
+        files.filter((file) => fixtures.some((spec) => spec.file === file)).toSorted()
       const reported = published(yield* fs.readDirectory(directory))
       yield* probe.awaitQuiescent
       assert.deepStrictEqual(
@@ -233,7 +222,7 @@ describe("migration fixture generation", () => {
       const fs = yield* FileSystem
       const directory = yield* fs.makeTempDirectoryScoped()
       const publisher = yield* publishMissingFixtures(directory).pipe(Effect.exit, Effect.forkChild)
-      const first = fixtures[0]!
+      const first = fixtures[0]
       const pendingPrefix = `.${first.file}.`
       while (!(yield* fs.readDirectory(directory)).some((file) => file.startsWith(pendingPrefix))) {
         yield* Effect.yieldNow
@@ -249,14 +238,18 @@ describe("migration fixture generation", () => {
     Effect.gen(function*() {
       const fs = yield* FileSystem
       const directory = yield* fs.makeTempDirectoryScoped()
-      yield* fs.writeFile(`${directory}/${fixtures[1]!.file}`, Uint8Array.of(1))
+      yield* fs.writeFile(`${directory}/${fixtures[1].file}`, Uint8Array.of(1))
 
       assert.strictEqual((yield* Effect.exit(publishMissingFixtures(directory)))._tag, "Failure")
-      assert.isFalse(yield* fs.exists(`${directory}/${fixtures[0]!.file}`))
-      assert.isFalse(yield* fs.exists(`${directory}/${fixtures[2]!.file}`))
+      assert.isFalse(yield* fs.exists(`${directory}/${fixtures[0].file}`))
+      assert.isFalse(yield* fs.exists(`${directory}/${fixtures[2].file}`))
     }).pipe(Effect.provide(NodeFileSystem.layer)))
 
-  it.effect.skipIf(process.env.EFFECT_LOCAL_REGEN_FIXTURES !== "1")(
+  it.effect.skipIf(
+    Effect.runSync(
+      Config.string("EFFECT_LOCAL_REGEN_FIXTURES").pipe(Config.withDefault("0")).parse(ConfigProvider.fromEnv())
+    ) !== "1"
+  )(
     "publishes only missing trailing frozen fixtures",
     () =>
       Effect.gen(function*() {

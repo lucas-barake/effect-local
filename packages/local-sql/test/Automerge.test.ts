@@ -3,30 +3,34 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
+import * as Clock from "effect/Clock"
+import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import { vi } from "vitest"
 import * as Automerge from "../src/internal/automerge.js"
 import * as Conflicts from "../src/internal/conflicts.js"
 import { gateLimits } from "./fixtures/limits.js"
+import { encodeJson } from "./helpers/json.js"
 
-const automergeMock = vi.hoisted(() => ({
-  cloned: undefined as NativeAutomerge.Doc<Automerge.Root<{ title: string }>> | undefined
-}))
-vi.mock("@automerge/automerge", async (importActual) => {
-  const actual = await importActual<typeof NativeAutomerge>()
-  return {
-    ...actual,
-    clone: <T,>(
-      document: NativeAutomerge.Doc<T>,
-      options?: NativeAutomerge.ActorId | NativeAutomerge.InitOptions<T>
-    ) => {
-      const cloned = actual.clone(document, options)
-      automergeMock.cloned = cloned as NativeAutomerge.Doc<Automerge.Root<{ title: string }>>
-      return cloned
-    }
-  }
-})
+const automergeMock: {
+  cloned: NativeAutomerge.Doc<Automerge.Root<{ title: string }>> | undefined
+} = vi.hoisted(() => ({ cloned: undefined }))
+vi.mock(
+  "@automerge/automerge",
+  (importActual) =>
+    vi.importActual<typeof NativeAutomerge>("@automerge/automerge").then((actual) => ({
+      ...actual,
+      clone: <T,>(
+        document: NativeAutomerge.Doc<T>,
+        options?: NativeAutomerge.ActorId | NativeAutomerge.InitOptions<T>
+      ) => {
+        const cloned = actual.clone(document, options)
+        automergeMock.cloned = cloned
+        return cloned
+      }
+    }))
+)
 
 describe("Automerge persistence", () => {
   const actor = (suffix: string) => suffix.padStart(32, "0")
@@ -81,28 +85,28 @@ describe("Automerge persistence", () => {
     const replicaId = Identity.ReplicaId.make("rep_00000000-0000-4000-8000-000000000001")
     const generation = Identity.WriterGeneration.make(1)
     const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
-    const actor = Automerge.actorId(replicaId, generation, documentId)
-    assert.strictEqual(Automerge.actorId(replicaId, generation, documentId), actor)
+    const derivedActor = Automerge.actorId(replicaId, generation, documentId)
+    assert.strictEqual(Automerge.actorId(replicaId, generation, documentId), derivedActor)
     assert.notStrictEqual(
       Automerge.actorId(
         replicaId,
         generation,
         Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000002")
       ),
-      actor
+      derivedActor
     )
   })
 
   it("extracts explicit changes and replays them from durable heads", () => {
     const replicaId = Identity.ReplicaId.make("rep_00000000-0000-4000-8000-000000000001")
-    const actor = Automerge.actorId(
+    const documentActor = Automerge.actorId(
       replicaId,
       Identity.WriterGeneration.make(1),
       Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
     )
-    const durable = Automerge.initialize({ title: "one", labels: [] as Array<string> }, actor)
+    const durable = Automerge.initialize({ title: "one", labels: [] }, documentActor)
     const durableHeads = Automerge.heads(durable)
-    const staged = Automerge.stage(durable, actor, (draft) => {
+    const staged = Automerge.stage(durable, documentActor, (draft) => {
       draft.title = "two"
       draft.labels.push("local")
     })
@@ -111,33 +115,32 @@ describe("Automerge persistence", () => {
     assert.deepStrictEqual(Automerge.value(replayed), { title: "two", labels: ["local"] })
     assert.deepStrictEqual(Automerge.heads(replayed), Automerge.heads(staged))
     assert.strictEqual(changes.length, 1)
-    assert.strictEqual(changes[0]?.actor, actor)
+    assert.strictEqual(changes[0]?.actor, documentActor)
     Automerge.free(replayed)
     Automerge.free(staged)
   })
 
-  it("frees a staged clone when the change callback throws", () => {
-    const actor = "00000000000000000000000000000001"
-    const durable = Automerge.initialize({ title: "one" }, actor)
+  it.effect("frees a staged clone when the change callback throws", () => {
+    const callbackActor = "00000000000000000000000000000001"
+    const durable = Automerge.initialize({ title: "one" }, callbackActor)
     automergeMock.cloned = undefined
-    try {
+    return Effect.sync(() => {
       assert.throws(() =>
-        Automerge.stage(durable, actor, () => {
-          throw new Error("change rejected")
+        Automerge.stage(durable, callbackActor, () => {
+          assert.fail("change rejected")
         })
       )
       assert.isDefined(automergeMock.cloned)
-      assert.throws(() => NativeAutomerge.getHeads(automergeMock.cloned!))
-    } finally {
-      Automerge.free(durable)
-    }
+      if (automergeMock.cloned === undefined) return
+      assert.throws(() => NativeAutomerge.getHeads(automergeMock.cloned))
+    }).pipe(Effect.ensuring(Effect.sync(() => Automerge.free(durable))))
   })
 
   it.effect("inspects detached datatype exact alternatives and resolves a selected scalar", () =>
     Effect.acquireUseRelease(
       Effect.sync(() =>
         concurrent(
-          { title: "base" as string | NativeAutomerge.ImmutableString },
+          { title: "base" },
           (draft) => draft.title = "same",
           (draft) => draft.title = new NativeAutomerge.ImmutableString("same")
         )
@@ -146,7 +149,7 @@ describe("Automerge persistence", () => {
         Effect.gen(function*() {
           const records = yield* Conflicts.inspect(merged, gateLimits)
           assert.strictEqual(records.length, 1)
-          const record = records[0]!
+          const record = records[0]
           assert.deepStrictEqual(record.path, {
             parents: [],
             target: { _tag: "Key", key: "title" }
@@ -156,6 +159,7 @@ describe("Automerge persistence", () => {
             NativeAutomerge.isImmutableString(alternative.value)
           )
           assert.isDefined(immutable)
+          if (immutable === undefined) yield* Effect.die("expected an immutable alternative")
           assert.isTrue(record.alternatives.some((alternative) => alternative.id === record.visible))
 
           const resolution: Conflict.Resolution = {
@@ -163,20 +167,26 @@ describe("Automerge persistence", () => {
             path: record.path,
             choice: {
               _tag: "SelectAlternative",
-              alternativeId: immutable!.id
+              alternativeId: immutable.id
             }
           }
           const prepared = yield* Conflicts.prepareResolution(merged, resolution, gateLimits)
           const resolved = Automerge.stage(merged, actor("4"), (draft) =>
             Conflicts.applyResolution(draft, prepared, { promoteParents: false }))
-          try {
-            assert.isTrue(NativeAutomerge.isImmutableString(Automerge.value(resolved).title))
+          yield* Effect.gen(function*() {
+            const resolvedValue = Automerge.value(resolved)
+            if (!NativeAutomerge.isImmutableString(resolvedValue.title)) {
+              yield* Effect.die("expected an immutable resolved value")
+            }
             assert.deepStrictEqual(yield* Conflicts.inspect(resolved, gateLimits), [])
-            ;(immutable!.value as NativeAutomerge.ImmutableString).val = "detached"
-            assert.strictEqual((Automerge.value(resolved).title as NativeAutomerge.ImmutableString).val, "same")
-          } finally {
+            if (!NativeAutomerge.isImmutableString(immutable.value)) {
+              yield* Effect.die("expected an immutable selected value")
+            }
+            immutable.value.val = "detached"
+            assert.strictEqual(resolvedValue.title.val, "same")
+          }).pipe(Effect.ensuring(Effect.sync(() =>
             Automerge.free(resolved)
-          }
+          )))
         }),
       (merged) => Effect.sync(() => Automerge.free(merged))
     ))
@@ -196,7 +206,7 @@ describe("Automerge persistence", () => {
           assert.isDefined(record)
           const resolution: Conflict.Resolution = {
             heads: Automerge.heads(merged),
-            path: record!.path,
+            path: record.path,
             choice: { _tag: "DeleteValue" }
           }
           const prepared = yield* Conflicts.prepareResolution(merged, resolution, gateLimits)
@@ -205,11 +215,9 @@ describe("Automerge persistence", () => {
             actor("5"),
             (draft) => Conflicts.applyResolution(draft, prepared, { promoteParents: false })
           )
-          try {
-            assert.deepStrictEqual(Automerge.value(resolved).items, [])
-          } finally {
-            Automerge.free(resolved)
-          }
+          yield* Effect.sync(() => assert.deepStrictEqual(Automerge.value(resolved).items, [])).pipe(
+            Effect.ensuring(Effect.sync(() => Automerge.free(resolved)))
+          )
         }),
       (merged) => Effect.sync(() => Automerge.free(merged))
     ))
@@ -218,7 +226,7 @@ describe("Automerge persistence", () => {
     Effect.acquireUseRelease(
       Effect.sync(() =>
         concurrent(
-          { value: "base" as NativeAutomerge.AutomergeValue },
+          { value: "base" },
           (draft) => draft.value = "left",
           (draft) => draft.value = "right"
         )
@@ -227,11 +235,11 @@ describe("Automerge persistence", () => {
         Effect.gen(function*() {
           const [record] = yield* Conflicts.inspect(merged, gateLimits)
           assert.isDefined(record)
-          const replacement = Object.create(null) as Record<string, NativeAutomerge.AutomergeValue>
+          const replacement: Record<string, NativeAutomerge.AutomergeValue> = Object.create(null)
           replacement.nested = Object.assign(Object.create(null), { title: "chosen" })
           const resolution: Conflict.Resolution = {
             heads: Automerge.heads(merged),
-            path: record!.path,
+            path: record.path,
             choice: { _tag: "ReplaceValue", value: replacement }
           }
           const prepared = yield* Conflicts.prepareResolution(merged, resolution, gateLimits)
@@ -240,12 +248,10 @@ describe("Automerge persistence", () => {
             actor("15"),
             (draft) => Conflicts.applyResolution(draft, prepared, { promoteParents: false })
           )
-          try {
+          yield* Effect.gen(function*() {
             assert.deepStrictEqual(Automerge.value(resolved), { value: { nested: { title: "chosen" } } })
             assert.deepStrictEqual(yield* Conflicts.inspect(resolved, gateLimits), [])
-          } finally {
-            Automerge.free(resolved)
-          }
+          }).pipe(Effect.ensuring(Effect.sync(() => Automerge.free(resolved))))
         }),
       (merged) => Effect.sync(() => Automerge.free(merged))
     ))
@@ -254,7 +260,7 @@ describe("Automerge persistence", () => {
     Effect.acquireUseRelease(
       Effect.sync(() =>
         concurrent(
-          { section: { value: "base" as NativeAutomerge.AutomergeValue } },
+          { section: { value: "base" } },
           (draft) => draft.section.value = "left",
           (draft) => draft.section.value = "right"
         )
@@ -265,7 +271,7 @@ describe("Automerge persistence", () => {
           assert.isDefined(record)
           const resolution: Conflict.Resolution = {
             heads: Automerge.heads(merged),
-            path: record!.path,
+            path: record.path,
             choice: { _tag: "ReplaceValue", value: { selected: ["nested"] } }
           }
           const prepared = yield* Conflicts.prepareResolution(merged, resolution, gateLimits)
@@ -274,14 +280,12 @@ describe("Automerge persistence", () => {
             actor("16"),
             (draft) => Conflicts.applyResolution(draft, prepared, { promoteParents: true })
           )
-          try {
-            assert.deepStrictEqual(Automerge.value(resolved) as unknown, {
+          yield* Effect.gen(function*() {
+            assert.deepStrictEqual(Automerge.value(resolved), {
               section: { value: { selected: ["nested"] } }
             })
             assert.deepStrictEqual(yield* Conflicts.inspect(resolved, gateLimits), [])
-          } finally {
-            Automerge.free(resolved)
-          }
+          }).pipe(Effect.ensuring(Effect.sync(() => Automerge.free(resolved))))
         }),
       (merged) => Effect.sync(() => Automerge.free(merged))
     ))
@@ -296,7 +300,7 @@ describe("Automerge persistence", () => {
           assert.isDefined(nested)
           const resolution: Conflict.Resolution = {
             heads: Automerge.heads(merged),
-            path: nested!.path,
+            path: nested.path,
             choice: { _tag: "ReplaceValue", value: "promoted" }
           }
           const prepared = yield* Conflicts.prepareResolution(merged, resolution, gateLimits)
@@ -305,12 +309,10 @@ describe("Automerge persistence", () => {
             actor("17"),
             (draft) => Conflicts.applyResolution(draft, prepared, { promoteParents: true })
           )
-          try {
+          yield* Effect.gen(function*() {
             assert.deepStrictEqual(Automerge.value(resolved), { section: { value: "promoted" } })
             assert.deepStrictEqual(yield* Conflicts.inspect(resolved, gateLimits), [])
-          } finally {
-            Automerge.free(resolved)
-          }
+          }).pipe(Effect.ensuring(Effect.sync(() => Automerge.free(resolved))))
         }),
       (merged) => Effect.sync(() => Automerge.free(merged))
     ))
@@ -325,7 +327,7 @@ describe("Automerge persistence", () => {
           assert.isDefined(nested)
           const resolution: Conflict.Resolution = {
             heads: Automerge.heads(merged),
-            path: nested!.path,
+            path: nested.path,
             choice: { _tag: "ReplaceValue", value: { selected: ["promoted"] } }
           }
           const prepared = yield* Conflicts.prepareResolution(merged, resolution, gateLimits)
@@ -334,14 +336,12 @@ describe("Automerge persistence", () => {
             actor("18"),
             (draft) => Conflicts.applyResolution(draft, prepared, { promoteParents: true })
           )
-          try {
-            assert.deepStrictEqual<unknown>(Automerge.value(resolved), {
+          yield* Effect.gen(function*() {
+            assert.deepStrictEqual(Automerge.value(resolved), {
               section: { value: { selected: ["promoted"] } }
             })
             assert.deepStrictEqual(yield* Conflicts.inspect(resolved, gateLimits), [])
-          } finally {
-            Automerge.free(resolved)
-          }
+          }).pipe(Effect.ensuring(Effect.sync(() => Automerge.free(resolved))))
         }),
       (merged) => Effect.sync(() => Automerge.free(merged))
     ))
@@ -365,9 +365,10 @@ describe("Automerge persistence", () => {
         Conflicts.inspect(merged, gateLimits).pipe(
           Effect.map((records) => {
             assert.deepStrictEqual(
-              records.map((record) =>
-                record.path.target._tag === "Key" ? record.path.target.key : record.path.target.index
-              ),
+              records.map((record) => {
+                if (record.path.target._tag === "Key") return record.path.target.key
+                return record.path.target.index
+              }),
               ["z", "ä"]
             )
           })
@@ -427,14 +428,14 @@ describe("Automerge persistence", () => {
       (merged) =>
         Effect.gen(function*() {
           const rssBefore = process.memoryUsage().rss
-          const started = performance.now()
+          const started = yield* Clock.currentTimeMillis
           const error = yield* Effect.flip(
             Conflicts.inspect(merged, {
               ...gateLimits,
               maxConflictValueBytes: 1024 * 1024
             })
           )
-          const elapsedMillis = performance.now() - started
+          const elapsedMillis = (yield* Clock.currentTimeMillis) - started
           const rssGrowth = Math.max(0, process.memoryUsage().rss - rssBefore)
 
           assert.strictEqual(error._tag, "ReplicaError")
@@ -478,7 +479,7 @@ describe("Automerge persistence", () => {
           const records = yield* Conflicts.inspect(merged, gateLimits)
           assert.strictEqual(records.length, 4)
           const encoded = Schema.encodeSync(Conflict.Records)(records)
-          const bytes = new TextEncoder().encode(JSON.stringify(encoded)).byteLength
+          const bytes = new TextEncoder().encode(encodeJson(encoded)).byteLength
           assert.strictEqual(
             (yield* Conflicts.inspect(merged, { ...gateLimits, maxConflictValueBytes: bytes })).length,
             records.length
@@ -505,19 +506,19 @@ describe("Automerge persistence", () => {
           {
             value: {
               bytes: new Uint8Array([0, 1, 2, 3, 254, 255]),
-              timestamp: new Date("2026-07-29T12:34:56.789Z")
-            } as NativeAutomerge.AutomergeValue
+              timestamp: DateTime.toDate(DateTime.makeUnsafe("2026-07-29T12:34:56.789Z"))
+            }
           },
           (draft) => {
             draft.value = {
               bytes: new Uint8Array([4, 5, 6, 7, 252, 253]),
-              timestamp: new Date("2026-07-30T12:34:56.789Z")
+              timestamp: DateTime.toDate(DateTime.makeUnsafe("2026-07-30T12:34:56.789Z"))
             }
           },
           (draft) => {
             draft.value = {
               bytes: new Uint8Array([8, 9, 10, 11, 250, 251]),
-              timestamp: new Date("2026-07-31T12:34:56.789Z")
+              timestamp: DateTime.toDate(DateTime.makeUnsafe("2026-07-31T12:34:56.789Z"))
             }
           }
         )
@@ -527,17 +528,16 @@ describe("Automerge persistence", () => {
           const records = yield* Conflicts.inspect(merged, gateLimits)
           assert.strictEqual(records.length, 1)
           assert.isTrue(
-            records[0]!.alternatives.every((alternative) => {
-              const value = alternative.value as {
-                readonly bytes: Uint8Array
-                readonly timestamp: Date
-              }
-              return value.bytes instanceof Uint8Array && value.timestamp instanceof Date
+            records[0].alternatives.every((alternative) => {
+              const value = alternative.value
+              return typeof value === "object" && value !== null &&
+                "bytes" in value && value.bytes instanceof Uint8Array &&
+                "timestamp" in value && value.timestamp instanceof Date
             })
           )
-          const nativeBytes = new TextEncoder().encode(JSON.stringify(records)).byteLength
+          const nativeBytes = new TextEncoder().encode(encodeJson(records)).byteLength
           const encoded = Schema.encodeSync(Conflict.Records)(records)
-          const encodedBytes = new TextEncoder().encode(JSON.stringify(encoded)).byteLength
+          const encodedBytes = new TextEncoder().encode(encodeJson(encoded)).byteLength
           assert.isAbove(encodedBytes, nativeBytes)
           const error = yield* Effect.flip(
             Conflicts.inspect(merged, {

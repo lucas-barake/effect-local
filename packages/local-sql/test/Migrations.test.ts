@@ -15,6 +15,7 @@ import * as Rows from "../src/internal/rows.js"
 import { tables } from "../src/internal/schema.js"
 import * as Migrations from "../src/Migrations.js"
 import * as PeerSyncEnvelope from "../src/PeerSyncEnvelope.js"
+import { decodeJson, encodeJson } from "./helpers/json.js"
 
 /**
  * Every migration in order, with the checksum each one is expected to record. One list keeps the
@@ -45,7 +46,7 @@ const migrationCatalog = [
 const migrationsAfter = (appliedThroughId: number) =>
   migrationCatalog
     .filter((migration) => migration.migration_id > appliedThroughId)
-    .map((migration) => [migration.migration_id, migration.name] as const)
+    .map((migration) => [migration.migration_id, migration.name] satisfies readonly [number, string])
 
 const migrationHistory = migrationCatalog.map(({ checksum: _, ...row }) => row)
 
@@ -86,11 +87,11 @@ describe("Migrations", () => {
           WHERE document_id = 'document-00001') AS relay_outbox`
       assert.isTrue(
         checkpointInstallPlan.some((row) => row.detail.includes("effect_local_peer_outbox_document_status")),
-        JSON.stringify(checkpointInstallPlan)
+        encodeJson(checkpointInstallPlan)
       )
       assert.isTrue(
         checkpointInstallPlan.some((row) => row.detail.includes("effect_local_peer_relay_outbox_document")),
-        JSON.stringify(checkpointInstallPlan)
+        encodeJson(checkpointInstallPlan)
       )
       const indexes = yield* sql<{ readonly name: string }>`
         SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'effect_local_peer_%'
@@ -147,6 +148,7 @@ describe("Migrations", () => {
         FROM documents`
       yield* sql`UPDATE effect_local_documents SET projection_status = 'Blocked'
         WHERE document_id = 'document-10000'`
+      const initialAuthorization: Uint8Array | null = new Uint8Array([2])
       const transitionRow = {
         document_id: "document-00001",
         prior_lineage: "prior-lineage",
@@ -158,7 +160,7 @@ describe("Migrations", () => {
         heads: "[\"b\"]",
         schema_version: 1,
         writer_definition_hash: "definition",
-        authorization: new Uint8Array([2]) as Uint8Array | null,
+        authorization: initialAuthorization,
         created_at: "2026-01-01T00:00:00.000Z"
       }
       const insertTransition = (overrides: Partial<typeof transitionRow>) =>
@@ -205,7 +207,7 @@ describe("Migrations", () => {
       `
       assert.isTrue(
         blockedDocumentPlan.some((row) => row.detail.includes("effect_local_documents_not_ready_type")),
-        JSON.stringify(blockedDocumentPlan)
+        encodeJson(blockedDocumentPlan)
       )
       const readinessPlan = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN
         SELECT COUNT(*) FROM effect_local_document_projections
@@ -385,7 +387,7 @@ describe("Migrations", () => {
         { actor: "c".repeat(32) }
       )
       const legacyCheckpointBytes = Automerge.save(legacyCheckpoint)
-      const legacyChangeHash = Automerge.decodeChange(Automerge.getAllChanges(legacyCheckpoint)[0]!).hash
+      const legacyChangeHash = Automerge.decodeChange(Automerge.getAllChanges(legacyCheckpoint)[0]).hash
       const emptyPeer = Automerge.init()
       const handshake = Automerge.generateSyncMessage(emptyPeer, Automerge.initSyncState())[1]!
       const receivedHandshake = Automerge.receiveSyncMessage(
@@ -488,7 +490,7 @@ describe("Migrations", () => {
       `
       assert.deepStrictEqual(checkpoints.map((row) => row.checkpoint_hash), ["checkpoint-1", "checkpoint-3"])
       assert.strictEqual(checkpoints[0]?.writer_provenance, "[]")
-      assert.deepStrictEqual(JSON.parse(checkpoints[1]!.writer_provenance), [{
+      assert.deepStrictEqual(decodeJson(checkpoints[1].writer_provenance), [{
         changeHash: legacyChangeHash,
         writerDefinitionHash: "definition-1",
         writerSchemaVersion: 1
@@ -510,7 +512,7 @@ describe("Migrations", () => {
       assert.deepStrictEqual(
         migratedPeerRows.map((row) => ({
           kind: row.kind,
-          writerProvenance: JSON.parse(row.writer_provenance)
+          writerProvenance: decodeJson(row.writer_provenance)
         })),
         [
           { kind: "outbox", writerProvenance: expectedLegacyProvenance },
@@ -737,7 +739,7 @@ describe("Migrations", () => {
           ${pending.relayMessageId}, ${pending.outerEnvelopeDigest}, 1, 1,
           ${`sender-epoch-${pending.senderSequence}`}, ${pending.senderSequence},
           ${documentId}, 'Task',
-          ${JSON.stringify(pending.writerProvenance)}, ${pending.messageHash},
+          ${encodeJson(pending.writerProvenance)}, ${pending.messageHash},
           ${pending.payload}, ${pending.payload.byteLength},
           ${pending.createdAt}, ${pending.retryDeadline},
           '2026-01-02T00:00:00.000Z', 'Pending'
@@ -750,7 +752,7 @@ describe("Migrations", () => {
           ${inFlight.relayMessageId}, ${inFlight.outerEnvelopeDigest}, 1, 1,
           ${`sender-epoch-${inFlight.senderSequence}`}, ${inFlight.senderSequence},
           ${documentId}, 'Task',
-          ${JSON.stringify(inFlight.writerProvenance)}, ${inFlight.messageHash},
+          ${encodeJson(inFlight.writerProvenance)}, ${inFlight.messageHash},
           ${inFlight.payload}, ${inFlight.payload.byteLength},
           ${inFlight.createdAt}, ${inFlight.retryDeadline},
           '2026-02-02T00:00:00.000Z', 'InFlight'
@@ -1087,7 +1089,7 @@ describe("Migrations", () => {
       })
       const rawChanges = Automerge.getAllChanges(source)
       const decoded = rawChanges.map(Automerge.decodeChange)
-      const heads = JSON.stringify(Automerge.getHeads(source))
+      const heads = encodeJson(Automerge.getHeads(source))
       const expectedOperations = decoded.reduce((total, change) => total + change.ops.length, 0)
       const expectedBytes = rawChanges.reduce((total, bytes) => total + bytes.byteLength, 0)
 
@@ -1096,14 +1098,14 @@ describe("Migrations", () => {
         accepted_heads, tombstone, projection_status, checkpoint_hash, lineage
       ) VALUES ('checkpoint-backed', 'Task', 1, '[1]', ${heads}, ${heads}, 0, 'Ready', NULL, '')`
       for (let index = 0; index < rawChanges.length; index++) {
-        const change = decoded[index]!
+        const change = decoded[index]
         yield* sql`INSERT INTO effect_local_changes (
           change_hash, document_id, document_type, writer_schema_version,
           writer_definition_hash, actor, sequence, dependencies, bytes, applied,
           peer_id, accepted_at, commit_sequence
         ) VALUES (
           ${change.hash}, 'checkpoint-backed', 'Task', 1, 'definition', ${change.actor}, ${change.seq},
-          ${JSON.stringify(change.deps)}, ${rawChanges[index]!}, 1, NULL,
+          ${encodeJson(change.deps)}, ${rawChanges[index]}, 1, NULL,
           '2026-01-01T00:00:00.000Z', ${index + 1}
         )`
       }
@@ -1120,22 +1122,26 @@ describe("Migrations", () => {
         document_id, document_type, schema_version, observed_versions, materialized_heads,
         accepted_heads, tombstone, projection_status, checkpoint_hash, lineage
       ) VALUES (
-        'incomplete', 'Task', 1, '[1]', ${JSON.stringify(["f".repeat(64)])},
-        ${JSON.stringify(["f".repeat(64)])}, 0, 'Ready', NULL, ''
+        'incomplete', 'Task', 1, '[1]', ${encodeJson(["f".repeat(64)])},
+        ${encodeJson(["f".repeat(64)])}, 0, 'Ready', NULL, ''
       )`
       for (
         const [documentId, actor, malformedField] of [
           ["malformed-hash", "c".repeat(32), "hash"],
           ["malformed-row", "d".repeat(32), "applied"]
-        ] as const
+        ] satisfies ReadonlyArray<readonly [string, string, string]>
       ) {
         const malformedSource = Automerge.from(
           { value: { title: documentId }, tombstone: false },
           { actor }
         )
-        const malformedBytes = Automerge.getAllChanges(malformedSource)[0]!
+        const malformedBytes = Automerge.getAllChanges(malformedSource)[0]
         const malformedChange = Automerge.decodeChange(malformedBytes)
-        const malformedHeads = JSON.stringify(Automerge.getHeads(malformedSource))
+        const malformedHeads = encodeJson(Automerge.getHeads(malformedSource))
+        let changeHash = malformedChange.hash
+        if (malformedField === "hash") changeHash = "legacy-hash"
+        let applied: number | string = 1
+        if (malformedField === "applied") applied = "not-an-integer"
         yield* sql`INSERT INTO effect_local_documents (
           document_id, document_type, schema_version, observed_versions, materialized_heads,
           accepted_heads, tombstone, projection_status, checkpoint_hash, lineage
@@ -1147,10 +1153,9 @@ describe("Migrations", () => {
           writer_definition_hash, actor, sequence, dependencies, bytes, applied,
           peer_id, accepted_at, commit_sequence
         ) VALUES (
-          ${malformedField === "hash" ? "legacy-hash" : malformedChange.hash},
+          ${changeHash},
           ${documentId}, 'Task', 1, 'definition', ${malformedChange.actor}, ${malformedChange.seq},
-          ${JSON.stringify(malformedChange.deps)}, ${malformedBytes},
-          ${malformedField === "applied" ? "not-an-integer" : 1},
+          ${encodeJson(malformedChange.deps)}, ${malformedBytes}, ${applied},
           NULL, '2026-01-01T00:00:00.000Z', 1
         )`
         Automerge.free(malformedSource)

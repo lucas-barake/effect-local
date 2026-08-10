@@ -81,9 +81,11 @@ describe("ReplicaGate grant boundary", () => {
 
       yield* Deferred.succeed(releaseWriter, undefined)
       for (let turn = 0; turn < offset; turn++) yield* Effect.yieldNow
-      yield* deliver === "inline"
-        ? Effect.sync(() => waiter.interruptUnsafe())
-        : Effect.forkChild(Fiber.interrupt(waiter)).pipe(Effect.asVoid)
+      if (deliver === "inline") {
+        yield* Effect.sync(() => waiter.interruptUnsafe())
+      } else {
+        yield* Effect.forkChild(Fiber.interrupt(waiter)).pipe(Effect.asVoid)
+      }
       const waiterExit = yield* Fiber.await(waiter).pipe(Effect.timeoutOption("5 seconds"))
       assert.strictEqual(waiterExit._tag, "Some", `${label}: waiter never terminated`)
       const writerExit = yield* Fiber.await(writer).pipe(Effect.timeoutOption("5 seconds"))

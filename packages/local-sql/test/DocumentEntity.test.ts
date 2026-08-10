@@ -33,6 +33,7 @@ import * as ClusterStorage from "../src/internal/clusterStorage.js"
 import * as PeerSync from "../src/PeerSync.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
 import * as SqlReplica from "../src/SqlReplica.js"
+import { decodeJson, encodeJson } from "./helpers/json.js"
 
 describe("DocumentEntity", () => {
   const Task = Document.make("Task", {
@@ -108,7 +109,7 @@ describe("DocumentEntity", () => {
     acceptedHeads: [],
     commitSequence: Identity.CommitSequence.make(1),
     observedByPeer: false,
-    durableConfirmation: false as const,
+    durableConfirmation: false,
     duplicate: false
   }
   const peerSync = (receive: PeerSync.PeerSync["Service"]["receive"] = () => Effect.succeed(syncResult)) =>
@@ -131,7 +132,9 @@ describe("DocumentEntity", () => {
       pruneRelayReceipts: Effect.succeed(0)
     })
   const keyOf = (payload: unknown) => {
-    if (!PrimaryKey.isPrimaryKey(payload)) throw new TypeError("Expected a primary key payload")
+    if (!PrimaryKey.isPrimaryKey(payload)) {
+      Effect.runSync(Effect.die(new TypeError("Expected a primary key payload")))
+    }
     return PrimaryKey.value(payload)
   }
   const replicaGate = (permit: ReplicaGate.Permit) =>
@@ -204,7 +207,7 @@ describe("DocumentEntity", () => {
     const key = keyOf(DocumentEntity.ApplySync.payloadSchema.make(base))
     assert.strictEqual(
       key,
-      JSON.stringify([1, peerId, "connection", 2, "hash-a", base.writerProvenance, "", null])
+      encodeJson([1, peerId, "connection", 2, "hash-a", base.writerProvenance, "", null])
     )
     assert.notStrictEqual(
       key,
@@ -231,7 +234,7 @@ describe("DocumentEntity", () => {
       key,
       keyOf(DocumentEntity.ApplySync.payloadSchema.make({
         ...base,
-        writerProvenance: [{ ...base.writerProvenance[0]!, writerSchemaVersion: Task.version + 1 }]
+        writerProvenance: [{ ...base.writerProvenance[0], writerSchemaVersion: Task.version + 1 }]
       }))
     )
     assert.notStrictEqual(
@@ -245,7 +248,7 @@ describe("DocumentEntity", () => {
       key,
       keyOf(DocumentEntity.ApplySync.payloadSchema.make({
         ...base,
-        writerProvenance: [{ ...base.writerProvenance[0]!, writerDefinitionHash: "different-definition" }]
+        writerProvenance: [{ ...base.writerProvenance[0], writerDefinitionHash: "different-definition" }]
       }))
     )
   })
@@ -390,7 +393,7 @@ describe("DocumentEntity", () => {
         })
       )
       const services = SqlReplica.servicesLayerWithBindings(definition, { projections: [] })
-      const peerSync = PeerSync.layer.pipe(Layer.provideMerge(services))
+      const peerSyncLayer = PeerSync.layer.pipe(Layer.provideMerge(services))
       const cluster = Sharding.layer.pipe(
         Layer.provideMerge(Runners.layerNoop),
         Layer.provideMerge(SqlMessageStorage.layerWith({ prefix: ClusterStorage.messagePrefix })),
@@ -401,7 +404,7 @@ describe("DocumentEntity", () => {
         Layer.provide(TestShardingConfig)
       )
       const live = DocumentEntity.layer(definition).pipe(
-        Layer.provideMerge(peerSync),
+        Layer.provideMerge(peerSyncLayer),
         Layer.provideMerge(cluster),
         Layer.provideMerge(inputs)
       )
@@ -429,7 +432,7 @@ describe("DocumentEntity", () => {
           writerGeneration: permit.writerGeneration,
           commandId,
           documentType: Task.name,
-          payload: new TextEncoder().encode(JSON.stringify(value)),
+          payload: new TextEncoder().encode(encodeJson(value)),
           requestHash
         }
 
@@ -439,7 +442,7 @@ describe("DocumentEntity", () => {
         assert.deepStrictEqual(
           yield* Schema.decodeUnknownEffect(
             Schema.toCodecJson(CommandOutcome.schema(Identity.DocumentId, Schema.Never))
-          )(JSON.parse(new TextDecoder().decode(replayed))),
+          )(decodeJson(new TextDecoder().decode(replayed))),
           CommandOutcome.durablyCommitted(commandId, documentId)
         )
 
@@ -534,13 +537,13 @@ describe("DocumentEntity", () => {
           writerGeneration: permit.writerGeneration,
           commandId,
           documentType: Task.name,
-          payload: new TextEncoder().encode(JSON.stringify({ title: "first" })),
+          payload: new TextEncoder().encode(encodeJson({ title: "first" })),
           requestHash: "create-hash"
         })
         const outcome = yield* Schema.decodeUnknownEffect(
           Schema.toCodecJson(CommandOutcome.schema(Identity.DocumentId, Schema.Never))
         )(
-          JSON.parse(new TextDecoder().decode(bytes))
+          decodeJson(new TextDecoder().decode(bytes))
         )
         assert.deepStrictEqual(outcome, CommandOutcome.durablyCommitted(commandId, documentId))
 
@@ -551,12 +554,12 @@ describe("DocumentEntity", () => {
           commandId: mutationCommandId,
           documentType: Task.name,
           mutationTag: Rename.name,
-          payload: new TextEncoder().encode(JSON.stringify("renamed")),
+          payload: new TextEncoder().encode(encodeJson("renamed")),
           requestHash: "mutation-hash"
         })
         assert.deepStrictEqual(
           yield* Schema.decodeUnknownEffect(Schema.toCodecJson(CommandOutcome.schema(Schema.String, Schema.Never)))(
-            JSON.parse(new TextDecoder().decode(mutationBytes))
+            decodeJson(new TextDecoder().decode(mutationBytes))
           ),
           CommandOutcome.durablyCommitted(mutationCommandId, "renamed")
         )
@@ -571,7 +574,7 @@ describe("DocumentEntity", () => {
         })
         assert.deepStrictEqual(
           yield* Schema.decodeUnknownEffect(Schema.toCodecJson(CommandOutcome.schema(Schema.Void, Schema.Never)))(
-            JSON.parse(new TextDecoder().decode(deleteBytes))
+            decodeJson(new TextDecoder().decode(deleteBytes))
           ),
           CommandOutcome.durablyCommitted(deleteCommandId, undefined)
         )
@@ -595,7 +598,7 @@ describe("DocumentEntity", () => {
         assert.deepStrictEqual(
           yield* Schema.decodeUnknownEffect(
             Schema.toCodecJson(CommandOutcome.schema(Schema.Void, Conflict.ResolutionError))
-          )(JSON.parse(new TextDecoder().decode(resolutionBytes))),
+          )(decodeJson(new TextDecoder().decode(resolutionBytes))),
           CommandOutcome.durablyCommitted(resolutionCommandId, undefined)
         )
 
@@ -736,7 +739,7 @@ describe("DocumentEntity", () => {
           writerGeneration: permit.writerGeneration,
           commandId,
           documentType: Task.name,
-          payload: new TextEncoder().encode(JSON.stringify({ title: "first" })),
+          payload: new TextEncoder().encode(encodeJson({ title: "first" })),
           requestHash: commandId
         })
         const first = yield* Effect.forkChild(client.Create(request(yield* Identity.makeCommandId)))
@@ -801,7 +804,7 @@ describe("DocumentEntity", () => {
           writerGeneration: permit.writerGeneration,
           commandId: yield* Identity.makeCommandId,
           documentType: "Ghost",
-          payload: new TextEncoder().encode(JSON.stringify({ title: "x" })),
+          payload: new TextEncoder().encode(encodeJson({ title: "x" })),
           requestHash: "hash"
         }))
         assert.strictEqual(unregisteredDocument.reason._tag, "ProtocolMismatch")
@@ -811,7 +814,7 @@ describe("DocumentEntity", () => {
           commandId: yield* Identity.makeCommandId,
           documentType: Task.name,
           mutationTag: "Ghost",
-          payload: new TextEncoder().encode(JSON.stringify("x")),
+          payload: new TextEncoder().encode(encodeJson("x")),
           requestHash: "hash"
         }))
         assert.strictEqual(unregisteredMutation.reason._tag, "ProtocolMismatch")

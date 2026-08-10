@@ -48,31 +48,34 @@ const Live = SqlReplica.layerWithBindings(definition, { projections: [] }).pipe(
   ))
 )
 
-it.layer(Live, { timeout: 60_000, excludeTestServices: true })("CommitPublisher poller interrupt", (it) => {
+it.layer(Live, { timeout: 60_000, excludeTestServices: true })("CommitPublisher poller interrupt", (layerIt) => {
   /**
    * Every attached tab holds one commit subscription through the owner's invalidation stream, and
    * those streams are interrupted routinely (session replacement, tab teardown, stream retry). One
    * interrupted poll must not stop the publisher from serving the remaining tabs.
    */
-  it.effect("keeps publishing commits after one subscriber's pending poll is interrupted", () =>
-    Effect.gen(function*() {
-      const publisher = yield* CommitPublisher.CommitPublisher
-      const replica = yield* Replica.Replica
+  layerIt.effect(
+    "keeps publishing commits after one subscriber's pending poll is interrupted",
+    () =>
+      Effect.gen(function*() {
+        const publisher = yield* CommitPublisher.CommitPublisher
+        const replica = yield* Replica.Replica
 
-      const subscription = yield* publisher.subscribe
-      const parked = yield* Effect.forkChild(Stream.runHead(subscription.events), { startImmediately: true })
-      yield* Effect.yieldNow
-      yield* Fiber.interrupt(parked)
+        const subscription = yield* publisher.subscribe
+        const parked = yield* Effect.forkChild(Stream.runHead(subscription.events), { startImmediately: true })
+        yield* Effect.yieldNow
+        yield* Fiber.interrupt(parked)
 
-      const exit = yield* Effect.exit(
-        replica.create(Task, {
-          commandId: yield* Identity.makeCommandId,
-          value: { title: "first" }
-        })
-      )
-      assert.isTrue(
-        Exit.isSuccess(exit),
-        `a commit after an interrupted subscriber poll must not die: ${Exit.isSuccess(exit) ? "" : String(exit.cause)}`
-      )
-    }))
+        const exit = yield* Effect.exit(
+          replica.create(Task, {
+            commandId: yield* Identity.makeCommandId,
+            value: { title: "first" }
+          })
+        )
+        const success = Exit.isSuccess(exit)
+        let detail = ""
+        if (!success) detail = String(exit.cause)
+        assert.isTrue(success, `a commit after an interrupted subscriber poll must not die: ${detail}`)
+      })
+  )
 })

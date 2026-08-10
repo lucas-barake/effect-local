@@ -2,6 +2,7 @@ import { NodeFileSystem } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
 import { FileSystem } from "effect/FileSystem"
 import * as Schema from "effect/Schema"
@@ -40,13 +41,13 @@ const migrationCatalog = [
 const migrationsAfter = (appliedThroughId: number) =>
   migrationCatalog
     .filter((migration) => migration.migration_id > appliedThroughId)
-    .map((migration) => [migration.migration_id, migration.name] as const)
+    .map((migration) => [migration.migration_id, migration.name] satisfies readonly [number, string])
 
 const outboxExpectations = {
   1: "none",
   2: "backfilled",
   3: { frozen: "2020-01-01T00:00:00.000Z" }
-} as const satisfies Record<HistoricalVersion, "none" | "backfilled" | { readonly frozen: string }>
+} satisfies Record<HistoricalVersion, "none" | "backfilled" | { readonly frozen: string }>
 
 const SchemaObject = Schema.Struct({
   type: Schema.String,
@@ -55,8 +56,10 @@ const SchemaObject = Schema.Struct({
   definition: Schema.NullOr(Schema.String)
 })
 
-const normalizeSchema = (definition: string | null) =>
-  definition === null ? null : definition.replace(/\s+/g, " ").trim()
+const normalizeSchema = (definition: string | null) => {
+  if (definition === null) return null
+  return definition.replace(/\s+/g, " ").trim()
+}
 
 const readSchema = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
@@ -245,7 +248,7 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
     if (expectedOutbox === "backfilled") {
       const timestamp = Date.parse(createdAt)
       assert.isFalse(Number.isNaN(timestamp), `invalid backfilled timestamp ${createdAt}`)
-      assert.strictEqual(new Date(timestamp).toISOString(), createdAt)
+      assert.strictEqual(DateTime.formatIso(DateTime.makeUnsafe(timestamp)), createdAt)
     } else {
       assert.strictEqual(createdAt, expectedOutbox.frozen)
     }

@@ -41,17 +41,14 @@ describe("CommandDeliveryStore", () => {
       SqlClient.SqlClient,
       Effect.gen(function*() {
         const sql = yield* SqlClient.SqlClient
-        return Object.assign(
-          ((...args: ReadonlyArray<unknown>) => {
-            const value = (sql as any)(...args)
-            if (value === undefined || typeof value.compile !== "function") return value
-            const statement = value as Statement.Statement<object>
-            return statement.pipe(
-              Effect.tap((rows) => Effect.sync(() => observe(statement, rows)))
-            )
-          }) as SqlClient.SqlClient,
-          sql
-        )
+        const instrumentedSql: SqlClient.SqlClient = (...args: Array<any>) => {
+          const value = sql(...args)
+          if (value === undefined || typeof value.compile !== "function") return value
+          return value.pipe(
+            Effect.tap((rows: ReadonlyArray<object>) => Effect.sync(() => observe(value, rows)))
+          )
+        }
+        return Object.assign(instrumentedSql, sql)
       })
     ).pipe(Layer.provide(database))
     const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provideMerge(database))

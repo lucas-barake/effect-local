@@ -180,36 +180,33 @@ describe("CommandDeliveryPublisher", () => {
       SqlClient.SqlClient,
       Effect.gen(function*() {
         const sql = yield* SqlClient.SqlClient
-        return Object.assign(
-          ((...args: ReadonlyArray<unknown>) => (sql as any)(...args)) as SqlClient.SqlClient,
-          sql,
-          {
-            withTransaction: <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
-              Effect.scoped(Effect.gen(function*() {
-                const transaction = yield* Effect.serviceOption(sql.transactionService)
-                if (Option.isSome(transaction)) {
-                  return yield* sql.withTransaction(effect)
+        const instrumentedSql: SqlClient.SqlClient = (...args: Array<any>) => sql(...args)
+        return Object.assign(instrumentedSql, sql, {
+          withTransaction: <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
+            Effect.scoped(Effect.gen(function*() {
+              const transaction = yield* Effect.serviceOption(sql.transactionService)
+              if (Option.isSome(transaction)) {
+                return yield* sql.withTransaction(effect)
+              }
+              const connection = yield* sql.reserve
+              const instrumentedConnection: SqlConnection.Connection = {
+                ...connection,
+                executeUnprepared: (statement, params, transformRows) => {
+                  const execution = connection.executeUnprepared(statement, params, transformRows)
+                  if (statement !== "COMMIT") return execution
+                  commitAttempts++
+                  if (!failNextCommit) return execution
+                  failNextCommit = false
+                  return execution.pipe(
+                    Effect.andThen(Effect.die(new Error("simulated commit defect")))
+                  )
                 }
-                const connection = yield* sql.reserve
-                const instrumentedConnection: SqlConnection.Connection = {
-                  ...connection,
-                  executeUnprepared: (statement, params, transformRows) => {
-                    const execution = connection.executeUnprepared(statement, params, transformRows)
-                    if (statement !== "COMMIT") return execution
-                    commitAttempts++
-                    if (!failNextCommit) return execution
-                    failNextCommit = false
-                    return execution.pipe(
-                      Effect.andThen(Effect.die(new Error("simulated commit defect")))
-                    )
-                  }
-                }
-                return yield* sql.withTransaction(effect).pipe(
-                  Effect.provideService(sql.transactionService, [instrumentedConnection, -1])
-                )
-              }))
-          }
-        )
+              }
+              return yield* sql.withTransaction(effect).pipe(
+                Effect.provideService(sql.transactionService, [instrumentedConnection, -1])
+              )
+            }))
+        })
       })
     ).pipe(Layer.provideMerge(baseDatabase))
     const database = Layer.merge(instrumentedDatabase, NodeCrypto.layer)
@@ -225,8 +222,8 @@ describe("CommandDeliveryPublisher", () => {
 
     return Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
-      const gate = yield* ReplicaGate.ReplicaGate
-      const permit = yield* gate.current
+      const activeGate = yield* ReplicaGate.ReplicaGate
+      const permit = yield* activeGate.current
       const firstDocumentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
       const secondDocumentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000002")
       const commitAttemptsBeforeDefect = commitAttempts

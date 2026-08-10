@@ -92,45 +92,45 @@ describe("EntityReplica in-flight command limit", () => {
       SqlClient.SqlClient,
       Effect.gen(function*() {
         const sql = yield* SqlClient.SqlClient
-        return Object.assign(
-          ((...args: ReadonlyArray<unknown>) => (sql as any)(...args)) as SqlClient.SqlClient,
-          sql,
-          {
-            withTransaction: <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
-              Effect.serviceOption(sql.transactionService).pipe(
-                Effect.flatMap((transaction) =>
-                  sql.withTransaction(effect).pipe(
-                    Effect.tap(() =>
-                      Effect.sync(() => {
-                        if (!probe.armed || Option.isSome(transaction)) return false
-                        probe.armed = false
-                        return true
-                      }).pipe(
-                        Effect.flatMap((pause) => pause ? onTransaction : Effect.void)
-                      )
+        const instrumentedSql: SqlClient.SqlClient = (...args: Array<any>) => sql(...args)
+        return Object.assign(instrumentedSql, sql, {
+          withTransaction: <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
+            Effect.serviceOption(sql.transactionService).pipe(
+              Effect.flatMap((transaction) =>
+                sql.withTransaction(effect).pipe(
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      if (!probe.armed || Option.isSome(transaction)) return false
+                      probe.armed = false
+                      return true
+                    }).pipe(
+                      Effect.flatMap((pause) => {
+                        if (pause) return onTransaction
+                        return Effect.void
+                      })
                     )
                   )
                 )
               )
-          }
-        )
+            )
+        })
       })
     ).pipe(Layer.provideMerge(baseDatabase))
     return Layer.merge(instrumentedDatabase, NodeCrypto.layer)
   }
 
   const productionLive = (
-    database: Layer.Layer<SqlClient.SqlClient | Crypto.Crypto>
+    databaseLayer: Layer.Layer<SqlClient.SqlClient | Crypto.Crypto>
   ) =>
     Layer.merge(
       SqlReplica.layerWithBindings(definition, { projections: [] }).pipe(
-        Layer.provide(Layer.merge(database, ReplicaLimits.layer(limits)))
+        Layer.provide(Layer.merge(databaseLayer, ReplicaLimits.layer(limits)))
       ),
-      database
+      databaseLayer
     )
 
   const productionLiveWithDirectReplica = (
-    database: Layer.Layer<SqlClient.SqlClient | Crypto.Crypto>
+    databaseLayer: Layer.Layer<SqlClient.SqlClient | Crypto.Crypto>
   ) => {
     const services = SqlReplica.servicesLayerWithBindings(definition, { projections: [] })
     const direct = Layer.effect(DirectReplica, Replica.Replica).pipe(
@@ -139,7 +139,7 @@ describe("EntityReplica in-flight command limit", () => {
     const durable = DurableRuntime.layer(definition).pipe(Layer.provideMerge(services))
     const entity = EntityReplica.layer(definition).pipe(Layer.provideMerge(durable))
     return Layer.merge(entity, direct).pipe(
-      Layer.provideMerge(Layer.merge(database, ReplicaLimits.layer(limits)))
+      Layer.provideMerge(Layer.merge(databaseLayer, ReplicaLimits.layer(limits)))
     )
   }
 

@@ -83,24 +83,22 @@ describe("EntityReplica", () => {
         SqlClient.SqlClient,
         Effect.gen(function*() {
           const sql = yield* SqlClient.SqlClient
-          return Object.assign(
-            ((...args: ReadonlyArray<unknown>) => (sql as any)(...args)) as SqlClient.SqlClient,
-            sql,
-            {
-              withTransaction: <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
-                Effect.serviceOption(sql.transactionService).pipe(
-                  Effect.flatMap((transaction) =>
-                    sql.withTransaction(effect).pipe(
-                      Effect.tap(() =>
-                        armed && Option.isNone(transaction)
-                          ? Deferred.succeed(committed, undefined).pipe(Effect.andThen(release.await))
-                          : Effect.void
-                      )
-                    )
+          const instrumentedSql: SqlClient.SqlClient = (...args: Array<any>) => sql(...args)
+          return Object.assign(instrumentedSql, sql, {
+            withTransaction: <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
+              Effect.serviceOption(sql.transactionService).pipe(
+                Effect.flatMap((transaction) =>
+                  sql.withTransaction(effect).pipe(
+                    Effect.tap(() => {
+                      if (armed && Option.isNone(transaction)) {
+                        return Deferred.succeed(committed, undefined).pipe(Effect.andThen(release.await))
+                      }
+                      return Effect.void
+                    })
                   )
                 )
-            }
-          )
+              )
+          })
         })
       ).pipe(Layer.provideMerge(baseDatabase))
       const database = Layer.merge(instrumentedDatabase, NodeCrypto.layer)

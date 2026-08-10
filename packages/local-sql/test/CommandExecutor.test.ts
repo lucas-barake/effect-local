@@ -369,7 +369,7 @@ describe("CommandExecutor", () => {
       const invalidCommandId = yield* Identity.makeCommandId
       const invalidResolution: Conflict.Resolution = {
         heads: persisted.materializedHeads,
-        path: record!.path,
+        path: record.path,
         choice: { _tag: "ReplaceValue", value: 42 }
       }
       const invalidOutcome = yield* executor.resolve(Task, {
@@ -400,10 +400,10 @@ describe("CommandExecutor", () => {
       const commandId = yield* Identity.makeCommandId
       const resolution: Conflict.Resolution = {
         heads: afterInvalid.materializedHeads,
-        path: record!.path,
+        path: record.path,
         choice: {
           _tag: "SelectAlternative",
-          alternativeId: record!.alternatives[0]!.id
+          alternativeId: record.alternatives[0].id
         }
       }
       const requestHash = yield* hashResolution(commandId, resolution)
@@ -593,12 +593,13 @@ describe("CommandExecutor", () => {
         requestHash
       })
       assert.deepStrictEqual(outcome, CommandOutcome.rejected(commandId, new CheckedRejected()))
-      const staged = stageSpy.mock.results.at(-1)?.value as InternalAutomerge.AnyDocument | undefined
+      const staged = stageSpy.mock.results.at(-1)?.value
       stageSpy.mockRestore()
       assert.isDefined(staged)
       // A rejected mutation must free the staged Automerge document it created.
       // A freed document throws on any access; a leaked one is still usable.
-      assert.throws(() => InternalAutomerge.heads(staged!))
+      if (staged === undefined) yield* Effect.die("expected staged document")
+      assert.throws(() => InternalAutomerge.heads(staged))
     })).pipe(Effect.provide(Live)))
 
   it.effect("frees a staged document when an executor operation is interrupted", () =>
@@ -641,7 +642,7 @@ describe("CommandExecutor", () => {
         Effect.forkChild({ startImmediately: true })
       )
       yield* Deferred.await(persisted)
-      const staged = stageSpy.mock.results.at(-1)?.value as InternalAutomerge.AnyDocument | undefined
+      const staged = stageSpy.mock.results.at(-1)?.value
       assert.isDefined(staged)
       const interrupt = yield* Fiber.interrupt(operation).pipe(
         Effect.forkChild({ startImmediately: true })
@@ -651,9 +652,10 @@ describe("CommandExecutor", () => {
       yield* Deferred.await(finalized)
 
       const exit = yield* Fiber.await(operation)
-      if (!Exit.isFailure(exit)) return assert.fail("expected the executor operation to be interrupted")
+      if (!Exit.isFailure(exit)) yield* Effect.die("expected the executor operation to be interrupted")
       assert.isTrue(Cause.hasInterrupts(exit.cause))
-      assert.throws(() => InternalAutomerge.heads(staged!))
+      if (staged === undefined) yield* Effect.die("expected staged document")
+      assert.throws(() => InternalAutomerge.heads(staged))
       assert.deepStrictEqual(yield* durableCounts, before)
     })).pipe(Effect.provide(Probed)))
 
@@ -770,9 +772,12 @@ describe("CommandExecutor", () => {
       assert.deepStrictEqual(
         yield* receiptKeys,
         [
-          { command_id: createCommandId as string, replica_incarnation: permit.incarnation as number },
-          { command_id: commandId as string, replica_incarnation: permit.incarnation as number }
-        ].toSorted((left, right) => left.command_id < right.command_id ? -1 : 1)
+          { command_id: createCommandId, replica_incarnation: permit.incarnation },
+          { command_id: commandId, replica_incarnation: permit.incarnation }
+        ].toSorted((left, right) => {
+          if (left.command_id < right.command_id) return -1
+          return 1
+        })
       )
       assert.deepStrictEqual(yield* executor.lookupMutation(Rename, commandId, permit), mutated)
 
@@ -794,7 +799,7 @@ describe("CommandExecutor", () => {
     SqlClient.SqlClient,
     Effect.map(SqlClient.SqlClient, (sql) =>
       Object.assign(
-        ((...args: ReadonlyArray<unknown>) => (sql as any)(...args)) as SqlClient.SqlClient,
+        (...args: Array<any>) => sql(...args),
         sql,
         {
           reserve: sql.reserve.pipe(
@@ -806,10 +811,10 @@ describe("CommandExecutor", () => {
                   transformRows: Parameters<typeof connection.execute>[2]
                 ) => {
                   const executed = connection.execute(statement, params, transformRows)
-                  return statement.includes("INSERT INTO effect_local_changes") &&
-                      interruptBoundary.afterChangeInsert !== undefined
-                    ? executed.pipe(Effect.tap(() => interruptBoundary.afterChangeInsert!))
-                    : executed
+                  if (!statement.includes("INSERT INTO effect_local_changes")) return executed
+                  const boundary = interruptBoundary.afterChangeInsert
+                  if (boundary === undefined) return executed
+                  return executed.pipe(Effect.tap(() => boundary))
                 },
                 executeUnprepared: (
                   statement: string,
@@ -823,7 +828,7 @@ describe("CommandExecutor", () => {
                   return Effect.fail(
                     new SqlError.SqlError({
                       reason: new SqlError.ConnectionError({
-                        cause: new Error("forced rollback failure"),
+                        cause: Error("forced rollback failure"),
                         message: "forced rollback failure",
                         operation: "rollback"
                       })
@@ -931,7 +936,7 @@ describe("CommandExecutor", () => {
 
       const exit = yield* rejectStaleResolution(executor, documentId, permit)
 
-      if (!Exit.isFailure(exit)) return assert.fail("expected the deferred constraint to reject the commit")
+      if (!Exit.isFailure(exit)) yield* Effect.die("expected the deferred constraint to reject the commit")
       assert.isFalse(Cause.hasDies(exit.cause))
       const failure = Cause.findErrorOption(exit.cause)
       assert.strictEqual(failure._tag, "Some")
@@ -949,9 +954,9 @@ describe("CommandExecutor", () => {
 
       const exit = yield* rejectStaleResolution(executor, documentId, permit)
 
-      if (!Exit.isFailure(exit)) return assert.fail("expected corrupt accepted heads to fail")
+      if (!Exit.isFailure(exit)) yield* Effect.die("expected corrupt accepted heads to fail")
       const failure = Cause.findErrorOption(exit.cause)
-      if (Option.isNone(failure)) return assert.fail("expected a typed failure")
+      if (Option.isNone(failure)) yield* Effect.die("expected a typed failure")
       assert.strictEqual(failure.value.reason._tag, "StorageCorrupt")
       assert.deepStrictEqual(yield* durableCounts, before)
     })).pipe(Effect.provide(Probed)))
@@ -967,9 +972,9 @@ describe("CommandExecutor", () => {
 
       const exit = yield* rejectStaleResolution(executor, documentId, permit)
 
-      if (!Exit.isFailure(exit)) return assert.fail("expected inconsistent materialized heads to fail")
+      if (!Exit.isFailure(exit)) yield* Effect.die("expected inconsistent materialized heads to fail")
       const failure = Cause.findErrorOption(exit.cause)
-      if (Option.isNone(failure)) return assert.fail("expected a typed failure")
+      if (Option.isNone(failure)) yield* Effect.die("expected a typed failure")
       assert.strictEqual(failure.value.reason._tag, "StorageCorrupt")
       assert.deepStrictEqual(yield* durableCounts, before)
     })).pipe(Effect.provide(Probed)))
@@ -1011,16 +1016,16 @@ describe("CommandExecutor", () => {
         END`
 
       const exit = yield* sql.withTransaction(Effect.gen(function*() {
-        const exit = yield* rejectStaleResolution(executor, documentId, permit)
+        const transactionExit = yield* rejectStaleResolution(executor, documentId, permit)
         yield* sql`BEGIN`
-        return exit
+        return transactionExit
       }))
 
-      if (!Exit.isFailure(exit)) return assert.fail("expected the receipt trigger to roll back the resolution")
+      if (!Exit.isFailure(exit)) yield* Effect.die("expected the receipt trigger to roll back the resolution")
       assert.isFalse(Cause.hasDies(exit.cause))
       assert.strictEqual(exit.cause.reasons.length, 2)
       for (const reason of exit.cause.reasons) {
-        if (!Cause.isFailReason(reason)) return assert.fail(`expected a typed failure, got ${reason._tag}`)
+        if (!Cause.isFailReason(reason)) yield* Effect.die(`expected a typed failure, got ${reason._tag}`)
         assert.strictEqual(reason.error.reason._tag, "StorageUnavailable")
       }
       assert.deepStrictEqual(yield* durableCounts, before)
@@ -1041,10 +1046,13 @@ describe("CommandExecutor", () => {
 
       const exit = yield* Effect.exit(renameTask(executor, documentId, permit, "poisoned"))
 
-      if (!Exit.isFailure(exit)) return assert.fail("expected the body and rollback to fail")
+      if (!Exit.isFailure(exit)) yield* Effect.die("expected the body and rollback to fail")
       assert.isFalse(Cause.hasDies(exit.cause))
       assert.strictEqual(exit.cause.reasons.length, 2)
-      const failures = exit.cause.reasons.flatMap((reason) => Cause.isFailReason(reason) ? [reason.error] : [])
+      const failures = exit.cause.reasons.flatMap((reason) => {
+        if (Cause.isFailReason(reason)) return [reason.error]
+        return []
+      })
       assert.strictEqual(failures.length, 2)
       assert.deepStrictEqual(
         failures.map((failure) => failure.reason._tag),
@@ -1091,13 +1099,13 @@ describe("CommandExecutor", () => {
       interruptBoundary.rollbackFailuresRemaining = 2
 
       const first = yield* Effect.exit(renameTask(executor, documentId, permit, "ambiguous"))
-      if (!Exit.isFailure(first)) return assert.fail("expected ambiguous cleanup to fail")
+      if (!Exit.isFailure(first)) yield* Effect.die("expected ambiguous cleanup to fail")
       assert.strictEqual(first.cause.reasons.length, 2)
 
       const second = yield* Effect.exit(renameTask(executor, documentId, permit, "blocked"))
-      if (!Exit.isFailure(second)) return assert.fail("expected the poisoned executor to fail")
+      if (!Exit.isFailure(second)) yield* Effect.die("expected the poisoned executor to fail")
       const failure = Cause.findErrorOption(second.cause)
-      if (Option.isNone(failure)) return assert.fail("expected a typed failure")
+      if (Option.isNone(failure)) yield* Effect.die("expected a typed failure")
       assert.strictEqual(failure.value.reason._tag, "StorageUnavailable")
     })).pipe(Effect.provide(Probed)))
 
@@ -1115,21 +1123,21 @@ describe("CommandExecutor", () => {
         (SELECT COUNT(*) FROM effect_local_command_receipts) AS receipts,
         (SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1) AS commitSequence
     `
-    return rows[0]!
+    return rows[0]
   })
 
   const bumpWriterGeneration = (sql: SqlClient.SqlClient) =>
     sql`UPDATE effect_local_metadata SET writer_generation = writer_generation + 1 WHERE singleton = 1`
 
-  const corruptChangeBytes = (text: string, params: Array<unknown>) =>
-    text.includes("INSERT INTO effect_local_changes")
-      ? params.map((param) => {
-        if (!(param instanceof Uint8Array) || param.length === 0) return param
-        const corrupted = new Uint8Array(param)
-        corrupted[corrupted.length - 1] = corrupted[corrupted.length - 1]! ^ 0xff
-        return corrupted
-      })
-      : params
+  const corruptChangeBytes = (text: string, params: Array<unknown>) => {
+    if (!text.includes("INSERT INTO effect_local_changes")) return params
+    return params.map((param) => {
+      if (!(param instanceof Uint8Array) || param.length === 0) return param
+      const corrupted = new Uint8Array(param)
+      corrupted[corrupted.length - 1] = corrupted[corrupted.length - 1] ^ 0xff
+      return corrupted
+    })
+  }
 
   // The write path re-reads the change blobs it just wrote, so a driver that
   // mangles a BLOB on the way to storage fails the mutation instead of
@@ -1156,8 +1164,10 @@ describe("CommandExecutor", () => {
       const { documentId, executor, permit } = yield* seedTask
       const before = yield* durableCounts
       yield* withFault(probe, {
-        before: (text) =>
-          text.includes("INSERT INTO effect_local_commit_outbox") ? bumpWriterGeneration(sql) : undefined,
+        before: (text) => {
+          if (text.includes("INSERT INTO effect_local_commit_outbox")) return bumpWriterGeneration(sql)
+          return undefined
+        },
         mapParams: corruptChangeBytes
       })
 
@@ -1174,10 +1184,13 @@ describe("CommandExecutor", () => {
       const { documentId, executor, permit } = yield* seedTask
       const before = yield* durableCounts
       yield* withFault(probe, {
-        mapParams: (text, params) =>
-          text.includes("UPDATE effect_local_documents SET")
-            ? params.map((param) => typeof param === "string" && param.startsWith("[\"") ? "[]" : param)
-            : params
+        mapParams: (text, params) => {
+          if (!text.includes("UPDATE effect_local_documents SET")) return params
+          return params.map((param) => {
+            if (typeof param === "string" && param.startsWith("[\"")) return "[]"
+            return param
+          })
+        }
       })
 
       const error = yield* Effect.flip(renameTask(executor, documentId, permit, "stale"))
@@ -1193,10 +1206,12 @@ describe("CommandExecutor", () => {
       const { documentId, executor, permit } = yield* seedTask
       const before = yield* durableCounts
       yield* withFault(probe, {
-        before: (text) =>
-          text.includes("INSERT INTO effect_local_commit_outbox")
-            ? sql`DELETE FROM effect_local_documents WHERE document_id = ${documentId}`
-            : undefined
+        before: (text) => {
+          if (text.includes("INSERT INTO effect_local_commit_outbox")) {
+            return sql`DELETE FROM effect_local_documents WHERE document_id = ${documentId}`
+          }
+          return undefined
+        }
       })
 
       const error = yield* Effect.flip(renameTask(executor, documentId, permit, "vanished"))

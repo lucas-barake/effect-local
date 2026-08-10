@@ -16,7 +16,7 @@ export interface SqlProbe {
   /** Normalized text of every statement issued through the decorated client. */
   readonly statements: Array<string>
   /** Runs before a matching statement, on the same connection. */
-  before: ((text: string) => Effect.Effect<unknown, unknown, never> | undefined) | undefined
+  before: ((text: string) => Effect.Effect<unknown, unknown> | undefined) | undefined
   /** Rewrites the interpolated parameters of a matching statement. */
   mapParams: ((text: string, params: Array<unknown>) => Array<unknown>) | undefined
   reset(): void
@@ -75,23 +75,19 @@ const normalize = (strings: ReadonlyArray<string>): string => strings.join("?").
 export const probeLayer = (probe: SqlProbe): Layer.Layer<SqlClient.SqlClient, never, SqlClient.SqlClient> =>
   Layer.effect(
     SqlClient.SqlClient,
-    Effect.map(SqlClient.SqlClient, (sql) =>
-      new Proxy(sql, {
-        apply(target, thisArg, args: Array<unknown>) {
-          const strings = args[0]
-          if (!Array.isArray(strings)) return Reflect.apply(target as never, thisArg, args)
-          const text = normalize(strings as ReadonlyArray<string>)
-          probe.statements.push(text)
-          const params = probe.mapParams === undefined
-            ? args.slice(1)
-            : probe.mapParams(text, args.slice(1))
-          const statement = Reflect.apply(target as never, thisArg, [strings, ...params]) as Effect.Effect<
-            unknown,
-            unknown,
-            never
-          >
-          const before = probe.before?.(text)
-          return before === undefined ? statement : Effect.andThen(before, statement)
-        }
-      }) as typeof sql)
+    Effect.map(SqlClient.SqlClient, (sql) => {
+      const instrumentedSql: SqlClient.SqlClient = (...args: Array<any>) => {
+        const strings = args[0]
+        if (!Array.isArray(strings)) return sql(...args)
+        const text = normalize(strings)
+        probe.statements.push(text)
+        let params = args.slice(1)
+        if (probe.mapParams !== undefined) params = probe.mapParams(text, params)
+        const statement = sql(strings, ...params)
+        const before = probe.before?.(text)
+        if (before === undefined) return statement
+        return Effect.andThen(before, statement)
+      }
+      return Object.assign(instrumentedSql, sql)
+    })
   )

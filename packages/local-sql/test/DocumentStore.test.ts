@@ -18,6 +18,7 @@ import * as InternalAutomerge from "../src/internal/automerge.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
 import { withGateLimits } from "./fixtures/limits.js"
+import { decodeJson } from "./helpers/json.js"
 import { makeProbe, probeLayer, withFault } from "./helpers/sqlProbe.js"
 
 describe("DocumentStore", () => {
@@ -74,7 +75,7 @@ describe("DocumentStore", () => {
         ORDER BY commit_sequence
       `
       assert.deepStrictEqual(
-        outbox.map((row) => JSON.parse(row.invalidation_keys)),
+        outbox.map((row) => decodeJson(row.invalidation_keys)),
         [
           ReplicaDefinition.documentCommitKeys(Task.name, documentId),
           ReplicaDefinition.documentCommitKeys(Task.name, documentId)
@@ -111,15 +112,14 @@ describe("DocumentStore", () => {
         yield* sql`UPDATE effect_local_documents SET accepted_heads = 'not-json'
         WHERE document_id = ${documentId}`
         const second = yield* Effect.exit(load)
-        if (!Exit.isFailure(second)) return assert.fail("expected corrupt accepted heads to fail")
+        if (!Exit.isFailure(second)) yield* Effect.die("expected corrupt accepted heads to fail")
 
-        const readable = yield* Effect.sync(() => {
-          try {
+        const readable = yield* Effect.try({
+          try: () => {
             InternalAutomerge.heads(first.stored.automerge)
             return true
-          } catch {
-            return false
-          }
+          },
+          catch: () => false
         })
         if (!readable) firstNeedsFree = false
         assert.isTrue(readable)
@@ -173,12 +173,13 @@ describe("DocumentStore", () => {
       // failing the insert after the Automerge document is already initialized.
       const exit = yield* Effect.exit(store.create(Task, documentId, { title: "duplicate", labels: [] }))
       assert.strictEqual(exit._tag, "Failure")
-      const leaked = initSpy.mock.results.at(-1)?.value as InternalAutomerge.AnyDocument | undefined
+      const leaked = initSpy.mock.results.at(-1)?.value
       initSpy.mockRestore()
       assert.isDefined(leaked)
       // A failed create must free the document it initialized; a freed document
       // throws on any access, a leaked one is still usable.
-      assert.throws(() => InternalAutomerge.heads(leaked!))
+      if (leaked === undefined) yield* Effect.die("expected initialized document")
+      assert.throws(() => InternalAutomerge.heads(leaked))
     }).pipe(Effect.provide(Store)))
 
   it.effect("rolls application rows back with an outer transaction", () =>
@@ -325,26 +326,29 @@ describe("DocumentStore", () => {
       })
       // A deferred foreign key violation is only reported at commit time.
       yield* withFault(probe, {
-        before: (text) =>
-          text.includes("INSERT INTO effect_local_commit_outbox")
-            ? Effect.andThen(
+        before: (text) => {
+          if (text.includes("INSERT INTO effect_local_commit_outbox")) {
+            return Effect.andThen(
               sql`PRAGMA defer_foreign_keys = ON`,
               sql`INSERT INTO effect_local_checkpoints (
                 checkpoint_hash, document_id, heads, bytes, checksum, commit_sequence, verified
               ) VALUES ('ghost', 'doc_missing', '[]', x'00', 'c', 1, 0)`
             )
-            : undefined
+          }
+          return undefined
+        }
       })
       const forked = vi.spyOn(InternalAutomerge, "clone")
 
       const exit = yield* Effect.exit(store.persist(Task, documentId, created, staged))
 
-      const owned = forked.mock.results.at(-1)?.value as InternalAutomerge.AnyDocument | undefined
+      const owned = forked.mock.results.at(-1)?.value
       forked.mockRestore()
       assert.strictEqual(exit._tag, "Failure")
       assert.isDefined(owned)
       // A freed document throws on access; a leaked one would still be usable.
-      assert.throws(() => InternalAutomerge.heads(owned!))
+      if (owned === undefined) yield* Effect.die("expected cloned document")
+      assert.throws(() => InternalAutomerge.heads(owned))
       // The caller keeps the handles it passed in.
       assert.deepStrictEqual(InternalAutomerge.value(staged), { title: "two", labels: [] })
       assert.deepStrictEqual(InternalAutomerge.value(created.automerge), { title: "one", labels: [] })

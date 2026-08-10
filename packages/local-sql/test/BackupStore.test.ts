@@ -20,7 +20,7 @@ import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as BackupStore from "../src/BackupStore.js"
-import type * as CheckpointAuthority from "../src/CheckpointAuthority.js"
+import * as CheckpointAuthority from "../src/CheckpointAuthority.js"
 import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as Compaction from "../src/Compaction.js"
 import * as DocumentStore from "../src/DocumentStore.js"
@@ -30,6 +30,7 @@ import * as ProjectionStore from "../src/ProjectionStore.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
 import * as SqlProjection from "../src/SqlProjection.js"
 import * as SqlReplica from "../src/SqlReplica.js"
+import { decodeJson, encodeJson } from "./helpers/json.js"
 
 describe("BackupStore", () => {
   const concatenate = (chunks: ReadonlyArray<Uint8Array>) => {
@@ -48,7 +49,7 @@ describe("BackupStore", () => {
    * contain is a value the remedy cannot deliver.
    */
   const archiveLinesOf = (chunks: ReadonlyArray<Uint8Array>) =>
-    new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n").map((line) => JSON.parse(line))
+    new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n").map(decodeJson)
   /**
    * Reseals edited archive lines back into archive bytes. Record checksums, the end record roll-up,
    * and the manifest are all recomputed, so a restore rejects the edit under test rather than the
@@ -67,12 +68,12 @@ describe("BackupStore", () => {
       manifest.value.recordCount = records.length
       for (let attempt = 0; attempt < 8; attempt++) {
         manifest.checksum = yield* Canonical.digest(manifest.value)
-        const encoded = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+        const encoded = new TextEncoder().encode(`${lines.map(encodeJson).join("\n")}\n`)
         if (manifest.value.declaredBytes === encoded.byteLength) return encoded
         manifest.value.declaredBytes = encoded.byteLength
       }
       manifest.checksum = yield* Canonical.digest(manifest.value)
-      return new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+      return new TextEncoder().encode(`${lines.map(encodeJson).join("\n")}\n`)
     })
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
   const definition = ReplicaDefinition.make({
@@ -158,30 +159,36 @@ describe("BackupStore", () => {
     NodeCrypto.layer
   )
   const Limits = ReplicaLimits.layer(limits)
-  const authorityToken = Uint8Array.of(7, 8, 9) as CheckpointAuthority.AuthorizationToken
+  const authorityToken = CheckpointAuthority.AuthorizationToken.make(Uint8Array.of(7, 8, 9))
   const issuedByAuthority = (token: CheckpointAuthority.AuthorizationToken) =>
     Encoding.encodeBase64(token) === Encoding.encodeBase64(authorityToken)
   const checkpointAuthority: CheckpointAuthority.Implementation = {
     signManifest: () => Effect.succeed(Option.some(authorityToken)),
     verifyManifest: (claims, token) =>
-      issuedByAuthority(token) ? Effect.void : Effect.fail(
-        new ReplicaError.ReplicaError({
-          reason: new ReplicaError.CheckpointRejected({
-            documentId: claims.documentId,
-            reason: "Invalid backup checkpoint authorization"
+      Effect.gen(function*() {
+        if (issuedByAuthority(token)) return
+        yield* Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.CheckpointRejected({
+              documentId: claims.documentId,
+              reason: "Invalid backup checkpoint authorization"
+            })
           })
-        })
-      ),
+        )
+      }),
     signTransition: () => Effect.succeed(Option.some(authorityToken)),
     verifyTransition: (claims, token) =>
-      issuedByAuthority(token) ? Effect.void : Effect.fail(
-        new ReplicaError.ReplicaError({
-          reason: new ReplicaError.CheckpointRejected({
-            documentId: claims.documentId,
-            reason: "Invalid backup transition authorization"
+      Effect.gen(function*() {
+        if (issuedByAuthority(token)) return
+        yield* Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.CheckpointRejected({
+              documentId: claims.documentId,
+              reason: "Invalid backup transition authorization"
+            })
           })
-        })
-      )
+        )
+      })
   }
   const Live = SqlReplica.servicesLayerWithBindings(definition, { projections: [] }).pipe(
     Layer.provideMerge(Layer.mergeAll(Database, Limits))
@@ -344,7 +351,7 @@ describe("BackupStore", () => {
         WHERE checkpoint_hash = ${latest.checkpoint.checkpointHash}
       `
       assert.deepStrictEqual(
-        Schema.decodeSync(Schema.fromJsonString(Schema.Unknown))(checkpoints[0]!.writer_provenance),
+        Schema.decodeSync(Schema.fromJsonString(Schema.Unknown))(checkpoints[0].writer_provenance),
         latest.checkpoint.writerProvenance
       )
       assert.isTrue(latest.checkpoint.writerProvenance.some((entry) =>
@@ -395,7 +402,7 @@ describe("BackupStore", () => {
       const restoredCheckpoints = yield* sql<{ readonly writer_provenance: string }>`
         SELECT writer_provenance FROM effect_local_checkpoints WHERE document_id = ${documentId}
       `
-      assert.deepStrictEqual(JSON.parse(restoredCheckpoints[0]!.writer_provenance), [{
+      assert.deepStrictEqual(decodeJson(restoredCheckpoints[0].writer_provenance), [{
         changeHash: change.value.change_hash,
         writerDefinitionHash: definition.hash,
         writerSchemaVersion: change.value.writer_schema_version
@@ -544,12 +551,12 @@ describe("BackupStore", () => {
       assert.deepStrictEqual(
         yield* sql<{ readonly lineage: string }>`
           SELECT lineage FROM effect_local_documents WHERE document_id = ${documentId}`,
-        [{ lineage: lineage as string }]
+        [{ lineage }]
       )
       assert.deepStrictEqual(
         yield* sql<{ readonly lineage: string }>`
           SELECT lineage FROM effect_local_checkpoints WHERE document_id = ${documentId}`,
-        [{ lineage: lineage as string }]
+        [{ lineage }]
       )
       const restored = yield* store.load(Task, documentId)
       assert.strictEqual(restored.snapshot.value.title, "rewritten")
@@ -580,19 +587,19 @@ describe("BackupStore", () => {
         readonly heads: string
         readonly lineage: string
       }>`SELECT checkpoint_hash, heads, lineage FROM effect_local_checkpoints WHERE document_id = ${documentId}`
-      const checkpoint = checkpoints[0]!
+      const checkpoint = checkpoints[0]
       const compactProvenance = {
         _tag: "Compact",
         checkpointHash: checkpoint.checkpoint_hash,
         lineage: checkpoint.lineage,
-        heads: JSON.parse(checkpoint.heads),
+        heads: decodeJson(checkpoint.heads),
         base: { _tag: "Bootstrap" },
         schemaVersion: Task.version,
         writerDefinitionHash: definition.hash,
         authorization: Encoding.encodeBase64(authorityToken)
       }
       yield* sql`UPDATE effect_local_checkpoints
-        SET writer_provenance = ${JSON.stringify(compactProvenance)}
+        SET writer_provenance = ${encodeJson(compactProvenance)}
         WHERE checkpoint_hash = ${checkpoint.checkpoint_hash}`
       const transitionsBefore = yield* sql<{
         readonly authorization: Uint8Array | null
@@ -635,11 +642,11 @@ describe("BackupStore", () => {
       const restoredCheckpoint = yield* sql<{ readonly writer_provenance: string }>`
         SELECT writer_provenance FROM effect_local_checkpoints WHERE checkpoint_hash = ${checkpoint.checkpoint_hash}
       `
-      assert.deepStrictEqual(JSON.parse(restoredCheckpoint[0]!.writer_provenance), compactProvenance)
+      assert.deepStrictEqual(decodeJson(restoredCheckpoint[0].writer_provenance), compactProvenance)
       assert.deepStrictEqual(
         yield* sql<{ readonly lineage: string }>`
           SELECT lineage FROM effect_local_documents WHERE document_id = ${documentId}`,
-        [{ lineage: secondLineage as string }]
+        [{ lineage: secondLineage }]
       )
       const restored = yield* store.load(Task, documentId)
       assert.strictEqual(restored.snapshot.value.title, "transitioned")
@@ -660,13 +667,13 @@ describe("BackupStore", () => {
         readonly checkpoint_hash: string
         readonly heads: string
         readonly lineage: string
-      }>`SELECT checkpoint_hash, heads, lineage FROM effect_local_checkpoints WHERE document_id = ${documentId}`)[0]!
+      }>`SELECT checkpoint_hash, heads, lineage FROM effect_local_checkpoints WHERE document_id = ${documentId}`)[0]
       yield* sql`UPDATE effect_local_checkpoints SET writer_provenance = ${
-        JSON.stringify({
+        encodeJson({
           _tag: "Compact",
           checkpointHash: checkpoint.checkpoint_hash,
           lineage: checkpoint.lineage,
-          heads: JSON.parse(checkpoint.heads),
+          heads: decodeJson(checkpoint.heads),
           base: { _tag: "Bootstrap" },
           schemaVersion: Task.version,
           writerDefinitionHash: definition.hash,
@@ -947,8 +954,8 @@ describe("BackupStore", () => {
         restoredReceipts.map((row) => row.command_id),
         commandIds.toSorted()
       )
-      const representativeCommand = commandIds[0]!
-      const representativeDocument = [...expected.keys()][0]!
+      const representativeCommand = commandIds[0]
+      const representativeDocument = [...expected.keys()][0]
       assert.deepStrictEqual(
         yield* executor.lookupCreate(representativeCommand, archivedPermit),
         CommandOutcome.durablyCommitted(representativeCommand, representativeDocument)
@@ -1185,10 +1192,10 @@ describe("BackupStore", () => {
         FROM effect_local_history_rewrites ORDER BY replica_incarnation`
 
       assert.deepStrictEqual(markers, [{
-        replica_incarnation: permitBeforeRetry.incarnation as number,
-        operation_id: operationId as string,
-        document_id: documentId as string,
-        lineage: firstLineage as string
+        replica_incarnation: permitBeforeRetry.incarnation,
+        operation_id: operationId,
+        document_id: documentId,
+        lineage: firstLineage
       }])
       assert.deepStrictEqual(permitAfterRetry, permitBeforeRetry)
       assert.strictEqual(replayed, firstLineage)
@@ -1337,14 +1344,14 @@ describe("BackupStore", () => {
       const archive = concatenate(chunks)
       const sourceLines = new TextDecoder().decode(archive).trimEnd().split("\n")
 
-      const declaredLines = sourceLines.map((line) => JSON.parse(line))
+      const declaredLines = sourceLines.map(decodeJson)
       declaredLines[0]!.value.declaredBytes += 1
       declaredLines[0]!.checksum = yield* Canonical.digest(declaredLines[0]!.value)
-      const declaredSize = new TextEncoder().encode(`${declaredLines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+      const declaredSize = new TextEncoder().encode(`${declaredLines.map(encodeJson).join("\n")}\n`)
 
-      const checksumLines = sourceLines.map((line) => JSON.parse(line))
+      const checksumLines = sourceLines.map(decodeJson)
       checksumLines[1]!.checksum = "invalid"
-      const checksum = new TextEncoder().encode(`${checksumLines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+      const checksum = new TextEncoder().encode(`${checksumLines.map(encodeJson).join("\n")}\n`)
 
       const malformed = new TextEncoder().encode(`${sourceLines[0]}${sourceLines.slice(1).join("\n")}\n`)
       const before = yield* sql<{
@@ -1414,7 +1421,7 @@ describe("BackupStore", () => {
         assert.isAtMost(chunk.byteLength, limits.maxChunkBytes)
       }
       const changeRecord = new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n")
-        .find((line) => JSON.parse(line).kind === "Change")!
+        .find((line) => decodeJson(line).kind === "Change")!
       assert.isAbove(new TextEncoder().encode(changeRecord).byteLength, limits.maxChunkBytes)
       yield* backups.restore({
         installationId: yield* Identity.makeBackupInstallationId,
@@ -1461,7 +1468,9 @@ describe("BackupStore", () => {
         ).pipe(
           Stream.concat(Stream.fail(
             new ReplicaError.ReplicaError({
-              reason: new ReplicaError.StorageUnavailable({ cause: new Error("source tail was pulled") })
+              reason: new ReplicaError.StorageUnavailable({
+                cause: Error("source tail was pulled")
+              })
             })
           ))
         ),
@@ -1530,8 +1539,7 @@ describe("BackupStore", () => {
     Effect.gen(function*() {
       const backups = yield* BackupStore.BackupStore
       const source = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
-      const manifest = (chunks: ReadonlyArray<Uint8Array>) =>
-        archiveLinesOf(chunks)[0]!.value as { readonly replicaId: string; readonly incarnation: number }
+      const manifest = (chunks: ReadonlyArray<Uint8Array>) => archiveLinesOf(chunks)[0]!.value
       const initial = manifest(source)
 
       yield* backups.restore({
@@ -1727,9 +1735,12 @@ describe("BackupStore", () => {
       assert.deepStrictEqual(
         restoredReceipts,
         archived.map((entry) => ({
-          command_id: entry.commandId as string,
-          replica_incarnation: archivedPermit.incarnation as number
-        })).toSorted((left, right) => left.command_id < right.command_id ? -1 : 1)
+          command_id: entry.commandId,
+          replica_incarnation: archivedPermit.incarnation
+        })).toSorted((left, right) => {
+          if (left.command_id < right.command_id) return -1
+          return 1
+        })
       )
 
       assert.strictEqual(yield* compaction.pruneCommandReceipts, archived.length)
@@ -1831,7 +1842,7 @@ describe("BackupStore", () => {
         (SELECT COUNT(*) FROM effect_local_checkpoints) AS checkpoints,
         (SELECT COUNT(*) FROM effect_local_command_receipts) AS receipts`
       assert.deepStrictEqual(sizing, [{ changes: 2, checkpoints: 0, documents: 2, receipts: 6 }])
-      const recordCount = sizing[0]!.documents + sizing[0]!.changes + sizing[0]!.checkpoints + sizing[0]!.receipts
+      const recordCount = sizing[0].documents + sizing[0].changes + sizing[0].checkpoints + sizing[0].receipts
 
       const error = yield* Effect.flip(
         backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
@@ -1851,9 +1862,12 @@ describe("BackupStore", () => {
       assert.deepStrictEqual(
         remaining,
         liveCommandIds.map((commandId) => ({
-          command_id: commandId as string,
-          replica_incarnation: permit.incarnation as number
-        })).toSorted((left, right) => left.command_id < right.command_id ? -1 : 1)
+          command_id: commandId,
+          replica_incarnation: permit.incarnation
+        })).toSorted((left, right) => {
+          if (left.command_id < right.command_id) return -1
+          return 1
+        })
       )
 
       const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
@@ -1917,7 +1931,7 @@ describe("BackupStore", () => {
         const watermark = yield* sql<{ readonly commit_sequence: number }>`
           SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1
         `
-        const commitSequence = watermark[0]!.commit_sequence
+        const commitSequence = watermark[0].commit_sequence
         assert.isAbove(commitSequence, 0)
         const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
         return { chunks, commitSequence }

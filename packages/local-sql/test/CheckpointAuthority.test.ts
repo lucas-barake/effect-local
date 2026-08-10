@@ -5,6 +5,7 @@ import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as CheckpointAuthority from "../src/CheckpointAuthority.js"
 import * as WriterProvenance from "../src/internal/writerProvenance.js"
+import { encodeJson } from "./helpers/json.js"
 
 const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
 const priorLineage = Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000002")
@@ -12,9 +13,9 @@ const resultingLineage = Identity.DocumentLineage.make("lin_00000000-0000-4000-8
 const priorCheckpointHash = "1".repeat(64)
 const anchorCheckpointHash = "2".repeat(64)
 const writerDefinitionHash = "def_0123456789abcdef"
-const oversizedToken = new Uint8Array(
+const oversizedToken: CheckpointAuthority.AuthorizationToken = Reflect.construct(Uint8Array, [
   CheckpointAuthority.maximumAuthorizationTokenBytes + 1
-) as CheckpointAuthority.AuthorizationToken
+])
 
 const manifestClaims: CheckpointAuthority.ManifestClaims = {
   purpose: CheckpointAuthority.manifestPurpose,
@@ -100,7 +101,7 @@ describe("CheckpointAuthority", () => {
           yield* Effect.flip(
             authority.verifyManifest(
               manifestClaims,
-              undefined as unknown as CheckpointAuthority.AuthorizationToken
+              Reflect.apply(authority.verifyManifest, authority, [manifestClaims, undefined])
             )
           ),
           yield* Effect.flip(authority.verifyTransition(transitionClaims, oversizedToken)),
@@ -116,7 +117,7 @@ describe("CheckpointAuthority", () => {
   it.effect("rejects oversized authorization in durable compact provenance", () =>
     Effect.gen(function*() {
       const error = yield* Effect.flip(
-        Schema.decodeUnknownEffect(WriterProvenance.StoredCheckpointProvenance)(JSON.stringify({
+        Schema.decodeUnknownEffect(WriterProvenance.StoredCheckpointProvenance)(encodeJson({
           _tag: "Compact",
           checkpointHash: priorCheckpointHash,
           lineage: priorLineage,

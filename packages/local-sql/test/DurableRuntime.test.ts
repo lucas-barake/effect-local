@@ -1,5 +1,5 @@
 import * as Automerge from "@automerge/automerge"
-import { NodeCrypto } from "@effect/platform-node"
+import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
@@ -17,6 +17,7 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
+import { FileSystem } from "effect/FileSystem"
 import * as Latch from "effect/Latch"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
@@ -30,9 +31,6 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as DurableClock from "effect/unstable/workflow/DurableClock"
 import * as Workflow from "effect/unstable/workflow/Workflow"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
-import { rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as Compaction from "../src/Compaction.js"
 import * as DocumentEntity from "../src/DocumentEntity.js"
@@ -143,7 +141,11 @@ describe("DurableRuntime", () => {
   const Services = Layer.merge(Inputs, Live)
 
   const servicesAtWith = <A, E, R,>(filename: string, workflowRegistrations: Layer.Layer<A, E, R>) => {
-    const database = Layer.merge(SqliteClient.layer({ filename, disableWAL: true }), NodeCrypto.layer)
+    const database = Layer.merge(
+      SqliteClient.layer({ filename, disableWAL: true }),
+      NodeCrypto.layer,
+      NodeFileSystem.layer
+    )
     const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(database))
     const gate = ReplicaGate.layer.pipe(Layer.provide(Limits), Layer.provide(Layer.merge(database, bootstrap)))
     const store = DocumentStore.layer.pipe(Layer.provide(Layer.mergeAll(database, gate, Limits)))
@@ -330,8 +332,11 @@ describe("DurableRuntime", () => {
 
   it.effect("polls a completed workflow after the SQL runtime restarts", () =>
     Effect.gen(function*() {
-      const filename = join(tmpdir(), `effect-local-workflow-${globalThis.crypto.randomUUID()}.sqlite`)
-      yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(filename, { force: true })))
+      const fs = yield* FileSystem
+      const filename = yield* fs.makeTempFileScoped({
+        prefix: "effect-local-workflow-",
+        suffix: ".sqlite"
+      })
       const execution = yield* Effect.scoped(
         Effect.gen(function*() {
           const runtime = yield* ReplicaWorkflow.CompactionWorkflow
@@ -339,10 +344,10 @@ describe("DurableRuntime", () => {
           const store = yield* DocumentStore.DocumentStore
           const stored = yield* store.create(Task, yield* Identity.makeDocumentId, { title: "restart" })
           InternalAutomerge.free(stored.automerge)
-          const execution = yield* runtime.execute(ReplicaWorkflow.OperationId.make("restart-compaction"))
+          const workflowExecution = yield* runtime.execute(ReplicaWorkflow.OperationId.make("restart-compaction"))
           for (let round = 0; round < 12; round++) {
             yield* sharding.pollStorage
-            if ((yield* runtime.poll(execution))._tag === "Some") return execution
+            if ((yield* runtime.poll(workflowExecution))._tag === "Some") return workflowExecution
             yield* TestClock.adjust(5_000)
           }
           return assert.fail("workflow did not record a result within 12 storage polls")
@@ -357,12 +362,15 @@ describe("DurableRuntime", () => {
           if (Option.isSome(result)) assert.strictEqual(result.value._tag, "Complete")
         }).pipe(Effect.provide(servicesAt(filename)))
       )
-    }), 20_000)
+    }).pipe(Effect.provide(NodeFileSystem.layer)), 20_000)
 
   it.effect("reconciles a suspended in-flight workflow after the SQL runtime restarts", () =>
     Effect.gen(function*() {
-      const filename = join(tmpdir(), `effect-local-workflow-${globalThis.crypto.randomUUID()}.sqlite`)
-      yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(filename, { force: true })))
+      const fs = yield* FileSystem
+      const filename = yield* fs.makeTempFileScoped({
+        prefix: "effect-local-workflow-",
+        suffix: ".sqlite"
+      })
       const attempts = yield* Ref.make(0)
       const firstSuspended = yield* Deferred.make<void>()
       const restartedSuspended = yield* Deferred.make<void>()
@@ -375,11 +383,11 @@ describe("DurableRuntime", () => {
           inMemoryThreshold: 0
         }).pipe(
           Effect.ensuring(
-            attempt === 1
-              ? Deferred.succeed(firstSuspended, undefined).pipe(Effect.asVoid)
-              : attempt === 2
-              ? Deferred.succeed(restartedSuspended, undefined).pipe(Effect.asVoid)
-              : Effect.void
+            (() => {
+              if (attempt === 1) return Deferred.succeed(firstSuspended, undefined).pipe(Effect.asVoid)
+              if (attempt === 2) return Deferred.succeed(restartedSuspended, undefined).pipe(Effect.asVoid)
+              return Effect.void
+            })()
           )
         )
         yield* Deferred.succeed(completed, undefined)
@@ -413,15 +421,15 @@ describe("DurableRuntime", () => {
       const executionId = yield* Effect.scoped(
         Effect.gen(function*() {
           const sharding = yield* Sharding.Sharding
-          const executionId = yield* RestartWorkflow.execute(
+          const restartExecutionId = yield* RestartWorkflow.execute(
             { operationId: "restart-interrupted" },
             { discard: true }
           )
           yield* driveUntil(sharding, firstSuspended)
-          const suspended = yield* awaitResult(executionId, "Suspended")
+          const suspended = yield* awaitResult(restartExecutionId, "Suspended")
           assert.strictEqual(suspended._tag, "Suspended")
           assert.strictEqual(yield* Ref.get(attempts), 1)
-          return executionId
+          return restartExecutionId
         }).pipe(Effect.provide(servicesAtWith(filename, registration)))
       )
 
@@ -438,7 +446,7 @@ describe("DurableRuntime", () => {
           assert.strictEqual(yield* Ref.get(attempts), 3)
         }).pipe(Effect.provide(servicesAtWith(filename, registration)))
       )
-    }), 30_000)
+    }).pipe(Effect.provide(NodeFileSystem.layer)), 30_000)
 
   it.effect("interrupts an in-flight compaction handle for the current incarnation", () =>
     Effect.gen(function*() {
@@ -525,14 +533,14 @@ describe("DurableRuntime", () => {
         const remote = Automerge.change(
           Automerge.clone(created.automerge, { actor: "1".repeat(32) }),
           (draft) => {
-            ;(draft.value as { title: string }).title = "remote"
+            draft.value.title = "remote"
           }
         )
         InternalAutomerge.free(created.automerge)
         const generated = Automerge.generateSyncMessage(remote, Automerge.initSyncState())
         InternalAutomerge.free(remote)
         assert.isNotNull(generated[1])
-        const message = generated[1]!
+        const message = generated[1]
         const messageHash = yield* Canonical.digest(message)
         const permit = yield* gate.current
         const entity = yield* DocumentEntity.DocumentEntity.client
@@ -607,7 +615,7 @@ describe("DurableRuntime", () => {
             )
             return Recovery.Recovery.of({
               ...recovery,
-              recover: <D extends Document.Any,>(document: D, documentId: Identity.DocumentId) =>
+              recover: (document: Document.Any, documentId: Identity.DocumentId) =>
                 recovery.recover(document, documentId).pipe(
                   Effect.flatMap((stored) => {
                     const targeted = options.target?.()
@@ -641,7 +649,7 @@ describe("DurableRuntime", () => {
             const recovery = yield* Recovery.Recovery
             return Recovery.Recovery.of({
               ...recovery,
-              recover: <D extends Document.Any,>(document: D, documentId: Identity.DocumentId) =>
+              recover: (document: Document.Any, documentId: Identity.DocumentId) =>
                 recovery.recover(document, documentId).pipe(
                   Effect.flatMap((stored) =>
                     Ref.update(recoverCalls, (count) => count + 1).pipe(
@@ -931,7 +939,7 @@ describe("DurableRuntime", () => {
       Effect.gen(function*() {
         const { recoverCalls, services } = yield* failingRecoveryServices(
           new ReplicaError.ReplicaError({
-            reason: new ReplicaError.StorageCorrupt({ cause: new Error("probe") })
+            reason: new ReplicaError.StorageCorrupt({ cause: Error("probe") })
           })
         )
         yield* Effect.gen(function*() {
@@ -993,7 +1001,7 @@ describe("DurableRuntime", () => {
       const rows = yield* sql<{ readonly lineage: string }>`SELECT lineage
         FROM effect_local_documents WHERE document_id = ${documentId}`
       assert.strictEqual(rows.length, 1)
-      return rows[0]!.lineage
+      return rows[0].lineage
     })
 
   const changeCountOf = (documentId: Identity.DocumentId) =>
@@ -1001,7 +1009,7 @@ describe("DurableRuntime", () => {
       const sql = yield* SqlClient.SqlClient
       const rows = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
         FROM effect_local_changes WHERE document_id = ${documentId}`
-      return rows[0]!.count
+      return rows[0].count
     })
 
   /** Identity of the one checkpoint a rewritten document keeps, so a second rewrite is visible. */
@@ -1021,11 +1029,11 @@ describe("DurableRuntime", () => {
     result: Option.Option<Workflow.Result<Identity.DocumentLineage, ReplicaError.ReplicaError>>
   ) => {
     assert.isTrue(Option.isSome(result))
-    if (!Option.isSome(result)) throw new Error("unreachable")
+    if (!Option.isSome(result)) return assert.fail("unreachable")
     assert.strictEqual(result.value._tag, "Complete")
-    if (result.value._tag !== "Complete") throw new Error("unreachable")
+    if (result.value._tag !== "Complete") return assert.fail("unreachable")
     assert.isTrue(Exit.isSuccess(result.value.exit))
-    if (!Exit.isSuccess(result.value.exit)) throw new Error("unreachable")
+    if (!Exit.isSuccess(result.value.exit)) return assert.fail("unreachable")
     return result.value.exit.value
   }
 
@@ -1055,7 +1063,7 @@ describe("DurableRuntime", () => {
         assert.strictEqual(yield* changeCountOf(documentId), 1)
         const checkpoints = yield* checkpointsOf(documentId)
         assert.strictEqual(checkpoints.length, 1)
-        assert.strictEqual(checkpoints[0]!.lineage, lineage)
+        assert.strictEqual(checkpoints[0].lineage, lineage)
 
         // Value preservation is what makes the discard acceptable, so it is asserted through the
         // ordinary load path rather than against the workflow's own report.
@@ -1123,8 +1131,8 @@ describe("DurableRuntime", () => {
         assert.strictEqual(yield* lineageOf(documentId), secondLineage)
         const secondCheckpoints = yield* checkpointsOf(documentId)
         assert.strictEqual(secondCheckpoints.length, 1)
-        assert.strictEqual(secondCheckpoints[0]!.lineage, secondLineage)
-        assert.isAbove(secondCheckpoints[0]!.commit_sequence, firstCheckpoints[0]!.commit_sequence)
+        assert.strictEqual(secondCheckpoints[0].lineage, secondLineage)
+        assert.isAbove(secondCheckpoints[0].commit_sequence, firstCheckpoints[0].commit_sequence)
         assert.strictEqual(yield* changeCountOf(documentId), 1)
       }).pipe(Effect.provide(Services)),
     20_000
@@ -1153,8 +1161,8 @@ describe("DurableRuntime", () => {
         const inner = yield* Compaction.Compaction
         return Compaction.Compaction.of({
           ...inner,
-          rewriteHistory: <D extends Document.Any,>(
-            document: D,
+          rewriteHistory: (
+            document: Document.Any,
             documentId: Identity.DocumentId,
             operationId: Compaction.OperationId
           ) =>
@@ -1223,14 +1231,14 @@ describe("DurableRuntime", () => {
           // One rewrite, durably. A second rewrite would leave a second marker, a different document
           // lineage, a different checkpoint and a new commit sequence.
           assert.deepStrictEqual(yield* rewriteMarkers, [{
-            document_id: documentId as string,
-            operation_id: operationId as string,
-            lineage: lineage as string
+            document_id: documentId,
+            operation_id: operationId,
+            lineage
           }])
           assert.strictEqual(yield* lineageOf(documentId), lineage)
           const checkpoints = yield* checkpointsOf(documentId)
           assert.strictEqual(checkpoints.length, 1)
-          assert.strictEqual(checkpoints[0]!.lineage, lineage)
+          assert.strictEqual(checkpoints[0].lineage, lineage)
           assert.strictEqual(yield* changeCountOf(documentId), 1)
 
           const reloaded = yield* store.load(Task, documentId)

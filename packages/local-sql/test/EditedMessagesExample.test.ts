@@ -196,7 +196,7 @@ describe("edited messages example", () => {
           !fromRight.dirty
         ) return
       }
-      return yield* Effect.die("edited message peers did not reach quiescence within 32 rounds")
+      yield* Effect.die("edited message peers did not reach quiescence within 32 rounds")
     })
 
   const edit = (side: Side, documentId: Identity.DocumentId, body: string) =>
@@ -227,11 +227,12 @@ describe("edited messages example", () => {
         record.path.target.key === "body"
       )
       assert.isDefined(bodyConflict)
-      assert.isTrue(bodyConflict!.alternatives.every(({ value }) => Automerge.isImmutableString(value)))
+      assert.isTrue(bodyConflict.alternatives.every(({ value }) => Automerge.isImmutableString(value)))
       assert.sameMembers(
-        bodyConflict!.alternatives.map(({ value }) =>
-          Automerge.isImmutableString(value) ? value.val : assert.fail("expected ImmutableString revision")
-        ),
+        bodyConflict.alternatives.map(({ value }) => {
+          if (!Automerge.isImmutableString(value)) return assert.fail("expected ImmutableString revision")
+          return value.val
+        }),
         ["left revision", "right revision"]
       )
 
@@ -245,7 +246,7 @@ describe("edited messages example", () => {
         const selected = alternatives.find(({ value }) =>
           Automerge.isImmutableString(value) && value.val === "right revision"
         )
-        if (selected === undefined) throw new Error("expected the right revision")
+        if (selected === undefined) return assert.fail("expected the right revision")
         return selected
       }).pipe(Effect.provideService(Replica.Replica, left.replica))
 
@@ -254,6 +255,6 @@ describe("edited messages example", () => {
       assert.deepStrictEqual(resolved.conflicts, [])
       const pending = yield* left.sql<{ readonly count: number }>`
         SELECT COUNT(*) AS count FROM effect_local_commit_outbox WHERE published = 0`
-      assert.strictEqual(pending[0]!.count, pendingBeforeResolution[0]!.count + 1)
+      assert.strictEqual(pending[0].count, pendingBeforeResolution[0].count + 1)
     })).pipe(Effect.provide(NodeCrypto.layer)))
 })

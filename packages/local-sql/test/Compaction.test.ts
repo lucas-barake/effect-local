@@ -22,6 +22,7 @@ import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
 import { withGateLimits } from "./fixtures/limits.js"
+import { decodeJson, encodeJson } from "./helpers/json.js"
 
 describe("Compaction", () => {
   const Task = Document.make("Task", {
@@ -85,7 +86,7 @@ describe("Compaction", () => {
     const permit = yield* gate.current
     const documentId = yield* Identity.makeDocumentId
     const commandId = yield* Identity.makeCommandId
-    const value = { title: "one", labels: [] as ReadonlyArray<string> }
+    const value = { title: "one", labels: [] }
     const encoded = yield* Document.encode(Task, documentId, value)
     const requestHash = yield* CommandExecutor.createRequestHash({
       incarnation: permit.incarnation,
@@ -95,7 +96,7 @@ describe("Compaction", () => {
       encoded
     })
     yield* executor.create(Task, { commandId, documentId, permit, requestHash, value })
-    return { command_id: commandId as string, replica_incarnation: permit.incarnation as number }
+    return { command_id: commandId, replica_incarnation: permit.incarnation }
   })
 
   const listReceipts = Effect.gen(function*() {
@@ -111,7 +112,11 @@ describe("Compaction", () => {
   ) =>
     rows.toSorted((left, right) =>
       left.replica_incarnation - right.replica_incarnation ||
-      (left.command_id < right.command_id ? -1 : left.command_id > right.command_id ? 1 : 0)
+      (() => {
+        if (left.command_id < right.command_id) return -1
+        if (left.command_id > right.command_id) return 1
+        return 0
+      })()
     )
 
   /** Overwrites `title` `count` times through the real store, leaving one change per write. */
@@ -129,7 +134,7 @@ describe("Compaction", () => {
         durable = next
       }
       InternalAutomerge.free(durable.automerge)
-      return { title: `write-${count}`, labels: [] as ReadonlyArray<string> }
+      return { title: `write-${count}`, labels: [] }
     })
 
   const checkpointsOf = (documentId: Identity.DocumentId) =>
@@ -170,7 +175,7 @@ describe("Compaction", () => {
         readonly tombstone: number
       }>`SELECT history_bytes, history_changes, history_operations, lineage, projection_status, tombstone
         FROM effect_local_documents WHERE document_id = ${documentId}`
-      return rows[0]!
+      return rows[0]
     })
 
   /**
@@ -192,7 +197,7 @@ describe("Compaction", () => {
       }>`SELECT bytes, checkpoint_hash, checksum, commit_sequence, heads, lineage, verified, writer_provenance
         FROM effect_local_checkpoints WHERE document_id = ${documentId} ORDER BY checkpoint_hash`
       assert.strictEqual(rows.length, 1)
-      return rows[0]!
+      return rows[0]
     })
 
   /** The durable rewrite markers, which is where a second rewrite of one request would be visible. */
@@ -252,14 +257,13 @@ describe("Compaction", () => {
   const operationId = Compaction.OperationId.make("rewrite-history")
 
   /** The change hashes a saved Automerge document actually contains. */
-  const changeHashesOf = (bytes: Uint8Array) => {
-    const loaded = Automerge.load(bytes)
-    try {
-      return Automerge.getAllChanges(loaded).map((change) => Automerge.decodeChange(change).hash)
-    } finally {
-      Automerge.free(loaded)
-    }
-  }
+  const changeHashesOf = (bytes: Uint8Array) =>
+    Effect.acquireUseRelease(
+      Effect.sync(() => Automerge.load(bytes)),
+      (loaded) =>
+        Effect.sync(() => Automerge.getAllChanges(loaded).map((change) => Automerge.decodeChange(change).hash)),
+      (loaded) => Effect.sync(() => Automerge.free(loaded))
+    )
 
   it.effect("publishes a checkpoint only when heads and commit sequence still match", () =>
     Effect.gen(function*() {
@@ -602,7 +606,7 @@ describe("Compaction", () => {
       const documentId = yield* Identity.makeDocumentId
       const value = yield* churn(documentId, 200)
       assert.isTrue((yield* compaction.compact(Task, documentId)).published)
-      const churned = (yield* checkpointsOf(documentId))[0]!
+      const churned = (yield* checkpointsOf(documentId))[0]
       assert.strictEqual((yield* changesOf(documentId)).length, 201)
 
       // The floor a single write costs: the same value written once into a fresh document and
@@ -611,14 +615,14 @@ describe("Compaction", () => {
       const floor = yield* store.create(Task, floorDocumentId, value)
       InternalAutomerge.free(floor.automerge)
       yield* compaction.compact(Task, floorDocumentId)
-      const floorBytes = (yield* checkpointsOf(floorDocumentId))[0]!.bytes.byteLength
+      const floorBytes = (yield* checkpointsOf(floorDocumentId))[0].bytes.byteLength
 
       const lineage = yield* compaction.rewriteHistory(Task, documentId, operationId)
       assert.notStrictEqual(lineage, "")
 
       const checkpoints = yield* checkpointsOf(documentId)
       assert.strictEqual(checkpoints.length, 1)
-      const rewritten = checkpoints[0]!
+      const rewritten = checkpoints[0]
       assert.strictEqual(rewritten.verified, 1)
       assert.strictEqual(rewritten.lineage, lineage)
       assert.isBelow(rewritten.bytes.byteLength, churned.bytes.byteLength)
@@ -628,32 +632,32 @@ describe("Compaction", () => {
 
       const changes = yield* changesOf(documentId)
       assert.strictEqual(changes.length, 1)
-      assert.strictEqual(changes[0]!.applied, 1)
-      assert.strictEqual(changes[0]!.peer_id, null)
-      assert.strictEqual(changes[0]!.commit_sequence, rewritten.commit_sequence)
+      assert.strictEqual(changes[0].applied, 1)
+      assert.strictEqual(changes[0].peer_id, null)
+      assert.strictEqual(changes[0].commit_sequence, rewritten.commit_sequence)
       assert.deepStrictEqual(
         (yield* commitOutboxOf(documentId)).filter((row) => row.commit_sequence === rewritten.commit_sequence),
         [{
           commit_sequence: rewritten.commit_sequence,
-          document_id: documentId as string,
-          invalidation_keys: JSON.stringify(ReplicaDefinition.documentCommitKeys(Task.name, documentId)),
+          document_id: documentId,
+          invalidation_keys: encodeJson(ReplicaDefinition.documentCommitKeys(Task.name, documentId)),
           published: 0
         }]
       )
 
-      const hashes = changeHashesOf(rewritten.bytes)
+      const hashes = yield* changeHashesOf(rewritten.bytes)
       assert.strictEqual(hashes.length, 1)
-      assert.deepStrictEqual(hashes, [changes[0]!.change_hash])
-      const provenance = JSON.parse(rewritten.writer_provenance) as ReadonlyArray<{ readonly changeHash: string }>
+      assert.deepStrictEqual(hashes, [changes[0].change_hash])
+      const provenance = decodeJson(rewritten.writer_provenance)
       assert.strictEqual(provenance.length, 1)
-      assert.strictEqual(provenance[0]!.changeHash, changes[0]!.change_hash)
+      assert.strictEqual(provenance[0].changeHash, changes[0].change_hash)
 
       const row = yield* documentRowOf(documentId)
       assert.strictEqual(row.lineage, lineage)
       assert.notStrictEqual(row.lineage, "")
       assert.strictEqual(row.history_changes, 1)
-      assert.strictEqual(row.history_operations, Automerge.decodeChange(changes[0]!.bytes).ops.length)
-      assert.strictEqual(row.history_bytes, changes[0]!.bytes.byteLength)
+      assert.strictEqual(row.history_operations, Automerge.decodeChange(changes[0].bytes).ops.length)
+      assert.strictEqual(row.history_bytes, changes[0].bytes.byteLength)
 
       const reloaded = yield* store.load(Task, documentId)
       assert.deepStrictEqual(reloaded.snapshot.value, value)
@@ -716,26 +720,24 @@ describe("Compaction", () => {
       const transitions = yield* lineageTransitionsOf(documentId)
 
       assert.strictEqual(transitions.length, 1)
-      const transition = transitions[0]!
+      const transition = transitions[0]
       assert.deepStrictEqual(transition.prior_snapshot, priorSnapshot)
       assert.strictEqual(transition.prior_checkpoint_hash, priorCheckpointHash)
-      assert.deepStrictEqual(JSON.parse(transition.prior_heads), priorHeads)
+      assert.deepStrictEqual(decodeJson(transition.prior_heads), priorHeads)
       assert.strictEqual(transition.prior_lineage, Identity.genesisLineage)
       assert.strictEqual(transition.lineage, lineage)
       assert.strictEqual(transition.checkpoint_hash, rewritten.checkpoint_hash)
-      assert.deepStrictEqual(JSON.parse(transition.heads), JSON.parse(rewritten.heads))
+      assert.deepStrictEqual(decodeJson(transition.heads), decodeJson(rewritten.heads))
       assert.strictEqual(transition.schema_version, Task.version)
       assert.strictEqual(transition.writer_definition_hash, definition.hash)
       assert.strictEqual(transition.authorization, null)
       assert.isNotEmpty(transition.created_at)
 
       const recoveredPrior = Automerge.load<InternalAutomerge.Root<typeof value>>(transition.prior_snapshot)
-      try {
+      yield* Effect.gen(function*() {
         assert.deepStrictEqual(InternalAutomerge.value(recoveredPrior), value)
         assert.deepStrictEqual(Automerge.getHeads(recoveredPrior), priorHeads)
-      } finally {
-        InternalAutomerge.free(recoveredPrior)
-      }
+      }).pipe(Effect.ensuring(Effect.sync(() => InternalAutomerge.free(recoveredPrior))))
     }).pipe(Effect.provide(Services)))
 
   it.effect("refuses to rewrite while materialized and accepted heads are diverged", () =>
@@ -814,7 +816,7 @@ describe("Compaction", () => {
       const retained = yield* sql<{ readonly count: number }>`
         SELECT COUNT(*) AS count FROM effect_local_peer_receipts WHERE document_id = ${documentId}
       `
-      assert.strictEqual(retained[0]!.count, 1)
+      assert.strictEqual(retained[0].count, 1)
       assert.strictEqual((yield* documentRowOf(documentId)).lineage, "")
     }).pipe(Effect.provide(Services)))
 
@@ -843,7 +845,7 @@ describe("Compaction", () => {
       const retained = yield* sql<{ readonly count: number }>`
         SELECT COUNT(*) AS count FROM effect_local_peer_outbox WHERE document_id = ${documentId}
       `
-      assert.strictEqual(retained[0]!.count, 1)
+      assert.strictEqual(retained[0].count, 1)
       assert.strictEqual((yield* documentRowOf(documentId)).lineage, "")
     }).pipe(Effect.provide(Services)))
 
@@ -885,7 +887,7 @@ describe("Compaction", () => {
         SELECT relay_message_id FROM effect_local_peer_relay_outbox
         WHERE document_id = ${documentId}
       `
-      assert.deepStrictEqual(retained, [{ relay_message_id: relayMessageId as string }])
+      assert.deepStrictEqual(retained, [{ relay_message_id: relayMessageId }])
       assert.strictEqual((yield* documentRowOf(documentId)).lineage, "")
     }).pipe(Effect.provide(Services)))
 
@@ -940,7 +942,7 @@ describe("Compaction", () => {
       assert.deepStrictEqual(retained, [{
         encoded_bytes: 128,
         receipt_count: 1,
-        relay_message_id: relayMessageId as string
+        relay_message_id: relayMessageId
       }])
       assert.strictEqual((yield* documentRowOf(documentId)).lineage, "")
     }).pipe(Effect.provide(Services)))
@@ -970,7 +972,9 @@ describe("Compaction", () => {
           [1, documentId, senderAPeerId, "subject-a", targetA, 120],
           [2, documentId, senderBPeerId, "subject-b", targetB, 40],
           [3, survivorDocumentId, senderAPeerId, "subject-a", survivorA, 80]
-        ] as const
+        ] satisfies ReadonlyArray<
+          readonly [number, Identity.DocumentId, string, string, Identity.RelayMessageId, number]
+        >
       ) {
         yield* sql`INSERT INTO effect_local_peer_receipts (
           replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id,
@@ -1014,12 +1018,12 @@ describe("Compaction", () => {
         [{ receipt_count: 2, encoded_bytes: 200 }, { receipt_count: 1, encoded_bytes: 40 }]
       )
       assert.strictEqual(
-        (yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM effect_local_peer_receipts`)[0]!.count,
+        (yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM effect_local_peer_receipts`)[0].count,
         3
       )
       assert.strictEqual(
         (yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
-          FROM effect_local_peer_receipt_replies`)[0]!.count,
+          FROM effect_local_peer_receipt_replies`)[0].count,
         3
       )
       assert.strictEqual((yield* documentRowOf(documentId)).lineage, "")
@@ -1175,7 +1179,7 @@ describe("Compaction", () => {
       assert.strictEqual((yield* documentRowOf(documentId)).lineage, lineage)
       assert.deepStrictEqual(
         (yield* rewriteMarkers).map((row) => ({ document_id: row.document_id, lineage: row.lineage })),
-        [{ document_id: documentId as string, lineage: lineage as string }]
+        [{ document_id: documentId, lineage }]
       )
       assert.strictEqual((yield* lineageTransitionsOf(documentId)).length, 1)
 
@@ -1185,7 +1189,7 @@ describe("Compaction", () => {
     }).pipe(Effect.provide(Services)))
 
   it.effect("signs canonical transition claims once across an operation retry", () => {
-    const token = Uint8Array.of(7, 8, 9) as CheckpointAuthority.AuthorizationToken
+    const token = CheckpointAuthority.AuthorizationToken.make(Uint8Array.of(7, 8, 9))
     const authority = recordingAuthority(Option.some(token))
 
     return Effect.gen(function*() {
@@ -1201,7 +1205,7 @@ describe("Compaction", () => {
       assert.strictEqual(replayed, lineage)
       assert.strictEqual(authority.signed.length, 1)
       assert.strictEqual(transitions.length, 1)
-      const claims = authority.signed[0]!
+      const claims = authority.signed[0]
       assert.deepStrictEqual(claims.priorHeads, [...new Set(claims.priorHeads)].toSorted())
       assert.deepStrictEqual(claims.resultingHeads, [...new Set(claims.resultingHeads)].toSorted())
       assert.strictEqual(claims.purpose, CheckpointAuthority.transitionPurpose)
@@ -1209,11 +1213,11 @@ describe("Compaction", () => {
       assert.strictEqual(claims.resultingLineage, lineage)
       assert.strictEqual(claims.schemaVersion, Task.version)
       assert.strictEqual(claims.writerDefinitionHash, definition.hash)
-      assert.strictEqual(transitions[0]!.prior_checkpoint_hash, claims.priorCheckpointHash)
-      assert.deepStrictEqual(JSON.parse(transitions[0]!.prior_heads), claims.priorHeads)
-      assert.strictEqual(transitions[0]!.checkpoint_hash, claims.anchorCheckpointHash)
-      assert.deepStrictEqual(JSON.parse(transitions[0]!.heads), claims.resultingHeads)
-      assert.deepStrictEqual(transitions[0]!.authorization, token)
+      assert.strictEqual(transitions[0].prior_checkpoint_hash, claims.priorCheckpointHash)
+      assert.deepStrictEqual(decodeJson(transitions[0].prior_heads), claims.priorHeads)
+      assert.strictEqual(transitions[0].checkpoint_hash, claims.anchorCheckpointHash)
+      assert.deepStrictEqual(decodeJson(transitions[0].heads), claims.resultingHeads)
+      assert.deepStrictEqual(transitions[0].authorization, token)
     }).pipe(Effect.provide(authority.Services))
   })
 
@@ -1251,11 +1255,11 @@ describe("Compaction", () => {
 
       assert.strictEqual(TaskV2.version, 2)
       assert.strictEqual(authority.signed.length, 1)
-      assert.strictEqual(authority.signed[0]!.schemaVersion, 1)
-      assert.strictEqual((yield* lineageTransitionsOf(documentId))[0]!.schema_version, 1)
+      assert.strictEqual(authority.signed[0].schemaVersion, 1)
+      assert.strictEqual((yield* lineageTransitionsOf(documentId))[0].schema_version, 1)
       const rewrittenChange = (yield* sql<{ readonly writer_schema_version: number }>`
         SELECT writer_schema_version FROM effect_local_changes WHERE document_id = ${documentId}
-      `)[0]!
+      `)[0]
       assert.strictEqual(rewrittenChange.writer_schema_version, 1)
     }).pipe(Effect.provide(authority.Services))
   })
@@ -1281,7 +1285,7 @@ describe("Compaction", () => {
       assert.notStrictEqual(secondCheckpoint.checkpoint_hash, firstCheckpoint.checkpoint_hash)
       assert.isAbove(secondCheckpoint.commit_sequence, firstCheckpoint.commit_sequence)
       assert.strictEqual((yield* documentRowOf(documentId)).lineage, second)
-      assert.deepStrictEqual((yield* rewriteMarkers).map((row) => row.lineage), [first as string, second as string])
+      assert.deepStrictEqual((yield* rewriteMarkers).map((row) => row.lineage), [first, second])
     }).pipe(Effect.provide(Services)))
 
   it.effect("refuses a stale operation marker after a later rewrite", () =>
@@ -1346,7 +1350,7 @@ describe("Compaction", () => {
       // Every retained checkpoint names the lineage its document is actually on. A genesis label
       // here would make the document and its own checkpoints disagree about which history they
       // belong to.
-      assert.deepStrictEqual([...new Set(checkpoints.map((row) => row.lineage))], [lineage as string])
+      assert.deepStrictEqual([...new Set(checkpoints.map((row) => row.lineage))], [lineage])
       assert.strictEqual((yield* documentRowOf(documentId)).lineage, lineage)
     }).pipe(Effect.provide(Services)))
 
@@ -1404,6 +1408,6 @@ describe("Compaction", () => {
       assert.deepStrictEqual(yield* changesOf(otherId), otherChanges)
       assert.strictEqual((yield* documentRowOf(otherId)).lineage, Identity.genesisLineage)
       assert.strictEqual((yield* documentRowOf(rewrittenId)).lineage, lineage)
-      assert.deepStrictEqual((yield* rewriteMarkers).map((row) => row.document_id), [rewrittenId as string])
+      assert.deepStrictEqual((yield* rewriteMarkers).map((row) => row.document_id), [rewrittenId])
     }).pipe(Effect.provide(Services)))
 })

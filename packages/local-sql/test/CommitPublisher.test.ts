@@ -158,7 +158,7 @@ describe("CommitPublisher", () => {
       const published = yield* Effect.all([publisher.publishPending, publisher.publishPending], {
         concurrency: "unbounded"
       })
-      assert.isAtMost(published[0]! + published[1]!, 1)
+      assert.isAtMost(published[0] + published[1], 1)
       assert.strictEqual(invalidations, 1)
       unregister()
     }).pipe(Effect.provide(Live)))
