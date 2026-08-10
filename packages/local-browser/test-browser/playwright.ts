@@ -1,9 +1,9 @@
+import { NodeFileSystem } from "@effect/platform-node"
 import { expect, test as base } from "@playwright/test"
-import { mkdtemp, rm } from "node:fs/promises"
-import { createServer as createHttpServer } from "node:http"
-import type { AddressInfo } from "node:net"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import * as Cause from "effect/Cause"
+import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
+import * as FileSystem from "effect/FileSystem"
 import { build, createServer, preview } from "vite"
 
 interface FixtureDependency {
@@ -18,119 +18,129 @@ interface Options {
   readonly dependency?: () => Promise<FixtureDependency>
 }
 
-const withEnvironment = async <A,>(
+const withEnvironment = <A,>(
   env: Readonly<Record<string, string>>,
-  evaluate: () => Promise<A>
-): Promise<A> => {
-  const previous = new Map<string, string | undefined>()
-  for (const [key, value] of Object.entries(env)) {
-    previous.set(key, process.env[key])
-    process.env[key] = value
-  }
-  try {
-    return await evaluate()
-  } finally {
-    for (const [key, value] of previous) {
-      if (value === undefined) delete process.env[key]
-      else process.env[key] = value
-    }
-  }
-}
+  evaluate: () => Effect.Effect<A, unknown>
+): Effect.Effect<A, unknown> =>
+  Effect.acquireUseRelease(
+    Effect.sync(() => {
+      const previous = new Map<string, string | undefined>()
+      for (const [key, value] of Object.entries(env)) {
+        previous.set(key, globalThis.process.env[key])
+        globalThis.process.env[key] = value
+      }
+      return previous
+    }),
+    evaluate,
+    (previous) =>
+      Effect.sync(() => {
+        for (const [key, value] of previous) {
+          if (value === undefined) delete globalThis.process.env[key]
+          else globalThis.process.env[key] = value
+        }
+      })
+  )
 
-const serverUrl = (server: { address(): string | AddressInfo | null }) => {
+const serverUrl = (server: { address(): string | { readonly port: number } | null } | null) => {
+  if (server === null) return Effect.die(new Error("Vite did not create an HTTP server"))
   const address = server.address()
-  if (address === null || address === undefined || typeof address === "string") {
-    throw new Error("Vite did not bind a TCP port")
+  if (address === null || typeof address === "string") {
+    return Effect.die(new Error("Vite did not bind a TCP port"))
   }
-  return `http://127.0.0.1:${address.port}`
+  return Effect.succeed(`http://127.0.0.1:${address.port}`)
 }
 
 export const makeViteTest = (options: Options) => {
   const test = base.extend<{}, { readonly appServer: { readonly url: string } }>({
-    // Playwright parses this parameter and requires an object destructuring pattern.
-    // oxlint-disable-next-line no-empty-pattern
-    appServer: [async ({}, use) => {
-      const dependency = options.dependency === undefined ? undefined : await options.dependency()
-      const env = { ...options.env, ...dependency?.env }
-      let outDir: string | undefined
-      let server: { readonly url: string; readonly close: () => Promise<void> } | undefined
-      const successful = Symbol()
-      let fixtureFailure: unknown = successful
-      try {
-        if (options.mode === "development") {
-          const httpServer = createHttpServer()
-          const vite = await withEnvironment(env, () =>
-            createServer({
-              configFile: options.configFile,
-              logLevel: "error",
-              server: { hmr: { server: httpServer }, middlewareMode: true }
-            }))
-          httpServer.on("request", vite.middlewares)
-          try {
-            await new Promise<void>((resolve, reject) => {
-              const onError = (error: Error) => {
-                httpServer.off("listening", onListening)
-                reject(error)
-              }
-              const onListening = () => {
-                httpServer.off("error", onError)
-                resolve()
-              }
-              httpServer.once("error", onError)
-              httpServer.once("listening", onListening)
-              httpServer.listen({ host: "127.0.0.1", port: 0 })
+    appServer: [({ browserName: _browserName }, use) =>
+      Effect.runPromise(
+        Effect.gen(function*() {
+          const fileSystem = yield* FileSystem.FileSystem
+          let dependency: FixtureDependency | undefined
+          if (options.dependency !== undefined) {
+            dependency = yield* Effect.tryPromise({
+              try: options.dependency,
+              catch: (error) => error
             })
-          } catch (error) {
-            await vite.close()
-            throw error
           }
-          server = {
-            url: serverUrl(httpServer),
-            close: async () => {
-              const results = await Promise.allSettled([
-                new Promise<void>((resolve, reject) => {
-                  httpServer.close((error) => error === undefined ? resolve() : reject(error))
-                }),
-                vite.close()
-              ])
-              const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : [])
-              if (failures.length > 0) throw new AggregateError(failures, "Vite development teardown failed")
+          const env = { ...options.env, ...dependency?.env }
+          let server: { readonly url: string; readonly close: () => Promise<void> } | undefined
+          let outDir: string | undefined
+          const successful = Symbol()
+          let fixtureFailure: unknown = successful
+          const fixtureExit = yield* Effect.exit(Effect.gen(function*() {
+            if (options.mode === "development") {
+              const vite = yield* withEnvironment(env, () =>
+                Effect.tryPromise({
+                  try: () =>
+                    createServer({
+                      configFile: options.configFile,
+                      logLevel: "error",
+                      server: { host: "127.0.0.1", port: 0 }
+                    }),
+                  catch: (error) => error
+                }))
+              const close = () => vite.close()
+              server = { url: "", close }
+              yield* withEnvironment(env, () =>
+                Effect.tryPromise({
+                  try: () => vite.listen(),
+                  catch: (error) => error
+                }))
+              const url = yield* serverUrl(vite.httpServer)
+              server = { url, close }
+            } else {
+              outDir = yield* fileSystem.makeTempDirectory({ prefix: "effect-local-playwright-" })
+              yield* withEnvironment(env, () =>
+                Effect.tryPromise({
+                  try: () =>
+                    build({
+                      configFile: options.configFile,
+                      logLevel: "error",
+                      build: { outDir }
+                    }).then(() => undefined),
+                  catch: (error) => error
+                }))
+              const vite = yield* withEnvironment(env, () =>
+                Effect.tryPromise({
+                  try: () =>
+                    preview({
+                      configFile: options.configFile,
+                      logLevel: "error",
+                      build: { outDir },
+                      preview: { host: "127.0.0.1", port: 0, strictPort: true }
+                    }),
+                  catch: (error) => error
+                }))
+              const close = () => vite.close()
+              server = { url: "", close }
+              const url = yield* serverUrl(vite.httpServer)
+              server = { url, close }
             }
+            const appServer = server
+            if (appServer === undefined) yield* Effect.die(new Error("Vite server was not initialized"))
+            yield* Effect.tryPromise({
+              try: () => use({ url: appServer.url }),
+              catch: (error) => error
+            })
+          }))
+          if (Exit.isFailure(fixtureExit)) {
+            fixtureFailure = Cause.squash(fixtureExit.cause)
           }
-        } else {
-          outDir = await mkdtemp(join(tmpdir(), "effect-local-playwright-"))
-          await withEnvironment(env, () =>
-            build({
-              configFile: options.configFile,
-              logLevel: "error",
-              build: { outDir }
-            }).then(() => undefined))
-          const vite = await withEnvironment(env, () =>
-            preview({
-              configFile: options.configFile,
-              logLevel: "error",
-              build: { outDir },
-              preview: { host: "127.0.0.1", port: 0, strictPort: true }
-            }))
-          server = { url: serverUrl(vite.httpServer), close: () => vite.close() }
-        }
-        await use({ url: server.url })
-      } catch (error) {
-        fixtureFailure = error
-      }
-      const results = await Promise.allSettled([
-        server?.close(),
-        dependency?.close(),
-        outDir === undefined ? undefined : rm(outDir, { recursive: true, force: true })
-      ])
-      const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : [])
-      if (fixtureFailure !== successful) failures.unshift(fixtureFailure)
-      if (failures.length === 1) throw failures[0]
-      if (failures.length > 1) throw new AggregateError(failures, "Playwright server fixture failed")
-    }, { scope: "worker" }],
-    baseURL: async ({ appServer }, use) => {
-      await use(appServer.url)
-    }
+          const cleanup: Array<Effect.Effect<unknown, unknown>> = []
+          if (server !== undefined) cleanup.push(Effect.tryPromise({ try: server.close, catch: (error) => error }))
+          if (dependency !== undefined) {
+            cleanup.push(Effect.tryPromise({ try: dependency.close, catch: (error) => error }))
+          }
+          if (outDir !== undefined) cleanup.push(fileSystem.remove(outDir, { recursive: true, force: true }))
+          const [cleanupFailures] = yield* Effect.partition(cleanup, (effect) => effect, { concurrency: "unbounded" })
+          const failures = [...cleanupFailures]
+          if (fixtureFailure !== successful) failures.unshift(fixtureFailure)
+          if (failures.length === 1) yield* Effect.die(failures[0])
+          if (failures.length > 1) yield* Effect.die(new AggregateError(failures, "Playwright server fixture failed"))
+        }).pipe(Effect.provide(NodeFileSystem.layer))
+      ), { scope: "worker" }],
+    baseURL: ({ appServer }, use) => use(appServer.url)
   })
   return { expect, test }
 }
