@@ -281,11 +281,29 @@ export const make = Effect.gen(function*() {
   // Superseded channels are deprioritized, never dropped. Priority alone would starve them the
   // other way: a live channel that is never empty never leaves a slot idle, and a superseded
   // message would sit `Pending` until expiry destroyed the last copy — the sender only replays its
-  // current epoch's outbox. So a head that has burned half its TTL is promoted into the priority
-  // class, where its age puts it at the front: deprioritization is bounded at half the message's
-  // lifetime and the other half is its delivery window.
+  // current epoch's outbox. So a head that has burned half its TTL is promoted ahead of the live
+  // channel: deprioritization is bounded at half the message's lifetime and the other half is its
+  // delivery window.
+  //
+  // That promotion is capped, because it is a pre-emption and pre-empting every slot at once is
+  // indistinguishable from being deaf. Aged heads all cross their half-life together — one per
+  // lapsed epoch, so a long-lived sender accumulates them faster than a jammed recipient settles
+  // them — and once more of them existed than the caller had slots they filled the window between
+  // themselves, evicting the only channel the sender still replays. The recipient then received
+  // nothing at all, for hours, on a session that stayed healthy the whole time.
+  //
+  // Aged heads therefore take the window minus one slot per live channel, so every sender still
+  // connected keeps a route in. The floor is one: at a single slot there is nothing to reserve and
+  // aging keeps its old, absolute precedence — a lone aged head pre-empts, settles, and hands the
+  // slot straight back. Reserving per live channel rather than one slot overall matters as soon as
+  // an inbox has more than one sender: a single reservation is taken by whichever live head is
+  // oldest, and a live channel stuck behind it is starved exactly as before.
   const findHeads = SqlSchema.findAll({
-    Request: Schema.Struct({ inboxKey: Schema.String, limit: Schema.Int, now: Schema.Number }),
+    Request: Schema.Struct({
+      inboxKey: Schema.String,
+      limit: Schema.Int,
+      now: Schema.Number
+    }),
     Result: PendingRow,
     execute: (request) =>
       sql`
@@ -293,24 +311,38 @@ export const make = Effect.gen(function*() {
                sender_replica_incarnation, sender_connection_epoch, sender_sequence,
                deliveries, envelope, message_hash, outer_envelope_digest
         FROM (
-          SELECT heads.*, ROW_NUMBER() OVER (
-            PARTITION BY tenant_id, sender_subject_id, sender_peer_id, sender_replica_incarnation
-            ORDER BY channel_started_at DESC, channel_key DESC
-          ) AS channel_recency
+          SELECT ranked.*,
+            ROW_NUMBER() OVER (
+              PARTITION BY CASE WHEN created_at + expires_at <= ${request.now * 2} THEN 1 ELSE 0 END
+              ORDER BY created_at ASC, channel_key ASC
+            ) AS aged_rank,
+            SUM(CASE WHEN channel_recency = 1 THEN 1 ELSE 0 END) OVER () AS live_channels
           FROM (
-            SELECT *,
-              ROW_NUMBER() OVER (
-                PARTITION BY channel_key ORDER BY sender_sequence ASC
-              ) AS rn,
-              MIN(created_at) OVER (PARTITION BY channel_key) AS channel_started_at
-            FROM ${sql(table)}
-            WHERE inbox_key = ${request.inboxKey} AND state = 'Pending'
-          ) heads
-          WHERE rn = 1
-        ) ranked
+            SELECT heads.*, ROW_NUMBER() OVER (
+              PARTITION BY tenant_id, sender_subject_id, sender_peer_id, sender_replica_incarnation
+              ORDER BY channel_started_at DESC, channel_key DESC
+            ) AS channel_recency
+            FROM (
+              SELECT *,
+                ROW_NUMBER() OVER (
+                  PARTITION BY channel_key ORDER BY sender_sequence ASC
+                ) AS rn,
+                MIN(created_at) OVER (PARTITION BY channel_key) AS channel_started_at
+              FROM ${sql(table)}
+              WHERE inbox_key = ${request.inboxKey} AND state = 'Pending'
+            ) heads
+            WHERE rn = 1
+          ) ranked
+        ) prioritized
         ORDER BY CASE
-            WHEN channel_recency = 1 OR created_at + expires_at <= ${request.now * 2} THEN 0
-            ELSE 1
+            WHEN created_at + expires_at <= ${request.now * 2}
+              AND aged_rank <= CASE
+                WHEN ${sql.literal(String(request.limit))} - live_channels < 1 THEN 1
+                ELSE ${sql.literal(String(request.limit))} - live_channels
+              END THEN 0
+            WHEN channel_recency = 1 THEN 1
+            WHEN created_at + expires_at <= ${request.now * 2} THEN 2
+            ELSE 3
           END,
           created_at ASC, channel_key ASC
         LIMIT ${sql.literal(String(request.limit))}

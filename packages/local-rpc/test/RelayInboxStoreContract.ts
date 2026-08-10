@@ -331,6 +331,65 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
     })
   },
   {
+    name: "keeps the live channel in the window when aged heads outnumber the delivery slots",
+    run: Effect.gen(function*() {
+      const store = yield* RelayInboxStore.RelayInboxStore
+      // Every reconnect mints a new connection epoch, and a message pushed on an epoch that ends
+      // before its delivery settles is stranded as that channel's permanent head. Over a long
+      // session those strandings accumulate, and once more of them than there are delivery slots
+      // pass half their TTL they all enter the priority class together. Age orders that class, so
+      // they take every slot and the live channel — the only one the sender still replays — is
+      // never even looked at. The dispatcher asks for exactly `maxConcurrentChannels` heads
+      // (`RelayInbox.ts:514-518`), so a window that never contains the live channel means the
+      // recipient stops receiving anything at all while its session stays healthy.
+      const start = 1_754_000_000_000
+      for (let index = 0; index < 3; index++) {
+        yield* store.admit(
+          admission({
+            inboxKey: "epoch-crowding",
+            id: `00000000000${index + 1}`,
+            sequence: 0,
+            now: start + index,
+            ttl: 1_000,
+            epoch: `epoch-stale-${index}`
+          })
+        )
+      }
+      yield* store.admit(
+        admission({
+          inboxKey: "epoch-crowding",
+          id: "000000000008",
+          sequence: 0,
+          now: start + 600,
+          ttl: 1_000,
+          epoch: "epoch-live-a"
+        })
+      )
+      // A second sender on the same inbox. One reserved slot overall is not enough: it goes to
+      // whichever live head is oldest, and this one would be starved exactly as before.
+      yield* store.admit(
+        admission({
+          inboxKey: "epoch-crowding",
+          id: "000000000009",
+          sequence: 0,
+          now: start + 601,
+          ttl: 1_000,
+          subject: "sender-b",
+          epoch: "epoch-live-b"
+        })
+      )
+
+      // At +700 every stranded head (created ~+0, expires ~+1 000) is past its half-life; neither
+      // live head (created ~+600, expires ~+1 600) is, so each holds its slot only through recency.
+      const heads = yield* store.pendingHeads("epoch-crowding", { limit: 4, now: start + 700 })
+      const received = heads.map((head) => head.relayMessageId)
+      assert.ok(
+        received.includes(relayId("000000000008")) && received.includes(relayId("000000000009")),
+        `every live channel must stay in the delivery window however many aged heads precede it, got ${received}`
+      )
+    })
+  },
+  {
     name: "orders within a channel by sender sequence",
     run: Effect.gen(function*() {
       const store = yield* RelayInboxStore.RelayInboxStore
