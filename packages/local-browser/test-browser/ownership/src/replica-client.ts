@@ -28,12 +28,12 @@ const OwnerInfo = Schema.Struct({
   replicaId: Schema.String,
   writerGeneration: Identity.WriterGeneration
 })
-const SharedWorker = globalThis.SharedWorker
-const Worker = globalThis.Worker
 
 const OwnershipLive = OwnershipCoordinator.layerTab({
   name: "effect-local-tasks",
   sharedWorker: () =>
+    // These native constructors are required by OwnershipCoordinator.layerTab and Vite's static worker transform.
+    // oxlint-disable-next-line effect/noGlobals
     new SharedWorker(new URL("./replica.shared-worker.ts", import.meta.url), {
       // Vite otherwise prepends a static environment import before the entry can buffer `connect`.
       /* @vite-ignore */
@@ -41,6 +41,7 @@ const OwnershipLive = OwnershipCoordinator.layerTab({
       type: "module"
     }),
   databaseWorker: () =>
+    // oxlint-disable-next-line effect/noGlobals
     new Worker(new URL("./opfs.worker.ts", import.meta.url), {
       // Vite otherwise prepends a static environment import before the entry can buffer its port.
       /* @vite-ignore */

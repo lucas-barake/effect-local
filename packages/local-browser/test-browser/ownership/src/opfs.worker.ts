@@ -5,6 +5,12 @@ const bufferMessage = (event: MessageEvent<unknown>) => {
   pending.push(event)
 }
 
+const nativeError = () => {
+  // The browser Worker error surface requires a native Error instance for this test failure.
+  // oxlint-disable-next-line effect/noNewError
+  return new Error("effect-local test coordinator import failure")
+}
+
 globalThis.addEventListener("message", bufferMessage)
 const workerUrl = new URL(globalThis.location.href)
 const loadOwnershipCoordinator = () => import("@lucas-barake/effect-local-browser/OwnershipCoordinator")
@@ -23,7 +29,7 @@ const coordinator = Effect.runPromise(Effect.gen(function*() {
     })
   }
   if (workerUrl.searchParams.has("effectLocalTestRejectImport")) {
-    return yield* Effect.fail(Error("effect-local test coordinator import failure"))
+    return yield* Effect.fail(nativeError())
   }
   return yield* Effect.tryPromise(() => loadOwnershipCoordinator())
 }))

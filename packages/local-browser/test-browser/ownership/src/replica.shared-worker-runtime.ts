@@ -27,7 +27,7 @@ const workerUrl = new URL(globalThis.location.href)
 const timerGateToken = workerUrl.searchParams.get("effectLocalTestTimerGate")
 let timerGate: BroadcastChannel | undefined
 if (timerGateToken !== null) {
-  timerGate = new globalThis.BroadcastChannel(`effect-local-ownership-timer-${timerGateToken}`)
+  timerGate = new BroadcastChannel(`effect-local-ownership-timer-${timerGateToken}`)
 }
 let timerGateArmed = workerUrl.searchParams.has("effectLocalTestTimerGateArmed")
 let releaseProvisionDeadline: (() => void) | undefined
