@@ -148,6 +148,11 @@ const safePostMessage = (
   })
 }
 
+const throwNativeError = (message: string): never => {
+  // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError -- preserve the synchronous spawner contract
+  throw new Error(message)
+}
+
 const DatabaseActivityFrame = Schema.Union([
   Schema.Tuple([Schema.Int, Schema.Unknown, Schema.Unknown]),
   Schema.Tuple([Schema.Literal("update_hook"), Schema.String, Schema.Number])
@@ -1268,7 +1273,7 @@ const layerTabImpl = (
       )
 
       return (id: number): MessagePort => {
-        if (closed) return Effect.runSync(Effect.die(new Error("the ownership tab connection is closed")))
+        if (closed) throwNativeError("the ownership tab connection is closed")
         const current = connection ?? establish()
         safeCall(() => current.rpcPorts.get(id)?.close())
         const channel = new MessageChannel()
