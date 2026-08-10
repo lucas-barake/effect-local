@@ -44,18 +44,39 @@ describe("Compaction", () => {
   const Gate = ReplicaGate.layer.pipe(withGateLimits, Layer.provide(Base))
   const StoreService = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Base, Gate)))
   const RecoveryService = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(Base, Gate)))
-  const compactionService = (Authority: Layer.Layer<CheckpointAuthority.CheckpointAuthority>) =>
-    Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Base, Gate, RecoveryService, Authority)))
-  const CompactionService = compactionService(CheckpointAuthority.layerRejectAll)
   const Projections = ProjectionStore.layer([]).pipe(Layer.provide(Base))
   // `definition` declares no mutations, so `MutationHandlers` resolves to `never` and the executor
   // needs no handler layer. It is here only to write real command receipts through production code.
   const Executor = CommandExecutor.layer(definition).pipe(
     Layer.provide(Layer.mergeAll(Base, Gate, StoreService, Projections))
   )
-  const Services = Layer.mergeAll(Base, Gate, StoreService, RecoveryService, CompactionService, Executor)
   const servicesWithAuthority = (Authority: Layer.Layer<CheckpointAuthority.CheckpointAuthority>) =>
-    Layer.mergeAll(Base, Gate, StoreService, RecoveryService, compactionService(Authority), Executor)
+    Layer.mergeAll(
+      Base,
+      Gate,
+      StoreService,
+      RecoveryService,
+      Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Base, Gate, RecoveryService, Authority))),
+      Executor
+    )
+  const Services = servicesWithAuthority(CheckpointAuthority.layerRejectAll)
+
+  /**
+   * The rewrite's own authority, recording every claim it is asked to sign. `Services` cannot show
+   * this: its `layerRejectAll` authority signs nothing.
+   */
+  const recordingAuthority = (token: Option.Option<CheckpointAuthority.AuthorizationToken>) => {
+    const signed: Array<CheckpointAuthority.TransitionClaims> = []
+    return {
+      signed,
+      Services: servicesWithAuthority(CheckpointAuthority.layer({
+        signManifest: () => Effect.succeed(Option.none()),
+        verifyManifest: () => Effect.void,
+        signTransition: (claims) => Effect.sync(() => signed.push(claims)).pipe(Effect.as(token)),
+        verifyTransition: () => Effect.void
+      }))
+    }
+  }
 
   /** Commits a real create command under the current incarnation and reports the receipt it wrote. */
   const commitReceipt = Effect.gen(function*() {
@@ -1149,17 +1170,8 @@ describe("Compaction", () => {
     }).pipe(Effect.provide(Services)))
 
   it.effect("signs canonical transition claims once across an operation retry", () => {
-    const signed: Array<CheckpointAuthority.TransitionClaims> = []
     const token = Uint8Array.of(7, 8, 9) as CheckpointAuthority.AuthorizationToken
-    const Authority = CheckpointAuthority.layer({
-      signManifest: () => Effect.succeed(Option.none()),
-      verifyManifest: () => Effect.void,
-      signTransition: (claims) =>
-        Effect.sync(() => signed.push(claims)).pipe(
-          Effect.as(Option.some(token))
-        ),
-      verifyTransition: () => Effect.void
-    })
+    const authority = recordingAuthority(Option.some(token))
 
     return Effect.gen(function*() {
       const compaction = yield* Compaction.Compaction
@@ -1172,9 +1184,9 @@ describe("Compaction", () => {
       const transitions = yield* lineageTransitionsOf(documentId)
 
       assert.strictEqual(replayed, lineage)
-      assert.strictEqual(signed.length, 1)
+      assert.strictEqual(authority.signed.length, 1)
       assert.strictEqual(transitions.length, 1)
-      const claims = signed[0]!
+      const claims = authority.signed[0]!
       assert.deepStrictEqual(claims.priorHeads, [...new Set(claims.priorHeads)].toSorted())
       assert.deepStrictEqual(claims.resultingHeads, [...new Set(claims.resultingHeads)].toSorted())
       assert.strictEqual(claims.purpose, CheckpointAuthority.transitionPurpose)
@@ -1187,17 +1199,11 @@ describe("Compaction", () => {
       assert.strictEqual(transitions[0]!.checkpoint_hash, claims.anchorCheckpointHash)
       assert.deepStrictEqual(JSON.parse(transitions[0]!.heads), claims.resultingHeads)
       assert.deepStrictEqual(transitions[0]!.authorization, token)
-    }).pipe(Effect.provide(servicesWithAuthority(Authority)))
+    }).pipe(Effect.provide(authority.Services))
   })
 
   it.effect("signs the stored encoding version when the current definition is newer", () => {
-    const signed: Array<CheckpointAuthority.TransitionClaims> = []
-    const Authority = CheckpointAuthority.layer({
-      signManifest: () => Effect.succeed(Option.none()),
-      verifyManifest: () => Effect.void,
-      signTransition: (claims) => Effect.sync(() => signed.push(claims)).pipe(Effect.as(Option.none())),
-      verifyTransition: () => Effect.void
-    })
+    const authority = recordingAuthority(Option.none())
     const TaskV2 = Document.make("Task", {
       schema: Schema.Struct({ title: Schema.String, labels: Schema.Array(Schema.String), done: Schema.Boolean }),
       version: 2,
@@ -1229,14 +1235,14 @@ describe("Compaction", () => {
       yield* compaction.rewriteHistory(TaskV2, documentId, operationId)
 
       assert.strictEqual(TaskV2.version, 2)
-      assert.strictEqual(signed.length, 1)
-      assert.strictEqual(signed[0]!.schemaVersion, 1)
+      assert.strictEqual(authority.signed.length, 1)
+      assert.strictEqual(authority.signed[0]!.schemaVersion, 1)
       assert.strictEqual((yield* lineageTransitionsOf(documentId))[0]!.schema_version, 1)
       const rewrittenChange = (yield* sql<{ readonly writer_schema_version: number }>`
         SELECT writer_schema_version FROM effect_local_changes WHERE document_id = ${documentId}
       `)[0]!
       assert.strictEqual(rewrittenChange.writer_schema_version, 1)
-    }).pipe(Effect.provide(servicesWithAuthority(Authority)))
+    }).pipe(Effect.provide(authority.Services))
   })
 
   it.effect("rewrites a second time under a different operation id", () =>
