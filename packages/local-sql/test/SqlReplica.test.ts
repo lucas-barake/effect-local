@@ -21,6 +21,7 @@ import * as Fiber from "effect/Fiber"
 import * as Latch from "effect/Latch"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Pull from "effect/Pull"
 import * as Queue from "effect/Queue"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
@@ -250,6 +251,58 @@ describe("SqlReplica", () => {
       yield* assertInteractivePriority.pipe(Effect.provide(PriorityLive))
       yield* assertInteractivePriority.pipe(Effect.provide(PriorityDirectLive))
     }).pipe(Effect.scoped, Effect.provide(NodeCrypto.layer), TestClock.withLive))
+
+  // Real deadline on Fiber.await, as in GateGrantBoundary.test.ts: a strand here must name the
+  // assertion that broke instead of surfacing as a bare suite timeout.
+  it.live("grants background admission while a backup export stream is open", () =>
+    Effect.gen(function*() {
+      const replica = yield* Replica.Replica
+      const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
+      const pull = yield* Stream.toPull(replica.exportBackup({ maxBytes: limits.maxBackupBytes }))
+      yield* pull
+      const background = yield* Effect.forkChild(Effect.scoped(scheduler.background), {
+        startImmediately: true
+      })
+      const exit = yield* Fiber.await(background).pipe(Effect.timeoutOption("2 seconds"))
+      assert.isTrue(
+        Option.isSome(exit),
+        "inbound sync admission stalled for the whole lifetime of an open backup export stream"
+      )
+    }).pipe(Effect.scoped, Effect.provide(Live), Effect.provide(NodeCrypto.layer)), 30_000)
+
+  it.effect("ends an export cleanly when the admission queue fills between pulls", () =>
+    Effect.gen(function*() {
+      const replica = yield* Replica.Replica
+      const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
+      const pull = yield* Stream.toPull(replica.exportBackup({ maxBytes: limits.maxBackupBytes }))
+      yield* pull
+      const holding = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const holder = yield* Effect.forkChild(
+        Effect.scoped(Effect.gen(function*() {
+          yield* scheduler.background
+          yield* Deferred.succeed(holding, undefined)
+          yield* Deferred.await(release)
+        })),
+        { startImmediately: true }
+      )
+      yield* Deferred.await(holding)
+      const queued = yield* Effect.forkChild(Effect.scoped(scheduler.interactive), { startImmediately: true })
+      yield* scheduler.reservationChanges.pipe(
+        Stream.filter((counts) => counts.interactive >= 1),
+        Stream.runHead
+      )
+      const terminal = yield* Effect.exit(pull)
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(holder)
+      yield* Fiber.interrupt(queued)
+      // The archive was fully emitted by the first pull, so the closing pull has no work left to
+      // admit. It must end the stream, not discard a complete backup because the queue was full.
+      assert.isTrue(
+        Exit.isFailure(terminal) && Pull.isDoneCause(terminal.cause),
+        "a complete export was thrown away by the terminal pull's admission refusal"
+      )
+    }).pipe(Effect.scoped, Effect.provide(PriorityLive), Effect.provide(NodeCrypto.layer), TestClock.withLive))
 
   it("rejects duplicate bindings for one projection", () => {
     assert.throws(

@@ -338,7 +338,29 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           Effect.all([publisher.drainPending, deliveryPublisher.publishPending], { discard: true })
         ),
         status: health.status,
-        exportBackup: (options) => Stream.unwrap(scheduler.interactive.pipe(Effect.as(backups.export(options)))),
+        // The export does all its database work on the first pull and then serves in-memory chunks,
+        // so admission is held for that pull only. Holding it for the stream's lifetime starves the
+        // background lane behind the consumer's pace; requiring it again for a pull that does no
+        // work lets a full queue discard a completely produced archive.
+        exportBackup: (options) =>
+          Stream.transformPull(
+            backups.export(options),
+            (pull) =>
+              Effect.sync(() => {
+                let produced = false
+                return Effect.suspend(() =>
+                  produced
+                    ? pull
+                    : Effect.scoped(scheduler.interactive.pipe(Effect.andThen(pull))).pipe(
+                      Effect.tap(() =>
+                        Effect.sync(() => {
+                          produced = true
+                        })
+                      )
+                    )
+                )
+              })
+          ),
         restoreBackup: (options) =>
           Effect.scoped(scheduler.interactive.pipe(Effect.andThen(
             Effect.uninterruptibleMask((interruptible) =>
