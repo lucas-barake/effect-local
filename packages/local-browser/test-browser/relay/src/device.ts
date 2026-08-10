@@ -43,15 +43,12 @@ const deferred = <A,>() => {
   return { promise, resolve }
 }
 
-const databaseOperations = new Map<string, ReturnType<typeof deferred<void>>>()
-
 export const databaseBridge = (() => {
   const engine = new MessageChannel()
   const database = new MessageChannel()
   const worker = new Worker(new URL("./opfs.worker.ts", import.meta.url), { type: "module" })
   const requests = new Array<ReturnType<typeof deferred<unknown>>>()
   let gate: {
-    readonly request: ReturnType<typeof deferred<void>>
     readonly response: ReturnType<typeof deferred<void>>
     requestObserved: boolean
     held?: MessageEvent
@@ -61,10 +58,7 @@ export const databaseBridge = (() => {
   }
   engine.port1.addEventListener("message", (event) => {
     requests.shift()?.resolve(event.data)
-    if (gate !== undefined && !gate.requestObserved) {
-      gate.requestObserved = true
-      gate.request.resolve()
-    }
+    if (gate !== undefined) gate.requestObserved = true
     forward(database.port2, event)
   })
   database.port2.addEventListener("message", (event) => {
@@ -82,11 +76,7 @@ export const databaseBridge = (() => {
     port: engine.port2,
     arm: () => {
       if (gate !== undefined) throw new Error("a database response gate is already armed")
-      gate = { request: deferred(), response: deferred(), requestObserved: false }
-    },
-    waitForRequest: () => {
-      if (gate === undefined) throw new Error("no database response gate is armed")
-      return gate.request.promise
+      gate = { response: deferred(), requestObserved: false }
     },
     waitForResponse: () => {
       if (gate === undefined) throw new Error("no database response gate is armed")
@@ -244,7 +234,6 @@ export const makeCommandId = runtime.fn<void>()(
 
 export const probeInteractiveDatabase = runtime.fn<Identity.CommandId>()(
   Effect.fnUntraced(function*(commandId) {
-    databaseOperations.get("interactive")?.resolve()
     const replica = yield* Replica.Replica
     yield* replica.lookupCommandDelivery(commandId)
   })
@@ -279,7 +268,6 @@ export const restoreBackup = runtime.fn<ReadonlyArray<number>>()(
 
 export const runBackgroundDatabaseOperation = runtime.fn<string>()(
   Effect.fnUntraced(function*(label) {
-    databaseOperations.get(label)?.resolve()
     yield* Effect.scoped(Effect.gen(function*() {
       const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
       yield* scheduler.background
@@ -290,39 +278,17 @@ export const runBackgroundDatabaseOperation = runtime.fn<string>()(
   { concurrent: true }
 )
 
-export const waitForDatabaseOperation = (label: string) => {
-  const operation = deferred<void>()
-  databaseOperations.set(label, operation)
-  return operation.promise.finally(() => databaseOperations.delete(label))
-}
-
-export const waitForInteractiveReservation = runtime.fn<void>()(
-  Effect.fnUntraced(function*() {
+/**
+ * Resolves once the scheduler reports reservations the caller accepts. The stream replays the
+ * current counts before any change, so a caller that arrives after the reservation it is waiting
+ * for still sees it.
+ */
+export const waitForReservations = runtime.fn<
+  (reservations: ReplicaOperationScheduler.Reservations) => boolean
+>()(
+  Effect.fnUntraced(function*(matches) {
     const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
-    yield* scheduler.reservationChanges.pipe(
-      Stream.filter((reservations) => reservations.interactive > 0),
-      Stream.runHead
-    )
-  })
-)
-
-export const waitForNoInteractiveReservations = runtime.fn<void>()(
-  Effect.fnUntraced(function*() {
-    const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
-    yield* scheduler.reservationChanges.pipe(
-      Stream.filter((reservations) => reservations.interactive === 0),
-      Stream.runHead
-    )
-  })
-)
-
-export const waitForBackgroundReservations = runtime.fn<number>()(
-  Effect.fnUntraced(function*(minimum) {
-    const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
-    yield* scheduler.reservationChanges.pipe(
-      Stream.filter((reservations) => reservations.background >= minimum),
-      Stream.runHead
-    )
+    yield* scheduler.reservationChanges.pipe(Stream.filter(matches), Stream.runHead)
   })
 )
 

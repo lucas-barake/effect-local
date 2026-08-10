@@ -233,19 +233,16 @@ describe("SqlReplica", () => {
     const overflow = yield* Effect.forkChild(Effect.exit(Effect.scoped(scheduler.interactive)), {
       startImmediately: true
     })
-    const overflowExit = overflow.pollUnsafe()
-    assert.isDefined(overflowExit)
-    if (overflowExit !== undefined) {
-      assert.isTrue(Exit.isSuccess(overflowExit))
-      if (Exit.isSuccess(overflowExit)) assert.isTrue(Exit.isFailure(overflowExit.value))
-    }
+    // Polled rather than joined first: the point is that admission was refused outright instead of
+    // parking, which only a fiber that has already finished can show.
+    assert.isDefined(overflow.pollUnsafe())
+    assert.isTrue(Exit.isFailure(yield* Fiber.join(overflow)))
     yield* Deferred.succeed(holderRelease, undefined)
     assert.deepStrictEqual(new Set(yield* Queue.takeN(completed, 2)), new Set(["interactive-1", "interactive-2"]))
     assert.strictEqual(yield* Queue.take(completed), "background")
     yield* Fiber.join(holder)
     yield* Fiber.join(background)
     yield* Effect.forEach(interactive, Fiber.join, { discard: true })
-    yield* Fiber.await(overflow)
   })
 
   it.effect("prioritizes interactive work through both replica constructors", () =>

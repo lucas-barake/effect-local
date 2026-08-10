@@ -1,4 +1,5 @@
 import { useAtomMount, useAtomSet, useAtomValue } from "@effect/atom-react"
+import type * as ReplicaOperationScheduler from "@lucas-barake/effect-local-sql/ReplicaOperationScheduler"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import { useEffect } from "react"
 import * as Device from "./device.ts"
@@ -21,12 +22,10 @@ declare global {
       readonly restoreBackup: (bytes: ReadonlyArray<number>) => Promise<void>
       readonly push: (documentId: Identity.DocumentId) => Promise<void>
       readonly runBackgroundDatabaseOperation: (label: string) => Promise<void>
-      readonly waitForDatabaseOperation: (label: string) => Promise<void>
-      readonly waitForInteractiveReservation: () => Promise<void>
-      readonly waitForNoInteractiveReservations: () => Promise<void>
-      readonly waitForBackgroundReservations: (minimum: number) => Promise<void>
+      readonly waitForReservations: (
+        matches: (reservations: ReplicaOperationScheduler.Reservations) => boolean
+      ) => Promise<void>
       readonly armNextDatabaseResponse: () => void
-      readonly waitForDatabaseRequest: () => Promise<void>
       readonly waitForDatabaseResponse: () => Promise<void>
       readonly nextDatabaseRequest: () => Promise<unknown>
       readonly releaseDatabaseResponse: () => void
@@ -49,9 +48,7 @@ export const App = () => {
   const restoreBackup = useAtomSet(Device.restoreBackup, { mode: "promise" })
   const push = useAtomSet(Device.push, { mode: "promise" })
   const runBackgroundDatabaseOperation = useAtomSet(Device.runBackgroundDatabaseOperation, { mode: "promise" })
-  const waitForInteractiveReservation = useAtomSet(Device.waitForInteractiveReservation, { mode: "promise" })
-  const waitForNoInteractiveReservations = useAtomSet(Device.waitForNoInteractiveReservations, { mode: "promise" })
-  const waitForBackgroundReservations = useAtomSet(Device.waitForBackgroundReservations, { mode: "promise" })
+  const waitForReservations = useAtomSet(Device.waitForReservations, { mode: "promise" })
 
   useEffect(() => {
     window.relayFixture = {
@@ -65,12 +62,8 @@ export const App = () => {
       restoreBackup,
       push,
       runBackgroundDatabaseOperation,
-      waitForDatabaseOperation: Device.waitForDatabaseOperation,
-      waitForInteractiveReservation,
-      waitForNoInteractiveReservations,
-      waitForBackgroundReservations,
+      waitForReservations,
       armNextDatabaseResponse: Device.databaseBridge.arm,
-      waitForDatabaseRequest: Device.databaseBridge.waitForRequest,
       waitForDatabaseResponse: Device.databaseBridge.waitForResponse,
       nextDatabaseRequest: Device.databaseBridge.nextRequest,
       releaseDatabaseResponse: Device.databaseBridge.release
@@ -87,9 +80,7 @@ export const App = () => {
     restoreBackup,
     push,
     runBackgroundDatabaseOperation,
-    waitForInteractiveReservation,
-    waitForNoInteractiveReservations,
-    waitForBackgroundReservations
+    waitForReservations
   ])
 
   useEffect(() => {

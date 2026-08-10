@@ -46,22 +46,16 @@ test("carries a change between two browsers through a real relay", async ({ brow
 
     const priority = await alpha.evaluate(async () => {
       window.relayFixture!.armNextDatabaseResponse()
-      const holderStarted = window.relayFixture!.waitForDatabaseOperation("background-holder")
       const holder = window.relayFixture!.runBackgroundDatabaseOperation("background-holder")
-      await holderStarted
-      await window.relayFixture!.waitForDatabaseRequest()
+      await window.relayFixture!.waitForReservations((reservations) => reservations.background >= 1)
       await window.relayFixture!.waitForDatabaseResponse()
 
-      const backgroundStarted = window.relayFixture!.waitForDatabaseOperation("background-queued")
       const background = window.relayFixture!.runBackgroundDatabaseOperation("background-queued")
-      await backgroundStarted
-      await window.relayFixture!.waitForBackgroundReservations(2)
-      await window.relayFixture!.waitForNoInteractiveReservations()
+      await window.relayFixture!.waitForReservations((reservations) => reservations.background >= 2)
+      await window.relayFixture!.waitForReservations((reservations) => reservations.interactive === 0)
       const commandId = await window.relayFixture!.makeCommandId()
-      const interactiveStarted = window.relayFixture!.waitForDatabaseOperation("interactive")
       const interactive = window.relayFixture!.probeInteractiveDatabase(commandId)
-      await interactiveStarted
-      await window.relayFixture!.waitForInteractiveReservation()
+      await window.relayFixture!.waitForReservations((reservations) => reservations.interactive > 0)
 
       const nextRequest = window.relayFixture!.nextDatabaseRequest()
       window.relayFixture!.releaseDatabaseResponse()
