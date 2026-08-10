@@ -131,6 +131,20 @@ signs and verifies. This demo HMACs the canonical claims with one hardcoded secr
 (`checkpoint-authority.ts`), which is the same shortcut the identities take; a real deployment signs
 with a key the application server holds.
 
+### "connected" is the socket, not the peer
+
+The sidebar's relay status is `RelayConnectionStatus`, which reports whether this replica's
+WebSocket to the relay is open. It says nothing about any peer: relay delivery is store-and-forward,
+so the socket can be healthy while no session with a given counterpart has ever opened. Everything
+peer-scoped — a push reaching custody, a transient finding a route — depends on the session, which
+is `PeerConnectionStatus` and is bound per counterpart in the roster.
+
+That is why the conversation header says "connecting…" rather than "offline" when there is no live
+session. "Offline" is a claim about the counterpart, and this replica has only earned that claim
+once the session is up and the beats have stopped. If the header sits on "connecting…" while the
+sidebar says "connected", the session is failing to open and the engine logs the reason as
+`relay session with <user> ended, reopening` in the SharedWorker console.
+
 ### One relay channel per conversation
 
 The relay allows one live session per peer endpoint (its inbox key is tenant + subject + peer, and

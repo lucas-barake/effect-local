@@ -215,7 +215,12 @@ const superviseSession = (link: RelayLink) =>
       })
     )
     yield* attempt.pipe(
-      Effect.catchCause((cause) => Effect.logDebug("relay session ended, reopening", cause)),
+      // Warning, not debug. The relay status a tab renders is the socket's, which says nothing
+      // about any peer, so a session that can never open reopens every two seconds behind a UI
+      // that still reads "connected". This log is the only place that failure is stated.
+      Effect.catchCause((cause) =>
+        Effect.logWarning(`relay session with ${link.counterpart.id} ended, reopening`, cause)
+      ),
       Effect.andThen(Effect.sleep(Duration.seconds(2))),
       Effect.forever
     )

@@ -155,6 +155,17 @@ const conversations = Atom.readable((get) => {
  */
 const peerIdOf = (counterpartId: string) => endpointFor(counterpartId, me.id).principal.peerId
 
+/**
+ * Whether the owner currently holds a live relay session with this counterpart.
+ *
+ * Distinct from `relayConnectionStatus`, which reports the socket and says nothing about any peer.
+ * Everything peer scoped — a push reaching custody, a transient finding a route — needs this one,
+ * and a session that cannot open leaves the socket status reading "connected" the whole time.
+ */
+const peerSessionStatus = Atom.family((counterpartId: string) =>
+  ReplicaAtom.peerConnectionStatus(runtime, peerIdOf(counterpartId))
+)
+
 const counterpartByPeerId = new Map(
   counterpartsOf(me.id).map((counterpart) => [peerIdOf(counterpart.id), counterpart.id])
 )
@@ -293,10 +304,12 @@ export const roster = Atom.readable((get) => {
     .map((counterpart) => {
       const conversation = conversationMap.get(counterpart.id)
       const seen = activity.get(counterpart.id)
+      const session = get(peerSessionStatus(counterpart.id))
       return {
         counterpart,
         conversationId: conversation?.conversationId,
         ready: conversation?.ready === true,
+        linked: session._tag === "Success" && session.value._tag === "Connected",
         online: seen !== undefined && now - seen.presentAtMillis < ONLINE_WINDOW_MILLIS,
         typing: seen !== undefined && now - seen.typingAtMillis < TYPING_WINDOW_MILLIS,
         summary: conversation === undefined ? undefined : byConversation.get(conversation.conversationId)

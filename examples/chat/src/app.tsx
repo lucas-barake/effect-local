@@ -72,9 +72,10 @@ const Ticks = ({ counterpart, message }: {
   )
 }
 
-const ChatView = ({ conversationId, counterpart, online, typing }: {
+const ChatView = ({ conversationId, counterpart, linked, online, typing }: {
   readonly conversationId: Identity.DocumentId
   readonly counterpart: ChatUser
+  readonly linked: boolean
   readonly online: boolean
   readonly typing: boolean
 }) => {
@@ -101,8 +102,12 @@ const ChatView = ({ conversationId, counterpart, online, typing }: {
         <UserAvatar user={counterpart} size={38} />
         <div>
           <div className="chat-title">{counterpart.displayName}</div>
-          <div className="chat-presence" data-online={online} data-typing={typing}>
-            {typing ? "typing…" : online ? "online" : "offline"}
+          {
+            /* "offline" is a claim about the counterpart, so it is only honest once this replica
+              holds a live session with them. Without one it knows nothing either way. */
+          }
+          <div className="chat-presence" data-online={online} data-typing={typing} data-linked={linked}>
+            {typing ? "typing…" : online ? "online" : linked ? "offline" : "connecting…"}
           </div>
         </div>
       </header>
@@ -210,7 +215,7 @@ export const App = () => {
           </header>
           <ScrollArea.Root className="roster">
             <ScrollArea.Viewport className="roster-viewport">
-              {rosterRows.map(({ counterpart, online, ready, summary, typing }) => {
+              {rosterRows.map(({ counterpart, linked, online, ready, summary, typing }) => {
                 return (
                   <button
                     key={counterpart.id}
@@ -223,7 +228,7 @@ export const App = () => {
                   >
                     <span className="roster-avatar">
                       <UserAvatar user={counterpart} size={44} />
-                      <span className="presence-dot" data-online={online} />
+                      <span className="presence-dot" data-online={online} data-linked={linked} />
                     </span>
                     <span className="roster-copy">
                       <span className="roster-name">{counterpart.displayName}</span>
@@ -257,6 +262,7 @@ export const App = () => {
             <ChatView
               conversationId={selected.conversationId}
               counterpart={selected.counterpart}
+              linked={selectedRow?.linked === true}
               online={selectedRow?.online === true}
               typing={selectedRow?.typing === true}
             />

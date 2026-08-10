@@ -161,7 +161,12 @@ test("all locally ready conversations stay enabled while the relay is unavailabl
     await dave.click()
     await expect(dave).toHaveAttribute("data-selected", "true")
 
+    // Without a live peer session this replica knows nothing about the counterpart, so it must not
+    // claim "offline". That claim is only available once the session is up and beats stop arriving.
+    await expect(alice.locator(".chat-presence")).toHaveText("connecting…", { timeout: 60_000 })
+
     await relay.reconnect()
+    await expect(alice.locator(".chat-presence")).toHaveText("offline", { timeout: 60_000 })
     await Promise.all(captures.map((capture) => capture.expectClean()))
   } finally {
     await closeWithEvidence(context, captures)
