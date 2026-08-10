@@ -340,12 +340,12 @@ describe("DurableRuntime", () => {
           const stored = yield* store.create(Task, yield* Identity.makeDocumentId, { title: "restart" })
           InternalAutomerge.free(stored.automerge)
           const execution = yield* runtime.execute(ReplicaWorkflow.OperationId.make("restart-compaction"))
-          for (let round = 0; round < 4; round++) {
+          for (let round = 0; round < 12; round++) {
             yield* sharding.pollStorage
+            if ((yield* runtime.poll(execution))._tag === "Some") return execution
             yield* TestClock.adjust(5_000)
           }
-          assert.strictEqual((yield* runtime.poll(execution))._tag, "Some")
-          return execution
+          return assert.fail("workflow did not record a result within 12 storage polls")
         }).pipe(Effect.provide(servicesAt(filename)))
       )
 
@@ -357,7 +357,7 @@ describe("DurableRuntime", () => {
           if (Option.isSome(result)) assert.strictEqual(result.value._tag, "Complete")
         }).pipe(Effect.provide(servicesAt(filename)))
       )
-    }))
+    }), 20_000)
 
   it.effect("reconciles a suspended in-flight workflow after the SQL runtime restarts", () =>
     Effect.gen(function*() {

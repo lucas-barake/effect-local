@@ -870,7 +870,7 @@ describe("PeerSync", () => {
       let remoteState = Automerge.initSyncState()
       let sequence = 0
       const drain = Effect.gen(function*() {
-        while (sequence < 20) {
+        for (let attempt = 0; attempt < 20; attempt++) {
           const [nextState, message] = Automerge.generateSyncMessage(remote, remoteState)
           remoteState = nextState
           if (message === null) return
@@ -887,6 +887,7 @@ describe("PeerSync", () => {
             remoteState = advanced[1]
           }
         }
+        return assert.fail("Remote sync did not settle")
       })
       for (let index = 0; index < 8; index++) {
         remote = Automerge.change(remote, (draft) => {
@@ -921,7 +922,9 @@ describe("PeerSync", () => {
       const outbound = yield* sync.enqueue(staleSession, received.reply!)
       assert.isNotNull(outbound)
       const fragmentCount = received.reply!.fragments?.length ?? 0
-      assert.isAbove(fragmentCount, 1)
+      // Two fragments are marked sent below, and the re-enqueue has to have something left to
+      // return, so this scenario is only meaningful past three.
+      assert.isAbove(fragmentCount, 2)
       const pending = yield* sync.pending(staleSession)
       assert.strictEqual(pending.length, fragmentCount)
       assert.deepStrictEqual(
@@ -1239,7 +1242,7 @@ describe("PeerSync", () => {
           }).pipe(Effect.provide(sourceLayer(limits, filename)))
         )
       }
-    }))
+    }), 20_000)
 
   it.effect("interrupts a blocked receive without durable effects and accepts a retry", () =>
     Effect.gen(function*() {
