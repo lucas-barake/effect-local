@@ -6,6 +6,7 @@ import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Schema from "effect/Schema"
+import * as SchemaAST from "effect/SchemaAST"
 import * as Rpc from "effect/unstable/rpc/Rpc"
 import * as RestoreProtocol from "../src/internal/restoreProtocol.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
@@ -147,7 +148,8 @@ it.effect("preserves more than eight typed reasons through the production Finish
       assert.deepStrictEqual(
         decoded.cause.reasons.flatMap((reason) => {
           const tag = restoreFailureReasonTag(reason)
-          return tag === undefined ? [] : [tag]
+          if (tag === undefined) return []
+          return [tag]
         }),
         Array.from({ length: 9 }, () => "RestoreBusy")
       )
@@ -160,7 +162,7 @@ it.effect("preserves mixed failure, redacted defect, and interruption through th
     const mixed = yield* roundTripFinishExit(
       Exit.failCause(Cause.fromReasons([
         Cause.makeFailReason(restoreFailure("typed")),
-        Cause.makeDieReason(new Error(secret))
+        Cause.makeDieReason(Error(secret))
       ]))
     )
     assert.isTrue(Exit.isFailure(mixed))
@@ -219,7 +221,7 @@ it.effect("encodes every restore error and defect at the minimum configured budg
     assert.strictEqual(ReplicaLimits.minimumRestoreErrorBytes, 111)
     const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
     const commandId = Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000001")
-    const cause = new Error("failure".repeat(32))
+    const cause = Error("failure".repeat(32))
     const reasons: ReadonlyArray<ReplicaError.Reason> = [
       new ReplicaError.DocumentNotFound({ documentId }),
       new ReplicaError.DocumentDecodeError({ documentId, cause }),
@@ -316,7 +318,7 @@ it.effect("validates branded identities before reconstructing a typed error", ()
 
 it("bounds redacted defects and rejects hostile preflight values", () => {
   const secret = "SELECT password=credential FROM /private/archive"
-  const redacted = RestoreProtocol.encodeDefect(new Error(secret), 4_096)
+  const redacted = RestoreProtocol.encodeDefect(Error(secret), 4_096)
   assert.notInclude(redacted.name, secret)
   assert.notInclude(redacted.message, "SELECT")
   assert.notInclude(redacted.message, "password")
@@ -326,12 +328,12 @@ it("bounds redacted defects and rejects hostile preflight values", () => {
   const throwing = Object.create(null)
   Object.defineProperty(throwing, "name", {
     get() {
-      throw new Error("name getter")
+      return Effect.runSync(Effect.die("name getter"))
     }
   })
   Object.defineProperty(throwing, "message", {
     get() {
-      throw new Error("message getter")
+      return Effect.runSync(Effect.die("message getter"))
     }
   })
   const description = RestoreProtocol.encodeDefect(throwing, 32)
@@ -347,7 +349,7 @@ it("bounds redacted defects and rejects hostile preflight values", () => {
   Object.defineProperty(hostile, "value", {
     enumerable: true,
     get() {
-      throw new Error("hostile getter")
+      return Effect.runSync(Effect.die("hostile getter"))
     }
   })
   assert.isFalse(RestoreProtocol.preflight(hostile, 4_096))
@@ -374,7 +376,7 @@ it.effect("guards transferred MessagePort values", () =>
     const hostile = Object.create(null)
     Object.defineProperty(hostile, "postMessage", {
       get() {
-        throw new Error("hostile getter")
+        return Effect.runSync(Effect.die("hostile getter"))
       }
     })
     const decoded = yield* Effect.exit(Schema.decodeUnknownEffect(ReplicaRpc.MessagePortSchema)(hostile))
@@ -424,9 +426,11 @@ it.effect("keeps its own tag when the budget is exhausted and only truncates the
 // module -- this guard covers exactly that seam, and it is the reason a forgotten reason is a test
 // failure rather than a silently rejected preflight.
 it("wires every ReplicaError reason into the restore wire field record", () => {
-  const tags = ReplicaError.Reason.members.map((member) =>
-    (member.fields._tag.ast as { readonly literal: string }).literal
-  )
+  const tags = ReplicaError.Reason.members.flatMap((member) => {
+    const ast = member.fields._tag.ast
+    if (!SchemaAST.isLiteral(ast) || typeof ast.literal !== "string") return []
+    return [ast.literal]
+  })
   assert.include(tags, "ReplicaMetadataMissing")
   for (const tag of tags) {
     assert.isTrue(

@@ -1,6 +1,6 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
-import { assert, it } from "@effect/vitest"
+import { assert, it as vitestIt } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as PeerRelayClientRuntime from "@lucas-barake/effect-local-sql/PeerRelayClientRuntime"
@@ -53,11 +53,14 @@ import {
 
 const ReplicaOwner = {
   ...ReplicaOwnerModule,
-  layerHandlers: (definition: ReplicaDefinition.Any) =>
-    ReplicaOwnerModule.layerHandlers(definition).pipe(Layer.provide(PeerRelayRuntime))
+  layerHandlers: (candidateDefinition: ReplicaDefinition.Any) =>
+    ReplicaOwnerModule.layerHandlers(candidateDefinition).pipe(Layer.provide(PeerRelayRuntime))
 }
 
-it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
+const mockReplica = (overrides: object): Replica.Replica["Service"] =>
+  Object.assign(Object.create<Replica.Replica["Service"]>(null), overrides)
+
+vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
   const limits = {
     maxBackupBytes: 1024,
     maxChunkBytes: 128,
@@ -240,14 +243,14 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     })
     const visible = Conflict.AlternativeId.make("2@actor")
     const other = Conflict.AlternativeId.make("1@actor")
-    const path = { parents: [], target: { _tag: "Key" as const, key: "title" } }
+    const path = { parents: [], target: { _tag: "Key" satisfies "Key", key: "title" } }
     const resolution = Conflict.Resolution.make({
       heads: ["head"],
       path,
       choice: { _tag: "SelectAlternative", alternativeId: other }
     })
     let resolved: Conflict.Resolution | undefined
-    const transformedReplica: Replica.Replica["Service"] = {
+    const transformedReplica = mockReplica({
       ...replica,
       inspectConflicts: (_document, requestedId) =>
         Effect.succeed({
@@ -267,14 +270,14 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
               { id: visible, value: "42" }
             ]
           }]
-        }) as never,
+        }),
       resolveConflict: (_document, options) =>
         Effect.sync(() => {
           resolved = options.resolution
-        }) as never,
+        }),
       lookupConflictResolution: (_document, options) =>
         Effect.succeed(CommandOutcome.durablyCommitted(options.commandId, undefined))
-    }
+    })
     const TransformedOwner = ReplicaOwner.layerHandlers(transformedDefinition).pipe(
       Layer.provide(PeerConnectionStatus.layer),
       Layer.provide(RelayConnectionStatus.layerNotConfigured),
@@ -306,10 +309,10 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
   })
 
   it.effect("round trips tagged query errors through the wire", () => {
-    const rejected: Replica.Replica["Service"] = {
+    const rejected = mockReplica({
       ...replica,
-      query: (_query, ...payload) => Effect.fail(new ReadError({ filter: String(payload[0]) })) as never
-    }
+      query: (_query, ...payload) => Effect.fail(new ReadError({ filter: String(payload[0]) }))
+    })
     const RejectedOwner = ReplicaOwner.layerHandlers(definition).pipe(
       Layer.provide(PeerConnectionStatus.layer),
       Layer.provide(RelayConnectionStatus.layerNotConfigured),
@@ -362,7 +365,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
   it.effect("decodes and rejects owners using an older protocol", () =>
     Effect.scoped(Effect.gen(function*() {
       const open = ReplicaRpc.group.requests.get("OpenSession")
-      if (open?._tag !== "OpenSession") return yield* Effect.die(new Error("OpenSession RPC not found"))
+      if (open?._tag !== "OpenSession") yield* Effect.die("OpenSession RPC not found")
       yield* Schema.decodeUnknownEffect(open.successSchema)({
         leaseMillis: 1_000,
         protocolVersion: ReplicaRpc.protocolVersion - 1,
@@ -376,12 +379,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           if (property !== "OpenSession") return value
           return (payload: never) =>
             value(payload).pipe(Effect.map((lease) => ({
-              ...(lease as {
-                readonly leaseMillis: number
-                readonly protocolVersion: number
-                readonly definitionHash: string
-                readonly ownerEpoch: string
-              }),
+              ...lease,
               protocolVersion: ReplicaRpc.protocolVersion - 1
             })))
         }
@@ -633,7 +631,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           watermark: Identity.CommitSequence.make(0),
           refreshGeneration: 0,
           events: Stream.make({
-            _tag: "Commit" as const,
+            _tag: "Commit" satisfies "Commit",
             commitSequence: Identity.CommitSequence.make(1),
             documentId,
             keys: [Task.name],
@@ -674,7 +672,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
             watermark: Identity.CommitSequence.make(subscriptions - 1),
             refreshGeneration: 0,
             events: Stream.make({
-              _tag: "Commit" as const,
+              _tag: "Commit" satisfies "Commit",
               commitSequence: Identity.CommitSequence.make(subscriptions),
               documentId,
               keys: [`subscription-${subscriptions}`],
@@ -713,23 +711,24 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           return ({ ownerEpoch }: { readonly ownerEpoch: string }) =>
             Stream.unwrap(Effect.sync(() => {
               subscriptions++
-              return subscriptions === 1
-                ? Stream.make({
-                  _tag: "InvalidationsReady" as const,
+              if (subscriptions === 1) {
+                return Stream.make({
+                  _tag: "InvalidationsReady" satisfies "InvalidationsReady",
                   ownerEpoch,
                   watermark: Identity.CommitSequence.make(0),
                   refreshGeneration: 0,
                   deliveryWatermark: 0,
                   deliveryRefreshEpoch: 0
                 }).pipe(Stream.concat(Stream.fail(disconnected())))
-                : Stream.make({
-                  _tag: "InvalidationsReady" as const,
-                  ownerEpoch,
-                  watermark: Identity.CommitSequence.make(2),
-                  refreshGeneration: 0,
-                  deliveryWatermark: 0,
-                  deliveryRefreshEpoch: 0
-                })
+              }
+              return Stream.make({
+                _tag: "InvalidationsReady" satisfies "InvalidationsReady",
+                ownerEpoch,
+                watermark: Identity.CommitSequence.make(2),
+                refreshGeneration: 0,
+                deliveryWatermark: 0,
+                deliveryRefreshEpoch: 0
+              })
             }))
         }
       })
@@ -752,7 +751,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           if (property !== "Invalidations") return Reflect.get(target, property, receiver)
           return ({ ownerEpoch }: { readonly ownerEpoch: string }) =>
             Stream.make({
-              _tag: "InvalidationsReady" as const,
+              _tag: "InvalidationsReady" satisfies "InvalidationsReady",
               ownerEpoch,
               watermark: Identity.CommitSequence.make(0),
               refreshGeneration: 1,
@@ -777,7 +776,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           if (property !== "Invalidations") return Reflect.get(target, property, receiver)
           return ({ ownerEpoch }: { readonly ownerEpoch: string }) =>
             Stream.make({
-              _tag: "InvalidationsReady" as const,
+              _tag: "InvalidationsReady" satisfies "InvalidationsReady",
               ownerEpoch,
               watermark: Identity.CommitSequence.make(1),
               refreshGeneration: 0,
@@ -805,21 +804,22 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
             Stream.unwrap(Effect.sync(() => {
               subscriptions++
               const ready = Stream.make({
-                _tag: "InvalidationsReady" as const,
+                _tag: "InvalidationsReady" satisfies "InvalidationsReady",
                 ownerEpoch,
                 watermark: Identity.CommitSequence.make(0),
                 refreshGeneration: 0,
                 deliveryWatermark: 0,
                 deliveryRefreshEpoch: 0
               })
-              return subscriptions < 5
-                ? ready.pipe(Stream.concat(Stream.fail(disconnected())))
-                : ready.pipe(Stream.concat(Stream.make({
-                  _tag: "Invalidation" as const,
-                  ownerEpoch,
-                  sequence: Identity.CommitSequence.make(1),
-                  keys: [Task.name]
-                })))
+              if (subscriptions < 5) {
+                return ready.pipe(Stream.concat(Stream.fail(disconnected())))
+              }
+              return ready.pipe(Stream.concat(Stream.make({
+                _tag: "Invalidation" satisfies "Invalidation",
+                ownerEpoch,
+                sequence: Identity.CommitSequence.make(1),
+                keys: [Task.name]
+              })))
             }))
         }
       })
@@ -846,7 +846,10 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           if (property !== "RenewSession") return value
           return (payload: never) =>
             Effect.sync(() => ++renewals).pipe(
-              Effect.flatMap((attempt) => attempt < 5 ? Effect.fail(disconnected()) : value(payload))
+              Effect.flatMap((attempt) => {
+                if (attempt < 5) return Effect.fail(disconnected())
+                return value(payload)
+              })
             )
         }
       })
@@ -876,9 +879,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
               )
           }
           if (property === "Get") {
-            return (payload: { readonly sessionId: Identity.SessionId }) =>
-              restarted && openSessions === 1
-                ? Effect.fail(
+            return (payload: { readonly sessionId: Identity.SessionId }) => {
+              if (restarted && openSessions === 1) {
+                return Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.ProtocolMismatch({
                       expected: "active session",
@@ -886,12 +889,14 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                     })
                   })
                 )
-                : value(payload)
+              }
+              return value(payload)
+            }
           }
           if (property === "Invalidations") {
             return ({ ownerEpoch }: { readonly ownerEpoch: string }) =>
               Stream.make({
-                _tag: "InvalidationsReady" as const,
+                _tag: "InvalidationsReady" satisfies "InvalidationsReady",
                 ownerEpoch,
                 watermark: Identity.CommitSequence.make(0),
                 refreshGeneration: 0,
@@ -899,9 +904,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 deliveryRefreshEpoch: 0
               }).pipe(
                 Stream.tap(() => Deferred.succeed(invalidationsStarted, undefined)),
-                Stream.concat(
-                  ownerEpoch === "owner-1"
-                    ? Stream.fromEffect(Deferred.await(ownerRestarted)).pipe(
+                Stream.concat((() => {
+                  if (ownerEpoch === "owner-1") {
+                    return Stream.fromEffect(Deferred.await(ownerRestarted)).pipe(
                       Stream.flatMap(() =>
                         Stream.fail(
                           new ReplicaError.ReplicaError({
@@ -913,8 +918,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                         )
                       )
                     )
-                    : Stream.never
-                )
+                  }
+                  return Stream.never
+                })())
               )
           }
           return value
@@ -954,9 +960,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           if (property === "Get") {
             return (payload: never) =>
               Effect.sync(() => ++gets).pipe(
-                Effect.flatMap((attempt) =>
-                  attempt === 1
-                    ? Effect.fail(
+                Effect.flatMap((attempt) => {
+                  if (attempt === 1) {
+                    return Effect.fail(
                       new ReplicaError.ReplicaError({
                         reason: new ReplicaError.ProtocolMismatch({
                           expected: "bounded conflict response",
@@ -964,8 +970,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                         })
                       })
                     )
-                    : value(payload)
-                )
+                  }
+                  return value(payload)
+                })
               )
           }
           return value
@@ -1007,11 +1014,11 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         }
       })
       const client = yield* ReplicaClient.fromRpcClient(definition, observed)
-      const invalid = {
+      const invalid = Object.assign(Object.create<Conflict.Resolution>(null), {
         heads: [],
         path: { parents: [], target: { _tag: "Key", key: "title" } },
         choice: { _tag: "ReplaceValue", value: Number.NaN }
-      } as never
+      })
 
       const error = yield* Effect.flip(
         client.resolveConflict(Task, {
@@ -1052,7 +1059,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
             return (payload: { readonly sessionId: Identity.SessionId }) => {
               if (!restarted || payload.sessionId !== initialSessionId) return value(payload)
               staleGets++
-              return (staleGets === 2 ? Deferred.succeed(staleRequests, undefined) : Effect.void).pipe(
+              let gate = Effect.void
+              if (staleGets === 2) gate = Deferred.succeed(staleRequests, undefined)
+              return gate.pipe(
                 Effect.andThen(Deferred.await(staleRequests)),
                 Effect.andThen(Effect.fail(
                   new ReplicaError.ReplicaError({
@@ -1095,21 +1104,24 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
               openedSessionIds.push(payload.sessionId)
               if (initialSessionId === undefined) initialSessionId = payload.sessionId
               const opened = value(payload)
-              return openSessions === 2 || openSessions === 3
-                ? opened.pipe(Effect.andThen(Effect.fail(disconnected())))
-                : opened
+              if (openSessions === 2 || openSessions === 3) {
+                return opened.pipe(Effect.andThen(Effect.fail(disconnected())))
+              }
+              return opened
             }
           }
           if (property === "CloseSession") {
-            return (payload: { readonly sessionId: Identity.SessionId }) =>
-              payload.sessionId !== initialSessionId && openSessions <= 3
-                ? Effect.fail(disconnected())
-                : value(payload)
+            return (payload: { readonly sessionId: Identity.SessionId }) => {
+              if (payload.sessionId !== initialSessionId && openSessions <= 3) {
+                return Effect.fail(disconnected())
+              }
+              return value(payload)
+            }
           }
           if (property === "Get") {
-            return (payload: { readonly sessionId: Identity.SessionId }) =>
-              payload.sessionId === initialSessionId
-                ? Effect.fail(
+            return (payload: { readonly sessionId: Identity.SessionId }) => {
+              if (payload.sessionId === initialSessionId) {
+                return Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.ProtocolMismatch({
                       expected: "active session",
@@ -1117,7 +1129,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                     })
                   })
                 )
-                : value(payload)
+              }
+              return value(payload)
+            }
           }
           return value
         }
@@ -1142,13 +1156,13 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           return ({ ownerEpoch }: { readonly ownerEpoch: string }) =>
             Stream.make(
               {
-                _tag: "Invalidation" as const,
+                _tag: "Invalidation" satisfies "Invalidation",
                 ownerEpoch: "stale-owner",
                 sequence: Identity.CommitSequence.make(1),
                 keys: [Task.name]
               },
               {
-                _tag: "Invalidation" as const,
+                _tag: "Invalidation" satisfies "Invalidation",
                 ownerEpoch,
                 sequence: Identity.CommitSequence.make(2),
                 keys: [Task.name]
@@ -1173,7 +1187,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           return ({ ownerEpoch }: { readonly ownerEpoch: string }) =>
             Stream.make(
               {
-                _tag: "InvalidationsReady" as const,
+                _tag: "InvalidationsReady" satisfies "InvalidationsReady",
                 ownerEpoch,
                 watermark: Identity.CommitSequence.make(5),
                 refreshGeneration: 0,
@@ -1181,18 +1195,18 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                 deliveryRefreshEpoch: 0
               },
               {
-                _tag: "FullRefreshRequired" as const,
+                _tag: "FullRefreshRequired" satisfies "FullRefreshRequired",
                 ownerEpoch,
                 keys: [Task.name]
               },
               {
-                _tag: "Invalidation" as const,
+                _tag: "Invalidation" satisfies "Invalidation",
                 ownerEpoch,
                 sequence: Identity.CommitSequence.make(1),
                 keys: [Task.name]
               },
               {
-                _tag: "Invalidation" as const,
+                _tag: "Invalidation" satisfies "Invalidation",
                 ownerEpoch,
                 sequence: Identity.CommitSequence.make(2),
                 keys: [Task.name]
@@ -1230,16 +1244,16 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     let lookups = 0
     return Effect.gen(function*() {
       const unknownCommandId = yield* Identity.makeCommandId
-      const rejected: Replica.Replica["Service"] = {
+      const rejected = mockReplica({
         ...replica,
         // A declared rejection is now an ordinary typed failure from the replica itself.
-        mutate: () => Effect.fail(new RenameError()) as never,
+        mutate: () => Effect.fail(new RenameError()),
         lookupMutation: () =>
           Effect.sync(() => {
             lookups++
             return CommandOutcome.unknown(unknownCommandId)
-          }) as never
-      }
+          })
+      })
       const RejectedOwner = ReplicaOwner.layerHandlers(definition).pipe(
         Layer.provide(PeerConnectionStatus.layer),
         Layer.provide(RelayConnectionStatus.layerNotConfigured),
@@ -1258,49 +1272,49 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         assert.strictEqual(lookups, 0)
       })).pipe(Effect.provide(RejectedOwner))
     })
+  })
 
-    it.effect("preserves and manually looks up a durable stale conflict rejection", () => {
-      let lookups = 0
-      const resolution = Conflict.Resolution.make({
-        heads: ["expected"],
-        path: { parents: [], target: { _tag: "Key", key: "title" } },
-        choice: { _tag: "DeleteValue" }
-      })
-      const rejection = new Conflict.StaleConflictResolution({
-        expectedHeads: ["expected"],
-        observedHeads: ["observed"]
-      })
-      const rejected: Replica.Replica["Service"] = {
-        ...replica,
-        resolveConflict: () => Effect.fail(rejection),
-        lookupConflictResolution: (_document, options) =>
-          Effect.sync(() => {
-            lookups++
-            return CommandOutcome.rejected(options.commandId, rejection)
-          })
-      }
-      const RejectedOwner = ReplicaOwner.layerHandlers(definition).pipe(
-        Layer.provide(PeerConnectionStatus.layer),
-        Layer.provide(RelayConnectionStatus.layerNotConfigured),
-        Layer.provideMerge(Sessions),
-        Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, rejected)))
-      )
-      return Effect.scoped(Effect.gen(function*() {
-        const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-        const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
-        const commandId = yield* Identity.makeCommandId
-        const error = yield* Effect.flip(
-          client.resolveConflict(Task, { commandId, documentId, resolution })
-        )
-        assert.deepStrictEqual(error, rejection)
-        assert.strictEqual(lookups, 0)
-        assert.deepStrictEqual(
-          yield* client.lookupConflictResolution(Task, { commandId, documentId, resolution }),
-          CommandOutcome.rejected(commandId, rejection)
-        )
-        assert.strictEqual(lookups, 1)
-      })).pipe(Effect.provide(RejectedOwner))
+  it.effect("preserves and manually looks up a durable stale conflict rejection", () => {
+    let lookups = 0
+    const resolution = Conflict.Resolution.make({
+      heads: ["expected"],
+      path: { parents: [], target: { _tag: "Key", key: "title" } },
+      choice: { _tag: "DeleteValue" }
     })
+    const rejection = new Conflict.StaleConflictResolution({
+      expectedHeads: ["expected"],
+      observedHeads: ["observed"]
+    })
+    const rejected: Replica.Replica["Service"] = {
+      ...replica,
+      resolveConflict: () => Effect.fail(rejection),
+      lookupConflictResolution: (_document, options) =>
+        Effect.sync(() => {
+          lookups++
+          return CommandOutcome.rejected(options.commandId, rejection)
+        })
+    }
+    const RejectedOwner = ReplicaOwner.layerHandlers(definition).pipe(
+      Layer.provide(PeerConnectionStatus.layer),
+      Layer.provide(RelayConnectionStatus.layerNotConfigured),
+      Layer.provideMerge(Sessions),
+      Layer.provide(Layer.merge(Publisher, Layer.succeed(Replica.Replica, rejected)))
+    )
+    return Effect.scoped(Effect.gen(function*() {
+      const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
+      const client = yield* ReplicaClient.fromRpcClient(definition, rpc)
+      const commandId = yield* Identity.makeCommandId
+      const error = yield* Effect.flip(
+        client.resolveConflict(Task, { commandId, documentId, resolution })
+      )
+      assert.deepStrictEqual(error, rejection)
+      assert.strictEqual(lookups, 0)
+      assert.deepStrictEqual(
+        yield* client.lookupConflictResolution(Task, { commandId, documentId, resolution }),
+        CommandOutcome.rejected(commandId, rejection)
+      )
+      assert.strictEqual(lookups, 1)
+    })).pipe(Effect.provide(RejectedOwner))
   })
 
   it.effect("rejects operations without an active session", () =>
@@ -1332,8 +1346,10 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         headers: Headers.empty
       })
       const unary = <A, E, R,>(effect: Effect.Effect<A | Deferred.Deferred<A, E>, E, R>) =>
-        Effect.flatMap(effect, (value) =>
-          Deferred.isDeferred<A, E>(value) ? Deferred.await(value) : Effect.succeed(value))
+        Effect.flatMap(effect, (value) => {
+          if (Deferred.isDeferred<A, E>(value)) return Deferred.await(value)
+          return Effect.succeed(value)
+        })
 
       // A tab old enough to omit the field entirely is still refused with a reason it can read,
       // which is only reachable because the payload field stays optional rather than a literal.
@@ -1390,7 +1406,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       )
 
       const otherTransients = transients({ sessionId }, options(other, "transients-other"))
-      const transientStreamError = yield* (otherTransients as Stream.Stream<unknown, ReplicaError.ReplicaError>).pipe(
+      if (!Stream.isStream(otherTransients)) yield* Effect.die("expected transient stream")
+      const transientStreamError = yield* otherTransients.pipe(
         Stream.runDrain,
         Effect.flip
       )
@@ -1398,7 +1415,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
 
       const otherStatus = status({ sessionId }, options(other, "status-other"))
       assert.isTrue(Stream.isStream(otherStatus))
-      const streamError = yield* (otherStatus as Stream.Stream<unknown, ReplicaError.ReplicaError>).pipe(
+      const streamError = yield* otherStatus.pipe(
         Stream.runDrain,
         Effect.flip
       )
@@ -1412,7 +1429,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       const ownerStatus = status({ sessionId }, options(owner, "status-owner"))
       assert.isTrue(Stream.isStream(ownerStatus))
       assert.lengthOf(
-        Array.from(yield* Stream.runCollect(ownerStatus as Stream.Stream<unknown, ReplicaError.ReplicaError>)),
+        Array.from(yield* Stream.runCollect(ownerStatus)),
         1
       )
       yield* unary(transient(
@@ -1425,10 +1442,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         options(owner, "transient-owner")
       ))
       yield* Stream.runDrain(
-        transients({ sessionId }, options(owner, "transients-owner")) as Stream.Stream<
-          unknown,
-          ReplicaError.ReplicaError
-        >
+        transients({ sessionId }, options(owner, "transients-owner"))
       )
 
       yield* TestClock.adjust(SessionManager.leaseDurationMillis + 1)
@@ -1445,7 +1459,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         "ProtocolMismatch"
       )
       const expiredTransients = transients({ sessionId }, options(owner, "transients-expired"))
-      const expiredStreamError = yield* (expiredTransients as Stream.Stream<unknown, ReplicaError.ReplicaError>).pipe(
+      const expiredStreamError = yield* expiredTransients.pipe(
         Stream.runDrain,
         Effect.flip
       )
@@ -1499,7 +1513,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         source: Stream.make(Uint8Array.of(1)).pipe(
           Stream.concat(Stream.fail(
             new ReplicaError.ReplicaError({
-              reason: new ReplicaError.StorageUnavailable({ cause: new Error("source tail was pulled") })
+              reason: new ReplicaError.StorageUnavailable({ cause: Error("source tail was pulled") })
             })
           ))
         ),
@@ -1532,12 +1546,18 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         Publisher,
         Layer.succeed(Replica.Replica, {
           ...replica,
-          installBackupDocument: (document, { documentId, expectedDefinitionHash, installationId, maxBytes, source }) =>
+          installBackupDocument: (document, {
+            documentId: installedDocumentId,
+            expectedDefinitionHash,
+            installationId,
+            maxBytes,
+            source
+          }) =>
             Stream.runCollect(source).pipe(
               Effect.map((chunks) => {
                 installed = {
                   document,
-                  documentId,
+                  documentId: installedDocumentId,
                   chunks: Array.from(chunks),
                   expectedDefinitionHash,
                   installationId,
@@ -1644,13 +1664,14 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       const finishDelivered = yield* Deferred.make<void>()
       const terminalDropped = yield* Deferred.make<void>()
+      const finish: FinishRestore = (payload) =>
+        rpc.FinishRestoreBackup(payload).pipe(
+          Effect.tap(() => Deferred.succeed(finishDelivered, undefined))
+        )
       const bridged = dropTerminalReady(
         rpc,
         terminalDropped,
-        ((payload) =>
-          rpc.FinishRestoreBackup(payload).pipe(
-            Effect.tap(() => Deferred.succeed(finishDelivered, undefined))
-          )) as FinishRestore
+        finish
       )
       const client = yield* ReplicaClient.fromRpcClient(
         definition,
@@ -1701,7 +1722,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
             reason: new ReplicaError.RestoreBusy({ replica: "composite-lost-terminal" })
           })
         ),
-        Cause.makeDieReason(new Error("composite restore defect"))
+        Cause.makeDieReason(Error("composite restore defect"))
       ]),
       expectedTags: ["Fail", "Die"],
       expectedFailureTags: ["RestoreBusy"]
@@ -1851,7 +1872,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
             reason: new ReplicaError.RestoreBusy({ replica: "typed" })
           })
         ),
-        Cause.makeDieReason(new Error("secret sql SELECT credential=/private/archive"))
+        Cause.makeDieReason(Error("secret sql SELECT credential=/private/archive"))
       ]),
       expectedTags: ["Fail", "Die"],
       expectedFailureTags: ["RestoreBusy"]
@@ -1872,7 +1893,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     {
       name: "preserves a pure defect through the public client",
       cause: Cause.fromReasons([
-        Cause.makeDieReason(new Error("secret password=/private/archive"))
+        Cause.makeDieReason(Error("secret password=/private/archive"))
       ]),
       expectedTags: ["Die"],
       expectedFailureTags: []
@@ -1887,8 +1908,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
             })
           ))
       ),
-      expectedTags: Array.from({ length: 9 }, () => "Fail" as const),
-      expectedFailureTags: Array.from({ length: 9 }, () => "RestoreBusy" as const)
+      expectedTags: Array.from({ length: 9 }, () => ("Fail" satisfies "Fail")),
+      expectedFailureTags: Array.from({ length: 9 }, () => ("RestoreBusy" satisfies "RestoreBusy"))
     }
   ]
 
@@ -2281,11 +2302,12 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           if (property === "ImportDocument") {
             return (payload: never) => {
               importCalls++
-              return importCalls === 1
-                ? value(payload).pipe(Effect.andThen(Effect.fail(
+              if (importCalls === 1) {
+                return value(payload).pipe(Effect.andThen(Effect.fail(
                   protocolMismatch("import")
                 )))
-                : value(payload)
+              }
+              return value(payload)
             }
           }
           return value
@@ -2332,7 +2354,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           if (property === "ImportDocument") {
             return (payload: never) => {
               importCalls++
-              return importCalls === 1 ? Effect.fail(protocolMismatch("before import")) : value(payload)
+              if (importCalls === 1) return Effect.fail(protocolMismatch("before import"))
+              return value(payload)
             }
           }
           return value
@@ -2377,19 +2400,19 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           if (property === "OpenSession") {
             return (payload: never) => {
               openSessions++
-              return openSessions === 2
-                ? Deferred.succeed(replacementFailed, undefined).pipe(
+              if (openSessions === 2) {
+                return Deferred.succeed(replacementFailed, undefined).pipe(
                   Effect.andThen(Effect.fail(transientDisconnected()))
                 )
-                : value(payload)
+              }
+              return value(payload)
             }
           }
           if (property === "BeginRestoreBackup") {
             return (payload: never) => {
               restoreCalls++
-              return restoreCalls === 1
-                ? Effect.fail(protocolMismatch("restore"))
-                : value(payload)
+              if (restoreCalls === 1) return Effect.fail(protocolMismatch("restore"))
+              return value(payload)
             }
           }
           return value
@@ -2430,11 +2453,10 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           if (property === "OpenSession") {
             return (payload: never) => {
               openSessions++
-              return openSessions === 1
-                ? value(payload)
-                : Effect.fail(transientDisconnected()).pipe(
-                  Effect.tapError(() => Deferred.succeed(replacementFailed, undefined))
-                )
+              if (openSessions === 1) return value(payload)
+              return Effect.fail(transientDisconnected()).pipe(
+                Effect.tapError(() => Deferred.succeed(replacementFailed, undefined))
+              )
             }
           }
           if (property === "BeginRestoreBackup") {
@@ -2504,13 +2526,14 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           if (property === "OpenSession") {
             return (payload: never) => {
               openSessions++
-              return openSessions === 2
-                ? Effect.fail(
+              if (openSessions === 2) {
+                return Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.QuotaExceeded({ resource: "sessions", limit: 2 })
                   })
                 )
-                : value(payload)
+              }
+              return value(payload)
             }
           }
           if (property === "BeginRestoreBackup") {
@@ -2564,9 +2587,10 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           if (property === "OpenSession") {
             return (payload: never) => {
               openSessions++
-              return openSessions === 2
-                ? Deferred.succeed(replacementStarted, undefined).pipe(Effect.andThen(Effect.never))
-                : value(payload)
+              if (openSessions === 2) {
+                return Deferred.succeed(replacementStarted, undefined).pipe(Effect.andThen(Effect.never))
+              }
+              return value(payload)
             }
           }
           if (property === "BeginRestoreBackup") {
@@ -2638,9 +2662,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           if (property === "Get") {
             return (payload: { readonly sessionId: Identity.SessionId }) => {
               getSessionIds.push(payload.sessionId)
-              return payload.sessionId === openedSessionIds[0]
-                ? Effect.fail(protocolMismatch("get"))
-                : value(payload)
+              if (payload.sessionId === openedSessionIds[0]) return Effect.fail(protocolMismatch("get"))
+              return value(payload)
             }
           }
           return value
@@ -2690,11 +2713,12 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           if (property === "Get") {
             return (payload: { readonly sessionId: Identity.SessionId }) => {
               getSessionIds.push(payload.sessionId)
-              return getSessionIds.length === 1
-                ? Effect.fail(
+              if (getSessionIds.length === 1) {
+                return Effect.fail(
                   protocolMismatch("get")
                 )
-                : value(payload)
+              }
+              return value(payload)
             }
           }
           return value
@@ -2719,7 +2743,11 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       replacementPending: true,
       expected: "OperationTimeout"
     }
-  ] as const
+  ] satisfies ReadonlyArray<{
+    readonly name: string
+    readonly replacementPending: boolean
+    readonly expected: "ProtocolMismatch" | "OperationTimeout"
+  }>
 
   for (const scenario of lostReleasedScenarios) {
     it.effect(scenario.name, () => {
@@ -2753,13 +2781,12 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                   openedSessionIds.push(payload.sessionId)
                   return openedSessionIds.length
                 }).pipe(
-                  Effect.flatMap((opened) =>
-                    opened === 1
-                      ? value(payload)
-                      : Deferred.succeed(replacementStarted, undefined).pipe(
-                        Effect.andThen(scenario.replacementPending ? Effect.never : value(payload))
-                      )
-                  )
+                  Effect.flatMap((opened) => {
+                    if (opened === 1) return value(payload)
+                    let completion = value(payload)
+                    if (scenario.replacementPending) completion = Effect.never
+                    return Deferred.succeed(replacementStarted, undefined).pipe(Effect.andThen(completion))
+                  })
                 )
             }
             if (property === "RenewSession") return () => Effect.never
@@ -2787,10 +2814,12 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                             return
                           }
                           const wrapped: EventListener = (event) => {
-                            const tag = typeof (event as MessageEvent<unknown>).data === "object" &&
-                                (event as MessageEvent<unknown>).data !== null
-                              ? Reflect.get((event as MessageEvent<unknown>).data as object, "_tag")
-                              : undefined
+                            let data: unknown
+                            if (event instanceof MessageEvent) data = event.data
+                            let tag: unknown
+                            if (typeof data === "object" && data !== null) {
+                              tag = Reflect.get(data, "_tag")
+                            }
                             if (tag === "Released") return
                             if (typeof listener === "function") listener.call(port, event)
                             else listener.handleEvent(event)
@@ -2824,7 +2853,11 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                           ) {
                             Deferred.doneUnsafe(terminalAck, Effect.void)
                           }
-                          post(message, transfer === undefined ? [] : [...transfer])
+                          if (transfer === undefined) {
+                            post(message, [])
+                          } else {
+                            post(message, [...transfer])
+                          }
                         }
                       }
                     })
@@ -2838,21 +2871,21 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         const client = yield* ReplicaClient.fromRpcClient(definition, observed, {
           operationTimeout: 1_000
         })
+        let installationId = "bak_3eb7f6c1-53fb-48a7-b292-a1faeb46d507"
+        if (scenario.replacementPending) {
+          installationId = "bak_e8fe506a-2f58-463f-8ef4-a52f363b6314"
+        }
         const restored = yield* client.restoreBackup({
           source: Stream.never,
           mode: "replace",
           maxBytes: 1_024,
           expectedDefinitionHash: definition.hash,
-          installationId: Identity.BackupInstallationId.make(
-            scenario.replacementPending
-              ? "bak_e8fe506a-2f58-463f-8ef4-a52f363b6314"
-              : "bak_3eb7f6c1-53fb-48a7-b292-a1faeb46d507"
-          )
+          installationId: Identity.BackupInstallationId.make(installationId)
         }).pipe(Effect.forkChild)
 
         const pulled = yield* Effect.raceFirst(
-          Deferred.await(start).pipe(Effect.map((sessionId) => ({ _tag: "Start" as const, sessionId }))),
-          Fiber.await(restored).pipe(Effect.map((exit) => ({ _tag: "Exit" as const, exit })))
+          Deferred.await(start).pipe(Effect.map((sessionId) => ({ _tag: "Start" satisfies "Start", sessionId }))),
+          Fiber.await(restored).pipe(Effect.map((exit) => ({ _tag: "Exit" satisfies "Exit", exit })))
         )
         assert.strictEqual(pulled._tag, "Start")
         if (pulled._tag !== "Start") return
@@ -2860,8 +2893,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         assert.deepStrictEqual(openedSessionIds, [staleSessionId])
         yield* sessions.close(staleSessionId, 0)
         const ready = yield* Effect.raceFirst(
-          Deferred.await(terminalAck).pipe(Effect.as("Ack" as const)),
-          Fiber.await(restored).pipe(Effect.map((exit) => ({ _tag: "Exit" as const, exit })))
+          Deferred.await(terminalAck).pipe(Effect.as("Ack" satisfies "Ack")),
+          Fiber.await(restored).pipe(Effect.map((exit) => ({ _tag: "Exit" satisfies "Exit", exit })))
         )
         assert.strictEqual(ready, "Ack")
         assert.deepStrictEqual(openedSessionIds, [staleSessionId])
@@ -2936,9 +2969,9 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
       PeerRelayClientRuntime.PeerRelayClientRuntime,
       {
         ...peerRelayRuntimeService,
-        send: (peerId, documentId, payload) =>
+        send: (sentPeerId, sentDocumentId, sentPayload) =>
           Effect.sync(() => {
-            sent.push({ peerId, documentId, payload })
+            sent.push({ peerId: sentPeerId, documentId: sentDocumentId, payload: sentPayload })
           }),
         transients: Stream.make({ peerId, documentId, payload })
       }
@@ -2993,12 +3026,13 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           return () =>
             Stream.unwrap(Effect.sync(() => {
               subscriptions++
-              return subscriptions === 1
-                ? Stream.make(first).pipe(
+              if (subscriptions === 1) {
+                return Stream.make(first).pipe(
                   Stream.tap(() => Deferred.succeed(firstObserved, undefined)),
                   Stream.concat(Stream.fail(protocolMismatch("expired transient stream")))
                 )
-                : Stream.make(second)
+              }
+              return Stream.make(second)
             }))
         }
       })
@@ -3051,8 +3085,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
           return (payload: never) =>
             Stream.unwrap(Effect.sync(() => {
               subscriptions++
-              return subscriptions === 1
-                ? Stream.fromEffect(
+              if (subscriptions === 1) {
+                return Stream.fromEffect(
                   Deferred.succeed(transportFailed, undefined).pipe(
                     Effect.andThen(Effect.fail(
                       new ReplicaError.ReplicaError({
@@ -3063,7 +3097,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
                     ))
                   )
                 )
-                : target.CommandDeliveryChanges(payload).pipe(Stream.take(1))
+              }
+              return target.CommandDeliveryChanges(payload).pipe(Stream.take(1))
             }))
         }
       })

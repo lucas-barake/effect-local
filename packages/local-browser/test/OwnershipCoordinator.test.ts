@@ -1,7 +1,7 @@
 import * as BrowserWorker from "@effect/platform-browser/BrowserWorker"
-import { NodeCrypto } from "@effect/platform-node"
+import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
-import { assert, it } from "@effect/vitest"
+import { assert, it as vitestIt } from "@effect/vitest"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -12,6 +12,7 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
+import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
 import * as ManagedRuntime from "effect/ManagedRuntime"
 import * as Option from "effect/Option"
@@ -26,9 +27,6 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as Worker from "effect/unstable/workers/Worker"
 import { getEventListeners } from "node:events"
-import * as NodeFs from "node:fs"
-import * as NodeOs from "node:os"
-import * as NodePath from "node:path"
 import { DatabaseSync } from "node:sqlite"
 import * as BrowserSqlite from "../src/BrowserSqlite.js"
 import * as OwnershipProtocol from "../src/internal/ownershipProtocol.js"
@@ -118,8 +116,8 @@ interface StartedEngine {
 const makeEngineFactory = (
   started: Array<StartedEngine>,
   filename: string,
-  beforeStart?: ((attempt: number) => Effect.Effect<void>) | undefined,
-  onRelease?: ((attempt: number) => void) | undefined
+  beforeStart?: (attempt: number) => Effect.Effect<void>,
+  onRelease?: (attempt: number) => void
 ) => {
   let attempt = 0
   const engine = (databasePort: MessagePort) => {
@@ -137,17 +135,19 @@ const makeEngineFactory = (
         ReplicaLimits.layer(limits)
       ))
     )
-    const withBeforeStart = beforeStart === undefined
-      ? services
-      : Layer.merge(services, Layer.effectDiscard(beforeStart(attempt)))
-    const EngineLive = onRelease === undefined
-      ? withBeforeStart
-      : Layer.merge(
+    let withBeforeStart = services
+    if (beforeStart !== undefined) {
+      withBeforeStart = Layer.merge(services, Layer.effectDiscard(beforeStart(attempt)))
+    }
+    let EngineLive = withBeforeStart
+    if (onRelease !== undefined) {
+      EngineLive = Layer.merge(
         withBeforeStart,
         Layer.effectDiscard(
           Effect.acquireRelease(Effect.void, () => Effect.sync(() => onRelease(current)))
         )
       )
+    }
     const runtime = ManagedRuntime.make(EngineLive)
     started.push({ sqlite, runtime })
     return runtime
@@ -213,7 +213,7 @@ const takeFrame = <Tag extends OwnershipProtocol.OwnerToPageFrame["_tag"],>(
   Queue.take(tab.frames).pipe(
     Effect.filterOrFail(
       (frame): frame is Extract<OwnershipProtocol.OwnerToPageFrame, { readonly _tag: Tag }> => frame._tag === tag,
-      (frame) => new Error(`expected ${tag}, received ${frame._tag}`)
+      (frame) => Error(`expected ${tag}, received ${frame._tag}`)
     )
   )
 
@@ -253,19 +253,24 @@ const makeSqliteWorker = (onIgnoredRequest?: (request: SqliteRequest) => void) =
   const workerPort = channel.port2
   let responding = true
   const respond = ([id, statementSql, params]: SqliteRequest) => {
-    try {
-      const statement = database.prepare(statementSql)
-      const columns = statement.columns().map((column) => column.column ?? column.name)
-      const rows = statement.all(...(params ?? []) as Array<never>) as Array<Record<string, unknown>>
-      workerPort.postMessage([id, undefined, [columns, rows.map((row) => columns.map((name) => row[name!]))]])
-    } catch (error) {
-      workerPort.postMessage([id, String(error)])
-    }
+    const result = Effect.try({
+      try: () => {
+        const statement = database.prepare(statementSql)
+        const columns = statement.columns().map((column) => column.column ?? column.name)
+        const rows = statement.all(...Array.from(params ?? []))
+        workerPort.postMessage([id, undefined, [columns, rows.map((row) => columns.map((name) => row[name]))]])
+      },
+      catch: (error) => error
+    })
+    Effect.runSync(result.pipe(Effect.matchEffect({
+      onFailure: (error) => Effect.sync(() => workerPort.postMessage([id, String(error)])),
+      onSuccess: () => Effect.void
+    })))
   }
   workerPort.addEventListener("message", (event) => {
-    const request = event.data as ReadonlyArray<unknown>
-    if (!Array.isArray(request) || typeof request[0] !== "number") return
-    const sqliteRequest = request as SqliteRequest
+    const request = event.data
+    if (!isSqliteRequest(request)) return
+    const sqliteRequest = request
     if (!responding) {
       onIgnoredRequest?.(sqliteRequest)
       return
@@ -291,6 +296,12 @@ const makeSqliteWorker = (onIgnoredRequest?: (request: SqliteRequest) => void) =
     }
   }
 }
+
+const isSqliteRequest = (value: unknown): value is SqliteRequest =>
+  Array.isArray(value) &&
+  typeof value[0] === "number" &&
+  typeof value[1] === "string" &&
+  Array.isArray(value[2])
 
 const makeBrowserEngineRuntime = (databasePort: MessagePort) =>
   ManagedRuntime.make(
@@ -325,17 +336,20 @@ const makeTestControlPort = () => {
   const port = {
     addEventListener(type: string, listener: EventListenerOrEventListenerObject) {
       if (type !== "message") return
-      onMessage = typeof listener === "function"
-        ? listener as (event: MessageEvent<unknown>) => void
-        : (event) => listener.handleEvent(event)
+      if (typeof listener === "function") {
+        onMessage = listener
+      } else {
+        onMessage = (event) => listener.handleEvent(event)
+      }
     },
     removeEventListener() {},
     postMessage() {},
     start() {},
     close() {}
-  } as unknown as MessagePort
+  }
+  const messagePort = Object.assign(Object.create<MessagePort>(null), port)
   return {
-    port,
+    port: messagePort,
     dispatch(frame: OwnershipProtocol.OwnerToPageFrame) {
       onMessage?.(
         new MessageEvent("message", {
@@ -346,26 +360,67 @@ const makeTestControlPort = () => {
   }
 }
 
-it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
+class TestWorker extends EventTarget {
+  onerror: ((this: globalThis.Worker, event: ErrorEvent) => unknown) | null = null
+  onmessage: ((this: globalThis.Worker, event: MessageEvent) => unknown) | null = null
+  onmessageerror: ((this: globalThis.Worker, event: MessageEvent) => unknown) | null = null
+  postMessage() {}
+  terminate() {}
+}
+
+class TestSharedWorker extends EventTarget {
+  onconnect: ((this: SharedWorker, event: MessageEvent) => unknown) | null = null
+  onerror: ((this: SharedWorker, event: ErrorEvent) => unknown) | null = null
+
+  constructor(readonly port: MessagePort) {
+    super()
+  }
+}
+
+const mockWorker = (overrides: object) => Object.assign(new TestWorker(), overrides)
+
+const mockSharedWorker = (overrides: { readonly port: MessagePort } & object) =>
+  Object.assign(new TestSharedWorker(overrides.port), overrides)
+
+const installErrorEvent = (constructor: typeof ErrorEvent) => {
+  Object.defineProperty(globalThis, "ErrorEvent", {
+    configurable: true,
+    value: constructor,
+    writable: true
+  })
+}
+
+const pumpMessageTask = Effect.callback<void>((resume) => {
+  const channel = new MessageChannel()
+  channel.port1.addEventListener("message", () => {
+    channel.port1.close()
+    channel.port2.close()
+    resume(Effect.succeed(undefined))
+  }, { once: true })
+  channel.port1.start()
+  channel.port2.postMessage(undefined)
+})
+
+vitestIt.layer(Layer.merge(NodeCrypto.layer, NodeFileSystem.layer))("OwnershipCoordinator", (it) => {
   it.effect("terminates a rejected provisional worker before RPC failure listeners can tear down the tab", () =>
     Effect.gen(function*() {
       const control = makeTestControlPort()
-      const sharedWorker = Object.assign(new EventTarget(), {
+      const sharedWorker = mockSharedWorker({
         port: control.port,
         onerror: null
-      }) as unknown as SharedWorker
+      })
       let terminated = 0
-      const databaseWorker = {
+      const databaseWorker = mockWorker({
         postMessage() {},
         terminate() {
           terminated++
         }
-      } as unknown as globalThis.Worker
+      })
       const previousErrorEvent = globalThis.ErrorEvent
-      globalThis.ErrorEvent = TestErrorEvent as typeof ErrorEvent
+      installErrorEvent(TestErrorEvent)
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
-          globalThis.ErrorEvent = previousErrorEvent
+          installErrorEvent(previousErrorEvent)
         })
       )
 
@@ -380,7 +435,7 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
         scope
       )
       const spawn = yield* Worker.Spawner.pipe(Effect.provide(context))
-      const rpcPort = spawn(0) as MessagePort
+      const rpcPort = spawn(0)
       rpcPort.addEventListener("error", () => {
         sharedWorker.dispatchEvent(new TestErrorEvent("error", { message: "connection closed" }))
       })
@@ -395,15 +450,15 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
   it.effect("fails stale RPC ports when reset error reporting throws", () =>
     Effect.gen(function*() {
       const control = makeTestControlPort()
-      const sharedWorker = Object.assign(new EventTarget(), {
+      const sharedWorker = mockSharedWorker({
         port: control.port,
         onerror: null
-      }) as unknown as SharedWorker
+      })
       const previousErrorEvent = globalThis.ErrorEvent
-      globalThis.ErrorEvent = TestErrorEvent as typeof ErrorEvent
+      installErrorEvent(TestErrorEvent)
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
-          globalThis.ErrorEvent = previousErrorEvent
+          installErrorEvent(previousErrorEvent)
         })
       )
 
@@ -411,49 +466,44 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
         OwnershipCoordinator.layerTab({
           name: "effect-local-reset-error-callback-test",
           sharedWorker: () => sharedWorker,
-          databaseWorker: () => ({ postMessage() {}, terminate() {} }) as unknown as globalThis.Worker,
+          databaseWorker: () => mockWorker({ postMessage() {}, terminate() {} }),
           onOwnerError: () => {
-            throw new Error("consumer callback failed")
+            return Effect.runSync(Effect.die("consumer callback failed"))
           }
         })
       )
       const spawn = yield* Worker.Spawner.pipe(Effect.provide(context))
-      const rpcPort = spawn(0) as MessagePort
+      const rpcPort = spawn(0)
       let rpcErrors = 0
       rpcPort.addEventListener("error", () => {
         rpcErrors++
       })
 
-      let callbackError: unknown
-      try {
+      const callbackExit = yield* Effect.exit(Effect.sync(() => {
         control.dispatch({
           _tag: "Reattach",
           ownerId: "previous-owner",
           reason: "the database worker health check failed"
         })
-      } catch (error) {
-        callbackError = error
-      }
-
-      if (!(callbackError instanceof Error)) {
-        assert.fail(`expected callback error, received ${String(callbackError)}`)
-      }
-      assert.strictEqual(callbackError.message, "consumer callback failed")
+      }))
+      assert.isTrue(Exit.isFailure(callbackExit))
+      if (Exit.isSuccess(callbackExit)) return
+      assert.include(String(callbackExit.cause), "consumer callback failed")
       assert.strictEqual(rpcErrors, 1)
     }).pipe(Effect.scoped))
 
   it.effect("does not expose RPC defects on the browser global", () =>
     Effect.gen(function*() {
       const control = makeTestControlPort()
-      const sharedWorker = Object.assign(new EventTarget(), {
+      const sharedWorker = mockSharedWorker({
         port: control.port,
         onerror: null
-      }) as unknown as SharedWorker
-      const target = globalThis as typeof globalThis & { __rpcDefects?: Array<unknown> }
-      delete target.__rpcDefects
+      })
+      const defectKey = "__rpcDefects"
+      Reflect.deleteProperty(globalThis, defectKey)
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
-          delete target.__rpcDefects
+          Reflect.deleteProperty(globalThis, defectKey)
         })
       )
 
@@ -461,11 +511,11 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
         OwnershipCoordinator.layerTab({
           name: "effect-local-private-defect-test",
           sharedWorker: () => sharedWorker,
-          databaseWorker: () => ({ postMessage() {}, terminate() {} }) as unknown as globalThis.Worker
+          databaseWorker: () => mockWorker({ postMessage() {}, terminate() {} })
         })
       )
       const spawn = yield* Worker.Spawner.pipe(Effect.provide(context))
-      const rpcPort = spawn(0) as MessagePort
+      const rpcPort = spawn(0)
       rpcPort.dispatchEvent(
         new MessageEvent("message", {
           data: [1, {
@@ -475,7 +525,7 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
         })
       )
 
-      assert.isFalse("__rpcDefects" in target)
+      assert.isFalse(Reflect.has(globalThis, defectKey))
     }).pipe(Effect.scoped))
 
   it.effect("fails a pending client acquisition and retries after provisioning is rejected", () =>
@@ -495,24 +545,24 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
       let nextWorkerId = 0
       const databaseWorker = () => {
         const id = ++nextWorkerId
-        const worker = {
+        const worker = mockWorker({
           postMessage() {},
           terminate() {
             Queue.offerUnsafe(terminated, id)
           }
-        } as unknown as globalThis.Worker
+        })
         Queue.offerUnsafe(created, { id, worker })
         return worker
       }
-      const sharedWorker = Object.assign(new EventTarget(), {
+      const sharedWorker = mockSharedWorker({
         port: control.port1,
         onerror: null
-      }) as unknown as SharedWorker
+      })
       const previousErrorEvent = globalThis.ErrorEvent
-      globalThis.ErrorEvent = TestErrorEvent as typeof ErrorEvent
+      installErrorEvent(TestErrorEvent)
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
-          globalThis.ErrorEvent = previousErrorEvent
+          installErrorEvent(previousErrorEvent)
         })
       )
 
@@ -535,7 +585,7 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
         Queue.take(frames).pipe(
           Effect.filterOrFail(
             (frame): frame is Extract<OwnershipProtocol.PageToOwnerFrame, { readonly _tag: Tag }> => frame._tag === tag,
-            (frame) => new Error(`expected ${tag}, received ${frame._tag}`)
+            (frame) => Error(`expected ${tag}, received ${frame._tag}`)
           )
         )
 
@@ -615,7 +665,7 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
         definition,
         engine: (databasePort) => {
           Deferred.doneUnsafe(factoryCalled, Effect.succeed(databasePort))
-          throw new Error("engine factory failed")
+          return Effect.runSync(Effect.die("engine factory failed"))
         },
         provisionTimeout: "500 millis",
         engineStartTimeout: "5 seconds",
@@ -640,17 +690,19 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
 
   it.effect("re-attaches every served tab after the database worker dies", () =>
     Effect.gen(function*() {
-      const filename = NodePath.join(
-        NodeOs.tmpdir(),
-        `effect-local-ownership-${crypto.randomUUID()}.sqlite`
-      )
+      const fs = yield* FileSystem.FileSystem
+      const directory = yield* fs.makeTempDirectoryScoped()
+      const filename = `${directory}/effect-local-ownership.sqlite`
       const started: Array<StartedEngine> = []
       yield* Effect.gen(function*() {
         const provider = yield* attachTab
         yield* acceptNextProvision(provider)
         yield* takeFrame(provider, "ProvisionAccepted")
         const firstAttached = yield* takeFrame(provider, "Attached")
-        const firstOwnerId = firstAttached._tag === "Attached" ? firstAttached.ownerId : undefined
+        let firstOwnerId: string | undefined
+        if (firstAttached._tag === "Attached") {
+          firstOwnerId = firstAttached.ownerId
+        }
         const firstInfo = attachedInfo(firstAttached)
 
         const secondary = yield* attachTab
@@ -710,12 +762,7 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
         )
       }).pipe(
         Effect.provide(coordinatorLayer(started, filename)),
-        Effect.scoped,
-        Effect.ensuring(Effect.sync(() => {
-          for (const suffix of ["", "-wal", "-shm"]) {
-            NodeFs.rmSync(`${filename}${suffix}`, { force: true })
-          }
-        }))
+        Effect.scoped
       )
     }))
 
@@ -851,7 +898,7 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
       const engine = makeEngineFactory(
         started,
         ":memory:",
-        () => Effect.die(new Error("corrupt replica database"))
+        () => Effect.die("corrupt replica database")
       )
       const Coordinator = OwnershipCoordinator.layerSharedWorker({
         name: "effect-local-ownership-backoff-test",
@@ -870,7 +917,7 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
 
       // MessagePort delivery is a macrotask, so absence assertions must pump the task queue
       // before polling; TestClock adjustments alone never deliver a posted frame.
-      const pumpTasks = Effect.promise(() => new Promise((resolve) => setImmediate(resolve))).pipe(
+      const pumpTasks = pumpMessageTask.pipe(
         Effect.repeat({ times: 4 }),
         Effect.asVoid
       )
@@ -928,7 +975,10 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
       const engine = makeEngineFactory(
         started,
         ":memory:",
-        (attempt) => attempt <= 2 ? Effect.die(new Error("transient start failure")) : Effect.void
+        (attempt) => {
+          if (attempt <= 2) return Effect.die("transient start failure")
+          return Effect.void
+        }
       )
       const Coordinator = OwnershipCoordinator.layerSharedWorker({
         name: "effect-local-ownership-healthy-reset-test",
@@ -992,7 +1042,7 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
       const engine = makeEngineFactory(
         started,
         ":memory:",
-        () => Effect.die(new Error("corrupt replica database"))
+        () => Effect.die("corrupt replica database")
       )
       const Coordinator = OwnershipCoordinator.layerSharedWorker({
         name: "effect-local-ownership-exhaustion-test",
@@ -1005,7 +1055,7 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
         healthCheck: { interval: "100 millis", timeout: "500 millis" },
         provisionRetry: { schedule: Schedule.recurs(0), failureBudget: 5 }
       })
-      const pumpTasks = Effect.promise(() => new Promise((resolve) => setImmediate(resolve))).pipe(
+      const pumpTasks = pumpMessageTask.pipe(
         Effect.repeat({ times: 4 }),
         Effect.asVoid
       )
@@ -1058,12 +1108,14 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
       const engine = makeEngineFactory(
         started,
         ":memory:",
-        (attempt) =>
-          attempt === 1
-            ? Deferred.succeed(firstStartEntered, undefined).pipe(
+        (attempt) => {
+          if (attempt === 1) {
+            return Deferred.succeed(firstStartEntered, undefined).pipe(
               Effect.andThen(Deferred.await(releaseFirstStart))
             )
-            : Effect.void,
+          }
+          return Effect.void
+        },
         (attempt) => released.push(attempt)
       )
       const Coordinator = OwnershipCoordinator.layerSharedWorker({
@@ -1204,7 +1256,7 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
       }).pipe(
         Effect.provide(Coordinator),
         Effect.scoped,
-        Effect.ensuring(Effect.sync(database.close))
+        Effect.ensuring(Effect.sync(() => database.close()))
       )
     }))
 
@@ -1251,7 +1303,7 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
       }).pipe(
         Effect.provide(Coordinator),
         Effect.scoped,
-        Effect.ensuring(Effect.sync(database.close))
+        Effect.ensuring(Effect.sync(() => database.close()))
       )
     }))
 
@@ -1307,7 +1359,7 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
       }).pipe(
         Effect.provide(Coordinator),
         Effect.scoped,
-        Effect.ensuring(Effect.sync(database.close))
+        Effect.ensuring(Effect.sync(() => database.close()))
       )
     }))
 
@@ -1379,10 +1431,16 @@ it.layer(NodeCrypto.layer)("OwnershipCoordinator", (it) => {
           pending.push(task)
           return () => {}
         }
-        const handle = setImmediate(task)
-        return () => clearImmediate(handle)
+        const channel = new MessageChannel()
+        channel.port1.addEventListener("message", task, { once: true })
+        channel.port1.start()
+        channel.port2.postMessage(undefined)
+        return () => {
+          channel.port1.close()
+          channel.port2.close()
+        }
       })
-      const pump = Effect.promise(() => new Promise((resolve) => setImmediate(resolve))).pipe(
+      const pump = pumpMessageTask.pipe(
         Effect.andThen(Effect.sync(() => {
           for (const task of pending.splice(0)) task()
         })),

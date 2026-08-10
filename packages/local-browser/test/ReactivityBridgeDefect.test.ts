@@ -28,16 +28,17 @@ describe("ReplicaAtom reactivity bridge", () => {
         relayConnectionStatus,
         invalidations: Stream.unwrap(Effect.sync(() => {
           subscriptions++
-          return subscriptions < 2
-            ? Stream.fromEffect(Deferred.succeed(died, undefined)).pipe(
-              Stream.flatMap(() => Stream.die(new TypeError("owner defect")))
+          if (subscriptions < 2) {
+            return Stream.fromEffect(Deferred.succeed(died, undefined)).pipe(
+              Stream.flatMap(() => Stream.die("owner defect"))
             )
-            : Stream.make({
-              _tag: "Invalidation" as const,
-              ownerEpoch: "owner",
-              sequence: Identity.CommitSequence.make(1),
-              keys: ["defect-key"]
-            }).pipe(Stream.tap(() => Deferred.succeed(consumed, undefined)))
+          }
+          return Stream.make({
+            _tag: "Invalidation",
+            ownerEpoch: "owner",
+            sequence: Identity.CommitSequence.make(1),
+            keys: ["defect-key"]
+          }).pipe(Stream.tap(() => Deferred.succeed(consumed, undefined)))
         }))
       }
       yield* Effect.scoped(

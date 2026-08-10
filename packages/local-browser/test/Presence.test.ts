@@ -1,5 +1,5 @@
 import { NodeCrypto } from "@effect/platform-node"
-import { assert, it } from "@effect/vitest"
+import { assert, it as layeredIt } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Clock from "effect/Clock"
 import * as Deferred from "effect/Deferred"
@@ -12,7 +12,7 @@ import * as Scope from "effect/Scope"
 import * as TestClock from "effect/testing/TestClock"
 import * as Presence from "../src/Presence.js"
 
-it.layer(NodeCrypto.layer)("Presence", (it) => {
+layeredIt.layer(NodeCrypto.layer)("Presence", (it) => {
   const Payload = Schema.Struct({ cursor: Schema.Number, status: Schema.Literals(["active", "idle"]) })
 
   interface Gate {
@@ -42,12 +42,11 @@ it.layer(NodeCrypto.layer)("Presence", (it) => {
     Payload.pipe(Schema.decode({
       decode: SchemaGetter.transformOrFail((value: typeof Payload.Type) => {
         const found = gates.find(([cursor]) => cursor === value.cursor)
-        return found === undefined
-          ? Effect.succeed(value)
-          : Deferred.succeed(found[1].started, undefined).pipe(
-            Effect.andThen(Deferred.await(found[1].release)),
-            Effect.as(value)
-          )
+        if (found === undefined) return Effect.succeed(value)
+        return Deferred.succeed(found[1].started, undefined).pipe(
+          Effect.andThen(Deferred.await(found[1].release)),
+          Effect.as(value)
+        )
       }),
       encode: SchemaGetter.passthrough()
     }))
@@ -87,7 +86,7 @@ it.layer(NodeCrypto.layer)("Presence", (it) => {
       assert.strictEqual(entries.length, 1)
       assert.deepStrictEqual(entries[0]?.value, { cursor: 2, status: "idle" })
       assert.strictEqual(entries[0]?.identity, "transport-peer")
-      assert.isFalse("userId" in entries[0]!)
+      assert.isFalse("userId" in entries[0])
     }))
 
   it.effect("removes received state explicitly and treats repeated removal as a no-op", () =>
@@ -184,18 +183,18 @@ it.layer(NodeCrypto.layer)("Presence", (it) => {
       yield* TestClock.adjust("600 millis")
       // `it.layer` shares one TestClock across the block, so derive the deadline instead of hardcoding it.
       const expiresAtMillis = (yield* Clock.currentTimeMillis) + 1_000
-      yield* presence.receive(peerIds[1]!, { cursor: 11, status: "idle" })
-      yield* presence.receive(peerIds[3]!, { cursor: 33, status: "idle" })
+      yield* presence.receive(peerIds[1], { cursor: 11, status: "idle" })
+      yield* presence.receive(peerIds[3], { cursor: 33, status: "idle" })
       yield* TestClock.adjust("500 millis")
       const survivors = [
         {
-          peerId: peerIds[1]!,
+          peerId: peerIds[1],
           value: { cursor: 11, status: "idle" },
           expiresAtMillis,
           identity: "transport-peer"
         },
         {
-          peerId: peerIds[3]!,
+          peerId: peerIds[3],
           value: { cursor: 33, status: "idle" },
           expiresAtMillis,
           identity: "transport-peer"
@@ -274,7 +273,10 @@ it.layer(NodeCrypto.layer)("Presence", (it) => {
           const presence = yield* Presence.make(gatedOn([[1, gate]]), { timeToLive: "1 second" })
           const peerId = yield* Identity.makePeerId
           const scope = yield* Scope.make()
-          const read = (point: number) => readPoints.includes(point) ? Effect.asVoid(presence.values) : Effect.void
+          const read = (point: number) => {
+            if (readPoints.includes(point)) return Effect.asVoid(presence.values)
+            return Effect.void
+          }
           yield* Scope.provide(presence.publish(peerId, { cursor: 0, status: "active" }), scope)
           yield* read(0)
           yield* TestClock.adjust("2 seconds")

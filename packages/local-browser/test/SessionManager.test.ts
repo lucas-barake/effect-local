@@ -1,5 +1,5 @@
 import { NodeCrypto } from "@effect/platform-node"
-import { assert, it } from "@effect/vitest"
+import { assert, it as layeredIt } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Deferred from "effect/Deferred"
@@ -10,7 +10,7 @@ import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
 import * as SessionManager from "../src/SessionManager.js"
 
-it.layer(NodeCrypto.layer)("SessionManager", (it) => {
+layeredIt.layer(NodeCrypto.layer)("SessionManager", (it) => {
   const clientId = 1
   const limits = {
     maxBackupBytes: 1024,
@@ -145,12 +145,14 @@ it.layer(NodeCrypto.layer)("SessionManager", (it) => {
         assert.isAtMost(outcome.observedForSession, sessions.maxRestoresPerSession)
       }
 
-      const successes = outcomes.flatMap((outcome) =>
-        Result.isSuccess(outcome.result)
-          ? [{ sessionId: outcome.sessionId, lease: outcome.result.success }]
-          : []
-      )
-      const failures = outcomes.flatMap((outcome) => Result.isFailure(outcome.result) ? [outcome.result.failure] : [])
+      const successes = outcomes.flatMap((outcome) => {
+        if (Result.isSuccess(outcome.result)) return [{ sessionId: outcome.sessionId, lease: outcome.result.success }]
+        return []
+      })
+      const failures = outcomes.flatMap((outcome) => {
+        if (Result.isFailure(outcome.result)) return [outcome.result.failure]
+        return []
+      })
       assert.strictEqual(successes.length, sessions.effectiveRestoreCapacity)
       assert.strictEqual(failures.length, attempts.length - sessions.effectiveRestoreCapacity)
       for (const error of failures) {

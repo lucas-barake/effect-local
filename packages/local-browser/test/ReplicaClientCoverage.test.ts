@@ -1,5 +1,5 @@
 import { NodeCrypto } from "@effect/platform-node"
-import { assert, it } from "@effect/vitest"
+import { assert, it as layeredIt } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
@@ -26,7 +26,7 @@ import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
 import { definition, DeliveryPublisher, documentId, PeerRelayRuntime, replica, Task } from "./fixtures.js"
 
-it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
+layeredIt.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
   const limits = {
     maxBackupBytes: 1024,
     maxChunkBytes: 128,
@@ -103,7 +103,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
   it.effect("recovers the status stream after a transient failure and surfaces a degraded status", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-      const ready = { _tag: "Ready" as const, pendingCommands: 0 }
+      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
       let statusCalls = 0
       let activeStatus = 0
       let concurrentStatus = 0
@@ -120,13 +120,14 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
               return Stream.unwrap(
                 Queue.offer(attempts, attempt).pipe(
                   Effect.as(
-                    (attempt === 1
-                      ? Stream.make(ready).pipe(Stream.concat(Stream.fail(disconnected())))
-                      : Stream.make(ready).pipe(Stream.concat(Stream.never))).pipe(
-                        Stream.ensuring(Effect.sync(() => {
-                          activeStatus--
-                        }))
-                      )
+                    (() => {
+                      if (attempt === 1) return Stream.make(ready).pipe(Stream.concat(Stream.fail(disconnected())))
+                      return Stream.make(ready).pipe(Stream.concat(Stream.never))
+                    })().pipe(
+                      Stream.ensuring(Effect.sync(() => {
+                        activeStatus--
+                      }))
+                    )
                   )
                 )
               )
@@ -152,7 +153,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
   it.effect("spaces repeated transient status failures and reuses the session", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-      const ready = { _tag: "Ready" as const, pendingCommands: 0 }
+      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
       const queued = new ReplicaError.ReplicaError({
         reason: new ReplicaError.QuotaExceeded({ resource: "queued RPCs", limit: 4 })
       })
@@ -181,13 +182,12 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
               const stream: Stream.Stream<
                 ReplicaStatus.ReplicaStatus,
                 ReplicaError.ReplicaError | RpcClientError.RpcClientError
-              > = attempt === 1
-                ? Stream.fail(disconnected())
-                : attempt === 2
-                ? Stream.fail(unavailable)
-                : attempt === 3
-                ? Stream.fail(queued)
-                : Stream.make(ready).pipe(Stream.concat(Stream.never))
+              > = (() => {
+                if (attempt === 1) return Stream.fail(disconnected())
+                if (attempt === 2) return Stream.fail(unavailable)
+                if (attempt === 3) return Stream.fail(queued)
+                return Stream.make(ready).pipe(Stream.concat(Stream.never))
+              })()
               return Stream.unwrap(
                 Queue.offer(attempts, attempt).pipe(
                   Effect.as(
@@ -235,7 +235,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
   it.effect("retries an HTTP transport failure and recovers status", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-      const ready = { _tag: "Ready" as const, pendingCommands: 0 }
+      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
       const transport = new RpcClientError.RpcClientError({
         reason: new HttpClientError.HttpClientErrorSchema({
           _tag: "HttpError",
@@ -249,7 +249,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
           if (property !== "Status") return Reflect.get(target, property, receiver)
           return () => {
             statusCalls++
-            return statusCalls === 1 ? Stream.fail(transport) : Stream.make(ready)
+            if (statusCalls === 1) return Stream.fail(transport)
+            return Stream.make(ready)
           }
         }
       })
@@ -280,7 +281,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
           if (property !== "Status") return Reflect.get(target, property, receiver)
           return () => {
             statusCalls++
-            return statusCalls === 1 ? Stream.fail(decode) : Stream.fail(protocolMismatch("unexpected retry"))
+            if (statusCalls === 1) return Stream.fail(decode)
+            return Stream.fail(protocolMismatch("unexpected retry"))
           }
         }
       })
@@ -336,7 +338,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
   it.effect("reopens the session when status reports a protocol mismatch before emitting", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-      const ready = { _tag: "Ready" as const, pendingCommands: 0 }
+      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
       const opened: Array<Identity.SessionId> = []
       const observed: Array<Identity.SessionId> = []
       const replacing = new Proxy(rpc, {
@@ -351,7 +353,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
           if (property === "Status") {
             return (payload: { readonly sessionId: Identity.SessionId }) => {
               observed.push(payload.sessionId)
-              return observed.length === 1 ? Stream.fail(protocolMismatch("owner restarted")) : Stream.make(ready)
+              if (observed.length === 1) return Stream.fail(protocolMismatch("owner restarted"))
+              return Stream.make(ready)
             }
           }
           return value
@@ -369,7 +372,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
   it.effect("counts statuses emitted by a replacement before a later mismatch", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
-      const ready = { _tag: "Ready" as const, pendingCommands: 0 }
+      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
       let openSessions = 0
       let statusCalls = 0
       const attempts = yield* Queue.unbounded<number>()
@@ -389,13 +392,12 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
               const stream: Stream.Stream<
                 ReplicaStatus.ReplicaStatus,
                 ReplicaError.ReplicaError | RpcClientError.RpcClientError
-              > = attempt === 1
-                ? Stream.fail(protocolMismatch("initial mismatch"))
-                : attempt === 2
-                ? Stream.make(ready).pipe(Stream.concat(Stream.fail(disconnected())))
-                : Stream.fail(
-                  protocolMismatch(attempt === 3 ? "mismatch after recovery" : "replacement incorrectly resumed")
-                )
+              > = (() => {
+                if (attempt === 1) return Stream.fail(protocolMismatch("initial mismatch"))
+                if (attempt === 2) return Stream.make(ready).pipe(Stream.concat(Stream.fail(disconnected())))
+                if (attempt === 3) return Stream.fail(protocolMismatch("mismatch after recovery"))
+                return Stream.fail(protocolMismatch("replacement incorrectly resumed"))
+              })()
               return Stream.unwrap(
                 Queue.offer(attempts, attempt).pipe(
                   Effect.as(stream)
@@ -441,13 +443,14 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
           if (property === "OpenSession") {
             return (payload: never) => {
               openSessions++
-              return openSessions === 3
-                ? Effect.fail(
+              if (openSessions === 3) {
+                return Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.QuotaExceeded({ resource: "unexpected replacement", limit: 1 })
                   })
                 )
-                : value(payload)
+              }
+              return value(payload)
             }
           }
           if (property === "Status") {
@@ -472,7 +475,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
       const sessions = yield* SessionManager.SessionManager
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       const ambiguousOpen = yield* Deferred.make<void>()
-      const ready = { _tag: "Ready" as const, pendingCommands: 0 }
+      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
       const opened: Array<Identity.SessionId> = []
       const observed: Array<Identity.SessionId> = []
       let candidateCleanupFailed = false
@@ -503,9 +506,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
           if (property === "Status") {
             return (payload: { readonly sessionId: Identity.SessionId }) => {
               observed.push(payload.sessionId)
-              return payload.sessionId === opened[0]
-                ? Stream.fail(protocolMismatch("owner restarted"))
-                : Stream.make(ready)
+              if (payload.sessionId === opened[0]) return Stream.fail(protocolMismatch("owner restarted"))
+              return Stream.make(ready)
             }
           }
           return value
@@ -559,10 +561,10 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
           }
           if (property === "Status") return () => Stream.fail(protocolMismatch("owner restarted"))
           if (property === "Get") {
-            return (payload: { readonly sessionId: Identity.SessionId }) =>
-              payload.sessionId === opened[0]
-                ? Effect.fail(protocolMismatch("owner restarted"))
-                : value(payload)
+            return (payload: { readonly sessionId: Identity.SessionId }) => {
+              if (payload.sessionId === opened[0]) return Effect.fail(protocolMismatch("owner restarted"))
+              return value(payload)
+            }
           }
           return value
         }
@@ -585,7 +587,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
       const staleGetStarted = yield* Deferred.make<void>()
       const releaseStaleGet = yield* Deferred.make<void>()
       const ambiguousOpen = yield* Deferred.make<void>()
-      const ready = { _tag: "Ready" as const, pendingCommands: 0 }
+      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
       const opened: Array<Identity.SessionId> = []
       let candidateCleanupFailed = false
       const replacing = new Proxy(rpc, {
@@ -613,25 +615,27 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
             }
           }
           if (property === "Get") {
-            return (payload: { readonly sessionId: Identity.SessionId }) =>
-              payload.sessionId === opened[0]
-                ? Deferred.succeed(staleGetStarted, undefined).pipe(
+            return (payload: { readonly sessionId: Identity.SessionId }) => {
+              if (payload.sessionId === opened[0]) {
+                return Deferred.succeed(staleGetStarted, undefined).pipe(
                   Effect.andThen(Deferred.await(releaseStaleGet)),
                   Effect.andThen(Effect.fail(protocolMismatch("older stale session")))
                 )
-                : value(payload)
+              }
+              return value(payload)
+            }
           }
           if (property === "Flush") {
-            return (payload: { readonly sessionId: Identity.SessionId }) =>
-              payload.sessionId === opened[0]
-                ? Effect.fail(protocolMismatch("owner restarted"))
-                : value(payload)
+            return (payload: { readonly sessionId: Identity.SessionId }) => {
+              if (payload.sessionId === opened[0]) return Effect.fail(protocolMismatch("owner restarted"))
+              return value(payload)
+            }
           }
           if (property === "Status") {
-            return (payload: { readonly sessionId: Identity.SessionId }) =>
-              payload.sessionId === opened[1]
-                ? Stream.fail(protocolMismatch("owner restarted again"))
-                : Stream.make(ready)
+            return (payload: { readonly sessionId: Identity.SessionId }) => {
+              if (payload.sessionId === opened[1]) return Stream.fail(protocolMismatch("owner restarted again"))
+              return Stream.make(ready)
+            }
           }
           return value
         }
@@ -671,12 +675,13 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
           if (property === "OpenSession") {
             return (payload: never) => {
               openSessions++
-              return openSessions === 2
-                ? Deferred.succeed(firstReplacementStarted, undefined).pipe(
+              if (openSessions === 2) {
+                return Deferred.succeed(firstReplacementStarted, undefined).pipe(
                   Effect.andThen(Deferred.await(releaseFirstReplacement)),
                   Effect.andThen(Effect.fail(disconnected()))
                 )
-                : value(payload)
+              }
+              return value(payload)
             }
           }
           if (property === "Status") {
@@ -725,7 +730,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
           if (property !== "Status") return Reflect.get(target, property, receiver)
           return () => {
             statusCalls++
-            return statusCalls === 1 ? Stream.fail(defect) : Stream.fail(protocolMismatch("unexpected retry"))
+            if (statusCalls === 1) return Stream.fail(defect)
+            return Stream.fail(protocolMismatch("unexpected retry"))
           }
         }
       })
@@ -756,7 +762,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
           if (property !== "Status") return Reflect.get(target, property, receiver)
           return () => {
             statusCalls++
-            return statusCalls === 1 ? Stream.fail(quota) : Stream.fail(protocolMismatch("unexpected retry"))
+            if (statusCalls === 1) return Stream.fail(quota)
+            return Stream.fail(protocolMismatch("unexpected retry"))
           }
         }
       })
@@ -785,7 +792,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
           return ({ ownerEpoch }: { readonly ownerEpoch: string }) =>
             Stream.make(
               {
-                _tag: "InvalidationsReady" as const,
+                _tag: "InvalidationsReady" satisfies "InvalidationsReady",
                 ownerEpoch,
                 watermark: Identity.CommitSequence.make(0),
                 refreshGeneration: 0,
@@ -793,19 +800,19 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
                 deliveryRefreshEpoch: 0
               },
               {
-                _tag: "Invalidation" as const,
+                _tag: "Invalidation" satisfies "Invalidation",
                 ownerEpoch,
                 sequence: Identity.CommitSequence.make(1),
                 keys: [Task.name]
               },
               {
-                _tag: "Invalidation" as const,
+                _tag: "Invalidation" satisfies "Invalidation",
                 ownerEpoch,
                 sequence: Identity.CommitSequence.make(1),
                 keys: [Task.name]
               },
               {
-                _tag: "Invalidation" as const,
+                _tag: "Invalidation" satisfies "Invalidation",
                 ownerEpoch,
                 sequence: Identity.CommitSequence.make(2),
                 keys: [Task.name]
@@ -835,7 +842,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       let statusCalls = 0
       let openSessions = 0
-      const ready = { _tag: "Ready" as const, pendingCommands: 0 }
+      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
       const flaky = new Proxy(rpc, {
         get(target, property, receiver) {
           const value = Reflect.get(target, property, receiver)
@@ -848,9 +855,10 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
           if (property === "Status") {
             return () => {
               statusCalls++
-              return statusCalls === 1
-                ? Stream.make(ready).pipe(Stream.concat(Stream.fail(protocolMismatch("owner restarted"))))
-                : Stream.make(ready)
+              if (statusCalls === 1) {
+                return Stream.make(ready).pipe(Stream.concat(Stream.fail(protocolMismatch("owner restarted"))))
+              }
+              return Stream.make(ready)
             }
           }
           return value
@@ -872,7 +880,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       const replacementFailed = yield* Deferred.make<void>()
-      const ready = { _tag: "Ready" as const, pendingCommands: 0 }
+      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
       let openSessions = 0
       let statusCalls = 0
       const flaky = new Proxy(rpc, {
@@ -881,11 +889,12 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
           if (property === "OpenSession") {
             return (payload: never) => {
               openSessions++
-              return openSessions === 2
-                ? Deferred.succeed(replacementFailed, undefined).pipe(
+              if (openSessions === 2) {
+                return Deferred.succeed(replacementFailed, undefined).pipe(
                   Effect.andThen(Effect.fail(disconnected()))
                 )
-                : value(payload)
+              }
+              return value(payload)
             }
           }
           if (property === "Status") {
@@ -894,9 +903,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
               if (statusCalls === 1) {
                 return Stream.make(ready).pipe(Stream.concat(Stream.fail(protocolMismatch("owner restarted"))))
               }
-              return Stream.fail(
-                protocolMismatch(statusCalls === 2 ? "owner restarted" : "replacement incorrectly resumed")
-              )
+              if (statusCalls === 2) return Stream.fail(protocolMismatch("owner restarted"))
+              return Stream.fail(protocolMismatch("replacement incorrectly resumed"))
             }
           }
           return value
@@ -926,7 +934,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       const firstReplacementFailed = yield* Deferred.make<void>()
-      const ready = { _tag: "Ready" as const, pendingCommands: 0 }
+      const ready = { _tag: "Ready" satisfies "Ready", pendingCommands: 0 }
       let openSessions = 0
       let statusCalls = 0
       const replacing = new Proxy(rpc, {
@@ -935,11 +943,12 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
           if (property === "OpenSession") {
             return (payload: never) => {
               openSessions++
-              return openSessions === 2
-                ? Deferred.succeed(firstReplacementFailed, undefined).pipe(
+              if (openSessions === 2) {
+                return Deferred.succeed(firstReplacementFailed, undefined).pipe(
                   Effect.andThen(Effect.fail(disconnected()))
                 )
-                : value(payload)
+              }
+              return value(payload)
             }
           }
           if (property === "Status") {
@@ -995,7 +1004,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
           if (property === "RenewSession") {
             return (payload: never) => {
               renewals++
-              return renewals === 1 ? Effect.fail(protocolMismatch("lease expired")) : value(payload)
+              if (renewals === 1) return Effect.fail(protocolMismatch("lease expired"))
+              return value(payload)
             }
           }
           return value
@@ -1055,7 +1065,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient coverage", (it) => {
           if (property === "Invalidations") {
             return ({ ownerEpoch }: { readonly ownerEpoch: string }) =>
               Stream.make({
-                _tag: "InvalidationsReady" as const,
+                _tag: "InvalidationsReady" satisfies "InvalidationsReady",
                 ownerEpoch,
                 watermark: Identity.CommitSequence.make(0),
                 refreshGeneration: 0,

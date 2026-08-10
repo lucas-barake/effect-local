@@ -3,6 +3,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import { assert, describe, it } from "vitest"
+import * as Presence from "../src/Presence.js"
 
 // Per-update cost must not grow with the number of tracked peers. Timing that is too noisy to assert, so
 // this counts the peer map operations a fixed churn performs instead, which is exact and machine
@@ -18,7 +19,7 @@ let operations = 0
 class CountingMap<K, V,> extends NativeMap<K, V> {
   override set(key: K, value: V): this {
     if (counting) operations++
-    return super.set(key, value) as this
+    return super.set(key, value)
   }
   override delete(key: K): boolean {
     if (counting) operations++
@@ -31,7 +32,7 @@ class CountingMap<K, V,> extends NativeMap<K, V> {
   // `new Map(current)` copies by iterating the source, so this is what makes a full-map clone visible.
   override [Symbol.iterator](): MapIterator<[K, V]> {
     const inner = super[Symbol.iterator]()
-    return {
+    const iterator: MapIterator<[K, V]> = {
       [Symbol.iterator]() {
         return this
       },
@@ -39,11 +40,10 @@ class CountingMap<K, V,> extends NativeMap<K, V> {
         if (counting) operations++
         return inner.next()
       }
-    } as MapIterator<[K, V]>
+    }
+    return iterator
   }
 }
-
-const Presence = await import("../src/Presence.js")
 
 const Payload = Schema.Struct({ cursor: Schema.Number })
 const writes = 200
@@ -64,10 +64,10 @@ const seed = (residents: number) =>
       }
     })
   })
-;(globalThis as { Map: unknown }).Map = CountingMap
+Reflect.set(globalThis, "Map", CountingMap)
 
 const mapOperationsForChurn = Effect.gen(function*() {
-  const churns = yield* Effect.forEach([250, 4_000] as const, seed)
+  const churns = yield* Effect.forEach([250, 4_000], seed)
   const counted: Array<number> = []
   for (const churn of churns) {
     yield* churn
@@ -81,14 +81,15 @@ const mapOperationsForChurn = Effect.gen(function*() {
 }).pipe(Effect.provide(NodeCrypto.layer))
 
 describe("Presence write cost", () => {
-  it("keeps peer map work per write independent of the resident peer count", async () => {
-    const [small, large] = await Effect.runPromise(mapOperationsForChurn)
-    // Guards against the counter silently observing nothing, which would make the equality vacuous.
-    assert.isAbove(small!, 0)
-    assert.strictEqual(
-      large,
-      small,
-      `growing residents 250 -> 4000 changed peer map work for ${writes} writes: ${small} -> ${large}`
-    )
-  })
+  it("keeps peer map work per write independent of the resident peer count", () =>
+    Effect.runPromise(Effect.gen(function*() {
+      const [small, large] = yield* mapOperationsForChurn
+      // Guards against the counter silently observing nothing, which would make the equality vacuous.
+      assert.isAbove(small, 0)
+      assert.strictEqual(
+        large,
+        small,
+        `growing residents 250 -> 4000 changed peer map work for ${writes} writes: ${small} -> ${large}`
+      )
+    })))
 })

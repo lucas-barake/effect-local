@@ -2,7 +2,7 @@ import * as BrowserWorker from "@effect/platform-browser/BrowserWorker"
 import * as BrowserWorkerRunner from "@effect/platform-browser/BrowserWorkerRunner"
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
-import { assert, it } from "@effect/vitest"
+import { assert, it as layeredIt } from "@effect/vitest"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
@@ -60,7 +60,7 @@ const limits = {
   maxRestoreErrorBytes: 4_096
 } satisfies ReplicaLimits.Values
 
-it.layer(NodeCrypto.layer)("ReplicaOwner defect isolation", (it) => {
+layeredIt.layer(NodeCrypto.layer)("ReplicaOwner defect isolation", (it) => {
   it.effect("answers a handler defect without tearing down the session", () =>
     Effect.gen(function*() {
       const invalidationsSubscribed = yield* Deferred.make<void>()
@@ -81,9 +81,8 @@ it.layer(NodeCrypto.layer)("ReplicaOwner defect isolation", (it) => {
           Read.toLayer((payload) =>
             Effect.suspend(() => {
               queryCalls++
-              return queryCalls === 1
-                ? Effect.die(new TypeError("poisoned query"))
-                : Effect.succeed([{ title: payload }])
+              if (queryCalls === 1) return Effect.die("poisoned query")
+              return Effect.succeed([{ title: payload }])
             })
           )
         )),
@@ -110,13 +109,11 @@ it.layer(NodeCrypto.layer)("ReplicaOwner defect isolation", (it) => {
           sessionId,
           ownerEpoch: session.ownerEpoch
         }).pipe(
-          Stream.tap((event) =>
-            event._tag === "InvalidationsReady"
-              ? Deferred.succeed(invalidationsSubscribed, undefined)
-              : event._tag === "Invalidation"
-              ? Deferred.succeed(invalidationReceived, undefined)
-              : Effect.void
-          ),
+          Stream.tap((event) => {
+            if (event._tag === "InvalidationsReady") return Deferred.succeed(invalidationsSubscribed, undefined)
+            if (event._tag === "Invalidation") return Deferred.succeed(invalidationReceived, undefined)
+            return Effect.void
+          }),
           Stream.runDrain,
           Effect.forkChild
         )

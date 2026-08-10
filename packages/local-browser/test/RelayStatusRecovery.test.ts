@@ -1,5 +1,5 @@
 import { NodeCrypto } from "@effect/platform-node"
-import { assert, it } from "@effect/vitest"
+import { assert, it as layeredIt } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
@@ -105,7 +105,7 @@ const workerReceiveError = () =>
     })
   })
 
-it.layer(NodeCrypto.layer)("relay status recovery", (it) => {
+layeredIt.layer(NodeCrypto.layer)("relay status recovery", (it) => {
   it.effect("resubscribes the relay status stream after a transient transport loss", () =>
     Effect.scoped(Effect.gen(function*() {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
@@ -117,8 +117,8 @@ it.layer(NodeCrypto.layer)("relay status recovery", (it) => {
           return (payload: never) =>
             Stream.unwrap(Effect.sync((): RelayStatusStream => {
               subscriptions++
-              return subscriptions === 1
-                ? Stream.make(RelayConnectionStatus.connected).pipe(
+              if (subscriptions === 1) {
+                return Stream.make(RelayConnectionStatus.connected).pipe(
                   Stream.concat(
                     Stream.fromEffect(
                       Deferred.succeed(transportFailed, undefined).pipe(
@@ -127,7 +127,8 @@ it.layer(NodeCrypto.layer)("relay status recovery", (it) => {
                     )
                   )
                 )
-                : target.RelayConnectionStatus(payload)
+              }
+              return target.RelayConnectionStatus(payload)
             }))
         }
       })
@@ -168,8 +169,8 @@ it.layer(NodeCrypto.layer)("relay status recovery", (it) => {
               ReplicaError.ReplicaError | RpcClientError.RpcClientError
             > => {
               subscriptions++
-              return subscriptions === 1
-                ? Stream.make(PeerConnectionStatus.connected).pipe(
+              if (subscriptions === 1) {
+                return Stream.make(PeerConnectionStatus.connected).pipe(
                   Stream.concat(
                     Stream.fromEffect(
                       Deferred.succeed(transportFailed, undefined).pipe(
@@ -178,7 +179,8 @@ it.layer(NodeCrypto.layer)("relay status recovery", (it) => {
                     )
                   )
                 )
-                : target.PeerConnectionStatus(payload)
+              }
+              return target.PeerConnectionStatus(payload)
             }))
         }
       })

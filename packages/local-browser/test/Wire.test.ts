@@ -1,11 +1,12 @@
 import { NodeCrypto } from "@effect/platform-node"
-import { assert, it } from "@effect/vitest"
+import { assert, it as layeredIt } from "@effect/vitest"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Schema from "effect/Schema"
+import * as SchemaTransformation from "effect/SchemaTransformation"
 import * as Wire from "../src/internal/wire.js"
 
 const conflictLimits: Wire.ConflictLimits = {
@@ -16,7 +17,11 @@ const conflictLimits: Wire.ConflictLimits = {
   maxConflictValueBytes: 4_096
 }
 
-it.layer(NodeCrypto.layer)("browser wire", (it) => {
+const JsonText = Schema.String.pipe(
+  Schema.decodeTo(Schema.Unknown, SchemaTransformation.fromJsonString())
+)
+
+layeredIt.layer(NodeCrypto.layer)("browser wire", (it) => {
   it.effect("represents void outcomes as JSON null", () =>
     Effect.gen(function*() {
       const commandId = yield* Identity.makeCommandId
@@ -199,12 +204,15 @@ it.layer(NodeCrypto.layer)("browser wire", (it) => {
       const hostile = new Proxy(resolution, {
         getOwnPropertyDescriptor(target, property) {
           const descriptor = Reflect.getOwnPropertyDescriptor(target, property)
-          return property === "choice" &&
-              !semanticPhase &&
-              descriptor !== undefined &&
-              "value" in descriptor
-            ? { ...descriptor, value: { _tag: "ReplaceValue", value: "x".repeat(512) } }
-            : descriptor
+          if (
+            property === "choice" &&
+            !semanticPhase &&
+            descriptor !== undefined &&
+            "value" in descriptor
+          ) {
+            return { ...descriptor, value: { _tag: "ReplaceValue", value: "x".repeat(512) } }
+          }
+          return descriptor
         }
       })
       const preflight: Wire.ConflictPreflight<Conflict.Resolution> = (value, currentLimits) => {
@@ -240,7 +248,7 @@ it.layer(NodeCrypto.layer)("browser wire", (it) => {
         choice: { _tag: "ReplaceValue", value: Number.NaN }
       }
       const exit = yield* Effect.exit(
-        Wire.encodeConflict(Conflict.Resolution, invalid as never, conflictLimits)
+        Wire.encodeConflict(Conflict.Resolution, invalid, conflictLimits)
       )
 
       assert(Exit.isFailure(exit))
@@ -253,7 +261,7 @@ it.layer(NodeCrypto.layer)("browser wire", (it) => {
   it.effect("rejects deeply nested inspection JSON as a typed protocol mismatch", () =>
     Effect.gen(function*() {
       const nested = `${"{\"value\":".repeat(12_000)}null${"}".repeat(12_000)}`
-      const encoded = JSON.stringify({
+      const encoded = Schema.encodeSync(JsonText)({
         snapshot: {
           documentId: "doc_00000000-0000-4000-8000-000000000001",
           value: "__nested__",
@@ -282,9 +290,11 @@ it.layer(NodeCrypto.layer)("browser wire", (it) => {
 
   it.effect("rejects deeply nested inspection encoding as a typed protocol mismatch", () =>
     Effect.gen(function*() {
-      const deeplyNested = JSON.parse(
-        `${"{\"value\":".repeat(12_000)}null${"}".repeat(12_000)}`
-      ) as Schema.Json
+      const deeplyNested = Schema.decodeUnknownSync(Schema.Json)(
+        Schema.decodeSync(JsonText)(
+          `${"{\"value\":".repeat(12_000)}null${"}".repeat(12_000)}`
+        )
+      )
       const inspection: Conflict.Inspection<Schema.Json> = {
         snapshot: {
           documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001"),
@@ -300,12 +310,15 @@ it.layer(NodeCrypto.layer)("browser wire", (it) => {
       const hostile = new Proxy(inspection, {
         getOwnPropertyDescriptor(target, property) {
           const descriptor = Reflect.getOwnPropertyDescriptor(target, property)
-          return property === "snapshot" &&
-              !semanticPhase &&
-              descriptor !== undefined &&
-              "value" in descriptor
-            ? { ...descriptor, value: { ...descriptor.value, value: deeplyNested } }
-            : descriptor
+          if (
+            property === "snapshot" &&
+            !semanticPhase &&
+            descriptor !== undefined &&
+            "value" in descriptor
+          ) {
+            return { ...descriptor, value: { ...descriptor.value, value: deeplyNested } }
+          }
+          return descriptor
         }
       })
       const preflight: Wire.ConflictPreflight<Conflict.Inspection<Schema.Json>> = (value, limits) => {
@@ -332,9 +345,11 @@ it.layer(NodeCrypto.layer)("browser wire", (it) => {
 
   it.effect("encodes a stable descriptor snapshot instead of rereading hostile values", () =>
     Effect.gen(function*() {
-      const deeplyNested = JSON.parse(
-        `${"{\"value\":".repeat(12_000)}null${"}".repeat(12_000)}`
-      ) as Schema.Json
+      const deeplyNested = Schema.decodeUnknownSync(Schema.Json)(
+        Schema.decodeSync(JsonText)(
+          `${"{\"value\":".repeat(12_000)}null${"}".repeat(12_000)}`
+        )
+      )
       let phase: "Semantic" | "Snapshot" | "Schema" = "Semantic"
       const statefulValue = new Proxy({ value: Number.NaN }, {
         get(target, property, receiver) {
@@ -383,7 +398,7 @@ it.layer(NodeCrypto.layer)("browser wire", (it) => {
   it.effect("bounds wide container inspection by the remaining node budget", () =>
     Effect.gen(function*() {
       let arrayDescriptorReads = 0
-      const wideArray = new Proxy(Array.from({ length: 100_000 }, () => null as unknown), {
+      const wideArray = new Proxy(Array.from({ length: 100_000 }, () => null), {
         getOwnPropertyDescriptor(target, property) {
           arrayDescriptorReads++
           return Reflect.getOwnPropertyDescriptor(target, property)

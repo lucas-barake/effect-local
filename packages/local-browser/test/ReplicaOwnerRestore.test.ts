@@ -1,5 +1,5 @@
 import { NodeCrypto } from "@effect/platform-node"
-import { assert, it } from "@effect/vitest"
+import { assert, it as layeredIt } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
@@ -24,7 +24,7 @@ import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
 import { definition, DeliveryPublisher, PeerRelayRuntime, replica } from "./fixtures.js"
 
-it.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
+layeredIt.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
   const limits = {
     maxBackupBytes: 1024,
     maxChunkBytes: 128,
@@ -94,7 +94,7 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
       ))
     )
   const restoreOptions = {
-    mode: "replace" as const,
+    mode: "replace" satisfies "replace",
     maxBytes: limits.maxBackupBytes,
     expectedDefinitionHash: definition.hash,
     installationId: Identity.BackupInstallationId.make("bak_43c8d2f4-58ce-4c9a-9155-9d21019f5e9d")
@@ -105,7 +105,10 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
     headers: Headers.empty
   })
   const unary = <A, E, R,>(effect: Effect.Effect<A | Deferred.Deferred<A, E>, E, R>) =>
-    Effect.flatMap(effect, (value) => Deferred.isDeferred<A, E>(value) ? Deferred.await(value) : Effect.succeed(value))
+    Effect.flatMap(effect, (value) => {
+      if (Deferred.isDeferred<A, E>(value)) return Deferred.await(value)
+      return Effect.succeed(value)
+    })
 
   it.effect("advertises the configured restore and conflict limits", () =>
     Effect.scoped(Effect.gen(function*() {
@@ -148,13 +151,13 @@ it.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
         enumerable: true,
         get() {
           chunksRead = true
-          throw new Error("legacy chunks were read")
+          return Effect.runSync(Effect.die("legacy chunks were read"))
         }
       })
 
       const restoreRpc = ReplicaRpc.group.requests.get("RestoreBackup")
       if (restoreRpc?._tag !== "RestoreBackup") {
-        return yield* Effect.die(new Error("RestoreBackup RPC not found"))
+        yield* Effect.die("RestoreBackup RPC not found")
       }
       assert.deepStrictEqual(
         yield* Schema.decodeUnknownEffect(restoreRpc.payloadSchema)(payload),

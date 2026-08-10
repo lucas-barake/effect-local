@@ -37,8 +37,8 @@ describe("public browser API types", () => {
     type OwnerRequirements = ReturnType<typeof ReplicaOwner.layerHandlers> extends
       Layer.Layer<infer _Out, infer _E, infer Requirements> ? Requirements : never
 
-    const peer: OwnerRequirements = undefined as unknown as PeerConnectionStatus.PeerConnectionStatus
-    const relay: OwnerRequirements = undefined as unknown as RelayConnectionStatus.RelayConnectionStatus
+    const peer: OwnerRequirements = undefined!
+    const relay: OwnerRequirements = undefined!
     assert.isDefined(ReplicaOwner.layerHandlers(definition))
     assert.isUndefined(peer)
     assert.isUndefined(relay)

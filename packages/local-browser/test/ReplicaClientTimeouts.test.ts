@@ -1,5 +1,5 @@
 import { NodeCrypto } from "@effect/platform-node"
-import { assert, it } from "@effect/vitest"
+import { assert, it as layeredIt } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
@@ -9,6 +9,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -24,7 +25,7 @@ import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
 import { definition, DeliveryPublisher, documentId, PeerRelayRuntime, replica, Task } from "./fixtures.js"
 
-it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
+layeredIt.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
   const limits = {
     maxBackupBytes: 1024,
     maxChunkBytes: 128,
@@ -129,7 +130,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
       yield* TestClock.adjust(1)
       const exit = fiber.pollUnsafe()
       assert.isDefined(exit)
-      assert.isTrue(Exit.isFailure(exit!))
+      assert.isTrue(Exit.isFailure(exit))
       const error = yield* Fiber.join(fiber).pipe(Effect.flip)
       assert.strictEqual(error.reason._tag, "OperationTimeout")
       if (error.reason._tag === "OperationTimeout") {
@@ -163,7 +164,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
       yield* TestClock.adjust(1)
       const exit = fiber.pollUnsafe()
       assert.isDefined(exit)
-      assert.isTrue(Exit.isFailure(exit!))
+      assert.isTrue(Exit.isFailure(exit))
       const error = yield* Fiber.join(fiber).pipe(Effect.flip)
       assert.strictEqual(error.reason._tag, "OperationTimeout")
       if (error.reason._tag === "OperationTimeout") {
@@ -270,13 +271,14 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
           if (property === "Get") {
             return () => {
               gets++
-              return gets === 1
-                ? Effect.fail(
+              if (gets === 1) {
+                return Effect.fail(
                   new ReplicaError.ReplicaError({
                     reason: new ReplicaError.ProtocolMismatch({ expected: "active session", observed: "stale" })
                   })
                 )
-                : Deferred.succeed(replayStarted, undefined).pipe(Effect.andThen(Effect.never))
+              }
+              return Deferred.succeed(replayStarted, undefined).pipe(Effect.andThen(Effect.never))
             }
           }
           return value
@@ -507,7 +509,10 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
           if (property === "RenewSession") {
             return (payload: never) =>
               Effect.sync(() => ++renewals).pipe(
-                Effect.flatMap((attempt) => attempt === 1 ? Effect.never : value(payload))
+                Effect.flatMap((attempt) => {
+                  if (attempt === 1) return Effect.never
+                  return value(payload)
+                })
               )
           }
           return value
@@ -592,7 +597,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
       const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
       const releaseStatus = yield* Deferred.make<void>()
       const releaseBackup = yield* Deferred.make<void>()
-      const ready = { _tag: "Ready" as const, pendingCommands: 0 }
+      const ready: ReplicaStatus.ReplicaStatus = { _tag: "Ready", pendingCommands: 0 }
       const wedged = new Proxy(rpc, {
         get(target, property, receiver) {
           if (property === "Status") {
@@ -625,7 +630,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
           if (property === "OpenSession") {
             return (payload: never) => {
               opens += 1
-              return opens === 1 ? Reflect.get(target, property, receiver)(payload) : Effect.never
+              if (opens === 1) return Reflect.get(target, property, receiver)(payload)
+              return Effect.never
             }
           }
           if (property === "Flush") {
@@ -644,7 +650,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
       yield* TestClock.adjust(timeouts.sessionTimeout)
       const exit = fiber.pollUnsafe()
       assert.isDefined(exit)
-      assert.isTrue(Exit.isFailure(exit!))
+      assert.isTrue(Exit.isFailure(exit))
       const error = yield* Fiber.join(fiber).pipe(Effect.flip)
       assert.strictEqual(error.reason._tag, "OperationTimeout")
       if (error.reason._tag === "OperationTimeout") {
@@ -690,7 +696,7 @@ it.layer(NodeCrypto.layer)("ReplicaClient timeouts", (it) => {
       yield* Fiber.join(interrupting)
       const exit = fiber.pollUnsafe()
       assert.isDefined(exit)
-      assert.isTrue(Exit.hasInterrupts(exit!))
+      assert.isTrue(Exit.hasInterrupts(exit))
       assert.isTrue(yield* Deferred.isDone(closeInterrupted))
       assert.strictEqual(yield* sessions.activeCount, 0)
     }).pipe(Effect.provide(Owner)))

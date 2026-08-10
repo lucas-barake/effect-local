@@ -64,6 +64,14 @@ const limits = {
 
 const installationId = Identity.BackupInstallationId.make("bak_ea5a1250-2d04-4c92-987a-e62d411a0b4e")
 
+const installMessageChannel = (constructor: unknown) => {
+  Object.defineProperty(globalThis, "MessageChannel", {
+    configurable: true,
+    value: constructor,
+    writable: true
+  })
+}
+
 const complete = <A, E,>(deferred: Deferred.Deferred<A, E>, value: A): void => {
   Deferred.doneUnsafe(deferred, Effect.succeed(value))
 }
@@ -74,11 +82,10 @@ const waitForControllerCount = (
 ): Effect.Effect<void> =>
   Effect.suspend(() =>
     transport.activeControllerCount.pipe(
-      Effect.flatMap((count) =>
-        count === expected
-          ? Effect.void
-          : Effect.yieldNow.pipe(Effect.andThen(waitForControllerCount(transport, expected)))
-      )
+      Effect.flatMap((count) => {
+        if (count === expected) return Effect.void
+        return Effect.yieldNow.pipe(Effect.andThen(waitForControllerCount(transport, expected)))
+      })
     )
   )
 
@@ -130,11 +137,11 @@ const restoreResultError = (
   exit: Exit.Exit<void, RestoreProtocol.RestoreResultFailure>
 ): RestoreProtocol.RestoreWireError => {
   if (!Exit.isFailure(exit)) {
-    throw new Error("expected restore result failure")
+    return Effect.runSync(Effect.die("expected restore result failure"))
   }
   const reason = exit.cause.reasons[0]
   if (reason === undefined || !Cause.isFailReason(reason)) {
-    throw new Error("expected one typed restore result failure")
+    return Effect.runSync(Effect.die("expected one typed restore result failure"))
   }
   assert.strictEqual(reason.error._tag, "RestoreResultRestoreFailure")
   return reason.error.error
@@ -154,16 +161,16 @@ const assertRestoreOperationTimeout = (
 }
 
 it.effect("does not export the internal RestoreTransport package subpath", () =>
-  Effect.sync(() => {
-    let error: unknown
-    try {
-      import.meta.resolve("@lucas-barake/effect-local-browser/RestoreTransport")
-    } catch (cause) {
-      error = cause
-    }
+  Effect.gen(function*() {
+    const error = yield* Effect.flip(Effect.try({
+      try: () => import.meta.resolve("@lucas-barake/effect-local-browser/RestoreTransport"),
+      catch: (cause) => cause
+    }))
     assert.instanceOf(error, Error)
+    let code: unknown
+    if (error instanceof Error && "code" in error) code = error.code
     assert.strictEqual(
-      error instanceof Error && "code" in error ? error.code : undefined,
+      code,
       "ERR_PACKAGE_PATH_NOT_EXPORTED"
     )
   }))
@@ -378,9 +385,9 @@ it.effect("streams one exact backing buffer per Pull and completes the release h
       yield* Deferred.await(released)
       yield* waitForControllerCount(transport, 0)
       assert.strictEqual(chunks.length, 1)
-      assert.deepStrictEqual(Array.from(chunks[0]!), [1, 2, 3, 4])
-      assert.strictEqual(chunks[0]!.byteOffset, 0)
-      assert.strictEqual(chunks[0]!.buffer.byteLength, chunks[0]!.byteLength)
+      assert.deepStrictEqual(Array.from(chunks[0]), [1, 2, 3, 4])
+      assert.strictEqual(chunks[0].byteOffset, 0)
+      assert.strictEqual(chunks[0].buffer.byteLength, chunks[0].byteLength)
       assert.strictEqual(sent.buffer.byteLength, 0)
       assert.strictEqual(yield* sessions.activeRestoreCount, 0)
       started.port.close()
@@ -471,7 +478,7 @@ it.effect("reports session expiry before Start as an authoritative session failu
     const terminal = yield* Deferred.make<RestoreProtocol.TerminalReady>()
     const replica: Replica.Replica["Service"] = {
       ...fixtureReplica,
-      restoreBackup: () => Effect.die(new Error("restore must not start before Start"))
+      restoreBackup: () => Effect.die("restore must not start before Start")
     }
     return yield* Effect.gen(function*() {
       const { result, sessionId, sessions, started, transport } = yield* begin
@@ -592,7 +599,7 @@ it.effect("reserves an outstanding Pull sequence before posting the authoritativ
 it.effect("does not collapse a composite typed failure and defect Cause into one terminal", () =>
   Effect.scoped(Effect.gen(function*() {
     const typed = new ReplicaError.ReplicaError({
-      reason: new ReplicaError.RestoreFailed({ cause: new Error("typed failure") })
+      reason: new ReplicaError.RestoreFailed({ cause: Error("typed failure") })
     })
     const workStarted = yield* Deferred.make<void>()
     const terminal = yield* Deferred.make<void>()
@@ -601,7 +608,7 @@ it.effect("does not collapse a composite typed failure and defect Cause into one
       restoreBackup: () =>
         Deferred.succeed(workStarted, undefined).pipe(
           Effect.andThen(
-            Effect.failCause(Cause.combine(Cause.fail(typed), Cause.die(new Error("winning defect"))))
+            Effect.failCause(Cause.combine(Cause.fail(typed), Cause.die(Error("winning defect"))))
           )
         )
     }
@@ -651,10 +658,10 @@ it.effect("does not collapse a composite typed failure and defect Cause into one
 it.effect("does not collapse two typed failures in a composite restore Cause", () =>
   Effect.scoped(Effect.gen(function*() {
     const first = new ReplicaError.ReplicaError({
-      reason: new ReplicaError.RestoreFailed({ cause: new Error("first failure") })
+      reason: new ReplicaError.RestoreFailed({ cause: Error("first failure") })
     })
     const second = new ReplicaError.ReplicaError({
-      reason: new ReplicaError.StorageUnavailable({ cause: new Error("second failure") })
+      reason: new ReplicaError.StorageUnavailable({ cause: Error("second failure") })
     })
     const workStarted = yield* Deferred.make<void>()
     const terminal = yield* Deferred.make<void>()
@@ -713,7 +720,7 @@ it.effect("does not collapse two typed failures in a composite restore Cause", (
 it.effect("preserves interruption over a typed failure in a composite restore Cause", () =>
   Effect.scoped(Effect.gen(function*() {
     const typed = new ReplicaError.ReplicaError({
-      reason: new ReplicaError.RestoreFailed({ cause: new Error("typed failure") })
+      reason: new ReplicaError.RestoreFailed({ cause: Error("typed failure") })
     })
     const workStarted = yield* Deferred.make<void>()
     const terminal = yield* Deferred.make<void>()
@@ -1119,7 +1126,7 @@ it.effect("times out an unclaimed result after Start without applying restore", 
         })
       }
     }
-    globalThis.MessageChannel = StartObservedMessageChannel as unknown as typeof MessageChannel
+    installMessageChannel(StartObservedMessageChannel)
     yield* Effect.addFinalizer(() =>
       Effect.sync(() => {
         globalThis.MessageChannel = NativeMessageChannel
@@ -1298,7 +1305,7 @@ it.effect("cleans up a messageerror before Start without applying restore", () =
         ownerPort = this.port1
       }
     }
-    globalThis.MessageChannel = ExposedOwnerMessageChannel as unknown as typeof MessageChannel
+    installMessageChannel(ExposedOwnerMessageChannel)
     yield* Effect.addFinalizer(() =>
       Effect.sync(() => {
         globalThis.MessageChannel = NativeMessageChannel
@@ -1307,7 +1314,7 @@ it.effect("cleans up a messageerror before Start without applying restore", () =
 
     return yield* Effect.gen(function*() {
       const { result, sessions, started, transport } = yield* begin
-      if (ownerPort === undefined) throw new Error("owner endpoint was not created")
+      if (ownerPort === undefined) yield* Effect.die("owner endpoint was not created")
       ownerPort.dispatchEvent(new MessageEvent("messageerror"))
 
       const exit = yield* Deferred.await(result).pipe(Effect.exit)
@@ -1347,7 +1354,7 @@ it.effect("cleans up an active Pull messageerror and finalizes the restore sourc
         ownerPort = this.port1
       }
     }
-    globalThis.MessageChannel = ExposedOwnerMessageChannel as unknown as typeof MessageChannel
+    installMessageChannel(ExposedOwnerMessageChannel)
     yield* Effect.addFinalizer(() =>
       Effect.sync(() => {
         globalThis.MessageChannel = NativeMessageChannel
@@ -1370,7 +1377,7 @@ it.effect("cleans up an active Pull messageerror and finalizes the restore sourc
         } satisfies RestoreProtocol.Start
       )
       yield* Deferred.await(pull)
-      if (ownerPort === undefined) throw new Error("owner endpoint was not created")
+      if (ownerPort === undefined) yield* Effect.die("owner endpoint was not created")
       ownerPort.dispatchEvent(new MessageEvent("messageerror"))
 
       const exit = yield* Deferred.await(result).pipe(Effect.exit)
@@ -1384,7 +1391,8 @@ it.effect("cleans up an active Pull messageerror and finalizes the restore sourc
     }).pipe(Effect.provide(makeLayer(replica)))
   })))
 
-for (const disconnect of ["close", "messageerror"] as const) {
+const disconnects = ["close", "messageerror"] satisfies ReadonlyArray<"close" | "messageerror">
+for (const disconnect of disconnects) {
   it.effect(`cleans up an owner ${disconnect} while awaiting ResultClaim`, () =>
     Effect.scoped(Effect.gen(function*() {
       const startObserved = yield* Deferred.make<void>()
@@ -1417,7 +1425,7 @@ for (const disconnect of ["close", "messageerror"] as const) {
           })
         }
       }
-      globalThis.MessageChannel = ExposedOwnerMessageChannel as unknown as typeof MessageChannel
+      installMessageChannel(ExposedOwnerMessageChannel)
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           globalThis.MessageChannel = NativeMessageChannel
@@ -1436,12 +1444,11 @@ for (const disconnect of ["close", "messageerror"] as const) {
         )
         yield* Deferred.await(startObserved)
         yield* Effect.yieldNow
-        if (ownerPort === undefined) throw new Error("owner endpoint was not created")
-        ownerPort.dispatchEvent(
-          disconnect === "close"
-            ? new Event("close")
-            : new MessageEvent("messageerror")
-        )
+        if (ownerPort === undefined) yield* Effect.die("owner endpoint was not created")
+        let event: Event
+        if (disconnect === "close") event = new Event("close")
+        else event = new MessageEvent("messageerror")
+        ownerPort.dispatchEvent(event)
 
         yield* waitForControllerCount(transport, 0)
         assert.strictEqual(applications, 0)
@@ -1473,7 +1480,7 @@ for (const disconnect of ["close", "messageerror"] as const) {
           ownerPort = this.port1
         }
       }
-      globalThis.MessageChannel = ExposedOwnerMessageChannel as unknown as typeof MessageChannel
+      installMessageChannel(ExposedOwnerMessageChannel)
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           globalThis.MessageChannel = NativeMessageChannel
@@ -1500,12 +1507,11 @@ for (const disconnect of ["close", "messageerror"] as const) {
         yield* Deferred.await(terminal)
         const resultExit = yield* Deferred.await(result).pipe(Effect.exit)
         assert.isTrue(Exit.isSuccess(resultExit))
-        if (ownerPort === undefined) throw new Error("owner endpoint was not created")
-        ownerPort.dispatchEvent(
-          disconnect === "close"
-            ? new Event("close")
-            : new MessageEvent("messageerror")
-        )
+        if (ownerPort === undefined) yield* Effect.die("owner endpoint was not created")
+        let event: Event
+        if (disconnect === "close") event = new Event("close")
+        else event = new MessageEvent("messageerror")
+        ownerPort.dispatchEvent(event)
 
         yield* waitForControllerCount(transport, 0)
         assert.strictEqual(applications, 1)
@@ -1537,7 +1543,7 @@ for (const disconnect of ["close", "messageerror"] as const) {
           ownerPort = this.port1
         }
       }
-      globalThis.MessageChannel = ExposedOwnerMessageChannel as unknown as typeof MessageChannel
+      installMessageChannel(ExposedOwnerMessageChannel)
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           globalThis.MessageChannel = NativeMessageChannel
@@ -1575,12 +1581,11 @@ for (const disconnect of ["close", "messageerror"] as const) {
         const resultExit = yield* Deferred.await(result).pipe(Effect.exit)
         assert.isTrue(Exit.isSuccess(resultExit))
         assert.strictEqual(yield* sessions.activeRestoreCount, 0)
-        if (ownerPort === undefined) throw new Error("owner endpoint was not created")
-        ownerPort.dispatchEvent(
-          disconnect === "close"
-            ? new Event("close")
-            : new MessageEvent("messageerror")
-        )
+        if (ownerPort === undefined) yield* Effect.die("owner endpoint was not created")
+        let event: Event
+        if (disconnect === "close") event = new Event("close")
+        else event = new MessageEvent("messageerror")
+        ownerPort.dispatchEvent(event)
 
         yield* waitForControllerCount(transport, 0)
         assert.strictEqual(applications, 1)
@@ -1888,14 +1893,15 @@ it.effect("releases admission when nonce generation fails and accepts a later Be
       ...nativeCrypto,
       randomUUIDv4: Effect.suspend(() => {
         nonceAttempts += 1
-        return nonceAttempts === 1
-          ? Effect.fail(PlatformError.systemError({
+        if (nonceAttempts === 1) {
+          return Effect.fail(PlatformError.systemError({
             _tag: "Unknown",
             module: "RestoreTransportTest",
             method: "randomUUIDv4",
             description: "injected nonce failure"
           }))
-          : Effect.succeed("00000000-0000-4000-8000-000000000002")
+        }
+        return Effect.succeed("00000000-0000-4000-8000-000000000002")
       })
     }
     const replica: Replica.Replica["Service"] = {
@@ -2019,32 +2025,27 @@ it.effect("rejects Begin and closes both endpoints when shutdown wins during cha
     let ownerCloseCount = 0
     let peerCloseCount = 0
     let shutdownFiber: Fiber.Fiber<void> | undefined
-    const ownerPort = {
-      addEventListener() {},
-      removeEventListener() {},
-      start() {},
-      postMessage() {},
-      close() {
-        ownerCloseCount += 1
-      }
-    } as unknown as MessagePort
-    const peerPort = {
-      addEventListener() {},
-      removeEventListener() {},
-      start() {},
-      postMessage() {},
-      close() {
-        peerCloseCount += 1
-      }
-    } as unknown as MessagePort
     class ShutdownMessageChannel {
-      readonly port1 = ownerPort
-      readonly port2 = peerPort
+      readonly port1: MessagePort
+      readonly port2: MessagePort
       constructor() {
+        const native = new NativeMessageChannel()
+        this.port1 = native.port1
+        this.port2 = native.port2
+        const ownerClose = this.port1.close.bind(this.port1)
+        this.port1.close = () => {
+          ownerCloseCount += 1
+          ownerClose()
+        }
+        const peerClose = this.port2.close.bind(this.port2)
+        this.port2.close = () => {
+          peerCloseCount += 1
+          peerClose()
+        }
         shutdownFiber = Effect.runFork(Scope.close(transportScope, Exit.void))
       }
     }
-    globalThis.MessageChannel = ShutdownMessageChannel as unknown as typeof MessageChannel
+    installMessageChannel(ShutdownMessageChannel)
     yield* Effect.addFinalizer(() =>
       Effect.sync(() => {
         globalThis.MessageChannel = NativeMessageChannel
@@ -2080,20 +2081,16 @@ it.effect("closes the owner endpoint exactly once when a malformed frame shuts d
         readonly port2: MessagePort
         constructor() {
           const native = new NativeMessageChannel()
-          this.port1 = {
-            addEventListener: native.port1.addEventListener.bind(native.port1),
-            removeEventListener: native.port1.removeEventListener.bind(native.port1),
-            start: native.port1.start.bind(native.port1),
-            postMessage: native.port1.postMessage.bind(native.port1),
-            close() {
-              ownerCloseCount += 1
-              native.port1.close()
-            }
-          } as unknown as MessagePort
+          this.port1 = native.port1
+          const close = this.port1.close.bind(this.port1)
+          this.port1.close = () => {
+            ownerCloseCount += 1
+            close()
+          }
           this.port2 = native.port2
         }
       }
-      globalThis.MessageChannel = CountingMessageChannel as unknown as typeof MessageChannel
+      installMessageChannel(CountingMessageChannel)
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           globalThis.MessageChannel = NativeMessageChannel

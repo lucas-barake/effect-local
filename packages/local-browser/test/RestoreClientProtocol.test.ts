@@ -1,5 +1,5 @@
 import { NodeCrypto } from "@effect/platform-node"
-import { assert, it } from "@effect/vitest"
+import { assert, it as layeredIt } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
@@ -20,7 +20,7 @@ import { definition } from "./fixtures.js"
 
 const installationId = Identity.BackupInstallationId.make("bak_43c8d2f4-58ce-4c9a-9155-9d21019f5e9d")
 const nonce = RestoreProtocol.RestoreNonce.make("rst_43c8d2f4-58ce-4c9a-9155-9d21019f5e9d")
-const sequence = RestoreProtocol.RestoreSequence.make
+const sequence = (value: number) => RestoreProtocol.RestoreSequence.make(value)
 
 const conflictLimits: ReplicaRpc.ConflictLimits = {
   maxConflictDepth: 16,
@@ -39,7 +39,7 @@ const rpcClient = (
   maxChunkBytes = 4,
   finish: () => Effect.Effect<void, RestoreProtocol.RestoreResultFailure> = () => Effect.void
 ) =>
-  ({
+  Object.assign(Object.create<RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>>(null), {
     OpenSession: () =>
       Effect.succeed({
         leaseMillis: 10_000,
@@ -55,9 +55,9 @@ const rpcClient = (
     CloseSession: () => Effect.void,
     BeginRestoreBackup: begin,
     FinishRestoreBackup: finish
-  }) as unknown as RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>
+  })
 
-it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
+layeredIt.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
   it.effect("coalesces within the advertised bound without transferring caller storage", () =>
     Effect.scoped(Effect.gen(function*() {
       const channel = new MessageChannel()
@@ -65,61 +65,57 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       const completed = yield* Deferred.make<void>()
       const received: Array<Uint8Array> = []
       channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
-        try {
-          const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
-          switch (frame._tag) {
-            case "Start":
-              channel.port2.postMessage(
-                Schema.encodeSync(RestoreProtocol.Pull)({
-                  _tag: "Pull",
-                  nonce,
-                  sequence: sequence(1)
-                })
-              )
-              return
-            case "Chunk":
-              assert.strictEqual(frame.bytes.byteLength, frame.bytes.buffer.byteLength)
-              assert.strictEqual(frame.bytes.byteOffset, 0)
-              assert.isAbove(frame.bytes.byteLength, 0)
-              assert.isAtMost(frame.bytes.byteLength, 4)
-              received.push(new Uint8Array(frame.bytes))
-              channel.port2.postMessage(
-                Schema.encodeSync(RestoreProtocol.Pull)({
-                  _tag: "Pull",
-                  nonce,
-                  sequence: sequence(frame.sequence + 1)
-                })
-              )
-              return
-            case "End":
-              channel.port2.postMessage(
-                Schema.encodeSync(RestoreProtocol.TerminalReady)({
-                  _tag: "TerminalReady",
-                  nonce,
-                  sequence: sequence(frame.sequence + 1)
-                })
-              )
-              return
-            case "TerminalAck":
-              channel.port2.postMessage(
-                Schema.encodeSync(RestoreProtocol.Released)({
-                  _tag: "Released",
-                  nonce,
-                  sequence: sequence(frame.sequence + 1)
-                })
-              )
-              return
-            case "ReleasedAck":
-              Deferred.doneUnsafe(completed, Effect.void)
-              return
-            case "SourceFailure":
-              Deferred.doneUnsafe(
-                completed,
-                Effect.die(new Error(`unexpected source failure: ${frame.error._tag}`))
-              )
-          }
-        } catch (cause) {
-          Deferred.doneUnsafe(completed, Effect.die(cause))
+        const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
+        switch (frame._tag) {
+          case "Start":
+            channel.port2.postMessage(
+              Schema.encodeSync(RestoreProtocol.Pull)({
+                _tag: "Pull",
+                nonce,
+                sequence: sequence(1)
+              })
+            )
+            return
+          case "Chunk":
+            assert.strictEqual(frame.bytes.byteLength, frame.bytes.buffer.byteLength)
+            assert.strictEqual(frame.bytes.byteOffset, 0)
+            assert.isAbove(frame.bytes.byteLength, 0)
+            assert.isAtMost(frame.bytes.byteLength, 4)
+            received.push(new Uint8Array(frame.bytes))
+            channel.port2.postMessage(
+              Schema.encodeSync(RestoreProtocol.Pull)({
+                _tag: "Pull",
+                nonce,
+                sequence: sequence(frame.sequence + 1)
+              })
+            )
+            return
+          case "End":
+            channel.port2.postMessage(
+              Schema.encodeSync(RestoreProtocol.TerminalReady)({
+                _tag: "TerminalReady",
+                nonce,
+                sequence: sequence(frame.sequence + 1)
+              })
+            )
+            return
+          case "TerminalAck":
+            channel.port2.postMessage(
+              Schema.encodeSync(RestoreProtocol.Released)({
+                _tag: "Released",
+                nonce,
+                sequence: sequence(frame.sequence + 1)
+              })
+            )
+            return
+          case "ReleasedAck":
+            Deferred.doneUnsafe(completed, Effect.void)
+            return
+          case "SourceFailure":
+            Deferred.doneUnsafe(
+              completed,
+              Effect.die(`unexpected source failure: ${frame.error._tag}`)
+            )
         }
       })
       channel.port2.start()
@@ -337,8 +333,10 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       }).pipe(Effect.forkChild)
 
       const outcome = yield* Effect.raceFirst(
-        Fiber.await(restore).pipe(Effect.map((exit) => ({ _tag: "Closed" as const, exit }))),
-        Deferred.await(sourcePulled).pipe(Effect.as({ _tag: "Pulled" as const }))
+        Fiber.await(restore).pipe(
+          Effect.map((exit) => ({ _tag: "Closed", exit } satisfies { readonly _tag: "Closed"; exit: typeof exit }))
+        ),
+        Deferred.await(sourcePulled).pipe(Effect.as({ _tag: "Pulled" } satisfies { readonly _tag: "Pulled" }))
       )
       assert.strictEqual(outcome._tag, "Closed")
       if (outcome._tag === "Closed") {
@@ -358,7 +356,7 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       const pendingStarted = yield* Deferred.make<void>()
       const releaseDefect = yield* Deferred.make<void>()
       const firstChunk = yield* Deferred.make<void>()
-      const sentinel = new Error("retained source pull defect")
+      const sentinel = Error("retained source pull defect")
       channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
         const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
         if (frame._tag === "Start") {
@@ -416,7 +414,7 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       const pendingStarted = yield* Deferred.make<void>()
       const releaseFailure = yield* Deferred.make<void>()
       const firstChunk = yield* Deferred.make<void>()
-      const sentinel = new Error("retained composite source defect")
+      const sentinel = Error("retained composite source defect")
       const sourceFailure = new ReplicaError.ReplicaError({
         reason: new ReplicaError.RestoreBusy({ replica: "retained" })
       })
@@ -820,7 +818,7 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       const finishResult = yield* Deferred.make<void, RestoreProtocol.RestoreResultFailure>()
       const finishStarted = yield* Deferred.make<void>()
       const finishFinalized = yield* Deferred.make<void>()
-      const sourceDefect = new Error("source failed after authoritative Finish")
+      const sourceDefect = Error("source failed after authoritative Finish")
       let beginCalls = 0
       let finishCalls = 0
       let sourcePulls = 0
@@ -1273,7 +1271,7 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
     Effect.scoped(Effect.gen(function*() {
       const channel = new MessageChannel()
       yield* Effect.addFinalizer(() => Effect.sync(() => channel.port2.close()))
-      const sentinel = new Error("composite source defect")
+      const sentinel = Error("composite source defect")
       const sourceFailure = new ReplicaError.ReplicaError({
         reason: new ReplicaError.RestoreBusy({ replica: "test" })
       })
@@ -1322,7 +1320,7 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       const exit = yield* client.restoreBackup({
         source: Stream.fromPull(
           Effect.succeed(Effect.failCause(composite))
-        ) as Stream.Stream<Uint8Array, ReplicaError.ReplicaError>,
+        ),
         mode: "replace",
         maxBytes: 64,
         expectedDefinitionHash: definition.hash,
@@ -1536,15 +1534,10 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
   it.effect("preserves the native postMessage failure", () =>
     Effect.scoped(Effect.gen(function*() {
       const sentinel = new DOMException("message port is closed", "InvalidStateError")
-      const port = {
-        addEventListener() {},
-        removeEventListener() {},
-        start() {},
-        close() {},
-        postMessage() {
-          throw sentinel
-        }
-      } as unknown as MessagePort
+      const channel = new MessageChannel()
+      const port = channel.port1
+      yield* Effect.addFinalizer(() => Effect.sync(() => channel.port2.close()))
+      port.postMessage = () => Effect.runSync(Effect.die(sentinel))
       const client = yield* ReplicaClient.fromRpcClient(
         definition,
         rpcClient(() => Effect.succeed({ nonce, port }))
@@ -1588,7 +1581,7 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
         const advertised = {
           maxChunkBytes: 4,
           maxRestoreCoalesceMillis: 25
-        } as {
+        } satisfies {
           maxChunkBytes?: number
           maxRestoreCoalesceMillis?: number
         }
@@ -1597,24 +1590,27 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
         } else {
           advertised[invalid.field] = invalid.value
         }
-        const invalidRpc = {
-          OpenSession: () =>
-            Effect.succeed({
-              leaseMillis: 10_000,
-              protocolVersion: ReplicaRpc.protocolVersion,
-              definitionHash: definition.hash,
-              ownerEpoch: "owner",
-              conflictLimits,
-              ...advertised,
-              maxRestoreErrorBytes: 4_096
-            }),
-          CloseSession: () => Effect.sync(() => closeCalls++),
-          BeginRestoreBackup: () =>
-            Effect.sync(() => {
-              beginCalls++
-              return { nonce, port: new MessageChannel().port1 }
-            })
-        } as unknown as RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>
+        const invalidRpc = Object.assign(
+          Object.create<RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>>(null),
+          {
+            OpenSession: () =>
+              Effect.succeed({
+                leaseMillis: 10_000,
+                protocolVersion: ReplicaRpc.protocolVersion,
+                definitionHash: definition.hash,
+                ownerEpoch: "owner",
+                conflictLimits,
+                ...advertised,
+                maxRestoreErrorBytes: 4_096
+              }),
+            CloseSession: () => Effect.sync(() => closeCalls++),
+            BeginRestoreBackup: () =>
+              Effect.sync(() => {
+                beginCalls++
+                return { nonce, port: new MessageChannel().port1 }
+              })
+          }
+        )
 
         const exit = yield* Effect.scoped(
           ReplicaClient.fromRpcClient(definition, invalidRpc)
@@ -1646,20 +1642,25 @@ it.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
         ]
       ) {
         let closeCalls = 0
-        const invalidRpc = {
-          OpenSession: () =>
-            Effect.succeed({
-              leaseMillis: 10_000,
-              protocolVersion: ReplicaRpc.protocolVersion,
-              definitionHash: definition.hash,
-              ownerEpoch: "owner",
-              conflictLimits,
-              maxChunkBytes: 4,
-              maxRestoreCoalesceMillis: 25,
-              ...(maxRestoreErrorBytes === undefined ? {} : { maxRestoreErrorBytes })
-            }),
-          CloseSession: () => Effect.sync(() => closeCalls++)
-        } as unknown as RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>
+        const restoreErrorLimit: { maxRestoreErrorBytes?: number } = {}
+        if (maxRestoreErrorBytes !== undefined) restoreErrorLimit.maxRestoreErrorBytes = maxRestoreErrorBytes
+        const invalidRpc = Object.assign(
+          Object.create<RpcClient.FromGroup<typeof ReplicaRpc.group, RpcClientError.RpcClientError>>(null),
+          {
+            OpenSession: () =>
+              Effect.succeed({
+                leaseMillis: 10_000,
+                protocolVersion: ReplicaRpc.protocolVersion,
+                definitionHash: definition.hash,
+                ownerEpoch: "owner",
+                conflictLimits,
+                maxChunkBytes: 4,
+                maxRestoreCoalesceMillis: 25,
+                ...restoreErrorLimit
+              }),
+            CloseSession: () => Effect.sync(() => closeCalls++)
+          }
+        )
         const exit = yield* Effect.scoped(
           ReplicaClient.fromRpcClient(definition, invalidRpc)
         ).pipe(Effect.exit)

@@ -1,5 +1,5 @@
 import { NodeCrypto } from "@effect/platform-node"
-import { assert, it } from "@effect/vitest"
+import { assert, it as layeredIt } from "@effect/vitest"
 import * as CommitPublisher from "@lucas-barake/effect-local-sql/CommitPublisher"
 import * as PeerConnectionStatus from "@lucas-barake/effect-local-sql/PeerConnectionStatus"
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
@@ -104,7 +104,7 @@ const withPageEvents = (target: EventTarget) =>
       })
   )
 
-it.layer(NodeCrypto.layer)("ReplicaClient pagehide", (it) => {
+layeredIt.layer(NodeCrypto.layer)("ReplicaClient pagehide", (it) => {
   it.effect("closes the owner session when the page hides", () =>
     Effect.gen(function*() {
       const sessions = yield* SessionManager.SessionManager
@@ -114,8 +114,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient pagehide", (it) => {
         const rpc = yield* RpcTest.makeClient(ReplicaRpc.group)
         const closed = yield* Deferred.make<void>()
         const observed = new Proxy(rpc, {
-          get(target, property, receiver) {
-            const value = Reflect.get(target, property, receiver)
+          get(rpcTarget, property, receiver) {
+            const value = Reflect.get(rpcTarget, property, receiver)
             if (property === "CloseSession") {
               return (payload: never) => value(payload).pipe(Effect.ensuring(Deferred.succeed(closed, undefined)))
             }
@@ -153,8 +153,8 @@ it.layer(NodeCrypto.layer)("ReplicaClient pagehide", (it) => {
         let hidden = false
         let opensAfterHide = 0
         const observedRpc = new Proxy(rpc, {
-          get(target, property, receiver) {
-            const value = Reflect.get(target, property, receiver)
+          get(rpcTarget, property, receiver) {
+            const value = Reflect.get(rpcTarget, property, receiver)
             if (property === "CloseSession") {
               return (payload: never) => value(payload).pipe(Effect.ensuring(Deferred.succeed(closed, undefined)))
             }
