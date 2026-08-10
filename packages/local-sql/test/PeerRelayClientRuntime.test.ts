@@ -115,8 +115,8 @@ describe("PeerRelayClientRuntime", () => {
   const fakePeerSync = (
     pruneRelayReceipts: PeerSync.PeerSync["Service"]["pruneRelayReceipts"]
   ): PeerSync.PeerSync["Service"] => {
-    const service = {
-      withDocumentInvalidation: (_documentId: Identity.DocumentId, effect: Effect.Effect<unknown>) => effect,
+    const service: PeerSync.PeerSync["Service"] = {
+      withDocumentInvalidation: <A, E, R,>(_documentId: Identity.DocumentId, effect: Effect.Effect<A, E, R>) => effect,
       invalidateDocument: () => Effect.void,
       open: () => Effect.die(new Error("unused")),
       reset: () => Effect.die(new Error("unused")),

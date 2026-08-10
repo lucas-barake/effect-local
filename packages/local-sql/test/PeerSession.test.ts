@@ -46,9 +46,36 @@ import { gateLimits } from "./fixtures/limits.js"
 import { nativeError, nativeTypeError } from "./TestErrors.js"
 
 type TestEntityClient = ReturnType<Effect.Success<typeof DocumentEntity.DocumentEntity.client>>
+type ApplySyncInput = Parameters<TestEntityClient["ApplySync"]>[0]
+type ApplySyncOptions = NonNullable<Parameters<TestEntityClient["ApplySync"]>[1]>
+type ApplySyncBaseOptions = Omit<ApplySyncOptions, "discard">
+type ApplySyncResult = typeof DocumentEntity.ApplySyncResult.Type
 
-const makeEntityClient = (client: Pick<TestEntityClient, "ApplySync">): TestEntityClient =>
-  Object.assign(Object.create(Object.prototype), client)
+const makeEntityClient = (
+  run: ((request: ApplySyncInput) => Effect.Effect<ApplySyncResult, ReplicaError.ReplicaError>) | {
+    readonly ApplySync: (request: ApplySyncInput) => Effect.Effect<ApplySyncResult, ReplicaError.ReplicaError>
+  }
+): TestEntityClient => {
+  let execute: (request: ApplySyncInput) => Effect.Effect<ApplySyncResult, ReplicaError.ReplicaError>
+  if (typeof run === "function") execute = run
+  else execute = run.ApplySync
+  function applySync(
+    request: ApplySyncInput,
+    options: ApplySyncBaseOptions & { readonly discard: true }
+  ): Effect.Effect<void, ReplicaError.ReplicaError>
+  function applySync(
+    request: ApplySyncInput,
+    options?: ApplySyncBaseOptions & { readonly discard?: false }
+  ): Effect.Effect<ApplySyncResult, ReplicaError.ReplicaError>
+  function applySync(
+    request: ApplySyncInput,
+    options?: ApplySyncBaseOptions & { readonly discard?: boolean }
+  ) {
+    if (options?.discard === true) return Effect.asVoid(execute(request))
+    return execute(request)
+  }
+  return Object.assign(Object.create(Object.prototype), { ApplySync: applySync })
+}
 
 const deliveryStore = CommandDeliveryStore.CommandDeliveryStore.of({
   lookup: () => Effect.die("unexpected command delivery lookup"),
@@ -149,9 +176,8 @@ rootIt.layer(Layer.mergeAll(
     acceptedHeads: [],
     commitSequence: Identity.CommitSequence.make(1),
     observedByPeer: true,
-    durableConfirmation: false,
     duplicate: false
-  } satisfies PeerSession.Received
+  } satisfies PeerSync.Received
   const gate = ReplicaGate.ReplicaGate.of({
     current: Effect.succeed(permit),
     claiming: Effect.succeed(false),
@@ -334,11 +360,11 @@ rootIt.layer(Layer.mergeAll(
     messageHash: Schema.String,
     message: Schema.String,
     lineage: Schema.optional(Schema.String),
-    writerProvenance: Schema.optional(Schema.Array(Schema.Struct({
-      changeHash: Schema.String,
-      writerSchemaVersion: Schema.Number,
-      writerDefinitionHash: Schema.String
-    })))
+    writerProvenance: Schema.optional(Schema.mutable(Schema.Array(Schema.Struct({
+      changeHash: Schema.mutableKey(Schema.String),
+      writerSchemaVersion: Schema.mutableKey(Schema.Number),
+      writerDefinitionHash: Schema.mutableKey(Schema.String)
+    }))))
   })
   const SyncEnvelopeWireJson = Schema.fromJsonString(SyncEnvelopeWire)
   // The longest value the lineage schema admits, so the envelope size bound is checked against the
@@ -2758,11 +2784,9 @@ rootIt.layer(Layer.mergeAll(
                     }),
                     Effect.andThen(
                       Effect.gen(function*() {
-                        if (request.relay === undefined) {
-                          yield* Effect.die("Expected relay receipt")
-                        } else {
-                          yield* Ref.update(received, (current) => [...current, request.relay])
-                        }
+                        const relay = request.relay
+                        if (relay === undefined) return yield* Effect.die("Expected relay receipt")
+                        return yield* Ref.update(received, (current) => [...current, relay])
                       })
                     ),
                     Effect.andThen(Ref.update(receivedLineages, (current) => [...current, request.lineage!])),
@@ -4033,7 +4057,6 @@ rootIt.layer(Layer.mergeAll(
         acceptedHeads: [],
         commitSequence: Identity.CommitSequence.make(1),
         observedByPeer: false,
-        durableConfirmation: false,
         duplicate: false
       }
       const entity = (): Effect.Effect<ReturnType<Effect.Success<typeof DocumentEntity.DocumentEntity.client>>> =>

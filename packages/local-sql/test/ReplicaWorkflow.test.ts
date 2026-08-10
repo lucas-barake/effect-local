@@ -210,11 +210,11 @@ describe("ReplicaWorkflow", () => {
 
           const result = yield* runtime.poll(execution)
           assert.isTrue(Option.isSome(result))
-          if (!Option.isSome(result)) yield* Effect.die(nativeError("unreachable"))
+          if (!Option.isSome(result)) return yield* Effect.die(nativeError("unreachable"))
           assert.strictEqual(result.value._tag, "Complete")
-          if (result.value._tag !== "Complete") yield* Effect.die(nativeError("unreachable"))
+          if (result.value._tag !== "Complete") return yield* Effect.die(nativeError("unreachable"))
           assert.isTrue(Exit.isSuccess(result.value.exit))
-          if (!Exit.isSuccess(result.value.exit)) yield* Effect.die(nativeError("unreachable"))
+          if (!Exit.isSuccess(result.value.exit)) return yield* Effect.die(nativeError("unreachable"))
           assert.notStrictEqual(result.value.exit.value, Identity.genesisLineage)
 
           // Exactly the rewritten document, exactly once. Nothing else evicts the in-memory sync
@@ -223,6 +223,7 @@ describe("ReplicaWorkflow", () => {
           // heads the rewrite destroyed.
           assert.deepStrictEqual(yield* Ref.get(invalidated), [rewritten])
           assert.notStrictEqual(rewritten, untouched)
+          return yield* Effect.void
         }).pipe(Effect.provide(services))
       }),
     20_000

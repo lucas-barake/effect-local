@@ -56,9 +56,8 @@ describe("ReplicaHealth", () => {
       SqlClient.SqlClient,
       Effect.gen(function*() {
         const sql = yield* SqlClient.SqlClient
-        const execute = (...args: Array<any>) => {
-          const statement = sql(...args)
-          const template = args[0]
+        const execute = (template: TemplateStringsArray, ...args: Array<any>) => {
+          const statement = sql(template, ...args)
           let text = ""
           if (Array.isArray(template)) text = template.join("")
           return transform(text, statement)

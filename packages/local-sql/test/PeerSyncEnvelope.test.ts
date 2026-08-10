@@ -19,6 +19,13 @@ const limits: PeerSyncEnvelope.SyncEnvelopeLimits = {
 const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
 const rewrittenLineage = Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000011")
 const priorLineage = Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000012")
+const JsonObject = Schema.fromJsonString(Schema.Record(Schema.String, Schema.Json))
+const CheckpointTransferWireJson = Schema.fromJsonString(Schema.Struct({
+  snapshot: Schema.String,
+  manifest: Schema.Struct({ authorization: Schema.String }),
+  transitions: Schema.Array(Schema.Struct({ authorization: Schema.String }))
+}))
+const JsonString = Schema.fromJsonString(Schema.Unknown)
 
 const checkpointTransfer = PeerSyncEnvelope.CheckpointTransfer.make({
   snapshot: Uint8Array.of(1, 2, 3),
@@ -105,7 +112,7 @@ describe("PeerSyncEnvelope", () => {
     Effect.gen(function*() {
       const envelope = yield* makeSyncEnvelope
       const bytes = yield* PeerSyncEnvelope.encodeSyncEnvelope(envelope)
-      const json = Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(new TextDecoder().decode(bytes))
+      const json = Schema.decodeUnknownSync(JsonObject)(new TextDecoder().decode(bytes))
       assert.isFalse(Object.hasOwn(json, "checkpointTransfer"))
       const decoded = yield* PeerSyncEnvelope.decodeSyncEnvelope(bytes, limits)
       assert.isFalse(Object.hasOwn(decoded, "checkpointTransfer"))
@@ -220,7 +227,7 @@ describe("PeerSyncEnvelope", () => {
           "Failure"
         )
       }
-      const encodedJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(new TextDecoder().decode(encoded))
+      const encodedJson = Schema.decodeUnknownSync(CheckpointTransferWireJson)(new TextDecoder().decode(encoded))
       for (
         const malformed of [
           {
@@ -235,7 +242,7 @@ describe("PeerSyncEnvelope", () => {
       ) {
         assert.strictEqual(
           (yield* Effect.exit(PeerSyncEnvelope.decodeCheckpointTransfer(
-            new TextEncoder().encode(Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(malformed)),
+            new TextEncoder().encode(Schema.encodeSync(JsonString)(malformed)),
             limits.maxSyncMessageBytes
           )))._tag,
           "Failure"

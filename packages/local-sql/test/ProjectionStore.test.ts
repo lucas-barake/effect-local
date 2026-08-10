@@ -267,9 +267,12 @@ describe("ProjectionStore", () => {
       const rows = yield* sql<{ readonly invalidation_keys: string }>`
         SELECT invalidation_keys FROM effect_local_commit_outbox
         WHERE commit_sequence = ${commitSequence} AND document_id = ${documentId}`
-      assert.deepStrictEqual(Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(rows[0].invalidation_keys), [
-        ...ReplicaDefinition.documentCommitKeys(Task.name, documentId),
-        Labels.name
-      ])
+      assert.deepStrictEqual(
+        Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))(rows[0].invalidation_keys),
+        [
+          ...ReplicaDefinition.documentCommitKeys(Task.name, documentId),
+          Labels.name
+        ]
+      )
     }).pipe(Effect.provide(Live)))
 })

@@ -20,6 +20,9 @@ import * as ReplicaGate from "../src/ReplicaGate.js"
 import * as ReplicaOperationScheduler from "../src/ReplicaOperationScheduler.js"
 import { gateLimits } from "./fixtures/limits.js"
 
+const isSupervised = (session: PeerSession.PeerSession): session is PeerSession.SupervisedPeerSession =>
+  "awaitDisconnect" in session
+
 const deliveryStore = CommandDeliveryStore.CommandDeliveryStore.of({
   lookup: () => Effect.die("unexpected command delivery lookup"),
   snapshotWithCursor: () => Effect.die("unexpected command delivery snapshot"),
@@ -100,7 +103,6 @@ it.layer(Layer.mergeAll(
     acceptedHeads: [],
     commitSequence: Identity.CommitSequence.make(1),
     observedByPeer: true,
-    durableConfirmation: false,
     duplicate: false
   }
   const makeSync = (incarnation: Identity.ReplicaIncarnation) =>
@@ -242,11 +244,12 @@ it.layer(Layer.mergeAll(
             assert.strictEqual(error.reason.observed, otherDocumentId)
           }
         }
-        const supervised = session
-        const disconnect = yield* Effect.exit(supervised.awaitDisconnect)
+        if (!isSupervised(session)) return yield* Effect.die("Expected supervised session")
+        const disconnect = yield* Effect.exit(session.awaitDisconnect)
         assert.strictEqual(disconnect._tag, "Failure")
         const flushed = yield* Effect.exit(session.flush)
         assert.strictEqual(flushed._tag, "Failure")
+        return yield* Effect.void
       }))
   )
 })

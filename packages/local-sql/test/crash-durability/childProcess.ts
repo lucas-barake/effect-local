@@ -77,7 +77,7 @@ const read = Effect.gen(function*() {
   yield* Effect.sync(() => stdout.write(line + "\n"))
 })
 
-let selectedProgram = read
+let selectedProgram: typeof write | typeof read = read
 if (mode === "write") selectedProgram = write
 const program = selectedProgram.pipe(
   Effect.scoped,

@@ -1,6 +1,7 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as Backup from "@lucas-barake/effect-local/Backup"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import type * as Conflict from "@lucas-barake/effect-local/Conflict"
@@ -35,6 +36,7 @@ import type * as SqlStatement from "effect/unstable/sql/Statement"
 import * as CommitPublisher from "../src/CommitPublisher.js"
 import * as Compaction from "../src/Compaction.js"
 import * as ClusterStorage from "../src/internal/clusterStorage.js"
+import * as WriterProvenance from "../src/internal/writerProvenance.js"
 import * as PeerRelayClientRuntime from "../src/PeerRelayClientRuntime.js"
 import * as PeerRelayOutboxLimits from "../src/PeerRelayOutboxLimits.js"
 import * as PeerRelayReceiptLimits from "../src/PeerRelayReceiptLimits.js"
@@ -46,7 +48,131 @@ import * as SqlReplica from "../src/SqlReplica.js"
 import { nativeError } from "./TestErrors.js"
 
 describe("SqlReplica", () => {
+  const CheckpointProvenanceJson = Schema.Array(Schema.Struct({
+    changeHash: WriterProvenance.ChangeHash,
+    writerSchemaVersion: WriterProvenance.WriterSchemaVersion,
+    writerDefinitionHash: WriterProvenance.WriterDefinitionHash
+  }))
+  const CompactCheckpointProvenanceJson = Schema.Struct({
+    checkpointHash: WriterProvenance.ChangeHash,
+    lineage: Identity.DocumentLineage,
+    heads: Schema.Array(Schema.String),
+    base: Schema.TaggedUnion({
+      Bootstrap: {},
+      Heads: { baseHeads: Schema.Array(Schema.String) }
+    }),
+    schemaVersion: WriterProvenance.WriterSchemaVersion,
+    writerDefinitionHash: WriterProvenance.WriterDefinitionHash,
+    authorization: Schema.String
+  })
+  const ManifestValue = Schema.Struct({
+    formatVersion: Backup.FormatVersion,
+    definitionHash: Schema.String,
+    replicaId: Identity.ReplicaId,
+    incarnation: Identity.ReplicaIncarnation,
+    createdAt: Schema.String,
+    recordCount: Schema.mutableKey(Schema.Int),
+    declaredBytes: Schema.mutableKey(Schema.Int)
+  })
+  const DocumentValue = Schema.Struct({
+    document_id: Identity.DocumentId,
+    document_type: Schema.String,
+    schema_version: Schema.mutableKey(Schema.Int),
+    observed_versions: Schema.String,
+    materialized_heads: Schema.String,
+    accepted_heads: Schema.mutableKey(Schema.String),
+    tombstone: Schema.Int,
+    projection_status: Schema.String,
+    checkpoint_hash: Schema.NullOr(Schema.String),
+    lineage: Identity.DocumentLineage,
+    history_changes: Schema.optionalKey(Schema.Unknown),
+    history_operations: Schema.optionalKey(Schema.Unknown),
+    history_bytes: Schema.optionalKey(Schema.Unknown)
+  })
+  const ChangeValue = Schema.Struct({
+    change_hash: Schema.mutableKey(Schema.String),
+    document_id: Schema.String,
+    document_type: Schema.String,
+    writer_schema_version: WriterProvenance.WriterSchemaVersion,
+    writer_definition_hash: WriterProvenance.WriterDefinitionHash,
+    actor: Schema.String,
+    sequence: Schema.Int,
+    dependencies: Schema.String,
+    bytes: Schema.String,
+    applied: Schema.mutableKey(Schema.Int),
+    peer_id: Schema.NullOr(Schema.String),
+    accepted_at: Schema.mutableKey(Schema.String),
+    commit_sequence: Schema.Int
+  })
+  const CheckpointValue = Schema.Struct({
+    checkpoint_hash: Schema.String,
+    document_id: Identity.DocumentId,
+    heads: Schema.String,
+    bytes: Schema.String,
+    checksum: Schema.String,
+    commit_sequence: Schema.Int,
+    verified: Schema.Int,
+    writer_provenance: Schema.optionalKey(
+      Schema.Union([CheckpointProvenanceJson, CompactCheckpointProvenanceJson])
+    ),
+    lineage: Identity.DocumentLineage
+  })
+  const TransitionValue = Schema.Struct({
+    authorization: Schema.NullOr(Schema.String),
+    checkpoint_hash: WriterProvenance.ChangeHash,
+    created_at: Schema.String,
+    document_id: Identity.DocumentId,
+    heads: Schema.String,
+    lineage: Identity.DocumentLineage,
+    prior_checkpoint_hash: WriterProvenance.ChangeHash,
+    prior_heads: Schema.String,
+    prior_lineage: Identity.DocumentLineage,
+    prior_snapshot: Schema.String,
+    schema_version: WriterProvenance.WriterSchemaVersion,
+    writer_definition_hash: WriterProvenance.WriterDefinitionHash
+  })
+  const ReceiptValue = Schema.Struct({
+    replica_incarnation: Identity.ReplicaIncarnation,
+    command_id: Schema.String,
+    request_hash: Schema.String,
+    mutation_name: Schema.String,
+    result: Schema.String,
+    document_id: Schema.String,
+    heads: Schema.String,
+    commit_sequence: Schema.Int
+  })
+  const EndValue = Schema.Struct({
+    recordCount: Schema.mutableKey(Schema.Int),
+    recordsChecksum: Schema.mutableKey(Schema.String)
+  })
+  const ArchiveLine = Schema.Union([
+    Schema.Struct({
+      kind: Schema.Literal("Manifest"),
+      checksum: Schema.mutableKey(Schema.String),
+      value: ManifestValue
+    }),
+    Schema.Struct({
+      kind: Schema.Literal("Document"),
+      checksum: Schema.mutableKey(Schema.String),
+      value: DocumentValue
+    }),
+    Schema.Struct({ kind: Schema.Literal("Change"), checksum: Schema.mutableKey(Schema.String), value: ChangeValue }),
+    Schema.Struct({
+      kind: Schema.Literal("Checkpoint"),
+      checksum: Schema.mutableKey(Schema.String),
+      value: CheckpointValue
+    }),
+    Schema.Struct({
+      kind: Schema.Literal("Transition"),
+      checksum: Schema.mutableKey(Schema.String),
+      value: TransitionValue
+    }),
+    Schema.Struct({ kind: Schema.Literal("Receipt"), checksum: Schema.mutableKey(Schema.String), value: ReceiptValue }),
+    Schema.Struct({ kind: Schema.Literal("End"), checksum: Schema.mutableKey(Schema.String), value: EndValue })
+  ])
+  const ArchiveLineJson = Schema.fromJsonString(ArchiveLine)
   const JsonString = Schema.fromJsonString(Schema.Json)
+  const encodeLine = (line: ArchiveLine) => Schema.encodeSync(ArchiveLineJson)(line)
   const concatenate = (chunks: ReadonlyArray<Uint8Array>) => {
     const length = chunks.reduce((total, chunk) => total + chunk.byteLength, 0)
     const result = new Uint8Array(length)
@@ -59,13 +185,17 @@ describe("SqlReplica", () => {
   }
   const archiveLines = (chunks: ReadonlyArray<Uint8Array>) =>
     new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n").map((line) =>
-      Schema.decodeSync(JsonString)(line)
+      Schema.decodeSync(ArchiveLineJson)(line)
     )
-  const encodeArchive = (lines: Array<any>) =>
+  type ArchiveLine = ReturnType<typeof archiveLines>[number]
+  const encodeArchive = (lines: Array<ArchiveLine>) =>
     Effect.gen(function*() {
-      const manifest = lines[0]!
+      const manifest = lines[0]
       const records = lines.slice(1, -1)
-      const end = lines.at(-1)!
+      const end = lines.at(-1)
+      if (!manifest || !end || manifest.kind !== "Manifest" || end.kind !== "End") {
+        return yield* Effect.die("Malformed archive fixture")
+      }
       for (const record of records) record.checksum = yield* Canonical.digest(record.value)
       end.value.recordCount = records.length
       end.value.recordsChecksum = yield* Canonical.digest(records.map((record) => record.checksum))
@@ -74,14 +204,14 @@ describe("SqlReplica", () => {
       for (let attempt = 0; attempt < 8; attempt++) {
         manifest.checksum = yield* Canonical.digest(manifest.value)
         const encoded = new TextEncoder().encode(
-          `${lines.map((line) => Schema.encodeSync(JsonString)(line)).join("\n")}\n`
+          `${lines.map(encodeLine).join("\n")}\n`
         )
         if (manifest.value.declaredBytes === encoded.byteLength) return encoded
         manifest.value.declaredBytes = encoded.byteLength
       }
       manifest.checksum = yield* Canonical.digest(manifest.value)
       return new TextEncoder().encode(
-        `${lines.map((line) => Schema.encodeSync(JsonString)(line)).join("\n")}\n`
+        `${lines.map(encodeLine).join("\n")}\n`
       )
     })
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
@@ -900,9 +1030,9 @@ describe("SqlReplica", () => {
         return { chunks, omittedId, selectedId }
       }).pipe(Effect.provide(Layer.fresh(ProjectedLive)))
       const lines = archiveLines(archive.chunks)
-      const duplicate = structuredClone(
-        lines.find((line) => line.kind === "Document" && line.value.document_id === archive.omittedId)
-      )
+      const source = lines.find((line) => line.kind === "Document" && line.value.document_id === archive.omittedId)
+      if (source === undefined) return yield* Effect.die("Missing omitted document archive record")
+      const duplicate = structuredClone(source)
       lines.splice(-1, 0, duplicate)
       const tampered = yield* encodeArchive(lines)
       const replica = yield* Replica.Replica
@@ -922,6 +1052,7 @@ describe("SqlReplica", () => {
         yield* sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`,
         before
       )
+      return yield* Effect.void
     }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive))
 
   it.effect("reports malformed selective archive history as BackupInvalid without mutation", () =>
@@ -973,8 +1104,13 @@ describe("SqlReplica", () => {
         return { chunks, omittedId, selectedId }
       }).pipe(Effect.provide(Layer.fresh(ProjectedLive)))
       const lines = archiveLines(archive.chunks)
-      lines.find((line) => line.kind === "Document" && line.value.document_id === archive.omittedId)!.value
-        .accepted_heads = "not-json"
+      const documentLine = lines.find(
+        (line) => line.kind === "Document" && line.value.document_id === archive.omittedId
+      )
+      if (documentLine === undefined || documentLine.kind !== "Document") {
+        return yield* Effect.die("Missing omitted document archive record")
+      }
+      documentLine.value.accepted_heads = "not-json"
       const tampered = yield* encodeArchive(lines)
       const replica = yield* Replica.Replica
 
@@ -987,6 +1123,7 @@ describe("SqlReplica", () => {
       }))
 
       assert.strictEqual(error.reason._tag, "BackupInvalid")
+      return yield* Effect.void
     }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive))
 
   it.effect("reports an unsupported selective archive version as BackupInvalid", () =>
@@ -1028,11 +1165,14 @@ describe("SqlReplica", () => {
         return { chunks, documentId }
       }).pipe(Effect.provide(Layer.fresh(ProjectedLive)))
       const lines = archiveLines(archive.chunks)
-      const manifestChecksum = lines[0]!.checksum
-      const change = lines.find((line) => line.kind === "Change")!
+      const manifest = lines[0]
+      if (!manifest || manifest.kind !== "Manifest") return yield* Effect.die("Malformed archive fixture")
+      const manifestChecksum = manifest.checksum
+      const change = lines.find((line) => line.kind === "Change")
+      if (!change || change.kind !== "Change") return yield* Effect.die("Malformed archive fixture")
       change.value.accepted_at = "2026-01-01T00:00:00.000Z"
       const changed = yield* encodeArchive(lines)
-      assert.strictEqual(lines[0]!.checksum, manifestChecksum)
+      assert.strictEqual(manifest.checksum, manifestChecksum)
       const replica = yield* Replica.Replica
       const sql = yield* SqlClient.SqlClient
       const installationId = yield* Identity.makeBackupInstallationId
@@ -1054,6 +1194,7 @@ describe("SqlReplica", () => {
         yield* sql`SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1`,
         before
       )
+      return yield* Effect.void
     }).pipe(Effect.provide(ProjectedLive), Effect.provide(Database), TestClock.withLive))
 
   it.effect("keeps a selectively installed pruned checkpoint document writable", () =>
@@ -1107,11 +1248,20 @@ describe("SqlReplica", () => {
         return { chunks, documentId }
       }).pipe(Effect.provide(Layer.fresh(DirectLive)))
       const lines = archiveLines(archive.chunks)
-      const checkpoint = lines.find((line) => line.kind === "Checkpoint")!
-      const covered = new Set(
-        checkpoint.value.writer_provenance.map((entry: { readonly changeHash: string }) => entry.changeHash)
+      const checkpoint = lines.find((line) => line.kind === "Checkpoint")
+      if (
+        !checkpoint ||
+        checkpoint.kind !== "Checkpoint" ||
+        !Array.isArray(checkpoint.value.writer_provenance)
+      ) return yield* Effect.die("Malformed checkpoint archive fixture")
+      const covered = new Set(checkpoint.value.writer_provenance.map((entry) => entry.changeHash))
+      const changeLine = lines.find(
+        (line) => line.kind === "Change" && covered.has(line.value.change_hash)
       )
-      lines.find((line) => line.kind === "Change" && covered.has(line.value.change_hash))!.value.applied = 0
+      if (changeLine === undefined || changeLine.kind !== "Change") {
+        return yield* Effect.die("Missing covered change archive record")
+      }
+      changeLine.value.applied = 0
       const tampered = yield* encodeArchive(lines)
       const replica = yield* Replica.Replica
       const sql = yield* SqlClient.SqlClient
@@ -1131,6 +1281,7 @@ describe("SqlReplica", () => {
         before
       )
       assert.deepStrictEqual(yield* sql`SELECT * FROM effect_local_changes`, [])
+      return yield* Effect.void
     }).pipe(Effect.provide(DirectLive), Effect.provide(Database), TestClock.withLive))
 
   it.effect("batches selective change insertion", () => {
