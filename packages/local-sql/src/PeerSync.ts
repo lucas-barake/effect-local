@@ -1087,6 +1087,12 @@ const make = (
           WHERE row_id = ${rowId}
           RETURNING receipt_row_id`
     })
+    const deleteOrphanReceiptReplies = sql`DELETE FROM effect_local_peer_receipt_replies AS reply
+      WHERE receipt_row_id IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM effect_local_peer_outbox AS outbox
+          WHERE outbox.receipt_reply_id = reply.row_id AND outbox.status = 'Pending'
+        )`
     const pruneRelayReceiptsInTransaction = (
       replicaIncarnation: Identity.ReplicaIncarnation,
       expiresAt: string
@@ -1142,12 +1148,7 @@ const make = (
               })
             }
           }
-          yield* sql`DELETE FROM effect_local_peer_receipt_replies AS reply
-            WHERE receipt_row_id IS NULL
-              AND NOT EXISTS (
-                SELECT 1 FROM effect_local_peer_outbox AS outbox
-                WHERE outbox.receipt_reply_id = reply.row_id AND outbox.status = 'Pending'
-              )`
+          yield* deleteOrphanReceiptReplies
           yield* sql`DELETE FROM effect_local_peer_relay_receipt_usage
             WHERE replica_incarnation = ${replicaIncarnation}
               AND receipt_count = 0
@@ -1179,12 +1180,7 @@ const make = (
       yield* sql`DELETE FROM effect_local_peer_receipts
         WHERE relay_message_id IS NULL
           AND (replica_incarnation != ${bootstrap.incarnation} OR accepted_at < ${startupCutoff})`
-      yield* sql`DELETE FROM effect_local_peer_receipt_replies AS reply
-        WHERE receipt_row_id IS NULL
-          AND NOT EXISTS (
-            SELECT 1 FROM effect_local_peer_outbox AS outbox
-            WHERE outbox.receipt_reply_id = reply.row_id AND outbox.status = 'Pending'
-          )`
+      yield* deleteOrphanReceiptReplies
       if (relayReceiptLimits !== null) {
         yield* pruneRelayReceiptsInTransaction(bootstrap.incarnation, startupAt)
       }
@@ -1317,12 +1313,7 @@ const make = (
             AND relay_message_id IS NULL
             AND pending_message IS NOT NULL
             AND accepted_at < ${cutoff}`
-        yield* sql`DELETE FROM effect_local_peer_receipt_replies AS reply
-          WHERE receipt_row_id IS NULL
-            AND NOT EXISTS (
-              SELECT 1 FROM effect_local_peer_outbox AS outbox
-              WHERE outbox.receipt_reply_id = reply.row_id AND outbox.status = 'Pending'
-            )`
+        yield* deleteOrphanReceiptReplies
       }))
 
     // Dominated by `gate.validate` on every path that reaches them, so these are defensive: they keep
@@ -3911,12 +3902,7 @@ const make = (
                 AND peer_id = ${session.peerId}
                 AND connection_epoch = ${session.connectionEpoch}
                 AND relay_message_id IS NULL`
-              yield* sql`DELETE FROM effect_local_peer_receipt_replies AS reply
-              WHERE receipt_row_id IS NULL
-                AND NOT EXISTS (
-                  SELECT 1 FROM effect_local_peer_outbox AS outbox
-                  WHERE outbox.receipt_reply_id = reply.row_id AND outbox.status = 'Pending'
-                )`
+              yield* deleteOrphanReceiptReplies
               yield* Ref.update(generation, (current) => current + 1)
               yield* removeState(session)
             }))).pipe(Effect.catchTag("SqlError", (cause) =>
