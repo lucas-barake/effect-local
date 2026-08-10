@@ -7,11 +7,13 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Arr from "effect/Array"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
 import * as Encoding from "effect/Encoding"
+import * as Equal from "effect/Equal"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Ref from "effect/Ref"
@@ -72,15 +74,6 @@ const ChangeRecord = Schema.Struct({
   commit_sequence: Schema.Int
 })
 
-const BoundedCompactCheckpointProvenance = Schema.Struct({
-  ...WriterProvenance.CompactCheckpointProvenance.fields,
-  authorization: CheckpointAuthority.AuthorizationToken
-})
-const CheckpointProvenance = Schema.Union([
-  WriterProvenance.ChangeProvenances,
-  BoundedCompactCheckpointProvenance
-])
-const StoredCheckpointProvenance = Schema.fromJsonString(Schema.toCodecJson(CheckpointProvenance))
 const EncodedCompactCheckpointProvenance = Schema.Struct({
   ...WriterProvenance.CompactCheckpointProvenance.fields,
   heads: Schema.Array(Schema.String),
@@ -140,13 +133,13 @@ const StoredChangeRecord = Schema.Struct({ ...ChangeRecord.fields, bytes: Schema
 const StoredCheckpointRecord = Schema.Struct({
   ...CheckpointRecord.fields,
   bytes: Schema.Uint8Array,
-  writer_provenance: StoredCheckpointProvenance,
+  writer_provenance: WriterProvenance.StoredCheckpointProvenance,
   lineage: Identity.DocumentLineage
 })
 const DecodedCheckpointRecord = Schema.Struct({
   ...CheckpointRecord.fields,
   bytes: Schema.Uint8Array,
-  writer_provenance: CheckpointProvenance,
+  writer_provenance: WriterProvenance.CheckpointProvenance,
   lineage: Identity.DocumentLineage
 })
 const StoredTransitionRecord = Schema.Struct({
@@ -168,6 +161,7 @@ const ForeignKeyViolationRow = Schema.Struct({
   parent: Schema.String,
   fkid: Schema.Int
 })
+const insertBatchSize = 50
 const JsonString = Schema.fromJsonString(Schema.Unknown)
 const EnvelopeJson = Schema.fromJsonString(Envelope)
 const backupAlreadyInstalled = { _tag: "BackupAlreadyInstalled" } as const
@@ -179,7 +173,7 @@ type RawDecodedRecord =
   | {
     readonly kind: "Checkpoint"
     readonly value: Omit<typeof DecodedCheckpointRecord.Type, "writer_provenance"> & {
-      readonly writer_provenance?: typeof CheckpointProvenance.Type
+      readonly writer_provenance?: WriterProvenance.CheckpointProvenance
     }
   }
   | { readonly kind: "Transition"; readonly value: typeof StoredTransitionRecord.Type }
@@ -681,29 +675,19 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 case "Checkpoint": {
                   const encoded = yield* Schema.decodeUnknownEffect(CheckpointRecord)(record.value)
                   const bytes = yield* decodeBytes(encoded.bytes)
-                  let writerProvenance: typeof CheckpointProvenance.Type | undefined
-                  if (encoded.writer_provenance !== undefined) {
-                    if (isEncodedCompactCheckpoint(encoded.writer_provenance)) {
-                      const authorization = yield* decodeBytes(encoded.writer_provenance.authorization)
-                      writerProvenance = yield* Schema.decodeUnknownEffect(BoundedCompactCheckpointProvenance)({
-                        ...encoded.writer_provenance,
-                        authorization
-                      })
-                      const canonicalHeads = Conflict.normalizeHeads(encoded.writer_provenance.heads)
-                      const canonicalBaseHeads = encoded.writer_provenance.base._tag === "Heads"
-                        ? Conflict.normalizeHeads(encoded.writer_provenance.base.baseHeads)
-                        : undefined
+                  const { writer_provenance: encodedProvenance, ...checkpoint } = encoded
+                  let writerProvenance: WriterProvenance.CheckpointProvenance | undefined
+                  if (encodedProvenance !== undefined) {
+                    if (isEncodedCompactCheckpoint(encodedProvenance)) {
+                      writerProvenance = yield* Schema.decodeUnknownEffect(
+                        WriterProvenance.CompactCheckpointProvenance
+                      )(encodedProvenance)
+                      const encodedBase = encodedProvenance.base
                       if (
-                        encoded.writer_provenance.heads.length !== canonicalHeads.length ||
-                        encoded.writer_provenance.heads.some((head, index) => head !== canonicalHeads[index]) ||
+                        !Equal.equals(Conflict.normalizeHeads(encodedProvenance.heads), encodedProvenance.heads) ||
                         (
-                          encoded.writer_provenance.base._tag === "Heads" &&
-                          (
-                            encoded.writer_provenance.base.baseHeads.length !== canonicalBaseHeads!.length ||
-                            encoded.writer_provenance.base.baseHeads.some(
-                              (head, index) => head !== canonicalBaseHeads![index]
-                            )
-                          )
+                          encodedBase._tag === "Heads" &&
+                          !Equal.equals(Conflict.normalizeHeads(encodedBase.baseHeads), encodedBase.baseHeads)
                         )
                       ) {
                         return yield* new ReplicaError.ReplicaError({
@@ -713,10 +697,9 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                         })
                       }
                     } else {
-                      writerProvenance = encoded.writer_provenance
+                      writerProvenance = encodedProvenance
                     }
                   }
-                  const { writer_provenance: _writerProvenance, ...checkpoint } = encoded
                   decoded.push({
                     kind: "Checkpoint",
                     value: writerProvenance === undefined
@@ -872,12 +855,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                         decoded: Automerge.decodeChange(bytes)
                       }))
                       const declaredHeads = Schema.decodeUnknownSync(Heads)(record.value.heads)
-                        .toSorted(Conflict.compareCodeUnits)
                       const actualHeads = Automerge.getHeads(document).toSorted(Conflict.compareCodeUnits)
-                      if (
-                        declaredHeads.length !== actualHeads.length ||
-                        declaredHeads.some((head, index) => head !== actualHeads[index])
-                      ) throw new TypeError(`Checkpoint heads mismatch: ${record.value.checkpoint_hash}`)
+                      if (!Equal.equals(declaredHeads, actualHeads)) {
+                        throw new TypeError(`Checkpoint heads mismatch: ${record.value.checkpoint_hash}`)
+                      }
                       const changeHashes = checkpointChanges.map((change) => change.decoded.hash).toSorted()
                       const stored = changeProvenanceByDocument.get(record.value.document_id) ?? []
                       const storedDocument = documentById.get(record.value.document_id)
@@ -898,8 +879,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                           provenance.checkpointHash !== record.value.checkpoint_hash ||
                           provenance.lineage !== record.value.lineage ||
                           provenance.schemaVersion !== storedDocument.schema_version ||
-                          provenance.heads.length !== actualHeads.length ||
-                          provenance.heads.some((head, index) => head !== actualHeads[index]) ||
+                          !Equal.equals(provenance.heads, actualHeads) ||
                           Automerge.getMissingDeps(document, []).length !== 0
                         ) throw new TypeError(`Invalid compact checkpoint proof: ${record.value.checkpoint_hash}`)
                       } else {
@@ -1110,8 +1090,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                         const actualHeads = Automerge.getHeads(priorDocument).toSorted(Conflict.compareCodeUnits)
                         if (
                           priorCheckpointHash !== record.value.prior_checkpoint_hash ||
-                          priorHeads.length !== actualHeads.length ||
-                          priorHeads.some((head, index) => head !== actualHeads[index]) ||
+                          !Equal.equals(priorHeads, actualHeads) ||
                           Automerge.getMissingDeps(priorDocument, []).length !== 0
                         ) throw new TypeError(`Invalid transition prior snapshot: ${record.value.lineage}`)
                       },
@@ -1134,8 +1113,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   if (
                     anchor.document_id !== record.value.document_id ||
                     anchor.lineage !== record.value.lineage ||
-                    anchorHeads.length !== resultingHeads.length ||
-                    anchorHeads.some((head, index) => head !== resultingHeads[index])
+                    !Equal.equals(anchorHeads, resultingHeads)
                   ) {
                     return yield* new ReplicaError.ReplicaError({
                       reason: new ReplicaError.BackupInvalid({
@@ -1428,16 +1406,12 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                         : sequence.commit_sequence
                     })
                   )
-                  for (let index = 0; index < installedChanges.length; index += 50) {
-                    yield* sql`INSERT INTO effect_local_changes ${
-                      sql.insert(
-                        installedChanges.slice(index, index + 50)
-                      )
-                    }`
+                  for (const batch of Arr.chunksOf(installedChanges, insertBatchSize)) {
+                    yield* sql`INSERT INTO effect_local_changes ${sql.insert(batch)}`
                   }
                   if (activeCheckpoint !== undefined) {
                     const writerProvenance = yield* Schema.encodeEffect(
-                      StoredCheckpointProvenance
+                      WriterProvenance.StoredCheckpointProvenance
                     )(activeCheckpoint.writer_provenance)
                     yield* sql`INSERT INTO effect_local_checkpoints (
                       checkpoint_hash, document_id, heads, bytes, checksum, commit_sequence,
@@ -1449,10 +1423,8 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                       ${writerProvenance}, ${activeCheckpoint.lineage}
                     )`
                   }
-                  for (let index = 0; index < selectedTransitions.length; index += 50) {
-                    yield* sql`INSERT INTO effect_local_lineage_transitions ${
-                      sql.insert(selectedTransitions.slice(index, index + 50))
-                    }`
+                  for (const batch of Arr.chunksOf(selectedTransitions, insertBatchSize)) {
+                    yield* sql`INSERT INTO effect_local_lineage_transitions ${sql.insert(batch)}`
                   }
                   const invalidationKeys = yield* Schema.encodeEffect(
                     Schema.fromJsonString(Schema.Array(Schema.String))
@@ -1584,7 +1556,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   record.kind === "Checkpoint"
                     ? [{
                       ...record.value,
-                      writer_provenance: Schema.encodeSync(StoredCheckpointProvenance)(
+                      writer_provenance: Schema.encodeSync(WriterProvenance.StoredCheckpointProvenance)(
                         record.value.writer_provenance
                       )
                     }]
@@ -1592,22 +1564,20 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 )
                 const transitions = decoded.flatMap((record) => record.kind === "Transition" ? [record.value] : [])
                 const receipts = decoded.flatMap((record) => record.kind === "Receipt" ? [record.value] : [])
-                for (let index = 0; index < documents.length; index += 50) {
-                  yield* sql`INSERT INTO effect_local_documents ${sql.insert(documents.slice(index, index + 50))}`
+                for (const batch of Arr.chunksOf(documents, insertBatchSize)) {
+                  yield* sql`INSERT INTO effect_local_documents ${sql.insert(batch)}`
                 }
-                for (let index = 0; index < changes.length; index += 50) {
-                  yield* sql`INSERT INTO effect_local_changes ${sql.insert(changes.slice(index, index + 50))}`
+                for (const batch of Arr.chunksOf(changes, insertBatchSize)) {
+                  yield* sql`INSERT INTO effect_local_changes ${sql.insert(batch)}`
                 }
-                for (let index = 0; index < checkpoints.length; index += 50) {
-                  yield* sql`INSERT INTO effect_local_checkpoints ${sql.insert(checkpoints.slice(index, index + 50))}`
+                for (const batch of Arr.chunksOf(checkpoints, insertBatchSize)) {
+                  yield* sql`INSERT INTO effect_local_checkpoints ${sql.insert(batch)}`
                 }
-                for (let index = 0; index < transitions.length; index += 50) {
-                  yield* sql`INSERT INTO effect_local_lineage_transitions ${
-                    sql.insert(transitions.slice(index, index + 50))
-                  }`
+                for (const batch of Arr.chunksOf(transitions, insertBatchSize)) {
+                  yield* sql`INSERT INTO effect_local_lineage_transitions ${sql.insert(batch)}`
                 }
-                for (let index = 0; index < receipts.length; index += 50) {
-                  yield* sql`INSERT INTO effect_local_command_receipts ${sql.insert(receipts.slice(index, index + 50))}`
+                for (const batch of Arr.chunksOf(receipts, insertBatchSize)) {
+                  yield* sql`INSERT INTO effect_local_command_receipts ${sql.insert(batch)}`
                 }
                 const sequences = decoded.flatMap((record) =>
                   "commit_sequence" in record.value ? [record.value.commit_sequence] : []
