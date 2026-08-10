@@ -18,6 +18,7 @@ import {
   X
 } from "lucide-react"
 import { type ChangeEvent, type FormEvent, useEffect, useMemo, useRef, useState } from "react"
+import type { TaskRow } from "./domain.ts"
 import {
   createTask,
   deleteTask,
@@ -254,7 +255,7 @@ export const App = () => {
     return runOperation(operation, () => setNotice("Backup restored"))
   }
 
-  const rows = (() => {
+  const rows: ReadonlyArray<TaskRow> = (() => {
     if (result._tag === "Success") return result.value
     return []
   })()

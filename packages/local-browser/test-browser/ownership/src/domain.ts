@@ -49,6 +49,8 @@ const TaskRow = Schema.Struct({
   updatedAt: Schema.Number
 })
 
+export type TaskRow = typeof TaskRow.Type
+
 export const TaskList = Projection.make("TaskList", {
   document: TaskDocument,
   version: 1,
