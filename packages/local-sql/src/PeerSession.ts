@@ -745,7 +745,29 @@ const makeWithTerminal = (
     const receiveAcknowledged = (delivery: PeerTransport.AcknowledgedDelivery) =>
       Effect.scoped(Effect.gen(function*() {
         const admissionScope = yield* Scope.fork(yield* Scope.Scope)
-        yield* scheduler.background.pipe(Effect.provideService(Scope.Scope, admissionScope))
+        // Same reasoning as the receive quota below: a refused admission is a transient condition,
+        // so failing the session would turn one busy moment into a reconnect loop. The message is
+        // left in relay custody for the next session to retry.
+        const admitted = yield* scheduler.background.pipe(
+          Effect.provideService(Scope.Scope, admissionScope),
+          Effect.as(true),
+          Effect.catchReason(
+            "ReplicaError",
+            "QuotaExceeded",
+            (reason) =>
+              Effect.logWarning(
+                "Peer session parked an inbound message after operation admission was refused; the message stays in relay custody"
+              ).pipe(
+                Effect.annotateLogs({
+                  peerId: connection.peerId,
+                  resource: reason.resource,
+                  limit: reason.limit
+                }),
+                Effect.as(false)
+              )
+          )
+        )
+        if (!admitted) return
         const permit = yield* Effect.scoped(gate.shared)
         const outcome = yield* processReceive(delivery.message, delivery, permit.incarnation).pipe(
           Effect.catchTag("RelayProtocolInvalid", () => Effect.succeed("ProtocolInvalid" as const))

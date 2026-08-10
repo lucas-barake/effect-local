@@ -2952,6 +2952,185 @@ it.layer(Layer.mergeAll(
       )
     }).pipe(Effect.provide(NodeCrypto.layer)))
 
+  it.effect("parks an inbound message and keeps the session alive when operation admission is refused", () =>
+    Effect.gen(function*() {
+      const deliveries = yield* Queue.unbounded<PeerTransport.AcknowledgedDelivery>()
+      const events = yield* Queue.unbounded<string>()
+      const closed = yield* Deferred.make<void>()
+      const rejections = yield* Ref.make<ReadonlyArray<PeerTransport.PermanentRejectReason>>([])
+      const documentId = yield* Identity.makeDocumentId
+      const senderPeerId = yield* Identity.makePeerId
+      const relayPeerId = yield* Identity.makePeerId
+      const message = yield* Effect.acquireUseRelease(
+        Effect.sync(() => Automerge.init()),
+        (document) =>
+          Effect.sync(() => {
+            const encoded = Automerge.generateSyncMessage(document, Automerge.initSyncState())[1]
+            if (encoded === null) throw new TypeError("Expected an initial sync message")
+            return encoded
+          }),
+        (document) => Effect.sync(() => Automerge.free(document))
+      )
+      const messageHash = yield* Canonical.digest(message)
+      const sync = PeerSync.PeerSync.of({
+        withDocumentInvalidation: (_documentId, effect) => effect,
+        invalidateDocument: () => Effect.void,
+        open: (peerId) =>
+          Effect.succeed({
+            peerId,
+            connectionEpoch: "local-epoch",
+            replicaIncarnation: permit.incarnation
+          }),
+        reset: () => Effect.void,
+        generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
+        receive: () => Effect.succeed(result),
+        enqueue: () => Effect.die("unexpected enqueue"),
+        pending: () => Effect.succeed([]),
+        markSent: () => Effect.succeed(true),
+        pruneRelayReceipts: Effect.succeed(0)
+      })
+      const transport = PeerTransport.PeerTransport.of({
+        capabilities: {},
+        connect: () =>
+          Effect.succeed({
+            peerId: senderPeerId,
+            relayPeerId,
+            capabilities: {},
+            receive: Stream.fromQueue(deliveries).pipe(
+              Stream.map((delivery) => ({ _tag: "Durable", delivery }) as const)
+            ),
+            send: () => Effect.void,
+            transient: () => Effect.void,
+            close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
+          })
+      })
+      const publisher = CommitPublisher.CommitPublisher.of({
+        publishPending: Queue.offer(events, "publish").pipe(Effect.as(0)),
+        invalidate: () => Effect.void,
+        subscribe: Effect.succeed({
+          watermark: Identity.CommitSequence.make(0),
+          refreshGeneration: 0,
+          events: Stream.never
+        })
+      })
+      const delivery = (
+        sequence: number,
+        relayMessageId: Identity.RelayMessageId
+      ): Effect.Effect<PeerTransport.AcknowledgedDelivery, ReplicaError.ReplicaError> =>
+        PeerSyncEnvelope.encodeSyncEnvelope({
+          connectionEpoch: "sender-epoch-a",
+          sequence,
+          documentId,
+          documentType: Task.name,
+          messageHash,
+          message,
+          lineage: Identity.genesisLineage,
+          writerProvenance: []
+        }).pipe(
+          Effect.map((bytes) => ({
+            message: bytes,
+            identity: {
+              relayMessageId,
+              relayPeerId,
+              senderTenantId: "tenant",
+              senderSubjectId: "sender",
+              senderPeerId,
+              senderReplicaIncarnation: Identity.ReplicaIncarnation.make(9),
+              messageHash,
+              outerEnvelopeDigest: "a".repeat(64)
+            },
+            receiptRetentionMillis: PeerRelayReceiptLimits.defaults.receiptRetentionMillis,
+            acknowledge: Queue.offer(events, "ack").pipe(Effect.asVoid),
+            reject: (reason) =>
+              Ref.update(rejections, (current) => [...current, reason]).pipe(
+                Effect.andThen(Queue.offer(events, `reject:${reason}`)),
+                Effect.asVoid
+              )
+          }))
+        )
+      yield* Effect.scoped(
+        Effect.gen(function*() {
+          // A scheduler of its own, because the suite's instance is shared and this test has to
+          // drive the background lane to the exact state where the next acquisition is refused
+          // rather than queued.
+          const context = yield* Layer.build(
+            Layer.fresh(
+              ReplicaOperationScheduler.layer.pipe(
+                Layer.provide(ReplicaLimits.layer({ ...gateLimits, maxQueuedRpc: 1 }))
+              )
+            )
+          )
+          const scheduler = Context.get(context, ReplicaOperationScheduler.ReplicaOperationScheduler)
+          // The holder has to be granted before the waiter is forked. Racing them lets the waiter
+          // register while the holder is still queued, which refuses the waiter instead of filling
+          // the queue the refusal under test depends on.
+          const holding = yield* Deferred.make<void>()
+          yield* Effect.forkScoped(Effect.scoped(scheduler.background.pipe(
+            Effect.andThen(Deferred.succeed(holding, undefined)),
+            Effect.andThen(Effect.never)
+          )))
+          yield* Deferred.await(holding)
+          yield* Effect.forkScoped(Effect.scoped(
+            scheduler.background.pipe(Effect.andThen(Effect.never))
+          ))
+          yield* Effect.repeat(
+            scheduler.reservations.pipe(Effect.tap(() => Effect.yieldNow)),
+            { until: (counts) => counts.background === 2 }
+          )
+          assert.isTrue(
+            Exit.isFailure(yield* Effect.exit(Effect.scoped(scheduler.background))),
+            "the background lane is not saturated, so the session would never be refused"
+          )
+
+          yield* PeerSession.makeTestClient(
+            { peerId: senderPeerId, documents: [{ document: Task, documentId }] },
+            () =>
+              Effect.succeed({
+                ApplySync: () => Queue.offer(events, "apply").pipe(Effect.as(result))
+              } as never)
+          ).pipe(Effect.provideService(ReplicaOperationScheduler.ReplicaOperationScheduler, scheduler))
+
+          yield* Queue.offer(
+            deliveries,
+            yield* delivery(0, Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000021"))
+          )
+          yield* Queue.offer(
+            deliveries,
+            yield* delivery(1, Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000022"))
+          )
+          // Deliveries are consumed serially, so a session that failed on the first refusal stops
+          // draining the queue. Racing the drain against the close is what turns a dead session
+          // into an assertion instead of a hang.
+          assert.strictEqual(
+            yield* Effect.raceFirst(
+              Effect.repeat(
+                Queue.size(deliveries).pipe(Effect.tap(() => Effect.yieldNow)),
+                { until: (size) => size === 0 }
+              ).pipe(Effect.as("drained")),
+              Deferred.await(closed).pipe(Effect.as("session terminated"))
+            ),
+            "drained"
+          )
+          assert.isTrue(Option.isNone(yield* Deferred.poll(closed)))
+          assert.deepStrictEqual(yield* Ref.get(rejections), [])
+          // Nothing was applied, acknowledged or rejected: both messages stay in relay custody for
+          // the next session to retry.
+          assert.strictEqual(yield* Queue.size(events), 0)
+        }).pipe(
+          Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
+          Effect.provideService(PeerSync.PeerSync, sync),
+          Effect.provideService(ReplicaGate.ReplicaGate, gate),
+          Effect.provideService(CommitPublisher.CommitPublisher, publisher),
+          Effect.provideService(ReplicaLimits.ReplicaLimits, limits),
+          Effect.provideService(
+            PeerRelayReceiptLimits.PeerRelayReceiptLimits,
+            PeerRelayReceiptLimits.defaults
+          )
+        )
+      )
+    }).pipe(Effect.provide(NodeCrypto.layer)))
+
   it.effect("does not permanently reject relay delivery when local digest infrastructure fails", () =>
     Effect.gen(function*() {
       const deliveries = yield* Queue.unbounded<PeerTransport.AcknowledgedDelivery>()
