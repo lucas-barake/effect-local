@@ -1162,73 +1162,16 @@ const batchedSyncRepliesMigration = Effect.gen(function*() {
       replica_incarnation, peer_id, document_id, message_hash,
       connection_epoch, send_sequence, status
     )`
-  yield* sql`CREATE TEMP TABLE effect_local_migration_15_reply_matches (
-    replica_incarnation INTEGER NOT NULL,
-    peer_id TEXT NOT NULL,
-    connection_epoch TEXT NOT NULL,
-    send_sequence INTEGER NOT NULL,
-    reply_row_id INTEGER NOT NULL,
-    outbox_status TEXT NOT NULL,
-    PRIMARY KEY(replica_incarnation, peer_id, connection_epoch, send_sequence)
-  )`
-  yield* sql`INSERT INTO effect_local_migration_15_reply_matches
-    SELECT outbox.replica_incarnation, outbox.peer_id, outbox.connection_epoch,
-      outbox.send_sequence, MIN(reply.row_id), outbox.status
-    FROM effect_local_peer_outbox AS outbox
-    JOIN effect_local_peer_receipts AS receipt
-      ON receipt.replica_incarnation = outbox.replica_incarnation
-      AND receipt.peer_id = outbox.peer_id
-      AND receipt.document_id = outbox.document_id
-      AND receipt.reply_hash = outbox.message_hash
-    JOIN effect_local_peer_receipt_replies AS reply ON reply.receipt_row_id = receipt.row_id
-    GROUP BY outbox.replica_incarnation, outbox.peer_id, outbox.connection_epoch,
-      outbox.send_sequence, outbox.status`
-  yield* sql`CREATE TEMP TABLE effect_local_migration_15_reply_coverage (
-    reply_row_id INTEGER PRIMARY KEY,
-    has_sent INTEGER NOT NULL
-  )`
-  yield* sql`INSERT INTO effect_local_migration_15_reply_coverage
-    SELECT reply.row_id, MAX(outbox.status = 'Sent')
-    FROM effect_local_peer_receipt_replies AS reply
-    JOIN effect_local_peer_receipts AS receipt ON receipt.row_id = reply.receipt_row_id
-    JOIN effect_local_peer_outbox AS outbox
-      ON outbox.replica_incarnation = receipt.replica_incarnation
-      AND outbox.peer_id = receipt.peer_id
-      AND outbox.document_id = receipt.document_id
-      AND outbox.message_hash = reply.message_hash
-    GROUP BY reply.row_id`
-  yield* sql`UPDATE effect_local_peer_receipt_replies AS reply
-    SET status = 'Sent'
-    WHERE EXISTS (
-      SELECT 1 FROM effect_local_migration_15_reply_coverage AS coverage
-      WHERE coverage.reply_row_id = reply.row_id
-        AND (
-          coverage.has_sent = 1 OR reply.row_id NOT IN (
-            SELECT reply_row_id FROM effect_local_migration_15_reply_matches
-            WHERE outbox_status = 'Pending'
-          )
-        )
-    )`
   yield* sql`UPDATE effect_local_peer_outbox AS outbox
     SET receipt_reply_id = (
-      SELECT match.reply_row_id
-      FROM effect_local_migration_15_reply_matches AS match
-      WHERE match.replica_incarnation = outbox.replica_incarnation
-        AND match.peer_id = outbox.peer_id
-        AND match.connection_epoch = outbox.connection_epoch
-        AND match.send_sequence = outbox.send_sequence
-    )
-    WHERE EXISTS (
-      SELECT 1 FROM effect_local_migration_15_reply_matches AS match
-      WHERE match.replica_incarnation = outbox.replica_incarnation
-        AND match.peer_id = outbox.peer_id
-        AND match.connection_epoch = outbox.connection_epoch
-        AND match.send_sequence = outbox.send_sequence
+      SELECT MIN(reply.row_id)
+      FROM effect_local_peer_receipts AS receipt
+      JOIN effect_local_peer_receipt_replies AS reply ON reply.receipt_row_id = receipt.row_id
+      WHERE receipt.replica_incarnation = outbox.replica_incarnation
+        AND receipt.peer_id = outbox.peer_id
+        AND receipt.document_id = outbox.document_id
+        AND receipt.reply_hash = outbox.message_hash
     )`
-  yield* sql`DROP TABLE effect_local_migration_15_reply_coverage`
-  yield* sql`DROP TABLE effect_local_migration_15_reply_matches`
-  yield* sql`DROP INDEX effect_local_migration_15_outbox_match`
-  yield* sql`DROP INDEX effect_local_migration_15_receipt_match`
   yield* sql`CREATE UNIQUE INDEX effect_local_peer_outbox_receipt_reply
     ON effect_local_peer_outbox(
       replica_incarnation, peer_id, connection_epoch, receipt_reply_id
@@ -1237,6 +1180,32 @@ const batchedSyncRepliesMigration = Effect.gen(function*() {
   yield* sql`CREATE INDEX effect_local_peer_outbox_pending_receipt_reply
     ON effect_local_peer_outbox(receipt_reply_id)
     WHERE status = 'Pending'`
+  yield* sql`WITH coverage AS (
+      SELECT reply.row_id AS reply_row_id, MAX(outbox.status = 'Sent') AS has_sent
+      FROM effect_local_peer_receipt_replies AS reply
+      JOIN effect_local_peer_receipts AS receipt ON receipt.row_id = reply.receipt_row_id
+      JOIN effect_local_peer_outbox AS outbox
+        ON outbox.replica_incarnation = receipt.replica_incarnation
+        AND outbox.peer_id = receipt.peer_id
+        AND outbox.document_id = receipt.document_id
+        AND outbox.message_hash = reply.message_hash
+      GROUP BY reply.row_id
+    )
+    UPDATE effect_local_peer_receipt_replies AS reply
+    SET status = 'Sent'
+    WHERE EXISTS (
+      SELECT 1 FROM coverage
+      WHERE coverage.reply_row_id = reply.row_id
+        AND (
+          coverage.has_sent = 1
+          OR NOT EXISTS (
+            SELECT 1 FROM effect_local_peer_outbox AS outbox
+            WHERE outbox.receipt_reply_id = reply.row_id AND outbox.status = 'Pending'
+          )
+        )
+    )`
+  yield* sql`DROP INDEX effect_local_migration_15_outbox_match`
+  yield* sql`DROP INDEX effect_local_migration_15_receipt_match`
   yield* sql`INSERT INTO effect_local_migration_catalog (migration_id, name, checksum)
     VALUES (15, 'batched_sync_replies', ${batchedSyncRepliesChecksum})`
 })
