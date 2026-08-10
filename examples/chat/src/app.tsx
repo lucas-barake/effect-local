@@ -72,10 +72,11 @@ const Ticks = ({ counterpart, message }: {
   )
 }
 
-const ChatView = ({ conversationId, counterpart, presenceText }: {
+const ChatView = ({ conversationId, counterpart, online, typing }: {
   readonly conversationId: Identity.DocumentId
   readonly counterpart: ChatUser
-  readonly presenceText: string
+  readonly online: boolean
+  readonly typing: boolean
 }) => {
   const result = useAtomValue(Client.messages({ conversationId }))
   const rows: ReadonlyArray<MessageRowUi> = latest(result, [])
@@ -100,7 +101,9 @@ const ChatView = ({ conversationId, counterpart, presenceText }: {
         <UserAvatar user={counterpart} size={38} />
         <div>
           <div className="chat-title">{counterpart.displayName}</div>
-          <div className="chat-presence" data-online={presenceText === "online"}>{presenceText}</div>
+          <div className="chat-presence" data-online={online} data-typing={typing}>
+            {typing ? "typing…" : online ? "online" : "offline"}
+          </div>
         </div>
       </header>
       <ScrollArea.Root className="messages">
@@ -154,7 +157,9 @@ const relayStatusText = {
 
 export const App = () => {
   // The daemons live in the atom graph; mounting is the only involvement React has in them.
+  useAtomMount(Client.awareness)
   useAtomMount(Client.presenceHeartbeat)
+  useAtomMount(Client.typingBeacon)
   useAtomMount(Client.deliveredReceipts)
   useAtomMount(Client.readReceipts)
 
@@ -163,6 +168,7 @@ export const App = () => {
   const selectedId = useAtomValue(Client.selectedCounterpartId)
   const setSelectedId = useAtomSet(Client.selectedCounterpartId)
   const selected = useAtomValue(Client.selectedConversation)
+  const selectedRow = rosterRows.find((row) => row.counterpart.id === selectedId)
 
   const relayTag = relayStatus._tag === "Success" ? relayStatus.value._tag : "Connecting"
 
@@ -204,7 +210,7 @@ export const App = () => {
           </header>
           <ScrollArea.Root className="roster">
             <ScrollArea.Viewport className="roster-viewport">
-              {rosterRows.map(({ counterpart, presenceText, ready, summary }) => {
+              {rosterRows.map(({ counterpart, online, ready, summary, typing }) => {
                 return (
                   <button
                     key={counterpart.id}
@@ -217,12 +223,14 @@ export const App = () => {
                   >
                     <span className="roster-avatar">
                       <UserAvatar user={counterpart} size={44} />
-                      <span className="presence-dot" data-online={presenceText === "online"} />
+                      <span className="presence-dot" data-online={online} />
                     </span>
                     <span className="roster-copy">
                       <span className="roster-name">{counterpart.displayName}</span>
-                      <span className="roster-preview">
-                        {summary?.lastBody === undefined || summary.lastBody === null
+                      <span className="roster-preview" data-typing={typing}>
+                        {typing
+                          ? "typing…"
+                          : summary?.lastBody === undefined || summary.lastBody === null
                           ? "No messages yet"
                           : `${summary.lastAuthor === me.id ? "You: " : ""}${summary.lastBody}`}
                       </span>
@@ -249,8 +257,8 @@ export const App = () => {
             <ChatView
               conversationId={selected.conversationId}
               counterpart={selected.counterpart}
-              presenceText={rosterRows.find((row) => row.counterpart.id === selected.counterpart.id)?.presenceText ??
-                "offline"}
+              online={selectedRow?.online === true}
+              typing={selectedRow?.typing === true}
             />
           )
           : (

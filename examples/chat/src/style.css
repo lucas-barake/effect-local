@@ -210,6 +210,11 @@ body {
   text-overflow: ellipsis;
 }
 
+.roster-preview[data-typing="true"] {
+  color: var(--accent);
+  font-style: italic;
+}
+
 .roster-side {
   display: flex;
   flex-direction: column;
@@ -282,6 +287,11 @@ body {
 
 .chat-presence[data-online="true"] {
   color: var(--accent);
+}
+
+.chat-presence[data-typing="true"] {
+  color: var(--accent);
+  font-style: italic;
 }
 
 .messages {

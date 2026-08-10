@@ -7,6 +7,7 @@ import * as Projection from "@lucas-barake/effect-local/Projection"
 import * as Query from "@lucas-barake/effect-local/Query"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import type * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Transient from "@lucas-barake/effect-local/Transient"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
@@ -14,21 +15,18 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 
 /**
- * A conversation is one flat record. Message entries live under `msg:<uuid>` keys and presence
- * entries under `presence:<user>` keys, so every key has exactly one creator: the sender creates
- * its message entries, each user creates only its own presence entry, and the recipient only
- * assigns scalar fields (`deliveredAtMillis`, `readAtMillis`) inside entries the sender created.
- * That keeps every concurrent edit register-level and single-writer, so no merge can orphan a
- * container.
+ * A conversation is one flat record keyed by message id, so every key has exactly one creator: the
+ * sender creates the entry, and the recipient only assigns scalar fields (`deliveredAtMillis`,
+ * `readAtMillis`) inside an entry the sender created. That keeps every concurrent edit
+ * register-level and single-writer, so no merge can orphan a container.
+ *
+ * Only state that must survive a disconnect lives here. Presence and typing are transient (see
+ * `Activity` below) and never touch the document, its history, or the relay's durable inboxes.
  */
-
-const messageKey = (messageId: string) => `msg:${messageId}`
-const presenceKey = (userId: string) => `presence:${userId}`
 
 const MessageBody = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4000))
 
 const MessageEntry = Schema.Struct({
-  kind: Schema.Literal("message"),
   author: Schema.String,
   body: MessageBody,
   sentAtMillis: Schema.Number,
@@ -36,16 +34,23 @@ const MessageEntry = Schema.Struct({
   readAtMillis: Schema.NullOr(Schema.Number)
 })
 
-const PresenceEntry = Schema.Struct({
-  kind: Schema.Literal("presence"),
-  lastSeenAtMillis: Schema.Number
+export const Conversation = Document.make("Conversation", {
+  schema: Schema.Record(Schema.String, MessageEntry),
+  version: 1
 })
 
-const Entry = Schema.Union([MessageEntry, PresenceEntry])
+/**
+ * Awareness the counterpart should stop believing the moment the sender goes away. Both variants
+ * are fieldless on purpose: a transient message carries the authenticated sender peer id from the
+ * live relay session, so the payload never has to claim who sent it and could not be trusted if it
+ * did. Expiry is the receiver's job.
+ */
+export class Present extends Schema.TaggedClass<Present>()("Present", {}) {}
+export class Typing extends Schema.TaggedClass<Typing>()("Typing", {}) {}
 
-export const Conversation = Document.make("Conversation", {
-  schema: Schema.Record(Schema.String, Entry),
-  version: 1
+export const Activity = Transient.make("Activity", {
+  document: Conversation,
+  payload: Schema.Union([Present, Typing])
 })
 
 export const SendMessage = Mutation.make("SendMessage", {
@@ -67,11 +72,6 @@ export const MarkRead = Mutation.make("MarkRead", {
   payload: { messageId: Schema.String }
 })
 
-export const Heartbeat = Mutation.make("Heartbeat", {
-  document: Conversation,
-  payload: { userId: Schema.String }
-})
-
 const MessageRow = Schema.Struct({
   messageId: Schema.String,
   sourceDocumentId: Identity.DocumentId,
@@ -88,44 +88,15 @@ export const Messages = Projection.make("Messages", {
   Row: MessageRow,
   key: (row) => row.messageId,
   project: (snapshot) =>
-    Object.entries(snapshot.value).flatMap(([key, entry]) =>
-      entry.kind === "message"
-        ? [{
-          messageId: key.slice("msg:".length),
-          sourceDocumentId: snapshot.documentId,
-          author: entry.author,
-          body: entry.body,
-          sentAtMillis: entry.sentAtMillis,
-          deliveredAtMillis: entry.deliveredAtMillis,
-          readAtMillis: entry.readAtMillis
-        }]
-        : []
-    )
-})
-
-const PresenceRow = Schema.Struct({
-  key: Schema.String,
-  sourceDocumentId: Identity.DocumentId,
-  userId: Schema.String,
-  lastSeenAtMillis: Schema.Number
-})
-
-const Presence = Projection.make("Presence", {
-  document: Conversation,
-  version: 1,
-  Row: PresenceRow,
-  key: (row) => row.key,
-  project: (snapshot) =>
-    Object.entries(snapshot.value).flatMap(([key, entry]) =>
-      entry.kind === "presence"
-        ? [{
-          key: `${snapshot.documentId}:${key.slice("presence:".length)}`,
-          sourceDocumentId: snapshot.documentId,
-          userId: key.slice("presence:".length),
-          lastSeenAtMillis: entry.lastSeenAtMillis
-        }]
-        : []
-    )
+    Object.entries(snapshot.value).map(([messageId, entry]) => ({
+      messageId,
+      sourceDocumentId: snapshot.documentId,
+      author: entry.author,
+      body: entry.body,
+      sentAtMillis: entry.sentAtMillis,
+      deliveredAtMillis: entry.deliveredAtMillis,
+      readAtMillis: entry.readAtMillis
+    }))
 })
 
 export const ListMessages = Query.make("ListMessages", {
@@ -148,11 +119,6 @@ export const ConversationSummaries = Query.make("ConversationSummaries", {
   dependsOn: [Messages]
 })
 
-export const PresenceSnapshot = Query.make("PresenceSnapshot", {
-  success: Schema.Array(PresenceRow),
-  dependsOn: [Presence]
-})
-
 const UndeliveredRow = Schema.Struct({
   messageId: Schema.String,
   conversationId: Identity.DocumentId
@@ -167,9 +133,10 @@ export const UndeliveredInbound = Query.make("UndeliveredInbound", {
 export const definition = ReplicaDefinition.make({
   name: "effect-local-chat",
   documents: DocumentSet.make(Conversation),
-  mutations: [SendMessage, MarkDelivered, MarkRead, Heartbeat],
-  projections: [Messages, Presence],
-  queries: [ListMessages, ConversationSummaries, PresenceSnapshot, UndeliveredInbound]
+  mutations: [SendMessage, MarkDelivered, MarkRead],
+  projections: [Messages],
+  queries: [ListMessages, ConversationSummaries, UndeliveredInbound],
+  transients: [Activity]
 })
 
 const MessagesSql = SqlProjection.make(Messages, {
@@ -199,27 +166,7 @@ const MessagesSql = SqlProjection.make(Messages, {
     )`.pipe(Effect.asVoid)
 })
 
-const PresenceSql = SqlProjection.make(Presence, {
-  table: "chat_presence_v1",
-  migrations: [{
-    id: 1,
-    name: "chat_presence_v1",
-    run: (sql, table) =>
-      sql`CREATE TABLE IF NOT EXISTS ${sql(table)} (
-        key TEXT PRIMARY KEY,
-        conversation_id TEXT NOT NULL,
-        user_id TEXT NOT NULL,
-        last_seen_at REAL NOT NULL
-      )`.pipe(Effect.asVoid)
-  }],
-  deleteByDocument: (sql, table, documentId) =>
-    sql`DELETE FROM ${sql(table)} WHERE conversation_id = ${documentId}`.pipe(Effect.asVoid),
-  insert: (sql, table, row) =>
-    sql`INSERT INTO ${sql(table)} (key, conversation_id, user_id, last_seen_at)
-      VALUES (${row.key}, ${row.sourceDocumentId}, ${row.userId}, ${row.lastSeenAtMillis})`.pipe(Effect.asVoid)
-})
-
-export const sqlProjections = [MessagesSql, PresenceSql]
+export const sqlProjections = [MessagesSql]
 
 const ListMessagesSql = SqlSchema.findAll({
   Request: ListMessages.payloadSchema,
@@ -261,16 +208,6 @@ const ConversationSummariesSql = SqlSchema.findAll({
     )
 })
 
-const PresenceSnapshotSql = SqlSchema.findAll({
-  Request: Schema.Void,
-  Result: PresenceRow,
-  execute: () =>
-    SqlClient.SqlClient.use((sql) =>
-      sql`SELECT key, conversation_id AS sourceDocumentId, user_id AS userId, last_seen_at AS lastSeenAtMillis
-      FROM chat_presence_v1`
-    )
-})
-
 const UndeliveredInboundSql = SqlSchema.findAll({
   Request: UndeliveredInbound.payloadSchema,
   Result: UndeliveredRow,
@@ -285,10 +222,8 @@ const UndeliveredInboundSql = SqlSchema.findAll({
 
 export const DomainLive = Layer.mergeAll(
   SendMessage.toLayer(({ draft, payload }) => {
-    const key = messageKey(payload.messageId)
-    if (draft[key] !== undefined) return undefined
-    draft[key] = {
-      kind: "message",
+    if (draft[payload.messageId] !== undefined) return undefined
+    draft[payload.messageId] = {
       author: payload.author,
       body: payload.body,
       sentAtMillis: Date.now(),
@@ -298,32 +233,21 @@ export const DomainLive = Layer.mergeAll(
     return undefined
   }),
   MarkDelivered.toLayer(({ draft, payload }) => {
-    const entry = draft[messageKey(payload.messageId)]
-    if (entry === undefined || entry.kind !== "message" || entry.deliveredAtMillis !== null) return undefined
+    const entry = draft[payload.messageId]
+    if (entry === undefined || entry.deliveredAtMillis !== null) return undefined
     entry.deliveredAtMillis = Date.now()
     return undefined
   }),
   MarkRead.toLayer(({ draft, payload }) => {
-    const entry = draft[messageKey(payload.messageId)]
-    if (entry === undefined || entry.kind !== "message") return undefined
+    const entry = draft[payload.messageId]
+    if (entry === undefined) return undefined
     const now = Date.now()
     if (entry.deliveredAtMillis === null) entry.deliveredAtMillis = now
     if (entry.readAtMillis === null) entry.readAtMillis = now
     return undefined
   }),
-  Heartbeat.toLayer(({ draft, payload }) => {
-    const key = presenceKey(payload.userId)
-    const entry = draft[key]
-    if (entry !== undefined && entry.kind === "presence") {
-      entry.lastSeenAtMillis = Date.now()
-      return undefined
-    }
-    draft[key] = { kind: "presence", lastSeenAtMillis: Date.now() }
-    return undefined
-  }),
   ListMessages.toLayer((payload) => ListMessagesSql(payload).pipe(Effect.orDie)),
   ConversationSummaries.toLayer((payload) => ConversationSummariesSql(payload).pipe(Effect.orDie)),
-  PresenceSnapshot.toLayer(() => PresenceSnapshotSql(undefined).pipe(Effect.orDie)),
   UndeliveredInbound.toLayer((payload) => UndeliveredInboundSql(payload).pipe(Effect.orDie))
 )
 
@@ -356,8 +280,11 @@ export const limits: ReplicaLimits.Values = {
   maxPendingDependencyEdgesPerPeer: 200_000,
   maxPendingDependencyEdgesPerReplica: 500_000,
   maxSessions: 32,
-  maxStreamsPerSession: 32,
-  maxInFlightPerSession: 128,
+  // Page to owner streams, not relay sessions. A tab holds the invalidation stream, one activity
+  // stream per conversation (each transient client opens its own), and one delivery stream per
+  // rendered outbound message — so this has to clear the longest conversation on screen.
+  maxStreamsPerSession: 256,
+  maxInFlightPerSession: 512,
   maxQueuedRpc: 1_024,
   maxQueuedPermits: 1_024,
   maxActiveRestores: 1_024,

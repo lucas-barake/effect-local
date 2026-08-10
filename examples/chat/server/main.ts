@@ -175,10 +175,11 @@ const Relay = RelayServer.layer({
   entityCallTimeout: Duration.seconds(30),
   inbox: {
     maxDeliveries: 64,
-    // Presence heartbeats stream through the same inboxes as messages, and an offline user keeps
-    // accumulating them; a chat message must survive a recipient who is gone for hours. The
-    // handshake requires receiptRetention (client default 8d) >= max(messageTtl, retryHorizon 7d)
-    // + terminalRetention, so the day long TTL leaves 12h of terminal retention inside the window.
+    // Only messages and receipts reach these inboxes — presence and typing go over the transient
+    // channel, which never stores anything — but a chat message must still survive a recipient who
+    // is gone for hours. The handshake requires receiptRetention (client default 8d) >=
+    // max(messageTtl, retryHorizon 7d) + terminalRetention, so the day long TTL leaves 12h of
+    // terminal retention inside the window.
     messageTtl: Duration.days(1),
     terminalRetention: Duration.hours(12),
     sessionDeadline: Duration.seconds(90),

@@ -6,7 +6,7 @@ concern.
 
 - Text-only 1:1 conversations between four hardcoded users (every pair is a conversation)
 - WhatsApp-style delivery ticks per message: clock, one gray tick, two gray ticks, two blue ticks
-- Online / last-seen presence, unread counts, conversation previews
+- Presence and typing indicators over the transient channel, unread counts, conversation previews
 - Multi-tab: tabs of one user share a single replica through a `SharedWorker` and OPFS
 - A Node relay server persisting custody in Postgres, exporting OTEL traces to Jaeger
 - React + [Base UI](https://base-ui.com) + `@effect/atom-react`, synced over the Effect Local RPC
@@ -64,14 +64,16 @@ fully offline-capable.
 ### The document is a flat record
 
 ```
-{ "msg:<uuid>":       { kind: "message", author, body, sentAtMillis, deliveredAtMillis, readAtMillis }
-, "presence:<user>":  { kind: "presence", lastSeenAtMillis } }
+{ "<message uuid>": { author, body, sentAtMillis, deliveredAtMillis, readAtMillis } }
 ```
 
-Every key has exactly one creator — senders create their message entries, each user writes only its
-own presence entry — and the recipient only assigns scalar fields inside entries the sender created.
-Concurrent edits are register-level and single-writer, so no merge can orphan a container. SQL
-projections (`chat_messages_v1`, `chat_presence_v1`) turn the record into rows the queries read.
+Every key has exactly one creator — the sender creates the entry, and the recipient only assigns
+scalar fields inside an entry the sender created. Concurrent edits are register-level and
+single-writer, so no merge can orphan a container. The `chat_messages_v1` SQL projection turns the
+record into the rows the queries read.
+
+Only state that must survive a disconnect is in here. Awareness is not, which is what keeps the
+document small enough to stay cheap to sync.
 
 ### Ticks
 
@@ -86,12 +88,38 @@ The sync layer only ever proves relay custody back to the sender; delivery and r
 ordinary document data flowing back through the same sync, which is exactly how they stay correct
 offline.
 
-### Presence
+### Presence and typing are transient
 
-There is no transport-level presence: an open app heartbeats `presence:<user>` into each of its
-conversations, and the counterpart thresholds `lastSeenAtMillis` into "online" or "last seen".
-Awareness that must survive is document data — the heartbeats also make convenient live traffic to
-watch in Jaeger.
+`Activity` is a `Transient.make` contract registered on the replica definition, carrying a union of
+two fieldless events:
+
+```ts
+export class Present extends Schema.TaggedClass<Present>()("Present", {}) {}
+export class Typing extends Schema.TaggedClass<Typing>()("Typing", {}) {}
+
+export const Activity = Transient.make("Activity", { document: Conversation, payload: Schema.Union([Present, Typing]) })
+```
+
+A transient message rides the same authenticated relay session as a document push, but it has no
+outbox, no custody, no receipt, no settlement, and no replay. It never enters the document, its
+Automerge history, or the relay's Postgres inboxes. An open tab beats `Present` at every counterpart
+every 5 seconds, and the composer beats `Typing` while a draft exists, throttled so that a fast
+typist cannot outrun the relay's per-session token bucket.
+
+Two consequences follow from having no durability, and both are deliberate:
+
+- **The sender is the session, not the payload.** Both events are fieldless. A receiver reads the
+  sender from `message.peerId`, which the relay authenticated, so a payload cannot claim to be
+  someone else.
+- **Expiry belongs to the receiver.** Nothing tells you a peer went away; beats simply stop. Each
+  replica believes an entry for 12 seconds (two missed beats), and a typing entry for 5. That is why
+  "last seen at 14:32" is gone from the UI: nothing durable is recorded, so nothing can be claimed
+  about an absent peer.
+
+The typing beacon reads the draft as a stream rather than through the atom graph, so a keystroke
+does not rebuild the pipeline and the throttle bucket survives the burst. `strategy: "enforce"`
+drops what does not fit instead of queueing it, which is also what ends the indicator: the last
+keystroke before a pause is usually the dropped one, and the counterpart's window expires.
 
 ### One relay channel per conversation
 

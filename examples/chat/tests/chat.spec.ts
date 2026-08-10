@@ -230,6 +230,45 @@ test(
   }
 )
 
+test(
+  "presence and typing travel over the transient channel and leave no durable trace",
+  async ({ browser }, testInfo) => {
+    const aliceContext = await browser.newContext()
+    const bobContext = await browser.newContext()
+    const captures: Array<FailureCapture> = []
+    try {
+      const alice = await openUserPage(aliceContext, "alice", "alice", testInfo, captures)
+      const bob = await openUserPage(bobContext, "bob", "bob", testInfo, captures)
+      await alice.getByTestId("conversation-bob").click()
+      await bob.getByTestId("conversation-alice").click()
+      await Promise.all([alice, bob].map(waitForPresenceOrOwnerError))
+
+      // Typing is published from the composer, never from a mutation, so nothing is sent.
+      await alice.getByPlaceholder("Message Bob").fill("still deciding what to say")
+      await expect(bob.locator(".chat-presence")).toHaveText("typing…", { timeout: 20_000 })
+      await expect(bob.getByTestId("conversation-alice")).toContainText("typing…")
+
+      // The beacon only beats while a draft exists, so the counterpart's window expires on its own.
+      await alice.getByPlaceholder("Message Bob").fill("")
+      await expect(bob.locator(".chat-presence")).toHaveText("online", { timeout: 20_000 })
+      await expect(bob.locator(".bubble")).toHaveCount(0)
+
+      // A transient value has no outbox and no replay, so a closed device simply goes dark.
+      await Promise.all(captures.map((capture) => capture.attach()))
+      await aliceContext.close()
+      await expect(bob.locator(".chat-presence")).toHaveText("offline", { timeout: 30_000 })
+      await expect(bob.locator(".bubble")).toHaveCount(0)
+
+      await Promise.all(captures.map((capture) => capture.expectClean()))
+    } finally {
+      await Promise.all([
+        aliceContext.close(),
+        closeWithEvidence(bobContext, captures)
+      ])
+    }
+  }
+)
+
 test("two already open tabs observe one new local commit", async ({ browser }, testInfo) => {
   const context = await browser.newContext()
   const captures: Array<FailureCapture> = []

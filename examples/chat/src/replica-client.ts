@@ -4,6 +4,9 @@ import * as OwnershipCoordinator from "@lucas-barake/effect-local-browser/Owners
 import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import type * as Transient from "@lucas-barake/effect-local/Transient"
+import * as Clock from "effect/Clock"
 import type * as Crypto from "effect/Crypto"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
@@ -15,19 +18,27 @@ import * as Stream from "effect/Stream"
 import { Atom } from "effect/unstable/reactivity"
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import {
+  Activity,
   Conversation,
   ConversationSummaries,
   definition,
-  Heartbeat,
   ListMessages,
   MarkDelivered,
   MarkRead,
   Messages,
-  PresenceSnapshot,
+  Present,
   SendMessage,
+  Typing,
   UndeliveredInbound
 } from "./shared/domain.ts"
-import { type ChatUser, conversationIdFor, counterpartsOf, engineGeneration, userById } from "./shared/identities.ts"
+import {
+  type ChatUser,
+  conversationIdFor,
+  counterpartsOf,
+  endpointFor,
+  engineGeneration,
+  userById
+} from "./shared/identities.ts"
 
 const params = new URL(window.location.href).searchParams
 export const me = userById(params.get("user") ?? "")
@@ -97,7 +108,6 @@ const runtime = Atom.runtime(ReplicaLive)
 
 const conversationSummaries = ReplicaAtom.queryFamily(runtime, ConversationSummaries)
 export const messages = ReplicaAtom.queryFamily(runtime, ListMessages)
-const presenceSnapshot = ReplicaAtom.queryFamily(runtime, PresenceSnapshot)
 export const commandDelivery = ReplicaAtom.commandDeliveryFamily(runtime)
 export const relayConnectionStatus = ReplicaAtom.relayConnectionStatus(runtime)
 
@@ -137,6 +147,29 @@ const conversations = Atom.readable((get) => {
   ) return previous.value
   return next
 })
+
+/**
+ * The endpoint identity each counterpart presents on the channel it shares with me. A transient
+ * message names its sender with the peer id the relay authenticated, so this is what turns an
+ * inbound activity message into a roster row — the payload itself never claims a sender.
+ */
+const peerIdOf = (counterpartId: string) => endpointFor(counterpartId, me.id).principal.peerId
+
+const counterpartByPeerId = new Map(
+  counterpartsOf(me.id).map((counterpart) => [peerIdOf(counterpart.id), counterpart.id])
+)
+
+interface ActivityTarget {
+  readonly conversationId: Identity.DocumentId
+  readonly peerId: Identity.PeerId
+}
+
+const activityTargets = (
+  conversationMap: ReadonlyMap<string, { readonly conversationId: Identity.DocumentId; readonly ready: boolean }>
+): ReadonlyArray<ActivityTarget> =>
+  [...conversationMap].flatMap(([counterpartId, conversation]) =>
+    conversation.ready ? [{ conversationId: conversation.conversationId, peerId: peerIdOf(counterpartId) }] : []
+  )
 
 /** The counterpart whose conversation is on screen. Written by the roster, read by the daemons. */
 export const selectedCounterpartId = Atom.make<string | undefined>(undefined)
@@ -198,19 +231,60 @@ export const sendMessage = Atom.family((conversationId: Identity.DocumentId) =>
 const latest = <A, E,>(result: AsyncResult.AsyncResult<A, E>, fallback: A): A =>
   AsyncResult.getOrElse(result, () => fallback)
 
-const ONLINE_WINDOW_MILLIS = 45_000
+const PRESENCE_BEAT_INTERVAL = Duration.seconds(5)
+const TYPING_BEAT_INTERVAL = Duration.seconds(2)
+/** Two missed beats. Long enough to ride out a reconnect, short enough that a closed tab goes dark. */
+const ONLINE_WINDOW_MILLIS = 12_000
+const TYPING_WINDOW_MILLIS = 5_000
 
-const timeOf = (millis: number) => new Date(millis).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-
-const lastSeenText = (lastSeenAtMillis: number | undefined, now: number) => {
-  if (lastSeenAtMillis === undefined) return "offline"
-  if (now - lastSeenAtMillis < ONLINE_WINDOW_MILLIS) return "online"
-  return `last seen ${timeOf(lastSeenAtMillis)}`
+interface Awareness {
+  readonly presentAtMillis: number
+  readonly typingAtMillis: number
 }
+
+const noAwareness: ReadonlyMap<string, Awareness> = new Map()
+
+/**
+ * What the counterparts are doing right now, accumulated from the transient activity channel.
+ *
+ * Nothing here is durable, and that is the point: a transient message has no outbox, no custody, no
+ * receipt, and no replay, so it never enters the document, its Automerge history, or the relay's
+ * store-and-forward inboxes. The cost is that the channel says nothing about an absent peer, so
+ * expiry is this replica's own job — an entry is only believed for as long as beats keep arriving.
+ */
+export const awareness = runtime.atom((get) => {
+  const targets = activityTargets(get(conversations))
+  if (targets.length === 0) return Stream.empty
+  return Activity.client.pipe(
+    Effect.map((forConversation) =>
+      Stream.mergeAll(
+        targets.map((target) => forConversation(target.conversationId).messages),
+        { concurrency: "unbounded" }
+      )
+    ),
+    Stream.unwrap,
+    Stream.mapEffect((message) =>
+      Effect.map(
+        Clock.currentTimeMillis,
+        (atMillis) => ({ peerId: message.peerId, payload: message.payload, atMillis })
+      )
+    ),
+    Stream.scan(noAwareness, (state, { atMillis, payload, peerId }) => {
+      const counterpartId = counterpartByPeerId.get(peerId)
+      if (counterpartId === undefined) return state
+      const previous = state.get(counterpartId)
+      return new Map(state).set(counterpartId, {
+        presentAtMillis: atMillis,
+        typingAtMillis: payload._tag === "Typing" ? atMillis : previous?.typingAtMillis ?? 0
+      })
+    }),
+    Stream.tapCause((cause) => Effect.logWarning("activity channel failed", cause))
+  )
+}, { initialValue: noAwareness })
 
 export const roster = Atom.readable((get) => {
   const summaries = latest(get(conversationSummaries({ me: me.id })), [])
-  const presenceRows = latest(get(presenceSnapshot()), [])
+  const activity = latest(get(awareness), noAwareness)
   const conversationMap = get(conversations)
   const now = latest(get(nowMillis), Date.now())
   const byConversation = new Map(summaries.map((summary) => [summary.conversationId, summary]))
@@ -218,33 +292,29 @@ export const roster = Atom.readable((get) => {
   return counterpartsOf(me.id)
     .map((counterpart) => {
       const conversation = conversationMap.get(counterpart.id)
-      const presence = presenceRows.find((candidate) =>
-        candidate.sourceDocumentId === conversation?.conversationId && candidate.userId === counterpart.id
-      )
+      const seen = activity.get(counterpart.id)
       return {
         counterpart,
         conversationId: conversation?.conversationId,
         ready: conversation?.ready === true,
-        presenceText: lastSeenText(presence?.lastSeenAtMillis, now),
+        online: seen !== undefined && now - seen.presentAtMillis < ONLINE_WINDOW_MILLIS,
+        typing: seen !== undefined && now - seen.typingAtMillis < TYPING_WINDOW_MILLIS,
         summary: conversation === undefined ? undefined : byConversation.get(conversation.conversationId)
       }
     })
     .toSorted((left, right) => (right.summary?.lastSentAtMillis ?? 0) - (left.summary?.lastSentAtMillis ?? 0))
 })
 
-const beatConversations = (conversationIdList: ReadonlyArray<Identity.DocumentId>) =>
-  Effect.gen(function*() {
-    const replica = yield* Replica.Replica
-    yield* Effect.forEach(conversationIdList, (conversationId) =>
-      Effect.flatMap(Identity.makeCommandId, (commandId) =>
-        replica.mutate(Heartbeat, { commandId, documentId: conversationId, payload: { userId: me.id } })), {
-      discard: true
-    })
-    // The reactive daemons cancel their previous run whenever a watched atom updates — which their
-    // own commits cause. An interrupted mutate can have committed without ever reaching the relay
-    // push stream, silently stranding the change on this replica, so a beat in flight always runs
-    // to completion.
-  }).pipe(Effect.uninterruptible)
+/**
+ * A counterpart that is not connected has no live relay route, and a burst of beats can outrun the
+ * relay's per-session token bucket. Neither is a fault of this replica: awareness that cannot be
+ * delivered is awareness the counterpart is right to not have.
+ */
+const publishQuietly = (publish: Effect.Effect<void, ReplicaError.ReplicaError>) =>
+  publish.pipe(
+    Effect.catchReason("ReplicaError", "StorageUnavailable", () => Effect.logDebug("no live route for the beat")),
+    Effect.catchReason("ReplicaError", "QuotaExceeded", () => Effect.logDebug("relay paced the beat"))
+  )
 
 /**
  * `runtime.atom` for the mounted daemons. The daemons are mounted fire-and-forget, so a failure
@@ -253,7 +323,7 @@ const beatConversations = (conversationIdList: ReadonlyArray<Identity.DocumentId
  */
 const daemonAtom = <A, E,>(
   label: string,
-  create: (get: Atom.AtomContext) => Effect.Effect<A, E, Replica.Replica | Crypto.Crypto>
+  create: (get: Atom.AtomContext) => Effect.Effect<A, E, Replica.Replica | Crypto.Crypto | Transient.Transient>
 ) =>
   runtime.atom((get) =>
     create(get).pipe(
@@ -262,26 +332,58 @@ const daemonAtom = <A, E,>(
   )
 
 /**
- * Presence heartbeat: while mounted, an open app writes `presence:<me>` into every conversation on
- * an interval. Duplicate beats from several tabs collapse in the document — each user's presence
- * is one key only that user writes.
+ * Presence heartbeat: while mounted, an open app announces itself to every counterpart on an
+ * interval. Several tabs of one user beat independently and the counterpart cannot tell, because a
+ * beat carries no state to conflict over.
  */
 export const presenceHeartbeat = daemonAtom("presence heartbeat", (get) =>
   Effect.gen(function*() {
-    const conversationIdList = [...get(conversations).values()].flatMap((conversation) =>
-      conversation.ready ? [conversation.conversationId] : []
-    )
-    if (conversationIdList.length === 0) return
-    yield* beatConversations(conversationIdList).pipe(
-      Effect.andThen(Effect.sleep(Duration.seconds(15))),
+    const targets = activityTargets(get(conversations))
+    if (targets.length === 0) return
+    const forConversation = yield* Activity.client
+    yield* Effect.forEach(
+      targets,
+      (target) => publishQuietly(forConversation(target.conversationId).publish(target.peerId, new Present())),
+      { concurrency: "unbounded", discard: true }
+    ).pipe(
+      Effect.andThen(Effect.sleep(PRESENCE_BEAT_INTERVAL)),
       Effect.forever
     )
   }).pipe(
     // Readiness changes can restart this atom while the profile is being provisioned. Once ready,
-    // ordinary document commits preserve the readiness map identity and the loop keeps its cadence.
+    // the readiness map keeps its identity and the loop keeps its cadence — and unlike the durable
+    // heartbeat this replaced, a beat commits nothing, so the loop can no longer restart itself.
     Effect.tapCause((cause) => Effect.logWarning("presence heartbeat restarting", cause)),
-    Effect.retry({ schedule: Schedule.spaced(Duration.seconds(15)) })
+    Effect.retry({ schedule: Schedule.spaced(PRESENCE_BEAT_INTERVAL) })
   ))
+
+/**
+ * Typing indicator: beats while the open conversation has an unsent draft.
+ *
+ * The draft is read as a stream rather than through `get`, so a keystroke does not rebuild this
+ * atom and the token bucket survives the whole typing burst. `enforce` drops what does not fit
+ * instead of queueing it, which is also what makes the indicator end: the last keystroke before a
+ * pause is usually dropped, and the counterpart's window simply expires.
+ */
+export const typingBeacon = runtime.atom((get) => {
+  const selected = get(selectedConversation)
+  if (selected === undefined) return Stream.empty
+  return Activity.client.pipe(
+    Effect.map((forConversation) =>
+      Atom.toStream(draft(selected.conversationId)).pipe(
+        Stream.filter((text) => text.trim().length > 0),
+        Stream.throttle({ cost: () => 1, units: 1, duration: TYPING_BEAT_INTERVAL, strategy: "enforce" }),
+        Stream.mapEffect(() =>
+          publishQuietly(
+            forConversation(selected.conversationId).publish(peerIdOf(selected.counterpart.id), new Typing())
+          )
+        )
+      )
+    ),
+    Stream.unwrap,
+    Stream.tapCause((cause) => Effect.logWarning("typing beacon failed", cause))
+  )
+})
 
 /**
  * Delivery receipts: any open tab of this user acknowledges inbound messages, whether or not their
