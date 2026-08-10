@@ -225,12 +225,12 @@ describe("SqlReplica", () => {
       ),
       { startImmediately: true }
     )
-    const interactive = yield* Effect.all(["interactive-1", "interactive-2"].map((label) =>
-      Effect.forkChild(
-        Effect.exit(replica.get(Task, documentId)).pipe(Effect.andThen(Queue.offer(completed, label))),
-        { startImmediately: true }
-      )
-    ))
+    const interactive = yield* Effect.forkChild(
+      Effect.exit(replica.get(Task, documentId)).pipe(
+        Effect.tap(() => Queue.offer(completed, "interactive"))
+      ),
+      { startImmediately: true }
+    )
     const overflow = yield* Effect.forkChild(Effect.exit(Effect.scoped(scheduler.interactive)), {
       startImmediately: true
     })
@@ -239,11 +239,21 @@ describe("SqlReplica", () => {
     assert.isDefined(overflow.pollUnsafe())
     assert.isTrue(Exit.isFailure(yield* Fiber.join(overflow)))
     yield* Deferred.succeed(holderRelease, undefined)
-    assert.deepStrictEqual(new Set(yield* Queue.takeN(completed, 2)), new Set(["interactive-1", "interactive-2"]))
+    assert.strictEqual(yield* Queue.take(completed), "interactive")
     assert.strictEqual(yield* Queue.take(completed), "background")
+    // The interactive operation was admitted and executed: it reaches the store and fails on the
+    // absent document, not on refused admission.
+    const outcome = yield* Fiber.join(interactive)
+    assert.isTrue(Exit.isFailure(outcome))
+    if (Exit.isFailure(outcome)) {
+      const failure = Cause.findErrorOption(outcome.cause)
+      assert.strictEqual(failure._tag, "Some")
+      if (failure._tag === "Some") {
+        assert.strictEqual(failure.value.reason._tag, "DocumentNotFound")
+      }
+    }
     yield* Fiber.join(holder)
     yield* Fiber.join(background)
-    yield* Effect.forEach(interactive, Fiber.join, { discard: true })
   })
 
   it.effect("prioritizes interactive work through both replica constructors", () =>

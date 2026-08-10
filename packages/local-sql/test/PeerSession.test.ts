@@ -18,6 +18,7 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Logger from "effect/Logger"
 import * as Option from "effect/Option"
 import * as PlatformError from "effect/PlatformError"
 import * as Queue from "effect/Queue"
@@ -2977,6 +2978,7 @@ it.layer(Layer.mergeAll(
     Effect.gen(function*() {
       const deliveries = yield* Queue.unbounded<PeerTransport.AcknowledgedDelivery>()
       const events = yield* Queue.unbounded<string>()
+      const parked = yield* Queue.unbounded<void>()
       const closed = yield* Deferred.make<void>()
       const rejections = yield* Ref.make<ReadonlyArray<PeerTransport.PermanentRejectReason>>([])
       const documentId = yield* Identity.makeDocumentId
@@ -3087,17 +3089,18 @@ it.layer(Layer.mergeAll(
           // register while the holder is still queued, which refuses the waiter instead of filling
           // the queue the refusal under test depends on.
           const holding = yield* Deferred.make<void>()
-          yield* Effect.forkScoped(Effect.scoped(scheduler.background.pipe(
+          const holderRelease = yield* Deferred.make<void>()
+          const holder = yield* Effect.forkScoped(Effect.scoped(scheduler.background.pipe(
             Effect.andThen(Deferred.succeed(holding, undefined)),
-            Effect.andThen(Effect.never)
+            Effect.andThen(Deferred.await(holderRelease))
           )))
           yield* Deferred.await(holding)
-          yield* Effect.forkScoped(Effect.scoped(
-            scheduler.background.pipe(Effect.andThen(Effect.never))
+          const waiter = yield* Effect.forkScoped(Effect.scoped(
+            scheduler.background.pipe(Effect.andThen(Deferred.await(holderRelease)))
           ))
-          yield* Effect.repeat(
-            scheduler.reservations.pipe(Effect.tap(() => Effect.yieldNow)),
-            { until: (counts) => counts.background === 2 }
+          yield* scheduler.reservationChanges.pipe(
+            Stream.filter((counts) => counts.background === 2),
+            Stream.runHead
           )
           assert.isTrue(
             Exit.isFailure(yield* Effect.exit(Effect.scoped(scheduler.background))),
@@ -3120,25 +3123,37 @@ it.layer(Layer.mergeAll(
             deliveries,
             yield* delivery(1, Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000022"))
           )
-          // Deliveries are consumed serially, so a session that failed on the first refusal stops
-          // draining the queue. Racing the drain against the close is what turns a dead session
-          // into an assertion instead of a hang.
-          assert.strictEqual(
-            yield* Effect.raceFirst(
-              Effect.repeat(
-                Queue.size(deliveries).pipe(Effect.tap(() => Effect.yieldNow)),
-                { until: (size) => size === 0 }
-              ).pipe(Effect.as("drained")),
-              Deferred.await(closed).pipe(Effect.as("session terminated"))
-            ),
-            "drained"
-          )
+          // A refusal leaves no trace in events or reservations, so the rendezvous is the park
+          // warning the session logs for each refused message.
+          yield* Queue.take(parked)
+          yield* Queue.take(parked)
           assert.isTrue(Option.isNone(yield* Deferred.poll(closed)))
           assert.deepStrictEqual(yield* Ref.get(rejections), [])
           // Nothing was applied, acknowledged or rejected: both messages stay in relay custody for
           // the next session to retry.
           assert.strictEqual(yield* Queue.size(events), 0)
+
+          // The session must have survived the refusals: once capacity frees, a later delivery is
+          // applied and acknowledged by the same session.
+          yield* Deferred.succeed(holderRelease, undefined)
+          yield* Fiber.join(holder)
+          yield* Fiber.join(waiter)
+          yield* Queue.offer(
+            deliveries,
+            yield* delivery(2, Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000023"))
+          )
+          assert.deepStrictEqual(yield* Queue.takeN(events, 3), ["apply", "publish", "ack"])
+          assert.isTrue(Option.isNone(yield* Deferred.poll(closed)))
+          assert.deepStrictEqual(yield* Ref.get(rejections), [])
+          assert.strictEqual(yield* Queue.size(events), 0)
         }).pipe(
+          Effect.provide(Logger.layer([
+            Logger.make((options) => {
+              if (String(options.message).includes("parked an inbound message")) {
+                Queue.offerUnsafe(parked, undefined)
+              }
+            })
+          ], { mergeWithExisting: true })),
           Effect.provideService(PeerTransport.PeerTransport, transport),
           Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),

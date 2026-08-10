@@ -234,7 +234,9 @@ describe("ReplicaOperationScheduler", () => {
       yield* Effect.scoped(scheduler.background)
     }).pipe(Effect.provide(live(2))))
 
-  it.effect("shutdown interrupts waiters in both lanes", () =>
+  // it.live, as in the sweep above: under it.effect the TestClock never advances these deadlines,
+  // so a stranded waiter would surface as a bare suite timeout instead of the named assertion.
+  it.live("shutdown interrupts waiters in both lanes", () =>
     Effect.gen(function*() {
       const layerScope = yield* Scope.make()
       const context = yield* Scope.provide(Layer.build(live(2)), layerScope)
