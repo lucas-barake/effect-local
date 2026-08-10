@@ -1650,40 +1650,36 @@ const make = (
             reply.documentId,
             pendingRows.map((row) => row.message)
           )
-          const outbounds = pendingRows.map((row, index) => {
-            const writerProvenance = provenances[index]!
-            return {
-              outbound: {
-                sendSequence: sendSequence + index,
-                documentId: reply.documentId,
-                message: row.message,
-                messageHash: row.message_hash,
-                heads: row.heads,
-                lineage,
-                writerProvenance,
-                receiptReplyId: row.row_id
-              } satisfies Outbound,
-              record: {
-                replica_incarnation: session.replicaIncarnation,
-                peer_id: session.peerId,
-                connection_epoch: session.connectionEpoch,
-                document_id: reply.documentId,
-                send_sequence: sendSequence + index,
-                message: row.message,
-                message_hash: row.message_hash,
-                heads: Schema.encodeSync(Heads)(row.heads),
-                status: "Pending",
-                created_at: createdAt,
-                writer_provenance: Schema.encodeSync(
-                  WriterProvenance.StoredChangeProvenances
-                )(writerProvenance),
-                lineage,
-                receipt_reply_id: row.row_id
-              }
-            }
-          })
-          yield* sql`INSERT INTO effect_local_peer_outbox ${sql.insert(outbounds.map((item) => item.record))}`
-          return outbounds[0]?.outbound ?? null
+          const outbounds = pendingRows.map((row, index) => ({
+            sendSequence: sendSequence + index,
+            documentId: reply.documentId,
+            message: row.message,
+            messageHash: row.message_hash,
+            heads: row.heads,
+            lineage,
+            writerProvenance: provenances[index]!,
+            receiptReplyId: row.row_id
+          } satisfies Outbound))
+          yield* sql`INSERT INTO effect_local_peer_outbox ${
+            sql.insert(outbounds.map((outbound) => ({
+              replica_incarnation: session.replicaIncarnation,
+              peer_id: session.peerId,
+              connection_epoch: session.connectionEpoch,
+              document_id: outbound.documentId,
+              send_sequence: outbound.sendSequence,
+              message: outbound.message,
+              message_hash: outbound.messageHash,
+              heads: Schema.encodeSync(Heads)(outbound.heads),
+              status: "Pending",
+              created_at: createdAt,
+              writer_provenance: Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(
+                outbound.writerProvenance
+              ),
+              lineage: outbound.lineage,
+              receipt_reply_id: outbound.receiptReplyId
+            })))
+          }`
+          return outbounds[0] ?? null
         }))).pipe(
           Effect.catchTags({
             SchemaError: (cause) =>
