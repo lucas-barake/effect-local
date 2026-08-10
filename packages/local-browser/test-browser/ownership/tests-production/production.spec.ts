@@ -141,8 +141,8 @@ test("starts concurrent built ownership clients and serves SQLite WASM", async (
   ])
 
   const [first, second, wasm] = await Promise.all([
-    page.evaluate(() => globalThis.__effectLocalOwnerInfo!),
-    attachedPage.evaluate(() => globalThis.__effectLocalOwnerInfo!),
+    page.evaluate(() => globalThis.__effectLocalOwnerInfo),
+    attachedPage.evaluate(() => globalThis.__effectLocalOwnerInfo),
     wasmResponse
   ])
 
