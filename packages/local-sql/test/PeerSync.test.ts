@@ -247,6 +247,48 @@ describe("PeerSync", () => {
     }))
   }
 
+  const sourcePeer = <E,>(
+    documentId: Identity.DocumentId,
+    initial: Automerge.Doc<InternalAutomerge.Root<E>>
+  ) =>
+    Effect.gen(function*() {
+      const sync = yield* PeerSync.PeerSync
+      const session = yield* sync.open(yield* Identity.makePeerId)
+      let document = initial
+      let state = Automerge.initSyncState()
+      let receiveSequence = 0
+      const drain = Effect.gen(function*() {
+        for (let attempt = 0; attempt < 10; attempt++) {
+          const generated = Automerge.generateSyncMessage(document, state)
+          state = generated[0]
+          if (generated[1] === null) return
+          const received = yield* sync.receive(Task, documentId, session, {
+            remoteConnectionEpoch: session.connectionEpoch,
+            receiveSequence: receiveSequence++,
+            lineage: Identity.genesisLineage,
+            message: generated[1],
+            writerProvenance: provenanceFor(generated[1])
+          })
+          if (received.reply !== null) {
+            const advanced = Automerge.receiveSyncMessage(document, state, received.reply.message)
+            document = advanced[0]
+            state = advanced[1]
+          }
+        }
+        return assert.fail("Source sync did not settle")
+      })
+      return {
+        current: () => document,
+        pushLabel: (label: string) =>
+          Effect.gen(function*() {
+            document = Automerge.change(document, (draft) => {
+              ;(draft.value as unknown as { labels: Array<string> }).labels.push(label)
+            })
+            yield* drain
+          })
+      }
+    })
+
   const durableFootprint = (documentId: Identity.DocumentId) =>
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
@@ -966,35 +1008,9 @@ describe("PeerSync", () => {
       const sql = yield* SqlClient.SqlClient
       const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
-      let source = Automerge.clone(created.automerge, { actor: "1".repeat(32) })
-      let sourceState = Automerge.initSyncState()
-      const sourceSession = yield* sync.open(yield* Identity.makePeerId)
-      let receiveSequence = 0
-      const drain = Effect.gen(function*() {
-        for (let attempt = 0; attempt < 10; attempt++) {
-          const generated = Automerge.generateSyncMessage(source, sourceState)
-          sourceState = generated[0]
-          if (generated[1] === null) return
-          const received = yield* sync.receive(Task, documentId, sourceSession, {
-            remoteConnectionEpoch: sourceSession.connectionEpoch,
-            receiveSequence: receiveSequence++,
-            lineage: Identity.genesisLineage,
-            message: generated[1],
-            writerProvenance: provenanceFor(generated[1])
-          })
-          if (received.reply !== null) {
-            const advanced = Automerge.receiveSyncMessage(source, sourceState, received.reply.message)
-            source = advanced[0]
-            sourceState = advanced[1]
-          }
-        }
-        return assert.fail("Source sync did not settle")
-      })
+      const source = yield* sourcePeer(documentId, Automerge.clone(created.automerge, { actor: "1".repeat(32) }))
       for (let index = 0; index < 5; index++) {
-        source = Automerge.change(source, (draft) => {
-          ;(draft.value as unknown as { labels: Array<string> }).labels.push(`change-${index}`)
-        })
-        yield* drain
+        yield* source.pushLabel(`change-${index}`)
       }
 
       const stale = Automerge.init<InternalAutomerge.Root<{ title: string; labels: Array<string> }>>()
@@ -1020,7 +1036,7 @@ describe("PeerSync", () => {
         [{ outbox: 0, receipts: 0, replyFragments: 0 }]
       )
       InternalAutomerge.free(stale)
-      InternalAutomerge.free(source)
+      InternalAutomerge.free(source.current())
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(AtomicBatchLayer)))
 
@@ -1030,40 +1046,15 @@ describe("PeerSync", () => {
       const sync = yield* PeerSync.PeerSync
       const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
-      let source = Automerge.clone(created.automerge, { actor: "3".repeat(32) })
-      let sourceState = Automerge.initSyncState()
-      const sourceSession = yield* sync.open(yield* Identity.makePeerId)
-      let receiveSequence = 0
-      const drain = Effect.gen(function*() {
-        for (let attempt = 0; attempt < 10; attempt++) {
-          const generated = Automerge.generateSyncMessage(source, sourceState)
-          sourceState = generated[0]
-          if (generated[1] === null) return
-          const received = yield* sync.receive(Task, documentId, sourceSession, {
-            remoteConnectionEpoch: sourceSession.connectionEpoch,
-            receiveSequence: receiveSequence++,
-            lineage: Identity.genesisLineage,
-            message: generated[1],
-            writerProvenance: provenanceFor(generated[1])
-          })
-          if (received.reply !== null) {
-            const advanced = Automerge.receiveSyncMessage(source, sourceState, received.reply.message)
-            source = advanced[0]
-            sourceState = advanced[1]
-          }
-        }
-        return assert.fail("Source sync did not settle")
-      })
+      const source = yield* sourcePeer(documentId, Automerge.clone(created.automerge, { actor: "3".repeat(32) }))
       for (let index = 0; index < 3; index++) {
         let seed = index + 1
-        const label = Array.from({ length: 900 }, () => {
-          seed = (seed * 1_664_525 + 1_013_904_223) >>> 0
-          return String.fromCharCode(33 + seed % 90)
-        }).join("")
-        source = Automerge.change(source, (draft) => {
-          ;(draft.value as unknown as { labels: Array<string> }).labels.push(label)
-        })
-        yield* drain
+        yield* source.pushLabel(
+          Array.from({ length: 900 }, () => {
+            seed = (seed * 1_664_525 + 1_013_904_223) >>> 0
+            return String.fromCharCode(33 + seed % 90)
+          }).join("")
+        )
       }
 
       let stale = Automerge.init<InternalAutomerge.Root<{ title: string; labels: Array<string> }>>()
@@ -1088,9 +1079,9 @@ describe("PeerSync", () => {
         stale = advanced[0]
         staleState = advanced[1]
       }
-      assert.deepStrictEqual(new Set(Automerge.getHeads(stale)), new Set(Automerge.getHeads(source)))
+      assert.deepStrictEqual(new Set(Automerge.getHeads(stale)), new Set(Automerge.getHeads(source.current())))
       InternalAutomerge.free(stale)
-      InternalAutomerge.free(source)
+      InternalAutomerge.free(source.current())
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(ByteBatchLayer)))
 
