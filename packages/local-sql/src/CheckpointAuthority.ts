@@ -15,19 +15,14 @@ export const maximumAuthorizationTokenBytes = WriterProvenance.maximumAuthorizat
 export const AuthorizationToken = WriterProvenance.AuthorizationToken
 export type AuthorizationToken = typeof AuthorizationToken.Type
 
-const CheckpointHash = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
-
-export const ManifestBase = Schema.TaggedUnion({
-  Bootstrap: {},
-  Heads: { baseHeads: Conflict.Heads }
-})
+export const ManifestBase = WriterProvenance.CheckpointBase
 export type ManifestBase = typeof ManifestBase.Type
 
 export const ManifestClaims = Schema.Struct({
   purpose: Schema.Literal(manifestPurpose),
   documentId: Identity.DocumentId,
   lineage: Identity.DocumentLineage,
-  checkpointHash: CheckpointHash,
+  checkpointHash: WriterProvenance.ChangeHash,
   heads: Conflict.Heads,
   base: ManifestBase,
   schemaVersion: WriterProvenance.WriterSchemaVersion,
@@ -39,10 +34,10 @@ export const TransitionClaims = Schema.Struct({
   purpose: Schema.Literal(transitionPurpose),
   documentId: Identity.DocumentId,
   priorLineage: Identity.DocumentLineage,
-  priorCheckpointHash: CheckpointHash,
+  priorCheckpointHash: WriterProvenance.ChangeHash,
   priorHeads: Conflict.Heads,
   resultingLineage: Identity.DocumentLineage,
-  anchorCheckpointHash: CheckpointHash,
+  anchorCheckpointHash: WriterProvenance.ChangeHash,
   resultingHeads: Conflict.Heads,
   schemaVersion: WriterProvenance.WriterSchemaVersion,
   writerDefinitionHash: WriterProvenance.WriterDefinitionHash
