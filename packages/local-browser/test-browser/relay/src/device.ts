@@ -18,6 +18,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -36,17 +37,21 @@ const identity = deviceByName(new URL(window.location.href).searchParams.get("de
 const remote = devices.find((device) => device.name !== identity.name)!
 
 const deferred = <A,>() => {
-  let resolve!: (value: A) => void
-  const promise = new Promise<A>((resume) => {
-    resolve = resume
-  })
-  return { promise, resolve }
+  const cell = Deferred.makeUnsafe<A>()
+  return {
+    promise: Effect.runPromise(Deferred.await(cell)),
+    resolve: (value: A) => {
+      globalThis.queueMicrotask(() => {
+        void Effect.runSync(Deferred.succeed(cell, value))
+      })
+    }
+  }
 }
 
 export const databaseBridge = (() => {
   const engine = new MessageChannel()
   const database = new MessageChannel()
-  const worker = new Worker(new URL("./opfs.worker.ts", import.meta.url), { type: "module" })
+  const worker = new globalThis.Worker(new URL("./opfs.worker.ts", import.meta.url), { type: "module" })
   const requests = new Array<ReturnType<typeof deferred<unknown>>>()
   let gate: {
     readonly response: ReturnType<typeof deferred<void>>
@@ -75,11 +80,14 @@ export const databaseBridge = (() => {
   return {
     port: engine.port2,
     arm: () => {
-      if (gate !== undefined) throw new Error("a database response gate is already armed")
+      if (gate !== undefined) {
+        Effect.runSync(Effect.die(new Error("a database response gate is already armed")))
+        return
+      }
       gate = { response: deferred(), requestObserved: false }
     },
     waitForResponse: () => {
-      if (gate === undefined) throw new Error("no database response gate is armed")
+      if (gate === undefined) return Effect.runSync(Effect.die(new Error("no database response gate is armed")))
       return gate.response.promise
     },
     nextRequest: () => {
@@ -88,7 +96,10 @@ export const databaseBridge = (() => {
       return request.promise
     },
     release: () => {
-      if (gate?.held === undefined) throw new Error("no database response is held")
+      if (gate?.held === undefined) {
+        Effect.runSync(Effect.die(new Error("no database response is held")))
+        return
+      }
       forward(engine.port1, gate.held)
       gate = undefined
     }
@@ -171,7 +182,10 @@ export const syncedDocumentsAtom = Atom.make("")
  */
 const addSyncedDocument = (get: Atom.FnContext, documentId: Identity.DocumentId) => {
   const current = get(syncedDocumentsAtom)
-  const next = new Set(current === "" ? [] : current.split(","))
+  const next = new Set<string>()
+  if (current !== "") {
+    for (const id of current.split(",")) next.add(id)
+  }
   next.add(documentId)
   get.set(syncedDocumentsAtom, [...next].toSorted().join(","))
 }

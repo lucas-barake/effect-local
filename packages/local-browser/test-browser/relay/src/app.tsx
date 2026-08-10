@@ -84,18 +84,18 @@ export const App = () => {
   ])
 
   useEffect(() => {
-    document.body.dataset.connectionStatus = connectionStatus._tag === "Success"
-      ? connectionStatus.value._tag
-      : connectionStatus._tag
+    let status: string = connectionStatus._tag
+    if (connectionStatus._tag === "Success") status = connectionStatus.value._tag
+    document.body.dataset.connectionStatus = status
   }, [connectionStatus])
 
   // Separate from the peer status above, and deliberately so: every peer session runs over this one
   // socket, so a relay drop takes them all quiet at once and per peer status alone would read as
   // several peers vanishing rather than as one link failing.
   useEffect(() => {
-    document.body.dataset.relayStatus = relayStatus._tag === "Success"
-      ? relayStatus.value._tag
-      : relayStatus._tag
+    let status: string = relayStatus._tag
+    if (relayStatus._tag === "Success") status = relayStatus.value._tag
+    document.body.dataset.relayStatus = status
   }, [relayStatus])
 
   return null

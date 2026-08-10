@@ -1,73 +1,55 @@
-import { spawn } from "node:child_process"
-import { once } from "node:events"
+import { NodeServices } from "@effect/platform-node"
+import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
+import * as ManagedRuntime from "effect/ManagedRuntime"
+import * as Option from "effect/Option"
+import * as Scope from "effect/Scope"
+import * as Stream from "effect/Stream"
+import * as ChildProcess from "effect/unstable/process/ChildProcess"
+import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner"
 import { fileURLToPath } from "node:url"
 import { makeViteTest } from "../playwright.ts"
 
-const startRelay = async () => {
-  const child = spawn(
-    process.execPath,
+const runtime = ManagedRuntime.make(NodeServices.layer)
+const readyPrefix = "RelayReady "
+
+const startRelay = () => {
+  const scope = Scope.makeUnsafe("parallel")
+  const command = ChildProcess.make(
+    globalThis.process.execPath,
     ["--import", "tsx", fileURLToPath(new URL("./relay-server.ts", import.meta.url))],
     {
       cwd: fileURLToPath(new URL("../..", import.meta.url)),
-      env: { ...process.env, EFFECT_LOCAL_RELAY_PORT: "0" },
-      stdio: ["ignore", "pipe", "pipe", "ipc"]
+      env: { EFFECT_LOCAL_RELAY_PORT: "0" },
+      extendEnv: true,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe"
     }
   )
-  let output = ""
-  child.stdout?.on("data", (chunk) => {
-    output += String(chunk)
-  })
-  child.stderr?.on("data", (chunk) => {
-    output += String(chunk)
-  })
-  const killOnParentExit = () => child.kill("SIGTERM")
-  process.once("exit", killOnParentExit)
-  let url: string
-  try {
-    url = await new Promise<string>((resolve, reject) => {
-      const cleanup = () => {
-        child.off("error", onError)
-        child.off("exit", onExit)
-        child.off("message", onMessage)
-      }
-      const onError = (error: Error) => {
-        cleanup()
-        reject(error)
-      }
-      const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
-        cleanup()
-        reject(new Error(`Relay exited before readiness (${code ?? signal ?? "unknown"})\n${output}`))
-      }
-      const onMessage = (message: unknown) => {
-        if (
-          typeof message !== "object" || message === null ||
-          Reflect.get(message, "_tag") !== "RelayReady" ||
-          typeof Reflect.get(message, "url") !== "string"
-        ) return
-        cleanup()
-        resolve(Reflect.get(message, "url"))
-      }
-      child.on("error", onError)
-      child.on("exit", onExit)
-      child.on("message", onMessage)
-    })
-  } catch (error) {
-    process.off("exit", killOnParentExit)
-    if (child.exitCode === null && child.signalCode === null) {
-      child.kill("SIGTERM")
-      await once(child, "exit")
+  const program = Effect.gen(function*() {
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
+    const child = yield* Effect.provideService(spawner.spawn(command), Scope.Scope, scope)
+    const firstLine = yield* Stream.decodeText(child.all).pipe(
+      Stream.splitLines,
+      Stream.filter((line) => line.startsWith(readyPrefix)),
+      Stream.runHead
+    )
+    if (Option.isNone(firstLine)) return yield* Effect.die(new Error("Relay exited before readiness"))
+    if (!firstLine.value.startsWith(readyPrefix)) {
+      return yield* Effect.die(new Error(`Relay emitted unexpected readiness output: ${firstLine.value}`))
     }
-    throw error
-  }
-  return {
-    env: { VITE_RELAY_PORT: new URL(url).port },
-    close: async () => {
-      process.off("exit", killOnParentExit)
-      if (child.exitCode !== null || child.signalCode !== null) return
-      child.kill("SIGTERM")
-      await once(child, "exit")
+    const url = firstLine.value.slice(readyPrefix.length)
+    return {
+      env: { VITE_RELAY_PORT: new URL(url).port },
+      close: () => runtime.runPromise(Scope.close(scope, Exit.void))
     }
-  }
+  }).pipe(
+    Effect.catchCause((cause) =>
+      Scope.close(scope, Exit.failCause(cause)).pipe(Effect.andThen(Effect.failCause(cause)))
+    )
+  )
+  return runtime.runPromise(program)
 }
 
 export const { expect, test } = makeViteTest({

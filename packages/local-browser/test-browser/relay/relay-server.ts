@@ -25,7 +25,6 @@ import * as HttpServer from "effect/unstable/http/HttpServer"
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
-import { createServer } from "node:http"
 import { definition } from "./src/domain.ts"
 import { devices } from "./src/identities.ts"
 
@@ -35,20 +34,19 @@ import { devices } from "./src/identities.ts"
  * it. Single runner on purpose - multi-runner ownership is covered by `RelayInboxMultiRunner`.
  */
 
-const port = Number(process.env.EFFECT_LOCAL_RELAY_PORT ?? 0)
+const port = Number(globalThis.process.env.EFFECT_LOCAL_RELAY_PORT ?? 0)
 
 const principals = new Map(devices.map((device) => [device.token, device.principal]))
 
 const Authenticator = Layer.succeed(PeerAuthenticator.PeerAuthenticator)({
   authenticate: (secret) => {
     const principal = principals.get(Redacted.value(secret))
-    return principal === undefined
-      ? Effect.fail(new PeerRpcError.AuthenticationFailure())
-      : Effect.succeed({
-        principal,
-        validUntil: Number.MAX_SAFE_INTEGER,
-        invalidated: Effect.never
-      })
+    if (principal === undefined) return Effect.fail(new PeerRpcError.AuthenticationFailure())
+    return Effect.succeed({
+      principal,
+      validUntil: Number.MAX_SAFE_INTEGER,
+      invalidated: Effect.never
+    })
   }
 })
 
@@ -68,26 +66,27 @@ const Authorization = PeerRelayAuthorization.layer(
       },
       documents: request.documents.flatMap((requested) => {
         const document = definition.documents.byName.get(requested.documentType)
-        return document === undefined ? [] : [{ document, documentId: requested.documentId }]
+        if (document === undefined) return []
+        return [{ document, documentId: requested.documentId }]
       }),
       validUntil: Number.MAX_SAFE_INTEGER,
       invalidated: Effect.never
     }),
   (request) =>
-    Effect.map(Clock.currentTimeMillis, (now) => ({
-      _tag: "UnsafeUnboundedAutomerge3DecodeGrant" as const,
-      risk: PeerRelayAuthorization.unsafeUnboundedAutomerge3DecodeRisk,
-      principal: request.principal,
-      remote: {
-        tenantId: request.principal.tenantId,
-        subjectId: request.remote.subjectId,
-        peerId: request.remote.peerId
-      },
-      direction: request.direction,
-      documents: request.documents,
-      validUntil: now + 60_000,
-      invalidated: Effect.never
-    }))
+    Effect.map(Clock.currentTimeMillis, (now) =>
+      PeerRelayAuthorization.UnsafeUnboundedAutomerge3DecodeGrant.make({
+        risk: PeerRelayAuthorization.unsafeUnboundedAutomerge3DecodeRisk,
+        principal: request.principal,
+        remote: {
+          tenantId: request.principal.tenantId,
+          subjectId: request.remote.subjectId,
+          peerId: request.remote.peerId
+        },
+        direction: request.direction,
+        documents: request.documents,
+        validUntil: now + 60_000,
+        invalidated: Effect.never
+      }))
 )
 
 const Cluster = Sharding.layer.pipe(
@@ -99,8 +98,8 @@ const Cluster = Sharding.layer.pipe(
 )
 
 const Relay = RelayServer.layer({
-  tenantId: devices[0]!.principal.tenantId,
-  peerId: devices[0]!.relayPeerId,
+  tenantId: devices[0].principal.tenantId,
+  peerId: devices[0].relayPeerId,
   heartbeatInterval: Duration.seconds(10),
   entityCallTimeout: Duration.seconds(30),
   inbox: {
@@ -145,14 +144,21 @@ const Rpc = RpcServer.layer(PeerRpc.Rpcs).pipe(
 const Ready = HttpRouter.add("GET", "/ready", HttpServerResponse.text("ok"))
 
 const Main = HttpRouter.serve(Layer.mergeAll(Rpc, Ready)).pipe(
-  Layer.provideMerge(NodeHttpServer.layer(createServer, { port, host: "127.0.0.1" }))
+  Layer.provideMerge(
+    NodeHttpServer.layer(
+      () => globalThis.process.getBuiltinModule("node:http").createServer(),
+      { port, host: "127.0.0.1" }
+    )
+  )
 )
 
 Effect.scoped(Effect.gen(function*() {
   const context = yield* Layer.build(Main)
   const server = Context.get(context, HttpServer.HttpServer)
-  if (server.address._tag !== "TcpAddress") throw new Error("Relay did not bind a TCP port")
-  process.send?.({ _tag: "RelayReady", url: `http://127.0.0.1:${server.address.port}` })
+  if (server.address._tag !== "TcpAddress") return yield* Effect.die(new Error("Relay did not bind a TCP port"))
+  const url = `http://127.0.0.1:${server.address.port}`
+  globalThis.process.send?.({ _tag: "RelayReady", url })
+  globalThis.process.stdout.write(`RelayReady ${url}\n`)
   return yield* Effect.never
 })).pipe(
   NodeRuntime.runMain

@@ -1,4 +1,6 @@
-import { readFile } from "node:fs/promises"
+import { NodeFileSystem } from "@effect/platform-node"
+import * as Effect from "effect/Effect"
+import * as FileSystem from "effect/FileSystem"
 import { fileURLToPath } from "node:url"
 import { defineConfig } from "vite"
 import wasm from "vite-plugin-wasm"
@@ -22,7 +24,12 @@ export default defineConfig({
           next()
           return
         }
-        void readFile(wasmPath).then((bytes) => {
+        void Effect.runPromise(
+          Effect.gen(function*() {
+            const fileSystem = yield* FileSystem.FileSystem
+            return yield* fileSystem.readFile(wasmPath)
+          }).pipe(Effect.provide(NodeFileSystem.layer))
+        ).then((bytes) => {
           response.setHeader("Content-Type", "application/wasm")
           response.end(bytes)
         }, next)
