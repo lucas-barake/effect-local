@@ -28,6 +28,7 @@ import * as Stream from "effect/Stream"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import { demoAuthority } from "./shared/checkpoint-authority.ts"
 import { Conversation, definition, DomainLive, limits, sqlProjections } from "./shared/domain.ts"
 import {
   type ChatUser,
@@ -251,14 +252,18 @@ const makeEngine = (databasePort: MessagePort) => {
     PeerRelayReceiptLimits.layer(PeerRelayReceiptLimits.defaults),
     PeerRelayOutboxLimits.layer(PeerRelayOutboxLimits.defaults)
   )
+  const ReplicaLive = Layer.unwrap(
+    Effect.map(
+      demoAuthority,
+      (checkpointAuthority) =>
+        SqlReplica.layerRelayWithBindings(definition, { checkpointAuthority, projections: sqlProjections })
+    )
+  )
   // `provideMerge` for the status aggregate is load-bearing: `layerRelayWithBindings` deliberately
   // does not provide `RelayConnectionStatus`, and the coordinator's engine contract requires it.
   const EngineLive = Bootstrap.pipe(
     Layer.provideMerge(PeerRelayClientRuntime.layerSql),
-    Layer.provideMerge(Layer.merge(
-      SqlReplica.layerRelayWithBindings(definition, { projections: sqlProjections }),
-      SessionManager.layer
-    )),
+    Layer.provideMerge(Layer.merge(ReplicaLive, SessionManager.layer)),
     Layer.provideMerge(AggregateStatusLive),
     Layer.provideMerge(RelayLinksLive),
     Layer.provideMerge(Dependencies),

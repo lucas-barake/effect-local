@@ -121,6 +121,16 @@ does not rebuild the pipeline and the throttle bucket survives the burst. `strat
 drops what does not fit instead of queueing it, which is also what ends the indicator: the last
 keystroke before a pause is usually the dropped one, and the counterpart's window expires.
 
+### Checkpoint shipping
+
+`SqlReplica` is configured with a `checkpointAuthority`. Without one a replica neither ships nor
+accepts compact checkpoints, so a peer whose remaining history no longer fits inside one sync
+message could never catch up. Checkpoint bytes carry a document's entire state, so the receiver has
+to be told by something other than the sender that they are legitimate — that is what the authority
+signs and verifies. This demo HMACs the canonical claims with one hardcoded secret
+(`checkpoint-authority.ts`), which is the same shortcut the identities take; a real deployment signs
+with a key the application server holds.
+
 ### One relay channel per conversation
 
 The relay allows one live session per peer endpoint (its inbox key is tenant + subject + peer, and
