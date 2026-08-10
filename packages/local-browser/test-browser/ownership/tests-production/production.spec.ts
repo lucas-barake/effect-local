@@ -3,22 +3,40 @@ import { expect, test } from "../playwright.production.ts"
 
 const ownershipTransitionTimeout = 40_000
 
+type OwnerInfo = {
+  readonly ownerId: string
+  readonly provider: boolean
+  readonly replicaId: string
+  readonly writerGeneration: number
+}
+
+type SharedWorkerMetrics = {
+  readonly created: number
+  readonly closes: Record<string, number>
+}
+
+declare global {
+  interface Window {
+    __effectLocalAttachPosted?: boolean
+    __effectLocalDedicatedWorkerStarts?: number
+    __effectLocalOwnerError?: string
+    __effectLocalOwnerInfo?: OwnerInfo
+    __effectLocalReplicaPorts?: Array<MessagePort>
+    __effectLocalSharedWorkers?: Array<SharedWorker>
+  }
+}
+
 const instrumentWorkerBoundaries = (context: BrowserContext) =>
   context.addInitScript(() => {
-    const state = globalThis as typeof globalThis & {
-      __effectLocalAttachPosted?: boolean
-      __effectLocalDedicatedWorkerStarts?: number
-      __effectLocalReplicaPorts?: Array<MessagePort>
-      __effectLocalSharedWorkers?: Array<SharedWorker>
-    }
+    const state = globalThis
 
-    const postMessage = MessagePort.prototype.postMessage
+    const postMessage = Reflect.get(MessagePort.prototype, "postMessage")
     MessagePort.prototype.postMessage = function(message: unknown) {
-      if ((message as { readonly _tag?: string } | null)?._tag === "Attach") {
+      if (typeof message === "object" && message !== null && Reflect.get(message, "_tag") === "Attach") {
         state.__effectLocalAttachPosted = true
       }
       return Reflect.apply(postMessage, this, arguments)
-    } as typeof postMessage
+    } satisfies typeof postMessage
 
     const NativeWorker = globalThis.Worker
     globalThis.Worker = new Proxy(NativeWorker, {
@@ -29,20 +47,14 @@ const instrumentWorkerBoundaries = (context: BrowserContext) =>
     })
 
     const metricsKey = "__effectLocalSharedWorkerMetrics"
-    const readMetrics = () =>
-      JSON.parse(sessionStorage.getItem(metricsKey) ?? "{\"created\":0,\"closes\":{}}") as {
-        readonly created: number
-        readonly closes: Record<string, number>
-      }
-    const writeMetrics = (metrics: {
-      readonly created: number
-      readonly closes: Record<string, number>
-    }) => sessionStorage.setItem(metricsKey, JSON.stringify(metrics))
+    const readMetrics = (): SharedWorkerMetrics =>
+      JSON.parse(sessionStorage.getItem(metricsKey) ?? "{\"created\":0,\"closes\":{}}")
+    const writeMetrics = (metrics: SharedWorkerMetrics) => sessionStorage.setItem(metricsKey, JSON.stringify(metrics))
 
     const NativeSharedWorker = globalThis.SharedWorker
     globalThis.SharedWorker = new Proxy(NativeSharedWorker, {
       construct(target, args, newTarget) {
-        const worker = Reflect.construct(target, args, newTarget) as SharedWorker
+        const worker = Reflect.construct(target, args, newTarget)
         const metrics = readMetrics()
         const id = String(metrics.created)
         writeMetrics({
@@ -68,10 +80,7 @@ const instrumentWorkerBoundaries = (context: BrowserContext) =>
 const attachPosted = (page: Page) =>
   expect.poll(async () => {
     try {
-      return await page.evaluate(() =>
-        (globalThis as typeof globalThis & { readonly __effectLocalAttachPosted?: boolean })
-          .__effectLocalAttachPosted
-      )
+      return await page.evaluate(() => globalThis.__effectLocalAttachPosted)
     } catch (error) {
       if (String(error).includes("Execution context was destroyed")) return false
       throw error
@@ -81,16 +90,7 @@ const attachPosted = (page: Page) =>
 const ownerInfo = (page: Page) =>
   expect.poll(async () => {
     try {
-      return await page.evaluate(() =>
-        (globalThis as typeof globalThis & {
-          readonly __effectLocalOwnerInfo?: {
-            readonly ownerId: string
-            readonly provider: boolean
-            readonly replicaId: string
-            readonly writerGeneration: number
-          }
-        }).__effectLocalOwnerInfo
-      )
+      return await page.evaluate(() => globalThis.__effectLocalOwnerInfo)
     } catch (error) {
       if (String(error).includes("Execution context was destroyed")) return undefined
       throw error
@@ -100,10 +100,7 @@ const ownerInfo = (page: Page) =>
 const ownerError = (page: Page) =>
   expect.poll(async () => {
     try {
-      return await page.evaluate(() =>
-        (globalThis as typeof globalThis & { readonly __effectLocalOwnerError?: string })
-          .__effectLocalOwnerError
-      )
+      return await page.evaluate(() => globalThis.__effectLocalOwnerError)
     } catch (error) {
       if (String(error).includes("Execution context was destroyed")) return undefined
       throw error
@@ -144,26 +141,8 @@ test("starts concurrent built ownership clients and serves SQLite WASM", async (
   ])
 
   const [first, second, wasm] = await Promise.all([
-    page.evaluate(() =>
-      (globalThis as typeof globalThis & {
-        readonly __effectLocalOwnerInfo: {
-          readonly ownerId: string
-          readonly provider: boolean
-          readonly replicaId: string
-          readonly writerGeneration: number
-        }
-      }).__effectLocalOwnerInfo
-    ),
-    attachedPage.evaluate(() =>
-      (globalThis as typeof globalThis & {
-        readonly __effectLocalOwnerInfo: {
-          readonly ownerId: string
-          readonly provider: boolean
-          readonly replicaId: string
-          readonly writerGeneration: number
-        }
-      }).__effectLocalOwnerInfo
-    ),
+    page.evaluate(() => globalThis.__effectLocalOwnerInfo!),
+    attachedPage.evaluate(() => globalThis.__effectLocalOwnerInfo!),
     wasmResponse
   ])
 
@@ -253,18 +232,9 @@ test("surfaces a built ownership runtime load failure", async ({ context, page, 
 
   expect(
     await Promise.all([
-      page.evaluate(() =>
-        (globalThis as typeof globalThis & { readonly __effectLocalDedicatedWorkerStarts?: number })
-          .__effectLocalDedicatedWorkerStarts ?? 0
-      ),
-      attachedPage.evaluate(() =>
-        (globalThis as typeof globalThis & { readonly __effectLocalDedicatedWorkerStarts?: number })
-          .__effectLocalDedicatedWorkerStarts ?? 0
-      ),
-      futurePage.evaluate(() =>
-        (globalThis as typeof globalThis & { readonly __effectLocalDedicatedWorkerStarts?: number })
-          .__effectLocalDedicatedWorkerStarts ?? 0
-      )
+      page.evaluate(() => globalThis.__effectLocalDedicatedWorkerStarts ?? 0),
+      attachedPage.evaluate(() => globalThis.__effectLocalDedicatedWorkerStarts ?? 0),
+      futurePage.evaluate(() => globalThis.__effectLocalDedicatedWorkerStarts ?? 0)
     ])
   ).toEqual([0, 0, 0])
 })
@@ -299,18 +269,9 @@ test("surfaces a built ownership coordinator load failure", async ({ context, pa
 
   expect(
     await Promise.all([
-      page.evaluate(() =>
-        (globalThis as typeof globalThis & { readonly __effectLocalDedicatedWorkerStarts?: number })
-          .__effectLocalDedicatedWorkerStarts ?? 0
-      ),
-      attachedPage.evaluate(() =>
-        (globalThis as typeof globalThis & { readonly __effectLocalDedicatedWorkerStarts?: number })
-          .__effectLocalDedicatedWorkerStarts ?? 0
-      ),
-      futurePage.evaluate(() =>
-        (globalThis as typeof globalThis & { readonly __effectLocalDedicatedWorkerStarts?: number })
-          .__effectLocalDedicatedWorkerStarts ?? 0
-      )
+      page.evaluate(() => globalThis.__effectLocalDedicatedWorkerStarts ?? 0),
+      attachedPage.evaluate(() => globalThis.__effectLocalDedicatedWorkerStarts ?? 0),
+      futurePage.evaluate(() => globalThis.__effectLocalDedicatedWorkerStarts ?? 0)
     ])
   ).toEqual([0, 0, 0])
 })
@@ -322,22 +283,15 @@ test("does not retain failed post-ready connections across retries", async ({ co
   await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
 
   const beforeFailure = await page.evaluate(() => {
-    const metrics = JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!) as {
-      readonly created: number
-      readonly closes: Record<string, number>
-    }
+    const metrics = JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!)
     return {
       created: metrics.created,
       failedId: String(metrics.created - 1)
     }
   })
   await page.evaluate(() => {
-    const state = globalThis as typeof globalThis & {
-      __effectLocalOwnerInfo?: unknown
-      readonly __effectLocalReplicaPorts: Array<MessagePort>
-    }
-    const ports = state.__effectLocalReplicaPorts
-    state.__effectLocalOwnerInfo = undefined
+    const ports = globalThis.__effectLocalReplicaPorts!
+    globalThis.__effectLocalOwnerInfo = undefined
     ports[ports.length - 1].dispatchEvent(
       new MessageEvent("message", {
         data: { _tag: "OwnerError", message: "forced post-ready owner failure" }
@@ -347,16 +301,12 @@ test("does not retain failed post-ready connections across retries", async ({ co
 
   await expect.poll(() =>
     page.evaluate(() => {
-      const metrics = JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!) as {
-        readonly created: number
-      }
+      const metrics = JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!)
       return metrics.created
     }), { timeout: ownershipTransitionTimeout }).toBeGreaterThan(beforeFailure.created)
   await expect.poll(() =>
     page.evaluate((failedId) => {
-      const metrics = JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!) as {
-        readonly closes: Record<string, number>
-      }
+      const metrics = JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!)
       return metrics.closes[failedId]
     }, beforeFailure.failedId)
   ).toBe(1)
@@ -368,12 +318,7 @@ test("does not retain failed post-ready connections across retries", async ({ co
   await expect(page.getByText(title, { exact: true })).toBeVisible({ timeout: ownershipTransitionTimeout })
 
   await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pagehide")))
-  const metrics = await page.evaluate(() =>
-    JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!) as {
-      readonly created: number
-      readonly closes: Record<string, number>
-    }
-  )
+  const metrics = await page.evaluate(() => JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!))
   expect(Object.values(metrics.closes).every((count) => count === 1)).toBe(true)
 })
 
@@ -386,18 +331,14 @@ test("does not create retry workers after page teardown", async ({ context, page
   await page.clock.pauseAt(new Date("2026-01-01T00:01:00Z"))
 
   const beforeFailure = await page.evaluate(() => {
-    const metrics = JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!) as {
-      readonly created: number
-    }
+    const metrics = JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!)
     return {
       created: metrics.created,
       failedId: String(metrics.created - 1)
     }
   })
   await page.evaluate(() => {
-    const ports = (globalThis as typeof globalThis & {
-      readonly __effectLocalReplicaPorts: Array<MessagePort>
-    }).__effectLocalReplicaPorts
+    const ports = globalThis.__effectLocalReplicaPorts!
     ports[ports.length - 1].dispatchEvent(
       new MessageEvent("message", {
         data: { _tag: "OwnerError", message: "forced owner failure before teardown" }
@@ -407,12 +348,7 @@ test("does not create retry workers after page teardown", async ({ context, page
   })
   await expect(page.locator("#root")).toBeEmpty()
   await page.clock.runFor(1_500)
-  const metrics = await page.evaluate(() =>
-    JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!) as {
-      readonly created: number
-      readonly closes: Record<string, number>
-    }
-  )
+  const metrics = await page.evaluate(() => JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!))
   expect(metrics.created).toBe(beforeFailure.created)
   expect(metrics.closes[beforeFailure.failedId]).toBe(1)
 })
@@ -424,15 +360,11 @@ test("ignores worker errors queued across page teardown", async ({ context, page
   await expect(page.getByText("Local replica ready")).toBeVisible({ timeout: ownershipTransitionTimeout })
 
   const workerId = await page.evaluate(() => {
-    const metrics = JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!) as {
-      readonly created: number
-    }
+    const metrics = JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!)
     return String(metrics.created - 1)
   })
   await page.evaluate(() => {
-    const workers = (globalThis as typeof globalThis & {
-      readonly __effectLocalSharedWorkers: Array<SharedWorker>
-    }).__effectLocalSharedWorkers
+    const workers = globalThis.__effectLocalSharedWorkers!
     window.dispatchEvent(new PageTransitionEvent("pagehide"))
     workers[workers.length - 1].dispatchEvent(
       new ErrorEvent("error", { error: new Error("queued teardown error"), message: "queued teardown error" })
@@ -440,9 +372,7 @@ test("ignores worker errors queued across page teardown", async ({ context, page
   })
 
   const closes = await page.evaluate(() => {
-    const metrics = JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!) as {
-      readonly closes: Record<string, number>
-    }
+    const metrics = JSON.parse(sessionStorage.getItem("__effectLocalSharedWorkerMetrics")!)
     return metrics.closes
   })
   expect(closes[workerId]).toBe(1)
