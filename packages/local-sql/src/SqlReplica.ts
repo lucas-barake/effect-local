@@ -12,6 +12,7 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
+import * as Stream from "effect/Stream"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import type * as Migrator from "effect/unstable/sql/Migrator"
@@ -40,6 +41,7 @@ import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
 import * as ReplicaEvolution from "./ReplicaEvolution.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 import * as ReplicaHealth from "./ReplicaHealth.js"
+import * as ReplicaOperationScheduler from "./ReplicaOperationScheduler.js"
 import type * as ReplicaWorkflow from "./ReplicaWorkflow.js"
 import type * as SqlProjection from "./SqlProjection.js"
 
@@ -61,6 +63,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
   | DocumentStore.DocumentStore
   | QueryExecutor.QueryExecutor
   | ReplicaGate.ReplicaGate
+  | ReplicaOperationScheduler.ReplicaOperationScheduler
   | ReplicaHealth.ReplicaHealth
   | ReplicaLimits.ReplicaLimits
   | Crypto.Crypto
@@ -76,12 +79,17 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
       const documents = yield* DocumentStore.DocumentStore
       const queries = yield* QueryExecutor.QueryExecutor
       const gate = yield* ReplicaGate.ReplicaGate
+      const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
       const health = yield* ReplicaHealth.ReplicaHealth
       const limits = yield* ReplicaLimits.ReplicaLimits
       const crypto = yield* Crypto.Crypto
 
       const withPermit = <A, E, R,>(f: (permit: ReplicaGate.Permit) => Effect.Effect<A, E, R>) =>
-        gate.admit.pipe(Effect.flatMap(f), Effect.scoped)
+        Effect.scoped(Effect.gen(function*() {
+          yield* scheduler.interactive
+          const permit = yield* gate.admit
+          return yield* f(permit)
+        }))
 
       const service: Replica.Replica["Service"] = {
         create: (document, options) =>
@@ -225,29 +233,55 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
               }
             })
           ),
-        lookupCommandDelivery: (commandId) => deliveries.lookup(commandId),
-        commandDeliveryChanges: (commandId) => deliveryPublisher.changes(commandId),
+        lookupCommandDelivery: (commandId) => withPermit(() => deliveries.lookup(commandId)),
+        commandDeliveryChanges: deliveryPublisher.changes,
         flush: withPermit(() =>
-          Effect.all([publisher.publishPending, deliveryPublisher.publishPending], { discard: true })
+          Effect.all([publisher.drainPending, deliveryPublisher.publishPending], { discard: true })
         ),
         status: health.status,
-        exportBackup: backups.export,
-        restoreBackup: (options) =>
-          Effect.uninterruptibleMask((interruptible) =>
-            Effect.gen(function*() {
-              const restored = yield* Effect.exit(interruptible(backups.restore(options)))
-              const refreshed = yield* Effect.exit(Effect.all([
-                publisher.invalidate(ReplicaDefinition.invalidationKeys(definition)),
-                deliveryPublisher.refresh
-              ], { discard: true }))
-              return yield* Exit.asVoidAll([restored, refreshed])
-            })
+        // The export does all its database work on the first pull and then serves in-memory chunks,
+        // so admission is held for that pull only. Holding it for the stream's lifetime starves the
+        // background lane behind the consumer's pace; requiring it again for a pull that does no
+        // work lets a full queue discard a completely produced archive.
+        exportBackup: (options) =>
+          Stream.transformPull(
+            backups.export(options),
+            (pull) =>
+              Effect.sync(() => {
+                let produced = false
+                return Effect.suspend(() =>
+                  produced
+                    ? pull
+                    : Effect.scoped(scheduler.interactive.pipe(Effect.andThen(pull))).pipe(
+                      Effect.tap(() =>
+                        Effect.sync(() => {
+                          produced = true
+                        })
+                      )
+                    )
+                )
+              })
           ),
+        restoreBackup: (options) =>
+          Effect.scoped(scheduler.interactive.pipe(Effect.andThen(
+            Effect.uninterruptibleMask((interruptible) =>
+              Effect.gen(function*() {
+                const restored = yield* Effect.exit(interruptible(backups.restore(options)))
+                const refreshed = yield* Effect.exit(Effect.all([
+                  publisher.invalidate(ReplicaDefinition.invalidationKeys(definition)),
+                  deliveryPublisher.refresh
+                ], { discard: true }))
+                return yield* Exit.asVoidAll([restored, refreshed])
+              })
+            )
+          ))),
         installBackupDocument: (document, options) =>
-          Effect.gen(function*() {
-            yield* backups.installDocument(document, options)
-            yield* publisher.publishPending
-          }),
+          Effect.scoped(scheduler.interactive.pipe(Effect.andThen(
+            Effect.gen(function*() {
+              yield* backups.installDocument(document, options)
+              yield* publisher.publishPending
+            })
+          ))),
         exportDocument: (document, documentId) =>
           withPermit(() =>
             Effect.acquireUseRelease(
@@ -299,6 +333,7 @@ export const servicesLayer = <
     ? CheckpointAuthority.layerRejectAll
     : CheckpointAuthority.layer(options.checkpointAuthority)
   const gate = ReplicaGate.layer.pipe(Layer.provideMerge(bootstrap))
+  const scheduler = ReplicaOperationScheduler.layer
   const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
   const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
   const compaction = Compaction.layer.pipe(
@@ -318,7 +353,7 @@ export const servicesLayer = <
   const deliveryPublisher = CommandDeliveryPublisher.layer(
     options.deliveryPublisher ?? CommandDeliveryPublisher.defaultOptions
   ).pipe(
-    Layer.provideMerge(deliveryStore)
+    Layer.provideMerge(Layer.merge(deliveryStore, scheduler))
   )
   const backups = BackupStore.layer(definition).pipe(
     Layer.provideMerge(Layer.mergeAll(publisher, deliveryPublisher, checkpointAuthority))
@@ -331,6 +366,7 @@ export const servicesLayer = <
     compaction,
     deliveryStore,
     deliveryPublisher,
+    scheduler,
     sql
   )
   return infrastructure
@@ -350,6 +386,7 @@ export const layer = <D extends ReplicaDefinition.Any, const Bindings extends Re
   | Replica.Replica
   | ReplicaEvolution.ReplicaEvolution
   | ReplicaGate.ReplicaGate
+  | ReplicaOperationScheduler.ReplicaOperationScheduler
   | ReplicaWorkflow.CompactionWorkflow
   | ReplicaWorkflow.HistoryRewriteWorkflow
   | Sharding.Sharding,
@@ -391,6 +428,7 @@ export const layerRelay = <
   | Replica.Replica
   | ReplicaEvolution.ReplicaEvolution
   | ReplicaGate.ReplicaGate
+  | ReplicaOperationScheduler.ReplicaOperationScheduler
   | ReplicaWorkflow.CompactionWorkflow
   | ReplicaWorkflow.HistoryRewriteWorkflow
   | Sharding.Sharding,

@@ -17,6 +17,8 @@ import * as PeerConnectionStatus from "../src/PeerConnectionStatus.js"
 import * as PeerSession from "../src/PeerSession.js"
 import * as PeerSync from "../src/PeerSync.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
+import * as ReplicaOperationScheduler from "../src/ReplicaOperationScheduler.js"
+import { gateLimits } from "./fixtures/limits.js"
 
 const deliveryStore = CommandDeliveryStore.CommandDeliveryStore.of({
   lookup: () => Effect.die("unexpected command delivery lookup"),
@@ -30,8 +32,9 @@ const deliveryStore = CommandDeliveryStore.CommandDeliveryStore.of({
   cursor: Effect.die("unexpected command delivery cursor")
 })
 
-it.layer(Layer.merge(
+it.layer(Layer.mergeAll(
   NodeCrypto.layer,
+  ReplicaOperationScheduler.layer.pipe(Layer.provide(ReplicaLimits.layer(gateLimits))),
   Layer.succeed(CommandDeliveryStore.CommandDeliveryStore, deliveryStore)
 ))("PeerSession coverage", (it) => {
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
@@ -132,6 +135,7 @@ it.layer(Layer.merge(
     })
   const publisher = CommitPublisher.CommitPublisher.of({
     publishPending: Effect.succeed(0),
+    drainPending: Effect.succeed(0),
     invalidate: () => Effect.void,
     subscribe: Effect.succeed({
       watermark: Identity.CommitSequence.make(0),

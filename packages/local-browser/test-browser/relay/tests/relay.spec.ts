@@ -42,10 +42,32 @@ test("carries a change between two browsers through a real relay", async ({ brow
     await expect.poll(() => alpha.locator("body").getAttribute("data-relay-status"), { timeout: 30_000 }).toBe(
       "Connected"
     )
+    const documentId = await alpha.evaluate(() => window.relayFixture!.createTask("shared task"))
+
+    const priority = await alpha.evaluate(async () => {
+      window.relayFixture!.armNextDatabaseResponse()
+      const holder = window.relayFixture!.runBackgroundDatabaseOperation("background-holder")
+      await window.relayFixture!.waitForReservations((reservations) => reservations.background >= 1)
+      await window.relayFixture!.waitForDatabaseResponse()
+
+      const background = window.relayFixture!.runBackgroundDatabaseOperation("background-queued")
+      await window.relayFixture!.waitForReservations((reservations) => reservations.background >= 2)
+      await window.relayFixture!.waitForReservations((reservations) => reservations.interactive === 0)
+      const commandId = await window.relayFixture!.makeCommandId()
+      const interactive = window.relayFixture!.probeInteractiveDatabase(commandId)
+      await window.relayFixture!.waitForReservations((reservations) => reservations.interactive > 0)
+
+      const nextRequest = window.relayFixture!.nextDatabaseRequest()
+      window.relayFixture!.releaseDatabaseResponse()
+      const next = JSON.stringify(await nextRequest)
+      await Promise.all([holder, background, interactive])
+      return { commandId, next }
+    })
+    expect(priority.next).toContain(priority.commandId)
+    expect(priority.next).not.toContain("background-queued")
 
     // A document created independently on both devices would be two lineages; this syncs two copies
     // of one.
-    const documentId = await alpha.evaluate(() => window.relayFixture!.createTask("shared task"))
     await expect.poll(() => alpha.locator("body").getAttribute("data-connection-status"), { timeout: 30_000 })
       .toBe("Connected")
     const backup = await alpha.evaluate(() => window.relayFixture!.exportBackup())

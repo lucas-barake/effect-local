@@ -18,6 +18,7 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Logger from "effect/Logger"
 import * as Option from "effect/Option"
 import * as PlatformError from "effect/PlatformError"
 import * as Queue from "effect/Queue"
@@ -40,6 +41,8 @@ import * as PeerSync from "../src/PeerSync.js"
 import * as PeerSyncEnvelope from "../src/PeerSyncEnvelope.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
+import * as ReplicaOperationScheduler from "../src/ReplicaOperationScheduler.js"
+import { gateLimits } from "./fixtures/limits.js"
 
 const deliveryStore = CommandDeliveryStore.CommandDeliveryStore.of({
   lookup: () => Effect.die("unexpected command delivery lookup"),
@@ -56,6 +59,7 @@ const deliveryStore = CommandDeliveryStore.CommandDeliveryStore.of({
 it.layer(Layer.mergeAll(
   NodeCrypto.layer,
   PeerRelayReceiptLimits.layerDefaults,
+  ReplicaOperationScheduler.layer.pipe(Layer.provide(ReplicaLimits.layer(gateLimits))),
   Layer.succeed(CommandDeliveryStore.CommandDeliveryStore, deliveryStore)
 ))("PeerSession", (it) => {
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
@@ -268,6 +272,7 @@ it.layer(Layer.mergeAll(
       })
       const publisher = CommitPublisher.CommitPublisher.of({
         publishPending: Effect.succeed(0),
+        drainPending: Effect.succeed(0),
         invalidate: () =>
           Queue.offer(events, { _tag: "FullRefreshRequired", refreshGeneration: 1 }).pipe(Effect.asVoid),
         subscribe: Deferred.succeed(subscribed, undefined).pipe(
@@ -479,6 +484,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -579,6 +585,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(1),
+              drainPending: Effect.succeed(1),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -713,6 +720,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -883,6 +891,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Ref.update(published, (count) => count + 1).pipe(Effect.as(1)),
+              drainPending: Ref.update(published, (count) => count + 1).pipe(Effect.as(1)),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1067,6 +1076,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1196,6 +1206,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1284,6 +1295,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1369,6 +1381,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1577,6 +1590,7 @@ it.layer(Layer.mergeAll(
               CommitPublisher.CommitPublisher,
               CommitPublisher.CommitPublisher.of({
                 publishPending: Ref.update(publications, (count) => count + 1).pipe(Effect.as(1)),
+                drainPending: Ref.update(publications, (count) => count + 1).pipe(Effect.as(1)),
                 invalidate: () => Effect.void,
                 subscribe: Effect.succeed({
                   watermark: Identity.CommitSequence.make(0),
@@ -1661,6 +1675,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1749,6 +1764,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1811,6 +1827,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1885,6 +1902,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1980,6 +1998,7 @@ it.layer(Layer.mergeAll(
                 CommitPublisher.CommitPublisher,
                 CommitPublisher.CommitPublisher.of({
                   publishPending: Effect.succeed(0),
+                  drainPending: Effect.succeed(0),
                   invalidate: () => Effect.void,
                   subscribe: Effect.succeed({
                     watermark: Identity.CommitSequence.make(0),
@@ -2094,6 +2113,7 @@ it.layer(Layer.mergeAll(
           CommitPublisher.CommitPublisher,
           CommitPublisher.CommitPublisher.of({
             publishPending: Effect.succeed(0),
+            drainPending: Effect.succeed(0),
             invalidate: () => Effect.void,
             subscribe: Effect.succeed({
               watermark: Identity.CommitSequence.make(0),
@@ -2208,6 +2228,7 @@ it.layer(Layer.mergeAll(
                 CommitPublisher.CommitPublisher,
                 CommitPublisher.CommitPublisher.of({
                   publishPending: Effect.succeed(0),
+                  drainPending: Effect.succeed(0),
                   invalidate: () => Effect.void,
                   subscribe: Effect.succeed({
                     watermark: Identity.CommitSequence.make(0),
@@ -2333,6 +2354,7 @@ it.layer(Layer.mergeAll(
                 CommitPublisher.CommitPublisher,
                 CommitPublisher.CommitPublisher.of({
                   publishPending: Effect.succeed(0),
+                  drainPending: Effect.succeed(0),
                   invalidate: () => Effect.void,
                   subscribe: Effect.succeed({
                     watermark: Identity.CommitSequence.make(0),
@@ -2444,6 +2466,7 @@ it.layer(Layer.mergeAll(
                   CommitPublisher.CommitPublisher,
                   CommitPublisher.CommitPublisher.of({
                     publishPending: Effect.succeed(0),
+                    drainPending: Effect.succeed(0),
                     invalidate: () => Effect.void,
                     subscribe: Effect.succeed({
                       watermark: Identity.CommitSequence.make(0),
@@ -2479,6 +2502,8 @@ it.layer(Layer.mergeAll(
       const deliveries = yield* Queue.unbounded<PeerTransport.AcknowledgedDelivery>()
       const events = yield* Queue.unbounded<string>()
       const closed = yield* Deferred.make<void>()
+      const firstAcknowledgementStarted = yield* Deferred.make<void>()
+      const releaseFirstAcknowledgement = yield* Deferred.make<void>()
       const resets = yield* Ref.make<ReadonlyArray<string>>([])
       const rejections = yield* Ref.make<ReadonlyArray<PeerTransport.PermanentRejectReason>>([])
       const received = yield* Ref.make<ReadonlyArray<PeerSync.RelayReceipt>>([])
@@ -2566,6 +2591,7 @@ it.layer(Layer.mergeAll(
       })
       const publisher = CommitPublisher.CommitPublisher.of({
         publishPending: Queue.offer(events, "publish").pipe(Effect.as(0)),
+        drainPending: Queue.offer(events, "publish").pipe(Effect.as(0)),
         invalidate: () => Effect.void,
         subscribe: Effect.succeed({
           watermark: Identity.CommitSequence.make(0),
@@ -2608,7 +2634,13 @@ it.layer(Layer.mergeAll(
               outerEnvelopeDigest: "a".repeat(64)
             },
             receiptRetentionMillis: PeerRelayReceiptLimits.defaults.receiptRetentionMillis,
-            acknowledge: Queue.offer(events, "ack").pipe(Effect.asVoid),
+            acknowledge: connectionEpoch === "sender-epoch-a" && sequence === 0
+              ? Deferred.succeed(firstAcknowledgementStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseFirstAcknowledgement)),
+                Effect.andThen(Queue.offer(events, "ack")),
+                Effect.asVoid
+              )
+              : Queue.offer(events, "ack").pipe(Effect.asVoid),
             reject: (reason) =>
               Ref.update(rejections, (current) => [...current, reason]).pipe(
                 Effect.andThen(Queue.offer(events, `reject:${reason}`)),
@@ -2674,9 +2706,14 @@ it.layer(Layer.mergeAll(
             )
           )
           assert.deepStrictEqual(
-            yield* Effect.forEach([0, 1, 2, 3], () => Queue.take(events)),
-            ["apply", "publish", "enqueue", "ack"]
+            yield* Effect.forEach([0, 1, 2], () => Queue.take(events)),
+            ["apply", "publish", "enqueue"]
           )
+          yield* Deferred.await(firstAcknowledgementStarted)
+          const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
+          yield* Effect.scoped(scheduler.interactive)
+          yield* Deferred.succeed(releaseFirstAcknowledgement, undefined)
+          assert.strictEqual(yield* Queue.take(events), "ack")
           assert.isTrue(Option.isNone(yield* Deferred.poll(closed)))
           yield* Queue.offer(
             deliveries,
@@ -2827,6 +2864,7 @@ it.layer(Layer.mergeAll(
       })
       const publisher = CommitPublisher.CommitPublisher.of({
         publishPending: Queue.offer(events, "publish").pipe(Effect.as(0)),
+        drainPending: Queue.offer(events, "publish").pipe(Effect.as(0)),
         invalidate: () => Effect.void,
         subscribe: Effect.succeed({
           watermark: Identity.CommitSequence.make(0),
@@ -2922,6 +2960,200 @@ it.layer(Layer.mergeAll(
           assert.isTrue(Option.isNone(yield* Deferred.poll(closed)))
           assert.deepStrictEqual(yield* Ref.get(rejections), [])
         }).pipe(
+          Effect.provideService(PeerTransport.PeerTransport, transport),
+          Effect.provide(PeerConnectionStatus.layer),
+          Effect.provideService(PeerSync.PeerSync, sync),
+          Effect.provideService(ReplicaGate.ReplicaGate, gate),
+          Effect.provideService(CommitPublisher.CommitPublisher, publisher),
+          Effect.provideService(ReplicaLimits.ReplicaLimits, limits),
+          Effect.provideService(
+            PeerRelayReceiptLimits.PeerRelayReceiptLimits,
+            PeerRelayReceiptLimits.defaults
+          )
+        )
+      )
+    }).pipe(Effect.provide(NodeCrypto.layer)))
+
+  it.effect("parks an inbound message and keeps the session alive when operation admission is refused", () =>
+    Effect.gen(function*() {
+      const deliveries = yield* Queue.unbounded<PeerTransport.AcknowledgedDelivery>()
+      const events = yield* Queue.unbounded<string>()
+      const parked = yield* Queue.unbounded<void>()
+      const closed = yield* Deferred.make<void>()
+      const rejections = yield* Ref.make<ReadonlyArray<PeerTransport.PermanentRejectReason>>([])
+      const documentId = yield* Identity.makeDocumentId
+      const senderPeerId = yield* Identity.makePeerId
+      const relayPeerId = yield* Identity.makePeerId
+      const message = yield* Effect.acquireUseRelease(
+        Effect.sync(() => Automerge.init()),
+        (document) =>
+          Effect.sync(() => {
+            const encoded = Automerge.generateSyncMessage(document, Automerge.initSyncState())[1]
+            if (encoded === null) throw new TypeError("Expected an initial sync message")
+            return encoded
+          }),
+        (document) => Effect.sync(() => Automerge.free(document))
+      )
+      const messageHash = yield* Canonical.digest(message)
+      const sync = PeerSync.PeerSync.of({
+        withDocumentInvalidation: (_documentId, effect) => effect,
+        invalidateDocument: () => Effect.void,
+        open: (peerId) =>
+          Effect.succeed({
+            peerId,
+            connectionEpoch: "local-epoch",
+            replicaIncarnation: permit.incarnation
+          }),
+        reset: () => Effect.void,
+        generate: () => Effect.succeed({ outbound: null, observedByPeer: false, dirty: false }),
+        receive: () => Effect.succeed(result),
+        enqueue: () => Effect.die("unexpected enqueue"),
+        pending: () => Effect.succeed([]),
+        markSent: () => Effect.succeed(true),
+        pruneRelayReceipts: Effect.succeed(0)
+      })
+      const transport = PeerTransport.PeerTransport.of({
+        capabilities: {},
+        connect: () =>
+          Effect.succeed({
+            peerId: senderPeerId,
+            relayPeerId,
+            capabilities: {},
+            receive: Stream.fromQueue(deliveries).pipe(
+              Stream.map((delivery) => ({ _tag: "Durable", delivery }) as const)
+            ),
+            send: () => Effect.void,
+            transient: () => Effect.void,
+            close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
+          })
+      })
+      const publisher = CommitPublisher.CommitPublisher.of({
+        publishPending: Queue.offer(events, "publish").pipe(Effect.as(0)),
+        drainPending: Queue.offer(events, "publish").pipe(Effect.as(0)),
+        invalidate: () => Effect.void,
+        subscribe: Effect.succeed({
+          watermark: Identity.CommitSequence.make(0),
+          refreshGeneration: 0,
+          events: Stream.never
+        })
+      })
+      const delivery = (
+        sequence: number,
+        relayMessageId: Identity.RelayMessageId
+      ): Effect.Effect<PeerTransport.AcknowledgedDelivery, ReplicaError.ReplicaError> =>
+        PeerSyncEnvelope.encodeSyncEnvelope({
+          connectionEpoch: "sender-epoch-a",
+          sequence,
+          documentId,
+          documentType: Task.name,
+          messageHash,
+          message,
+          lineage: Identity.genesisLineage,
+          writerProvenance: []
+        }).pipe(
+          Effect.map((bytes) => ({
+            message: bytes,
+            identity: {
+              relayMessageId,
+              relayPeerId,
+              senderTenantId: "tenant",
+              senderSubjectId: "sender",
+              senderPeerId,
+              senderReplicaIncarnation: Identity.ReplicaIncarnation.make(9),
+              messageHash,
+              outerEnvelopeDigest: "a".repeat(64)
+            },
+            receiptRetentionMillis: PeerRelayReceiptLimits.defaults.receiptRetentionMillis,
+            acknowledge: Queue.offer(events, "ack").pipe(Effect.asVoid),
+            reject: (reason) =>
+              Ref.update(rejections, (current) => [...current, reason]).pipe(
+                Effect.andThen(Queue.offer(events, `reject:${reason}`)),
+                Effect.asVoid
+              )
+          }))
+        )
+      yield* Effect.scoped(
+        Effect.gen(function*() {
+          // A scheduler of its own, because the suite's instance is shared and this test has to
+          // drive the background lane to the exact state where the next acquisition is refused
+          // rather than queued.
+          const context = yield* Layer.build(
+            Layer.fresh(
+              ReplicaOperationScheduler.layer.pipe(
+                Layer.provide(ReplicaLimits.layer({ ...gateLimits, maxQueuedRpc: 1 }))
+              )
+            )
+          )
+          const scheduler = Context.get(context, ReplicaOperationScheduler.ReplicaOperationScheduler)
+          // The holder has to be granted before the waiter is forked. Racing them lets the waiter
+          // register while the holder is still queued, which refuses the waiter instead of filling
+          // the queue the refusal under test depends on.
+          const holding = yield* Deferred.make<void>()
+          const holderRelease = yield* Deferred.make<void>()
+          const holder = yield* Effect.forkScoped(Effect.scoped(scheduler.background.pipe(
+            Effect.andThen(Deferred.succeed(holding, undefined)),
+            Effect.andThen(Deferred.await(holderRelease))
+          )))
+          yield* Deferred.await(holding)
+          const waiter = yield* Effect.forkScoped(Effect.scoped(
+            scheduler.background.pipe(Effect.andThen(Deferred.await(holderRelease)))
+          ))
+          yield* scheduler.reservationChanges.pipe(
+            Stream.filter((counts) => counts.background === 2),
+            Stream.runHead
+          )
+          assert.isTrue(
+            Exit.isFailure(yield* Effect.exit(Effect.scoped(scheduler.background))),
+            "the background lane is not saturated, so the session would never be refused"
+          )
+
+          yield* PeerSession.makeTestClient(
+            { peerId: senderPeerId, documents: [{ document: Task, documentId }] },
+            () =>
+              Effect.succeed({
+                ApplySync: () => Queue.offer(events, "apply").pipe(Effect.as(result))
+              } as never)
+          ).pipe(Effect.provideService(ReplicaOperationScheduler.ReplicaOperationScheduler, scheduler))
+
+          yield* Queue.offer(
+            deliveries,
+            yield* delivery(0, Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000021"))
+          )
+          yield* Queue.offer(
+            deliveries,
+            yield* delivery(1, Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000022"))
+          )
+          // A refusal leaves no trace in events or reservations, so the rendezvous is the park
+          // warning the session logs for each refused message.
+          yield* Queue.take(parked)
+          yield* Queue.take(parked)
+          assert.isTrue(Option.isNone(yield* Deferred.poll(closed)))
+          assert.deepStrictEqual(yield* Ref.get(rejections), [])
+          // Nothing was applied, acknowledged or rejected: both messages stay in relay custody for
+          // the next session to retry.
+          assert.strictEqual(yield* Queue.size(events), 0)
+
+          // The session must have survived the refusals: once capacity frees, a later delivery is
+          // applied and acknowledged by the same session.
+          yield* Deferred.succeed(holderRelease, undefined)
+          yield* Fiber.join(holder)
+          yield* Fiber.join(waiter)
+          yield* Queue.offer(
+            deliveries,
+            yield* delivery(2, Identity.RelayMessageId.make("rly_00000000-0000-4000-8000-000000000023"))
+          )
+          assert.deepStrictEqual(yield* Queue.takeN(events, 3), ["apply", "publish", "ack"])
+          assert.isTrue(Option.isNone(yield* Deferred.poll(closed)))
+          assert.deepStrictEqual(yield* Ref.get(rejections), [])
+          assert.strictEqual(yield* Queue.size(events), 0)
+        }).pipe(
+          Effect.provide(Logger.layer([
+            Logger.make((options) => {
+              if (String(options.message).includes("parked an inbound message")) {
+                Queue.offerUnsafe(parked, undefined)
+              }
+            })
+          ], { mergeWithExisting: true })),
           Effect.provideService(PeerTransport.PeerTransport, transport),
           Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),
@@ -3048,6 +3280,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -3156,6 +3389,7 @@ it.layer(Layer.mergeAll(
           CommitPublisher.CommitPublisher,
           CommitPublisher.CommitPublisher.of({
             publishPending: Effect.succeed(0),
+            drainPending: Effect.succeed(0),
             invalidate: () => Effect.void,
             subscribe: Effect.succeed({
               watermark: Identity.CommitSequence.make(0),
@@ -3645,6 +3879,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Ref.updateAndGet(publications, (count) => count + 1),
+              drainPending: Ref.updateAndGet(publications, (count) => count + 1),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -3750,6 +3985,7 @@ it.layer(Layer.mergeAll(
           CommitPublisher.CommitPublisher,
           CommitPublisher.CommitPublisher.of({
             publishPending: Effect.succeed(0),
+            drainPending: Effect.succeed(0),
             invalidate: () => Effect.void,
             subscribe: Effect.succeed({
               watermark: Identity.CommitSequence.make(0),
@@ -3801,6 +4037,7 @@ it.layer(Layer.mergeAll(
 
   const quietPublisher = CommitPublisher.CommitPublisher.of({
     publishPending: Effect.succeed(0),
+    drainPending: Effect.succeed(0),
     invalidate: () => Effect.void,
     subscribe: Effect.succeed({
       watermark: Identity.CommitSequence.make(0),

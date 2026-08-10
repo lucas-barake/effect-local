@@ -12,6 +12,7 @@ import * as PeerRelayReceiptLimits from "@lucas-barake/effect-local-sql/PeerRela
 import type * as PeerSession from "@lucas-barake/effect-local-sql/PeerSession"
 import * as RelayConnectionStatus from "@lucas-barake/effect-local-sql/RelayConnectionStatus"
 import * as ReplicaGate from "@lucas-barake/effect-local-sql/ReplicaGate"
+import * as ReplicaOperationScheduler from "@lucas-barake/effect-local-sql/ReplicaOperationScheduler"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
@@ -24,6 +25,7 @@ import * as Redacted from "effect/Redacted"
 import * as Stream from "effect/Stream"
 import { Atom } from "effect/unstable/reactivity"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
 import { AddLabel, definition, DomainLive, limits, TaskDocument } from "./domain.ts"
 import { deviceByName, type DeviceIdentity, devices } from "./identities.ts"
 
@@ -33,15 +35,68 @@ const identity = deviceByName(new URL(window.location.href).searchParams.get("de
 
 const remote = devices.find((device) => device.name !== identity.name)!
 
-const databasePort = (dbName: string) => {
-  const channel = new MessageChannel()
-  const worker = new Worker(new URL("./opfs.worker.ts", import.meta.url), { type: "module" })
-  worker.postMessage({ databasePort: channel.port2, dbName }, [channel.port2])
-  return channel.port1
+const deferred = <A,>() => {
+  let resolve!: (value: A) => void
+  const promise = new Promise<A>((resume) => {
+    resolve = resume
+  })
+  return { promise, resolve }
 }
 
+export const databaseBridge = (() => {
+  const engine = new MessageChannel()
+  const database = new MessageChannel()
+  const worker = new Worker(new URL("./opfs.worker.ts", import.meta.url), { type: "module" })
+  const requests = new Array<ReturnType<typeof deferred<unknown>>>()
+  let gate: {
+    readonly response: ReturnType<typeof deferred<void>>
+    requestObserved: boolean
+    held?: MessageEvent
+  } | undefined
+  const forward = (target: MessagePort, event: MessageEvent) => {
+    target.postMessage(event.data, [...event.ports])
+  }
+  engine.port1.addEventListener("message", (event) => {
+    requests.shift()?.resolve(event.data)
+    if (gate !== undefined) gate.requestObserved = true
+    forward(database.port2, event)
+  })
+  database.port2.addEventListener("message", (event) => {
+    if (gate !== undefined && gate.requestObserved && gate.held === undefined) {
+      gate.held = event
+      gate.response.resolve()
+      return
+    }
+    forward(engine.port1, event)
+  })
+  engine.port1.start()
+  database.port2.start()
+  worker.postMessage({ databasePort: database.port1, dbName: `relay-${identity.name}.sqlite` }, [database.port1])
+  return {
+    port: engine.port2,
+    arm: () => {
+      if (gate !== undefined) throw new Error("a database response gate is already armed")
+      gate = { response: deferred(), requestObserved: false }
+    },
+    waitForResponse: () => {
+      if (gate === undefined) throw new Error("no database response gate is armed")
+      return gate.response.promise
+    },
+    nextRequest: () => {
+      const request = deferred<unknown>()
+      requests.push(request)
+      return request.promise
+    },
+    release: () => {
+      if (gate?.held === undefined) throw new Error("no database response is held")
+      forward(engine.port1, gate.held)
+      gate = undefined
+    }
+  }
+})()
+
 const Base = Layer.mergeAll(
-  BrowserSqlite.layerMessagePort(databasePort(`relay-${identity.name}.sqlite`)),
+  BrowserSqlite.layerMessagePort(databaseBridge.port),
   BrowserCrypto.layer,
   ReplicaLimits.layer(limits),
   PeerRelayReceiptLimits.layer(PeerRelayReceiptLimits.defaults),
@@ -171,6 +226,19 @@ export const readTask = runtime.fn<Identity.DocumentId>()(
   { concurrent: true }
 )
 
+export const makeCommandId = runtime.fn<void>()(
+  Effect.fnUntraced(function*() {
+    return yield* Identity.makeCommandId
+  })
+)
+
+export const probeInteractiveDatabase = runtime.fn<Identity.CommandId>()(
+  Effect.fnUntraced(function*(commandId) {
+    const replica = yield* Replica.Replica
+    yield* replica.lookupCommandDelivery(commandId)
+  })
+)
+
 export const exportBackup = runtime.fn<void>()(
   Effect.fnUntraced(function*() {
     const replica = yield* Replica.Replica
@@ -195,6 +263,32 @@ export const restoreBackup = runtime.fn<ReadonlyArray<number>>()(
       mode: "clone",
       source: Stream.make(new Uint8Array(bytes))
     })
+  })
+)
+
+export const runBackgroundDatabaseOperation = runtime.fn<string>()(
+  Effect.fnUntraced(function*(label) {
+    yield* Effect.scoped(Effect.gen(function*() {
+      const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
+      yield* scheduler.background
+      const sql = yield* SqlClient.SqlClient
+      yield* sql.unsafe(`SELECT '${label}' AS label`)
+    }))
+  }),
+  { concurrent: true }
+)
+
+/**
+ * Resolves once the scheduler reports reservations the caller accepts. The stream replays the
+ * current counts before any change, so a caller that arrives after the reservation it is waiting
+ * for still sees it.
+ */
+export const waitForReservations = runtime.fn<
+  (reservations: ReplicaOperationScheduler.Reservations) => boolean
+>()(
+  Effect.fnUntraced(function*(matches) {
+    const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
+    yield* scheduler.reservationChanges.pipe(Stream.filter(matches), Stream.runHead)
   })
 )
 

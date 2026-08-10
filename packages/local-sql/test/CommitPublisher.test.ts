@@ -228,7 +228,8 @@ describe("CommitPublisher", () => {
       ) INSERT INTO effect_local_commit_outbox (
         commit_sequence, document_id, invalidation_keys, published
       ) SELECT commit_sequence, ${documentId}, '["Items"]', 0 FROM sequence`
-      assert.strictEqual(yield* publisher.publishPending, 257)
+      assert.strictEqual(yield* publisher.publishPending, 128)
+      assert.strictEqual(yield* publisher.drainPending, 257 - 128)
       const retained = [...yield* subscription.events.pipe(Stream.take(2), Stream.runCollect)]
       assert.deepStrictEqual(retained[0], { _tag: "FullRefreshRequired", refreshGeneration: 1 })
       assert.strictEqual(retained[1]?._tag, "Commit")
@@ -249,7 +250,7 @@ describe("CommitPublisher", () => {
       ) INSERT INTO effect_local_commit_outbox (
         commit_sequence, document_id, invalidation_keys, published
       ) SELECT commit_sequence, ${documentId}, '["Items"]', 0 FROM sequence`
-      assert.strictEqual(yield* publisher.publishPending, 257)
+      assert.strictEqual(yield* publisher.drainPending, 257)
       const retained = [...yield* subscription.events.pipe(Stream.take(2), Stream.runCollect)]
       assert.deepStrictEqual(retained[0], { _tag: "FullRefreshRequired", refreshGeneration: 0 })
       assert.strictEqual(retained[1]?._tag, "Commit")
