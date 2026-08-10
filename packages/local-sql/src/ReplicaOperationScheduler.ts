@@ -18,16 +18,15 @@ type Request =
   | { readonly _tag: "Interrupt"; readonly granted: Deferred.Deferred<void>; readonly lane: Lane }
   | { readonly _tag: "Release"; readonly lane: Lane }
 
+interface LaneState {
+  readonly queued: Set<Deferred.Deferred<void>>
+  readonly running: Set<Deferred.Deferred<void>>
+}
+
 interface AdmissionState {
   closed: boolean
-  readonly interactive: Set<Deferred.Deferred<void>>
-  readonly background: Set<Deferred.Deferred<void>>
-  readonly grantingInteractive: Set<Deferred.Deferred<void>>
-  readonly grantingBackground: Set<Deferred.Deferred<void>>
-  activeInteractive: number
-  activeBackground: number
-  pendingInteractive: number
-  pendingBackground: number
+  readonly interactive: LaneState
+  readonly background: LaneState
 }
 
 export interface Reservations {
@@ -46,15 +45,6 @@ export class ReplicaOperationScheduler extends Context.Service<ReplicaOperationS
   readonly reservationChanges: Stream.Stream<Reservations>
 }>()("@lucas-barake/effect-local-sql/ReplicaOperationScheduler") {}
 
-const remove = (
-  state: AdmissionState,
-  lane: Lane,
-  granted: Deferred.Deferred<void>
-): AdmissionState => {
-  state[lane].delete(granted)
-  return state
-}
-
 // The Layer scope owns the request queue, arbiter fiber, and reservation feed. Shutdown first closes
 // admission and interrupts retained reservations, then interrupts the arbiter before closing the feed
 // and request queue.
@@ -64,14 +54,8 @@ export const layer: Layer.Layer<ReplicaOperationScheduler, never, ReplicaLimits.
     const limits = yield* ReplicaLimits.ReplicaLimits
     const state = yield* Ref.make<AdmissionState>({
       closed: false,
-      interactive: new Set(),
-      background: new Set(),
-      grantingInteractive: new Set(),
-      grantingBackground: new Set(),
-      activeInteractive: 0,
-      activeBackground: 0,
-      pendingInteractive: 0,
-      pendingBackground: 0
+      interactive: { queued: new Set(), running: new Set() },
+      background: { queued: new Set(), running: new Set() }
     })
     const requests = yield* Effect.acquireRelease(Queue.unbounded<Request>(), Queue.shutdown)
     const reservationEvents = yield* Effect.acquireRelease(PubSub.sliding<Reservations>(1), PubSub.shutdown)
@@ -85,8 +69,8 @@ export const layer: Layer.Layer<ReplicaOperationScheduler, never, ReplicaLimits.
     const maxActiveInteractive = limits.maxQueuedRpc + 1
 
     const snapshot = (current: AdmissionState): Reservations => ({
-      interactive: current.interactive.size,
-      background: current.background.size
+      interactive: current.interactive.queued.size + current.interactive.running.size,
+      background: current.background.queued.size + current.background.running.size
     })
     const publishReservations = Ref.get(state).pipe(
       Effect.flatMap((current) => PubSub.publish(reservationEvents, snapshot(current))),
@@ -94,47 +78,23 @@ export const layer: Layer.Layer<ReplicaOperationScheduler, never, ReplicaLimits.
     )
     const cancelReservation = (lane: Lane, granted: Deferred.Deferred<void>) =>
       Ref.update(state, (current) => {
-        if (!current[lane].delete(granted)) return current
-        const granting = lane === "interactive" ? current.grantingInteractive : current.grantingBackground
-        if (granting.delete(granted)) {
-          if (lane === "interactive") current.activeInteractive--
-          else current.activeBackground--
-        } else if (lane === "interactive") {
-          current.pendingInteractive--
-        } else {
-          current.pendingBackground--
-        }
+        current[lane].queued.delete(granted)
+        current[lane].running.delete(granted)
         return current
       }).pipe(
         Effect.andThen(publishReservations)
       )
+    // The queued entry moves into the running set, so a reservation is counted exactly once and an
+    // acquirer that cancelled first is no longer there to grant.
     const beginGrant = (lane: Lane, granted: Deferred.Deferred<void>) =>
       Ref.modify(state, (current) => {
-        if (!current[lane].has(granted)) return [false, current]
-        if (lane === "interactive") {
-          current.pendingInteractive--
-          current.activeInteractive++
-          current.grantingInteractive.add(granted)
-        } else {
-          current.pendingBackground--
-          current.activeBackground++
-          current.grantingBackground.add(granted)
-        }
+        if (!current[lane].queued.delete(granted)) return [false, current]
+        current[lane].running.add(granted)
         return [true, current]
       }).pipe(Effect.tap(() => publishReservations))
-    const finishGrant = (lane: Lane, granted: Deferred.Deferred<void>) =>
+    const endGrant = (lane: Lane, granted: Deferred.Deferred<void>) =>
       Ref.update(state, (current) => {
-        ;(lane === "interactive" ? current.grantingInteractive : current.grantingBackground).delete(granted)
-        return current
-      })
-    const rollbackGrant = (lane: Lane, granted: Deferred.Deferred<void>) =>
-      Ref.update(state, (current) => {
-        current[lane].delete(granted)
-        const granting = lane === "interactive" ? current.grantingInteractive : current.grantingBackground
-        if (granting.delete(granted)) {
-          if (lane === "interactive") current.activeInteractive--
-          else current.activeBackground--
-        }
+        current[lane].running.delete(granted)
         return current
       }).pipe(Effect.andThen(publishReservations))
 
@@ -184,7 +144,6 @@ export const layer: Layer.Layer<ReplicaOperationScheduler, never, ReplicaLimits.
           waiters.delete(granted)
           if (yield* beginGrant(lane, granted)) {
             if (yield* Deferred.succeed(granted, undefined)) {
-              yield* finishGrant(lane, granted)
               if (lane === "interactive") {
                 activeInteractive++
               } else {
@@ -192,7 +151,7 @@ export const layer: Layer.Layer<ReplicaOperationScheduler, never, ReplicaLimits.
                 backgroundTurn = false
               }
             } else {
-              yield* rollbackGrant(lane, granted)
+              yield* endGrant(lane, granted)
             }
           }
         }
@@ -200,14 +159,7 @@ export const layer: Layer.Layer<ReplicaOperationScheduler, never, ReplicaLimits.
     }).pipe(Effect.forkScoped({ startImmediately: true }))
 
     const release = (lane: Lane, granted: Deferred.Deferred<void>) =>
-      Ref.update(state, (current) => {
-        remove(current, lane, granted)
-        ;(lane === "interactive" ? current.grantingInteractive : current.grantingBackground).delete(granted)
-        if (lane === "interactive") current.activeInteractive--
-        else current.activeBackground--
-        return current
-      }).pipe(
-        Effect.andThen(publishReservations),
+      endGrant(lane, granted).pipe(
         Effect.andThen(Queue.offer(requests, { _tag: "Release", lane })),
         Effect.asVoid
       )
@@ -222,12 +174,9 @@ export const layer: Layer.Layer<ReplicaOperationScheduler, never, ReplicaLimits.
           Effect.uninterruptible(
             Effect.gen(function*() {
               const registered = yield* Ref.modify(state, (current) => {
-                const waiters = current[lane]
-                const pending = lane === "interactive" ? current.pendingInteractive : current.pendingBackground
-                if (current.closed || pending >= limits.maxQueuedRpc) return [false, current]
-                waiters.add(granted)
-                if (lane === "interactive") current.pendingInteractive++
-                else current.pendingBackground++
+                const queued = current[lane].queued
+                if (current.closed || queued.size >= limits.maxQueuedRpc) return [false, current]
+                queued.add(granted)
                 return [true, current]
               })
               if (!registered) {
@@ -263,16 +212,14 @@ export const layer: Layer.Layer<ReplicaOperationScheduler, never, ReplicaLimits.
 
     yield* Effect.addFinalizer(() =>
       Ref.modify(state, (current) => {
-        const waiters: Array<Deferred.Deferred<void>> = [...current.interactive, ...current.background]
+        const waiters: Array<Deferred.Deferred<void>> = []
         current.closed = true
-        current.interactive.clear()
-        current.background.clear()
-        current.grantingInteractive.clear()
-        current.grantingBackground.clear()
-        current.activeInteractive = 0
-        current.activeBackground = 0
-        current.pendingInteractive = 0
-        current.pendingBackground = 0
+        for (const lane of [current.interactive, current.background]) {
+          for (const granted of lane.queued) waiters.push(granted)
+          for (const granted of lane.running) waiters.push(granted)
+          lane.queued.clear()
+          lane.running.clear()
+        }
         return [waiters, current]
       }).pipe(
         Effect.flatMap((waiters) => Effect.forEach(waiters, Deferred.interrupt, { discard: true })),
