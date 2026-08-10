@@ -184,10 +184,11 @@ export const App = () => {
           setStorage("best-effort")
         }
       }
-    }
-    ).pipe(Effect.catch(() => Effect.sync(() => {
-      if (active) setStorage("best-effort")
-    })))
+    }).pipe(Effect.catch(() =>
+      Effect.sync(() => {
+        if (active) setStorage("best-effort")
+      })
+    ))
     void Effect.runPromise(requestPersistence)
     return () => {
       active = false
@@ -219,7 +220,9 @@ export const App = () => {
     const normalized = title.trim()
     if (normalized.length === 0) return undefined
     return Effect.runPromise(Effect.gen(function*() {
-      const succeeded = yield* Effect.tryPromise(() => execute(Effect.tryPromise(() => runCreate({ title: normalized }))))
+      const succeeded = yield* Effect.tryPromise(() =>
+        execute(Effect.tryPromise(() => runCreate({ title: normalized })))
+      )
       if (succeeded) setTitle("")
     }))
   }
