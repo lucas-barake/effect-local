@@ -1429,8 +1429,7 @@ const make = (
       documentId: Identity.DocumentId,
       message: Uint8Array,
       heads: ReadonlyArray<string>,
-      checkpointTransfer?: Uint8Array,
-      receiptReplyId?: number
+      checkpointTransfer?: Uint8Array
     ) =>
       Effect.gen(function*() {
         const writerProvenance = checkpointTransfer === undefined
@@ -1475,13 +1474,12 @@ const make = (
         const createdAt = new Date(yield* Clock.currentTimeMillis).toISOString()
         yield* sql`INSERT INTO effect_local_peer_outbox (
           replica_incarnation, peer_id, connection_epoch, document_id, send_sequence,
-          message, message_hash, heads, status, created_at, writer_provenance, lineage, checkpoint_transfer,
-          receipt_reply_id
+          message, message_hash, heads, status, created_at, writer_provenance, lineage, checkpoint_transfer
         ) VALUES (
           ${session.replicaIncarnation}, ${session.peerId}, ${session.connectionEpoch}, ${documentId}, ${sendSequence},
           ${message}, ${messageHash}, ${Schema.encodeSync(Heads)(heads)}, 'Pending', ${createdAt},
           ${Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(writerProvenance)}, ${lineage},
-          ${checkpointTransfer ?? null}, ${receiptReplyId ?? null}
+          ${checkpointTransfer ?? null}
         )`
         return {
           sendSequence,
@@ -1491,8 +1489,7 @@ const make = (
           heads,
           lineage,
           writerProvenance,
-          ...(checkpointTransfer === undefined ? {} : { checkpointTransfer }),
-          ...(receiptReplyId === undefined ? {} : { receiptReplyId })
+          ...(checkpointTransfer === undefined ? {} : { checkpointTransfer })
         } satisfies Outbound
       })
 
