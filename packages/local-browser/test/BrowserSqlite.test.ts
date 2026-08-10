@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
@@ -29,26 +30,32 @@ const makeDatabaseChannel = (database: string = "database") => {
 
   let messageListeners = 0
   const originalAddEventListener = databasePort.addEventListener.bind(databasePort)
-  databasePort.addEventListener = ((type: string, ...rest: Array<unknown>) => {
+  databasePort.addEventListener = (
+    type: string,
+    listener: EventListenerOrEventListenerObject,
+    options?: boolean | AddEventListenerOptions
+  ) => {
     if (type === "message") messageListeners += 1
-    return (originalAddEventListener as (...args: Array<unknown>) => unknown)(type, ...rest)
-  }) as MessagePort["addEventListener"]
+    return originalAddEventListener(type, listener, options)
+  }
 
   let removedMessageListeners = 0
   const originalRemoveEventListener = databasePort.removeEventListener.bind(databasePort)
-  databasePort.removeEventListener = ((type: string, ...rest: Array<unknown>) => {
+  databasePort.removeEventListener = (
+    type: string,
+    listener: EventListenerOrEventListenerObject,
+    options?: boolean | EventListenerOptions
+  ) => {
     if (type === "message") removedMessageListeners += 1
-    return (originalRemoveEventListener as (...args: Array<unknown>) => unknown)(type, ...rest)
-  }) as MessagePort["removeEventListener"]
+    return originalRemoveEventListener(type, listener, options)
+  }
 
-  let resolveClosed!: () => void
-  const closed = new Promise<void>((resolve) => {
-    resolveClosed = resolve
-  })
+  const closed = Deferred.makeUnsafe<void>()
   workerPort.addEventListener("message", (event) => {
-    const request = event.data as WorkerRequest
+    if (!isWorkerRequest(event.data)) return
+    const request = event.data
     if (request[0] === "close") {
-      resolveClosed()
+      Effect.runSync(Deferred.succeed(closed, undefined))
       return
     }
     if (typeof request[0] !== "number") return
@@ -73,6 +80,9 @@ const makeDatabaseChannel = (database: string = "database") => {
     messageListeners: () => messageListeners
   }
 }
+
+const isWorkerRequest = (value: unknown): value is WorkerRequest =>
+  Array.isArray(value) && (typeof value[0] === "number" || typeof value[0] === "string")
 
 const captureClients = <E, R,>(database: Layer.Layer<SqlClient.SqlClient, E, R>) =>
   Layer.merge(
@@ -107,7 +117,8 @@ describe("BrowserSqlite", () => {
     const channel = new MessageChannel()
     const requests: Array<WorkerRequest> = []
     channel.port2.addEventListener("message", (event) => {
-      const request = event.data as WorkerRequest
+      if (!isWorkerRequest(event.data)) return
+      const request = event.data
       requests.push(request)
       if (typeof request[0] !== "number") return
       const [id, , params] = request
@@ -201,9 +212,8 @@ describe("BrowserSqlite", () => {
 
   it.effect("exposes database port startup failures", () => {
     const channel = new MessageChannel()
-    const failure = new Error("start failed")
     channel.port1.start = () => {
-      throw failure
+      Effect.runSync(Effect.die(new Error("start failed")))
     }
 
     return Effect.gen(function*() {
@@ -213,7 +223,9 @@ describe("BrowserSqlite", () => {
 
       assert.isTrue(Exit.isFailure(exit))
       if (Exit.isFailure(exit)) {
-        assert.strictEqual(Result.getOrThrow(Cause.findDefect(exit.cause)), failure)
+        const failure = Result.getOrThrow(Cause.findDefect(exit.cause))
+        assert.instanceOf(failure, Error)
+        assert.strictEqual(failure.message, "start failed")
       }
     }).pipe(
       Effect.ensuring(Effect.sync(() => {
@@ -228,7 +240,7 @@ describe("BrowserSqlite", () => {
       const db = makeDatabaseChannel()
       yield* Effect.gen(function*() {
         yield* Effect.scoped(Layer.build(BrowserSqlite.layerMessagePort(db.databasePort)))
-        yield* Effect.promise(() => db.closed)
+        yield* Deferred.await(db.closed)
         assert.strictEqual(db.removedMessageListeners(), 1)
       }).pipe(Effect.ensuring(Effect.sync(db.close)))
     }))

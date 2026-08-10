@@ -11,6 +11,7 @@ import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Query from "@lucas-barake/effect-local/Query"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
+import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
@@ -49,36 +50,45 @@ export const definition = ReplicaDefinition.make({
 })
 
 export const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
+const readyProjection = "Ready"
 
 export const replica: Replica.Replica["Service"] = {
   create: () => Effect.succeed(documentId),
-  get: (_document, requestedId) =>
-    Effect.succeed({
-      documentId: requestedId,
-      value: { title: "stored" },
-      version: 1,
-      heads: [],
-      tombstone: false,
-      projection: "Ready"
-    }) as never,
-  inspectConflicts: (_document, requestedId) =>
-    Effect.succeed({
-      snapshot: {
+  get: (document, requestedId) =>
+    Document.decode(document, requestedId, { title: "stored" }).pipe(
+      Effect.map((value) => ({
         documentId: requestedId,
-        value: { title: "stored" },
+        value,
         version: 1,
         heads: [],
         tombstone: false,
-        projection: "Ready"
-      },
-      conflicts: []
-    }) as never,
+        projection: readyProjection
+      }))
+    ),
+  inspectConflicts: (document, requestedId) =>
+    Document.decode(document, requestedId, { title: "stored" }).pipe(
+      Effect.map((value) => ({
+        snapshot: {
+          documentId: requestedId,
+          value,
+          version: 1,
+          heads: [],
+          tombstone: false,
+          projection: readyProjection
+        },
+        conflicts: []
+      }))
+    ),
   resolveConflict: () => Effect.void,
-  mutate: () => Effect.succeed("renamed") as never,
+  mutate: (mutation) => Schema.decodeUnknownEffect(mutation.successSchema)("renamed").pipe(Effect.orDie),
   delete: () => Effect.void,
-  query: (_query, ...payload) => Effect.succeed([{ title: String(payload[0]) }]) as never,
-  lookupMutation: (_mutation, commandId) =>
-    Effect.succeed(CommandOutcome.durablyCommitted(commandId, "renamed")) as never,
+  query: (query, ...payload) =>
+    Schema.decodeUnknownEffect(query.successSchema)([{ title: String(payload[0]) }]).pipe(Effect.orDie),
+  lookupMutation: (mutation, commandId) =>
+    Schema.decodeUnknownEffect(mutation.successSchema)("renamed").pipe(
+      Effect.orDie,
+      Effect.map((value) => CommandOutcome.durablyCommitted(commandId, value))
+    ),
   lookupCreate: (_document, commandId) => Effect.succeed(CommandOutcome.durablyCommitted(commandId, documentId)),
   lookupDelete: (_document, commandId) => Effect.succeed(CommandOutcome.durablyCommitted(commandId, undefined)),
   lookupConflictResolution: (_document, { commandId }) =>
@@ -86,16 +96,19 @@ export const replica: Replica.Replica["Service"] = {
   lookupCommandDelivery: (commandId) => Effect.succeed(CommandDelivery.UnknownCommand.make({ commandId })),
   commandDeliveryChanges: (commandId) => Stream.make(CommandDelivery.UnknownCommand.make({ commandId })),
   flush: Effect.void,
-  status: Stream.make({ _tag: "Ready" as const, pendingCommands: 0 }),
+  status: Stream.make({ _tag: "Ready", pendingCommands: 0 } satisfies ReplicaStatus.Ready),
   exportBackup: () => Stream.make(Uint8Array.of(1, 2, 3)),
   restoreBackup: () => Effect.void,
   installBackupDocument: () => Effect.void,
   exportDocument: (document, _documentId) =>
-    Effect.succeed({
-      documentName: document.name,
-      schemaVersion: document.version,
-      value: { title: "stored" }
-    }) as never,
+    Schema.encodeUnknownEffect(document.schema)({ title: "stored" }).pipe(
+      Effect.orDie,
+      Effect.map((value) => ({
+        documentName: document.name,
+        schemaVersion: document.version,
+        value
+      }))
+    ),
   importDocument: () => Effect.succeed(documentId)
 }
 

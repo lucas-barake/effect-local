@@ -105,8 +105,8 @@ const graph = (port: MessagePort) =>
 // One `Atom.runtime` memo map is shared app wide, so two replica graphs in one application build
 // under one memo map. Layer memoization is by reference, so a Layer value that republishes its own
 // graph's `ReplicaClient` cannot be shared between the two constructors.
-it.layer(NodeCrypto.layer)("BrowserReplica graphs", (it) => {
-  it.effect("keeps two replica graphs on their own owner under one memo map", () =>
+it.layer(NodeCrypto.layer)("BrowserReplica graphs", (layer) => {
+  layer.effect("keeps two replica graphs on their own owner under one memo map", () =>
     Effect.gen(function*() {
       const portA = yield* startOwner
       const portB = yield* startOwner
