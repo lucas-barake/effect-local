@@ -42,6 +42,11 @@ import * as RelayInboxStore from "../src/RelayInboxStore.js"
 import * as RelayServer from "../src/RelayServer.js"
 import * as SqlRelayInboxStore from "../src/SqlRelayInboxStore.js"
 
+const throwDefect = (defect: unknown): never => {
+  // oxlint-disable-next-line effect/noThrowStatement -- These tests simulate a hostile synchronous backend callback.
+  throw defect
+}
+
 const Task = Document.make("Task", {
   schema: Schema.Struct({ title: Schema.String }),
   version: 1
@@ -1047,7 +1052,7 @@ describe("RelayServer", () => {
       const peer = yield* harness({
         knobs: {
           allow: () => {
-            return Effect.runSync(Effect.die("authorization backend is broken"))
+            return throwDefect("authorization backend is broken")
           }
         }
       })

@@ -9,6 +9,11 @@ import * as Schema from "effect/Schema"
 import * as Tracer from "effect/Tracer"
 import * as PeerRpcObservability from "../src/internal/peerRpcObservability.js"
 
+const throwDefect = (defect: unknown): never => {
+  // oxlint-disable-next-line effect/noThrowStatement -- These tests simulate a hostile synchronous telemetry callback.
+  throw defect
+}
+
 describe("PeerRpcObservability", () => {
   it.effect("does not let telemetry Clock defects replace the business Cause", () =>
     Effect.gen(function*() {
@@ -18,7 +23,7 @@ describe("PeerRpcObservability", () => {
         let reads = 0
         const currentTimeNanosUnsafe = () => {
           reads += 1
-          if (reads === defectAtRead) return Effect.runSync(Effect.die("telemetry clock defect"))
+          if (reads === defectAtRead) return throwDefect("telemetry clock defect")
           return clock.currentTimeNanosUnsafe()
         }
         return {
@@ -77,7 +82,7 @@ describe("PeerRpcObservability", () => {
       }
     })
     const original = Cause.fail({ _tag: "OriginalFailure" })
-    const throwTelemetry = () => Effect.runSync(Effect.die("telemetry defect"))
+    const throwTelemetry = () => throwDefect("telemetry defect")
 
     return Effect.gen(function*() {
       const exits = [
@@ -127,13 +132,13 @@ describe("PeerRpcObservability", () => {
     const original = Cause.fail({ _tag: "OriginalFailure" })
     let createRan = false
     const createTracer = Tracer.make({
-      span: () => Effect.runSync(Effect.die("span create defect"))
+      span: () => throwDefect("span create defect")
     })
     let endRan = false
     const endTracer = Tracer.make({
       span: (options) => {
         const span = new Tracer.NativeSpan(options)
-        span.end = () => Effect.runSync(Effect.die("span end defect"))
+        span.end = () => throwDefect("span end defect")
         return span
       }
     })

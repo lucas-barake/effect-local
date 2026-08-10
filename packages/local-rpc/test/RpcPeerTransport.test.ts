@@ -284,8 +284,9 @@ const makeRuntime = (overrides: RuntimeOverrides = {}) =>
   })
 
 const durable = (inbound: PeerTransport.Inbound): PeerTransport.AcknowledgedDelivery => {
-  assert.strictEqual(inbound._tag, "Durable")
-  if (inbound._tag !== "Durable") return Effect.runSync(Effect.die("Expected durable delivery"))
+  if (inbound._tag !== "Durable") {
+    assert.fail("Expected durable delivery")
+  }
   return inbound.delivery
 }
 
