@@ -6,6 +6,7 @@ import type * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Arr from "effect/Array"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
@@ -1374,12 +1375,8 @@ const make = (
         const messageHashes = yield* Effect.forEach(messages, decodeWriterProvenanceHashes)
         const uniqueHashes = [...new Set(messageHashes.flat())]
         if (uniqueHashes.length === 0) return messages.map(() => [])
-        const hashChunks: Array<ReadonlyArray<string>> = []
-        for (let start = 0; start < uniqueHashes.length; start += 500) {
-          hashChunks.push(uniqueHashes.slice(start, start + 500))
-        }
         const [rowGroups, checkpoints] = yield* Effect.all([
-          Effect.forEach(hashChunks, findChangeProvenance),
+          Effect.forEach(Arr.chunksOf(uniqueHashes, 500), findChangeProvenance),
           findCheckpointProvenance(documentId)
         ]).pipe(
           Effect.catchTags({
