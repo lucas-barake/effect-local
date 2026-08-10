@@ -629,9 +629,8 @@ const makeWithTerminal = (
         )
         if (result === "Parked") return "Parked" as const
         if (result === null) return "ApplicationRejected" as const
-        yield* Effect.gen(function*() {
-          yield* publisher.publishPending
-          if (result.reply === null) return
+        yield* publisher.publishPending
+        if (result.reply !== null) {
           // A reply that cannot be enqueued deterministically — over the per-message change
           // budget, unresolvable provenance, an unencodable envelope — will fail identically on
           // every retry, and failing the session only reconnects into the same reply while the
@@ -657,7 +656,7 @@ const makeWithTerminal = (
             )
           )
           yield* Queue.offer(flushRequests, undefined)
-        })
+        }
         return "Applied" as const
       })
 
@@ -703,16 +702,13 @@ const makeWithTerminal = (
 
     const receiveAcknowledged = (delivery: PeerTransport.AcknowledgedDelivery) =>
       Effect.scoped(Effect.gen(function*() {
-        const admissionScope = yield* Effect.acquireRelease(Scope.make(), Scope.close)
+        const admissionScope = yield* Scope.fork(yield* Scope.Scope)
         yield* scheduler.background.pipe(Effect.provideService(Scope.Scope, admissionScope))
         const permit = yield* Effect.scoped(gate.shared)
         const outcome = yield* processReceive(delivery.message, delivery, permit.incarnation).pipe(
           Effect.catchTag("RelayProtocolInvalid", () => Effect.succeed("ProtocolInvalid" as const))
         )
-        if (outcome === "Parked") {
-          yield* Scope.close(admissionScope, Exit.void)
-          return
-        }
+        if (outcome === "Parked") return
         // Keep restore excluded after releasing SQL admission. Normal reads share this gate and can
         // proceed while relay settlement retries, but restore cannot erase the receipt being settled.
         yield* gate.shared
