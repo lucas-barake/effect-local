@@ -63,10 +63,6 @@ export const ChangeRow = Schema.Struct({
   writer_schema_version: WriterProvenance.WriterSchemaVersion
 })
 
-export const CheckpointTransferColumn = Schema.Struct({
-  checkpoint_transfer: Schema.NullOr(Schema.Uint8Array)
-})
-
 export const LineageTransitionRow = Schema.Struct({
   authorization: Schema.NullOr(CheckpointAuthority.AuthorizationToken),
   checkpoint_hash: Schema.String,
