@@ -319,9 +319,11 @@ export const roster = Atom.readable((get) => {
 })
 
 /**
- * A counterpart that is not connected has no live relay route, and a burst of beats can outrun the
- * relay's per-session token bucket. Neither is a fault of this replica: awareness that cannot be
- * delivered is awareness the counterpart is right to not have.
+ * Neither failure here is about the counterpart. The relay drops a transient addressed to a device
+ * with no live session and answers success (`RelayInbox` `Transient`, `onNone: () => Effect.void`),
+ * so an offline counterpart is not an error at all. `StorageUnavailable` means this replica has no
+ * live session of its own to send over, and `QuotaExceeded` means the relay paced us. A beat that
+ * cannot be sent is awareness nobody is entitled to, so neither is worth failing the daemon over.
  */
 const publishQuietly = (publish: Effect.Effect<void, ReplicaError.ReplicaError>) =>
   publish.pipe(
