@@ -2,6 +2,7 @@ import * as BrowserWorker from "@effect/platform-browser/BrowserWorker"
 import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, it as vitestIt } from "@effect/vitest"
+import { throws } from "@effect/vitest/utils"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -35,6 +36,7 @@ import * as ReplicaClient from "../src/ReplicaClient.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
 import { PeerRelayRuntime, Task } from "./fixtures.js"
+import { nativeError, throwDefect } from "./TestErrors.js"
 
 const definition = ReplicaDefinition.make({
   name: "ownership-test",
@@ -213,7 +215,7 @@ const takeFrame = <Tag extends OwnershipProtocol.OwnerToPageFrame["_tag"],>(
   Queue.take(tab.frames).pipe(
     Effect.filterOrFail(
       (frame): frame is Extract<OwnershipProtocol.OwnerToPageFrame, { readonly _tag: Tag }> => frame._tag === tag,
-      (frame) => Error(`expected ${tag}, received ${frame._tag}`)
+      (frame) => nativeError(`expected ${tag}, received ${frame._tag}`)
     )
   )
 
@@ -462,14 +464,13 @@ vitestIt.layer(Layer.merge(NodeCrypto.layer, NodeFileSystem.layer))("OwnershipCo
         })
       )
 
+      const callbackError = nativeError("consumer callback failed")
       const context = yield* Layer.build(
         OwnershipCoordinator.layerTab({
           name: "effect-local-reset-error-callback-test",
           sharedWorker: () => sharedWorker,
           databaseWorker: () => mockWorker({ postMessage() {}, terminate() {} }),
-          onOwnerError: () => {
-            return Effect.runSync(Effect.die("consumer callback failed"))
-          }
+          onOwnerError: () => throwDefect(callbackError)
         })
       )
       const spawn = yield* Worker.Spawner.pipe(Effect.provide(context))
@@ -479,16 +480,16 @@ vitestIt.layer(Layer.merge(NodeCrypto.layer, NodeFileSystem.layer))("OwnershipCo
         rpcErrors++
       })
 
-      const callbackExit = yield* Effect.exit(Effect.sync(() => {
+      throws(() =>
         control.dispatch({
           _tag: "Reattach",
           ownerId: "previous-owner",
           reason: "the database worker health check failed"
-        })
-      }))
-      assert.isTrue(Exit.isFailure(callbackExit))
-      if (Exit.isSuccess(callbackExit)) return
-      assert.include(String(callbackExit.cause), "consumer callback failed")
+        }), (error) => {
+        assert.strictEqual(error, callbackError)
+        assert.strictEqual(callbackError.message, "consumer callback failed")
+        return undefined
+      })
       assert.strictEqual(rpcErrors, 1)
     }).pipe(Effect.scoped))
 
@@ -585,7 +586,7 @@ vitestIt.layer(Layer.merge(NodeCrypto.layer, NodeFileSystem.layer))("OwnershipCo
         Queue.take(frames).pipe(
           Effect.filterOrFail(
             (frame): frame is Extract<OwnershipProtocol.PageToOwnerFrame, { readonly _tag: Tag }> => frame._tag === tag,
-            (frame) => Error(`expected ${tag}, received ${frame._tag}`)
+            (frame) => nativeError(`expected ${tag}, received ${frame._tag}`)
           )
         )
 
@@ -665,7 +666,7 @@ vitestIt.layer(Layer.merge(NodeCrypto.layer, NodeFileSystem.layer))("OwnershipCo
         definition,
         engine: (databasePort) => {
           Deferred.doneUnsafe(factoryCalled, Effect.succeed(databasePort))
-          return Effect.runSync(Effect.die("engine factory failed"))
+          return throwDefect("engine factory failed")
         },
         provisionTimeout: "500 millis",
         engineStartTimeout: "5 seconds",

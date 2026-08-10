@@ -17,6 +17,7 @@ import * as RestoreProtocol from "../src/internal/restoreProtocol.js"
 import * as ReplicaClient from "../src/ReplicaClient.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import { definition } from "./fixtures.js"
+import { nativeError, throwDefect } from "./TestErrors.js"
 
 const installationId = Identity.BackupInstallationId.make("bak_43c8d2f4-58ce-4c9a-9155-9d21019f5e9d")
 const nonce = RestoreProtocol.RestoreNonce.make("rst_43c8d2f4-58ce-4c9a-9155-9d21019f5e9d")
@@ -356,7 +357,7 @@ layeredIt.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       const pendingStarted = yield* Deferred.make<void>()
       const releaseDefect = yield* Deferred.make<void>()
       const firstChunk = yield* Deferred.make<void>()
-      const sentinel = Error("retained source pull defect")
+      const sentinel = nativeError("retained source pull defect")
       channel.port2.addEventListener("message", (event: MessageEvent<unknown>) => {
         const frame = Schema.decodeUnknownSync(RestoreProtocol.PageToOwnerFrame)(event.data)
         if (frame._tag === "Start") {
@@ -414,7 +415,7 @@ layeredIt.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       const pendingStarted = yield* Deferred.make<void>()
       const releaseFailure = yield* Deferred.make<void>()
       const firstChunk = yield* Deferred.make<void>()
-      const sentinel = Error("retained composite source defect")
+      const sentinel = nativeError("retained composite source defect")
       const sourceFailure = new ReplicaError.ReplicaError({
         reason: new ReplicaError.RestoreBusy({ replica: "retained" })
       })
@@ -818,7 +819,7 @@ layeredIt.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       const finishResult = yield* Deferred.make<void, RestoreProtocol.RestoreResultFailure>()
       const finishStarted = yield* Deferred.make<void>()
       const finishFinalized = yield* Deferred.make<void>()
-      const sourceDefect = Error("source failed after authoritative Finish")
+      const sourceDefect = nativeError("source failed after authoritative Finish")
       let beginCalls = 0
       let finishCalls = 0
       let sourcePulls = 0
@@ -1271,7 +1272,7 @@ layeredIt.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
     Effect.scoped(Effect.gen(function*() {
       const channel = new MessageChannel()
       yield* Effect.addFinalizer(() => Effect.sync(() => channel.port2.close()))
-      const sentinel = Error("composite source defect")
+      const sentinel = nativeError("composite source defect")
       const sourceFailure = new ReplicaError.ReplicaError({
         reason: new ReplicaError.RestoreBusy({ replica: "test" })
       })
@@ -1537,7 +1538,7 @@ layeredIt.layer(NodeCrypto.layer)("RestoreClientProtocol", (it) => {
       const channel = new MessageChannel()
       const port = channel.port1
       yield* Effect.addFinalizer(() => Effect.sync(() => channel.port2.close()))
-      port.postMessage = () => Effect.runSync(Effect.die(sentinel))
+      port.postMessage = () => throwDefect(sentinel)
       const client = yield* ReplicaClient.fromRpcClient(
         definition,
         rpcClient(() => Effect.succeed({ nonce, port }))

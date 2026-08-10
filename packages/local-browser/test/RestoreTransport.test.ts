@@ -20,6 +20,7 @@ import * as RestoreProtocol from "../src/internal/restoreProtocol.js"
 import * as RestoreTransport from "../src/internal/RestoreTransport.js"
 import * as SessionManager from "../src/SessionManager.js"
 import { replica as fixtureReplica } from "./fixtures.js"
+import { nativeError } from "./TestErrors.js"
 
 const limits = {
   maxBackupBytes: 1024,
@@ -137,11 +138,14 @@ const restoreResultError = (
   exit: Exit.Exit<void, RestoreProtocol.RestoreResultFailure>
 ): RestoreProtocol.RestoreWireError => {
   if (!Exit.isFailure(exit)) {
-    return Effect.runSync(Effect.die("expected restore result failure"))
+    assert.fail("expected restore result failure")
   }
   const reason = exit.cause.reasons[0]
-  if (reason === undefined || !Cause.isFailReason(reason)) {
-    return Effect.runSync(Effect.die("expected one typed restore result failure"))
+  if (reason === undefined) {
+    assert.fail("expected one typed restore result failure")
+  }
+  if (!Cause.isFailReason(reason)) {
+    assert.fail("expected one typed restore result failure")
   }
   assert.strictEqual(reason.error._tag, "RestoreResultRestoreFailure")
   return reason.error.error
@@ -599,7 +603,7 @@ it.effect("reserves an outstanding Pull sequence before posting the authoritativ
 it.effect("does not collapse a composite typed failure and defect Cause into one terminal", () =>
   Effect.scoped(Effect.gen(function*() {
     const typed = new ReplicaError.ReplicaError({
-      reason: new ReplicaError.RestoreFailed({ cause: Error("typed failure") })
+      reason: new ReplicaError.RestoreFailed({ cause: nativeError("typed failure") })
     })
     const workStarted = yield* Deferred.make<void>()
     const terminal = yield* Deferred.make<void>()
@@ -608,7 +612,7 @@ it.effect("does not collapse a composite typed failure and defect Cause into one
       restoreBackup: () =>
         Deferred.succeed(workStarted, undefined).pipe(
           Effect.andThen(
-            Effect.failCause(Cause.combine(Cause.fail(typed), Cause.die(Error("winning defect"))))
+            Effect.failCause(Cause.combine(Cause.fail(typed), Cause.die(nativeError("winning defect"))))
           )
         )
     }
@@ -658,10 +662,10 @@ it.effect("does not collapse a composite typed failure and defect Cause into one
 it.effect("does not collapse two typed failures in a composite restore Cause", () =>
   Effect.scoped(Effect.gen(function*() {
     const first = new ReplicaError.ReplicaError({
-      reason: new ReplicaError.RestoreFailed({ cause: Error("first failure") })
+      reason: new ReplicaError.RestoreFailed({ cause: nativeError("first failure") })
     })
     const second = new ReplicaError.ReplicaError({
-      reason: new ReplicaError.StorageUnavailable({ cause: Error("second failure") })
+      reason: new ReplicaError.StorageUnavailable({ cause: nativeError("second failure") })
     })
     const workStarted = yield* Deferred.make<void>()
     const terminal = yield* Deferred.make<void>()
@@ -720,7 +724,7 @@ it.effect("does not collapse two typed failures in a composite restore Cause", (
 it.effect("preserves interruption over a typed failure in a composite restore Cause", () =>
   Effect.scoped(Effect.gen(function*() {
     const typed = new ReplicaError.ReplicaError({
-      reason: new ReplicaError.RestoreFailed({ cause: Error("typed failure") })
+      reason: new ReplicaError.RestoreFailed({ cause: nativeError("typed failure") })
     })
     const workStarted = yield* Deferred.make<void>()
     const terminal = yield* Deferred.make<void>()

@@ -50,6 +50,7 @@ import {
   replica,
   Task
 } from "./fixtures.js"
+import { nativeError } from "./TestErrors.js"
 
 const ReplicaOwner = {
   ...ReplicaOwnerModule,
@@ -1513,7 +1514,7 @@ vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
         source: Stream.make(Uint8Array.of(1)).pipe(
           Stream.concat(Stream.fail(
             new ReplicaError.ReplicaError({
-              reason: new ReplicaError.StorageUnavailable({ cause: Error("source tail was pulled") })
+              reason: new ReplicaError.StorageUnavailable({ cause: nativeError("source tail was pulled") })
             })
           ))
         ),
@@ -1722,7 +1723,7 @@ vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
             reason: new ReplicaError.RestoreBusy({ replica: "composite-lost-terminal" })
           })
         ),
-        Cause.makeDieReason(Error("composite restore defect"))
+        Cause.makeDieReason(nativeError("composite restore defect"))
       ]),
       expectedTags: ["Fail", "Die"],
       expectedFailureTags: ["RestoreBusy"]
@@ -1872,7 +1873,7 @@ vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
             reason: new ReplicaError.RestoreBusy({ replica: "typed" })
           })
         ),
-        Cause.makeDieReason(Error("secret sql SELECT credential=/private/archive"))
+        Cause.makeDieReason(nativeError("secret sql SELECT credential=/private/archive"))
       ]),
       expectedTags: ["Fail", "Die"],
       expectedFailureTags: ["RestoreBusy"]
@@ -1893,7 +1894,7 @@ vitestIt.layer(NodeCrypto.layer)("ReplicaClient", (it) => {
     {
       name: "preserves a pure defect through the public client",
       cause: Cause.fromReasons([
-        Cause.makeDieReason(Error("secret password=/private/archive"))
+        Cause.makeDieReason(nativeError("secret password=/private/archive"))
       ]),
       expectedTags: ["Die"],
       expectedFailureTags: []

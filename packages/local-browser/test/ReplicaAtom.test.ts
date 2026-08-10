@@ -23,6 +23,7 @@ import * as ReplicaAtom from "../src/ReplicaAtom.js"
 import * as ReplicaClient from "../src/ReplicaClient.js"
 import type * as ReplicaRpc from "../src/ReplicaRpc.js"
 import { peerConnectionStatus, relayConnectionStatus, Rename, replica, Task, transientClient } from "./fixtures.js"
+import { nativeError } from "./TestErrors.js"
 
 const mockReplica = (overrides: object): Replica.Replica["Service"] =>
   Object.assign(Object.create<Replica.Replica["Service"]>(null), overrides)
@@ -727,7 +728,7 @@ describe("ReplicaAtom", () => {
             return Stream.fail(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
-                  cause: Error("disconnected")
+                  cause: nativeError("disconnected")
                 })
               })
             )

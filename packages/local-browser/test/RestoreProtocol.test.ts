@@ -10,6 +10,7 @@ import * as SchemaAST from "effect/SchemaAST"
 import * as Rpc from "effect/unstable/rpc/Rpc"
 import * as RestoreProtocol from "../src/internal/restoreProtocol.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
+import { nativeError, throwDefect } from "./TestErrors.js"
 
 /** Every field of the reason must survive the encode, the wire schema and the reconstruction. */
 const roundTripsThroughWire = (reason: ReplicaError.Reason) =>
@@ -162,7 +163,7 @@ it.effect("preserves mixed failure, redacted defect, and interruption through th
     const mixed = yield* roundTripFinishExit(
       Exit.failCause(Cause.fromReasons([
         Cause.makeFailReason(restoreFailure("typed")),
-        Cause.makeDieReason(Error(secret))
+        Cause.makeDieReason(nativeError(secret))
       ]))
     )
     assert.isTrue(Exit.isFailure(mixed))
@@ -221,7 +222,7 @@ it.effect("encodes every restore error and defect at the minimum configured budg
     assert.strictEqual(ReplicaLimits.minimumRestoreErrorBytes, 111)
     const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
     const commandId = Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000001")
-    const cause = Error("failure".repeat(32))
+    const cause = nativeError("failure".repeat(32))
     const reasons: ReadonlyArray<ReplicaError.Reason> = [
       new ReplicaError.DocumentNotFound({ documentId }),
       new ReplicaError.DocumentDecodeError({ documentId, cause }),
@@ -318,7 +319,7 @@ it.effect("validates branded identities before reconstructing a typed error", ()
 
 it("bounds redacted defects and rejects hostile preflight values", () => {
   const secret = "SELECT password=credential FROM /private/archive"
-  const redacted = RestoreProtocol.encodeDefect(Error(secret), 4_096)
+  const redacted = RestoreProtocol.encodeDefect(nativeError(secret), 4_096)
   assert.notInclude(redacted.name, secret)
   assert.notInclude(redacted.message, "SELECT")
   assert.notInclude(redacted.message, "password")
@@ -328,12 +329,12 @@ it("bounds redacted defects and rejects hostile preflight values", () => {
   const throwing = Object.create(null)
   Object.defineProperty(throwing, "name", {
     get() {
-      return Effect.runSync(Effect.die("name getter"))
+      return throwDefect("name getter")
     }
   })
   Object.defineProperty(throwing, "message", {
     get() {
-      return Effect.runSync(Effect.die("message getter"))
+      return throwDefect("message getter")
     }
   })
   const description = RestoreProtocol.encodeDefect(throwing, 32)
@@ -349,7 +350,7 @@ it("bounds redacted defects and rejects hostile preflight values", () => {
   Object.defineProperty(hostile, "value", {
     enumerable: true,
     get() {
-      return Effect.runSync(Effect.die("hostile getter"))
+      return throwDefect("hostile getter")
     }
   })
   assert.isFalse(RestoreProtocol.preflight(hostile, 4_096))
@@ -376,7 +377,7 @@ it.effect("guards transferred MessagePort values", () =>
     const hostile = Object.create(null)
     Object.defineProperty(hostile, "postMessage", {
       get() {
-        return Effect.runSync(Effect.die("hostile getter"))
+        return throwDefect("hostile getter")
       }
     })
     const decoded = yield* Effect.exit(Schema.decodeUnknownEffect(ReplicaRpc.MessagePortSchema)(hostile))

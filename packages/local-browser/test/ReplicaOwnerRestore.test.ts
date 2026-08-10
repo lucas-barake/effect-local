@@ -23,6 +23,7 @@ import * as ReplicaOwner from "../src/ReplicaOwner.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 import * as SessionManager from "../src/SessionManager.js"
 import { definition, DeliveryPublisher, PeerRelayRuntime, replica } from "./fixtures.js"
+import { throwDefect } from "./TestErrors.js"
 
 layeredIt.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
   const limits = {
@@ -151,7 +152,7 @@ layeredIt.layer(NodeCrypto.layer)("ReplicaOwner restore", (it) => {
         enumerable: true,
         get() {
           chunksRead = true
-          return Effect.runSync(Effect.die("legacy chunks were read"))
+          return throwDefect("legacy chunks were read")
         }
       })
 
