@@ -42,6 +42,7 @@ import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
 import * as ReplicaWorkflow from "../src/ReplicaWorkflow.js"
+import { nativeError } from "./helpers/json.js"
 
 describe("DurableRuntime", () => {
   const Task = Document.make("Task", {
@@ -939,7 +940,7 @@ describe("DurableRuntime", () => {
       Effect.gen(function*() {
         const { recoverCalls, services } = yield* failingRecoveryServices(
           new ReplicaError.ReplicaError({
-            reason: new ReplicaError.StorageCorrupt({ cause: Error("probe") })
+            reason: new ReplicaError.StorageCorrupt({ cause: nativeError("probe") })
           })
         )
         yield* Effect.gen(function*() {

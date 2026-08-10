@@ -30,7 +30,7 @@ import * as ProjectionStore from "../src/ProjectionStore.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
 import * as SqlProjection from "../src/SqlProjection.js"
 import * as SqlReplica from "../src/SqlReplica.js"
-import { decodeJson, encodeJson } from "./helpers/json.js"
+import { decodeJson, encodeJson, nativeError } from "./helpers/json.js"
 
 describe("BackupStore", () => {
   const concatenate = (chunks: ReadonlyArray<Uint8Array>) => {
@@ -1469,7 +1469,7 @@ describe("BackupStore", () => {
           Stream.concat(Stream.fail(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageUnavailable({
-                cause: Error("source tail was pulled")
+                cause: nativeError("source tail was pulled")
               })
             })
           ))

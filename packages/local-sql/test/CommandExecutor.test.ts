@@ -31,6 +31,7 @@ import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
 import { gateLimits, withGateLimits } from "./fixtures/limits.js"
+import { nativeError } from "./helpers/json.js"
 import { makeProbe, probeLayer, withFault } from "./helpers/sqlProbe.js"
 
 describe("CommandExecutor", () => {
@@ -828,7 +829,7 @@ describe("CommandExecutor", () => {
                   return Effect.fail(
                     new SqlError.SqlError({
                       reason: new SqlError.ConnectionError({
-                        cause: Error("forced rollback failure"),
+                        cause: nativeError("forced rollback failure"),
                         message: "forced rollback failure",
                         operation: "rollback"
                       })

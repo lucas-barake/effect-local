@@ -131,9 +131,15 @@ describe("DocumentEntity", () => {
       markSent: () => Effect.succeed(false),
       pruneRelayReceipts: Effect.succeed(0)
     })
+  const throwTypeError = (): never => {
+    // oxlint-disable-next-line effect/noNewError
+    const error = new TypeError("Expected a primary key payload")
+    // oxlint-disable-next-line effect/noThrowStatement
+    throw error
+  }
   const keyOf = (payload: unknown) => {
     if (!PrimaryKey.isPrimaryKey(payload)) {
-      Effect.runSync(Effect.die(new TypeError("Expected a primary key payload")))
+      throwTypeError()
     }
     return PrimaryKey.value(payload)
   }

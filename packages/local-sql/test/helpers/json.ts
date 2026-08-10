@@ -8,3 +8,8 @@ const JsonString = Schema.String.pipe(
 export const encodeJson = (value: unknown): string => Schema.encodeSync(JsonString)(value)
 
 export const decodeJson = (value: string): any => Schema.decodeSync(JsonString)(value)
+
+export const nativeError = (message: string): Error => {
+  // oxlint-disable-next-line effect/noNewError
+  return new Error(message)
+}
