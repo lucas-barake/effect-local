@@ -25,9 +25,10 @@ const OwnerInfo = Schema.Struct({
 
 const workerUrl = new URL(globalThis.location.href)
 const timerGateToken = workerUrl.searchParams.get("effectLocalTestTimerGate")
-const timerGate = timerGateToken === null
-  ? undefined
-  : new BroadcastChannel(`effect-local-ownership-timer-${timerGateToken}`)
+let timerGate: BroadcastChannel | undefined
+if (timerGateToken !== null) {
+  timerGate = new globalThis.BroadcastChannel(`effect-local-ownership-timer-${timerGateToken}`)
+}
 let timerGateArmed = workerUrl.searchParams.has("effectLocalTestTimerGateArmed")
 let releaseProvisionDeadline: (() => void) | undefined
 timerGate?.addEventListener("message", (event) => {
@@ -42,22 +43,23 @@ timerGate?.addEventListener("message", (event) => {
   release()
 })
 
-const provisionDeadline: OwnershipCoordinator.SharedWorkerOptions<unknown, unknown, unknown>["provisionDeadline"] =
-  timerGate === undefined
-    ? undefined
-    : (timeout) =>
-      Effect.suspend(() => {
-        if (!timerGateArmed) return Effect.sleep(timeout)
-        timerGateArmed = false
-        return Effect.callback<void>((resume) => {
-          const release = () => resume(Effect.void)
-          releaseProvisionDeadline = release
-          timerGate.postMessage({ _tag: "Held" })
-          return Effect.sync(() => {
-            if (releaseProvisionDeadline === release) releaseProvisionDeadline = undefined
-          })
+let provisionDeadline: OwnershipCoordinator.SharedWorkerOptions<unknown, unknown, unknown>["provisionDeadline"]
+if (timerGate !== undefined) {
+  const gate = timerGate
+  provisionDeadline = (timeout) =>
+    Effect.suspend(() => {
+      if (!timerGateArmed) return Effect.sleep(timeout)
+      timerGateArmed = false
+      return Effect.callback<void>((resume) => {
+        const release = () => resume(Effect.void)
+        releaseProvisionDeadline = release
+        gate.postMessage({ _tag: "Held" })
+        return Effect.sync(() => {
+          if (releaseProvisionDeadline === release) releaseProvisionDeadline = undefined
         })
       })
+    })
+}
 
 const makeEngine = (databasePort: MessagePort) => {
   const DatabaseLive = BrowserSqlite.layerMessagePort(databasePort)

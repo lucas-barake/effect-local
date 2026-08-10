@@ -4,6 +4,7 @@ import * as OwnershipCoordinator from "@lucas-barake/effect-local-browser/Owners
 import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as Clock from "effect/Clock"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
@@ -27,6 +28,8 @@ const OwnerInfo = Schema.Struct({
   replicaId: Schema.String,
   writerGeneration: Identity.WriterGeneration
 })
+const SharedWorker = globalThis.SharedWorker
+const Worker = globalThis.Worker
 
 const OwnershipLive = OwnershipCoordinator.layerTab({
   name: "effect-local-tasks",
@@ -73,7 +76,7 @@ export const createTask = runtime.fn<{ readonly title: string }>()(
   ({ title }) =>
     Effect.gen(function*() {
       const replica = yield* Replica.Replica
-      const now = Date.now()
+      const now = yield* Clock.currentTimeMillis
       return yield* replica.create(TaskDocument, {
         commandId: yield* Identity.makeCommandId,
         value: { title, completed: false, createdAt: now, updatedAt: now }

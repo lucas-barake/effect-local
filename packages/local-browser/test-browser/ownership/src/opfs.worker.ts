@@ -1,3 +1,5 @@
+import * as Effect from "effect/Effect"
+
 const pending: Array<MessageEvent<unknown>> = []
 const bufferMessage = (event: MessageEvent<unknown>) => {
   pending.push(event)
@@ -5,24 +7,26 @@ const bufferMessage = (event: MessageEvent<unknown>) => {
 
 globalThis.addEventListener("message", bufferMessage)
 const workerUrl = new URL(globalThis.location.href)
-const coordinator = (
+const loadOwnershipCoordinator = () => import("@lucas-barake/effect-local-browser/OwnershipCoordinator")
+const coordinator = Effect.runPromise(Effect.gen(function*() {
+  if (
     workerUrl.searchParams.has("effectLocalTestHoldImport") ||
     workerUrl.searchParams.has("effectLocalTestRejectImport")
-  )
-  ? new Promise<void>((resolve) => {
-    const release = (event: MessageEvent<unknown>) => {
-      if (event.data !== "effectLocalTestReleaseImport") return
-      globalThis.removeEventListener("message", release)
-      resolve()
-    }
-    globalThis.addEventListener("message", release)
-  }).then(() => {
-    if (workerUrl.searchParams.has("effectLocalTestRejectImport")) {
-      throw new Error("effect-local test coordinator import failure")
-    }
-    return import("@lucas-barake/effect-local-browser/OwnershipCoordinator")
-  })
-  : import("@lucas-barake/effect-local-browser/OwnershipCoordinator")
+  ) {
+    yield* Effect.callback<void>((resume) => {
+      const release = (event: MessageEvent<unknown>) => {
+        if (event.data !== "effectLocalTestReleaseImport") return
+        resume(Effect.void)
+      }
+      globalThis.addEventListener("message", release)
+      return Effect.sync(() => globalThis.removeEventListener("message", release))
+    })
+  }
+  if (workerUrl.searchParams.has("effectLocalTestRejectImport")) {
+    return yield* Effect.fail(Error("effect-local test coordinator import failure"))
+  }
+  return yield* Effect.tryPromise(() => loadOwnershipCoordinator())
+}))
 
 void coordinator.then(
   (OwnershipCoordinator) => {

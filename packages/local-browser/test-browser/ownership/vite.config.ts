@@ -1,20 +1,31 @@
-import { readFile } from "node:fs/promises"
-import type { ServerResponse } from "node:http"
+import { NodeFileSystem } from "@effect/platform-node"
+import * as Config from "effect/Config"
+import * as ConfigProvider from "effect/ConfigProvider"
+import * as Effect from "effect/Effect"
+import * as FileSystem from "effect/FileSystem"
+import * as Option from "effect/Option"
 import { fileURLToPath } from "node:url"
 import { defineConfig } from "vite"
-import type { PreviewServer } from "vite"
+import type { Connect, PreviewServer } from "vite"
 import wasm from "vite-plugin-wasm"
 
 const wasmPath = fileURLToPath(
   new URL("../../node_modules/@effect/wa-sqlite/dist/wa-sqlite.wasm", import.meta.url)
 )
 
+const readWasm = () =>
+  Effect.gen(function*() {
+    const fileSystem = yield* FileSystem.FileSystem
+    return yield* fileSystem.readFile(wasmPath)
+  }).pipe(Effect.provide(NodeFileSystem.layer))
+
 const runtimeGate = () => {
-  if (process.env.EFFECT_LOCAL_RUNTIME_GATE !== "1") return
+  const gate = Effect.runSync(Config.option(Config.string("EFFECT_LOCAL_RUNTIME_GATE")).parse(ConfigProvider.fromEnv()))
+  if (Option.isNone(gate) || gate.value !== "1") return undefined
 
   type WaitingResponse = {
     readonly next: () => void
-    readonly response: ServerResponse
+    readonly response: Parameters<Connect.NextHandleFunction>[1]
   }
   type Gate = {
     mode: "failed" | "held" | "released"
@@ -26,9 +37,9 @@ const runtimeGate = () => {
     runtime: { mode: "released", waiting: [] }
   }
 
-  const release = (gate: Gate, failed: boolean) => {
-    const current = gate.waiting
-    gate.waiting = []
+  const release = (targetGate: Gate, failed: boolean) => {
+    const current = targetGate.waiting
+    targetGate.waiting = []
     for (const item of current) {
       if (!failed) {
         item.next()
@@ -46,38 +57,44 @@ const runtimeGate = () => {
         const pathname = new URL(request.url ?? "/", "http://localhost").pathname
         const control = /^\/__effect-local-(coordinator|runtime)\/(fail|hold|release|waiting)$/.exec(pathname)
         if (control !== null) {
-          const gate = gates[control[1] as "coordinator" | "runtime"]
-          const operation = control[2]!
-          if (operation === "waiting") {
-            response.statusCode = 200
-            response.end(String(gate.waiting.length))
+          const gateName = control[1]
+          const operation = control[2]
+          if (gateName === undefined || operation === undefined) {
+            next()
             return
           }
-          gate.mode = operation === "hold" ? "held" : operation === "fail" ? "failed" : "released"
-          if (operation !== "hold") release(gate, operation === "fail")
+          let targetGate = gates.runtime
+          if (gateName === "coordinator") targetGate = gates.coordinator
+          if (operation === "waiting") {
+            response.statusCode = 200
+            response.end(String(targetGate.waiting.length))
+            return
+          }
+          if (operation === "hold") targetGate.mode = "held"
+          if (operation === "fail") targetGate.mode = "failed"
+          if (operation === "release") targetGate.mode = "released"
+          if (operation !== "hold") release(targetGate, operation === "fail")
           response.statusCode = 204
           response.end()
           return
         }
-        const gate = pathname.includes("OwnershipCoordinator-")
-          ? gates.coordinator
-          : pathname.includes("replica.shared-worker-runtime-")
-          ? gates.runtime
-          : undefined
-        if (gate === undefined) {
+        let routeGate: Gate | undefined
+        if (pathname.includes("OwnershipCoordinator-")) routeGate = gates.coordinator
+        if (pathname.includes("replica.shared-worker-runtime-")) routeGate = gates.runtime
+        if (routeGate === undefined) {
           next()
           return
         }
-        if (gate.mode === "released") {
+        if (routeGate.mode === "released") {
           next()
           return
         }
-        if (gate.mode === "failed") {
+        if (routeGate.mode === "failed") {
           response.statusCode = 503
           response.end("ownership runtime unavailable")
           return
         }
-        gate.waiting.push({ next, response })
+        routeGate.waiting.push({ next, response })
       })
     }
   }
@@ -94,7 +111,7 @@ export default defineConfig({
           next()
           return
         }
-        void readFile(wasmPath).then((bytes) => {
+        void Effect.runPromise(readWasm()).then((bytes) => {
           response.setHeader("Content-Type", "application/wasm")
           response.end(bytes)
         }, next)

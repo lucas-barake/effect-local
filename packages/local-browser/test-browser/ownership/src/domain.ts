@@ -8,12 +8,18 @@ import * as Query from "@lucas-barake/effect-local/Query"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import type * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Effect from "effect/Effect"
+import * as Clock from "effect/Clock"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 
 const Title = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(160))
+
+const completedToBit = (completed: boolean) => {
+  if (completed) return 1
+  return 0
+}
 
 export const TaskDocument = Document.make("Task", {
   schema: Schema.Struct({
@@ -88,7 +94,7 @@ export const TaskListSql = SqlProjection.make(TaskList, {
     sql`INSERT INTO ${sql(table)} (
       source_document_id, title, completed, created_at, updated_at
     ) VALUES (
-      ${row.sourceDocumentId}, ${row.title}, ${row.completed ? 1 : 0}, ${row.createdAt}, ${row.updatedAt}
+        ${row.sourceDocumentId}, ${row.title}, ${completedToBit(row.completed)}, ${row.createdAt}, ${row.updatedAt}
     )`.pipe(Effect.asVoid)
 })
 
@@ -118,16 +124,22 @@ const ListTasksSql = SqlSchema.findAll({
 })
 
 export const DomainLive = Layer.mergeAll(
-  RenameTask.toLayer(({ draft, payload }) => {
-    draft.title = payload.title
-    draft.updatedAt = Date.now()
-    return undefined
-  }),
-  SetTaskCompleted.toLayer(({ draft, payload }) => {
-    draft.completed = payload.completed
-    draft.updatedAt = Date.now()
-    return undefined
-  }),
+  RenameTask.toLayer(Effect.gen(function*() {
+    const clock = yield* Clock.Clock
+    return ({ draft, payload }) => {
+      draft.title = payload.title
+      draft.updatedAt = clock.currentTimeMillisUnsafe()
+      return undefined
+    }
+  })),
+  SetTaskCompleted.toLayer(Effect.gen(function*() {
+    const clock = yield* Clock.Clock
+    return ({ draft, payload }) => {
+      draft.completed = payload.completed
+      draft.updatedAt = clock.currentTimeMillisUnsafe()
+      return undefined
+    }
+  })),
   ListTasks.toLayer((payload) => ListTasksSql(payload).pipe(Effect.orDie))
 )
 
