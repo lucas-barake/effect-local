@@ -83,7 +83,7 @@ describe("EntityReplica", () => {
         SqlClient.SqlClient,
         Effect.gen(function*() {
           const sql = yield* SqlClient.SqlClient
-          const instrumentedSql: SqlClient.SqlClient = (...args: Array<any>) => sql(...args)
+          const instrumentedSql = Object.assign(sql.bind(sql), sql)
           return Object.assign(instrumentedSql, sql, {
             withTransaction: <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
               Effect.serviceOption(sql.transactionService).pipe(

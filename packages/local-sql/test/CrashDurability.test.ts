@@ -1,17 +1,20 @@
+import { NodeFileSystem, NodePath } from "@effect/platform-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
+import * as FileSystem from "effect/FileSystem"
+import * as Layer from "effect/Layer"
+import * as Path from "effect/Path"
 import * as Schema from "effect/Schema"
+import { nativeError } from "./helpers/json.js"
+// oxlint-disable-next-line effect/noNodeBuiltinImport
 import { type ChildProcess, spawn } from "node:child_process"
-import { copyFileSync, existsSync, mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
 import { StringDecoder } from "node:string_decoder"
 import { fileURLToPath } from "node:url"
 import { AckLineJson, ReadLineJson } from "./crash-durability/fixture.js"
 
-const testDirectory = dirname(fileURLToPath(import.meta.url))
-const packageRoot = dirname(testDirectory)
-const childScript = join(testDirectory, "crash-durability", "childProcess.ts")
+const packageRoot = fileURLToPath(new URL("..", import.meta.url))
+const childScript = fileURLToPath(new URL("./crash-durability/childProcess.ts", import.meta.url))
+const NodeServices = Layer.merge(NodeFileSystem.layer, NodePath.layer)
 
 interface ChildCompletion {
   readonly code: number | null
@@ -25,7 +28,10 @@ interface SpawnedChild {
   readonly completion: Promise<ChildCompletion>
 }
 
-const childError = (cause: unknown) => cause instanceof Error ? cause : new Error(String(cause))
+const childError = (cause: unknown) => {
+  if (cause instanceof Error) return cause
+  return nativeError(String(cause))
+}
 
 const awaitFirstLine = (child: SpawnedChild) =>
   Effect.tryPromise({
@@ -47,6 +53,7 @@ const spawnChild = (args: ReadonlyArray<string>) =>
       let firstLineSettled = false
       let resolveFirstLine: (line: string) => void
       let rejectFirstLine: (error: Error) => void
+      // oxlint-disable-next-line effect/noNewPromise
       const firstLine = new Promise<string>((resolve, reject) => {
         resolveFirstLine = resolve
         rejectFirstLine = reject
@@ -59,7 +66,7 @@ const spawnChild = (args: ReadonlyArray<string>) =>
         firstLineSettled = true
         resolveFirstLine(stdout.slice(0, newline))
       }
-      child.stdout!.on("data", (chunk: Buffer) => {
+      child.stdout.on("data", (chunk: Buffer) => {
         stdout += decoder.write(chunk)
         settleFirstLine()
       })
@@ -68,13 +75,14 @@ const spawnChild = (args: ReadonlyArray<string>) =>
         firstLineSettled = true
         rejectFirstLine(error)
       })
+      // oxlint-disable-next-line effect/noNewPromise
       const completion = new Promise<ChildCompletion>((resolve) => {
         child.once("close", (code, signal) => {
           stdout += decoder.end()
           settleFirstLine()
           if (!firstLineSettled) {
             firstLineSettled = true
-            rejectFirstLine(new Error(`child closed before emitting a line (code=${code}, signal=${signal})`))
+            rejectFirstLine(nativeError(`child closed before emitting a line (code=${code}, signal=${signal})`))
           }
           resolve({ code, signal, stdout })
         })
@@ -97,7 +105,7 @@ const onlyOutputLine = (stdout: string) =>
     try: () => {
       const newline = stdout.indexOf("\n")
       if (newline < 0 || newline !== stdout.length - 1) {
-        throw new Error("child stdout must contain exactly one newline-terminated record")
+        return assert.fail("child stdout must contain exactly one newline-terminated record")
       }
       return stdout.slice(0, newline)
     },
@@ -107,23 +115,21 @@ const onlyOutputLine = (stdout: string) =>
 describe("CrashDurability", () => {
   it.live("awaits child termination before releasing its scope", () =>
     Effect.gen(function*() {
-      const directory = yield* Effect.acquireRelease(
-        Effect.sync(() => mkdtempSync(join(tmpdir(), "effect-local-crash-cleanup-"))),
-        (dir) => Effect.sync(() => rmSync(dir, { recursive: true, force: true }))
-      )
-      const child = yield* Effect.scoped(spawnChild(["write", join(directory, "replica.sqlite")]))
+      const fs = yield* FileSystem.FileSystem
+      const path = yield* Path.Path
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "effect-local-crash-cleanup-" })
+      const child = yield* Effect.scoped(spawnChild(["write", path.join(directory, "replica.sqlite")]))
 
       assert.strictEqual(child.process.signalCode, "SIGKILL")
-      assert.isTrue(child.process.stdout!.destroyed)
-    }))
+      assert.isTrue(child.process.stdout.destroyed)
+    }).pipe(Effect.provide(NodeServices)))
 
   it.live("recovers an acknowledged write after the writing process is SIGKILLed", () =>
     Effect.gen(function*() {
-      const directory = yield* Effect.acquireRelease(
-        Effect.sync(() => mkdtempSync(join(tmpdir(), "effect-local-crash-"))),
-        (dir) => Effect.sync(() => rmSync(dir, { recursive: true, force: true }))
-      )
-      const databasePath = join(directory, "replica.sqlite")
+      const fs = yield* FileSystem.FileSystem
+      const path = yield* Path.Path
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "effect-local-crash-" })
+      const databasePath = path.join(directory, "replica.sqlite")
 
       const writer = yield* spawnChild(["write", databasePath])
       const ackLine = yield* awaitFirstLine(writer)
@@ -137,12 +143,12 @@ describe("CrashDurability", () => {
       assert.strictEqual(yield* onlyOutputLine(writerExit.stdout), ackLine)
 
       assert.isTrue(
-        existsSync(`${databasePath}-wal`),
+        yield* fs.exists(`${databasePath}-wal`),
         "the WAL sidecar must survive the kill; a clean close would have checkpointed it away"
       )
 
-      const mainOnlyPath = join(directory, "main-only.sqlite")
-      yield* Effect.sync(() => copyFileSync(databasePath, mainOnlyPath))
+      const mainOnlyPath = path.join(directory, "main-only.sqlite")
+      yield* fs.copyFile(databasePath, mainOnlyPath)
       const mainOnlyReader = yield* spawnChild(["read", mainOnlyPath, ack.documentId])
       const mainOnlyExit = yield* awaitCompletion(mainOnlyReader)
       assert.strictEqual(mainOnlyExit.code, 0)
@@ -160,5 +166,5 @@ describe("CrashDurability", () => {
       const recovered = yield* Schema.decodeUnknownEffect(ReadLineJson)(yield* onlyOutputLine(readerExit.stdout))
       assert.isTrue(recovered.found)
       assert.strictEqual(recovered.title, ack.title)
-    }), 30_000)
+    }).pipe(Effect.provide(NodeServices)), 30_000)
 })

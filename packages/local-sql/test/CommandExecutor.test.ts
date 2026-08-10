@@ -653,7 +653,10 @@ describe("CommandExecutor", () => {
       yield* Deferred.await(finalized)
 
       const exit = yield* Fiber.await(operation)
-      if (!Exit.isFailure(exit)) yield* Effect.die("expected the executor operation to be interrupted")
+      if (!Exit.isFailure(exit)) {
+        assert.fail("expected the executor operation to be interrupted")
+        return
+      }
       assert.isTrue(Cause.hasInterrupts(exit.cause))
       if (staged === undefined) yield* Effect.die("expected staged document")
       assert.throws(() => InternalAutomerge.heads(staged))
@@ -800,7 +803,7 @@ describe("CommandExecutor", () => {
     SqlClient.SqlClient,
     Effect.map(SqlClient.SqlClient, (sql) =>
       Object.assign(
-        (...args: Array<any>) => sql(...args),
+        sql.bind(sql),
         sql,
         {
           reserve: sql.reserve.pipe(
@@ -937,7 +940,10 @@ describe("CommandExecutor", () => {
 
       const exit = yield* rejectStaleResolution(executor, documentId, permit)
 
-      if (!Exit.isFailure(exit)) yield* Effect.die("expected the deferred constraint to reject the commit")
+      if (!Exit.isFailure(exit)) {
+        assert.fail("expected the deferred constraint to reject the commit")
+        return
+      }
       assert.isFalse(Cause.hasDies(exit.cause))
       const failure = Cause.findErrorOption(exit.cause)
       assert.strictEqual(failure._tag, "Some")
@@ -955,9 +961,15 @@ describe("CommandExecutor", () => {
 
       const exit = yield* rejectStaleResolution(executor, documentId, permit)
 
-      if (!Exit.isFailure(exit)) yield* Effect.die("expected corrupt accepted heads to fail")
+      if (!Exit.isFailure(exit)) {
+        assert.fail("expected corrupt accepted heads to fail")
+        return
+      }
       const failure = Cause.findErrorOption(exit.cause)
-      if (Option.isNone(failure)) yield* Effect.die("expected a typed failure")
+      if (Option.isNone(failure)) {
+        assert.fail("expected a typed failure")
+        return
+      }
       assert.strictEqual(failure.value.reason._tag, "StorageCorrupt")
       assert.deepStrictEqual(yield* durableCounts, before)
     })).pipe(Effect.provide(Probed)))
@@ -973,9 +985,15 @@ describe("CommandExecutor", () => {
 
       const exit = yield* rejectStaleResolution(executor, documentId, permit)
 
-      if (!Exit.isFailure(exit)) yield* Effect.die("expected inconsistent materialized heads to fail")
+      if (!Exit.isFailure(exit)) {
+        assert.fail("expected inconsistent materialized heads to fail")
+        return
+      }
       const failure = Cause.findErrorOption(exit.cause)
-      if (Option.isNone(failure)) yield* Effect.die("expected a typed failure")
+      if (Option.isNone(failure)) {
+        assert.fail("expected a typed failure")
+        return
+      }
       assert.strictEqual(failure.value.reason._tag, "StorageCorrupt")
       assert.deepStrictEqual(yield* durableCounts, before)
     })).pipe(Effect.provide(Probed)))
@@ -1022,11 +1040,17 @@ describe("CommandExecutor", () => {
         return transactionExit
       }))
 
-      if (!Exit.isFailure(exit)) yield* Effect.die("expected the receipt trigger to roll back the resolution")
+      if (!Exit.isFailure(exit)) {
+        assert.fail("expected the receipt trigger to roll back the resolution")
+        return
+      }
       assert.isFalse(Cause.hasDies(exit.cause))
       assert.strictEqual(exit.cause.reasons.length, 2)
       for (const reason of exit.cause.reasons) {
-        if (!Cause.isFailReason(reason)) yield* Effect.die(`expected a typed failure, got ${reason._tag}`)
+        if (!Cause.isFailReason(reason)) {
+          assert.fail(`expected a typed failure, got ${reason._tag}`)
+          return
+        }
         assert.strictEqual(reason.error.reason._tag, "StorageUnavailable")
       }
       assert.deepStrictEqual(yield* durableCounts, before)
@@ -1047,7 +1071,10 @@ describe("CommandExecutor", () => {
 
       const exit = yield* Effect.exit(renameTask(executor, documentId, permit, "poisoned"))
 
-      if (!Exit.isFailure(exit)) yield* Effect.die("expected the body and rollback to fail")
+      if (!Exit.isFailure(exit)) {
+        assert.fail("expected the body and rollback to fail")
+        return
+      }
       assert.isFalse(Cause.hasDies(exit.cause))
       assert.strictEqual(exit.cause.reasons.length, 2)
       const failures = exit.cause.reasons.flatMap((reason) => {
@@ -1100,13 +1127,22 @@ describe("CommandExecutor", () => {
       interruptBoundary.rollbackFailuresRemaining = 2
 
       const first = yield* Effect.exit(renameTask(executor, documentId, permit, "ambiguous"))
-      if (!Exit.isFailure(first)) yield* Effect.die("expected ambiguous cleanup to fail")
+      if (!Exit.isFailure(first)) {
+        assert.fail("expected ambiguous cleanup to fail")
+        return
+      }
       assert.strictEqual(first.cause.reasons.length, 2)
 
       const second = yield* Effect.exit(renameTask(executor, documentId, permit, "blocked"))
-      if (!Exit.isFailure(second)) yield* Effect.die("expected the poisoned executor to fail")
+      if (!Exit.isFailure(second)) {
+        assert.fail("expected the poisoned executor to fail")
+        return
+      }
       const failure = Cause.findErrorOption(second.cause)
-      if (Option.isNone(failure)) yield* Effect.die("expected a typed failure")
+      if (Option.isNone(failure)) {
+        assert.fail("expected a typed failure")
+        return
+      }
       assert.strictEqual(failure.value.reason._tag, "StorageUnavailable")
     })).pipe(Effect.provide(Probed)))
 

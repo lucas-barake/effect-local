@@ -143,8 +143,7 @@ describe("DurableRuntime", () => {
 
   const servicesAtWith = <A, E, R,>(filename: string, workflowRegistrations: Layer.Layer<A, E, R>) => {
     const database = Layer.merge(
-      SqliteClient.layer({ filename, disableWAL: true }),
-      NodeCrypto.layer,
+      Layer.merge(SqliteClient.layer({ filename, disableWAL: true }), NodeCrypto.layer),
       NodeFileSystem.layer
     )
     const bootstrap = ReplicaBootstrap.layer(definition).pipe(Layer.provide(database))
@@ -534,7 +533,7 @@ describe("DurableRuntime", () => {
         const remote = Automerge.change(
           Automerge.clone(created.automerge, { actor: "1".repeat(32) }),
           (draft) => {
-            draft.value.title = "remote"
+            draft.value = { title: "remote" }
           }
         )
         InternalAutomerge.free(created.automerge)

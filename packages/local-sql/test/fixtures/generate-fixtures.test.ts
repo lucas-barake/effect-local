@@ -5,8 +5,9 @@ import * as Config from "effect/Config"
 import * as ConfigProvider from "effect/ConfigProvider"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
-import { FileSystem } from "effect/FileSystem"
+import * as FileSystem from "effect/FileSystem"
 import * as Latch from "effect/Latch"
+import type * as PlatformError from "effect/PlatformError"
 import * as Schema from "effect/Schema"
 import * as Migrator from "effect/unstable/sql/Migrator"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
@@ -66,7 +67,11 @@ interface LinkProbe {
   readonly awaitCompleted: (index: number) => Effect.Effect<void>
   readonly awaitQuiescent: Effect.Effect<void>
   readonly release: Effect.Effect<void>
-  readonly link: (index: number, path: string, destination: string) => Effect.Effect<void>
+  readonly link: (
+    index: number,
+    path: string,
+    destination: string
+  ) => Effect.Effect<void, PlatformError.PlatformError>
 }
 
 const makeLinkProbe = (fs: FileSystem.FileSystem): LinkProbe => {
@@ -96,7 +101,7 @@ const makeLinkProbe = (fs: FileSystem.FileSystem): LinkProbe => {
 
 const publishMissingFixtures = (destinationDirectory: string, probe?: LinkProbe) =>
   Effect.gen(function*() {
-    const fs = yield* FileSystem
+    const fs = yield* FileSystem.FileSystem
     const existing = yield* Effect.forEach(
       fixtures,
       (spec) => fs.exists(`${destinationDirectory}/${spec.file}`)
@@ -143,7 +148,7 @@ const publishMissingFixtures = (destinationDirectory: string, probe?: LinkProbe)
 describe("migration fixture generation", () => {
   it.effect("normalizes volatile metadata within one SQLite runtime", () =>
     Effect.gen(function*() {
-      const fs = yield* FileSystem
+      const fs = yield* FileSystem.FileSystem
       const first = yield* fs.makeTempDirectoryScoped()
       const second = yield* fs.makeTempDirectoryScoped()
       yield* generateFixtureSet(first, fixtures)
@@ -159,7 +164,7 @@ describe("migration fixture generation", () => {
 
   it.effect("publishes a complete missing suffix without replacing frozen fixtures", () =>
     Effect.gen(function*() {
-      const fs = yield* FileSystem
+      const fs = yield* FileSystem.FileSystem
       const directory = yield* fs.makeTempDirectoryScoped()
       assert.deepStrictEqual(yield* publishMissingFixtures(directory), fixtures.map((spec) => spec.file))
 
@@ -171,7 +176,7 @@ describe("migration fixture generation", () => {
 
   it.effect("leaves an interrupted publication as a recoverable version prefix", () =>
     Effect.gen(function*() {
-      const fs = yield* FileSystem
+      const fs = yield* FileSystem.FileSystem
       const directory = yield* fs.makeTempDirectoryScoped()
       const publisher = yield* publishMissingFixtures(directory).pipe(Effect.forkChild)
       const first = `${directory}/${fixtures[0].file}`
@@ -193,7 +198,7 @@ describe("migration fixture generation", () => {
 
   it.effect("publishes nothing more once it reports the publication was interrupted", () =>
     Effect.gen(function*() {
-      const fs = yield* FileSystem
+      const fs = yield* FileSystem.FileSystem
       const directory = yield* fs.makeTempDirectoryScoped()
       const probe = makeLinkProbe(fs)
       const publisher = yield* publishMissingFixtures(directory, probe).pipe(Effect.forkChild)
@@ -219,7 +224,7 @@ describe("migration fixture generation", () => {
 
   it.effect("does not replace a fixture published concurrently after the prefix snapshot", () =>
     Effect.gen(function*() {
-      const fs = yield* FileSystem
+      const fs = yield* FileSystem.FileSystem
       const directory = yield* fs.makeTempDirectoryScoped()
       const publisher = yield* publishMissingFixtures(directory).pipe(Effect.exit, Effect.forkChild)
       const first = fixtures[0]
@@ -236,7 +241,7 @@ describe("migration fixture generation", () => {
 
   it.effect("refuses a fixture gap before publishing any missing database", () =>
     Effect.gen(function*() {
-      const fs = yield* FileSystem
+      const fs = yield* FileSystem.FileSystem
       const directory = yield* fs.makeTempDirectoryScoped()
       yield* fs.writeFile(`${directory}/${fixtures[1].file}`, Uint8Array.of(1))
 

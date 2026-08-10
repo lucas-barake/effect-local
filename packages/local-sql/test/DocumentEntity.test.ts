@@ -138,10 +138,10 @@ describe("DocumentEntity", () => {
     throw error
   }
   const keyOf = (payload: unknown) => {
-    if (!PrimaryKey.isPrimaryKey(payload)) {
-      throwTypeError()
+    if (PrimaryKey.isPrimaryKey(payload)) {
+      return PrimaryKey.value(payload)
     }
-    return PrimaryKey.value(payload)
+    return throwTypeError()
   }
   const replicaGate = (permit: ReplicaGate.Permit) =>
     ReplicaGate.ReplicaGate.of({

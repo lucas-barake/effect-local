@@ -76,18 +76,20 @@ export const probeLayer = (probe: SqlProbe): Layer.Layer<SqlClient.SqlClient, ne
   Layer.effect(
     SqlClient.SqlClient,
     Effect.map(SqlClient.SqlClient, (sql) => {
-      const instrumentedSql: SqlClient.SqlClient = (...args: Array<any>) => {
-        const strings = args[0]
-        if (!Array.isArray(strings)) return sql(...args)
-        const text = normalize(strings)
-        probe.statements.push(text)
-        let params = args.slice(1)
-        if (probe.mapParams !== undefined) params = probe.mapParams(text, params)
-        const statement = sql(strings, ...params)
-        const before = probe.before?.(text)
-        if (before === undefined) return statement
-        return Effect.andThen(before, statement)
-      }
+      const instrumentedSql = new Proxy(sql.bind(sql), {
+        apply(target, thisArg, args: Array<any>) {
+          const strings = args[0]
+          if (!Array.isArray(strings)) return Reflect.apply(target, thisArg, args)
+          const text = normalize(strings)
+          probe.statements.push(text)
+          let params = args.slice(1)
+          if (probe.mapParams !== undefined) params = probe.mapParams(text, params)
+          const statement = Reflect.apply(target, thisArg, [strings, ...params])
+          const before = probe.before?.(text)
+          if (before === undefined) return statement
+          return Effect.andThen(before, statement)
+        }
+      })
       return Object.assign(instrumentedSql, sql)
     })
   )

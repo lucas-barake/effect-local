@@ -41,13 +41,16 @@ describe("CommandDeliveryStore", () => {
       SqlClient.SqlClient,
       Effect.gen(function*() {
         const sql = yield* SqlClient.SqlClient
-        const instrumentedSql: SqlClient.SqlClient = (...args: Array<any>) => {
-          const value = sql(...args)
-          if (value === undefined || typeof value.compile !== "function") return value
-          return value.pipe(
-            Effect.tap((rows: ReadonlyArray<object>) => Effect.sync(() => observe(value, rows)))
-          )
-        }
+        const instrumentedSql = new Proxy(sql.bind(sql), {
+          apply(target, thisArg, args: Array<any>) {
+            const value: Statement.Statement<object> | undefined = Reflect.apply(target, thisArg, args)
+            if (value === undefined || typeof value.compile !== "function") return value
+            return Effect.tap(
+              value,
+              (rows: ReadonlyArray<object>) => Effect.sync(() => observe(value, rows))
+            )
+          }
+        })
         return Object.assign(instrumentedSql, sql)
       })
     ).pipe(Layer.provide(database))

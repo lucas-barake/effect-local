@@ -14,7 +14,7 @@ import { gateLimits } from "./fixtures/limits.js"
 import { encodeJson } from "./helpers/json.js"
 
 const automergeMock: {
-  cloned: NativeAutomerge.Doc<Automerge.Root<{ title: string }>> | undefined
+  cloned: NativeAutomerge.Doc<unknown> | undefined
 } = vi.hoisted(() => ({ cloned: undefined }))
 vi.mock(
   "@automerge/automerge",
@@ -51,7 +51,9 @@ describe("Automerge persistence", () => {
   }
 
   const nestedLosingConflict = () => {
-    const durable = Automerge.initialize({ section: { value: "base" } }, actor("10"))
+    const durable = Automerge.initialize<{
+      section: { value: string | { selected: Array<string> } }
+    }>({ section: { value: "base" } }, actor("10"))
     const durableHeads = Automerge.heads(durable)
     const losing = Automerge.stage(durable, actor("11"), (draft) => {
       draft.section = { value: "losing" }
@@ -104,7 +106,10 @@ describe("Automerge persistence", () => {
       Identity.WriterGeneration.make(1),
       Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
     )
-    const durable = Automerge.initialize({ title: "one", labels: [] }, documentActor)
+    const durable = Automerge.initialize<{ title: string; labels: Array<string> }>(
+      { title: "one", labels: [] },
+      documentActor
+    )
     const durableHeads = Automerge.heads(durable)
     const staged = Automerge.stage(durable, documentActor, (draft) => {
       draft.title = "two"
@@ -130,16 +135,17 @@ describe("Automerge persistence", () => {
           assert.fail("change rejected")
         })
       )
-      assert.isDefined(automergeMock.cloned)
-      if (automergeMock.cloned === undefined) return
-      assert.throws(() => NativeAutomerge.getHeads(automergeMock.cloned))
+      const cloned = automergeMock.cloned
+      assert.isDefined(cloned)
+      if (cloned === undefined) return
+      assert.throws(() => NativeAutomerge.getHeads(cloned))
     }).pipe(Effect.ensuring(Effect.sync(() => Automerge.free(durable))))
   })
 
   it.effect("inspects detached datatype exact alternatives and resolves a selected scalar", () =>
     Effect.acquireUseRelease(
       Effect.sync(() =>
-        concurrent(
+        concurrent<{ title: string | NativeAutomerge.ImmutableString }>(
           { title: "base" },
           (draft) => draft.title = "same",
           (draft) => draft.title = new NativeAutomerge.ImmutableString("same")
@@ -175,15 +181,19 @@ describe("Automerge persistence", () => {
             Conflicts.applyResolution(draft, prepared, { promoteParents: false }))
           yield* Effect.gen(function*() {
             const resolvedValue = Automerge.value(resolved)
-            if (!NativeAutomerge.isImmutableString(resolvedValue.title)) {
-              yield* Effect.die("expected an immutable resolved value")
+            const resolvedTitle = resolvedValue.title
+            if (!NativeAutomerge.isImmutableString(resolvedTitle)) {
+              assert.fail("expected an immutable resolved value")
+              return
             }
             assert.deepStrictEqual(yield* Conflicts.inspect(resolved, gateLimits), [])
-            if (!NativeAutomerge.isImmutableString(immutable.value)) {
-              yield* Effect.die("expected an immutable selected value")
+            const selectedValue = immutable.value
+            if (!NativeAutomerge.isImmutableString(selectedValue)) {
+              assert.fail("expected an immutable selected value")
+              return
             }
-            immutable.value.val = "detached"
-            assert.strictEqual(resolvedValue.title.val, "same")
+            selectedValue.val = "detached"
+            assert.strictEqual(resolvedTitle.val, "same")
           }).pipe(Effect.ensuring(Effect.sync(() =>
             Automerge.free(resolved)
           )))
@@ -194,7 +204,7 @@ describe("Automerge persistence", () => {
   it.effect("deletes a conflicted list element with splice", () =>
     Effect.acquireUseRelease(
       Effect.sync(() =>
-        concurrent(
+        concurrent<{ items: Array<string> }>(
           { items: ["base"] },
           (draft) => draft.items[0] = "left",
           (draft) => draft.items[0] = "right"
@@ -225,7 +235,7 @@ describe("Automerge persistence", () => {
   it.effect("accepts null prototype maps as conflict replacements", () =>
     Effect.acquireUseRelease(
       Effect.sync(() =>
-        concurrent(
+        concurrent<{ value: string | { nested: { title: string } } }>(
           { value: "base" },
           (draft) => draft.value = "left",
           (draft) => draft.value = "right"
@@ -259,7 +269,7 @@ describe("Automerge persistence", () => {
   it.effect("keeps a composite replacement nested under the visible parent", () =>
     Effect.acquireUseRelease(
       Effect.sync(() =>
-        concurrent(
+        concurrent<{ section: { value: string | { selected: Array<string> } } }>(
           { section: { value: "base" } },
           (draft) => draft.section.value = "left",
           (draft) => draft.section.value = "right"

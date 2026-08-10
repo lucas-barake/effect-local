@@ -148,7 +148,7 @@ describe("Migrations", () => {
         FROM documents`
       yield* sql`UPDATE effect_local_documents SET projection_status = 'Blocked'
         WHERE document_id = 'document-10000'`
-      const initialAuthorization: Uint8Array | null = new Uint8Array([2])
+      const initialAuthorization = (): Uint8Array | null => new Uint8Array([2])
       const transitionRow = {
         document_id: "document-00001",
         prior_lineage: "prior-lineage",
@@ -160,7 +160,7 @@ describe("Migrations", () => {
         heads: "[\"b\"]",
         schema_version: 1,
         writer_definition_hash: "definition",
-        authorization: initialAuthorization,
+        authorization: initialAuthorization(),
         created_at: "2026-01-01T00:00:00.000Z"
       }
       const insertTransition = (overrides: Partial<typeof transitionRow>) =>
