@@ -12,6 +12,7 @@ import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
+import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -1296,13 +1297,11 @@ const withDatabaseLock = <E,>(
 ): Effect.Effect<void, E> => {
   if (typeof navigator !== "undefined" && "locks" in navigator) {
     return Effect.callback<void, E>((resume, signal) => {
-      navigator.locks.request(name, { signal }, () =>
-        Effect.runPromise(
-          Effect.onExit(effect, () => {
-            resume(Effect.void)
-            return Effect.void
-          })
-        )).catch((defect) => resume(Effect.die(defect)))
+      const bridge = Effect.runSync(Deferred.make<void>())
+      navigator.locks.request(name, { signal }, () => Effect.runPromise(Deferred.await(bridge))).catch((defect) =>
+        resume(Effect.die(defect))
+      )
+      resume(Effect.onExit(effect, () => Deferred.succeed(bridge, undefined)))
     })
   }
   return effect
