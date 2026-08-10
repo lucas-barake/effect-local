@@ -271,6 +271,7 @@ it.layer(Layer.mergeAll(
       })
       const publisher = CommitPublisher.CommitPublisher.of({
         publishPending: Effect.succeed(0),
+        drainPending: Effect.succeed(0),
         invalidate: () =>
           Queue.offer(events, { _tag: "FullRefreshRequired", refreshGeneration: 1 }).pipe(Effect.asVoid),
         subscribe: Deferred.succeed(subscribed, undefined).pipe(
@@ -482,6 +483,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -582,6 +584,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(1),
+              drainPending: Effect.succeed(1),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -716,6 +719,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -886,6 +890,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Ref.update(published, (count) => count + 1).pipe(Effect.as(1)),
+              drainPending: Ref.update(published, (count) => count + 1).pipe(Effect.as(1)),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1070,6 +1075,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1199,6 +1205,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1287,6 +1294,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1372,6 +1380,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1580,6 +1589,7 @@ it.layer(Layer.mergeAll(
               CommitPublisher.CommitPublisher,
               CommitPublisher.CommitPublisher.of({
                 publishPending: Ref.update(publications, (count) => count + 1).pipe(Effect.as(1)),
+                drainPending: Ref.update(publications, (count) => count + 1).pipe(Effect.as(1)),
                 invalidate: () => Effect.void,
                 subscribe: Effect.succeed({
                   watermark: Identity.CommitSequence.make(0),
@@ -1664,6 +1674,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1752,6 +1763,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1814,6 +1826,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1888,6 +1901,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -1983,6 +1997,7 @@ it.layer(Layer.mergeAll(
                 CommitPublisher.CommitPublisher,
                 CommitPublisher.CommitPublisher.of({
                   publishPending: Effect.succeed(0),
+                  drainPending: Effect.succeed(0),
                   invalidate: () => Effect.void,
                   subscribe: Effect.succeed({
                     watermark: Identity.CommitSequence.make(0),
@@ -2097,6 +2112,7 @@ it.layer(Layer.mergeAll(
           CommitPublisher.CommitPublisher,
           CommitPublisher.CommitPublisher.of({
             publishPending: Effect.succeed(0),
+            drainPending: Effect.succeed(0),
             invalidate: () => Effect.void,
             subscribe: Effect.succeed({
               watermark: Identity.CommitSequence.make(0),
@@ -2211,6 +2227,7 @@ it.layer(Layer.mergeAll(
                 CommitPublisher.CommitPublisher,
                 CommitPublisher.CommitPublisher.of({
                   publishPending: Effect.succeed(0),
+                  drainPending: Effect.succeed(0),
                   invalidate: () => Effect.void,
                   subscribe: Effect.succeed({
                     watermark: Identity.CommitSequence.make(0),
@@ -2336,6 +2353,7 @@ it.layer(Layer.mergeAll(
                 CommitPublisher.CommitPublisher,
                 CommitPublisher.CommitPublisher.of({
                   publishPending: Effect.succeed(0),
+                  drainPending: Effect.succeed(0),
                   invalidate: () => Effect.void,
                   subscribe: Effect.succeed({
                     watermark: Identity.CommitSequence.make(0),
@@ -2447,6 +2465,7 @@ it.layer(Layer.mergeAll(
                   CommitPublisher.CommitPublisher,
                   CommitPublisher.CommitPublisher.of({
                     publishPending: Effect.succeed(0),
+                    drainPending: Effect.succeed(0),
                     invalidate: () => Effect.void,
                     subscribe: Effect.succeed({
                       watermark: Identity.CommitSequence.make(0),
@@ -2571,6 +2590,7 @@ it.layer(Layer.mergeAll(
       })
       const publisher = CommitPublisher.CommitPublisher.of({
         publishPending: Queue.offer(events, "publish").pipe(Effect.as(0)),
+        drainPending: Queue.offer(events, "publish").pipe(Effect.as(0)),
         invalidate: () => Effect.void,
         subscribe: Effect.succeed({
           watermark: Identity.CommitSequence.make(0),
@@ -2843,6 +2863,7 @@ it.layer(Layer.mergeAll(
       })
       const publisher = CommitPublisher.CommitPublisher.of({
         publishPending: Queue.offer(events, "publish").pipe(Effect.as(0)),
+        drainPending: Queue.offer(events, "publish").pipe(Effect.as(0)),
         invalidate: () => Effect.void,
         subscribe: Effect.succeed({
           watermark: Identity.CommitSequence.make(0),
@@ -3006,6 +3027,7 @@ it.layer(Layer.mergeAll(
       })
       const publisher = CommitPublisher.CommitPublisher.of({
         publishPending: Queue.offer(events, "publish").pipe(Effect.as(0)),
+        drainPending: Queue.offer(events, "publish").pipe(Effect.as(0)),
         invalidate: () => Effect.void,
         subscribe: Effect.succeed({
           watermark: Identity.CommitSequence.make(0),
@@ -3243,6 +3265,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Effect.succeed(0),
+              drainPending: Effect.succeed(0),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -3351,6 +3374,7 @@ it.layer(Layer.mergeAll(
           CommitPublisher.CommitPublisher,
           CommitPublisher.CommitPublisher.of({
             publishPending: Effect.succeed(0),
+            drainPending: Effect.succeed(0),
             invalidate: () => Effect.void,
             subscribe: Effect.succeed({
               watermark: Identity.CommitSequence.make(0),
@@ -3840,6 +3864,7 @@ it.layer(Layer.mergeAll(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
               publishPending: Ref.updateAndGet(publications, (count) => count + 1),
+              drainPending: Ref.updateAndGet(publications, (count) => count + 1),
               invalidate: () => Effect.void,
               subscribe: Effect.succeed({
                 watermark: Identity.CommitSequence.make(0),
@@ -3945,6 +3970,7 @@ it.layer(Layer.mergeAll(
           CommitPublisher.CommitPublisher,
           CommitPublisher.CommitPublisher.of({
             publishPending: Effect.succeed(0),
+            drainPending: Effect.succeed(0),
             invalidate: () => Effect.void,
             subscribe: Effect.succeed({
               watermark: Identity.CommitSequence.make(0),
@@ -3996,6 +4022,7 @@ it.layer(Layer.mergeAll(
 
   const quietPublisher = CommitPublisher.CommitPublisher.of({
     publishPending: Effect.succeed(0),
+    drainPending: Effect.succeed(0),
     invalidate: () => Effect.void,
     subscribe: Effect.succeed({
       watermark: Identity.CommitSequence.make(0),

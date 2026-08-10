@@ -44,6 +44,8 @@ export interface CommitSubscription {
 
 export class CommitPublisher extends Context.Service<CommitPublisher, {
   readonly publishPending: Effect.Effect<number, ReplicaError.ReplicaError>
+  /** Publishes every pending commit, one bounded turn at a time. */
+  readonly drainPending: Effect.Effect<number, ReplicaError.ReplicaError>
   readonly invalidate: (keys: ReadonlyArray<unknown>) => Effect.Effect<void>
   readonly subscribe: Effect.Effect<CommitSubscription, ReplicaError.ReplicaError, Scope.Scope>
 }>()("@lucas-barake/effect-local-sql/CommitPublisher") {}
@@ -129,6 +131,15 @@ export const layer: Layer.Layer<CommitPublisher, never, Reactivity.Reactivity | 
           )
       })
     )
+    const drainPending = Effect.gen(function*() {
+      let total = 0
+      let published: number
+      do {
+        published = yield* publishPending
+        total += published
+      } while (published === pendingCommitBatchSize)
+      return total
+    })
     const subscribe = lock.withPermit(Effect.gen(function*() {
       const subscription = yield* PubSub.subscribe(events)
       const generation = yield* Ref.get(refreshGeneration)
@@ -183,11 +194,11 @@ export const layer: Layer.Layer<CommitPublisher, never, Reactivity.Reactivity | 
         )
       }
     }))
-    yield* publishPending.pipe(
+    yield* drainPending.pipe(
       Effect.catchTag("ReplicaError", () => Effect.void),
       Effect.repeat(Schedule.spaced("1 second")),
       Effect.forkScoped({ startImmediately: true })
     )
-    return CommitPublisher.of({ invalidate, publishPending, subscribe })
+    return CommitPublisher.of({ invalidate, publishPending, drainPending, subscribe })
   })
 )

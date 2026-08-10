@@ -31,16 +31,6 @@ describe("CommitPublisher", () => {
   const Reactive = Reactivity.layer
   const Publisher = CommitPublisher.layer.pipe(Layer.provide(Layer.merge(Database, Reactive)))
   const Live = Layer.mergeAll(Database, Bootstrap, Reactive, Publisher)
-  const publishAll = (publisher: CommitPublisher.CommitPublisher["Service"]) =>
-    Effect.gen(function*() {
-      let published = 0
-      let batch: number
-      do {
-        batch = yield* publisher.publishPending
-        published += batch
-      } while (batch === CommitPublisher.pendingCommitBatchSize)
-      return published
-    })
 
   it.effect("publishes committed invalidations and marks the outbox afterward", () =>
     Effect.gen(function*() {
@@ -238,8 +228,8 @@ describe("CommitPublisher", () => {
       ) INSERT INTO effect_local_commit_outbox (
         commit_sequence, document_id, invalidation_keys, published
       ) SELECT commit_sequence, ${documentId}, '["Items"]', 0 FROM sequence`
-      assert.strictEqual(yield* publisher.publishPending, CommitPublisher.pendingCommitBatchSize)
-      assert.strictEqual(yield* publishAll(publisher), 257 - CommitPublisher.pendingCommitBatchSize)
+      assert.strictEqual(yield* publisher.publishPending, 128)
+      assert.strictEqual(yield* publisher.drainPending, 257 - 128)
       const retained = [...yield* subscription.events.pipe(Stream.take(2), Stream.runCollect)]
       assert.deepStrictEqual(retained[0], { _tag: "FullRefreshRequired", refreshGeneration: 1 })
       assert.strictEqual(retained[1]?._tag, "Commit")
@@ -260,7 +250,7 @@ describe("CommitPublisher", () => {
       ) INSERT INTO effect_local_commit_outbox (
         commit_sequence, document_id, invalidation_keys, published
       ) SELECT commit_sequence, ${documentId}, '["Items"]', 0 FROM sequence`
-      assert.strictEqual(yield* publishAll(publisher), 257)
+      assert.strictEqual(yield* publisher.drainPending, 257)
       const retained = [...yield* subscription.events.pipe(Stream.take(2), Stream.runCollect)]
       assert.deepStrictEqual(retained[0], { _tag: "FullRefreshRequired", refreshGeneration: 0 })
       assert.strictEqual(retained[1]?._tag, "Commit")

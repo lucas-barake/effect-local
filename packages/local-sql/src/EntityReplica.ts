@@ -335,7 +335,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         lookupCommandDelivery: (commandId) => withPermit(() => deliveries.lookup(commandId)),
         commandDeliveryChanges: deliveryPublisher.changes,
         flush: withPermit(() =>
-          Effect.all([publisher.publishPending, deliveryPublisher.publishPending], { discard: true })
+          Effect.all([publisher.drainPending, deliveryPublisher.publishPending], { discard: true })
         ),
         status: health.status,
         exportBackup: (options) => Stream.unwrap(scheduler.interactive.pipe(Effect.as(backups.export(options)))),

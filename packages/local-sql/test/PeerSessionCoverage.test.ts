@@ -135,6 +135,7 @@ it.layer(Layer.mergeAll(
     })
   const publisher = CommitPublisher.CommitPublisher.of({
     publishPending: Effect.succeed(0),
+    drainPending: Effect.succeed(0),
     invalidate: () => Effect.void,
     subscribe: Effect.succeed({
       watermark: Identity.CommitSequence.make(0),
