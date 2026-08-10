@@ -1,4 +1,3 @@
-import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Stream from "effect/Stream"
@@ -6,33 +5,32 @@ import type * as HttpRouter from "effect/unstable/http/HttpRouter"
 import type * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
 import * as Authentication from "./Authentication.js"
-import * as PresenceHub from "./PresenceHub.js"
+import * as SpaceEntity from "./SpaceEntity.js"
 import * as SyncRpc from "./SyncRpc.js"
 
 export const layerHandlers = SyncRpc.Rpcs.toLayer(Effect.gen(function*() {
-  const store = yield* ServerStore.ServerStore
-  const presence = yield* PresenceHub.PresenceHub
+  const client = yield* SpaceEntity.Client
   return SyncRpc.Rpcs.of({
     Submit: (envelope) =>
       Authentication.Principal.pipe(
-        Effect.flatMap((principal) => store.admit(envelope, principal))
+        Effect.flatMap((principal) => client.submit(envelope.spaceId, envelope, principal))
       ),
     Pull: (request) =>
       Authentication.Principal.pipe(
-        Effect.flatMap((principal) => store.pullAuthorized(request, principal))
+        Effect.flatMap((principal) => client.pull(request.spaceId, request, principal))
       ),
     Watch: ({ spaceId }) =>
       Stream.unwrap(Authentication.Principal.pipe(
-        Effect.flatMap((principal) => store.watchAuthorized(spaceId, principal))
+        Effect.map((principal) => client.watch(spaceId, principal))
       )),
     PublishPresence: (update) =>
       Authentication.Principal.pipe(
-        Effect.flatMap((principal) => presence.publish(update, principal)),
+        Effect.flatMap((principal) => client.publishPresence(update.spaceId, update, principal)),
         Effect.as(null)
       ),
     WatchPresence: ({ spaceId }) =>
       Stream.unwrap(Authentication.Principal.pipe(
-        Effect.map((principal) => presence.watch(spaceId, principal))
+        Effect.map((principal) => client.watchPresence(spaceId, principal))
       ))
   })
 }))

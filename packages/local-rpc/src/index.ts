@@ -1,6 +1,7 @@
 export * as Authentication from "./Authentication.js"
 export * as PresenceClient from "./PresenceClient.js"
 export * as PresenceHub from "./PresenceHub.js"
+export * as SpaceEntity from "./SpaceEntity.js"
 export * as SyncClient from "./SyncClient.js"
 export * as SyncRpc from "./SyncRpc.js"
 export * as SyncServer from "./SyncServer.js"

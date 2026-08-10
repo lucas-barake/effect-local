@@ -8,12 +8,10 @@ import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Hash from "effect/Hash"
-import * as Layer from "effect/Layer"
+import type * as Layer from "effect/Layer"
 import { Atom } from "effect/unstable/reactivity"
 import type * as AtomRegistry from "effect/unstable/reactivity/AtomRegistry"
 import type * as Reactivity from "effect/unstable/reactivity/Reactivity"
-
-export const context = Atom.context({ memoMap: Layer.makeMemoMapUnsafe() })
 
 class QueryKey<P,> implements Equal.Equal {
   readonly value: string
@@ -37,25 +35,29 @@ export const make = <R, E,>(
     readonly idleTTL?: Duration.Input
   }
 ) => {
-  const factory = options?.factory ?? context
+  const factory = options?.factory ?? Atom.runtime
   const runtime = factory(layer)
-  const ttl = options?.idleTTL ?? Duration.seconds(30)
+  const idleTTL = Duration.toMillis(options?.idleTTL ?? Duration.seconds(30))
 
   const entity = <M extends Model.Any,>(model: M) =>
     Atom.family((key: Model.Key<M>) =>
       runtime.atom(Replica.Replica.use((replica) => replica.get(model, key))).pipe(
         factory.withReactivity({ "effect-local:entities": [[model.name, key]] }),
-        Atom.setIdleTTL(ttl)
+        Atom.setIdleTTL(idleTTL)
       )
     )
 
   const query = <Q extends Query.Any,>(definition: Q) => {
+    const dependencyKeys = Array.from(
+      new Set(definition.dependsOn.map((model) => model.name)),
+      (name) => [name]
+    )
     const family = Atom.family((key: QueryKey<Q["payloadSchema"]["Type"]>) =>
       runtime.atom(Replica.Replica.use((replica) => replica.query(definition, key.payload))).pipe(
         factory.withReactivity({
-          "effect-local:entities": definition.dependsOn.map((model) => [model.name])
+          "effect-local:entities": dependencyKeys
         }),
-        Atom.setIdleTTL(ttl)
+        Atom.setIdleTTL(idleTTL)
       )
     )
     return (payload: Q["payloadSchema"]["Type"]) => {
@@ -75,7 +77,7 @@ export const make = <R, E,>(
   const receipt = Atom.family((mutationId: Identity.MutationId) =>
     runtime.atom(Replica.Replica.use((replica) => replica.receipt(mutationId))).pipe(
       factory.withReactivity([`effect-local:receipt:${mutationId}`]),
-      Atom.setIdleTTL(ttl)
+      Atom.setIdleTTL(idleTTL)
     )
   )
 

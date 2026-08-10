@@ -8,17 +8,11 @@ const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-00000000000
 const page: Protocol.PullPage = {
   entries: Array.from({ length: 256 }, (_, index) => ({
     sequence: Identity.ServerSequence.make(index + 1),
-    envelope: {
-      spaceId,
-      clientId,
-      mutationId: Identity.MutationId.make(`mut_00000000-0000-4000-8000-${String(index).padStart(12, "0")}`),
-      localSequence: Identity.LocalSequence.make(index + 1),
-      basis: Identity.ServerSequence.make(index),
-      name: "PutTodo",
-      payload: { id: String(index), title: "x".repeat(512) },
-      digest: "a".repeat(64)
-    },
-    result: null,
+    spaceId,
+    clientId,
+    mutationId: Identity.MutationId.make(`mut_00000000-0000-4000-8000-${String(index).padStart(12, "0")}`),
+    localSequence: Identity.LocalSequence.make(index + 1),
+    digest: "a".repeat(64),
     changes: [{
       _tag: "Upsert" as const,
       entity: { model: "Todo", key: String(index) },

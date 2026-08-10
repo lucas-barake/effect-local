@@ -1,14 +1,14 @@
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Protocol from "@lucas-barake/effect-local/Protocol"
-import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import type * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import type * as Authentication from "./Authentication.js"
-import { mapRpcError } from "./SyncClient.js"
 import * as SyncRpc from "./SyncRpc.js"
 
 export interface Service {
@@ -31,10 +31,33 @@ export const layer: Layer.Layer<
       PresenceClient.of({
         publish: (update) =>
           client.PublishPresence(update).pipe(
-            Effect.mapError(mapRpcError),
-            Effect.asVoid
+            Effect.mapError((cause) =>
+              Schema.is(ReplicaError.ReplicaError)(cause)
+                ? cause
+                : new ReplicaError.ProtocolInvalid({
+                  message: "The presence transport failed",
+                  cause
+                })
+            ),
+            Effect.asVoid,
+            Effect.withSpan("PresenceClient.publish", {
+              attributes: { "space.id": update.spaceId, "client.id": update.clientId }
+            })
           ),
-        watch: (spaceId) => client.WatchPresence({ spaceId }).pipe(Stream.mapError(mapRpcError))
+        watch: (spaceId) =>
+          client.WatchPresence({ spaceId }).pipe(
+            Stream.mapError((cause) =>
+              Schema.is(ReplicaError.ReplicaError)(cause)
+                ? cause
+                : new ReplicaError.ProtocolInvalid({
+                  message: "The presence transport failed",
+                  cause
+                })
+            ),
+            Stream.withSpan("PresenceClient.watch", {
+              attributes: { "space.id": spaceId }
+            })
+          )
       })
     )
   )

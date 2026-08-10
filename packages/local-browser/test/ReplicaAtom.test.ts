@@ -11,11 +11,12 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Query from "@lucas-barake/effect-local/Query"
+import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
-import { AtomRegistry } from "effect/unstable/reactivity"
+import { Atom, AtomRegistry } from "effect/unstable/reactivity"
 import * as BrowserReplica from "../src/BrowserReplica.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
@@ -39,7 +40,7 @@ const database = Layer.mergeAll(
   NodeCrypto.layer
 )
 const mutationRuntime = MutationRuntime.layer(definition).pipe(Layer.provide(handlers))
-const server = ServerStore.layer({ definition }).pipe(
+const server = ServerStore.layerTrusted({ definition }).pipe(
   Layer.provide(mutationRuntime),
   Layer.provide(database)
 )
@@ -56,6 +57,33 @@ const replica = SqlReplica.layer({ definition, spaceId, clientId, retryDelay: "1
 )
 
 describe("Replica Atom graph", () => {
+  it("uses the shared runtime factory by default and preserves an explicit factory", () => {
+    const graph = BrowserReplica.make(replica)
+    assert.strictEqual(graph.factory, Atom.runtime)
+
+    const factory = Atom.context({ memoMap: Layer.makeMemoMapUnsafe() })
+    const customGraph = BrowserReplica.make(replica, { factory })
+    assert.strictEqual(customGraph.factory, factory)
+  })
+
+  it("normalizes the configured idle duration once when the graph is constructed", () => {
+    let reads = 0
+    const idleTTL = {
+      get milliseconds() {
+        reads++
+        return 17
+      }
+    } satisfies Duration.Input
+    const graph = BrowserReplica.make(replica, { idleTTL })
+    const readsAfterConstruction = reads
+
+    assert.isAbove(readsAfterConstruction, 0)
+    assert.strictEqual(graph.entity(Todo)("1").idleTTL, 17)
+    assert.strictEqual(graph.query(ListTodos)(undefined).idleTTL, 17)
+    assert.strictEqual(graph.receipt(Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")).idleTTL, 17)
+    assert.strictEqual(reads, readsAfterConstruction)
+  })
+
   it.live(
     "runs mutation, entity, query, receipt, and status state through one reactive runtime",
     () =>
@@ -97,7 +125,6 @@ describe("Replica Atom graph", () => {
         assert.strictEqual(accepted._tag, "Accepted")
         const status = yield* AtomRegistry.getResult(registry, graph.status)
         assert.strictEqual(status._tag, "Online")
-      }).pipe(Effect.scoped),
-    { timeout: 20_000 }
+      })
   )
 })

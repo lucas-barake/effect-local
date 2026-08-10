@@ -35,7 +35,7 @@ interface ClientState<A,> {
 
 interface State<A,> {
   readonly nextToken: number
-  readonly clients: ReadonlyMap<Identity.ClientId, ClientState<A>>
+  readonly clients: Map<Identity.ClientId, ClientState<A>>
 }
 
 export const make = <A,>(schema: Schema.Decoder<A>, options: { readonly timeToLive: Duration.Input }) =>
@@ -48,6 +48,8 @@ export const make = <A,>(schema: Schema.Decoder<A>, options: { readonly timeToLi
     if (!Number.isFinite(timeToLiveMillis) || timeToLiveMillis <= 0) {
       return yield* new ReplicaError.ProtocolInvalid({ message: "Presence timeToLive must be positive and finite" })
     }
+    // The map never escapes and is mutated only inside synchronous Ref callbacks. Each callback is one
+    // atomic state transition without copying every resident for an unrelated client's update.
     const state = yield* Ref.make<State<A>>({ nextToken: 0, clients: new Map() })
     const removeInFlight = (client: ClientState<A>, token: number) => {
       if (!client.inFlight.has(token)) return client
@@ -60,11 +62,10 @@ export const make = <A,>(schema: Schema.Decoder<A>, options: { readonly timeToLi
       clientId: Identity.ClientId,
       update: (client: ClientState<A>) => ClientState<A>
     ): State<A> => {
-      const clients = new Map(current.clients)
-      const client = update(clients.get(clientId) ?? { barrier: 0, inFlight: new Set(), entry: undefined })
-      if (client.entry === undefined && client.inFlight.size === 0) clients.delete(clientId)
-      else clients.set(clientId, client)
-      return { ...current, clients }
+      const client = update(current.clients.get(clientId) ?? { barrier: 0, inFlight: new Set(), entry: undefined })
+      if (client.entry === undefined && client.inFlight.size === 0) current.clients.delete(clientId)
+      else current.clients.set(clientId, client)
+      return current
     }
     const begin = (clientId: Identity.ClientId) =>
       Ref.modify(state, (current) => {
@@ -128,19 +129,18 @@ export const make = <A,>(schema: Schema.Decoder<A>, options: { readonly timeToLi
       values: Effect.gen(function*() {
         const now = yield* Clock.currentTimeMillis
         return yield* Ref.modify(state, (current) => {
-          const clients = new Map(current.clients)
           const active: Array<Entry<A>> = []
           for (const [clientId, client] of current.clients) {
             const entry = client.entry
             if (entry === undefined) continue
             if (entry.expiresAtMillis <= now) {
-              if (client.inFlight.size === 0) clients.delete(clientId)
-              else clients.set(clientId, { ...client, entry: undefined })
+              if (client.inFlight.size === 0) current.clients.delete(clientId)
+              else current.clients.set(clientId, { ...client, entry: undefined })
             } else {
               active.push({ clientId, value: entry.value, expiresAtMillis: entry.expiresAtMillis })
             }
           }
-          return [active, { ...current, clients }]
+          return [active, current]
         })
       })
     } satisfies Presence<A>
