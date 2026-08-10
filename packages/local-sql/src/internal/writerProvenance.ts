@@ -3,6 +3,7 @@ import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Equal from "effect/Equal"
 import * as Schema from "effect/Schema"
+import * as NativeError from "./nativeError.js"
 import * as SyncChunks from "./syncChunks.js"
 
 export const WriterSchemaVersion = Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))
@@ -68,7 +69,11 @@ export const isCompactCheckpoint = (
 
 export const exactEntries = (
   provenance: CheckpointProvenance
-): ReadonlyArray<ChangeProvenance> => Array.isArray(provenance) ? provenance : []
+): ReadonlyArray<ChangeProvenance> =>
+  (() => {
+    if (Array.isArray(provenance)) return provenance
+    return []
+  })()
 
 export const canonicalize = (values: ReadonlyArray<ChangeProvenance>): ReadonlyArray<ChangeProvenance> =>
   values.toSorted((left, right) => left.changeHash.localeCompare(right.changeHash))
@@ -87,11 +92,11 @@ export const syncMessageChangeHashes = (message: Uint8Array): ReadonlyArray<stri
     .toSorted()
 
 export const backfill = (
-  changeHashes: ReadonlyArray<string>,
+  requiredHashes: ReadonlyArray<string>,
   entries: Iterable<ChangeProvenance>,
   fallback: Pick<ChangeProvenance, "writerDefinitionHash" | "writerSchemaVersion">
 ): ReadonlyArray<ChangeProvenance> => {
-  const required = new Set(changeHashes)
+  const required = new Set(requiredHashes)
   const byHash = new Map<string, ChangeProvenance>()
   for (const entry of entries) {
     if (!required.has(entry.changeHash)) continue
@@ -103,7 +108,7 @@ export const backfill = (
         existing.writerDefinitionHash !== entry.writerDefinitionHash
       )
     ) {
-      throw new TypeError(`Conflicting writer provenance for change ${entry.changeHash}`)
+      return NativeError.throwTypeError(`Conflicting writer provenance for change ${entry.changeHash}`)
     }
     byHash.set(entry.changeHash, entry)
   }
@@ -117,10 +122,10 @@ export const backfill = (
 }
 
 export const resolve = (
-  changeHashes: ReadonlyArray<string>,
+  requiredHashes: ReadonlyArray<string>,
   entries: Iterable<ChangeProvenance>
 ): ReadonlyArray<ChangeProvenance> => {
-  const required = new Set(changeHashes)
+  const required = new Set(requiredHashes)
   const byHash = new Map<string, ChangeProvenance>()
   for (const entry of entries) {
     if (!required.has(entry.changeHash)) continue
@@ -132,24 +137,26 @@ export const resolve = (
         existing.writerDefinitionHash !== entry.writerDefinitionHash
       )
     ) {
-      throw new TypeError(`Conflicting writer provenance for change ${entry.changeHash}`)
+      return NativeError.throwTypeError(`Conflicting writer provenance for change ${entry.changeHash}`)
     }
     byHash.set(entry.changeHash, entry)
   }
   return [...required].toSorted().map((changeHash) => {
     const entry = byHash.get(changeHash)
-    if (entry === undefined) throw new TypeError(`Missing writer provenance for change ${changeHash}`)
+    if (entry === undefined) {
+      return NativeError.throwTypeError(`Missing writer provenance for change ${changeHash}`)
+    }
     return entry
   })
 }
 
 export const validateExact = (
-  changeHashes: ReadonlyArray<string>,
+  requiredHashes: ReadonlyArray<string>,
   entries: ReadonlyArray<ChangeProvenance>
 ): ReadonlyArray<ChangeProvenance> => {
-  const resolved = resolve(changeHashes, entries)
+  const resolved = resolve(requiredHashes, entries)
   if (resolved.length !== entries.length) {
-    throw new TypeError("Checkpoint writer provenance contains duplicate or unrelated changes")
+    return NativeError.throwTypeError("Checkpoint writer provenance contains duplicate or unrelated changes")
   }
   return resolved
 }

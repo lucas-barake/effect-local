@@ -1,6 +1,7 @@
+import { literal } from "./literal.js"
 export const storageFormatVersion = 2
 
-export const tables = [
+export const tables = literal([
   "effect_local_metadata",
   "effect_local_migration_catalog",
   "effect_local_writer_generations",
@@ -29,7 +30,7 @@ export const tables = [
   "effect_local_peer_relay_delivery_changes",
   "effect_local_command_delivery_events",
   "effect_local_command_delivery_control"
-] as const
+])
 
 /**
  * The tables whose contents mean "this replica holds durable state", used to decide whether a

@@ -4,12 +4,15 @@ import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
+import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as CommandDeliveryStore from "./CommandDeliveryStore.js"
+import { literal } from "./internal/literal.js"
+import * as NativeError from "./internal/nativeError.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as PeerRelayOutboxLimits from "./PeerRelayOutboxLimits.js"
 import * as PeerSyncEnvelope from "./PeerSyncEnvelope.js"
@@ -167,7 +170,10 @@ const replayRowBatchSize = 500
 
 const parseIso = (value: string): number | null => {
   const millis = Date.parse(value)
-  return Number.isFinite(millis) && new Date(millis).toISOString() === value ? millis : null
+  return (() => {
+    if (Number.isFinite(millis) && DateTime.formatIso(DateTime.makeUnsafe(millis)) === value) return millis
+    return (null)
+  })()
 }
 
 export class PeerRelayOutbox extends Context.Service<PeerRelayOutbox, {
@@ -225,12 +231,15 @@ const make = Effect.gen(function*() {
         Effect.flatMap((syncEnvelope) =>
           Effect.try({
             try: () =>
-              syncEnvelope.checkpointTransfer === undefined
-                ? WriterProvenance.validateExact(
-                  WriterProvenance.syncMessageChangeHashes(syncEnvelope.message),
-                  syncEnvelope.writerProvenance
-                ).map((provenance) => provenance.changeHash)
-                : [],
+              (() => {
+                if (syncEnvelope.checkpointTransfer === undefined) {
+                  return (WriterProvenance.validateExact(
+                    WriterProvenance.syncMessageChangeHashes(syncEnvelope.message),
+                    syncEnvelope.writerProvenance
+                  ).map((provenance) => provenance.changeHash))
+                }
+                return []
+              })(),
             catch: (cause) =>
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({ cause })
@@ -604,7 +613,7 @@ const make = Effect.gen(function*() {
       if (remote.length !== 1 || replica.length !== 1) {
         return yield* new ReplicaError.ReplicaError({
           reason: new ReplicaError.StorageCorrupt({
-            cause: new Error("Relay outbox usage reservation mismatch")
+            cause: NativeError.nativeError("Relay outbox usage reservation mismatch")
           })
         })
       }
@@ -619,6 +628,7 @@ const make = Effect.gen(function*() {
         WHERE replica_incarnation = ${row.replica_incarnation}
           AND message_count = 0
           AND encoded_bytes = 0`
+      return undefined
     })
 
   const validateRow = (
@@ -633,7 +643,7 @@ const make = Effect.gen(function*() {
       ) {
         return yield* new ReplicaError.ReplicaError({
           reason: new ReplicaError.StorageCorrupt({
-            cause: new Error("Relay outbox metadata mismatch")
+            cause: NativeError.nativeError("Relay outbox metadata mismatch")
           })
         })
       }
@@ -651,7 +661,7 @@ const make = Effect.gen(function*() {
       ) {
         return yield* new ReplicaError.ReplicaError({
           reason: new ReplicaError.StorageCorrupt({
-            cause: new Error("Relay outbox deadline mismatch")
+            cause: NativeError.nativeError("Relay outbox deadline mismatch")
           })
         })
       }
@@ -667,7 +677,7 @@ const make = Effect.gen(function*() {
       ) {
         return yield* new ReplicaError.ReplicaError({
           reason: new ReplicaError.StorageCorrupt({
-            cause: new Error("Relay outbox payload metadata mismatch")
+            cause: NativeError.nativeError("Relay outbox payload metadata mismatch")
           })
         })
       }
@@ -706,7 +716,7 @@ const make = Effect.gen(function*() {
       if (digest !== row.outer_envelope_digest) {
         return yield* new ReplicaError.ReplicaError({
           reason: new ReplicaError.StorageCorrupt({
-            cause: new Error("Relay outbox digest mismatch")
+            cause: NativeError.nativeError("Relay outbox digest mismatch")
           })
         })
       }
@@ -739,16 +749,17 @@ const make = Effect.gen(function*() {
   const validateReplicaIncarnation = (expected: Identity.ReplicaIncarnation) =>
     gate.current.pipe(
       Effect.flatMap((permit) =>
-        permit.incarnation === expected
-          ? Effect.void
-          : Effect.fail(
+        (() => {
+          if (permit.incarnation === expected) return (Effect.void)
+          return (Effect.fail(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.ProtocolMismatch({
                 expected: "current replica incarnation",
                 observed: "stale replica incarnation"
               })
             })
-          )
+          ))
+        })()
       )
     )
 
@@ -773,12 +784,15 @@ const make = Effect.gen(function*() {
       )
       const changeHashes = yield* Effect.try({
         try: () =>
-          syncEnvelope.checkpointTransfer === undefined
-            ? WriterProvenance.validateExact(
-              WriterProvenance.syncMessageChangeHashes(syncEnvelope.message),
-              syncEnvelope.writerProvenance
-            ).map((entry) => entry.changeHash)
-            : [],
+          (() => {
+            if (syncEnvelope.checkpointTransfer === undefined) {
+              return (WriterProvenance.validateExact(
+                WriterProvenance.syncMessageChangeHashes(syncEnvelope.message),
+                syncEnvelope.writerProvenance
+              ).map((entry) => entry.changeHash))
+            }
+            return []
+          })(),
         catch: (cause) =>
           new ReplicaError.ReplicaError({
             reason: new ReplicaError.ProtocolMismatch({
@@ -808,8 +822,8 @@ const make = Effect.gen(function*() {
         payload: input.payload
       })
       const nowMillis = yield* Clock.currentTimeMillis
-      const createdAt = new Date(nowMillis).toISOString()
-      const retryDeadline = new Date(nowMillis + input.retryHorizonMillis).toISOString()
+      const createdAt = DateTime.formatIso(DateTime.makeUnsafe(nowMillis))
+      const retryDeadline = DateTime.formatIso(DateTime.makeUnsafe(nowMillis + input.retryHorizonMillis))
       const request = {
         replicaId: permit.replicaId,
         replicaIncarnation: permit.incarnation,
@@ -825,12 +839,12 @@ const make = Effect.gen(function*() {
         if (existing.length > 1) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new Error("Duplicate relay source operation")
+              cause: NativeError.nativeError("Duplicate relay source operation")
             })
           })
         }
         if (existing.length === 1) {
-          const entry = yield* validateRow(existing[0]!, permit)
+          const entry = yield* validateRow(existing[0], permit)
           const existingDigest = yield* PeerSyncEnvelope.digestRelayOuterEnvelope(
             makeOuterEnvelope(entry.relayMessageId)
           ).pipe(
@@ -873,12 +887,12 @@ const make = Effect.gen(function*() {
         if (retained.length > 1) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new Error("Duplicate retained relay source operation")
+              cause: NativeError.nativeError("Duplicate retained relay source operation")
             })
           })
         }
         if (retained.length === 1) {
-          const row = retained[0]!
+          const row = retained[0]
           const retainedDigest = yield* PeerSyncEnvelope.digestRelayOuterEnvelope(
             makeOuterEnvelope(row.relay_message_id)
           ).pipe(
@@ -886,12 +900,14 @@ const make = Effect.gen(function*() {
           )
           const retainedCreatedAt = parseIso(row.created_at)
           const retainedRetryDeadline = parseIso(row.retry_deadline)
-          const acceptedAt = row.relay_custody_accepted_at === null
-            ? null
-            : parseIso(row.relay_custody_accepted_at)
-          const unconfirmedAt = row.sender_custody_unconfirmed_at === null
-            ? null
-            : parseIso(row.sender_custody_unconfirmed_at)
+          const acceptedAt = (() => {
+            if (row.relay_custody_accepted_at === null) return (null)
+            return (parseIso(row.relay_custody_accepted_at))
+          })()
+          const unconfirmedAt = (() => {
+            if (row.sender_custody_unconfirmed_at === null) return (null)
+            return (parseIso(row.sender_custody_unconfirmed_at))
+          })()
           if (
             row.outer_envelope_digest !== retainedDigest ||
             row.document_id !== syncEnvelope.documentId ||
@@ -926,21 +942,21 @@ const make = Effect.gen(function*() {
           yield* gate.validate(permit)
           if (acceptedAt !== null) {
             return {
-              _tag: "RelayCustodyAccepted" as const,
+              _tag: literal("RelayCustodyAccepted"),
               relayMessageId: row.relay_message_id,
               outerEnvelopeDigest: row.outer_envelope_digest
             }
           }
           if (unconfirmedAt !== null) {
             return {
-              _tag: "RelayCustodyUnconfirmedAtDeadline" as const,
+              _tag: literal("RelayCustodyUnconfirmedAtDeadline"),
               relayMessageId: row.relay_message_id,
               outerEnvelopeDigest: row.outer_envelope_digest
             }
           }
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new Error("Retained relay source operation is not terminal")
+              cause: NativeError.nativeError("Retained relay source operation is not terminal")
             })
           })
         }
@@ -1017,7 +1033,7 @@ const make = Effect.gen(function*() {
         if (inserted.length !== 1) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new Error("Relay outbox insert did not return one row")
+              cause: NativeError.nativeError("Relay outbox insert did not return one row")
             })
           })
         }
@@ -1039,8 +1055,8 @@ const make = Effect.gen(function*() {
         yield* gate.validate(permit)
         provenanceCache.set(relayMessageId, { outerEnvelopeDigest, changeHashes })
         return {
-          _tag: "PendingRelayCustody" as const,
-          rowId: inserted[0]!.row_id,
+          _tag: literal("PendingRelayCustody"),
+          rowId: inserted[0].row_id,
           replicaId: permit.replicaId,
           replicaIncarnation: permit.incarnation,
           writerGeneration: permit.writerGeneration,
@@ -1049,8 +1065,12 @@ const make = Effect.gen(function*() {
           relayPeerId: endpoint.relayPeerId,
           relayMessageId,
           outerEnvelopeDigest,
-          protocolVersion: PeerSyncEnvelope.relayProtocolVersion as typeof PeerSyncEnvelope.relayProtocolVersion,
-          payloadVersion: PeerSyncEnvelope.syncEnvelopeVersion as typeof PeerSyncEnvelope.syncEnvelopeVersion,
+          protocolVersion: Schema.decodeUnknownSync(Schema.Literal(PeerSyncEnvelope.relayProtocolVersion))(
+            PeerSyncEnvelope.relayProtocolVersion
+          ),
+          payloadVersion: Schema.decodeUnknownSync(Schema.Literal(PeerSyncEnvelope.syncEnvelopeVersion))(
+            PeerSyncEnvelope.syncEnvelopeVersion
+          ),
           senderConnectionEpoch: syncEnvelope.connectionEpoch,
           senderSequence: syncEnvelope.sequence,
           document: PeerSyncEnvelope.syncEnvelopeDocument(syncEnvelope),
@@ -1094,7 +1114,7 @@ const make = Effect.gen(function*() {
         })
       }
       const permit = yield* gate.shared
-      const now = new Date(yield* Clock.currentTimeMillis).toISOString()
+      const now = DateTime.formatIso(yield* DateTime.now)
       return yield* sql.withTransaction(Effect.gen(function*() {
         const metadata = yield* findDueMetadata({
           replicaId: permit.replicaId,
@@ -1138,7 +1158,7 @@ const make = Effect.gen(function*() {
             if (replayDeliveries.has(message.relay_message_id)) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({
-                  cause: new Error("Duplicate relay delivery message identity")
+                  cause: NativeError.nativeError("Duplicate relay delivery message identity")
                 })
               })
             }
@@ -1157,14 +1177,14 @@ const make = Effect.gen(function*() {
             if (delivery === undefined) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({
-                  cause: new Error("Relay delivery change has no message identity")
+                  cause: NativeError.nativeError("Relay delivery change has no message identity")
                 })
               })
             }
             if (delivery.changeHashSet.has(change.change_hash)) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({
-                  cause: new Error("Duplicate relay delivery change identity")
+                  cause: NativeError.nativeError("Duplicate relay delivery change identity")
                 })
               })
             }
@@ -1183,7 +1203,7 @@ const make = Effect.gen(function*() {
           ) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new Error("Relay outbox payload length mismatch")
+                cause: NativeError.nativeError("Relay outbox payload length mismatch")
               })
             })
           }
@@ -1191,7 +1211,7 @@ const make = Effect.gen(function*() {
           if (row === undefined) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new Error("Relay outbox row disappeared during replay")
+                cause: NativeError.nativeError("Relay outbox row disappeared during replay")
               })
             })
           }
@@ -1226,7 +1246,7 @@ const make = Effect.gen(function*() {
           ) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new Error("Relay delivery message identity is missing or conflicting")
+                cause: NativeError.nativeError("Relay delivery message identity is missing or conflicting")
               })
             })
           }
@@ -1237,7 +1257,7 @@ const make = Effect.gen(function*() {
           ) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new Error("Relay outbox local endpoint mismatch")
+                cause: NativeError.nativeError("Relay outbox local endpoint mismatch")
               })
             })
           }
@@ -1302,7 +1322,7 @@ const make = Effect.gen(function*() {
       if (rounded <= 0 || rounded > limits.maxRetryHorizonMillis) {
         return yield* new ReplicaError.ReplicaError({
           reason: new ReplicaError.StorageCorrupt({
-            cause: new Error("Relay outbox horizon mismatch")
+            cause: NativeError.nativeError("Relay outbox horizon mismatch")
           })
         })
       }
@@ -1312,7 +1332,7 @@ const make = Effect.gen(function*() {
   const markCustody = (input: CustodyInput) =>
     Effect.scoped(Effect.gen(function*() {
       const permit = yield* gate.shared
-      const acceptedAt = new Date(yield* Clock.currentTimeMillis).toISOString()
+      const acceptedAt = DateTime.formatIso(yield* DateTime.now)
       yield* sql.withTransaction(Effect.gen(function*() {
         const rows = yield* findRow({
           replicaId: permit.replicaId,
@@ -1328,16 +1348,16 @@ const make = Effect.gen(function*() {
           )
           provenanceCache.delete(input.relayMessageId)
           yield* gate.validate(permit)
-          return
+          return undefined
         }
         if (rows.length !== 1) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new Error("Duplicate relay message identity")
+              cause: NativeError.nativeError("Duplicate relay message identity")
             })
           })
         }
-        const row = rows[0]!
+        const row = rows[0]
         const entry = yield* validateRow(row, permit)
         if (row.outer_envelope_digest !== input.outerEnvelopeDigest) {
           return yield* new ReplicaError.ReplicaError({
@@ -1368,6 +1388,7 @@ const make = Effect.gen(function*() {
             AND outer_envelope_digest = ${input.outerEnvelopeDigest}`
         provenanceCache.delete(input.relayMessageId)
         yield* gate.validate(permit)
+        return undefined
       })).pipe(Effect.catchTags({
         SqlError: (cause) =>
           Effect.fail(
@@ -1386,7 +1407,7 @@ const make = Effect.gen(function*() {
 
   const pruneExpired = Effect.scoped(Effect.gen(function*() {
     const permit = yield* gate.shared
-    const now = new Date(yield* Clock.currentTimeMillis).toISOString()
+    const now = DateTime.formatIso(yield* DateTime.now)
     return yield* sql.withTransaction(Effect.gen(function*() {
       const query = SqlSchema.findAll({
         Request: Schema.Void,

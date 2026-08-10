@@ -349,15 +349,16 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               Effect.sync(() => {
                 let produced = false
                 return Effect.suspend(() =>
-                  produced
-                    ? pull
-                    : Effect.scoped(scheduler.interactive.pipe(Effect.andThen(pull))).pipe(
+                  (() => {
+                    if (produced) return pull
+                    return (Effect.scoped(scheduler.interactive.pipe(Effect.andThen(pull))).pipe(
                       Effect.tap(() =>
                         Effect.sync(() => {
                           produced = true
                         })
                       )
-                    )
+                    ))
+                  })()
                 )
               })
           ),
@@ -399,7 +400,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             if (options.value.documentName !== document.name || options.value.schemaVersion !== document.version) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new Error("Portable document definition mismatch")
+                  cause: NativeError.nativeError("Portable document definition mismatch")
                 })
               })
             }
@@ -411,3 +412,4 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
       return service
     })
   )
+import * as NativeError from "./internal/nativeError.js"

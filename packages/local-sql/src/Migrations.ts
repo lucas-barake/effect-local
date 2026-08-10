@@ -9,6 +9,8 @@ import * as Migrator from "effect/unstable/sql/Migrator"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import { literal } from "./internal/literal.js"
+import * as NativeError from "./internal/nativeError.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 
 export const canonicalStoreChecksum = "sha256:effect-local-canonical-store-v1"
@@ -294,7 +296,7 @@ const peerWriterProvenanceMigration = Effect.gen(function*() {
                     })),
                     {
                       writerSchemaVersion: checkpoint.schema_version,
-                      writerDefinitionHash: defaults!.definition_hash
+                      writerDefinitionHash: defaults.definition_hash
                     }
                   )
                   return {
@@ -337,7 +339,7 @@ const peerWriterProvenanceMigration = Effect.gen(function*() {
       storedEntries(documentId),
       {
         writerSchemaVersion: schemaVersionByDocument.get(documentId)!,
-        writerDefinitionHash: defaults!.definition_hash
+        writerDefinitionHash: defaults.definition_hash
       }
     )
   const outbox = yield* sql<{
@@ -695,16 +697,19 @@ const documentHistoryCountersMigration = Effect.gen(function*() {
     }),
     Result: RawDocumentPageRow,
     execute: ({ after, limit }) =>
-      after === null
-        ? sql`SELECT rowid AS page_rowid, document_id, document_type, materialized_heads
+      (() => {
+        if (after === null) {
+          return (sql`SELECT rowid AS page_rowid, document_id, document_type, materialized_heads
           FROM effect_local_documents
           ORDER BY rowid
-          LIMIT ${limit}`
-        : sql`SELECT rowid AS page_rowid, document_id, document_type, materialized_heads
+          LIMIT ${limit}`)
+        }
+        return (sql`SELECT rowid AS page_rowid, document_id, document_type, materialized_heads
           FROM effect_local_documents
           WHERE rowid > ${after}
           ORDER BY rowid
-          LIMIT ${limit}`
+          LIMIT ${limit}`)
+      })()
   })
   const findHistoryAggregates = SqlSchema.findAll({
     Request: Schema.Array(Schema.String),
@@ -768,9 +773,10 @@ const documentHistoryCountersMigration = Effect.gen(function*() {
       const decoded = yield* Effect.option(decodeDocumentPageRow(document))
       if (Option.isSome(decoded)) decodedPage.push(decoded.value)
     }
-    const aggregates = decodedPage.length === 0
-      ? []
-      : yield* findHistoryAggregates(decodedPage.map((document) => document.document_id))
+    const aggregates = yield* Effect.gen(function*() {
+      if (decodedPage.length === 0) return []
+      return (yield* findHistoryAggregates(decodedPage.map((document) => document.document_id)))
+    })
     const aggregateByDocument = new Map(aggregates.map((aggregate) => [aggregate.document_id, aggregate]))
     const documents: Array<DocumentPageEntry> = decodedPage.map((document) => {
       const aggregate = aggregateByDocument.get(document.document_id)
@@ -842,31 +848,35 @@ const documentHistoryCountersMigration = Effect.gen(function*() {
                   decoded.hash !== change.change_hash ||
                   decoded.actor !== change.actor ||
                   decoded.seq !== change.sequence ||
-                  JSON.stringify(decoded.deps) !== change.dependencies
-                ) throw new TypeError(`Invalid retained change ${change.change_hash}`)
+                  Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(decoded.deps) !== change.dependencies
+                ) return NativeError.throwTypeError(`Invalid retained change ${change.change_hash}`)
               }
 
-              let recovered = Automerge.init()
-              try {
-                const applied = retained.filter((change) => change.applied === 1)
-                if (applied.length > 0) {
-                  recovered = Automerge.applyChanges(recovered, applied.map((change) => change.bytes))[0]
-                }
-                const expectedHeads = decodeHeads(document.materialized_heads)
-                const observedHeads = Automerge.getHeads(recovered)
-                if (
-                  observedHeads.length !== expectedHeads.length ||
-                  !Automerge.hasHeads(recovered, [...expectedHeads])
-                ) throw new TypeError(`Incomplete retained history for ${document.document_id}`)
-                return {
-                  document_id: document.document_id,
-                  history_bytes: document.change_bytes,
-                  history_changes: retained.length,
-                  history_operations: operations
-                }
-              } finally {
-                Automerge.free(recovered)
-              }
+              return Effect.runSync(Effect.acquireUseRelease(
+                Effect.sync(() => Automerge.init()),
+                (recovered) =>
+                  Effect.sync(() => {
+                    const applied = retained.filter((change) => change.applied === 1)
+                    if (applied.length > 0) {
+                      recovered = Automerge.applyChanges(recovered, applied.map((change) => change.bytes))[0]
+                    }
+                    const expectedHeads = decodeHeads(document.materialized_heads)
+                    const observedHeads = Automerge.getHeads(recovered)
+                    if (
+                      observedHeads.length !== expectedHeads.length ||
+                      !Automerge.hasHeads(recovered, [...expectedHeads])
+                    ) {
+                      return NativeError.throwTypeError(`Incomplete retained history for ${document.document_id}`)
+                    }
+                    return {
+                      document_id: document.document_id,
+                      history_bytes: document.change_bytes,
+                      history_changes: retained.length,
+                      history_operations: operations
+                    }
+                  }),
+                (recovered) => Effect.sync(() => Automerge.free(recovered))
+              ))
             },
             catch: (cause) => cause
           })
@@ -1238,7 +1248,7 @@ export const run = Effect.gen(function*() {
     execute: (migrationId) =>
       sql`SELECT name, checksum FROM effect_local_migration_catalog WHERE migration_id = ${migrationId}`
   })
-  const expectedCatalog = [
+  const expectedCatalog = literal([
     { id: 1, name: "canonical_store", checksum: canonicalStoreChecksum, label: "Canonical store" },
     { id: 2, name: "peer_sync", checksum: peerSyncChecksum, label: "Peer sync" },
     { id: 3, name: "durability_indexes", checksum: durabilityIndexesChecksum, label: "Durability indexes" },
@@ -1304,7 +1314,7 @@ export const run = Effect.gen(function*() {
       checksum: batchedSyncRepliesChecksum,
       label: "Batched sync replies"
     }
-  ] as const
+  ])
   // One transaction over migrate + validation so a rejected catalog rolls back
   // the freshly applied migrations instead of leaving a partial schema.
   return yield* sql.withTransaction(Effect.gen(function*() {
@@ -1325,7 +1335,7 @@ export const run = Effect.gen(function*() {
     Effect.fail(
       new Migrator.MigrationError({
         kind: "BadState",
-        message: `Invalid migration catalog: ${cause}`
+        message: `Invalid migration catalog: ${String(cause)}`
       })
     ))
 )

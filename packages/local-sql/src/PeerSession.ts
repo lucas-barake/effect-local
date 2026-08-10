@@ -6,6 +6,7 @@ import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Crypto from "effect/Crypto"
+import * as DateTime from "effect/DateTime"
 import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
@@ -22,6 +23,8 @@ import type * as Sharding from "effect/unstable/cluster/Sharding"
 import * as CommandDeliveryStore from "./CommandDeliveryStore.js"
 import * as CommitPublisher from "./CommitPublisher.js"
 import * as DocumentEntity from "./DocumentEntity.js"
+import { literal } from "./internal/literal.js"
+import * as NativeError from "./internal/nativeError.js"
 import * as PeerConnectionStatus from "./PeerConnectionStatus.js"
 import * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
 import * as PeerSync from "./PeerSync.js"
@@ -146,9 +149,9 @@ const makeWithTerminal = (
     // to indicate the wiring was wrong. That is the same failure the reader side already refuses.
     const reporter = yield* PeerConnectionStatus.Reporter
     const attempt = yield* reporter.connecting(options.peerId).pipe(
-      Effect.tap((attempt) =>
+      Effect.tap((attemptStatus) =>
         Effect.sync(() => {
-          cleanupOnError = attempt.disconnected
+          cleanupOnError = attemptStatus.disconnected
         })
       ),
       Effect.uninterruptible
@@ -170,33 +173,33 @@ const makeWithTerminal = (
       (scope) =>
         Effect.gen(function*() {
           const permit = yield* gate.shared.pipe(Effect.provideService(Scope.Scope, scope))
-          const connection = yield* transport.connect({ replicaId: permit.replicaId, peerId: options.peerId })
-          if (connection.peerId !== options.peerId) {
+          const connected = yield* transport.connect({ replicaId: permit.replicaId, peerId: options.peerId })
+          if (connected.peerId !== options.peerId) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.ProtocolMismatch({
                 expected: options.peerId,
-                observed: connection.peerId
+                observed: connected.peerId
               })
             })
           }
-          const session = yield* sync.open(connection.peerId)
-          if (session.peerId !== connection.peerId) {
+          const openedSession = yield* sync.open(connected.peerId)
+          if (openedSession.peerId !== connected.peerId) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.ProtocolMismatch({
-                expected: connection.peerId,
-                observed: session.peerId
+                expected: connected.peerId,
+                observed: openedSession.peerId
               })
             })
           }
-          if (session.replicaIncarnation !== permit.incarnation) {
+          if (openedSession.replicaIncarnation !== permit.incarnation) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.ProtocolMismatch({
                 expected: String(permit.incarnation),
-                observed: String(session.replicaIncarnation)
+                observed: String(openedSession.replicaIncarnation)
               })
             })
           }
-          return { connection, session }
+          return { connection: connected, session: openedSession }
         }),
       Scope.close
     )
@@ -234,16 +237,19 @@ const makeWithTerminal = (
 
     const selectedById = (documentId: Identity.DocumentId) => {
       const entry = options.documents.find((candidate) => candidate.documentId === documentId)
-      return entry === undefined
-        ? Effect.fail(
-          new ReplicaError.ReplicaError({
-            reason: new ReplicaError.ProtocolMismatch({
-              expected: "selected document",
-              observed: documentId
+      return (() => {
+        if (entry === undefined) {
+          return (Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ProtocolMismatch({
+                expected: "selected document",
+                observed: documentId
+              })
             })
-          })
-        )
-        : Effect.succeed(entry)
+          ))
+        }
+        return (Effect.succeed(entry))
+      })()
     }
 
     /**
@@ -298,9 +304,10 @@ const makeWithTerminal = (
             // relabel it.
             lineage: outbound.lineage,
             writerProvenance: outbound.writerProvenance,
-            ...(outbound.checkpointTransfer === undefined
-              ? {}
-              : { checkpointTransfer: outbound.checkpointTransfer })
+            ...((() => {
+              if (outbound.checkpointTransfer === undefined) return ({})
+              return ({ checkpointTransfer: outbound.checkpointTransfer })
+            })())
           })
           yield* Effect.scoped(Effect.gen(function*() {
             const permit = yield* gate.shared
@@ -329,6 +336,7 @@ const makeWithTerminal = (
                 yield* sync.markSent(session, outbound.sendSequence, outbound.messageHash)
               }
             }))
+            return undefined
           }))
         })
       )
@@ -344,7 +352,7 @@ const makeWithTerminal = (
     const drainOutbox = (afterSend: ReadonlyMap<number, Effect.Effect<void>>) =>
       Effect.gen(function*() {
         const pending = yield* Effect.raceFirst(
-          Deferred.await(teardown).pipe(Effect.as([] as const)),
+          Deferred.await(teardown).pipe(Effect.as(literal([]))),
           sync.pending(session)
         )
         const scheduledNow = yield* Ref.getAndSet(scheduled, new Map())
@@ -352,7 +360,7 @@ const makeWithTerminal = (
         for (const [sendSequence, outbound] of scheduledNow) bySequence.set(sendSequence, outbound)
         const ordered = [...bySequence.values()].toSorted((left, right) => left.sendSequence - right.sendSequence)
         for (let index = 0; index < ordered.length; index++) {
-          const outbound = ordered[index]!
+          const outbound = ordered[index]
           yield* send(outbound).pipe(
             Effect.onError(() =>
               Ref.update(scheduled, (current) => {
@@ -383,53 +391,53 @@ const makeWithTerminal = (
         if (revision === undefined) continue
         const generated = yield* Effect.gen(function*() {
           while (true) {
-            const attempt = yield* Effect.raceFirst(
+            const flushAttempt = yield* Effect.raceFirst(
               Deferred.await(teardown).pipe(
-                Effect.as({ _tag: "TornDown" } as const)
+                Effect.as(literal({ _tag: "TornDown" }))
               ),
               withSyncLock(
                 entry.documentId,
                 Effect.gen(function*() {
                   const observationRevision = (yield* Ref.get(observed)).get(entry.documentId)?.revision ?? 0
-                  const result = yield* sync.generate(entry.document, entry.documentId, session, {
+                  const generatedResult = yield* sync.generate(entry.document, entry.documentId, session, {
                     lineageAware: connection.capabilities.lineageAware === true,
                     checkpointTransfer: connection.capabilities.checkpointTransfer === true
                   })
                   yield* Ref.update(observed, (values) => {
-                    const current = values.get(entry.documentId)
-                    if ((current?.revision ?? 0) !== observationRevision) return values
+                    const observedCurrent = values.get(entry.documentId)
+                    if ((observedCurrent?.revision ?? 0) !== observationRevision) return values
                     return new Map(values).set(entry.documentId, {
-                      value: result.observedByPeer,
+                      value: generatedResult.observedByPeer,
                       revision: observationRevision
                     })
                   })
-                  return result
+                  return generatedResult
                 }).pipe(
-                  Effect.map((result) => ({ _tag: "Generated", result } as const)),
+                  Effect.map((result) => (literal({ _tag: "Generated", result }))),
                   // The send direction refusal. The peer never sees it, so it must not travel any
                   // further than this document's own slot in the flush loop.
                   Effect.catchReason(
                     "ReplicaError",
                     "DocumentLineageChanged",
-                    (reason) => refuse(entry.documentId, reason).pipe(Effect.as({ _tag: "Refused" } as const))
+                    (reason) => refuse(entry.documentId, reason).pipe(Effect.as(literal({ _tag: "Refused" })))
                   ),
                   Effect.catchReason(
                     "ReplicaError",
                     "DocumentNotFound",
-                    () => Effect.succeed({ _tag: "Missing" } as const)
+                    () => Effect.succeed(literal({ _tag: "Missing" }))
                   ),
                   Effect.catchIf(
                     (error) =>
                       error.reason._tag === "QuotaExceeded" &&
                       (error.reason.resource === "peer sync outbox messages" ||
                         error.reason.resource === "peer sync outbox bytes"),
-                    (error) => Effect.succeed({ _tag: "OutboxQuota", error } as const)
+                    (error) => Effect.succeed(literal({ _tag: "OutboxQuota", error }))
                   )
                 )
               )
             )
-            if (attempt._tag !== "OutboxQuota") return attempt
-            if ((yield* drainOutbox(new Map())) === 0) return yield* attempt.error
+            if (flushAttempt._tag !== "OutboxQuota") return flushAttempt
+            if ((yield* drainOutbox(new Map())) === 0) return yield* flushAttempt.error
           }
         })
         if (generated._tag === "TornDown") return
@@ -453,14 +461,27 @@ const makeWithTerminal = (
     const guardTerminal = (effect: Effect.Effect<void, ReplicaError.ReplicaError>) =>
       transitionGate.withPermit(Ref.get(admissionOpen)).pipe(
         Effect.flatMap((admitted) =>
-          admitted
-            ? Effect.raceFirst(Deferred.await(terminalFailure), effect).pipe(
-              Effect.andThen(Deferred.isDone(terminalFailure)),
-              Effect.flatMap((failed) => failed ? Deferred.await(terminalFailure) : Effect.void)
-            )
-            : Deferred.isDone(terminalFailure).pipe(
-              Effect.flatMap((failed) => failed ? Deferred.await(terminalFailure) : Effect.void)
-            )
+          (() => {
+            if (admitted) {
+              return (Effect.raceFirst(Deferred.await(terminalFailure), effect).pipe(
+                Effect.andThen(Deferred.isDone(terminalFailure)),
+                Effect.flatMap((failed) =>
+                  (() => {
+                    if (failed) return (Deferred.await(terminalFailure))
+                    return (Effect.void)
+                  })()
+                )
+              ))
+            }
+            return (Deferred.isDone(terminalFailure).pipe(
+              Effect.flatMap((failed) =>
+                (() => {
+                  if (failed) return (Deferred.await(terminalFailure))
+                  return (Effect.void)
+                })()
+              )
+            ))
+          })()
         )
       )
     const guardedFlush = guardTerminal(flush)
@@ -500,7 +521,7 @@ const makeWithTerminal = (
       incarnation: Identity.ReplicaIncarnation
     ) =>
       Effect.gen(function*() {
-        const protocolInvalid = (expected: string, observed: string) => Effect.fail(new RelayProtocolInvalid())
+        const protocolInvalid = (expected: string, observedMessage: string) => Effect.fail(new RelayProtocolInvalid())
         const envelope = yield* decodeRelay(bytes)
         const boundEpoch = yield* bindRemoteEpoch(envelope.connectionEpoch, true)
         const selectedDocument = selected.has(key(envelope.documentType, envelope.documentId))
@@ -508,7 +529,7 @@ const makeWithTerminal = (
         // refused lineage inside this session, so dispatching every further message the peer sends
         // for it would be a peer driven retry loop over allocation and storage.
         if (selectedDocument && (yield* Ref.get(refused)).has(envelope.documentId)) {
-          return "ApplicationRejected" as const
+          return literal("ApplicationRejected")
         }
         if (!selectedDocument) {
           return yield* protocolInvalid(
@@ -522,7 +543,7 @@ const makeWithTerminal = (
             if (incarnation !== session.replicaIncarnation) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
-                  cause: new Error(
+                  cause: NativeError.nativeError(
                     `Replica incarnation changed from ${session.replicaIncarnation} to ${incarnation}`
                   )
                 })
@@ -534,7 +555,7 @@ const makeWithTerminal = (
               if (relayReceiptLimits._tag === "None") {
                 return yield* new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageUnavailable({
-                    cause: new Error("Relay receipt limits are unavailable")
+                    cause: NativeError.nativeError("Relay receipt limits are unavailable")
                   })
                 })
               }
@@ -557,7 +578,7 @@ const makeWithTerminal = (
               const nowMillis = yield* Clock.currentTimeMillis
               return {
                 ...delivery.identity,
-                receiptExpiresAt: new Date(nowMillis + delivery.receiptRetentionMillis).toISOString(),
+                receiptExpiresAt: DateTime.formatIso(DateTime.makeUnsafe(nowMillis + delivery.receiptRetentionMillis)),
                 encodedSize: bytes.byteLength
               } satisfies PeerSync.RelayReceipt
             })
@@ -574,9 +595,10 @@ const makeWithTerminal = (
               // absent key of a pre lineage peer becomes the genesis lineage.
               lineage: envelope.lineage,
               writerProvenance: envelope.writerProvenance,
-              ...(envelope.checkpointTransfer === undefined
-                ? {}
-                : { checkpointTransfer: envelope.checkpointTransfer }),
+              ...((() => {
+                if (envelope.checkpointTransfer === undefined) return ({})
+                return ({ checkpointTransfer: envelope.checkpointTransfer })
+              })()),
               relay
             }).pipe(
               Effect.catchTag(
@@ -591,7 +613,10 @@ const makeWithTerminal = (
                   )
               )
             )
-            const result = yield* (retainPersistedAdmission ? Effect.uninterruptible(applySync) : applySync).pipe(
+            const appliedResult = yield* ((() => {
+              if (retainPersistedAdmission) return (Effect.uninterruptible(applySync))
+              return applySync
+            })()).pipe(
               Effect.catchReason(
                 "ReplicaError",
                 "ProtocolMismatch",
@@ -603,7 +628,7 @@ const makeWithTerminal = (
                     }
                     return yield* new ReplicaError.ReplicaError({
                       reason: new ReplicaError.StorageUnavailable({
-                        cause: new Error(
+                        cause: NativeError.nativeError(
                           `Replica incarnation changed from ${session.replicaIncarnation} to ${current.incarnation}`
                         )
                       })
@@ -615,11 +640,11 @@ const makeWithTerminal = (
               const current = values.get(envelope.documentId)
               if ((current?.revision ?? 0) !== observationRevision) return values
               return new Map(values).set(envelope.documentId, {
-                value: result.observedByPeer,
+                value: appliedResult.observedByPeer,
                 revision: observationRevision
               })
             })
-            return result
+            return appliedResult
           })
         ).pipe(
           // The receive direction refusal. `PeerSync.receive` rejects the message before it reaches
@@ -651,20 +676,25 @@ const makeWithTerminal = (
                   resource: reason.resource,
                   limit: reason.limit
                 }),
-                Effect.as("Parked" as const)
+                Effect.as(literal("Parked"))
               )
           )
         )
-        if (result === "Parked") return "Parked" as const
-        if (result === null) return "ApplicationRejected" as const
+        if (result === "Parked") return literal("Parked")
+        if (result === null) return literal("ApplicationRejected")
         yield* publisher.publishPending
         if (result.reply !== null) {
           // Permanently invalid replies fail identically on every retry and can settle with a
           // warning. Quota pressure is transient: keep relay custody so the stored reply can be
           // enqueued after older outbox entries drain.
           const enqueueOutcome = yield* sync.enqueue(session, result.reply).pipe(
-            Effect.flatMap((outbound) => outbound === null ? Effect.void : schedule(outbound)),
-            Effect.as("Enqueued" as const),
+            Effect.flatMap((outbound) =>
+              (() => {
+                if (outbound === null) return (Effect.void)
+                return (schedule(outbound))
+              })()
+            ),
+            Effect.as(literal("Enqueued")),
             Effect.catchReason(
               "ReplicaError",
               "QuotaExceeded",
@@ -678,7 +708,7 @@ const makeWithTerminal = (
                     resource: reason.resource,
                     limit: reason.limit
                   }),
-                  Effect.as("Parked" as const)
+                  Effect.as(literal("Parked"))
                 )
             ),
             Effect.catchIf(
@@ -691,15 +721,18 @@ const makeWithTerminal = (
                     documentId: envelope.documentId,
                     peerId: connection.peerId,
                     reason: error.reason._tag,
-                    limit: error.reason._tag === "QuotaExceeded" ? error.reason.limit : undefined
+                    limit: (() => {
+                      if (error.reason._tag === "QuotaExceeded") return (error.reason.limit)
+                      return undefined
+                    })()
                   })
-                ).pipe(Effect.as("Enqueued" as const))
+                ).pipe(Effect.as(literal("Enqueued")))
             )
           )
-          if (enqueueOutcome === "Parked") return "Parked" as const
+          if (enqueueOutcome === "Parked") return literal("Parked")
           yield* Queue.offer(flushRequests, undefined)
         }
-        return "Applied" as const
+        return literal("Applied")
       })
 
     const relayCall = (
@@ -770,33 +803,42 @@ const makeWithTerminal = (
         if (!admitted) return
         const permit = yield* Effect.scoped(gate.shared)
         const outcome = yield* processReceive(delivery.message, delivery, permit.incarnation).pipe(
-          Effect.catchTag("RelayProtocolInvalid", () => Effect.succeed("ProtocolInvalid" as const))
+          Effect.catchTag("RelayProtocolInvalid", () => Effect.succeed(literal("ProtocolInvalid")))
         )
         if (outcome === "Parked") return
         // Keep restore excluded after releasing SQL admission. Normal reads share this gate and can
         // proceed while relay settlement retries, but restore cannot erase the receipt being settled.
         yield* gate.shared
         yield* Scope.close(admissionScope, Exit.void)
-        return yield* outcome === "ApplicationRejected"
-          ? settleDelivery("relay reject", delivery.reject("ApplicationRejected"))
-          : outcome === "ProtocolInvalid"
-          ? settleDelivery("relay reject", delivery.reject("ProtocolInvalid"))
-          : settleDelivery("relay acknowledge", delivery.acknowledge)
+        yield* (() => {
+          if (outcome === "ApplicationRejected") {
+            return (settleDelivery("relay reject", delivery.reject("ApplicationRejected")))
+          }
+          return ((() => {
+            if (outcome === "ProtocolInvalid") {
+              return (settleDelivery("relay reject", delivery.reject("ProtocolInvalid")))
+            }
+            return (settleDelivery("relay acknowledge", delivery.acknowledge))
+          })())
+        })()
       }))
     const receiveInbound = (inbound: PeerTransport.Inbound) => {
       if (inbound._tag === "Durable") return receiveAcknowledged(inbound.delivery)
       return selectedById(inbound.delivery.documentId).pipe(
         Effect.andThen(
-          inbound.delivery.peerId === connection.peerId
-            ? PubSub.publish(transients, inbound.delivery).pipe(Effect.asVoid)
-            : Effect.fail(
+          (() => {
+            if (inbound.delivery.peerId === connection.peerId) {
+              return (PubSub.publish(transients, inbound.delivery).pipe(Effect.asVoid))
+            }
+            return (Effect.fail(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.ProtocolMismatch({
                   expected: connection.peerId,
                   observed: inbound.delivery.peerId
                 })
               })
-            )
+            ))
+          })()
         )
       )
     }
@@ -805,13 +847,14 @@ const makeWithTerminal = (
         const boundEpoch = yield* Ref.get(remoteEpoch)
         yield* sync.reset(session).pipe(
           Effect.ensuring(
-            boundEpoch === null
-              ? Effect.void
-              : sync.reset({
+            (() => {
+              if (boundEpoch === null) return (Effect.void)
+              return (sync.reset({
                 peerId: connection.peerId,
                 connectionEpoch: boundEpoch,
                 replicaIncarnation: session.replicaIncarnation
-              }).pipe(Effect.orDie)
+              }).pipe(Effect.orDie))
+            })()
           )
         )
       }))).pipe(
@@ -826,7 +869,7 @@ const makeWithTerminal = (
           Effect.fail(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageUnavailable({
-                cause: new Error("Peer connection receive stream ended")
+                cause: NativeError.nativeError("Peer connection receive stream ended")
               })
             })
           )
@@ -1021,14 +1064,17 @@ export const makeLive = (options: {
     const selected = new Set(options.documents.map((entry) => entry.documentId))
     const subscriptionEnded = new ReplicaError.ReplicaError({
       reason: new ReplicaError.StorageUnavailable({
-        cause: new Error("Commit subscription stream ended")
+        cause: NativeError.nativeError("Commit subscription stream ended")
       })
     })
     const consume = Stream.runForEach(subscription.events, (event) => {
       if (event._tag === "Commit") {
-        return selected.has(event.documentId)
-          ? session.markDirty(event.documentId).pipe(Effect.andThen(session.flush))
-          : Effect.void
+        return (() => {
+          if (selected.has(event.documentId)) {
+            return (session.markDirty(event.documentId).pipe(Effect.andThen(session.flush)))
+          }
+          return (Effect.void)
+        })()
       }
       return Effect.forEach(options.documents, (entry) => session.markDirty(entry.documentId), {
         discard: true

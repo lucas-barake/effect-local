@@ -103,11 +103,17 @@ export const layer: Layer.Layer<ReplicaOperationScheduler, never, ReplicaLimits.
         const request = yield* Queue.take(requests)
         switch (request._tag) {
           case "Acquire":
-            ;(request.lane === "interactive" ? interactive : background).add(request.granted)
+            ;((() => {
+              if (request.lane === "interactive") return interactive
+              return background
+            })()).add(request.granted)
             if (request.lane === "background" && activeInteractive > 0) backgroundTurn = true
             break
           case "Interrupt":
-            ;(request.lane === "interactive" ? interactive : background).delete(request.granted)
+            ;((() => {
+              if (request.lane === "interactive") return interactive
+              return background
+            })()).delete(request.granted)
             if (request.lane === "background" && background.size === 0) backgroundTurn = false
             break
           case "Release":
@@ -126,13 +132,21 @@ export const layer: Layer.Layer<ReplicaOperationScheduler, never, ReplicaLimits.
           } else if (interactive.size === 0 && background.size === 0) {
             break
           }
-          const lane = activeInteractive === 0 && backgroundTurn && background.size > 0
-            ? "background"
-            : interactive.size > 0
-            ? "interactive"
-            : "background"
-          const waiters = lane === "interactive" ? interactive : background
-          let cursor = lane === "interactive" ? interactiveCursor : backgroundCursor
+          const lane = (() => {
+            if (activeInteractive === 0 && backgroundTurn && background.size > 0) return ("background")
+            return ((() => {
+              if (interactive.size > 0) return ("interactive")
+              return ("background")
+            })())
+          })()
+          const waiters = (() => {
+            if (lane === "interactive") return interactive
+            return background
+          })()
+          let cursor = (() => {
+            if (lane === "interactive") return interactiveCursor
+            return backgroundCursor
+          })()
           let next = cursor.next()
           if (next.done) {
             cursor = waiters.values()
@@ -196,12 +210,15 @@ export const layer: Layer.Layer<ReplicaOperationScheduler, never, ReplicaLimits.
               Effect.onInterrupt(() =>
                 Deferred.interrupt(granted).pipe(
                   Effect.flatMap((interrupted) =>
-                    interrupted
-                      ? cancelReservation(lane, granted).pipe(
-                        Effect.andThen(Queue.offer(requests, { _tag: "Interrupt", granted, lane })),
-                        Effect.asVoid
-                      )
-                      : Deferred.await(granted).pipe(Effect.andThen(release(lane, granted)), Effect.ignore)
+                    (() => {
+                      if (interrupted) {
+                        return (cancelReservation(lane, granted).pipe(
+                          Effect.andThen(Queue.offer(requests, { _tag: "Interrupt", granted, lane })),
+                          Effect.asVoid
+                        ))
+                      }
+                      return (Deferred.await(granted).pipe(Effect.andThen(release(lane, granted)), Effect.ignore))
+                    })()
                   )
                 )
               )

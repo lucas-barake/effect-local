@@ -48,16 +48,17 @@ export const encodeCheckpointTransfer = (
   Schema.encodeEffect(CheckpointTransferJson)(transfer).pipe(
     Effect.map((value) => new TextEncoder().encode(value)),
     Effect.flatMap((bytes) =>
-      bytes.byteLength <= maxSyncMessageBytes
-        ? Effect.succeed(bytes)
-        : Effect.fail(
+      (() => {
+        if (bytes.byteLength <= maxSyncMessageBytes) return (Effect.succeed(bytes))
+        return (Effect.fail(
           new ReplicaError.ReplicaError({
             reason: new ReplicaError.ProtocolMismatch({
               expected: `checkpoint transfer at most ${maxSyncMessageBytes} bytes`,
               observed: "oversized checkpoint transfer"
             })
           })
-        )
+        ))
+      })()
     ),
     Effect.catchTag("SchemaError", () =>
       Effect.fail(

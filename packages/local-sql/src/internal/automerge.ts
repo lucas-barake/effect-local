@@ -1,7 +1,11 @@
 import * as Automerge from "@automerge/automerge"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
+import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
+import * as Schema from "effect/Schema"
+import * as NativeError from "./nativeError.js"
 
 export interface Root<E,> {
   value: E
@@ -99,19 +103,23 @@ const changeClone = <E,>(
   change: Automerge.ChangeFn<Root<E>>
 ): Automerge.Doc<Root<E>> => {
   const cloned = Automerge.clone(durable, { actor })
-  try {
-    return Automerge.change(cloned, change)
-  } catch (cause) {
-    Automerge.free(cloned)
-    throw cause
-  }
+  const result = Effect.runSyncExit(
+    Effect.sync(() => Automerge.change(cloned, change)).pipe(
+      Effect.catchCause((cause) =>
+        Effect.sync(() => Automerge.free(cloned)).pipe(Effect.andThen(Effect.failCause(cause)))
+      )
+    )
+  )
+  if (Exit.isSuccess(result)) return result.value
+  return NativeError.throwDefect(Cause.squash(result.cause))
 }
 
 export const stage = <E,>(
   durable: Automerge.Doc<Root<E>>,
   actor: string,
   change: (draft: Mutation.DraftValue<E>) => void
-): Automerge.Doc<Root<E>> => changeClone(durable, actor, (draft) => change(draft.value as Mutation.DraftValue<E>))
+): Automerge.Doc<Root<E>> =>
+  changeClone(durable, actor, (draft) => change(Schema.decodeUnknownSync(Schema.Any)(draft.value)))
 
 export const stageValue = <E,>(
   durable: Automerge.Doc<Root<E>>,

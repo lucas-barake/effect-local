@@ -15,6 +15,8 @@ import * as TxReentrantLock from "effect/TxReentrantLock"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import { literal } from "./internal/literal.js"
+import * as NativeError from "./internal/nativeError.js"
 import * as ReplicaBootstrap from "./ReplicaBootstrap.js"
 
 export interface Permit {
@@ -140,7 +142,12 @@ export const layer: Layer.Layer<
             const next = takeNext()
             waiters.delete(next)
             const nextExclusive = exclusiveWaiters.delete(next)
-            if (yield* Deferred.succeed(next, undefined)) holder = nextExclusive ? "exclusive" : "shared"
+            if (yield* Deferred.succeed(next, undefined)) {
+              holder = (() => {
+                if (nextExclusive) return ("exclusive")
+                return ("shared")
+              })()
+            }
           }
         }
       }).pipe(Effect.forkScoped({ startImmediately: true }))
@@ -173,11 +180,12 @@ export const layer: Layer.Layer<
                 Effect.onInterrupt(() =>
                   Deferred.interrupt(granted).pipe(
                     Effect.flatMap((interrupted) =>
-                      interrupted
-                        ? Queue.offer(requests, { _tag: "Interrupt", granted }).pipe(Effect.asVoid)
-                        // The arbiter decided first. Only a grant leaves the gate held, so a shed
-                        // acquirer must not offer a `Release` it never earned.
-                        : Deferred.await(granted).pipe(Effect.andThen(release), Effect.ignore)
+                      (() => {
+                        if (interrupted) {
+                          return (Queue.offer(requests, { _tag: "Interrupt", granted }).pipe(Effect.asVoid))
+                        }
+                        return (Deferred.await(granted).pipe(Effect.andThen(release), Effect.ignore))
+                      })()
                     )
                   )
                 )
@@ -248,7 +256,12 @@ export const layer: Layer.Layer<
               restore(TxReentrantLock.acquireWrite(lock)).pipe(
                 Effect.onInterrupt(() =>
                   TxReentrantLock.writeLocks(lock).pipe(
-                    Effect.flatMap((after) => after > before ? TxReentrantLock.releaseWrite(lock) : Effect.void)
+                    Effect.flatMap((after) =>
+                      (() => {
+                        if (after > before) return (TxReentrantLock.releaseWrite(lock))
+                        return (Effect.void)
+                      })()
+                    )
                   )
                 )
               ),
@@ -337,10 +350,11 @@ export const layer: Layer.Layer<
         const enter = Effect.acquireUseRelease(admission, () => readLock, () => release)
         return Effect.withFiber((fiber) =>
           Effect.all({ readers: Ref.get(readers), writer: Ref.get(writer) }).pipe(
-            Effect.flatMap(({ readers, writer }) =>
-              writer === fiber.id || (readers.get(fiber.id) ?? 0) > 0
-                ? readLock
-                : enter
+            Effect.flatMap(({ readers: currentReaders, writer: currentWriter }) =>
+              (() => {
+                if (currentWriter === fiber.id || (currentReaders.get(fiber.id) ?? 0) > 0) return readLock
+                return enter
+              })()
             ),
             Effect.andThen(Ref.get(state))
           )
@@ -370,10 +384,13 @@ export const layer: Layer.Layer<
                         yield* sql`INSERT INTO effect_local_writer_generations (generation, claimed_at)
                       VALUES (${permit.writerGeneration}, ${DateTime.formatIso(yield* DateTime.now)})`
                         const result = yield* restore(use(permit))
-                        return [result, yield* readState("ReplicaGate.claim")] as const
+                        return literal([result, yield* readState("ReplicaGate.claim")])
                       })).pipe(
                         Effect.flatMap(([result, permit]) =>
-                          publish ? Ref.set(state, permit).pipe(Effect.as(result)) : Effect.succeed(result)
+                          (() => {
+                            if (publish) return (Ref.set(state, permit).pipe(Effect.as(result)))
+                            return (Effect.succeed(result))
+                          })()
                         )
                       )
                     )
@@ -382,37 +399,46 @@ export const layer: Layer.Layer<
               )
             return Ref.get(writer).pipe(
               Effect.flatMap((owner) =>
-                owner === fiber.id
-                  ? run(false)
-                  : Effect.serviceOption(sql.transactionService).pipe(
+                (() => {
+                  if (owner === fiber.id) return (run(false))
+                  return (Effect.serviceOption(sql.transactionService).pipe(
                     Effect.flatMap((transaction) =>
-                      transaction._tag === "Some"
-                        ? Effect.die(new Error("ReplicaGate.claim cannot run inside an existing SQL transaction"))
-                        : Effect.acquireUseRelease(
+                      (() => {
+                        if (transaction._tag === "Some") {
+                          return (Effect.die(
+                            NativeError.nativeError("ReplicaGate.claim cannot run inside an existing SQL transaction")
+                          ))
+                        }
+                        return (Effect.acquireUseRelease(
                           acquireExclusive,
                           () => Ref.set(writer, fiber.id).pipe(Effect.andThen(run(true))),
                           () => Ref.set(writer, null).pipe(Effect.andThen(release))
-                        )
+                        ))
+                      })()
                     )
-                  )
+                  ))
+                })()
               )
             )
           }),
         validate: (expected) =>
           validateState(expected).pipe(
             Effect.flatMap((rows) =>
-              rows.length === 1 ? Effect.void : readState("ReplicaGate.validate").pipe(
-                Effect.flatMap((observed) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.ReplicaFenced({
-                        expectedGeneration: expected.writerGeneration,
-                        observedGeneration: observed.writerGeneration
+              (() => {
+                if (rows.length === 1) return (Effect.void)
+                return (readState("ReplicaGate.validate").pipe(
+                  Effect.flatMap((observed) =>
+                    Effect.fail(
+                      new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.ReplicaFenced({
+                          expectedGeneration: expected.writerGeneration,
+                          observedGeneration: observed.writerGeneration
+                        })
                       })
-                    })
+                    )
                   )
-                )
-              )
+                ))
+              })()
             ),
             Effect.catchTags({
               SchemaError: (cause) =>

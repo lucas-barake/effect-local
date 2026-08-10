@@ -2,12 +2,12 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import * as Effect from "effect/Effect"
 import * as ManagedRuntime from "effect/ManagedRuntime"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
-import { afterAll, bench } from "vitest"
+import { bench } from "vitest"
 import * as Migrations from "../src/Migrations.js"
 
 const runtime = ManagedRuntime.make(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))
 
-await runtime.runPromise(Effect.gen(function*() {
+const setup = runtime.runPromise(Effect.gen(function*() {
   yield* Migrations.run
   const sql = yield* SqlClient.SqlClient
   yield* sql`INSERT INTO effect_local_projection_registry (
@@ -56,22 +56,22 @@ const transitionProjectionStatus = SqlClient.SqlClient.use((sql) =>
   })
 )
 
-bench("projection readiness across 400k rows", async () => {
-  await runtime.runPromise(countBlocked)
-}, {
+bench("projection readiness across 400k rows", () => setup.then(() => runtime.runPromise(countBlocked)), {
   iterations: 500,
   time: 0,
   warmupIterations: 20,
   warmupTime: 0
 })
 
-bench("projection status transition across 400k rows", async () => {
-  await runtime.runPromise(transitionProjectionStatus)
-}, {
-  iterations: 500,
-  time: 0,
-  warmupIterations: 20,
-  warmupTime: 0
-})
+bench(
+  "projection status transition across 400k rows",
+  () => setup.then(() => runtime.runPromise(transitionProjectionStatus)),
+  {
+    iterations: 500,
+    time: 0,
+    warmupIterations: 20,
+    warmupTime: 0
+  }
+)
 
-afterAll(() => runtime.dispose())
+process.once("exit", () => runtime.dispose())

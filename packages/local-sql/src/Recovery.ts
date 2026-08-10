@@ -17,6 +17,8 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as InternalAutomerge from "./internal/automerge.js"
 import * as HistoryCounters from "./internal/historyCounters.js"
+import { literal } from "./internal/literal.js"
+import * as NativeError from "./internal/nativeError.js"
 import * as Rows from "./internal/rows.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -173,7 +175,10 @@ export const make = Effect.gen(function*() {
     sql.withTransaction(Effect.gen(function*() {
       const document = yield* findDocument(documentId)
       return {
-        document: document._tag === "Some" ? document.value : null,
+        document: (() => {
+          if (document._tag === "Some") return (document.value)
+          return (null)
+        })(),
         checkpoints: yield* findCheckpoints(documentId),
         changes: yield* findChanges(documentId)
       }
@@ -284,12 +289,12 @@ export const make = Effect.gen(function*() {
       const row = option.value
       if (row.document_type !== document.name) {
         return {
-          _tag: "Quarantine" as const,
+          _tag: literal("Quarantine"),
           invalidCheckpoints: [],
           reason: `Stored document type does not match ${document.name}`,
           error: new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new Error(`Stored document type does not match ${document.name}`)
+              cause: NativeError.nativeError(`Stored document type does not match ${document.name}`)
             })
           })
         }
@@ -318,7 +323,7 @@ export const make = Effect.gen(function*() {
       }))
       if (Result.isFailure(parsedHeads)) {
         return {
-          _tag: "Quarantine" as const,
+          _tag: literal("Quarantine"),
           invalidCheckpoints: [],
           reason: "Invalid canonical head metadata",
           error: parsedHeads.failure
@@ -334,7 +339,7 @@ export const make = Effect.gen(function*() {
       if (counterState._tag === "Invalid") {
         return yield* new ReplicaError.ReplicaError({
           reason: new ReplicaError.StorageCorrupt({
-            cause: new TypeError("History counters must either all be measured or all be null")
+            cause: NativeError.nativeTypeError("History counters must either all be measured or all be null")
           })
         })
       }
@@ -355,7 +360,7 @@ export const make = Effect.gen(function*() {
         ) {
           yield* gate.validate(permit)
           return {
-            _tag: "Stale" as const,
+            _tag: literal("Stale"),
             materializedHeads,
             commitSequence
           }
@@ -391,7 +396,7 @@ export const make = Effect.gen(function*() {
       }))
       if (Result.isFailure(provenanceConsistency)) {
         return {
-          _tag: "Quarantine" as const,
+          _tag: literal("Quarantine"),
           invalidCheckpoints: [],
           reason: "Conflicting canonical writer provenance",
           error: provenanceConsistency.failure
@@ -416,9 +421,10 @@ export const make = Effect.gen(function*() {
           Effect.gen(function*() {
             current = yield* Effect.try({
               try: () =>
-                checkpoint === null
-                  ? InternalAutomerge.empty<D["schema"]["Encoded"]>(actor)
-                  : InternalAutomerge.load<D["schema"]["Encoded"]>(checkpoint.bytes, actor),
+                (() => {
+                  if (checkpoint === null) return (InternalAutomerge.empty<D["schema"]["Encoded"]>(actor))
+                  return (InternalAutomerge.load<D["schema"]["Encoded"]>(checkpoint.bytes, actor))
+                })(),
               catch: (cause) =>
                 new ReplicaError.ReplicaError({
                   reason: new ReplicaError.StorageCorrupt({
@@ -437,7 +443,7 @@ export const make = Effect.gen(function*() {
                   if (
                     checksum !== checkpoint.checksum || checkpoint.checkpoint_hash !== checkpointHash ||
                     !Equal.equals(InternalAutomerge.heads(current!), checkpointHeads)
-                  ) throw new TypeError(`Invalid checkpoint: ${checkpoint.checkpoint_hash}`)
+                  ) return NativeError.throwTypeError(`Invalid checkpoint: ${checkpoint.checkpoint_hash}`)
                   if (WriterProvenance.isCompactCheckpoint(checkpoint.writer_provenance)) {
                     const compact = checkpoint.writer_provenance
                     if (
@@ -445,7 +451,11 @@ export const make = Effect.gen(function*() {
                       compact.lineage !== checkpoint.lineage ||
                       !Equal.equals(compact.heads, checkpointHeads) ||
                       Automerge.getMissingDeps(current!, []).length !== 0
-                    ) throw new TypeError(`Invalid compact checkpoint proof: ${checkpoint.checkpoint_hash}`)
+                    ) {
+                      return NativeError.throwTypeError(
+                        `Invalid compact checkpoint proof: ${checkpoint.checkpoint_hash}`
+                      )
+                    }
                   } else {
                     const checkpointChangeHashes = WriterProvenance.changeHashes(current!)
                     WriterProvenance.validateExact(checkpointChangeHashes, checkpoint.writer_provenance)
@@ -458,6 +468,7 @@ export const make = Effect.gen(function*() {
                       }))
                     ])
                   }
+                  return undefined
                 },
                 catch: (cause) =>
                   new ReplicaError.ReplicaError({
@@ -482,7 +493,7 @@ export const make = Effect.gen(function*() {
                     decoded.actor !== change.actor ||
                     decoded.sequence !== change.sequence ||
                     encodeHeads(decoded.dependencies) !== change.dependencies
-                  ) throw new TypeError(`Invalid stored change: ${change.change_hash}`)
+                  ) return NativeError.throwTypeError(`Invalid stored change: ${change.change_hash}`)
                   return { decoded, row: change }
                 }),
               catch: (cause) =>
@@ -492,9 +503,10 @@ export const make = Effect.gen(function*() {
             })
             yield* Effect.try({
               try: () => {
-                const checkpointProvenance = checkpoint === null
-                  ? []
-                  : WriterProvenance.exactEntries(checkpoint.writer_provenance)
+                const checkpointProvenance = (() => {
+                  if (checkpoint === null) return []
+                  return (WriterProvenance.exactEntries(checkpoint.writer_provenance))
+                })()
                 const required = [
                   ...checkpointProvenance.map((entry) => entry.changeHash),
                   ...retainedChanges.map(({ decoded }) => decoded.hash)
@@ -522,7 +534,9 @@ export const make = Effect.gen(function*() {
                 if (
                   !Equal.equals(InternalAutomerge.heads(current!), materializedHeads) ||
                   !Automerge.hasHeads(current!, [...materializedHeads])
-                ) throw new TypeError("Recovered Automerge heads do not match materialized heads")
+                ) {
+                  return NativeError.throwTypeError("Recovered Automerge heads do not match materialized heads")
+                }
                 return current!
               },
               catch: (cause) =>
@@ -568,7 +582,8 @@ export const make = Effect.gen(function*() {
                     counterState.counters.bytes
                 ) ||
                 pendingBytes > counterState.counters.bytes
-              ) throw new TypeError("Stored history counters do not match recovered history")
+              ) return NativeError.throwTypeError("Stored history counters do not match recovered history")
+              return undefined
             },
             catch: (cause) =>
               new ReplicaError.ReplicaError({
@@ -598,7 +613,7 @@ export const make = Effect.gen(function*() {
           Effect.onError(() => Effect.sync(() => InternalAutomerge.free(automerge)))
         )
         return {
-          _tag: "Loaded" as const,
+          _tag: literal("Loaded"),
           stored: {
             automerge,
             encoded,
@@ -621,12 +636,12 @@ export const make = Effect.gen(function*() {
       }
 
       return {
-        _tag: "Quarantine" as const,
+        _tag: literal("Quarantine"),
         invalidCheckpoints,
         reason: "Canonical recovery failed",
         error: new ReplicaError.ReplicaError({
           reason: new ReplicaError.StorageCorrupt({
-            cause: new Error(`No complete verified history for document ${documentId}`)
+            cause: NativeError.nativeError(`No complete verified history for document ${documentId}`)
           })
         })
       }
@@ -673,9 +688,10 @@ export const make = Effect.gen(function*() {
   ) =>
     executeRecovery(document, documentId, permit).pipe(
       Effect.flatMap((outcome) =>
-        outcome._tag === "Loaded"
-          ? Effect.succeed(outcome.stored)
-          : Effect.die(new Error("Recovery returned a stale result without expected heads"))
+        (() => {
+          if (outcome._tag === "Loaded") return (Effect.succeed(outcome.stored))
+          return (Effect.die(NativeError.nativeError("Recovery returned a stale result without expected heads")))
+        })()
       )
     )
 
@@ -690,16 +706,20 @@ export const make = Effect.gen(function*() {
       document,
       documentId,
       permit,
-      expectedHeads === undefined ? { limits } : { limits, expectedHeads }
+      (() => {
+        if (expectedHeads === undefined) return ({ limits })
+        return ({ limits, expectedHeads })
+      })()
     ).pipe(
       Effect.map((outcome): ConflictSource<D> =>
-        outcome._tag === "Loaded"
-          ? outcome
-          : {
+        (() => {
+          if (outcome._tag === "Loaded") return outcome
+          return ({
             _tag: "Stale",
             materializedHeads: outcome.materializedHeads,
             commitSequence: outcome.commitSequence
-          }
+          })
+        })()
       )
     )
 

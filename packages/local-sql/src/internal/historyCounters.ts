@@ -2,6 +2,7 @@ import * as Automerge from "@automerge/automerge"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Effect from "effect/Effect"
+import * as NativeError from "./nativeError.js"
 import { quotaExceeded } from "./quotaExceeded.js"
 
 export interface HistoryCounters {
@@ -89,7 +90,7 @@ export const add = (
     return Effect.fail(
       new ReplicaError.ReplicaError({
         reason: new ReplicaError.StorageCorrupt({
-          cause: new TypeError("History counters must either all be measured or all be null")
+          cause: NativeError.nativeTypeError("History counters must either all be measured or all be null")
         })
       })
     )

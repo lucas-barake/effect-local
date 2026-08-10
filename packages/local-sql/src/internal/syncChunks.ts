@@ -1,4 +1,6 @@
 import * as Automerge from "@automerge/automerge"
+import * as Effect from "effect/Effect"
+import * as NativeError from "./nativeError.js"
 
 /**
  * Automerge's storage chunk envelope: magic, checksum, one type byte, then a ULEB128 byte length
@@ -17,27 +19,29 @@ const splitChunks = (bytes: Uint8Array): Array<{ type: number; bytes: Uint8Array
   const chunks: Array<{ type: number; bytes: Uint8Array }> = []
   let offset = 0
   while (offset < bytes.length) {
-    if (bytes.length - offset < 9) throw new Error(`truncated chunk header at ${offset}`)
+    if (bytes.length - offset < 9) return NativeError.throwError(`truncated chunk header at ${offset}`)
     for (let index = 0; index < 4; index++) {
       if (bytes[offset + index] !== chunkMagic[index]) {
-        throw new Error(`bad chunk magic at ${offset}`)
+        return NativeError.throwError(`bad chunk magic at ${offset}`)
       }
     }
-    const type = bytes[offset + 8]!
+    const type = bytes[offset + 8]
     // ULEB128 built with multiplication: `<<` is 32-bit in JS and would wrap on a large chunk.
     let cursor = offset + 9
     let length = 0
     let scale = 1
     let byte: number
     do {
-      if (cursor >= bytes.length) throw new Error(`truncated chunk length at ${cursor}`)
+      if (cursor >= bytes.length) return NativeError.throwError(`truncated chunk length at ${cursor}`)
       byte = bytes[cursor++]!
       length += (byte & 0x7f) * scale
       scale *= 128
-      if (scale > 2 ** 53) throw new Error(`chunk length out of range at ${offset}`)
+      if (scale > 2 ** 53) return NativeError.throwError(`chunk length out of range at ${offset}`)
     } while (byte & 0x80)
     const end = cursor + length
-    if (end > bytes.length) throw new Error(`chunk length ${length} overruns buffer at ${offset}`)
+    if (end > bytes.length) {
+      return NativeError.throwError(`chunk length ${length} overruns buffer at ${offset}`)
+    }
     chunks.push({ type, bytes: bytes.subarray(offset, end) })
     offset = end
   }
@@ -65,19 +69,23 @@ export function decodeSyncChanges(
       } else if (part.type === chunkTypeDocument) {
         // A whole-document chunk is self-contained: it carries every change it describes, so it
         // loads standalone without the local document supplying dependencies.
-        const document = Automerge.load(part.bytes)
-        try {
-          if (options?.maxChanges !== undefined && Automerge.stats(document).numChanges > options.maxChanges) {
-            return null
-          }
-          for (const bytes of Automerge.getAllChanges(document)) {
-            const change = Automerge.decodeChange(bytes)
-            changes.set(change.hash, change)
-            if (options?.maxChanges !== undefined && changes.size > options.maxChanges) return null
-          }
-        } finally {
-          Automerge.free(document)
-        }
+        const shouldStop = Effect.runSync(Effect.acquireUseRelease(
+          Effect.sync(() => Automerge.load(part.bytes)),
+          (document) =>
+            Effect.sync(() => {
+              if (options?.maxChanges !== undefined && Automerge.stats(document).numChanges > options.maxChanges) {
+                return true
+              }
+              for (const bytes of Automerge.getAllChanges(document)) {
+                const change = Automerge.decodeChange(bytes)
+                changes.set(change.hash, change)
+                if (options?.maxChanges !== undefined && changes.size > options.maxChanges) return true
+              }
+              return false
+            }),
+          (document) => Effect.sync(() => Automerge.free(document))
+        ))
+        if (shouldStop) return null
       } else if (part.type === chunkTypeBundle) {
         Automerge.free(Automerge.load(part.bytes, { allowMissingChanges: true }))
         for (const change of Automerge.readBundle(part.bytes).changes) {
@@ -87,7 +95,7 @@ export function decodeSyncChanges(
       } else {
         // Guessing at a future chunk type would misattribute provenance, which the receiving
         // replica validates count for count.
-        throw new Error(`unsupported Automerge chunk type ${part.type}`)
+        return NativeError.throwError(`unsupported Automerge chunk type ${part.type}`)
       }
     }
   }
@@ -100,31 +108,42 @@ const dependencyOrder = (
   const hashes = new Set(changes.map((change) => change.hash))
   const remaining = changes.map((change) =>
     change.deps.reduce(
-      (count, dependency) => count + (hashes.has(dependency) ? 1 : 0),
+      (count, dependency) =>
+        count + ((() => {
+          if (hashes.has(dependency)) return (1)
+          return (0)
+        })()),
       0
     )
   )
   const dependents = new Map<string, Array<number>>()
   for (let index = 0; index < changes.length; index++) {
-    for (const dependency of changes[index]!.deps) {
+    for (const dependency of changes[index].deps) {
       if (!hashes.has(dependency)) continue
       const waiting = dependents.get(dependency) ?? []
       waiting.push(index)
       dependents.set(dependency, waiting)
     }
   }
-  const ready = remaining.flatMap((count, index) => count === 0 ? [index] : [])
+  const ready = remaining.flatMap((count, index) =>
+    (() => {
+      if (count === 0) return [index]
+      return []
+    })()
+  )
   const ordered: Array<Automerge.DecodedChange> = []
   for (let cursor = 0; cursor < ready.length; cursor++) {
-    const index = ready[cursor]!
-    const change = changes[index]!
+    const index = ready[cursor]
+    const change = changes[index]
     ordered.push(change)
     for (const dependent of dependents.get(change.hash) ?? []) {
-      remaining[dependent] = remaining[dependent]! - 1
+      remaining[dependent] = remaining[dependent] - 1
       if (remaining[dependent] === 0) ready.push(dependent)
     }
   }
-  if (ordered.length !== changes.length) throw new Error("cyclic Automerge change dependencies")
+  if (ordered.length !== changes.length) {
+    return NativeError.throwError("cyclic Automerge change dependencies")
+  }
   return ordered
 }
 

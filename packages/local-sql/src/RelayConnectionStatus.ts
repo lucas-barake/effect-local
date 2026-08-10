@@ -10,6 +10,7 @@ import * as Stream from "effect/Stream"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import type * as Socket from "effect/unstable/socket/Socket"
+import { literal } from "./internal/literal.js"
 
 /** No relay is part of this topology, so there is no link to be up or down. */
 export const NotConfigured = Schema.TaggedStruct("NotConfigured", {})
@@ -150,7 +151,7 @@ const makeOwner = Effect.gen(function*() {
     Ref.update(state, (current) => ({ ...current, closed: true }))
   ).pipe(Effect.uninterruptible)
 
-  return { hooks, reader, retire } as const
+  return literal({ hooks, reader, retire })
 })
 
 /**

@@ -15,6 +15,7 @@ import * as Schema from "effect/Schema"
 import * as Migrator from "effect/unstable/sql/Migrator"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as NativeError from "./internal/nativeError.js"
 import type * as SqlProjection from "./SqlProjection.js"
 
 const StringArrayJson = Schema.fromJsonString(Schema.Array(Schema.String))
@@ -103,7 +104,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.ProjectionBlocked({
                 projection: binding.projection.name,
-                cause: new Error(`Duplicate projection table: ${binding.table}`)
+                cause: NativeError.nativeError(`Duplicate projection table: ${binding.table}`)
               })
             })
           }
@@ -116,9 +117,12 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
             table: `${binding.table}_effect_sql_migrations`
           }).pipe(
             Effect.catchDefect((cause) =>
-              Predicate.isTagged("MigrationError")(cause)
-                ? Effect.fail(toProjectionBlocked(binding.projection.name)(cause))
-                : Effect.die(cause)
+              (() => {
+                if (Predicate.isTagged("MigrationError")(cause)) {
+                  return (Effect.fail(toProjectionBlocked(binding.projection.name)(cause)))
+                }
+                return (Effect.die(cause))
+              })()
             ),
             Effect.catchTag(["SqlError", "MigrationError"], (cause) =>
               Effect.fail(toProjectionBlocked(binding.projection.name)(cause)))
@@ -163,7 +167,12 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
             })(binding.projection.document.name).pipe(
               Effect.mapError(toProjectionBlocked(binding.projection.name))
             )
-            const status = populated.populated === 1 ? "Rebuilding" : "Ready"
+            const status = (() => {
+              if (populated.populated === 1) {
+                return ("Rebuilding")
+              }
+              return ("Ready")
+            })()
             yield* sql`INSERT INTO effect_local_projection_registry (
             projection_name, table_name, projection_version, schema_checksum, status
           ) VALUES (
@@ -171,6 +180,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
           )`.pipe(Effect.mapError(toProjectionBlocked(binding.projection.name)))
           }
         }
+        return undefined
       })).pipe(
         Effect.catchTag("SqlError", (cause) =>
           Effect.fail(
@@ -185,7 +195,12 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
         destinationTable: string
       ) =>
         sql.withTransaction(Effect.gen(function*() {
-          const rows = snapshot.tombstone ? [] : yield* Projection.evaluate(binding.projection, snapshot)
+          const rows = yield* Effect.gen(function*() {
+            if (snapshot.tombstone) {
+              return []
+            }
+            return (yield* Projection.evaluate(binding.projection, snapshot))
+          })
           for (const row of rows) {
             if (
               typeof row !== "object" || row === null || !("sourceDocumentId" in row) ||
@@ -194,7 +209,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.ProjectionBlocked({
                   projection: binding.projection.name,
-                  cause: new Error("Projection row must contain its source document ID")
+                  cause: NativeError.nativeError("Projection row must contain its source document ID")
                 })
               })
             }
@@ -211,6 +226,7 @@ export const layer = <const Bindings extends ReadonlyArray<SqlProjection.Any>,>(
           ) ON CONFLICT(document_id, projection_name) DO UPDATE SET
             projected_heads = excluded.projected_heads,
             status = excluded.status`
+          return undefined
         })).pipe(
           Effect.catchTag("SqlError", (cause) => Effect.fail(toProjectionBlocked(binding.projection.name)(cause)))
         )

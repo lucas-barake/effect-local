@@ -25,6 +25,8 @@ import * as CheckpointAuthority from "./CheckpointAuthority.js"
 import * as InternalAutomerge from "./internal/automerge.js"
 import * as ClusterStorage from "./internal/clusterStorage.js"
 import * as HistoryCounters from "./internal/historyCounters.js"
+import { literal } from "./internal/literal.js"
+import * as NativeError from "./internal/nativeError.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as ProjectionStore from "./ProjectionStore.js"
 import * as Recovery from "./Recovery.js"
@@ -164,7 +166,7 @@ const ForeignKeyViolationRow = Schema.Struct({
 const insertBatchSize = 50
 const JsonString = Schema.fromJsonString(Schema.Unknown)
 const EnvelopeJson = Schema.fromJsonString(Envelope)
-const backupAlreadyInstalled = { _tag: "BackupAlreadyInstalled" } as const
+const backupAlreadyInstalled = literal({ _tag: "BackupAlreadyInstalled" })
 
 type Envelope = typeof Envelope.Type
 type RawDecodedRecord =
@@ -222,8 +224,8 @@ const exceedsJsonDepth = (value: unknown, limit: number) => {
 export class BackupStore extends Context.Service<BackupStore, {
   readonly export: (options: Backup.ExportOptions) => Stream.Stream<Uint8Array, ReplicaError.ReplicaError>
   readonly restore: <R,>(options: Backup.RestoreOptions<R>) => Effect.Effect<void, ReplicaError.ReplicaError, R>
-  readonly installDocument: <D extends Document.Any, R,>(
-    document: D,
+  readonly installDocument: <R,>(
+    document: Document.Any,
     options: Backup.InstallDocumentOptions<R>
   ) => Effect.Effect<void, ReplicaError.ReplicaError, R>
 }>()("@lucas-barake/effect-local-sql/BackupStore") {}
@@ -409,31 +411,37 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               return { documents, changes, checkpoints, transitions, receipts }
             }))
             const records = yield* Effect.forEach([
-              ...snapshot.documents.map((value) => ["Document", value] as const),
+              ...snapshot.documents.map((value) => literal(["Document", value])),
               ...snapshot.changes.map((row) =>
-                ["Change", { ...row, bytes: Encoding.encodeBase64(row.bytes) }] as const
+                literal(["Change", { ...row, bytes: Encoding.encodeBase64(row.bytes) }])
               ),
               ...snapshot.checkpoints.map((row) =>
-                ["Checkpoint", {
+                literal(["Checkpoint", {
                   ...row,
                   bytes: Encoding.encodeBase64(row.bytes),
-                  writer_provenance: WriterProvenance.isCompactCheckpoint(row.writer_provenance)
-                    ? {
-                      ...row.writer_provenance,
-                      authorization: Encoding.encodeBase64(row.writer_provenance.authorization)
+                  writer_provenance: (() => {
+                    if (WriterProvenance.isCompactCheckpoint(row.writer_provenance)) {
+                      return ({
+                        ...row.writer_provenance,
+                        authorization: Encoding.encodeBase64(row.writer_provenance.authorization)
+                      })
                     }
-                    : row.writer_provenance
-                }] as const
+                    return (row.writer_provenance)
+                  })()
+                }])
               ),
               ...snapshot.transitions.map((row) =>
-                ["Transition", {
+                literal(["Transition", {
                   ...row,
-                  authorization: row.authorization === null ? null : Encoding.encodeBase64(row.authorization),
+                  authorization: (() => {
+                    if (row.authorization === null) return (null)
+                    return (Encoding.encodeBase64(row.authorization))
+                  })(),
                   prior_snapshot: Encoding.encodeBase64(row.prior_snapshot)
-                }] as const
+                }])
               ),
               ...snapshot.receipts.map((row) =>
-                ["Receipt", { ...row, result: Encoding.encodeBase64(row.result) }] as const
+                literal(["Receipt", { ...row, result: Encoding.encodeBase64(row.result) }])
               )
             ], ([kind, value]) => encodeEnvelope(kind, value))
             const recordsChecksum = yield* digest(records.map((record) => record.checksum))
@@ -536,38 +544,43 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                       })
                     )
                   }
-                  return bytes > maxBytes
-                    ? Effect.fail(
-                      new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.BackupTooLarge({
-                          limit: maxBytes,
-                          observed: bytes
+                  return (() => {
+                    if (bytes > maxBytes) {
+                      return (Effect.fail(
+                        new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.BackupTooLarge({
+                            limit: maxBytes,
+                            observed: bytes
+                          })
                         })
-                      })
-                    )
-                    : reporter.progress(bytes).pipe(Effect.as(chunk))
+                      ))
+                    }
+                    return (reporter.progress(bytes).pipe(Effect.as(chunk)))
+                  })()
                 })
               )
             ),
             Stream.decodeText(),
             Stream.splitLines,
             Stream.mapEffect((line, index) =>
-              index >= limits.maxArchiveRecords + 2
-                ? Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.BackupTooLarge({
-                      limit: limits.maxArchiveRecords,
-                      observed: index - 1
+              (() => {
+                if (index >= limits.maxArchiveRecords + 2) {
+                  return (Effect.fail(
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.BackupTooLarge({
+                        limit: limits.maxArchiveRecords,
+                        observed: index - 1
+                      })
                     })
-                  })
-                )
-                : Schema.decodeUnknownEffect(JsonString)(line).pipe(
+                  ))
+                }
+                return (Schema.decodeUnknownEffect(JsonString)(line).pipe(
                   Effect.filterOrFail(
                     (value) => !exceedsJsonDepth(value, limits.maxJsonDepth),
                     () =>
                       new ReplicaError.ReplicaError({
                         reason: new ReplicaError.BackupInvalid({
-                          cause: new Error(`Backup JSON exceeds maximum depth ${limits.maxJsonDepth}`)
+                          cause: NativeError.nativeError(`Backup JSON exceeds maximum depth ${limits.maxJsonDepth}`)
                         })
                       })
                   ),
@@ -580,7 +593,8 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                         })
                       })
                     ))
-                )
+                ))
+              })()
             ),
             Stream.runCollect
           )
@@ -590,7 +604,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           if (manifestEnvelope?.kind !== "Manifest" || endEnvelope?.kind !== "End") {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.BackupInvalid({
-                cause: new Error("Backup manifest or ending record is missing")
+                cause: NativeError.nativeError("Backup manifest or ending record is missing")
               })
             })
           }
@@ -619,7 +633,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           ) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.BackupInvalid({
-                cause: new Error("Backup manifest does not match this replica")
+                cause: NativeError.nativeError("Backup manifest does not match this replica")
               })
             })
           }
@@ -627,7 +641,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           if (manifest.recordCount !== records.length || end.recordCount !== records.length) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.BackupInvalid({
-                cause: new Error("Backup record count mismatch")
+                cause: NativeError.nativeError("Backup record count mismatch")
               })
             })
           }
@@ -635,7 +649,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             if ((yield* digest(envelope.value)) !== envelope.checksum) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new Error(`Backup checksum mismatch: ${envelope.kind}`)
+                  cause: NativeError.nativeError(`Backup checksum mismatch: ${envelope.kind}`)
                 })
               })
             }
@@ -643,7 +657,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           if ((yield* digest(records.map((record) => record.checksum))) !== end.recordsChecksum) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.BackupInvalid({
-                cause: new Error("Backup records checksum mismatch")
+                cause: NativeError.nativeError("Backup records checksum mismatch")
               })
             })
           }
@@ -665,9 +679,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                     value: {
                       ...encoded,
                       bytes,
-                      writer_definition_hash: encoded.writer_definition_hash === "local"
-                        ? manifest.definitionHash
-                        : encoded.writer_definition_hash
+                      writer_definition_hash: (() => {
+                        if (encoded.writer_definition_hash === "local") return (manifest.definitionHash)
+                        return (encoded.writer_definition_hash)
+                      })()
                     }
                   })
                   break
@@ -692,7 +707,9 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                       ) {
                         return yield* new ReplicaError.ReplicaError({
                           reason: new ReplicaError.BackupInvalid({
-                            cause: new Error(`Compact checkpoint heads are not canonical: ${encoded.checkpoint_hash}`)
+                            cause: NativeError.nativeError(
+                              `Compact checkpoint heads are not canonical: ${encoded.checkpoint_hash}`
+                            )
                           })
                         })
                       }
@@ -702,20 +719,22 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   }
                   decoded.push({
                     kind: "Checkpoint",
-                    value: writerProvenance === undefined
-                      ? { ...checkpoint, bytes }
-                      : { ...checkpoint, bytes, writer_provenance: writerProvenance }
+                    value: (() => {
+                      if (writerProvenance === undefined) return ({ ...checkpoint, bytes })
+                      return ({ ...checkpoint, bytes, writer_provenance: writerProvenance })
+                    })()
                   })
                   break
                 }
                 case "Transition": {
                   const encoded = yield* Schema.decodeUnknownEffect(TransitionRecord)(record.value)
                   const priorSnapshot = yield* decodeBytes(encoded.prior_snapshot)
-                  const authorization = encoded.authorization === null
-                    ? null
-                    : yield* decodeBytes(encoded.authorization).pipe(
+                  const authorization = yield* Effect.gen(function*() {
+                    if (encoded.authorization === null) return (null)
+                    return (yield* decodeBytes(encoded.authorization).pipe(
                       Effect.flatMap(Schema.decodeUnknownEffect(CheckpointAuthority.AuthorizationToken))
-                    )
+                    ))
+                  })
                   decoded.push({
                     kind: "Transition",
                     value: { ...encoded, authorization, prior_snapshot: priorSnapshot }
@@ -731,7 +750,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 default:
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.BackupInvalid({
-                      cause: new Error(`Unknown backup record: ${record.kind}`)
+                      cause: NativeError.nativeError(`Unknown backup record: ${record.kind}`)
                     })
                   })
               }
@@ -749,7 +768,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           )
           const documentById = new Map<string, typeof DocumentRecord.Type>(
             rawDecoded.flatMap((record) =>
-              record.kind === "Document" ? [[record.value.document_id, record.value] as const] : []
+              (() => {
+                if (record.kind === "Document") return [literal([record.value.document_id, record.value])]
+                return []
+              })()
             )
           )
           const documentIds = new Set<string>()
@@ -773,7 +795,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 if (changeActors.has(`${record.value.document_id}:${record.value.actor}:${record.value.sequence}`)) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.BackupInvalid({
-                      cause: new Error(`Duplicate archive change sequence: ${record.value.document_id}`)
+                      cause: NativeError.nativeError(`Duplicate archive change sequence: ${record.value.document_id}`)
                     })
                   })
                 }
@@ -790,7 +812,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 if (transitionPriorLineages.has(priorKey)) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.BackupInvalid({
-                      cause: new Error(`Conflicting archive transition fork: ${priorKey}`)
+                      cause: NativeError.nativeError(`Conflicting archive transition fork: ${priorKey}`)
                     })
                   })
                 }
@@ -805,7 +827,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             if (keys.some((entries) => entries.has(key))) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new Error(`Duplicate archive ${record.kind.toLowerCase()} record: ${key}`)
+                  cause: NativeError.nativeError(`Duplicate archive ${record.kind.toLowerCase()} record: ${key}`)
                 })
               })
             }
@@ -815,7 +837,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             if (record.kind !== "Document" && !documentIds.has(record.value.document_id)) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new Error(`Archive ${record.kind.toLowerCase()} references an unknown document`)
+                  cause: NativeError.nativeError(`Archive ${record.kind.toLowerCase()} references an unknown document`)
                 })
               })
             }
@@ -857,17 +879,19 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                       const declaredHeads = Schema.decodeUnknownSync(Heads)(record.value.heads)
                       const actualHeads = Automerge.getHeads(document).toSorted(Conflict.compareCodeUnits)
                       if (!Equal.equals(declaredHeads, actualHeads)) {
-                        throw new TypeError(`Checkpoint heads mismatch: ${record.value.checkpoint_hash}`)
+                        return NativeError.throwTypeError(`Checkpoint heads mismatch: ${record.value.checkpoint_hash}`)
                       }
-                      const changeHashes = checkpointChanges.map((change) => change.decoded.hash).toSorted()
+                      const checkpointChangeHashes = checkpointChanges.map((change) => change.decoded.hash).toSorted()
                       const stored = changeProvenanceByDocument.get(record.value.document_id) ?? []
                       const storedDocument = documentById.get(record.value.document_id)
                       if (storedDocument === undefined) {
-                        throw new TypeError(`Checkpoint references unknown document ${record.value.document_id}`)
+                        return NativeError.throwTypeError(
+                          `Checkpoint references unknown document ${record.value.document_id}`
+                        )
                       }
                       const provenance = record.value.writer_provenance ??
                         WriterProvenance.backfill(
-                          changeHashes,
+                          checkpointChangeHashes,
                           stored,
                           {
                             writerSchemaVersion: storedDocument.schema_version,
@@ -881,10 +905,14 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                           provenance.schemaVersion !== storedDocument.schema_version ||
                           !Equal.equals(provenance.heads, actualHeads) ||
                           Automerge.getMissingDeps(document, []).length !== 0
-                        ) throw new TypeError(`Invalid compact checkpoint proof: ${record.value.checkpoint_hash}`)
+                        ) {
+                          return NativeError.throwTypeError(
+                            `Invalid compact checkpoint proof: ${record.value.checkpoint_hash}`
+                          )
+                        }
                       } else {
-                        WriterProvenance.validateExact(changeHashes, provenance)
-                        WriterProvenance.resolve(changeHashes, [...provenance, ...stored])
+                        WriterProvenance.validateExact(checkpointChangeHashes, provenance)
+                        WriterProvenance.resolve(checkpointChangeHashes, [...provenance, ...stored])
                       }
                       checkpointHistoryByHash.set(record.value.checkpoint_hash, {
                         changes: checkpointChanges.length,
@@ -895,7 +923,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                         bytes: checkpointChanges.reduce((total, change) => total + change.bytes.byteLength, 0)
                       })
                       return {
-                        kind: "Checkpoint" as const,
+                        kind: literal("Checkpoint"),
                         value: { ...record.value, writer_provenance: provenance }
                       }
                     },
@@ -927,7 +955,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           })
           const checkpointByHash = new Map(
             decoded.flatMap((record) =>
-              record.kind === "Checkpoint" ? [[record.value.checkpoint_hash, record.value] as const] : []
+              (() => {
+                if (record.kind === "Checkpoint") return [literal([record.value.checkpoint_hash, record.value])]
+                return []
+              })()
             )
           )
           const transitionsByDocument = new Map<string, Array<typeof StoredTransitionRecord.Type>>()
@@ -941,7 +972,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             ) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new Error(`Invalid active checkpoint for ${document.document_id}`)
+                  cause: NativeError.nativeError(`Invalid active checkpoint for ${document.document_id}`)
                 })
               })
             }
@@ -961,7 +992,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 ) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.BackupInvalid({
-                      cause: new Error(`Invalid document record: ${record.value.document_id}`)
+                      cause: NativeError.nativeError(`Invalid document record: ${record.value.document_id}`)
                     })
                   })
                 }
@@ -998,7 +1029,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 ) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.BackupInvalid({
-                      cause: new Error(`Invalid change record: ${record.value.change_hash}`)
+                      cause: NativeError.nativeError(`Invalid change record: ${record.value.change_hash}`)
                     })
                   })
                 }
@@ -1019,7 +1050,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 ) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.BackupInvalid({
-                      cause: new Error(`Invalid checkpoint record: ${record.value.checkpoint_hash}`)
+                      cause: NativeError.nativeError(`Invalid checkpoint record: ${record.value.checkpoint_hash}`)
                     })
                   })
                 }
@@ -1034,12 +1065,13 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   (document) =>
                     Effect.try({
                       try: () =>
-                        WriterProvenance.isCompactCheckpoint(record.value.writer_provenance)
-                          ? undefined
-                          : WriterProvenance.validateExact(
+                        (() => {
+                          if (WriterProvenance.isCompactCheckpoint(record.value.writer_provenance)) return undefined
+                          return (WriterProvenance.validateExact(
                             WriterProvenance.changeHashes(document),
                             record.value.writer_provenance
-                          ),
+                          ))
+                        })(),
                       catch: (cause) =>
                         new ReplicaError.ReplicaError({
                           reason: new ReplicaError.BackupInvalid({ cause })
@@ -1052,13 +1084,15 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               case "Transition": {
                 const [priorHeads, resultingHeads] = yield* Effect.try({
                   try: () => {
-                    const priorHeads = Schema.decodeUnknownSync(Heads)(record.value.prior_heads)
-                    const resultingHeads = Schema.decodeUnknownSync(Heads)(record.value.heads)
+                    const decodedPriorHeads = Schema.decodeUnknownSync(Heads)(record.value.prior_heads)
+                    const decodedResultingHeads = Schema.decodeUnknownSync(Heads)(record.value.heads)
                     if (
-                      Schema.encodeSync(JsonString)(priorHeads) !== record.value.prior_heads ||
-                      Schema.encodeSync(JsonString)(resultingHeads) !== record.value.heads
-                    ) throw new TypeError(`Transition heads are not canonical: ${record.value.lineage}`)
-                    return [priorHeads, resultingHeads] as const
+                      Schema.encodeSync(JsonString)(decodedPriorHeads) !== record.value.prior_heads ||
+                      Schema.encodeSync(JsonString)(decodedResultingHeads) !== record.value.heads
+                    ) {
+                      return NativeError.throwTypeError(`Transition heads are not canonical: ${record.value.lineage}`)
+                    }
+                    return literal([decodedPriorHeads, decodedResultingHeads])
                   },
                   catch: (cause) =>
                     new ReplicaError.ReplicaError({
@@ -1068,7 +1102,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 if (record.value.prior_lineage === record.value.lineage) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.BackupInvalid({
-                      cause: new Error(`Transition does not advance lineage: ${record.value.lineage}`)
+                      cause: NativeError.nativeError(`Transition does not advance lineage: ${record.value.lineage}`)
                     })
                   })
                 }
@@ -1092,7 +1126,12 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                           priorCheckpointHash !== record.value.prior_checkpoint_hash ||
                           !Equal.equals(priorHeads, actualHeads) ||
                           Automerge.getMissingDeps(priorDocument, []).length !== 0
-                        ) throw new TypeError(`Invalid transition prior snapshot: ${record.value.lineage}`)
+                        ) {
+                          return NativeError.throwTypeError(
+                            `Invalid transition prior snapshot: ${record.value.lineage}`
+                          )
+                        }
+                        return undefined
                       },
                       catch: (cause) =>
                         new ReplicaError.ReplicaError({
@@ -1117,7 +1156,9 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   ) {
                     return yield* new ReplicaError.ReplicaError({
                       reason: new ReplicaError.BackupInvalid({
-                        cause: new Error(`Transition anchor checkpoint does not match: ${record.value.lineage}`)
+                        cause: NativeError.nativeError(
+                          `Transition anchor checkpoint does not match: ${record.value.lineage}`
+                        )
                       })
                     })
                   }
@@ -1157,7 +1198,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 if (record.value.replica_incarnation > manifest.incarnation) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.BackupInvalid({
-                      cause: new Error(`Invalid receipt record: ${record.value.command_id}`)
+                      cause: NativeError.nativeError(`Invalid receipt record: ${record.value.command_id}`)
                     })
                   })
                 }
@@ -1173,11 +1214,11 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             if (roots.length !== 1) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new Error(`Lineage transition chain has no unique root: ${documentId}`)
+                  cause: NativeError.nativeError(`Lineage transition chain has no unique root: ${documentId}`)
                 })
               })
             }
-            let current = roots[0]!
+            let current = roots[0]
             let visited = 1
             for (;;) {
               const next = byPriorLineage.get(current.lineage)
@@ -1189,13 +1230,20 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             if (visited !== transitions.length || current.lineage !== document.lineage) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new Error(`Lineage transition chain is not adjacent to the document: ${documentId}`)
+                  cause: NativeError.nativeError(
+                    `Lineage transition chain is not adjacent to the document: ${documentId}`
+                  )
                 })
               })
             }
           }
           const checkpointDocuments = new Set(
-            decoded.flatMap((record) => record.kind === "Checkpoint" ? [record.value.document_id] : [])
+            decoded.flatMap((record) =>
+              (() => {
+                if (record.kind === "Checkpoint") return [record.value.document_id]
+                return []
+              })()
+            )
           )
           const changesByDocument = new Map<string, Array<typeof StoredChangeRecord.Type>>()
           for (const record of decoded) {
@@ -1210,7 +1258,12 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             const complete = yield* Effect.try({
               try: () => {
                 const appliedHashes = new Set(
-                  changes.flatMap((change) => change.applied === 1 ? [change.change_hash] : [])
+                  changes.flatMap((change) =>
+                    (() => {
+                      if (change.applied === 1) return [change.change_hash]
+                      return []
+                    })()
+                  )
                 )
                 const dependencies = new Set<string>()
                 for (const change of changes) {
@@ -1241,7 +1294,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               }
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new Error(`Incomplete retained history for ${document.document_id}`)
+                  cause: NativeError.nativeError(`Incomplete retained history for ${document.document_id}`)
                 })
               })
             }
@@ -1256,61 +1309,85 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
           }
           if (options.mode === "document") {
             const selectedDocuments = decoded.flatMap((record) =>
-              record.kind === "Document" && record.value.document_id === options.documentId ? [record.value] : []
+              (() => {
+                if (record.kind === "Document" && record.value.document_id === options.documentId) return [record.value]
+                return []
+              })()
             )
             if (selectedDocuments.length !== 1) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new Error(`Backup must contain exactly one document record for ${options.documentId}`)
+                  cause: NativeError.nativeError(
+                    `Backup must contain exactly one document record for ${options.documentId}`
+                  )
                 })
               })
             }
-            const selectedDocument = selectedDocuments[0]!
+            const selectedDocument = selectedDocuments[0]
             if (selectedDocument.document_type !== options.document.name) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new Error(`Backup document type does not match ${options.document.name}`)
+                  cause: NativeError.nativeError(`Backup document type does not match ${options.document.name}`)
                 })
               })
             }
             const selectedChanges = decoded.flatMap((record) =>
-              record.kind === "Change" && record.value.document_id === options.documentId ? [record.value] : []
+              (() => {
+                if (record.kind === "Change" && record.value.document_id === options.documentId) return [record.value]
+                return []
+              })()
             )
             if (selectedChanges.some((change) => change.document_type !== selectedDocument.document_type)) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new Error(`Backup changes do not match document ${options.documentId}`)
+                  cause: NativeError.nativeError(`Backup changes do not match document ${options.documentId}`)
                 })
               })
             }
             const selectedCheckpoints = decoded.flatMap((record) =>
-              record.kind === "Checkpoint" && record.value.document_id === options.documentId ? [record.value] : []
+              (() => {
+                if (record.kind === "Checkpoint" && record.value.document_id === options.documentId) {
+                  return [record.value]
+                }
+                return []
+              })()
             )
             const selectedTransitions = decoded.flatMap((record) =>
-              record.kind === "Transition" && record.value.document_id === options.documentId ? [record.value] : []
+              (() => {
+                if (record.kind === "Transition" && record.value.document_id === options.documentId) {
+                  return [record.value]
+                }
+                return []
+              })()
             )
-            const activeCheckpoints = selectedDocument.checkpoint_hash === null
-              ? []
-              : selectedCheckpoints.filter((checkpoint) =>
+            const activeCheckpoints = (() => {
+              if (selectedDocument.checkpoint_hash === null) return []
+              return (selectedCheckpoints.filter((checkpoint) =>
                 checkpoint.checkpoint_hash === selectedDocument.checkpoint_hash
-              )
+              ))
+            })()
             if (selectedDocument.checkpoint_hash !== null && activeCheckpoints.length !== 1) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new Error(`Backup active checkpoint is missing or duplicated for ${options.documentId}`)
+                  cause: NativeError.nativeError(
+                    `Backup active checkpoint is missing or duplicated for ${options.documentId}`
+                  )
                 })
               })
             }
             const activeCheckpoint = activeCheckpoints[0]
             const checkpointChanges = new Set(
-              activeCheckpoint === undefined
-                ? []
-                : WriterProvenance.exactEntries(activeCheckpoint.writer_provenance).map((entry) => entry.changeHash)
+              (() => {
+                if (activeCheckpoint === undefined) return []
+                return (WriterProvenance.exactEntries(activeCheckpoint.writer_provenance).map((entry) =>
+                  entry.changeHash
+                ))
+              })()
             )
             if (selectedChanges.some((change) => checkpointChanges.has(change.change_hash) && change.applied !== 1)) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new Error(`Checkpoint materialized change is not applied: ${options.documentId}`)
+                  cause: NativeError.nativeError(`Checkpoint materialized change is not applied: ${options.documentId}`)
                 })
               })
             }
@@ -1319,7 +1396,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               if (activeCheckpoint === undefined) {
                 return yield* new ReplicaError.ReplicaError({
                   reason: new ReplicaError.BackupInvalid({
-                    cause: new Error(`Backup history cannot be measured for ${options.documentId}`)
+                    cause: NativeError.nativeError(`Backup history cannot be measured for ${options.documentId}`)
                   })
                 })
               }
@@ -1327,15 +1404,16 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               if (checkpointHistory === undefined) {
                 return yield* new ReplicaError.ReplicaError({
                   reason: new ReplicaError.BackupInvalid({
-                    cause: new Error(`Checkpoint history is missing: ${activeCheckpoint.checkpoint_hash}`)
+                    cause: NativeError.nativeError(`Checkpoint history is missing: ${activeCheckpoint.checkpoint_hash}`)
                   })
                 })
               }
               const retainedHistory = HistoryCounters.measureDecoded(
                 selectedChanges.flatMap((change) =>
-                  checkpointChanges.has(change.change_hash)
-                    ? []
-                    : [{ bytes: change.bytes, operations: metadataByChange.get(change.change_hash)!.operations }]
+                  (() => {
+                    if (checkpointChanges.has(change.change_hash)) return []
+                    return [{ bytes: change.bytes, operations: metadataByChange.get(change.change_hash)!.operations }]
+                  })()
                 )
               )
               selectedHistory = yield* HistoryCounters.check({
@@ -1356,7 +1434,9 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                     ) return false
                     return yield* new ReplicaError.ReplicaError({
                       reason: new ReplicaError.BackupInvalid({
-                        cause: new Error("Backup installation id was already used for a different request")
+                        cause: NativeError.nativeError(
+                          "Backup installation id was already used for a different request"
+                        )
                       })
                     })
                   }
@@ -1365,7 +1445,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                       Effect.fail(
                         new ReplicaError.ReplicaError({
                           reason: new ReplicaError.StorageCorrupt({
-                            cause: new Error("Document existence query returned no row")
+                            cause: NativeError.nativeError("Document existence query returned no row")
                           })
                         })
                       ))
@@ -1373,7 +1453,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   if (existingDocument.present === 1) {
                     return yield* new ReplicaError.ReplicaError({
                       reason: new ReplicaError.BackupInvalid({
-                        cause: new Error(`Document already exists: ${options.documentId}`)
+                        cause: NativeError.nativeError(`Document already exists: ${options.documentId}`)
                       })
                     })
                   }
@@ -1401,9 +1481,10 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   )`
                   const installedChanges = selectedChanges.map((change) =>
                     Object.assign({}, change, {
-                      commit_sequence: checkpointChanges.has(change.change_hash)
-                        ? sequence.prior_sequence
-                        : sequence.commit_sequence
+                      commit_sequence: (() => {
+                        if (checkpointChanges.has(change.change_hash)) return (sequence.prior_sequence)
+                        return (sequence.commit_sequence)
+                      })()
                     })
                   )
                   for (const batch of Arr.chunksOf(installedChanges, insertBatchSize)) {
@@ -1437,11 +1518,14 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   )`
                   const stored = yield* recovery.recoverWithPermit(options.document, options.documentId, permit).pipe(
                     Effect.mapError((error) =>
-                      error.reason._tag === "StorageCorrupt"
-                        ? new ReplicaError.ReplicaError({
-                          reason: new ReplicaError.BackupInvalid({ cause: error })
-                        })
-                        : error
+                      (() => {
+                        if (error.reason._tag === "StorageCorrupt") {
+                          return (new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.BackupInvalid({ cause: error })
+                          }))
+                        }
+                        return error
+                      })()
                     )
                   )
                   yield* projections.replaceDocument(
@@ -1462,21 +1546,24 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 }))
               )
             ))
-            if (!installed) return
-            return
+            if (!installed) return undefined
+            return undefined
           }
-          const nextReplicaId = options.mode === "clone"
-            ? yield* Identity.makeReplicaId.pipe(
-              Effect.provideService(Crypto.Crypto, crypto),
-              Effect.mapError((cause) =>
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageUnavailable({
-                    cause
+          const nextReplicaId = yield* Effect.gen(function*() {
+            if (options.mode === "clone") {
+              return (yield* Identity.makeReplicaId.pipe(
+                Effect.provideService(Crypto.Crypto, crypto),
+                Effect.mapError((cause) =>
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageUnavailable({
+                      cause
+                    })
                   })
-                })
-              )
-            )
-            : manifest.replicaId
+                )
+              ))
+            }
+            return (manifest.replicaId)
+          })
           yield* Effect.scoped(Effect.gen(function*() {
             yield* reporter.installing
             yield* gate.claim((permit) =>
@@ -1496,7 +1583,9 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   ) {
                     return yield* new ReplicaError.ReplicaError({
                       reason: new ReplicaError.BackupInvalid({
-                        cause: new Error("Backup installation id was already used for a different restore")
+                        cause: NativeError.nativeError(
+                          "Backup installation id was already used for a different restore"
+                        )
                       })
                     })
                   }
@@ -1541,29 +1630,50 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 yield* projections.clear
                 yield* sql`DELETE FROM effect_local_documents`
                 const documents = decoded.flatMap((record) =>
-                  record.kind === "Document"
-                    ? [{
-                      ...record.value,
-                      projection_status: "Ready",
-                      history_changes: historyByDocument.get(record.value.document_id)?.changes ?? null,
-                      history_operations: historyByDocument.get(record.value.document_id)?.operations ?? null,
-                      history_bytes: historyByDocument.get(record.value.document_id)?.bytes ?? null
-                    }]
-                    : []
+                  (() => {
+                    if (record.kind === "Document") {
+                      return [{
+                        ...record.value,
+                        projection_status: "Ready",
+                        history_changes: historyByDocument.get(record.value.document_id)?.changes ?? null,
+                        history_operations: historyByDocument.get(record.value.document_id)?.operations ?? null,
+                        history_bytes: historyByDocument.get(record.value.document_id)?.bytes ?? null
+                      }]
+                    }
+                    return []
+                  })()
                 )
-                const changes = decoded.flatMap((record) => record.kind === "Change" ? [record.value] : [])
+                const changes = decoded.flatMap((record) =>
+                  (() => {
+                    if (record.kind === "Change") return [record.value]
+                    return []
+                  })()
+                )
                 const checkpoints = decoded.flatMap((record) =>
-                  record.kind === "Checkpoint"
-                    ? [{
-                      ...record.value,
-                      writer_provenance: Schema.encodeSync(WriterProvenance.StoredCheckpointProvenance)(
-                        record.value.writer_provenance
-                      )
-                    }]
-                    : []
+                  (() => {
+                    if (record.kind === "Checkpoint") {
+                      return [{
+                        ...record.value,
+                        writer_provenance: Schema.encodeSync(WriterProvenance.StoredCheckpointProvenance)(
+                          record.value.writer_provenance
+                        )
+                      }]
+                    }
+                    return []
+                  })()
                 )
-                const transitions = decoded.flatMap((record) => record.kind === "Transition" ? [record.value] : [])
-                const receipts = decoded.flatMap((record) => record.kind === "Receipt" ? [record.value] : [])
+                const transitions = decoded.flatMap((record) =>
+                  (() => {
+                    if (record.kind === "Transition") return [record.value]
+                    return []
+                  })()
+                )
+                const receipts = decoded.flatMap((record) =>
+                  (() => {
+                    if (record.kind === "Receipt") return [record.value]
+                    return []
+                  })()
+                )
                 for (const batch of Arr.chunksOf(documents, insertBatchSize)) {
                   yield* sql`INSERT INTO effect_local_documents ${sql.insert(batch)}`
                 }
@@ -1580,9 +1690,15 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   yield* sql`INSERT INTO effect_local_command_receipts ${sql.insert(batch)}`
                 }
                 const sequences = decoded.flatMap((record) =>
-                  "commit_sequence" in record.value ? [record.value.commit_sequence] : []
+                  (() => {
+                    if ("commit_sequence" in record.value) return [record.value.commit_sequence]
+                    return []
+                  })()
                 )
-                const commitSequence = sequences.length === 0 ? 0 : Math.max(...sequences)
+                const commitSequence = (() => {
+                  if (sequences.length === 0) return (0)
+                  return (Math.max(...sequences))
+                })()
                 yield* sql`UPDATE effect_local_metadata SET
             replica_id = ${nextReplicaId},
             replica_incarnation = ${restoredPermit.incarnation},
@@ -1613,16 +1729,18 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                 if (foreignKeys.length > 0) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.BackupInvalid({
-                      cause: new Error("Backup violates SQLite foreign keys")
+                      cause: NativeError.nativeError("Backup violates SQLite foreign keys")
                     })
                   })
                 }
                 yield* gate.validate(restoredPermit)
+                return undefined
               })
             ).pipe(
               Effect.catchTag("BackupAlreadyInstalled", () => gate.refresh.pipe(Effect.asVoid))
             )
           }))
+          return undefined
         }).pipe(
           Effect.scoped,
           Effect.catchTags({
@@ -1637,14 +1755,19 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
             SqlError: (cause) =>
               Effect.fail(
                 new ReplicaError.ReplicaError({
-                  reason: !cause.isRetryable &&
+                  reason: (() => {
+                    if (
+                      !cause.isRetryable &&
                       (cause.reason._tag === "UniqueViolation" || cause.reason._tag === "ConstraintError")
-                    ? new ReplicaError.BackupInvalid({
+                    ) {
+                      return (new ReplicaError.BackupInvalid({
+                        cause
+                      }))
+                    }
+                    return (new ReplicaError.StorageUnavailable({
                       cause
-                    })
-                    : new ReplicaError.StorageUnavailable({
-                      cause
-                    })
+                    }))
+                  })()
                 })
               )
           }),

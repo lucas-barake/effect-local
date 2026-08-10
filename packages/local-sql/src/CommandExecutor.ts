@@ -25,6 +25,8 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as DocumentStore from "./DocumentStore.js"
 import * as InternalAutomerge from "./internal/automerge.js"
 import * as InternalConflicts from "./internal/conflicts.js"
+import { literal } from "./internal/literal.js"
+import * as NativeError from "./internal/nativeError.js"
 import * as ProjectionStore from "./ProjectionStore.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
@@ -170,8 +172,8 @@ export class CommandExecutor extends Context.Service<CommandExecutor, {
     CommandOutcome.CommandOutcome<M["successSchema"]["Type"], M["errorSchema"]["Type"]>,
     ReplicaError.ReplicaError
   >
-  readonly delete: <D extends Document.Any,>(
-    document: D,
+  readonly delete: (
+    document: Document.Any,
     options: {
       readonly commandId: Identity.CommandId
       readonly documentId: Identity.DocumentId
@@ -179,8 +181,8 @@ export class CommandExecutor extends Context.Service<CommandExecutor, {
       readonly requestHash: string
     }
   ) => Effect.Effect<CommandOutcome.CommandOutcome<void>, ReplicaError.ReplicaError>
-  readonly resolve: <D extends Document.Any,>(
-    document: D,
+  readonly resolve: (
+    document: Document.Any,
     options: {
       readonly commandId: Identity.CommandId
       readonly documentId: Identity.DocumentId
@@ -208,8 +210,8 @@ export class CommandExecutor extends Context.Service<CommandExecutor, {
     commandId: Identity.CommandId,
     permit: ReplicaGate.Permit
   ) => Effect.Effect<CommandOutcome.CommandOutcome<void>, ReplicaError.ReplicaError>
-  readonly lookupResolution: <D extends Document.Any,>(
-    document: D,
+  readonly lookupResolution: (
+    document: Document.Any,
     options: {
       readonly commandId: Identity.CommandId
       readonly documentId: Identity.DocumentId
@@ -288,20 +290,23 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 const beginProbe = yield* command(connection, "BEGIN").pipe(Effect.exit)
                 if (Exit.isFailure(beginProbe)) {
                   return {
-                    reusable: false as const,
-                    causes: [beginProbe.cause] as ReadonlyArray<Cause.Cause<unknown>>
+                    reusable: literal(false),
+                    causes: [beginProbe.cause] satisfies ReadonlyArray<Cause.Cause<unknown>>
                   }
                 }
                 const rollbackProbe = yield* command(connection, "ROLLBACK").pipe(Effect.exit)
-                return Exit.isSuccess(rollbackProbe)
-                  ? {
-                    reusable: true as const,
-                    causes: [] as ReadonlyArray<Cause.Cause<unknown>>
+                return (() => {
+                  if (Exit.isSuccess(rollbackProbe)) {
+                    return ({
+                      reusable: literal(true),
+                      causes: [] satisfies ReadonlyArray<Cause.Cause<unknown>>
+                    })
                   }
-                  : {
-                    reusable: false as const,
-                    causes: [rollbackProbe.cause] as ReadonlyArray<Cause.Cause<unknown>>
-                  }
+                  return ({
+                    reusable: literal(false),
+                    causes: [rollbackProbe.cause] satisfies ReadonlyArray<Cause.Cause<unknown>>
+                  })
+                })()
               })
               const begin = yield* command(connection, "BEGIN").pipe(Effect.exit)
               if (Exit.isFailure(begin)) {
@@ -428,7 +433,9 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                     yield* Scope.close(leaseScope, result.exit)
                   } else {
                     if (Exit.isSuccess(result.exit)) {
-                      return yield* Effect.die(new Error("A successful transaction cannot poison its connection"))
+                      return yield* Effect.die(
+                        NativeError.nativeError("A successful transaction cannot poison its connection")
+                      )
                     }
                     yield* Ref.set(
                       poisoned,
@@ -448,7 +455,12 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
             }))
           )
           return Ref.get(poisoned).pipe(
-            Effect.flatMap((error) => error === undefined ? transaction : Effect.fail(error)),
+            Effect.flatMap((error) =>
+              (() => {
+                if (error === undefined) return transaction
+                return (Effect.fail(error))
+              })()
+            ),
             Effect.catchCause((cause) =>
               Effect.failCause(Cause.map(cause, (error): E | ReplicaError.ReplicaError => {
                 if (SqlError.isSqlError(error)) {
@@ -456,7 +468,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                     reason: new ReplicaError.StorageUnavailable({ cause: error })
                   })
                 }
-                return error as E | ReplicaError.ReplicaError
+                return Schema.decodeUnknownSync(Schema.Any)(error)
               }))
             )
           )
@@ -574,22 +586,25 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
         )
 
       const operationLabel = (mutationName: string) =>
-        mutationName === "$create"
-          ? "create"
-          : mutationName === "$delete"
-          ? "delete"
-          : mutationName === "$resolve"
-          ? "resolve"
-          : mutationName
+        (() => {
+          if (mutationName === "$create") return ("create")
+          return ((() => {
+            if (mutationName === "$delete") return ("delete")
+            return ((() => {
+              if (mutationName === "$resolve") return ("resolve")
+              return mutationName
+            })())
+          })())
+        })()
 
       const requireOperation = (
         commandId: Identity.CommandId,
         receipt: ReceiptRow,
         expected: string
       ) =>
-        receipt.mutation_name === expected
-          ? Effect.void
-          : Effect.fail(
+        (() => {
+          if (receipt.mutation_name === expected) return (Effect.void)
+          return (Effect.fail(
             new ReplicaError.ReplicaError({
               reason: new ReplicaError.ReceiptOperationMismatch({
                 commandId,
@@ -597,7 +612,8 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 observed: operationLabel(receipt.mutation_name)
               })
             })
-          )
+          ))
+        })()
 
       return CommandExecutor.of({
         create: (document, options) =>
@@ -629,7 +645,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                   return yield* decodeReceipt(Identity.DocumentId, Schema.Never, existing.value)
                 }
                 const stored = yield* store.create(document, options.documentId, options.value).pipe(
-                  Effect.map((stored) => ({ ...stored, automerge: track(stored.automerge) }))
+                  Effect.map((storedResult) => ({ ...storedResult, automerge: track(storedResult.automerge) }))
                 )
                 yield* projections.replaceDocument(document, stored.snapshot, stored.commitSequence, "Fresh")
                 const outcome = CommandOutcome.durablyCommitted(options.commandId, options.documentId)
@@ -696,7 +712,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 )
                 const handler = handlers.get(mutation.name)
                 if (handler === undefined) {
-                  return yield* Effect.die(new Error(`Missing mutation handler: ${mutation.name}`))
+                  return yield* Effect.die(NativeError.nativeError(`Missing mutation handler: ${mutation.name}`))
                 }
                 let handlerResult!: Result.Result<
                   (typeof mutation)["successSchema"]["Type"],
@@ -705,9 +721,10 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                 const staged = yield* InternalAutomerge.acquireTracked(
                   store.stage(durable, (draft) => {
                     const result = handler({ draft, payload: options.payload, current: durable.snapshot.value })
-                    handlerResult = SchemaAST.isNever(mutation.errorSchema.ast)
-                      ? Result.succeed(result)
-                      : result
+                    handlerResult = (() => {
+                      if (SchemaAST.isNever(mutation.errorSchema.ast)) return (Result.succeed(result))
+                      return result
+                    })()
                   }),
                   track
                 )
@@ -745,7 +762,10 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                   mutation.document,
                   persisted.snapshot,
                   persisted.commitSequence,
-                  changeHashes.length > 0 ? "Fresh" : "Reused"
+                  (() => {
+                    if (changeHashes.length > 0) return ("Fresh")
+                    return ("Reused")
+                  })()
                 )
                 const outcome = CommandOutcome.durablyCommitted(options.commandId, handlerResult.success)
                 const result = yield* encodeResult(
@@ -812,7 +832,10 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                   document,
                   persisted.snapshot,
                   persisted.commitSequence,
-                  deletedChangeHashes.length > 0 ? "Fresh" : "Reused"
+                  (() => {
+                    if (deletedChangeHashes.length > 0) return ("Fresh")
+                    return ("Reused")
+                  })()
                 )
                 const outcome = CommandOutcome.durablyCommitted(options.commandId, undefined)
                 const result = yield* encodeResult(CommandOutcome.schema(Schema.Void, Schema.Never), outcome)
@@ -879,12 +902,13 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                   options.documentId,
                   options.resolution.heads
                 )
-                const metadata = source._tag === "Stale"
-                  ? source
-                  : {
+                const metadata = (() => {
+                  if (source._tag === "Stale") return source
+                  return ({
                     commitSequence: source.stored.commitSequence,
                     materializedHeads: source.stored.materializedHeads
-                  }
+                  })
+                })()
                 const reject = (error: Conflict.ResolutionError) =>
                   Effect.gen(function*() {
                     const outcome = CommandOutcome.rejected(options.commandId, error)
@@ -976,7 +1000,10 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
                   document,
                   persisted.snapshot,
                   persisted.commitSequence,
-                  resolvedChangeHashes.length > 0 ? "Fresh" : "Reused"
+                  (() => {
+                    if (resolvedChangeHashes.length > 0) return ("Fresh")
+                    return ("Reused")
+                  })()
                 )
                 const outcome = CommandOutcome.durablyCommitted(options.commandId, undefined)
                 const result = yield* encodeResult(
@@ -1005,27 +1032,30 @@ export const layer = <D extends ReplicaDefinition.Any,>(definition: D): Layer.La
           ),
         lookupCreate: (commandId, permit) =>
           lookup(commandId, permit).pipe(Effect.flatMap((receipt) =>
-            Option.isNone(receipt)
-              ? Effect.succeed(CommandOutcome.unknown(commandId))
-              : requireOperation(commandId, receipt.value, "$create").pipe(
+            (() => {
+              if (Option.isNone(receipt)) return (Effect.succeed(CommandOutcome.unknown(commandId)))
+              return (requireOperation(commandId, receipt.value, "$create").pipe(
                 Effect.andThen(decodeReceipt(Identity.DocumentId, Schema.Never, receipt.value))
-              )
+              ))
+            })()
           )),
         lookupMutation: (mutation, commandId, permit) =>
           lookup(commandId, permit).pipe(Effect.flatMap((receipt) =>
-            Option.isNone(receipt)
-              ? Effect.succeed(CommandOutcome.unknown(commandId))
-              : requireOperation(commandId, receipt.value, mutation.name).pipe(
+            (() => {
+              if (Option.isNone(receipt)) return (Effect.succeed(CommandOutcome.unknown(commandId)))
+              return (requireOperation(commandId, receipt.value, mutation.name).pipe(
                 Effect.andThen(decodeReceipt(mutation.successSchema, mutation.errorSchema, receipt.value))
-              )
+              ))
+            })()
           )),
         lookupDelete: (commandId, permit) =>
           lookup(commandId, permit).pipe(Effect.flatMap((receipt) =>
-            Option.isNone(receipt)
-              ? Effect.succeed(CommandOutcome.unknown(commandId))
-              : requireOperation(commandId, receipt.value, "$delete").pipe(
+            (() => {
+              if (Option.isNone(receipt)) return (Effect.succeed(CommandOutcome.unknown(commandId)))
+              return (requireOperation(commandId, receipt.value, "$delete").pipe(
                 Effect.andThen(decodeReceipt(Schema.Void, Schema.Never, receipt.value))
-              )
+              ))
+            })()
           )),
         lookupResolution: (document, options) =>
           Effect.gen(function*() {

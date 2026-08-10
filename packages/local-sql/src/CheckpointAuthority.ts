@@ -6,10 +6,11 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
+import { literal } from "./internal/literal.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 
-export const manifestPurpose = "@lucas-barake/effect-local-sql/CheckpointManifest/v1" as const
-export const transitionPurpose = "@lucas-barake/effect-local-sql/LineageTransition/v1" as const
+export const manifestPurpose = literal("@lucas-barake/effect-local-sql/CheckpointManifest/v1")
+export const transitionPurpose = literal("@lucas-barake/effect-local-sql/LineageTransition/v1")
 
 export const maximumAuthorizationTokenBytes = WriterProvenance.maximumAuthorizationTokenBytes
 export const AuthorizationToken = WriterProvenance.AuthorizationToken
@@ -78,9 +79,9 @@ export const layer = (implementation: Implementation): Layer.Layer<CheckpointAut
           })),
         Effect.flatMap(implementation.signManifest),
         Effect.flatMap((token) =>
-          Option.isNone(token)
-            ? Effect.succeed(token)
-            : Schema.decodeUnknownEffect(AuthorizationToken)(token.value).pipe(
+          (() => {
+            if (Option.isNone(token)) return (Effect.succeed(token))
+            return (Schema.decodeUnknownEffect(AuthorizationToken)(token.value).pipe(
               Effect.asSome,
               Effect.catchTag("SchemaError", () =>
                 new ReplicaError.ReplicaError({
@@ -89,7 +90,8 @@ export const layer = (implementation: Implementation): Layer.Layer<CheckpointAut
                     reason: "Checkpoint manifest authorization token is malformed"
                   })
                 }))
-            )
+            ))
+          })()
         )
       ),
     verifyManifest: (claims, token) =>
@@ -119,9 +121,9 @@ export const layer = (implementation: Implementation): Layer.Layer<CheckpointAut
           })),
         Effect.flatMap(implementation.signTransition),
         Effect.flatMap((token) =>
-          Option.isNone(token)
-            ? Effect.succeed(token)
-            : Schema.decodeUnknownEffect(AuthorizationToken)(token.value).pipe(
+          (() => {
+            if (Option.isNone(token)) return (Effect.succeed(token))
+            return (Schema.decodeUnknownEffect(AuthorizationToken)(token.value).pipe(
               Effect.asSome,
               Effect.catchTag("SchemaError", () =>
                 new ReplicaError.ReplicaError({
@@ -130,7 +132,8 @@ export const layer = (implementation: Implementation): Layer.Layer<CheckpointAut
                     reason: "Lineage transition authorization token is malformed"
                   })
                 }))
-            )
+            ))
+          })()
         )
       ),
     verifyTransition: (claims, token) =>

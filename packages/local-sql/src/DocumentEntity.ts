@@ -22,6 +22,8 @@ import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as PeerSync from "./PeerSync.js"
 import * as ReplicaGate from "./ReplicaGate.js"
 
+const JsonString = Schema.fromJsonString(Schema.Unknown)
+
 const commandFields = {
   replicaIncarnation: Identity.ReplicaIncarnation,
   writerGeneration: Identity.WriterGeneration,
@@ -50,18 +52,23 @@ const syncPrimaryKey = (payload: {
   readonly checkpointTransfer?: Uint8Array
   readonly relay?: PeerSync.RelayReceipt | undefined
 }) =>
-  payload.relay === undefined
-    ? JSON.stringify([
-      payload.replicaIncarnation,
-      payload.peerId,
-      payload.connectionEpoch,
-      payload.receiveSequence,
-      payload.messageHash,
-      WriterProvenance.canonicalize(payload.writerProvenance),
-      payload.lineage ?? Identity.genesisLineage,
-      payload.checkpointTransfer === undefined ? null : Encoding.encodeBase64(payload.checkpointTransfer)
-    ])
-    : JSON.stringify([
+  (() => {
+    if (payload.relay === undefined) {
+      return (Schema.encodeSync(JsonString)([
+        payload.replicaIncarnation,
+        payload.peerId,
+        payload.connectionEpoch,
+        payload.receiveSequence,
+        payload.messageHash,
+        WriterProvenance.canonicalize(payload.writerProvenance),
+        payload.lineage ?? Identity.genesisLineage,
+        (() => {
+          if (payload.checkpointTransfer === undefined) return (null)
+          return (Encoding.encodeBase64(payload.checkpointTransfer))
+        })()
+      ]))
+    }
+    return (Schema.encodeSync(JsonString)([
       "Relay",
       payload.replicaIncarnation,
       payload.relay.relayPeerId,
@@ -72,7 +79,8 @@ const syncPrimaryKey = (payload: {
       payload.relay.relayMessageId,
       payload.relay.messageHash,
       payload.relay.outerEnvelopeDigest
-    ])
+    ]))
+  })()
 
 const RelayReceipt = Schema.Struct({
   relayMessageId: Identity.RelayMessageId,
@@ -217,16 +225,19 @@ const encode = <S extends Document.WireSchema,>(schema: S, value: S["Type"]) =>
 
 const resolveDocument = (definition: ReplicaDefinition.Any, name: string) => {
   const document = DocumentSet.get(definition.documents, name)
-  return document === undefined
-    ? Effect.fail(
-      new ReplicaError.ReplicaError({
-        reason: new ReplicaError.ProtocolMismatch({
-          expected: "registered document type",
-          observed: name
+  return (() => {
+    if (document === undefined) {
+      return (Effect.fail(
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.ProtocolMismatch({
+            expected: "registered document type",
+            observed: name
+          })
         })
-      })
-    )
-    : Effect.succeed(document)
+      ))
+    }
+    return (Effect.succeed(document))
+  })()
 }
 
 const resolveMutation = (
@@ -237,16 +248,19 @@ const resolveMutation = (
   const mutation = definition.mutations.find((candidate: Mutation.Any) =>
     candidate.name === name && candidate.document === document
   )
-  return mutation === undefined
-    ? Effect.fail(
-      new ReplicaError.ReplicaError({
-        reason: new ReplicaError.ProtocolMismatch({
-          expected: `registered mutation for ${document.name}`,
-          observed: name
+  return (() => {
+    if (mutation === undefined) {
+      return (Effect.fail(
+        new ReplicaError.ReplicaError({
+          reason: new ReplicaError.ProtocolMismatch({
+            expected: `registered mutation for ${document.name}`,
+            observed: name
+          })
         })
-      })
-    )
-    : Effect.succeed(mutation)
+      ))
+    }
+    return (Effect.succeed(mutation))
+  })()
 }
 
 export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
@@ -387,10 +401,14 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
                   lineage: request.payload.lineage ?? Identity.genesisLineage,
                   message: request.payload.message,
                   writerProvenance: request.payload.writerProvenance,
-                  ...(request.payload.checkpointTransfer === undefined
-                    ? {}
-                    : { checkpointTransfer: request.payload.checkpointTransfer }),
-                  ...(request.payload.relay === undefined ? {} : { relay: request.payload.relay })
+                  ...((() => {
+                    if (request.payload.checkpointTransfer === undefined) return ({})
+                    return ({ checkpointTransfer: request.payload.checkpointTransfer })
+                  })()),
+                  ...((() => {
+                    if (request.payload.relay === undefined) return ({})
+                    return ({ relay: request.payload.relay })
+                  })())
                 }
               )
             })

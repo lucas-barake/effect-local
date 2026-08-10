@@ -116,14 +116,17 @@ const validateIncarnation = (
   expected: Identity.ReplicaIncarnation,
   permit: ReplicaGate.Permit
 ) =>
-  permit.incarnation === expected ? Effect.void : Effect.fail(
-    new ReplicaError.ReplicaError({
-      reason: new ReplicaError.ProtocolMismatch({
-        expected: `replica incarnation ${expected}`,
-        observed: `replica incarnation ${permit.incarnation}`
+  (() => {
+    if (permit.incarnation === expected) return (Effect.void)
+    return (Effect.fail(
+      new ReplicaError.ReplicaError({
+        reason: new ReplicaError.ProtocolMismatch({
+          expected: `replica incarnation ${expected}`,
+          observed: `replica incarnation ${permit.incarnation}`
+        })
       })
-    })
-  )
+    ))
+  })()
 
 const withActivityPermit = <A,>(
   gate: ReplicaGate.ReplicaGate["Service"],
@@ -253,6 +256,7 @@ export const layerRegistration = (
               })
             }
             yield* compaction.prune(reference.documentId)
+            return undefined
           })
         ).pipe(
           Effect.retry({
@@ -278,6 +282,7 @@ export const layerRegistration = (
         })
       })
     }
+    return undefined
   }))
 
 export const layerRuntime: Layer.Layer<
@@ -303,6 +308,7 @@ export const layerRuntime: Layer.Layer<
             })
           })
         }
+        return undefined
       })
     return CompactionWorkflow.of({
       execute: (operationId) =>
@@ -468,6 +474,7 @@ export const layerHistoryRewriteRuntime: Layer.Layer<
             })
           })
         }
+        return undefined
       })
     return HistoryRewriteWorkflow.of({
       execute: (documentId, operationId) =>

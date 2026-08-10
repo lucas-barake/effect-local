@@ -95,7 +95,7 @@ export const make = (definition: ReplicaDefinition.Any) =>
     // reads on one snapshot when another process is upgrading the replica concurrently.
     yield* sql.withTransaction(Effect.gen(function*() {
       const table = yield* findMetadataTable(undefined)
-      if (table.length === 0) return
+      if (table.length === 0) return undefined
       const stored = (yield* findStorageFormat(undefined))[0]
       if (stored === undefined) {
         if (yield* isPopulated) {
@@ -103,9 +103,9 @@ export const make = (definition: ReplicaDefinition.Any) =>
             reason: new ReplicaError.ReplicaMetadataMissing({ operation: "ReplicaBootstrap.probe" })
           })
         }
-        return
+        return undefined
       }
-      if (stored.storage_format_version === storageFormatVersion) return
+      if (stored.storage_format_version === storageFormatVersion) return undefined
       if (stored.storage_format_version === 1) {
         const migratorTable = yield* findMigratorTable(undefined)
         if (migratorTable.length > 0) {
@@ -113,7 +113,7 @@ export const make = (definition: ReplicaDefinition.Any) =>
           // Format 1 is upgradeable exactly while 12_document_history_counters, the only migration
           // that writes format 2, has not run. A fully migrated database claiming format 1 is
           // tampered or downgraded and is still refused.
-          if (latest._tag === "Some" && latest.value.migration_id < 12) return
+          if (latest._tag === "Some" && latest.value.migration_id < 12) return undefined
         }
       }
       return yield* new ReplicaError.ReplicaError({

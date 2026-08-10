@@ -18,6 +18,7 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as CheckpointAuthority from "./CheckpointAuthority.js"
 import * as InternalAutomerge from "./internal/automerge.js"
 import * as HistoryCounters from "./internal/historyCounters.js"
+import * as NativeError from "./internal/nativeError.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as Recovery from "./Recovery.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -132,13 +133,13 @@ const CheckpointIdentity = Schema.Struct({
 })
 
 export class Compaction extends Context.Service<Compaction, {
-  readonly prepare: <D extends Document.Any,>(
-    document: D,
+  readonly prepare: (
+    document: Document.Any,
     documentId: Identity.DocumentId
   ) => Effect.Effect<PreparedCheckpoint, ReplicaError.ReplicaError>
   readonly publish: (checkpoint: PreparedCheckpoint) => Effect.Effect<boolean, ReplicaError.ReplicaError>
-  readonly compact: <D extends Document.Any,>(
-    document: D,
+  readonly compact: (
+    document: Document.Any,
     documentId: Identity.DocumentId
   ) => Effect.Effect<CompactResult, ReplicaError.ReplicaError>
   readonly prune: (documentId: Identity.DocumentId) => Effect.Effect<number, ReplicaError.ReplicaError>
@@ -194,8 +195,8 @@ export class Compaction extends Context.Service<Compaction, {
    * with `ProtocolMismatch` rather than performing a second destructive rewrite under an identity
    * that already names one.
    */
-  readonly rewriteHistory: <D extends Document.Any,>(
-    document: D,
+  readonly rewriteHistory: (
+    document: Document.Any,
     documentId: Identity.DocumentId,
     operationId: OperationId
   ) => Effect.Effect<Identity.DocumentLineage, ReplicaError.ReplicaError>
@@ -594,14 +595,14 @@ export const layer: Layer.Layer<
         if (!Option.exists(current, (row) => row.lineage === marker.value.lineage)) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new Error("Recorded history rewrite does not match the document's current lineage")
+              cause: NativeError.nativeError("Recorded history rewrite does not match the document's current lineage")
             })
           })
         }
         return Option.some(marker.value.lineage)
       })
 
-    const prepare = <D extends Document.Any,>(document: D, documentId: Identity.DocumentId) =>
+    const prepare = (document: Document.Any, documentId: Identity.DocumentId) =>
       Effect.gen(function*() {
         const stored = yield* recovery.recover(document, documentId)
         return yield* Effect.gen(function*() {
@@ -631,7 +632,7 @@ export const layer: Layer.Layer<
           ) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new Error("Cannot compact an incomplete canonical history")
+                cause: NativeError.nativeError("Cannot compact an incomplete canonical history")
               })
             })
           }
@@ -709,7 +710,7 @@ export const layer: Layer.Layer<
         if (checkpoint.checkpointHash !== checkpointHash || checkpoint.checksum !== checksum) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new Error("Prepared checkpoint checksum mismatch")
+              cause: NativeError.nativeError("Prepared checkpoint checksum mismatch")
             })
           })
         }
@@ -743,7 +744,7 @@ export const layer: Layer.Layer<
         if (!checkpointContent.headsMatch) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new Error("Prepared checkpoint heads mismatch")
+              cause: NativeError.nativeError("Prepared checkpoint heads mismatch")
             })
           })
         }
@@ -786,7 +787,7 @@ export const layer: Layer.Layer<
           if (!WriterProvenance.equals(durableWriterProvenance, checkpoint.writerProvenance)) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new Error("Prepared checkpoint writer provenance does not match durable history")
+                cause: NativeError.nativeError("Prepared checkpoint writer provenance does not match durable history")
               })
             })
           }
@@ -815,7 +816,7 @@ export const layer: Layer.Layer<
           if (installed.length !== 1) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new Error("Checkpoint identity collision")
+                cause: NativeError.nativeError("Checkpoint identity collision")
               })
             })
           }
@@ -912,7 +913,7 @@ export const layer: Layer.Layer<
       })
     )
 
-    const compact = <D extends Document.Any,>(document: D, documentId: Identity.DocumentId) =>
+    const compact = (document: Document.Any, documentId: Identity.DocumentId) =>
       Effect.gen(function*() {
         const checkpoint = yield* prepare(document, documentId)
         return { checkpoint, published: yield* publish(checkpoint) }
@@ -984,7 +985,7 @@ export const layer: Layer.Layer<
           ) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new Error("Cannot prune from a corrupt checkpoint")
+                cause: NativeError.nativeError("Cannot prune from a corrupt checkpoint")
               })
             })
           }
@@ -1018,7 +1019,7 @@ export const layer: Layer.Layer<
           ) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new Error("Cannot prune from checkpoint head metadata mismatch")
+                cause: NativeError.nativeError("Cannot prune from checkpoint head metadata mismatch")
               })
             })
           }
@@ -1136,8 +1137,8 @@ export const layer: Layer.Layer<
         }))
       })
 
-    const rewriteHistory = <D extends Document.Any,>(
-      document: D,
+    const rewriteHistory = (
+      document: Document.Any,
       documentId: Identity.DocumentId,
       operationId: OperationId
     ) =>
@@ -1164,7 +1165,7 @@ export const layer: Layer.Layer<
         // interruptible and SQL rolls back, but wasm handles do not.
         const stored = yield* Effect.acquireRelease(
           recovery.recover(document, documentId),
-          (stored) => Effect.sync(() => InternalAutomerge.free(stored.automerge))
+          (storedHandle) => Effect.sync(() => InternalAutomerge.free(storedHandle.automerge))
         )
         const priorSnapshot = InternalAutomerge.save(stored.automerge)
         const priorCheckpointHash = yield* digest({ documentId, bytes: priorSnapshot })
@@ -1196,7 +1197,7 @@ export const layer: Layer.Layer<
                 reason: new ReplicaError.StorageCorrupt({ cause })
               })
           }),
-          (rebuilt) => Effect.sync(() => InternalAutomerge.free(rebuilt))
+          (rebuiltHandle) => Effect.sync(() => InternalAutomerge.free(rebuiltHandle))
         )
         const bytes = InternalAutomerge.save(rebuilt)
         yield* Effect.annotateCurrentSpan({ "rewrite.checkpoint_bytes": bytes.byteLength })
@@ -1208,7 +1209,7 @@ export const layer: Layer.Layer<
         if (rootChanges.length !== 1 || rootChange === undefined) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new Error(`Re-rooted document produced ${rootChanges.length} changes instead of one`)
+              cause: NativeError.nativeError(`Re-rooted document produced ${rootChanges.length} changes instead of one`)
             })
           })
         }
@@ -1285,7 +1286,7 @@ export const layer: Layer.Layer<
           }
           const row = guard.value
           const currentDefinitionHash = yield* findDefinitionHash(undefined).pipe(
-            Effect.map((row) => row.definition_hash),
+            Effect.map((definitionRow) => definitionRow.definition_hash),
             Effect.catchTag("NoSuchElementError", () =>
               Effect.fail(
                 new ReplicaError.ReplicaError({
@@ -1304,7 +1305,8 @@ export const layer: Layer.Layer<
             unexpiredRelayReceiptCount({ documentId, expiresAt: receiptExpiryCutoff }),
             changeCount(documentId)
           ])
-          const nonZero = (count: Option.Option<typeof CountRow.Type>) => Option.exists(count, (row) => row.count !== 0)
+          const nonZero = (count: Option.Option<typeof CountRow.Type>) =>
+            Option.exists(count, (countRow) => countRow.count !== 0)
           if (
             row.document_type !== document.name || row.lineage !== transitionClaims.priorLineage ||
             row.materialized_heads !== priorMaterializedHeads || row.accepted_heads !== priorAcceptedHeads ||
@@ -1314,7 +1316,7 @@ export const layer: Layer.Layer<
           ) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new Error("Cannot rewrite the history of an incomplete or unsettled document")
+                cause: NativeError.nativeError("Cannot rewrite the history of an incomplete or unsettled document")
               })
             })
           }
@@ -1322,7 +1324,7 @@ export const layer: Layer.Layer<
           if ((row.tombstone === 1) !== tombstone) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new Error("Re-rooted tombstone does not match the stored document")
+                cause: NativeError.nativeError("Re-rooted tombstone does not match the stored document")
               })
             })
           }
@@ -1347,17 +1349,20 @@ export const layer: Layer.Layer<
             // row the guard above read.
             priorCheckpointHash: row.checkpoint_hash,
             priorMaterializedHeads,
-            tombstone: tombstone ? 1 : 0
+            tombstone: (() => {
+              if (tombstone) return (1)
+              return (0)
+            })()
           })
           if (swapped.length !== 1) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new Error("Document advanced while its history rewrite was being prepared")
+                cause: NativeError.nativeError("Document advanced while its history rewrite was being prepared")
               })
             })
           }
           const commitSequence = yield* nextCommitSequence(undefined).pipe(
-            Effect.map((row) => row.commit_sequence),
+            Effect.map((sequenceRow) => sequenceRow.commit_sequence),
             Effect.catchTag("NoSuchElementError", () =>
               Effect.fail(
                 new ReplicaError.ReplicaError({
@@ -1385,7 +1390,7 @@ export const layer: Layer.Layer<
             readonly senderTenantId: string
           }>()
           for (const receipt of settledRelayReceipts) {
-            const key = JSON.stringify([
+            const key = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))([
               receipt.replica_incarnation,
               receipt.sender_tenant_id,
               receipt.sender_subject_id,
@@ -1412,11 +1417,11 @@ export const layer: Layer.Layer<
             if (updated.length !== 1) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({
-                  cause: new Error("Relay receipt usage is inconsistent")
+                  cause: NativeError.nativeError("Relay receipt usage is inconsistent")
                 })
               })
             }
-            if (updated[0]!.receipt_count === 0) {
+            if (updated[0].receipt_count === 0) {
               zeroUsage.push(entry)
             }
           }
@@ -1427,7 +1432,7 @@ export const layer: Layer.Layer<
             if (deleted.length !== 1) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({
-                  cause: new Error("Zero relay receipt usage disappeared")
+                  cause: NativeError.nativeError("Zero relay receipt usage disappeared")
                 })
               })
             }
@@ -1437,7 +1442,7 @@ export const layer: Layer.Layer<
             if (authorized.length !== 1) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({
-                  cause: new Error("Relay receipt deletion was not authorized")
+                  cause: NativeError.nativeError("Relay receipt deletion was not authorized")
                 })
               })
             }
@@ -1449,7 +1454,7 @@ export const layer: Layer.Layer<
             if (deleted.length !== 1) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({
-                  cause: new Error("Relay receipt disappeared during history rewrite")
+                  cause: NativeError.nativeError("Relay receipt disappeared during history rewrite")
                 })
               })
             }
@@ -1519,7 +1524,7 @@ export const layer: Layer.Layer<
           if (installed.length !== 1 || persisted === undefined) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new Error(`Rewritten document retained ${installed.length} verified checkpoints`)
+                cause: NativeError.nativeError(`Rewritten document retained ${installed.length} verified checkpoints`)
               })
             })
           }
@@ -1534,7 +1539,7 @@ export const layer: Layer.Layer<
           ) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new Error("Rewritten checkpoint does not match what was written")
+                cause: NativeError.nativeError("Rewritten checkpoint does not match what was written")
               })
             })
           }
@@ -1550,12 +1555,13 @@ export const layer: Layer.Layer<
               Effect.try({
                 try: () => {
                   if (!Equal.equals(Automerge.getHeads(automerge), persisted.heads)) {
-                    throw new TypeError("Rewritten checkpoint heads do not match its stored heads")
+                    return NativeError.throwTypeError("Rewritten checkpoint heads do not match its stored heads")
                   }
                   WriterProvenance.validateExact(
                     WriterProvenance.changeHashes(automerge),
                     persisted.writer_provenance
                   )
+                  return undefined
                 },
                 catch: (cause) =>
                   new ReplicaError.ReplicaError({
@@ -1575,13 +1581,16 @@ export const layer: Layer.Layer<
           if (confirmed.length !== 1) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new Error("Rewritten checkpoint identity collision")
+                cause: NativeError.nativeError("Rewritten checkpoint identity collision")
               })
             })
           }
           yield* gate.validate(permit)
           yield* Effect.annotateCurrentSpan({
-            "rewrite.changes_removed": Option.match(priorChanges, { onNone: () => 0, onSome: (row) => row.count })
+            "rewrite.changes_removed": Option.match(priorChanges, {
+              onNone: () => 0,
+              onSome: (changeCountRow) => changeCountRow.count
+            })
           })
           return lineage
         }))

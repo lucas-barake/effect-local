@@ -9,6 +9,7 @@ import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
+import { literal } from "./internal/literal.js"
 
 export const Disconnected = Schema.TaggedStruct("Disconnected", {})
 export type Disconnected = typeof Disconnected.Type
@@ -68,7 +69,10 @@ const derive = (attempts: ReadonlyMap<number, AttemptState>): Status => {
   for (const state of attempts.values()) {
     if (state === "Connected") return connected
   }
-  return attempts.size > 0 ? connecting : disconnected
+  return (() => {
+    if (attempts.size > 0) return connecting
+    return disconnected
+  })()
 }
 
 const sameStatus = (left: Status, right: Status) => left._tag === right._tag
@@ -159,7 +163,7 @@ export const layer: Layer.Layer<PeerConnectionStatus | Reporter> = Layer.effectC
             } satisfies Attempt
           }
           const currentPeer = current.attempts.get(peerId) ?? new Map()
-          const nextPeer = new Map(currentPeer).set(attemptId, "Connecting" as const)
+          const nextPeer = new Map(currentPeer).set(attemptId, literal("Connecting"))
           const nextAttempts = new Map(current.attempts).set(peerId, nextPeer)
           const nextStatuses = new Map(current.statuses)
           const previousStatus = current.statuses.get(peerId) ?? disconnected
@@ -178,7 +182,11 @@ export const layer: Layer.Layer<PeerConnectionStatus | Reporter> = Layer.effectC
             connected: updateAttempt(
               peerId,
               attemptId,
-              (value) => value === "Connecting" ? "Connected" : value
+              (value) =>
+                (() => {
+                  if (value === "Connecting") return ("Connected")
+                  return value
+                })()
             ),
             disconnected: updateAttempt(peerId, attemptId, () => undefined)
           } satisfies Attempt

@@ -30,6 +30,7 @@ import * as DurableRuntime from "./DurableRuntime.js"
 import * as EntityReplica from "./EntityReplica.js"
 import * as InternalAutomerge from "./internal/automerge.js"
 import * as InternalConflicts from "./internal/conflicts.js"
+import * as NativeError from "./internal/nativeError.js"
 import * as PeerConnectionStatus from "./PeerConnectionStatus.js"
 import type * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
 import type * as PeerSync from "./PeerSync.js"
@@ -250,15 +251,16 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
               Effect.sync(() => {
                 let produced = false
                 return Effect.suspend(() =>
-                  produced
-                    ? pull
-                    : Effect.scoped(scheduler.interactive.pipe(Effect.andThen(pull))).pipe(
+                  (() => {
+                    if (produced) return pull
+                    return (Effect.scoped(scheduler.interactive.pipe(Effect.andThen(pull))).pipe(
                       Effect.tap(() =>
                         Effect.sync(() => {
                           produced = true
                         })
                       )
-                    )
+                    ))
+                  })()
                 )
               })
           ),
@@ -300,7 +302,7 @@ export const layerFromServices = (definition: ReplicaDefinition.Any): Layer.Laye
             if (options.value.documentName !== document.name || options.value.schemaVersion !== document.version) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.BackupInvalid({
-                  cause: new Error("Portable document definition mismatch")
+                  cause: NativeError.nativeError("Portable document definition mismatch")
                 })
               })
             }
@@ -326,12 +328,13 @@ export const servicesLayer = <
     options.projections.length !== expected.size ||
     [...expected].some((projection) => !actual.has(projection))
   ) {
-    throw new TypeError("SqlReplica requires exactly one SQL binding for every projection")
+    return NativeError.throwTypeError("SqlReplica requires exactly one SQL binding for every projection")
   }
   const bootstrap = ReplicaBootstrap.layer(definition)
-  const checkpointAuthority = options.checkpointAuthority === undefined
-    ? CheckpointAuthority.layerRejectAll
-    : CheckpointAuthority.layer(options.checkpointAuthority)
+  const checkpointAuthority = (() => {
+    if (options.checkpointAuthority === undefined) return (CheckpointAuthority.layerRejectAll)
+    return (CheckpointAuthority.layer(options.checkpointAuthority))
+  })()
   const gate = ReplicaGate.layer.pipe(Layer.provideMerge(bootstrap))
   const scheduler = ReplicaOperationScheduler.layer
   const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))

@@ -7,6 +7,7 @@ import * as Projection from "@lucas-barake/effect-local/Projection"
 import * as Query from "@lucas-barake/effect-local/Query"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import type * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Clock from "effect/Clock"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Result from "effect/Result"
@@ -101,7 +102,12 @@ export const TaskListSql = SqlProjection.make(TaskList, {
     sql`INSERT INTO ${sql(table)} (
       source_document_id, title, completed, updated_at
     ) VALUES (
-      ${row.sourceDocumentId}, ${row.title}, ${row.completed ? 1 : 0}, ${row.updatedAt}
+      ${row.sourceDocumentId}, ${row.title}, ${
+      (() => {
+        if (row.completed) return (1)
+        return (0)
+      })()
+    }, ${row.updatedAt}
     )`.pipe(Effect.asVoid)
 })
 
@@ -127,12 +133,12 @@ export const DomainLive = Layer.mergeAll(
     const title = payload.title.trim()
     if (title.length === 0) return Result.fail(new TitleEmpty())
     draft.title = title
-    draft.updatedAt = Date.now()
+    draft.updatedAt = Effect.runSync(Clock.currentTimeMillis)
     return Result.void
   }),
   SetTaskCompleted.toLayer(({ draft, payload }) => {
     draft.completed = payload.completed
-    draft.updatedAt = Date.now()
+    draft.updatedAt = Effect.runSync(Clock.currentTimeMillis)
     return undefined
   }),
   ListTasks.toLayer((payload) =>

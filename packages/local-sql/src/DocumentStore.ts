@@ -17,6 +17,8 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as InternalAutomerge from "./internal/automerge.js"
 import * as HistoryCounters from "./internal/historyCounters.js"
+import { literal } from "./internal/literal.js"
+import * as NativeError from "./internal/nativeError.js"
 import * as Rows from "./internal/rows.js"
 import * as Recovery from "./Recovery.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -25,14 +27,15 @@ const Heads = Schema.fromJsonString(Schema.Array(Schema.String))
 const Versions = Schema.fromJsonString(Schema.Array(Schema.Int))
 
 const requireAutomergeValue = (documentId: Identity.DocumentId, encoded: unknown) =>
-  Document.isAutomergeValue(encoded)
-    ? Effect.void
-    : new ReplicaError.ReplicaError({
+  (() => {
+    if (Document.isAutomergeValue(encoded)) return (Effect.void)
+    return (new ReplicaError.ReplicaError({
       reason: new ReplicaError.DocumentDecodeError({
         documentId,
-        cause: new Error("Encoded value is not Automerge compatible")
+        cause: NativeError.nativeError("Encoded value is not Automerge compatible")
       })
-    })
+    }))
+  })()
 
 export interface Stored<D extends Document.Any,> {
   readonly automerge: Automerge.Doc<InternalAutomerge.Root<D["schema"]["Encoded"]>>
@@ -202,7 +205,7 @@ export const layer: Layer.Layer<
             projection_status, schema_version, tombstone
           FROM effect_local_documents WHERE document_id = ${documentId}`
     })
-    const loadConflictSource = (<D extends Document.Any,>(
+    const loadConflictSource = Schema.decodeUnknownSync(Schema.Any)(<D extends Document.Any,>(
       document: D,
       documentId: Identity.DocumentId,
       expectedHeads?: ReadonlyArray<string>
@@ -230,12 +233,12 @@ export const layer: Layer.Layer<
                 InternalAutomerge.free(stored.automerge)
                 acquired = undefined
                 return {
-                  _tag: "Stale" as const,
+                  _tag: literal("Stale"),
                   materializedHeads: stored.materializedHeads,
                   commitSequence: stored.commitSequence
                 }
               }
-              return { _tag: "Loaded" as const, stored }
+              return { _tag: literal("Loaded"), stored }
             }))
           ),
           Effect.catchTags({
@@ -252,7 +255,8 @@ export const layer: Layer.Layer<
             })
           )
         )
-      })) as LoadConflictSource
+      })
+    )
 
     /**
      * Re-reads what the current `persist` just wrote and checks it round tripped.
@@ -263,10 +267,10 @@ export const layer: Layer.Layer<
      * document row need re-reading, which keeps the check independent of history
      * length.
      */
-    const verifyPersisted = <D extends Document.Any,>(options: {
+    const verifyPersisted = (options: {
       readonly changes: ReadonlyArray<InternalAutomerge.Change>
       readonly definitionHash: string
-      readonly document: D
+      readonly document: Document.Any
       readonly documentId: Identity.DocumentId
       readonly heads: ReadonlyArray<string>
       readonly history: HistoryCounters.HistoryCounters
@@ -293,7 +297,7 @@ export const layer: Layer.Layer<
           try: () => {
             const expected = new Set(options.changes.map((change) => change.hash))
             if (stored.length !== expected.size) {
-              throw new TypeError(`Unexpected stored change count for ${options.documentId}`)
+              return NativeError.throwTypeError(`Unexpected stored change count for ${options.documentId}`)
             }
             for (const change of stored) {
               const decoded = InternalAutomerge.decode(change.bytes)
@@ -308,7 +312,7 @@ export const layer: Layer.Layer<
                 decoded.hash !== change.change_hash || decoded.actor !== change.actor ||
                 decoded.sequence !== change.sequence ||
                 Schema.encodeSync(Heads)(decoded.dependencies) !== change.dependencies
-              ) throw new TypeError(`Invalid stored change: ${change.change_hash}`)
+              ) return NativeError.throwTypeError(`Invalid stored change: ${change.change_hash}`)
             }
             if (
               row.document_type !== options.document.name ||
@@ -320,7 +324,7 @@ export const layer: Layer.Layer<
               row.history_bytes !== options.history.bytes ||
               row.history_changes !== options.history.changes ||
               row.history_operations !== options.history.operations
-            ) throw new TypeError(`Invalid stored document: ${options.documentId}`)
+            ) return NativeError.throwTypeError(`Invalid stored document: ${options.documentId}`)
             // Sourced from the row rather than carried over from `durable`: the
             // recovery this replaces reported the status the document had at
             // persist time, and another writer can block it in between.
@@ -389,7 +393,12 @@ export const layer: Layer.Layer<
             history_bytes = ${history.bytes},
             history_changes = ${history.changes},
             history_operations = ${history.operations}
-            , tombstone = ${tombstone ? 1 : 0}
+            , tombstone = ${
+            (() => {
+              if (tombstone) return (1)
+              return (0)
+            })()
+          }
             WHERE document_id = ${documentId}
               AND materialized_heads = ${Schema.encodeSync(Heads)(durable.materializedHeads)}
               AND history_bytes = ${durable.historyBytes}

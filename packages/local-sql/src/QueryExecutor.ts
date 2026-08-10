@@ -10,6 +10,7 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as NativeError from "./internal/nativeError.js"
 
 export class QueryExecutor extends Context.Service<QueryExecutor, {
   readonly execute: <Q extends Query.Any,>(
@@ -79,7 +80,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.ProjectionBlocked({
                   projection: projection.name,
-                  cause: new Error("Projection is not ready")
+                  cause: NativeError.nativeError("Projection is not ready")
                 })
               })
             }
@@ -93,11 +94,16 @@ export const layer = <D extends ReplicaDefinition.Any,>(
                 })
               )
             )
-            if ((blockedDocuments._tag === "Some" ? blockedDocuments.value.count : 0) > 0) {
+            if (
+              ((() => {
+                if (blockedDocuments._tag === "Some") return (blockedDocuments.value.count)
+                return (0)
+              })()) > 0
+            ) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.ProjectionBlocked({
                   projection: projection.name,
-                  cause: new Error("A source document projection is not ready")
+                  cause: NativeError.nativeError("A source document projection is not ready")
                 })
               })
             }
@@ -111,11 +117,16 @@ export const layer = <D extends ReplicaDefinition.Any,>(
                 })
               )
             )
-            if ((blocked._tag === "Some" ? blocked.value.count : 0) > 0) {
+            if (
+              ((() => {
+                if (blocked._tag === "Some") return (blocked.value.count)
+                return (0)
+              })()) > 0
+            ) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.ProjectionBlocked({
                   projection: projection.name,
-                  cause: new Error("A document projection is not ready")
+                  cause: NativeError.nativeError("A document projection is not ready")
                 })
               })
             }
@@ -139,7 +150,9 @@ export const layer = <D extends ReplicaDefinition.Any,>(
             )
           )
           const handler = handlers.get(query.name)
-          if (handler === undefined) return yield* Effect.die(new Error(`Missing query handler: ${query.name}`))
+          if (handler === undefined) {
+            return yield* Effect.die(NativeError.nativeError(`Missing query handler: ${query.name}`))
+          }
           const result = yield* handler(decoded)
           return yield* Schema.decodeUnknownEffect(Schema.toType(query.successSchema))(result).pipe(
             Effect.mapError((cause) =>
@@ -159,7 +172,7 @@ export const layer = <D extends ReplicaDefinition.Any,>(
                 })
               })
             ))
-        ) as Effect.Effect<Q["successSchema"]["Type"], Q["errorSchema"]["Type"] | ReplicaError.ReplicaError>
+        )
       const reactivityKeys = (
         query: Query.Any
       ) => [...new Set(query.dependsOn.flatMap((projection) => [projection.name, projection.document.name]))]

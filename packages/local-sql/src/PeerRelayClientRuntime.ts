@@ -17,6 +17,8 @@ import * as Ref from "effect/Ref"
 import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
+import { literal } from "./internal/literal.js"
+import * as NativeError from "./internal/nativeError.js"
 import * as OutboxMaintenance from "./internal/peerRelayOutboxMaintenance.js"
 import * as ReceiptMaintenance from "./internal/peerRelayReceiptMaintenance.js"
 import * as PeerRelayOutbox from "./PeerRelayOutbox.js"
@@ -74,9 +76,10 @@ const unexpectedExit = (
   name: string,
   exit: Exit.Exit<never, ReplicaError.ReplicaError>
 ): Cause.Cause<ReplicaError.ReplicaError> =>
-  Exit.isFailure(exit)
-    ? exit.cause
-    : Cause.die(new Error(`${name} stopped unexpectedly`))
+  (() => {
+    if (Exit.isFailure(exit)) return (exit.cause)
+    return (Cause.die(NativeError.nativeError(`${name} stopped unexpectedly`)))
+  })()
 
 export const makeScoped = Effect.gen(function*() {
   const outbox = yield* PeerRelayOutbox.PeerRelayOutbox
@@ -127,6 +130,7 @@ export const makeScoped = Effect.gen(function*() {
         case "Closing":
           return Effect.interrupt
       }
+      return Effect.void
     })
   )
 
@@ -159,9 +163,10 @@ export const makeScoped = Effect.gen(function*() {
     Effect.gen(function*() {
       const cause = unexpectedExit(name, exit)
       const first = yield* Ref.modify(state, (current) =>
-        current._tag === "Running"
-          ? [true, { _tag: "Failed", cause } as const]
-          : [false, current])
+        (() => {
+          if (current._tag === "Running") return [true, literal({ _tag: "Failed", cause })]
+          return [false, current]
+        })())
       if (!first) return
       yield* Deferred.succeed(fatal, cause)
       yield* Fiber.interrupt(sibling)
@@ -177,10 +182,14 @@ export const makeScoped = Effect.gen(function*() {
   ).pipe(Effect.forkScoped({ startImmediately: true }))
 
   yield* Effect.addFinalizer(() =>
-    Ref.update(state, (current) => current._tag === "Running" ? { _tag: "Closing" } as const : current).pipe(
-      Effect.andThen(Deferred.interrupt(fatal)),
-      Effect.asVoid
-    )
+    Ref.update(state, (current) =>
+      (() => {
+        if (current._tag === "Running") return (literal({ _tag: "Closing" }))
+        return current
+      })()).pipe(
+        Effect.andThen(Deferred.interrupt(fatal)),
+        Effect.asVoid
+      )
   )
 
   const validateConnectionConfiguration = (input: ConnectionConfiguration) =>
@@ -225,6 +234,7 @@ export const makeScoped = Effect.gen(function*() {
           })
         )
       }
+      return undefined
     }))
 
   const unregister = (
@@ -263,10 +273,10 @@ export const makeScoped = Effect.gen(function*() {
       const registered = yield* Ref.modify(routes, (current) => {
         const peerRoutes = current.get(session.peerId) ?? new Map<Identity.DocumentId, Route>()
         const duplicate = documentIds.find((documentId) => peerRoutes.has(documentId))
-        if (duplicate !== undefined) return [duplicate, current] as const
+        if (duplicate !== undefined) return literal([duplicate, current])
         const nextPeerRoutes = new Map(peerRoutes)
         for (const documentId of documentIds) nextPeerRoutes.set(documentId, { token, session })
-        return [undefined, new Map(current).set(session.peerId, nextPeerRoutes)] as const
+        return literal([undefined, new Map(current).set(session.peerId, nextPeerRoutes)])
       })
       if (registered !== undefined) {
         return yield* new ReplicaError.ReplicaError({
@@ -299,15 +309,18 @@ export const makeScoped = Effect.gen(function*() {
       Ref.get(routes).pipe(
         Effect.flatMap((current) => {
           const route = current.get(peerId)?.get(documentId)
-          return route === undefined
-            ? Effect.fail(
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.StorageUnavailable({
-                  cause: new Error("Peer transient route is unavailable")
+          return (() => {
+            if (route === undefined) {
+              return (Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({
+                    cause: NativeError.nativeError("Peer transient route is unavailable")
+                  })
                 })
-              })
-            )
-            : route.session.transient(documentId, payload)
+              ))
+            }
+            return (route.session.transient(documentId, payload))
+          })()
         })
       )
     )

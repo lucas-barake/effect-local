@@ -7,6 +7,7 @@ import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as SchemaTransformation from "effect/SchemaTransformation"
+import { literal } from "../src/internal/literal.js"
 
 const ImmutableString = Schema.declare(Automerge.isImmutableString, {
   identifier: "Automerge.ImmutableString"
@@ -48,14 +49,14 @@ export const chooseMessageRevision = (
 
     const alternative = choose(bodyConflict.alternatives)
     const commandId = yield* Identity.makeCommandId
-    const resolution = {
+    const resolution = literal({
       heads: inspection.snapshot.heads,
       path: bodyConflict.path,
       choice: {
         _tag: "SelectAlternative",
         alternativeId: alternative.id
       }
-    } as const
+    })
 
     yield* replica.resolveConflict(EditedMessage, {
       commandId,

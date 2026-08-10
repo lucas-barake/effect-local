@@ -10,6 +10,7 @@ import * as Arr from "effect/Array"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
+import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Layer from "effect/Layer"
@@ -24,6 +25,8 @@ import * as CheckpointAuthority from "./CheckpointAuthority.js"
 import * as DocumentStore from "./DocumentStore.js"
 import * as InternalAutomerge from "./internal/automerge.js"
 import * as HistoryCounters from "./internal/historyCounters.js"
+import { literal } from "./internal/literal.js"
+import * as NativeError from "./internal/nativeError.js"
 import * as SyncChunks from "./internal/syncChunks.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as PeerRelayReceiptLimits from "./PeerRelayReceiptLimits.js"
@@ -279,20 +282,26 @@ const receivedFromReceipt = (
   receipt: typeof ReceiptRow.Type,
   rows: ReadonlyArray<typeof ReceiptReplyRow.Type>
 ): Received => ({
-  reply: rows[0] === undefined ? null : {
-    documentId,
-    message: rows[0].message,
-    messageHash: rows[0].message_hash,
-    heads: rows[0].heads,
-    ...(receipt.checkpoint_transfer === null ? {} : { checkpointTransfer: receipt.checkpoint_transfer }),
-    fragments: rows.map((row) => ({
-      receiptReplyId: row.row_id,
-      replyIndex: row.reply_index,
-      message: row.message,
-      messageHash: row.message_hash,
-      heads: row.heads
-    }))
-  },
+  reply: (() => {
+    if (rows[0] === undefined) return (null)
+    return ({
+      documentId,
+      message: rows[0].message,
+      messageHash: rows[0].message_hash,
+      heads: rows[0].heads,
+      ...((() => {
+        if (receipt.checkpoint_transfer === null) return ({})
+        return ({ checkpointTransfer: receipt.checkpoint_transfer })
+      })()),
+      fragments: rows.map((row) => ({
+        receiptReplyId: row.row_id,
+        replyIndex: row.reply_index,
+        message: row.message,
+        messageHash: row.message_hash,
+        heads: row.heads
+      }))
+    })
+  })(),
   heads: receipt.heads,
   acceptedHeads: receipt.accepted_heads,
   commitSequence: Identity.CommitSequence.make(receipt.commit_sequence),
@@ -325,14 +334,14 @@ export class PeerSync extends Context.Service<PeerSync, {
    * reply. The refusal on the receive side cannot cover that direction, because it is the peer, not
    * this replica, that would be doing the merging.
    */
-  readonly generate: <D extends Document.Any,>(
-    document: D,
+  readonly generate: (
+    document: Document.Any,
     documentId: Identity.DocumentId,
     session: Session,
     peer: { readonly lineageAware: boolean; readonly checkpointTransfer?: boolean }
   ) => Effect.Effect<Generated, ReplicaError.ReplicaError>
-  readonly receive: <D extends Document.Any,>(
-    document: D,
+  readonly receive: (
+    document: Document.Any,
     documentId: Identity.DocumentId,
     session: Session,
     input: {
@@ -418,8 +427,8 @@ const make = (
     })
     const quotaLock = yield* Semaphore.make(1)
     const startupMillis = yield* Clock.currentTimeMillis
-    const startupAt = new Date(startupMillis).toISOString()
-    const startupCutoff = new Date(startupMillis - limits.maxPendingAgeMillis).toISOString()
+    const startupAt = DateTime.formatIso(DateTime.makeUnsafe(startupMillis))
+    const startupCutoff = DateTime.formatIso(DateTime.makeUnsafe(startupMillis - limits.maxPendingAgeMillis))
     const findReceipts = SqlSchema.findAll({
       Request: Schema.Struct({
         replicaIncarnation: Identity.ReplicaIncarnation,
@@ -601,6 +610,7 @@ const make = (
             })
           })
         }
+        return undefined
       })
     const findExistingChanges = SqlSchema.findAll({
       Request: Schema.Struct({
@@ -1097,9 +1107,9 @@ const make = (
       replicaIncarnation: Identity.ReplicaIncarnation,
       expiresAt: string
     ) =>
-      relayReceiptLimits === null
-        ? Effect.succeed(0)
-        : Effect.gen(function*() {
+      (() => {
+        if (relayReceiptLimits === null) return (Effect.succeed(0))
+        return (Effect.gen(function*() {
           const rows = yield* findRelayReceiptsToPrune({
             expiresAt,
             limit: relayReceiptLimits.pruneBatchSize,
@@ -1113,7 +1123,11 @@ const make = (
             readonly senderTenantId: string
           }>()
           for (const row of rows) {
-            const key = JSON.stringify([row.sender_tenant_id, row.sender_subject_id, row.sender_peer_id])
+            const key = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))([
+              row.sender_tenant_id,
+              row.sender_subject_id,
+              row.sender_peer_id
+            ])
             const current = usage.get(key)
             usage.set(key, {
               encodedBytes: (current?.encodedBytes ?? 0) + row.encoded_size,
@@ -1131,7 +1145,7 @@ const make = (
             if (updated.length !== 1) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({
-                  cause: new Error("Relay receipt usage is inconsistent")
+                  cause: NativeError.nativeError("Relay receipt usage is inconsistent")
                 })
               })
             }
@@ -1143,7 +1157,7 @@ const make = (
             if (deleted.length !== 1) {
               return yield* new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageCorrupt({
-                  cause: new Error("Relay receipt disappeared during pruning")
+                  cause: NativeError.nativeError("Relay receipt disappeared during pruning")
                 })
               })
             }
@@ -1154,7 +1168,8 @@ const make = (
               AND receipt_count = 0
               AND encoded_bytes = 0`
           return rows.length
-        })
+        }))
+      })()
     yield* sql.withTransaction(Effect.gen(function*() {
       yield* sql`INSERT INTO effect_local_quarantine (document_id, peer_id, reason, bytes, created_at)
         SELECT document_id, peer_id, 'Expired pending sync change', bytes, ${startupAt}
@@ -1253,6 +1268,7 @@ const make = (
             })
           })
         }
+        return undefined
       })
 
     const withSessionGeneration = <A, E, R,>(
@@ -1275,14 +1291,17 @@ const make = (
     const validateSessionGeneration = (generation: Ref.Ref<number>, expected: number) =>
       Ref.get(generation).pipe(
         Effect.flatMap((current) =>
-          current === expected ? Effect.void : Effect.fail(
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.ProtocolMismatch({
-                expected: `session generation ${current}`,
-                observed: `session generation ${expected}`
+          (() => {
+            if (current === expected) return (Effect.void)
+            return (Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.ProtocolMismatch({
+                  expected: `session generation ${current}`,
+                  observed: `session generation ${expected}`
+                })
               })
-            })
-          )
+            ))
+          })()
         )
       )
 
@@ -1319,23 +1338,29 @@ const make = (
     // Dominated by `gate.validate` on every path that reaches them, so these are defensive: they keep
     // the one-condition-one-answer invariant if the statement order ever changes.
     const nextSequence = incrementCommitSequence(undefined).pipe(Effect.flatMap((rows) =>
-      rows[0] === undefined
-        ? Effect.fail(
-          new ReplicaError.ReplicaError({
-            reason: new ReplicaError.ReplicaMetadataMissing({ operation: "PeerSync.nextSequence" })
-          })
-        )
-        : Effect.succeed(Identity.CommitSequence.make(rows[0].commit_sequence))
+      (() => {
+        if (rows[0] === undefined) {
+          return (Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ReplicaMetadataMissing({ operation: "PeerSync.nextSequence" })
+            })
+          ))
+        }
+        return (Effect.succeed(Identity.CommitSequence.make(rows[0].commit_sequence)))
+      })()
     ))
 
     const currentSequence = findCommitSequence(undefined).pipe(Effect.flatMap((rows) =>
-      rows[0] === undefined
-        ? Effect.fail(
-          new ReplicaError.ReplicaError({
-            reason: new ReplicaError.ReplicaMetadataMissing({ operation: "PeerSync.currentSequence" })
-          })
-        )
-        : Effect.succeed(Identity.CommitSequence.make(rows[0].commit_sequence))
+      (() => {
+        if (rows[0] === undefined) {
+          return (Effect.fail(
+            new ReplicaError.ReplicaError({
+              reason: new ReplicaError.ReplicaMetadataMissing({ operation: "PeerSync.currentSequence" })
+            })
+          ))
+        }
+        return (Effect.succeed(Identity.CommitSequence.make(rows[0].commit_sequence)))
+      })()
     ))
 
     const decodeWriterProvenanceHashes = (message: Uint8Array) =>
@@ -1409,7 +1434,7 @@ const make = (
 
     const loadWriterProvenance = (documentId: Identity.DocumentId, message: Uint8Array) =>
       loadWriterProvenanceBatch(documentId, [message]).pipe(
-        Effect.map((provenance) => provenance[0]!)
+        Effect.map((provenance) => provenance[0])
       )
 
     const persistOutbound = (
@@ -1420,9 +1445,10 @@ const make = (
       checkpointTransfer?: Uint8Array
     ) =>
       Effect.gen(function*() {
-        const writerProvenance = checkpointTransfer === undefined
-          ? yield* loadWriterProvenance(documentId, message)
-          : []
+        const writerProvenance = yield* Effect.gen(function*() {
+          if (checkpointTransfer === undefined) return (yield* loadWriterProvenance(documentId, message))
+          return []
+        })
         // Read here and stored on the row, never re-read when the row is finally sent. This is the
         // generation time the message describes: a message queued before a rewrite must stay
         // labelled with the lineage it was generated from, or the peer would apply pre-rewrite
@@ -1459,7 +1485,7 @@ const make = (
         })
         const sendSequence = rows[0]?.sequence ?? 0
         const messageHash = yield* digest(message)
-        const createdAt = new Date(yield* Clock.currentTimeMillis).toISOString()
+        const createdAt = DateTime.formatIso(yield* DateTime.now)
         yield* sql`INSERT INTO effect_local_peer_outbox (
           replica_incarnation, peer_id, connection_epoch, document_id, send_sequence,
           message, message_hash, heads, status, created_at, writer_provenance, lineage, checkpoint_transfer
@@ -1477,7 +1503,10 @@ const make = (
           heads,
           lineage,
           writerProvenance,
-          ...(checkpointTransfer === undefined ? {} : { checkpointTransfer })
+          ...((() => {
+            if (checkpointTransfer === undefined) return ({})
+            return ({ checkpointTransfer })
+          })())
         } satisfies Outbound
       })
 
@@ -1524,10 +1553,14 @@ const make = (
                 heads: existing.heads,
                 lineage: existing.lineage,
                 writerProvenance: existing.writer_provenance,
-                ...(existing.checkpoint_transfer === null
-                  ? {}
-                  : { checkpointTransfer: existing.checkpoint_transfer }),
-                ...(existing.receipt_reply_id === null ? {} : { receiptReplyId: existing.receipt_reply_id })
+                ...((() => {
+                  if (existing.checkpoint_transfer === null) return ({})
+                  return ({ checkpointTransfer: existing.checkpoint_transfer })
+                })()),
+                ...((() => {
+                  if (existing.receipt_reply_id === null) return ({})
+                  return ({ receiptReplyId: existing.receipt_reply_id })
+                })())
               }
             }
             return yield* persistOutbound(
@@ -1542,23 +1575,23 @@ const make = (
           const fragments = [...reply.fragments].toSorted((left, right) => left.replyIndex - right.replyIndex)
           if (
             fragments.length === 0 ||
-            fragments[0]!.messageHash !== reply.messageHash ||
-            !Equal.equals(fragments[0]!.message, reply.message) ||
+            fragments[0].messageHash !== reply.messageHash ||
+            !Equal.equals(fragments[0].message, reply.message) ||
             fragments.some((fragment, index) => fragment.replyIndex !== index)
           ) {
             return yield* new ReplicaError.ReplicaError({
-              reason: new ReplicaError.StorageCorrupt({ cause: new Error("Invalid receipt reply batch") })
+              reason: new ReplicaError.StorageCorrupt({ cause: NativeError.nativeError("Invalid receipt reply batch") })
             })
           }
           const stored = yield* findReceiptRepliesById(fragments.map((fragment) => fragment.receiptReplyId))
           if (stored.length !== fragments.length) {
             return yield* new ReplicaError.ReplicaError({
-              reason: new ReplicaError.StorageCorrupt({ cause: new Error("Missing receipt reply") })
+              reason: new ReplicaError.StorageCorrupt({ cause: NativeError.nativeError("Missing receipt reply") })
             })
           }
           for (let index = 0; index < fragments.length; index++) {
-            const fragment = fragments[index]!
-            const row = stored[index]!
+            const fragment = fragments[index]
+            const row = stored[index]
             const observedHash = yield* digest(fragment.message)
             if (
               row.row_id !== fragment.receiptReplyId || row.reply_index !== fragment.replyIndex ||
@@ -1566,7 +1599,7 @@ const make = (
               !Equal.equals(row.message, fragment.message) || !Equal.equals(row.heads, fragment.heads)
             ) {
               return yield* new ReplicaError.ReplicaError({
-                reason: new ReplicaError.StorageCorrupt({ cause: new Error("Conflicting receipt reply") })
+                reason: new ReplicaError.StorageCorrupt({ cause: NativeError.nativeError("Conflicting receipt reply") })
               })
             }
           }
@@ -1580,23 +1613,27 @@ const make = (
           })
           if (existing.length !== 0 && existing.length !== pendingRows.length) {
             return yield* new ReplicaError.ReplicaError({
-              reason: new ReplicaError.StorageCorrupt({ cause: new Error("Partial receipt reply outbox batch") })
+              reason: new ReplicaError.StorageCorrupt({
+                cause: NativeError.nativeError("Partial receipt reply outbox batch")
+              })
             })
           }
           if (existing.length !== 0) {
             for (let index = 0; index < existing.length; index++) {
-              const row = existing[index]!
-              const expected = pendingRows[index]!
+              const row = existing[index]
+              const expected = pendingRows[index]
               if (
                 row.receipt_reply_id !== expected.row_id || row.message_hash !== expected.message_hash ||
                 !Equal.equals(row.message, expected.message)
               ) {
                 return yield* new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageCorrupt({ cause: new Error("Conflicting receipt reply outbox") })
+                  reason: new ReplicaError.StorageCorrupt({
+                    cause: NativeError.nativeError("Conflicting receipt reply outbox")
+                  })
                 })
               }
             }
-            const first = existing[0]!
+            const first = existing[0]
             return {
               sendSequence: first.send_sequence,
               documentId: reply.documentId,
@@ -1636,7 +1673,7 @@ const make = (
             connectionEpoch: session.connectionEpoch
           }))[0]?.sequence ?? 0
           const lineage = yield* documentLineage(reply.documentId)
-          const createdAt = new Date(yield* Clock.currentTimeMillis).toISOString()
+          const createdAt = DateTime.formatIso(yield* DateTime.now)
           const provenances = yield* loadWriterProvenanceBatch(
             reply.documentId,
             pendingRows.map((row) => row.message)
@@ -1648,7 +1685,7 @@ const make = (
             messageHash: row.message_hash,
             heads: row.heads,
             lineage,
-            writerProvenance: provenances[index]!,
+            writerProvenance: provenances[index],
             receiptReplyId: row.row_id
           } satisfies Outbound))
           const records = yield* Effect.forEach(outbounds, (outbound) =>
@@ -1662,7 +1699,7 @@ const make = (
                 message: outbound.message,
                 message_hash: outbound.messageHash,
                 heads: yield* Schema.encodeEffect(Heads)(outbound.heads),
-                status: "Pending" as const,
+                status: literal("Pending"),
                 created_at: createdAt,
                 writer_provenance: yield* Schema.encodeEffect(
                   WriterProvenance.StoredChangeProvenances
@@ -1691,8 +1728,8 @@ const make = (
         )
       }))
 
-    const generate = <D extends Document.Any,>(
-      document: D,
+    const generate = (
+      document: Document.Any,
       documentId: Identity.DocumentId,
       session: Session,
       peer: { readonly lineageAware: boolean; readonly checkpointTransfer?: boolean }
@@ -1794,10 +1831,14 @@ const make = (
                     if ((oversizedBytes || oversizedChanges) && !peer.checkpointTransfer) {
                       return yield* new ReplicaError.ReplicaError({
                         reason: new ReplicaError.QuotaExceeded({
-                          resource: oversizedBytes ? "sync message bytes" : "sync message writer provenance",
-                          limit: oversizedBytes
-                            ? limits.maxSyncMessageBytes
-                            : limits.maxSyncChangesPerMessage
+                          resource: (() => {
+                            if (oversizedBytes) return ("sync message bytes")
+                            return ("sync message writer provenance")
+                          })(),
+                          limit: (() => {
+                            if (oversizedBytes) return (limits.maxSyncMessageBytes)
+                            return (limits.maxSyncChangesPerMessage)
+                          })()
                         })
                       })
                     }
@@ -1808,7 +1849,7 @@ const make = (
                       if (Automerge.getMissingDeps(durable.automerge, []).length !== 0) {
                         return yield* new ReplicaError.ReplicaError({
                           reason: new ReplicaError.StorageCorrupt({
-                            cause: new Error("Cannot transfer an incomplete checkpoint snapshot")
+                            cause: NativeError.nativeError("Cannot transfer an incomplete checkpoint snapshot")
                           })
                         })
                       }
@@ -1850,9 +1891,10 @@ const make = (
                       }
                       const definitionHash = definition.definition_hash
                       const baseHeads = state.sharedHeads
-                      const base = baseHeads.length === 0
-                        ? { _tag: "Bootstrap" as const }
-                        : { _tag: "Heads" as const, baseHeads }
+                      const base = (() => {
+                        if (baseHeads.length === 0) return ({ _tag: literal("Bootstrap") })
+                        return ({ _tag: literal("Heads"), baseHeads })
+                      })()
                       const manifestClaims = CheckpointAuthority.ManifestClaims.make({
                         purpose: CheckpointAuthority.manifestPurpose,
                         documentId,
@@ -1868,10 +1910,14 @@ const make = (
                         if (oversizedBytes || oversizedChanges) {
                           return yield* new ReplicaError.ReplicaError({
                             reason: new ReplicaError.QuotaExceeded({
-                              resource: oversizedBytes ? "sync message bytes" : "sync message writer provenance",
-                              limit: oversizedBytes
-                                ? limits.maxSyncMessageBytes
-                                : limits.maxSyncChangesPerMessage
+                              resource: (() => {
+                                if (oversizedBytes) return ("sync message bytes")
+                                return ("sync message writer provenance")
+                              })(),
+                              limit: (() => {
+                                if (oversizedBytes) return (limits.maxSyncMessageBytes)
+                                return (limits.maxSyncChangesPerMessage)
+                              })()
                             })
                           })
                         }
@@ -1884,7 +1930,7 @@ const make = (
                           if (seen.has(cursor)) {
                             return yield* new ReplicaError.ReplicaError({
                               reason: new ReplicaError.StorageCorrupt({
-                                cause: new Error("Lineage transition chain contains a cycle")
+                                cause: NativeError.nativeError("Lineage transition chain contains a cycle")
                               })
                             })
                           }
@@ -1918,31 +1964,32 @@ const make = (
                     }
                     const outbound = yield* sql.withTransaction(quotaLock.withPermit(Effect.gen(function*() {
                       yield* validateSessionGeneration(generation, sessionGeneration)
-                      const existing = yield* findPendingOutboxCount({
+                      const pendingOutboxCountRows = yield* findPendingOutboxCount({
                         replicaIncarnation: session.replicaIncarnation,
                         peerId: session.peerId,
                         connectionEpoch: session.connectionEpoch,
                         documentId
                       })
-                      if ((existing[0]?.count ?? 0) > 0) return null
-                      const outbound = yield* persistOutbound(
+                      if ((pendingOutboxCountRows[0]?.count ?? 0) > 0) return null
+                      const pendingOutbound = yield* persistOutbound(
                         session,
                         documentId,
-                        outboundMessage!,
+                        outboundMessage,
                         durable.materializedHeads,
                         checkpointTransfer
                       )
                       yield* writeState(
                         session,
                         documentId,
-                        checkpointTransfer === undefined
-                          ? generated[0]
-                          : syncStateAtHeads(
+                        (() => {
+                          if (checkpointTransfer === undefined) return (generated[0])
+                          return (syncStateAtHeads(
                             durable.materializedHeads,
                             WriterProvenance.changeHashes(durable.automerge)
-                          )
+                          ))
+                        })()
                       )
-                      return outbound
+                      return pendingOutbound
                     }))).pipe(
                       Effect.catchTags({
                         SqlError: (cause) =>
@@ -1959,9 +2006,10 @@ const make = (
                           )
                       })
                     )
-                    return outbound === null
-                      ? { outbound: null, observedByPeer: false, dirty: true }
-                      : { outbound, observedByPeer, dirty: false }
+                    return (() => {
+                      if (outbound === null) return ({ outbound: null, observedByPeer: false, dirty: true })
+                      return ({ outbound, observedByPeer, dirty: false })
+                    })()
                   }),
                 (durable) => Effect.sync(() => InternalAutomerge.free(durable.automerge))
               )
@@ -1969,8 +2017,8 @@ const make = (
           )
         })))
 
-    const installCheckpoint = <D extends Document.Any,>(
-      document: D,
+    const installCheckpoint = (
+      document: Document.Any,
       documentId: Identity.DocumentId,
       session: Session,
       receiptSession: Session,
@@ -2079,7 +2127,7 @@ const make = (
             preceding = transition
           }
           const automerge = yield* Effect.try({
-            try: () => Automerge.load<InternalAutomerge.Root<D["schema"]["Encoded"]>>(transfer.snapshot),
+            try: () => Automerge.load<InternalAutomerge.Root<unknown>>(transfer.snapshot),
             catch: (cause) =>
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.CheckpointRejected({
@@ -2254,7 +2302,12 @@ const make = (
                 ) VALUES (
                   ${documentId}, ${document.name}, ${manifest.schemaVersion},
                   ${Schema.encodeSync(Versions)([manifest.schemaVersion])}, ${Schema.encodeSync(Heads)(heads)},
-                  ${Schema.encodeSync(Heads)(heads)}, ${InternalAutomerge.tombstone(automerge) ? 1 : 0},
+                  ${Schema.encodeSync(Heads)(heads)}, ${
+                  (() => {
+                    if (InternalAutomerge.tombstone(automerge)) return (1)
+                    return (0)
+                  })()
+                },
                   'Ready', ${manifest.checkpointHash}, ${history.changes}, ${history.operations},
                   ${history.bytes}, ${manifest.lineage}
                 )`
@@ -2264,7 +2317,12 @@ const make = (
                   observed_versions = ${Schema.encodeSync(Versions)([manifest.schemaVersion])},
                   materialized_heads = ${Schema.encodeSync(Heads)(heads)},
                   accepted_heads = ${Schema.encodeSync(Heads)(heads)},
-                  tombstone = ${InternalAutomerge.tombstone(automerge) ? 1 : 0},
+                  tombstone = ${
+                  (() => {
+                    if (InternalAutomerge.tombstone(automerge)) return (1)
+                    return (0)
+                  })()
+                },
                   projection_status = 'Ready', checkpoint_hash = ${manifest.checkpointHash},
                   history_changes = ${history.changes}, history_operations = ${history.operations},
                   history_bytes = ${history.bytes}, lineage = ${manifest.lineage}
@@ -2293,13 +2351,14 @@ const make = (
                 ${Schema.encodeSync(WriterProvenance.StoredCheckpointProvenance)(compactProvenance)},
                 ${manifest.lineage}
               )`
-              const storedTransitions = transfer.transitions.length === 0
-                ? []
-                : yield* findRelevantLineageTransitions({
+              const storedTransitions = yield* Effect.gen(function*() {
+                if (transfer.transitions.length === 0) return []
+                return (yield* findRelevantLineageTransitions({
                   documentId,
                   lineages: transfer.transitions.map((transition) => transition.resultingLineage),
                   priorLineages: transfer.transitions.map((transition) => transition.priorLineage)
-                })
+                }))
+              })
               for (const transition of transfer.transitions) {
                 const conflict = storedTransitions.find((stored) =>
                   stored.lineage === transition.resultingLineage ||
@@ -2359,10 +2418,11 @@ const make = (
               const encodedWriterProvenance = Schema.encodeSync(
                 WriterProvenance.StoredChangeProvenances
               )([])
-              const relayRetainedSize = relay === undefined
-                ? null
-                : relay.encodedSize + checkpointTransferBytes.byteLength +
-                  new TextEncoder().encode(encodedWriterProvenance).byteLength
+              const relayRetainedSize = (() => {
+                if (relay === undefined) return (null)
+                return (relay.encodedSize + checkpointTransferBytes.byteLength +
+                  new TextEncoder().encode(encodedWriterProvenance).byteLength)
+              })()
               yield* sql`INSERT INTO effect_local_peer_receipts (
                 replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id,
                 message_hash, reply, reply_hash, pending_message, heads, accepted_heads,
@@ -2443,8 +2503,8 @@ const make = (
         Effect.onError(() => removeDocumentState(documentId))
       )
 
-    const receive = <D extends Document.Any,>(
-      document: D,
+    const receive = (
+      document: Document.Any,
       documentId: Identity.DocumentId,
       session: Session,
       input: {
@@ -2566,7 +2626,7 @@ const make = (
                 const permit = yield* gate.current
                 yield* validateSession(permit, session)
                 const nowMillis = yield* Clock.currentTimeMillis
-                const acceptedAt = new Date(nowMillis).toISOString()
+                const acceptedAt = DateTime.formatIso(DateTime.makeUnsafe(nowMillis))
                 if (relay !== undefined) {
                   if (relay.senderPeerId !== session.peerId) {
                     return yield* new ReplicaError.ReplicaError({
@@ -2607,7 +2667,7 @@ const make = (
                     receiptSession,
                     documentId,
                     acceptedAt,
-                    new Date(nowMillis - limits.maxPendingAgeMillis).toISOString()
+                    DateTime.formatIso(DateTime.makeUnsafe(nowMillis - limits.maxPendingAgeMillis))
                   ).pipe(Effect.catchTag("SqlError", (cause) =>
                     Effect.fail(
                       new ReplicaError.ReplicaError({
@@ -2684,22 +2744,26 @@ const make = (
                         })
                       })
                     }
+                    return undefined
                   })
                 const loadReceipt = () =>
-                  relay === undefined
-                    ? findReceipts({
-                      replicaIncarnation: receiptSession.replicaIncarnation,
-                      peerId: receiptSession.peerId,
-                      connectionEpoch: receiptSession.connectionEpoch,
-                      receiveSequence
-                    })
-                    : findRelayReceipts({
+                  (() => {
+                    if (relay === undefined) {
+                      return (findReceipts({
+                        replicaIncarnation: receiptSession.replicaIncarnation,
+                        peerId: receiptSession.peerId,
+                        connectionEpoch: receiptSession.connectionEpoch,
+                        receiveSequence
+                      }))
+                    }
+                    return (findRelayReceipts({
                       relayMessageId: relay.relayMessageId,
                       replicaIncarnation: receiptSession.replicaIncarnation,
                       senderPeerId: relay.senderPeerId,
                       senderSubjectId: relay.senderSubjectId,
                       senderTenantId: relay.senderTenantId
-                    })
+                    }))
+                  })()
                 const validateStoredReceipt = (
                   receipt: typeof ReceiptRow.Type | typeof RelayReceiptRow.Type
                 ) =>
@@ -2719,6 +2783,7 @@ const make = (
                         })
                       })
                     }
+                    return undefined
                   })
                 const storedReceipt = yield* sql.withTransaction(Effect.gen(function*() {
                   const receipt = (yield* loadReceipt())[0]
@@ -2814,6 +2879,7 @@ const make = (
                       })
                     })
                   }
+                  return undefined
                 })
                 const decoded = yield* Effect.try({
                   try: () => Automerge.decodeSyncMessage(message),
@@ -2860,22 +2926,26 @@ const make = (
                   (durable) =>
                     Effect.gen(function*() {
                       const { changeBytes, changes, unresolvedBytes } = yield* Effect.try({
-                        try: () => {
-                          let current = Automerge.clone(durable.automerge)
-                          try {
-                            for (const chunk of decoded.changes) current = Automerge.loadIncremental(current, chunk)
-                            const changeBytes = Automerge.getChangesSince(current, [...durable.materializedHeads])
-                            return {
-                              changeBytes,
-                              changes: changeBytes.map((bytes) => Automerge.decodeChange(bytes)),
-                              unresolvedBytes: Automerge.hasHeads(current, decoded.heads)
-                                ? 0
-                                : decoded.changes.reduce((total, bytes) => total + bytes.byteLength, 0)
-                            }
-                          } finally {
-                            InternalAutomerge.free(current)
-                          }
-                        },
+                        try: () =>
+                          Effect.runSync(Effect.acquireUseRelease(
+                            Effect.sync(() => Automerge.clone(durable.automerge)),
+                            (current) =>
+                              Effect.sync(() => {
+                                for (const chunk of decoded.changes) current = Automerge.loadIncremental(current, chunk)
+                                const generatedChangeBytes = Automerge.getChangesSince(current, [
+                                  ...durable.materializedHeads
+                                ])
+                                return {
+                                  changeBytes: generatedChangeBytes,
+                                  changes: generatedChangeBytes.map((bytes) => Automerge.decodeChange(bytes)),
+                                  unresolvedBytes: (() => {
+                                    if (Automerge.hasHeads(current, decoded.heads)) return (0)
+                                    return (decoded.changes.reduce((total, bytes) => total + bytes.byteLength, 0))
+                                  })()
+                                }
+                              }),
+                            (current) => Effect.sync(() => InternalAutomerge.free(current))
+                          )),
                         catch: (cause) =>
                           new ReplicaError.ReplicaError({
                             reason: new ReplicaError.ProtocolMismatch({
@@ -2974,29 +3044,32 @@ const make = (
                           }
                           return hashes
                         })
-                      const existingChanges = validationChanges.length === 0 ? [] : yield* findExistingChanges({
-                        documentId,
-                        changes: validationChanges.map((change) => ({
-                          actor: change.actor,
-                          changeHash: change.hash,
-                          sequence: change.seq
-                        }))
-                      }).pipe(
-                        Effect.catchTags({
-                          SqlError: (cause) =>
-                            Effect.fail(
-                              new ReplicaError.ReplicaError({
-                                reason: new ReplicaError.StorageUnavailable({ cause })
-                              })
-                            ),
-                          SchemaError: (cause) =>
-                            Effect.fail(
-                              new ReplicaError.ReplicaError({
-                                reason: new ReplicaError.StorageCorrupt({ cause })
-                              })
-                            )
-                        })
-                      )
+                      const existingChanges = yield* Effect.gen(function*() {
+                        if (validationChanges.length === 0) return []
+                        return (yield* findExistingChanges({
+                          documentId,
+                          changes: validationChanges.map((change) => ({
+                            actor: change.actor,
+                            changeHash: change.hash,
+                            sequence: change.seq
+                          }))
+                        }).pipe(
+                          Effect.catchTags({
+                            SqlError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageUnavailable({ cause })
+                                })
+                              ),
+                            SchemaError: (cause) =>
+                              Effect.fail(
+                                new ReplicaError.ReplicaError({
+                                  reason: new ReplicaError.StorageCorrupt({ cause })
+                                })
+                              )
+                          })
+                        ))
+                      })
                       yield* validateExistingChanges(existingChanges)
                       const validatePendingQuota = Effect.gen(function*() {
                         const pendingTotals = yield* findDocumentPendingChangeTotals(documentId).pipe(
@@ -3199,6 +3272,7 @@ const make = (
                             })
                           })
                         }
+                        return undefined
                       })
                       const state = yield* readState(session, documentId)
                       const received = yield* Effect.try({
@@ -3299,7 +3373,7 @@ const make = (
                         ) {
                           return yield* new ReplicaError.ReplicaError({
                             reason: new ReplicaError.StorageCorrupt({
-                              cause: new Error(
+                              cause: NativeError.nativeError(
                                 `Conflicting checkpoint writer provenance for change ${entry.changeHash}`
                               )
                             })
@@ -3345,7 +3419,7 @@ const make = (
                         ) {
                           return yield* new ReplicaError.ReplicaError({
                             reason: new ReplicaError.StorageCorrupt({
-                              cause: new Error(
+                              cause: NativeError.nativeError(
                                 `Conflicting pending writer provenance for change ${entry.changeHash}`
                               )
                             })
@@ -3370,9 +3444,9 @@ const make = (
                           })
                         }
                       }
-                      const staged = pendingRows.length === 0
-                        ? received[0]
-                        : yield* Effect.try({
+                      const staged = yield* Effect.gen(function*() {
+                        if (pendingRows.length === 0) return (received[0])
+                        return (yield* Effect.try({
                           try: () => {
                             for (const row of pendingRows) {
                               const pending = InternalAutomerge.decode(row.bytes)
@@ -3381,7 +3455,7 @@ const make = (
                                 pending.sequence !== row.sequence ||
                                 Schema.encodeSync(Heads)(pending.dependencies) !== row.dependencies
                               ) {
-                                throw new TypeError(`Invalid stored change: ${row.change_hash}`)
+                                return NativeError.throwTypeError(`Invalid stored change: ${row.change_hash}`)
                               }
                             }
                             return InternalAutomerge.replay(received[0], pendingRows.map((row) => row.bytes))
@@ -3390,7 +3464,8 @@ const make = (
                             new ReplicaError.ReplicaError({
                               reason: new ReplicaError.StorageCorrupt({ cause })
                             })
-                        })
+                        }))
+                      })
                       const generated = yield* Effect.try({
                         try: () => Automerge.generateSyncMessage(staged, received[1]),
                         catch: (cause) =>
@@ -3401,9 +3476,9 @@ const make = (
                             })
                           })
                       })
-                      const replyMessages = generated[1] === null
-                        ? []
-                        : yield* Effect.try({
+                      const replyMessages = yield* Effect.gen(function*() {
+                        if (generated[1] === null) return []
+                        return (yield* Effect.try({
                           try: () =>
                             SyncChunks.batchSyncMessage(generated[1]!, {
                               maxChanges: Math.min(
@@ -3421,7 +3496,8 @@ const make = (
                                 observed: String(cause)
                               })
                             })
-                        })
+                        }))
+                      })
                       if (replyMessages === null) {
                         return yield* new ReplicaError.ReplicaError({
                           reason: new ReplicaError.QuotaExceeded({
@@ -3431,13 +3507,18 @@ const make = (
                         })
                       }
                       const materializedHeads = InternalAutomerge.heads(staged)
-                      const acceptedHeads = Automerge.hasHeads(staged, decoded.heads)
-                        ? materializedHeads
-                        : [...new Set([...durable.acceptedHeads, ...materializedHeads, ...decoded.heads])].toSorted()
+                      const acceptedHeads = (() => {
+                        if (Automerge.hasHeads(staged, decoded.heads)) return materializedHeads
+                        return ([...new Set([...durable.acceptedHeads, ...materializedHeads, ...decoded.heads])]
+                          .toSorted())
+                      })()
                       const transition = !sameHeads(materializedHeads, durable.materializedHeads)
-                      const value = transition
-                        ? yield* Document.decode(document, documentId, InternalAutomerge.value(staged))
-                        : durable.snapshot.value
+                      const value = yield* Effect.gen(function*() {
+                        if (transition) {
+                          return (yield* Document.decode(document, documentId, InternalAutomerge.value(staged)))
+                        }
+                        return (durable.snapshot.value)
+                      })
                       // A chunk whose dependencies are not satisfied yet stays queued inside the Automerge
                       // document instead of joining its history, so `getChangesSince` above never reports it
                       // and it never becomes an `effect_local_changes` row. The saved checkpoint is the only
@@ -3446,9 +3527,9 @@ const make = (
                       const unmaterialized = incomingChanges.some((change) =>
                         !Automerge.hasHeads(staged, [change.hash])
                       )
-                      const checkpoint = !transition && !unmaterialized
-                        ? null
-                        : yield* Effect.gen(function*() {
+                      const checkpoint = yield* Effect.gen(function*() {
+                        if (!transition && !unmaterialized) return (null)
+                        return (yield* Effect.gen(function*() {
                           const bytes = InternalAutomerge.save(staged)
                           const durableRows = yield* findDocumentChangeProvenance(documentId).pipe(
                             Effect.catchTags({
@@ -3492,9 +3573,10 @@ const make = (
                             checkpointHash: yield* digest({ documentId, bytes }),
                             writerProvenance: checkpointWriterProvenance
                           }
-                        })
+                        }))
+                      })
                       const result = yield* quotaLock.withPermit(Effect.gen(function*() {
-                        const result = yield* sql.withTransaction(Effect.gen(function*() {
+                        const transactionResult = yield* sql.withTransaction(Effect.gen(function*() {
                           yield* validateSessionGeneration(generation, sessionGeneration)
                           if (relayReceiptLimits !== null) {
                             yield* pruneRelayReceiptsInTransaction(permit.incarnation, acceptedAt)
@@ -3505,34 +3587,40 @@ const make = (
                             yield* validateStoredReceipt(receipt)
                             const replies = yield* findReceiptReplies(receipt.row_id)
                             return {
-                              _tag: "Duplicate" as const,
+                              _tag: literal("Duplicate"),
                               received: receivedFromReceipt(documentId, receipt, replies)
                             }
                           }
-                          const committedChanges = validationChanges.length === 0 ? [] : yield* findExistingChanges({
-                            documentId,
-                            changes: validationChanges.map((change) => ({
-                              actor: change.actor,
-                              changeHash: change.hash,
-                              sequence: change.seq
+                          const committedChanges = yield* Effect.gen(function*() {
+                            if (validationChanges.length === 0) return []
+                            return (yield* findExistingChanges({
+                              documentId,
+                              changes: validationChanges.map((change) => ({
+                                actor: change.actor,
+                                changeHash: change.hash,
+                                sequence: change.seq
+                              }))
                             }))
                           })
                           const committedChangeMap = yield* validateExistingChanges(committedChanges)
                           const newChanges = changes.flatMap((change, index) =>
-                            committedChangeMap.has(change.hash)
-                              ? []
-                              : [{
-                                bytes: changeBytes[index]!,
+                            (() => {
+                              if (committedChangeMap.has(change.hash)) return []
+                              return [{
+                                bytes: changeBytes[index],
                                 operations: change.ops.length
                               }]
+                            })()
                           )
-                          const history = newChanges.length === 0
-                            ? {
-                              bytes: durable.historyBytes,
-                              changes: durable.historyChanges,
-                              operations: durable.historyOperations
+                          const history = yield* Effect.gen(function*() {
+                            if (newChanges.length === 0) {
+                              return ({
+                                bytes: durable.historyBytes,
+                                changes: durable.historyChanges,
+                                operations: durable.historyOperations
+                              })
                             }
-                            : yield* HistoryCounters.add(
+                            return (yield* HistoryCounters.add(
                               {
                                 bytes: durable.historyBytes,
                                 changes: durable.historyChanges,
@@ -3540,14 +3628,21 @@ const make = (
                               },
                               HistoryCounters.measureDecoded(newChanges),
                               limits
-                            )
+                            ))
+                          })
                           yield* gate.validate(permit)
-                          const commitSequence = transition ? yield* nextSequence : yield* currentSequence
+                          const commitSequence = yield* Effect.gen(function*() {
+                            if (transition) return (yield* nextSequence)
+                            return (yield* currentSequence)
+                          })
                           for (let index = 0; index < changes.length; index++) {
-                            const change = changes[index]!
+                            const change = changes[index]
                             if (committedChangeMap.has(change.hash)) continue
-                            const bytes = changeBytes[index]!
-                            const applied = Automerge.hasHeads(staged, [change.hash]) ? 1 : 0
+                            const bytes = changeBytes[index]
+                            const applied = (() => {
+                              if (Automerge.hasHeads(staged, [change.hash])) return (1)
+                              return (0)
+                            })()
                             const provenance = provenanceByHash.get(change.hash) ??
                               pendingProvenanceByHash.get(change.hash)
                             if (provenance === undefined) {
@@ -3621,7 +3716,7 @@ const make = (
                             if (installed.length !== 1) {
                               return yield* new ReplicaError.ReplicaError({
                                 reason: new ReplicaError.StorageCorrupt({
-                                  cause: new Error("Checkpoint identity collision")
+                                  cause: NativeError.nativeError("Checkpoint identity collision")
                                 })
                               })
                             }
@@ -3648,8 +3743,14 @@ const make = (
                             historyChanges: history.changes,
                             historyOperations: history.operations,
                             materializedHeads: Schema.encodeSync(Heads)(materializedHeads),
-                            projectionStatus: transition ? "Blocked" : durable.snapshot.projection,
-                            tombstone: InternalAutomerge.tombstone(staged) ? 1 : 0
+                            projectionStatus: (() => {
+                              if (transition) return ("Blocked")
+                              return (durable.snapshot.projection)
+                            })(),
+                            tombstone: (() => {
+                              if (InternalAutomerge.tombstone(staged)) return (1)
+                              return (0)
+                            })()
                           })
                           if (updated.length === 0) return yield* new ConcurrentDocumentWrite()
                           if (transition) {
@@ -3704,15 +3805,19 @@ const make = (
                               })
                           )
                           const firstReply = replyParts[0]
-                          const pendingMessage = unresolvedBytes === 0 ? null : message
+                          const pendingMessage = (() => {
+                            if (unresolvedBytes === 0) return (null)
+                            return message
+                          })()
                           const encodedWriterProvenance = Schema.encodeSync(
                             WriterProvenance.StoredChangeProvenances
                           )(writerProvenance)
-                          const relayRetainedSize = relay === undefined
-                            ? null
-                            : relay.encodedSize + replyBytes +
+                          const relayRetainedSize = (() => {
+                            if (relay === undefined) return (null)
+                            return (relay.encodedSize + replyBytes +
                               (pendingMessage?.byteLength ?? 0) +
-                              new TextEncoder().encode(encodedWriterProvenance).byteLength
+                              new TextEncoder().encode(encodedWriterProvenance).byteLength)
+                          })()
                           yield* sql`INSERT INTO effect_local_peer_receipts (
             replica_incarnation, peer_id, connection_epoch, receive_sequence,
             document_id, message_hash, reply, reply_hash, pending_message,
@@ -3736,13 +3841,13 @@ const make = (
                           if (insertedReceipt === undefined) {
                             return yield* new ReplicaError.ReplicaError({
                               reason: new ReplicaError.StorageCorrupt({
-                                cause: new Error("Inserted sync receipt is missing")
+                                cause: NativeError.nativeError("Inserted sync receipt is missing")
                               })
                             })
                           }
-                          const insertedReplies = replyParts.length === 0
-                            ? []
-                            : yield* insertReceiptReplies(replyParts.map((part) => ({
+                          const insertedReplies = yield* Effect.gen(function*() {
+                            if (replyParts.length === 0) return []
+                            return (yield* insertReceiptReplies(replyParts.map((part) => ({
                               receipt_row_id: insertedReceipt.row_id,
                               reply_index: part.replyIndex,
                               document_id: documentId,
@@ -3750,11 +3855,12 @@ const make = (
                               message_hash: part.messageHash,
                               heads: Schema.encodeSync(Heads)(part.heads),
                               status: "Pending"
-                            })))
+                            }))))
+                          })
                           if (insertedReplies.length !== replyParts.length) {
                             return yield* new ReplicaError.ReplicaError({
                               reason: new ReplicaError.StorageCorrupt({
-                                cause: new Error("Inserted sync receipt replies are missing")
+                                cause: NativeError.nativeError("Inserted sync receipt replies are missing")
                               })
                             })
                           }
@@ -3768,15 +3874,16 @@ const make = (
                             messageHash: part.messageHash,
                             heads: part.heads
                           }))
-                          const reply: Reply | null = firstReply === undefined
-                            ? null
-                            : {
+                          const reply: Reply | null = (() => {
+                            if (firstReply === undefined) return (null)
+                            return ({
                               documentId,
                               message: firstReply.message,
                               messageHash: firstReply.messageHash,
                               heads: firstReply.heads,
                               fragments
-                            }
+                            })
+                          })()
                           if (relay !== undefined) {
                             yield* recordRelayReceiptUsage(
                               receiptSession.replicaIncarnation,
@@ -3788,7 +3895,7 @@ const make = (
                             yield* validateReceiptQuota
                             yield* validatePendingQuota
                           }
-                          return { _tag: "Committed" as const, commitSequence, reply }
+                          return { _tag: literal("Committed"), commitSequence, reply }
                         })).pipe(
                           Effect.catchTags({
                             SqlError: (cause) =>
@@ -3805,10 +3912,10 @@ const make = (
                               )
                           })
                         )
-                        if (result._tag === "Committed") {
+                        if (transactionResult._tag === "Committed") {
                           yield* writeState(session, documentId, generated[0])
                         }
-                        return result
+                        return transactionResult
                       }))
                       if (result._tag === "Duplicate") return result.received
                       return {
@@ -3831,7 +3938,7 @@ const make = (
                   Effect.fail(
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.StorageUnavailable({
-                        cause: new Error("Document remained busy while applying peer sync")
+                        cause: NativeError.nativeError("Document remained busy while applying peer sync")
                       })
                     })
                   ))
@@ -3840,12 +3947,12 @@ const make = (
           )
         ))
 
-    const pruneRelayReceipts = relayReceiptLimits === null
-      ? {}
-      : {
+    const pruneRelayReceipts = (() => {
+      if (relayReceiptLimits === null) return ({})
+      return ({
         pruneRelayReceipts: Effect.scoped(Effect.gen(function*() {
           const permit = yield* gate.shared
-          const expiresAt = new Date(yield* Clock.currentTimeMillis).toISOString()
+          const expiresAt = DateTime.formatIso(yield* DateTime.now)
           return yield* sql.withTransaction(
             quotaLock.withPermit(Effect.gen(function*() {
               const pruned = yield* pruneRelayReceiptsInTransaction(permit.incarnation, expiresAt)
@@ -3869,7 +3976,8 @@ const make = (
             })
           )
         }))
-      }
+      })
+    })()
     return PeerSync.of({
       open: (peerId) =>
         Effect.scoped(Effect.gen(function*() {
@@ -3942,10 +4050,14 @@ const make = (
                 heads: row.heads,
                 lineage: row.lineage,
                 writerProvenance: row.writer_provenance,
-                ...(row.checkpoint_transfer === null
-                  ? {}
-                  : { checkpointTransfer: row.checkpoint_transfer }),
-                ...(row.receipt_reply_id === null ? {} : { receiptReplyId: row.receipt_reply_id })
+                ...((() => {
+                  if (row.checkpoint_transfer === null) return ({})
+                  return ({ checkpointTransfer: row.checkpoint_transfer })
+                })()),
+                ...((() => {
+                  if (row.receipt_reply_id === null) return ({})
+                  return ({ receiptReplyId: row.receipt_reply_id })
+                })())
               }))
             ),
             Effect.catchTags({
@@ -3979,17 +4091,17 @@ const make = (
                 messageHash
               })
               if (rows.length === 0) return false
-              const receiptReplyId = rows[0]!.receipt_reply_id
+              const receiptReplyId = rows[0].receipt_reply_id
               if (receiptReplyId !== null) {
                 const marked = yield* markReceiptReplySent(receiptReplyId)
                 if (marked.length === 0) {
                   return yield* new ReplicaError.ReplicaError({
                     reason: new ReplicaError.StorageCorrupt({
-                      cause: new Error(`Missing pending receipt reply ${receiptReplyId}`)
+                      cause: NativeError.nativeError(`Missing pending receipt reply ${receiptReplyId}`)
                     })
                   })
                 }
-                if (marked[0]!.receipt_row_id === null) {
+                if (marked[0].receipt_row_id === null) {
                   yield* sql`DELETE FROM effect_local_peer_receipt_replies AS reply
                     WHERE row_id = ${receiptReplyId} AND receipt_row_id IS NULL
                       AND NOT EXISTS (

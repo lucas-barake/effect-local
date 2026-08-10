@@ -10,6 +10,8 @@ import type * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as CommandDeliveryStore from "./CommandDeliveryStore.js"
+import { literal } from "./internal/literal.js"
+import * as NativeError from "./internal/nativeError.js"
 import * as ReplicaOperationScheduler from "./ReplicaOperationScheduler.js"
 
 export interface Options {
@@ -63,11 +65,11 @@ export const layer = (options: Options): Layer.Layer<
   CommandDeliveryStore.CommandDeliveryStore | ReplicaOperationScheduler.ReplicaOperationScheduler
 > => {
   if (!Number.isSafeInteger(options.eventCapacity) || options.eventCapacity < 1) {
-    throw new TypeError("Command delivery event capacity must be a positive integer")
+    return NativeError.throwTypeError("Command delivery event capacity must be a positive integer")
   }
   const publishIntervalMillis = Duration.toMillis(Duration.fromInputUnsafe(options.publishInterval))
   if (!Number.isFinite(publishIntervalMillis) || publishIntervalMillis <= 0) {
-    throw new TypeError("Command delivery publish interval must be finite and positive")
+    return NativeError.throwTypeError("Command delivery publish interval must be finite and positive")
   }
 
   return Layer.effect(
@@ -137,14 +139,16 @@ export const layer = (options: Options): Layer.Layer<
                   sequence: Math.max(observed.sequence, event.sequence),
                   refreshEpoch: Math.max(observed.refreshEpoch, event.refreshEpoch)
                 }
-                return [
+                return literal([
                   next,
-                  event.sequence <= observed.sequence && !refreshChanged
-                    ? []
-                    : gap || refreshChanged || relevant
-                    ? [undefined]
-                    : []
-                ] as const
+                  (() => {
+                    if (event.sequence <= observed.sequence && !refreshChanged) return []
+                    return ((() => {
+                      if (gap || refreshChanged || relevant) return [undefined]
+                      return []
+                    })())
+                  })()
+                ])
               }
             ),
             Stream.mapEffect(() => scheduleRead(store.lookup(commandId)))

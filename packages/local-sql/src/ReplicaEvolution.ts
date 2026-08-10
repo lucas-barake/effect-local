@@ -109,13 +109,16 @@ export const make = (
           row.min_version !== document.version ||
           row.max_version !== document.version
       })
-      const rows = needsScan ? yield* findDocuments(undefined) : []
+      const rows = yield* Effect.gen(function*() {
+        if (needsScan) return (yield* findDocuments(undefined))
+        return []
+      })
       const migrated = new Map<string, number>()
       for (const row of rows) {
         const document = DocumentSet.get(definition.documents, row.document_type)
         if (document === undefined) {
           return yield* Effect.die(
-            new Error(`Stored document type is not part of the accepted definition: ${row.document_type}`)
+            NativeError.nativeError(`Stored document type is not part of the accepted definition: ${row.document_type}`)
           )
         }
         const stale = row.schema_version !== document.version
@@ -179,3 +182,4 @@ export const layer = (
   ReplicaError.ReplicaError,
   DocumentStore.DocumentStore | ProjectionStore.ProjectionStore | ReplicaGate.ReplicaGate | SqlClient.SqlClient
 > => Layer.effect(ReplicaEvolution, make(definition))
+import * as NativeError from "./internal/nativeError.js"

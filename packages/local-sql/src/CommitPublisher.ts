@@ -14,6 +14,7 @@ import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import { literal } from "./internal/literal.js"
 
 const OutboxRow = Schema.Struct({
   commit_sequence: Identity.CommitSequence,
@@ -77,8 +78,8 @@ export const layer: Layer.Layer<CommitPublisher, never, Reactivity.Reactivity | 
       lock.withPermit(
         reactivity.invalidate(keys).pipe(
           Effect.andThen(Ref.updateAndGet(refreshGeneration, (generation) => generation + 1)),
-          Effect.flatMap((refreshGeneration) =>
-            PubSub.publish(events, { _tag: "FullRefreshRequired", refreshGeneration })
+          Effect.flatMap((nextRefreshGeneration) =>
+            PubSub.publish(events, { _tag: "FullRefreshRequired", refreshGeneration: nextRefreshGeneration })
           ),
           Effect.asVoid,
           Effect.uninterruptible
@@ -179,16 +180,19 @@ export const layer: Layer.Layer<CommitPublisher, never, Reactivity.Reactivity | 
               }
               const refreshRequired = event.refreshGeneration > observedGeneration ||
                 event.commitSequence > observedSequence + 1
-              const state = [
+              const state = literal([
                 Math.max(observedGeneration, event.refreshGeneration),
                 Identity.CommitSequence.make(Math.max(observedSequence, event.commitSequence))
-              ] as const
-              return refreshRequired
-                ? [state, [{
-                  _tag: "FullRefreshRequired",
-                  refreshGeneration: event.refreshGeneration
-                }, event]]
-                : [state, [event]]
+              ])
+              return (() => {
+                if (refreshRequired) {
+                  return [state, [{
+                    _tag: "FullRefreshRequired",
+                    refreshGeneration: event.refreshGeneration
+                  }, event]]
+                }
+                return [state, [event]]
+              })()
             }
           )
         )

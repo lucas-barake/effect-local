@@ -189,7 +189,10 @@ export const layer = (definition: ReplicaDefinition.Any, options: Options): Laye
         Arr.findFirst(
           definition.projections,
           (projection: Projection.Any) =>
-            projection.document.name === documentType ? Option.some(projection.name) : Option.none()
+            (() => {
+              if (projection.document.name === documentType) return (Option.some(projection.name))
+              return (Option.none())
+            })()
         )
 
       // `ReplicaError.message` is only the reason tag, so the underlying driver or schema message is
@@ -207,9 +210,15 @@ export const layer = (definition: ReplicaDefinition.Any, options: Options): Laye
           ) {
             messages.push(current.message)
           }
-          current = Predicate.hasProperty(current, "cause") ? current.cause : undefined
+          current = (() => {
+            if (Predicate.hasProperty(current, "cause")) return (current.cause)
+            return undefined
+          })()
         }
-        return messages.length > 0 ? messages.join(": ") : String(cause)
+        return (() => {
+          if (messages.length > 0) return (messages.join(": "))
+          return (String(cause))
+        })()
       }
 
       const sample = samples.withPermit(
@@ -263,6 +272,7 @@ export const layer = (definition: ReplicaDefinition.Any, options: Options): Laye
             // over a local claim that committed and republished its permit after the generation was read.
             fenced: !claiming && generation.value.writer_generation > permit.writerGeneration
           }))
+          return undefined
         }).pipe(
           // `SqlError | SchemaError` is the entire failure channel of the reads above, so handling both
           // closes it and the status stream itself can never fail, which is what keeps subscribers from
@@ -276,16 +286,19 @@ export const layer = (definition: ReplicaDefinition.Any, options: Options): Laye
             // A busy or locked database is transient, so it degrades rather than failing, and the previously
             // sampled fields are deliberately left in place instead of being reset to a guess.
             SqlError: (cause) =>
-              cause.isRetryable
-                ? commit((current) => ({
-                  ...current,
-                  degraded: Option.some(`Replica storage is unavailable: ${detailOf(cause)}`)
-                }))
-                : commit((current) => ({
+              (() => {
+                if (cause.isRetryable) {
+                  return (commit((current) => ({
+                    ...current,
+                    degraded: Option.some(`Replica storage is unavailable: ${detailOf(cause)}`)
+                  })))
+                }
+                return (commit((current) => ({
                   ...current,
                   degraded: Option.none(),
                   failure: Option.some(`Replica storage failed: ${detailOf(cause)}`)
-                }))
+                })))
+              })()
           }),
           Effect.withSpan("ReplicaHealth.sample")
         )
@@ -331,9 +344,10 @@ export const layer = (definition: ReplicaDefinition.Any, options: Options): Laye
       yield* sample.pipe(
         Effect.repeat(Schedule.spaced(options.sampleInterval)),
         Effect.onExit((exit) =>
-          Exit.hasInterrupts(exit)
-            ? Effect.void
-            : commit((current) => ({ ...current, samplerStopped: true }))
+          (() => {
+            if (Exit.hasInterrupts(exit)) return (Effect.void)
+            return (commit((current) => ({ ...current, samplerStopped: true })))
+          })()
         ),
         Effect.forkScoped({ startImmediately: true })
       )

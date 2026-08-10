@@ -3,8 +3,10 @@ import type * as Projection from "@lucas-barake/effect-local/Projection"
 import * as Context from "effect/Context"
 import type * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Schema from "effect/Schema"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
+import * as NativeError from "./internal/nativeError.js"
 
 export interface Migration {
   readonly id: number
@@ -43,21 +45,27 @@ export const make = <P extends Projection.Any,>(
     readonly insert: SqlProjection<P>["insert"]
   }
 ): SqlProjection<P> => {
-  if (options.table.length === 0) throw new TypeError("Projection table must be nonempty")
-  if (options.migrations.length === 0) throw new TypeError("Projection requires at least one migration")
+  if (options.table.length === 0) return NativeError.throwTypeError("Projection table must be nonempty")
+  if (options.migrations.length === 0) {
+    return NativeError.throwTypeError("Projection requires at least one migration")
+  }
   const ids = new Set<number>()
   for (const migration of options.migrations) {
     if (!Number.isSafeInteger(migration.id) || migration.id < 1) {
-      throw new TypeError("Projection migration ID must be a positive integer")
+      return NativeError.throwTypeError("Projection migration ID must be a positive integer")
     }
-    if (migration.name.length === 0) throw new TypeError("Projection migration name must be nonempty")
-    if (ids.has(migration.id)) throw new TypeError(`Duplicate projection migration: ${migration.id}`)
+    if (migration.name.length === 0) {
+      return NativeError.throwTypeError("Projection migration name must be nonempty")
+    }
+    if (ids.has(migration.id)) {
+      return NativeError.throwTypeError(`Duplicate projection migration: ${migration.id}`)
+    }
     ids.add(migration.id)
   }
   const service = Context.Service<BindingService<P>, SqlProjection<P>>(
     `@lucas-barake/effect-local-sql/SqlProjection/${projection.name}`
   )
-  const binding = { projection, service, ...options } as SqlProjection<P>
+  const binding = Schema.decodeUnknownSync(Schema.Any)({ projection, service, ...options })
   return Object.assign(binding, { layer: Layer.succeed(service, binding) })
 }
 

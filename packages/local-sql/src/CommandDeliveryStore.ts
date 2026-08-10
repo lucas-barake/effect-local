@@ -8,6 +8,7 @@ import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import { literal } from "./internal/literal.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
 import * as PeerSyncEnvelope from "./PeerSyncEnvelope.js"
 import * as ReplicaGate from "./ReplicaGate.js"
@@ -55,9 +56,10 @@ const destinationState = (
       _tag: "RelayCustodyAccepted",
       acceptedChangeCount: row.accepted_change_count,
       acceptedAt: row.accepted_at,
-      ...(row.any_unconfirmed_at === null
-        ? {}
-        : { senderCustodyUnconfirmedAt: row.any_unconfirmed_at })
+      ...((() => {
+        if (row.any_unconfirmed_at === null) return ({})
+        return ({ senderCustodyUnconfirmedAt: row.any_unconfirmed_at })
+      })())
     }
   }
   if (
@@ -382,11 +384,11 @@ export const layer: Layer.Layer<
         if (receiptRows.length !== 1) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new Error("Duplicate command receipt")
+              cause: NativeError.nativeError("Duplicate command receipt")
             })
           })
         }
-        const receipt = receiptRows[0]!
+        const receipt = receiptRows[0]
         if (receipt.tracked !== 1) {
           return CommandDelivery.UntrackedCommand.make({ commandId, documentId: receipt.document_id })
         }
@@ -397,11 +399,11 @@ export const layer: Layer.Layer<
         if (sourceRows.length !== 1) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new Error("Command delivery change count is missing")
+              cause: NativeError.nativeError("Command delivery change count is missing")
             })
           })
         }
-        const source = sourceRows[0]!
+        const source = sourceRows[0]
         if (source.change_count === 0) {
           return CommandDelivery.NoChangesToDeliver.make({ commandId, documentId: receipt.document_id })
         }
@@ -449,7 +451,7 @@ export const layer: Layer.Layer<
           const snapshot = yield* lookupWithPermit(commandId, permit)
           const cursor = yield* currentCursor
           yield* gate.validate(permit)
-          return [snapshot, cursor] as const
+          return literal([snapshot, cursor])
         }))
       })).pipe(
         Effect.catchTags({
@@ -469,9 +471,9 @@ export const layer: Layer.Layer<
       documentId: Identity.DocumentId,
       changeHashes: ReadonlyArray<string>
     ) =>
-      changeHashes.length === 0
-        ? Effect.void
-        : sql`INSERT INTO effect_local_command_delivery_events (
+      (() => {
+        if (changeHashes.length === 0) return (Effect.void)
+        return (sql`INSERT INTO effect_local_command_delivery_events (
             replica_incarnation, command_id, document_id, published
           )
           SELECT DISTINCT
@@ -485,7 +487,8 @@ export const layer: Layer.Layer<
             AND changes.command_id = sources.command_id
           WHERE sources.replica_incarnation = ${replicaIncarnation}
             AND sources.document_id = ${documentId}
-            AND ${sql.in("changes.change_hash", changeHashes)}`
+            AND ${sql.in("changes.change_hash", changeHashes)}`)
+      })()
 
     const findStoredMessage = SqlSchema.findAll({
       Request: Schema.Struct({
@@ -564,7 +567,7 @@ export const layer: Layer.Layer<
         if (uniqueChangeHashes.length !== input.changeHashes.length) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new Error("Relay delivery message contains duplicate change hashes")
+              cause: NativeError.nativeError("Relay delivery message contains duplicate change hashes")
             })
           })
         }
@@ -601,16 +604,16 @@ export const layer: Layer.Layer<
           ) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new Error("Relay delivery message identity is conflicting")
+                cause: NativeError.nativeError("Relay delivery message identity is conflicting")
               })
             })
           }
-          return
+          return undefined
         }
         if (insertedMessages.length !== 1) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new Error("Duplicate relay delivery message identity")
+              cause: NativeError.nativeError("Duplicate relay delivery message identity")
             })
           })
         }
@@ -626,11 +629,12 @@ export const layer: Layer.Layer<
         if (insertedChangeCount !== uniqueChangeHashes.length) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new Error("Duplicate relay delivery change identity")
+              cause: NativeError.nativeError("Duplicate relay delivery change identity")
             })
           })
         }
         yield* insertEvents(input.replicaIncarnation, input.documentId, uniqueChangeHashes)
+        return undefined
       })).pipe(
         Effect.catchTags({
           SqlError: (cause) =>
@@ -708,25 +712,26 @@ export const layer: Layer.Layer<
           const existing = yield* findAcceptance({ replicaIncarnation, relayMessageId })
           if (
             existing.length !== 1 ||
-            existing[0]!.outer_envelope_digest !== outerEnvelopeDigest ||
-            existing[0]!.accepted === null
+            existing[0].outer_envelope_digest !== outerEnvelopeDigest ||
+            existing[0].accepted === null
           ) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({
-                cause: new Error("Relay custody identity is missing or conflicting")
+                cause: NativeError.nativeError("Relay custody identity is missing or conflicting")
               })
             })
           }
-          return
+          return undefined
         }
         if (rows.length !== 1) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new Error("Duplicate relay custody identity")
+              cause: NativeError.nativeError("Duplicate relay custody identity")
             })
           })
         }
         yield* matchingCommands(replicaIncarnation, relayMessageId)
+        return undefined
       })).pipe(
         Effect.catchTags({
           SqlError: (cause) =>
@@ -767,13 +772,14 @@ export const layer: Layer.Layer<
         if (rows.length > 1) {
           return yield* new ReplicaError.ReplicaError({
             reason: new ReplicaError.StorageCorrupt({
-              cause: new Error("Duplicate relay deadline identity")
+              cause: NativeError.nativeError("Duplicate relay deadline identity")
             })
           })
         }
         if (rows.length === 1) {
           yield* matchingCommands(replicaIncarnation, relayMessageId)
         }
+        return undefined
       })).pipe(
         Effect.catchTags({
           SqlError: (cause) =>
@@ -791,9 +797,9 @@ export const layer: Layer.Layer<
       documentId: Identity.DocumentId,
       endpoint: PeerTransport.RelayEndpoint | undefined
     ) =>
-      endpoint === undefined
-        ? Effect.succeed(false)
-        : Effect.scoped(Effect.gen(function*() {
+      (() => {
+        if (endpoint === undefined) return (Effect.succeed(false))
+        return (Effect.scoped(Effect.gen(function*() {
           const permit = yield* gate.shared
           const rows = yield* SqlSchema.findOne({
             Request: Schema.Void,
@@ -843,7 +849,8 @@ export const layer: Layer.Layer<
                 reason: new ReplicaError.StorageCorrupt({ cause })
               })
           })
-        )
+        ))
+      })()
 
     const pendingEvents = SqlSchema.findAll({
       Request: Schema.Void,
@@ -876,9 +883,9 @@ export const layer: Layer.Layer<
     )
 
     const markEventsPublished = (sequences: ReadonlyArray<number>) =>
-      sequences.length === 0
-        ? Effect.void
-        : sql.withTransaction(Effect.gen(function*() {
+      (() => {
+        if (sequences.length === 0) return (Effect.void)
+        return (sql.withTransaction(Effect.gen(function*() {
           yield* sql`UPDATE effect_local_command_delivery_events
             SET published = 1
             WHERE ${sql.in("event_sequence", sequences)}`
@@ -894,7 +901,8 @@ export const layer: Layer.Layer<
               reason: new ReplicaError.StorageUnavailable({ cause })
             })),
           Effect.asVoid
-        )
+        ))
+      })()
 
     const cursor = currentCursor.pipe(
       Effect.catchTags({
@@ -922,3 +930,4 @@ export const layer: Layer.Layer<
     })
   })
 )
+import * as NativeError from "./internal/nativeError.js"

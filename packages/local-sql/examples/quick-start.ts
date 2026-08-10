@@ -1,6 +1,7 @@
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as Clock from "effect/Clock"
 import * as Effect from "effect/Effect"
 import { ListTasks, RenameTask, SetTaskCompleted, TaskDocument } from "./domain.js"
 import { EngineLive } from "./node.js"
@@ -8,7 +9,7 @@ import { EngineLive } from "./node.js"
 const program = Effect.gen(function*() {
   const replica = yield* Replica.Replica
 
-  const now = Date.now()
+  const now = yield* Clock.currentTimeMillis
   const documentId = yield* replica.create(TaskDocument, {
     commandId: yield* Identity.makeCommandId,
     value: { title: "Write the README", completed: false, createdAt: now, updatedAt: now }
