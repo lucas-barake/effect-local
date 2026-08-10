@@ -138,32 +138,23 @@ describe("PeerSync", () => {
   const StrictServices = Layer.mergeAll(StrictInfrastructure, StrictStoreService, Projections)
   const StrictSyncService = PeerSync.layer.pipe(Layer.provide(StrictServices))
   const StrictLayer = Layer.merge(StrictServices, StrictSyncService)
-  const BatchLimits = ReplicaLimits.layer({ ...limits, maxSyncChangesPerMessage: 2 })
-  const BatchInfrastructure = Layer.mergeAll(Base, Gate, BatchLimits)
-  const BatchStoreService = DocumentStore.layer.pipe(Layer.provide(BatchInfrastructure))
-  const BatchServices = Layer.mergeAll(BatchInfrastructure, BatchStoreService, Projections)
-  const BatchSyncService = PeerSync.layer.pipe(Layer.provide(BatchServices))
-  const BatchLayer = Layer.merge(BatchServices, BatchSyncService)
-  const ByteBatchLimits = ReplicaLimits.layer({ ...limits, maxSyncMessageBytes: 1_800 })
-  const ByteBatchInfrastructure = Layer.mergeAll(Base, Gate, ByteBatchLimits)
-  const ByteBatchStoreService = DocumentStore.layer.pipe(Layer.provide(ByteBatchInfrastructure))
-  const ByteBatchServices = Layer.mergeAll(ByteBatchInfrastructure, ByteBatchStoreService, Projections)
-  const ByteBatchSyncService = PeerSync.layer.pipe(Layer.provide(ByteBatchServices))
-  const ByteBatchLayer = Layer.merge(ByteBatchServices, ByteBatchSyncService)
-  const AtomicBatchLimits = ReplicaLimits.layer({
-    ...limits,
-    maxSyncChangesPerMessage: 2,
-    maxPendingChangesPerPeer: 2
+  const syncLayerWith = (overrides: Partial<ReplicaLimits.Values>) => {
+    const infrastructure = Layer.mergeAll(Base, Gate, ReplicaLimits.layer({ ...limits, ...overrides }))
+    const services = Layer.mergeAll(
+      infrastructure,
+      DocumentStore.layer.pipe(Layer.provide(infrastructure)),
+      Projections
+    )
+    return Layer.merge(services, PeerSync.layer.pipe(Layer.provide(services)))
+  }
+  const batchChangeBudget = 2
+  const batchByteBudget = 1_800
+  const BatchLayer = syncLayerWith({ maxSyncChangesPerMessage: batchChangeBudget })
+  const ByteBatchLayer = syncLayerWith({ maxSyncMessageBytes: batchByteBudget })
+  const AtomicBatchLayer = syncLayerWith({
+    maxSyncChangesPerMessage: batchChangeBudget,
+    maxPendingChangesPerPeer: batchChangeBudget
   })
-  const AtomicBatchInfrastructure = Layer.mergeAll(Base, Gate, AtomicBatchLimits)
-  const AtomicBatchStoreService = DocumentStore.layer.pipe(Layer.provide(AtomicBatchInfrastructure))
-  const AtomicBatchServices = Layer.mergeAll(
-    AtomicBatchInfrastructure,
-    AtomicBatchStoreService,
-    Projections
-  )
-  const AtomicBatchSyncService = PeerSync.layer.pipe(Layer.provide(AtomicBatchServices))
-  const AtomicBatchLayer = Layer.merge(AtomicBatchServices, AtomicBatchSyncService)
   const sourceLayer = (
     sourceLimits: ReplicaLimits.Values,
     filename = ":memory:"
@@ -928,7 +919,7 @@ describe("PeerSync", () => {
         pending.map((item) => item.sendSequence),
         Array.from({ length: fragmentCount }, (_, index) => index)
       )
-      assert.isTrue(pending.every((item) => item.writerProvenance.length <= 2))
+      assert.isTrue(pending.every((item) => item.writerProvenance.length <= batchChangeBudget))
       yield* sync.markSent(staleSession, pending[0]!.sendSequence, pending[0]!.messageHash)
       yield* sync.markSent(staleSession, pending[1]!.sendSequence, pending[1]!.messageHash)
       const duplicate = yield* sync.receive(Task, documentId, staleSession, {
@@ -1082,7 +1073,7 @@ describe("PeerSync", () => {
       yield* sync.enqueue(staleSession, received.reply)
       const pending = yield* sync.pending(staleSession)
       assert.isAbove(pending.length, 1)
-      assert.isTrue(pending.every((outbound) => outbound.message.byteLength <= 1_800))
+      assert.isTrue(pending.every((outbound) => outbound.message.byteLength <= batchByteBudget))
       for (const outbound of pending) {
         const advanced = Automerge.receiveSyncMessage(stale, staleState, outbound.message)
         stale = advanced[0]
