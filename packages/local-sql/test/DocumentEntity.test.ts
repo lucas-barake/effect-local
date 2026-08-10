@@ -130,6 +130,10 @@ describe("DocumentEntity", () => {
       markSent: () => Effect.succeed(false),
       pruneRelayReceipts: Effect.succeed(0)
     })
+  const keyOf = (payload: unknown) => {
+    if (!PrimaryKey.isPrimaryKey(payload)) throw new TypeError("Expected a primary key payload")
+    return PrimaryKey.value(payload)
+  }
   const replicaGate = (permit: ReplicaGate.Permit) =>
     ReplicaGate.ReplicaGate.of({
       current: Effect.succeed(permit),
@@ -150,10 +154,6 @@ describe("DocumentEntity", () => {
       documentType: "Task",
       payload: new Uint8Array([1]),
       requestHash: "hash-a"
-    }
-    const keyOf = (payload: unknown) => {
-      if (!PrimaryKey.isPrimaryKey(payload)) throw new TypeError("Expected a primary key payload")
-      return PrimaryKey.value(payload)
     }
     const key = keyOf(DocumentEntity.Create.payloadSchema.make(base))
     assert.strictEqual(key, `1:${commandId}:hash-a`)
@@ -200,10 +200,6 @@ describe("DocumentEntity", () => {
         writerSchemaVersion: Task.version,
         writerDefinitionHash: definition.hash
       }]
-    }
-    const keyOf = (payload: unknown) => {
-      if (!PrimaryKey.isPrimaryKey(payload)) throw new TypeError("Expected a primary key payload")
-      return PrimaryKey.value(payload)
     }
     const key = keyOf(DocumentEntity.ApplySync.payloadSchema.make(base))
     assert.strictEqual(
@@ -268,10 +264,6 @@ describe("DocumentEntity", () => {
         writerSchemaVersion: Task.version,
         writerDefinitionHash: definition.hash
       }]
-    }
-    const keyOf = (payload: unknown) => {
-      if (!PrimaryKey.isPrimaryKey(payload)) throw new TypeError("Expected a primary key payload")
-      return PrimaryKey.value(payload)
     }
     const first = keyOf(DocumentEntity.ApplySync.payloadSchema.make({
       ...base,
@@ -357,10 +349,6 @@ describe("DocumentEntity", () => {
         receiptExpiresAt: "2026-08-02T00:00:00.000Z",
         encodedSize: 10
       }
-    }
-    const keyOf = (payload: unknown) => {
-      if (!PrimaryKey.isPrimaryKey(payload)) throw new TypeError("Expected a primary key payload")
-      return PrimaryKey.value(payload)
     }
     const key = keyOf(DocumentEntity.ApplySync.payloadSchema.make(base))
     assert.strictEqual(

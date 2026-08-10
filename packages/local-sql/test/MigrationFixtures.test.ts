@@ -11,65 +11,41 @@ import * as Migrations from "../src/Migrations.js"
 import type { FixtureSpec, HistoricalVersion } from "./fixtures/versions.js"
 import { fixturePath, fixtures } from "./fixtures/versions.js"
 
-const expectations = {
-  1: {
-    applied: [
-      [2, "peer_sync"],
-      [3, "durability_indexes"],
-      [4, "projection_readiness"],
-      [5, "pending_receipt_indexes"],
-      [6, "peer_writer_provenance"],
-      [7, "replica_health_indexes"],
-      [8, "document_lineage"],
-      [9, "history_rewrite_markers"],
-      [10, "peer_relay_state"],
-      [11, "command_delivery"],
-      [12, "document_history_counters"],
-      [13, "backup_document_installations"],
-      [14, "checkpoint_shipping"]
-    ],
-    outbox: "none"
-  },
-  2: {
-    applied: [
-      [3, "durability_indexes"],
-      [4, "projection_readiness"],
-      [5, "pending_receipt_indexes"],
-      [6, "peer_writer_provenance"],
-      [7, "replica_health_indexes"],
-      [8, "document_lineage"],
-      [9, "history_rewrite_markers"],
-      [10, "peer_relay_state"],
-      [11, "command_delivery"],
-      [12, "document_history_counters"],
-      [13, "backup_document_installations"],
-      [14, "checkpoint_shipping"]
-    ],
-    outbox: "backfilled"
-  },
-  3: {
-    applied: [
-      [4, "projection_readiness"],
-      [5, "pending_receipt_indexes"],
-      [6, "peer_writer_provenance"],
-      [7, "replica_health_indexes"],
-      [8, "document_lineage"],
-      [9, "history_rewrite_markers"],
-      [10, "peer_relay_state"],
-      [11, "command_delivery"],
-      [12, "document_history_counters"],
-      [13, "backup_document_installations"],
-      [14, "checkpoint_shipping"]
-    ],
-    outbox: { frozen: "2020-01-01T00:00:00.000Z" }
-  }
-} as const satisfies Record<
-  HistoricalVersion,
+/**
+ * Every migration in order, with the checksum each one is expected to record. One list keeps the
+ * upgrade history, the catalog, and each fixture's pending set from drifting apart.
+ */
+const migrationCatalog = [
+  { migration_id: 1, name: "canonical_store", checksum: Migrations.canonicalStoreChecksum },
+  { migration_id: 2, name: "peer_sync", checksum: Migrations.peerSyncChecksum },
+  { migration_id: 3, name: "durability_indexes", checksum: Migrations.durabilityIndexesChecksum },
+  { migration_id: 4, name: "projection_readiness", checksum: Migrations.projectionReadinessChecksum },
+  { migration_id: 5, name: "pending_receipt_indexes", checksum: Migrations.pendingReceiptIndexesChecksum },
+  { migration_id: 6, name: "peer_writer_provenance", checksum: Migrations.peerWriterProvenanceChecksum },
+  { migration_id: 7, name: "replica_health_indexes", checksum: Migrations.replicaHealthIndexesChecksum },
+  { migration_id: 8, name: "document_lineage", checksum: Migrations.documentLineageChecksum },
+  { migration_id: 9, name: "history_rewrite_markers", checksum: Migrations.historyRewriteMarkersChecksum },
+  { migration_id: 10, name: "peer_relay_state", checksum: Migrations.peerRelayStateChecksum },
+  { migration_id: 11, name: "command_delivery", checksum: Migrations.commandDeliveryChecksum },
+  { migration_id: 12, name: "document_history_counters", checksum: Migrations.documentHistoryCountersChecksum },
   {
-    readonly applied: ReadonlyArray<readonly [number, string]>
-    readonly outbox: "none" | "backfilled" | { readonly frozen: string }
-  }
->
+    migration_id: 13,
+    name: "backup_document_installations",
+    checksum: Migrations.backupDocumentInstallationsChecksum
+  },
+  { migration_id: 14, name: "checkpoint_shipping", checksum: Migrations.checkpointShippingChecksum }
+]
+
+const migrationsAfter = (appliedThroughId: number) =>
+  migrationCatalog
+    .filter((migration) => migration.migration_id > appliedThroughId)
+    .map((migration) => [migration.migration_id, migration.name] as const)
+
+const outboxExpectations = {
+  1: "none",
+  2: "backfilled",
+  3: { frozen: "2020-01-01T00:00:00.000Z" }
+} as const satisfies Record<HistoricalVersion, "none" | "backfilled" | { readonly frozen: string }>
 
 const SchemaObject = Schema.Struct({
   type: Schema.String,
@@ -137,60 +113,14 @@ const assertMigrationHistory = Effect.gen(function*() {
     Result: Schema.Struct({ migration_id: Schema.Int, name: Schema.String }),
     execute: () => sql`SELECT migration_id, name FROM effect_local_migrations ORDER BY migration_id`
   })(undefined)
-  assert.deepStrictEqual(history, [
-    { migration_id: 1, name: "canonical_store" },
-    { migration_id: 2, name: "peer_sync" },
-    { migration_id: 3, name: "durability_indexes" },
-    { migration_id: 4, name: "projection_readiness" },
-    { migration_id: 5, name: "pending_receipt_indexes" },
-    { migration_id: 6, name: "peer_writer_provenance" },
-    { migration_id: 7, name: "replica_health_indexes" },
-    { migration_id: 8, name: "document_lineage" },
-    { migration_id: 9, name: "history_rewrite_markers" },
-    { migration_id: 10, name: "peer_relay_state" },
-    { migration_id: 11, name: "command_delivery" },
-    { migration_id: 12, name: "document_history_counters" },
-    { migration_id: 13, name: "backup_document_installations" },
-    { migration_id: 14, name: "checkpoint_shipping" }
-  ])
+  assert.deepStrictEqual(history, migrationCatalog.map(({ checksum: _, ...row }) => row))
 
   const catalog = yield* SqlSchema.findAll({
     Request: Schema.Void,
     Result: Schema.Struct({ migration_id: Schema.Int, name: Schema.String, checksum: Schema.String }),
     execute: () => sql`SELECT migration_id, name, checksum FROM effect_local_migration_catalog ORDER BY migration_id`
   })(undefined)
-  assert.deepStrictEqual(catalog, [
-    { migration_id: 1, name: "canonical_store", checksum: Migrations.canonicalStoreChecksum },
-    { migration_id: 2, name: "peer_sync", checksum: Migrations.peerSyncChecksum },
-    { migration_id: 3, name: "durability_indexes", checksum: Migrations.durabilityIndexesChecksum },
-    { migration_id: 4, name: "projection_readiness", checksum: Migrations.projectionReadinessChecksum },
-    { migration_id: 5, name: "pending_receipt_indexes", checksum: Migrations.pendingReceiptIndexesChecksum },
-    { migration_id: 6, name: "peer_writer_provenance", checksum: Migrations.peerWriterProvenanceChecksum },
-    { migration_id: 7, name: "replica_health_indexes", checksum: Migrations.replicaHealthIndexesChecksum },
-    { migration_id: 8, name: "document_lineage", checksum: Migrations.documentLineageChecksum },
-    {
-      migration_id: 9,
-      name: "history_rewrite_markers",
-      checksum: Migrations.historyRewriteMarkersChecksum
-    },
-    { migration_id: 10, name: "peer_relay_state", checksum: Migrations.peerRelayStateChecksum },
-    { migration_id: 11, name: "command_delivery", checksum: Migrations.commandDeliveryChecksum },
-    {
-      migration_id: 12,
-      name: "document_history_counters",
-      checksum: Migrations.documentHistoryCountersChecksum
-    },
-    {
-      migration_id: 13,
-      name: "backup_document_installations",
-      checksum: Migrations.backupDocumentInstallationsChecksum
-    },
-    {
-      migration_id: 14,
-      name: "checkpoint_shipping",
-      checksum: Migrations.checkpointShippingChecksum
-    }
-  ])
+  assert.deepStrictEqual(catalog, migrationCatalog)
 })
 
 const assertSeededDurabilityState = (version: HistoricalVersion) =>
@@ -289,7 +219,7 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
       }),
       execute: () => sql`SELECT * FROM effect_local_peer_outbox ORDER BY send_sequence`
     })(undefined)
-    if (expectations[version].outbox === "none") {
+    if (outboxExpectations[version] === "none") {
       assert.deepStrictEqual(outbox, [])
       return
     }
@@ -310,7 +240,7 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
       }]
     )
     const createdAt = outbox[0]?.created_at ?? ""
-    const expectedOutbox = expectations[version].outbox
+    const expectedOutbox = outboxExpectations[version]
     if (expectedOutbox === "backfilled") {
       const timestamp = Date.parse(createdAt)
       assert.isFalse(Number.isNaN(timestamp), `invalid backfilled timestamp ${createdAt}`)
@@ -323,7 +253,7 @@ const assertSeededDurabilityState = (version: HistoricalVersion) =>
 const assertUpgradesToCurrentSchema = (spec: FixtureSpec) =>
   Effect.gen(function*() {
     const applied = yield* Migrations.run
-    assert.deepStrictEqual(applied, expectations[spec.version].applied)
+    assert.deepStrictEqual(applied, migrationsAfter(spec.appliedThroughId))
 
     yield* assertDatabaseIntegrity
     yield* assertMigrationHistory
