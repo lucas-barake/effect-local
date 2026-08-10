@@ -1514,22 +1514,7 @@ const make = (
               connectionEpoch: session.connectionEpoch,
               documentId: reply.documentId,
               messageHash: reply.messageHash
-            }).pipe(
-              Effect.catchTags({
-                SqlError: (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageUnavailable({ cause })
-                    })
-                  ),
-                SchemaError: (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageCorrupt({ cause })
-                    })
-                  )
-              })
-            )
+            })
             const existing = rows[0]
             if (existing !== undefined) {
               if (!Equal.equals(existing.checkpoint_transfer, reply.checkpointTransfer ?? null)) {
@@ -1560,21 +1545,6 @@ const make = (
               reply.message,
               reply.heads,
               reply.checkpointTransfer
-            ).pipe(
-              Effect.catchTags({
-                SqlError: (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageUnavailable({ cause })
-                    })
-                  ),
-                SchemaError: (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageCorrupt({ cause })
-                    })
-                  )
-              })
             )
           }
 
@@ -1589,22 +1559,7 @@ const make = (
               reason: new ReplicaError.StorageCorrupt({ cause: new Error("Invalid receipt reply batch") })
             })
           }
-          const stored = yield* findReceiptRepliesById(fragments.map((fragment) => fragment.receiptReplyId)).pipe(
-            Effect.catchTags({
-              SqlError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageUnavailable({ cause })
-                  })
-                ),
-              SchemaError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageCorrupt({ cause })
-                  })
-                )
-            })
-          )
+          const stored = yield* findReceiptRepliesById(fragments.map((fragment) => fragment.receiptReplyId))
           if (stored.length !== fragments.length) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({ cause: new Error("Missing receipt reply") })
@@ -1631,22 +1586,7 @@ const make = (
             peerId: session.peerId,
             connectionEpoch: session.connectionEpoch,
             receiptReplyIds: pendingRows.map((row) => row.row_id)
-          }).pipe(
-            Effect.catchTags({
-              SqlError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageUnavailable({ cause })
-                  })
-                ),
-              SchemaError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageCorrupt({ cause })
-                  })
-                )
-            })
-          )
+          })
           if (existing.length !== 0 && existing.length !== pendingRows.length) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({ cause: new Error("Partial receipt reply outbox batch") })
