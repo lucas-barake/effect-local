@@ -12,7 +12,7 @@ import { TestClock } from "effect/testing"
 import * as TestReplica from "../src/TestReplica.js"
 import { definition, Rename, Task } from "./fixtures.js"
 
-it.layer(NodeCrypto.layer)("TestReplica", (it) => {
+it.layer(NodeCrypto.layer)("TestReplica", (test) => {
   const Handler = Rename.toLayer(({ draft, payload }) => {
     draft.title = payload
     return undefined
@@ -55,7 +55,7 @@ it.layer(NodeCrypto.layer)("TestReplica", (it) => {
     Layer.provide(Handler)
   )
 
-  it.effect("runs the production SQL replica over an in-memory database", () =>
+  test.effect("runs the production SQL replica over an in-memory database", () =>
     Effect.gen(function*() {
       const replica = yield* Replica.Replica
       const created = yield* replica.create(Task, {
@@ -70,7 +70,7 @@ it.layer(NodeCrypto.layer)("TestReplica", (it) => {
       assert.strictEqual((yield* replica.get(Task, created)).value.title, "two")
     }).pipe(Effect.provide(Live), TestClock.withLive))
 
-  it.effect("installs projection bindings for every test layer variant", () => {
+  test.effect("installs projection bindings for every test layer variant", () => {
     const create = Effect.gen(function*() {
       const replica = yield* Replica.Replica
       return yield* replica.create(Task, {

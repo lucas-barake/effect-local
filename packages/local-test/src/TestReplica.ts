@@ -127,10 +127,12 @@ export const layerWithSync = <
     readonly health?: ReplicaHealth.Options
     readonly projections: Bindings
   }
-) =>
-  layerWithSyncAndLimits(definition, {
-    ...(options.database === undefined ? {} : { database: options.database }),
+) => {
+  const common = {
     health: options.health ?? ReplicaHealth.defaultOptions,
     projections: options.projections,
     limits: defaultLimits
-  })
+  }
+  if (options.database === undefined) return layerWithSyncAndLimits(definition, common)
+  return layerWithSyncAndLimits(definition, { ...common, database: options.database })
+}

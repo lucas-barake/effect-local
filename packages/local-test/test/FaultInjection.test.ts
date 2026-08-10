@@ -4,8 +4,8 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Effect from "effect/Effect"
 import * as FaultInjection from "../src/FaultInjection.js"
 
-it.layer(NodeCrypto.layer)("FaultInjection", (it) => {
-  it.effect("replays the final decision after a deterministic sequence", () =>
+it.layer(NodeCrypto.layer)("FaultInjection", (test) => {
+  test.effect("replays the final decision after a deterministic sequence", () =>
     Effect.gen(function*() {
       const faults = yield* FaultInjection.FaultInjection
       const packet = {
@@ -22,7 +22,7 @@ it.layer(NodeCrypto.layer)("FaultInjection", (it) => {
       { drop: false, copies: 1, delay: 0, reorder: false }
     ]))))
 
-  it.effect("returns its only decision for a NaN sequence", () => {
+  test.effect("returns its only decision for a NaN sequence", () => {
     const decision = { drop: false, copies: 1, delay: 0, reorder: false }
     return Effect.gen(function*() {
       const faults = yield* FaultInjection.FaultInjection

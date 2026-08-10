@@ -1,4 +1,4 @@
-import { NodeCrypto } from "@effect/platform-node"
+import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
 import { assert, it } from "@effect/vitest"
 import * as PeerSync from "@lucas-barake/effect-local-sql/PeerSync"
 import type * as Conflict from "@lucas-barake/effect-local/Conflict"
@@ -10,12 +10,10 @@ import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
+import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
-import { rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import * as TestReplica from "../src/TestReplica.js"
 
 const Message = Document.make("ConvergenceMessage", {
@@ -52,11 +50,12 @@ const Handlers = Layer.mergeAll(
   })
 )
 
-const makeLive = (database?: Parameters<typeof TestReplica.layerWithSync>[1]["database"]) =>
-  TestReplica.layerWithSync(definition, {
-    ...(database === undefined ? {} : { database }),
-    projections: []
-  }).pipe(Layer.provide(Handlers))
+const makeLive = (database?: Parameters<typeof TestReplica.layerWithSync>[1]["database"]) => {
+  if (database === undefined) {
+    return TestReplica.layerWithSync(definition, { projections: [] }).pipe(Layer.provide(Handlers))
+  }
+  return TestReplica.layerWithSync(definition, { database, projections: [] }).pipe(Layer.provide(Handlers))
+}
 
 const Live = makeLive()
 
@@ -182,7 +181,7 @@ const drain = (documentId: Identity.DocumentId, left: Side, right: Side, reverse
         !fromRight.dirty
       ) return
     }
-    return yield* Effect.die("peer sync did not reach quiescence within 32 rounds")
+    yield* Effect.die("peer sync did not reach quiescence within 32 rounds")
   })
 
 const mutate = (
@@ -207,26 +206,29 @@ const inspectMessageConflict = (
       path.target._tag === "Key" &&
       path.target.key === "message"
   )
-  if (record === undefined) throw new Error("expected a message conflict")
-  return record
+  if (record === undefined) return Effect.die("expected a message conflict")
+  return Effect.succeed(record)
 }
 
 const selectMessage = (
   inspection: Conflict.Inspection<{ readonly message: string; readonly labels: ReadonlyArray<string> }>,
   value: string
-): Conflict.Resolution => {
-  const record = inspectMessageConflict(inspection)
-  const matching = record.alternatives.filter((alternative) => alternative.value === value)
-  if (matching.length !== 1) throw new Error(`expected exactly one message alternative for ${value}`)
-  return {
-    heads: [...inspection.snapshot.heads],
-    path: record.path,
-    choice: {
-      _tag: "SelectAlternative",
-      alternativeId: matching[0]!.id
+): Effect.Effect<Conflict.Resolution> =>
+  Effect.gen(function*() {
+    const record = yield* inspectMessageConflict(inspection)
+    const matching = record.alternatives.filter((alternative) => alternative.value === value)
+    if (matching.length !== 1) yield* Effect.die(`expected exactly one message alternative for ${value}`)
+    const alternative = matching[0]
+    if (alternative === undefined) yield* Effect.die(`expected exactly one message alternative for ${value}`)
+    return {
+      heads: [...inspection.snapshot.heads],
+      path: record.path,
+      choice: {
+        _tag: "SelectAlternative",
+        alternativeId: alternative.id
+      }
     }
-  }
-}
+  })
 
 const createMessageConflict = (
   documentId: Identity.DocumentId,
@@ -245,8 +247,8 @@ const createMessageConflict = (
     Effect.andThen(drain(documentId, left, right, options.reverse))
   )
 
-it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
-  it.effect("converges a tombstone with a concurrent list edit after reordered duplicate delivery", () =>
+it.layer(Layer.mergeAll(NodeCrypto.layer, NodeFileSystem.layer))("two replica convergence", (test) => {
+  test.effect("converges a tombstone with a concurrent list edit after reordered duplicate delivery", () =>
     Effect.scoped(Effect.gen(function*() {
       const { documentId, left, right } = yield* seedPair()
       yield* Effect.all([
@@ -263,7 +265,7 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
       assert.deepStrictEqual(leftSnapshot.value, rightSnapshot.value)
     })))
 
-  it.effect("inspects identical alternatives on converged replicas", () =>
+  test.effect("inspects identical alternatives on converged replicas", () =>
     Effect.scoped(Effect.gen(function*() {
       const { documentId, left, right } = yield* seedPair()
       yield* createMessageConflict(documentId, left, right, {
@@ -275,7 +277,7 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
       const rightInspection = yield* right.replica.inspectConflicts(Message, documentId)
       assert.deepStrictEqual(leftInspection.snapshot.heads, rightInspection.snapshot.heads)
       assert.deepStrictEqual(leftInspection.conflicts, rightInspection.conflicts)
-      const record = inspectMessageConflict(leftInspection)
+      const record = yield* inspectMessageConflict(leftInspection)
       assert.lengthOf(record.alternatives, 2)
       assert.deepStrictEqual(record.alternatives.map(({ value }) => value), ["same", "same"])
       assert.strictEqual(
@@ -284,7 +286,7 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
       )
     })))
 
-  it.effect("inspects the same conflict after reordered duplicate delivery", () =>
+  test.effect("inspects the same conflict after reordered duplicate delivery", () =>
     Effect.scoped(Effect.gen(function*() {
       const { documentId, left, right } = yield* seedPair()
       yield* createMessageConflict(documentId, left, right, {
@@ -295,13 +297,11 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
       const leftInspection = yield* left.replica.inspectConflicts(Message, documentId)
       const rightInspection = yield* right.replica.inspectConflicts(Message, documentId)
       assert.deepStrictEqual(leftInspection.conflicts, rightInspection.conflicts)
-      assert.sameMembers(
-        inspectMessageConflict(leftInspection).alternatives.map(({ value }) => value),
-        ["left", "right"]
-      )
+      const record = yield* inspectMessageConflict(leftInspection)
+      assert.sameMembers(record.alternatives.map(({ value }) => value), ["left", "right"])
     })))
 
-  it.effect("resolves a selected edited message and converges after reordered duplicate delivery", () =>
+  test.effect("resolves a selected edited message and converges after reordered duplicate delivery", () =>
     Effect.scoped(Effect.gen(function*() {
       const { documentId, left, right } = yield* seedPair()
       yield* createMessageConflict(documentId, left, right, {
@@ -309,7 +309,7 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
         right: "right edit",
         reverse: false
       })
-      const resolution = selectMessage(
+      const resolution = yield* selectMessage(
         yield* left.replica.inspectConflicts(Message, documentId),
         "right edit"
       )
@@ -342,7 +342,7 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
       assert.deepStrictEqual(rightInspection.conflicts, [])
     })))
 
-  it.effect("preserves concurrent conflict resolutions as a new conflict", () =>
+  test.effect("preserves concurrent conflict resolutions as a new conflict", () =>
     Effect.scoped(Effect.gen(function*() {
       const { documentId, left, right } = yield* seedPair()
       yield* createMessageConflict(documentId, left, right, {
@@ -351,8 +351,8 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
         reverse: true
       })
       const inspection = yield* left.replica.inspectConflicts(Message, documentId)
-      const leftResolution = selectMessage(inspection, "left")
-      const rightResolution = selectMessage(inspection, "right")
+      const leftResolution = yield* selectMessage(inspection, "left")
+      const rightResolution = yield* selectMessage(inspection, "right")
       const leftCommandId = yield* Identity.makeCommandId
       const rightCommandId = yield* Identity.makeCommandId
       yield* Effect.all([
@@ -391,13 +391,11 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
       const leftInspection = yield* left.replica.inspectConflicts(Message, documentId)
       const rightInspection = yield* right.replica.inspectConflicts(Message, documentId)
       assert.deepStrictEqual(leftInspection.conflicts, rightInspection.conflicts)
-      assert.sameMembers(
-        inspectMessageConflict(leftInspection).alternatives.map(({ value }) => value),
-        ["left", "right"]
-      )
+      const record = yield* inspectMessageConflict(leftInspection)
+      assert.sameMembers(record.alternatives.map(({ value }) => value), ["left", "right"])
     })))
 
-  it.effect("reinspects and resolves after a durable stale rejection", () =>
+  test.effect("reinspects and resolves after a durable stale rejection", () =>
     Effect.scoped(Effect.gen(function*() {
       const { documentId, left, right } = yield* seedPair()
       yield* createMessageConflict(documentId, left, right, {
@@ -405,7 +403,7 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
         right: "right",
         reverse: false
       })
-      const staleResolution = selectMessage(
+      const staleResolution = yield* selectMessage(
         yield* left.replica.inspectConflicts(Message, documentId),
         "left"
       )
@@ -432,7 +430,7 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
       const staleDelivery = yield* left.replica.lookupCommandDelivery(staleCommandId)
       assert.strictEqual(staleDelivery._tag, "NoChangesToDeliver")
 
-      const freshResolution = selectMessage(
+      const freshResolution = yield* selectMessage(
         yield* left.replica.inspectConflicts(Message, documentId),
         "left"
       )
@@ -468,21 +466,20 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
       assert.deepStrictEqual(rightInspection.conflicts, [])
     })))
 
-  it.effect("persists the resolution, heads, conflict absence, and receipt through a full SQL restart", () =>
+  test.effect("persists the resolution, heads, conflict absence, and receipt through a full SQL restart", () =>
     Effect.scoped(Effect.gen(function*() {
-      const filename = join(
-        tmpdir(),
-        `effect-local-conflict-convergence-${globalThis.crypto.randomUUID()}.sqlite`
-      )
+      const fs = yield* FileSystem.FileSystem
+      const filename = yield* fs.makeTempFile({
+        prefix: "effect-local-conflict-convergence-",
+        suffix: ".sqlite"
+      })
+      const remove = (filePath: string) => fs.remove(filePath).pipe(Effect.ignore)
       yield* Effect.addFinalizer(() =>
-        Effect.try({
-          try: () => {
-            rmSync(filename, { force: true })
-            rmSync(`${filename}-wal`, { force: true })
-            rmSync(`${filename}-shm`, { force: true })
-          },
-          catch: (cause) => cause
-        }).pipe(Effect.orDie)
+        Effect.all([
+          remove(filename),
+          remove(`${filename}-wal`),
+          remove(`${filename}-shm`)
+        ], { discard: true })
       )
       const persisted = yield* Effect.scoped(Effect.gen(function*() {
         const { documentId, left, right } = yield* seedPair({
@@ -493,7 +490,7 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
           right: "selected",
           reverse: true
         })
-        const resolution = selectMessage(
+        const resolution = yield* selectMessage(
           yield* left.replica.inspectConflicts(Message, documentId),
           "selected"
         )
@@ -533,7 +530,7 @@ it.layer(NodeCrypto.layer)("two replica convergence", (it) => {
       }))
     })))
 
-  it.effect("converges bounded concurrent list edits", () =>
+  test.effect("converges bounded concurrent list edits", () =>
     Effect.scoped(Effect.gen(function*() {
       const leftLabels = ["alpha", "shared prefix", "unicode 🧪"]
       const rightLabels = ["omega", "shared prefix", "unicode 🧬"]

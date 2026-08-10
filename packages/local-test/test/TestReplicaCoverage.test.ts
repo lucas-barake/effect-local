@@ -15,13 +15,13 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as TestReplica from "../src/TestReplica.js"
 import { definition, Rename, Task } from "./fixtures.js"
 
-it.layer(NodeCrypto.layer)("TestReplica limits threading", (it) => {
+it.layer(NodeCrypto.layer)("TestReplica limits threading", (test) => {
   const Handler = Rename.toLayer(({ draft, payload }) => {
     draft.title = payload
     return undefined
   })
 
-  it.effect("layerWithSyncAndLimits exposes the provided limits rather than defaults", () =>
+  test.effect("layerWithSyncAndLimits exposes the provided limits rather than defaults", () =>
     Effect.gen(function*() {
       const custom = { ...TestReplica.defaultLimits, maxSessions: 3, maxQueuedRpc: 7 }
       assert.notStrictEqual(TestReplica.defaultLimits.maxSessions, custom.maxSessions)
@@ -36,7 +36,7 @@ it.layer(NodeCrypto.layer)("TestReplica limits threading", (it) => {
       assert.strictEqual(limits.maxQueuedRpc, 7)
     }).pipe(TestClock.withLive))
 
-  it.effect("layerWithSyncAndLimits forwards the configured health sampling interval", () =>
+  test.effect("layerWithSyncAndLimits forwards the configured health sampling interval", () =>
     Effect.gen(function*() {
       const replica = yield* Replica.Replica
       const sql = yield* SqlClient.SqlClient
@@ -65,7 +65,7 @@ it.layer(NodeCrypto.layer)("TestReplica limits threading", (it) => {
       )
     ))
 
-  it.effect("commits a concurrent write burst on an idle replica", () =>
+  test.effect("commits a concurrent write burst on an idle replica", () =>
     Effect.gen(function*() {
       const replica = yield* Replica.Replica
       const commandIds = yield* Effect.all(

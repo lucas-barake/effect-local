@@ -219,11 +219,11 @@ const drain = (documentId: Identity.DocumentId, left: Side, right: Side) =>
         !fromRight.dirty
       ) return
     }
-    return yield* Effect.die("peer sync did not reach quiescence within 32 rounds")
+    yield* Effect.die("peer sync did not reach quiescence within 32 rounds")
   })
 
-it.layer(NodeCrypto.layer)("inbound projection recovery", (it) => {
-  it.effect("an inbound sync rebuilds projections before publishing the commit", () =>
+it.layer(NodeCrypto.layer)("inbound projection recovery", (test) => {
+  test.effect("an inbound sync rebuilds projections before publishing the commit", () =>
     Effect.gen(function*() {
       const { documentId, left, right } = yield* seedPair
       yield* right.publisher.publishPending
@@ -231,8 +231,8 @@ it.layer(NodeCrypto.layer)("inbound projection recovery", (it) => {
         left.replica.mutate(EditNote, { commandId, documentId, payload: "from left" }))
       const subscription = yield* right.publisher.subscribe
       const event = yield* subscription.events.pipe(
-        Stream.filter((event) =>
-          event._tag === "Commit"
+        Stream.filter((candidate) =>
+          candidate._tag === "Commit"
         ),
         Stream.runHead,
         Effect.forkChild
@@ -254,7 +254,7 @@ it.layer(NodeCrypto.layer)("inbound projection recovery", (it) => {
       ])
     }).pipe(Effect.scoped))
 
-  it.effect("a no-change command publishes the ready inbound projection without a second commit", () =>
+  test.effect("a no-change command publishes the ready inbound projection without a second commit", () =>
     Effect.gen(function*() {
       const { documentId, left, right } = yield* seedPair
       yield* right.publisher.publishPending
@@ -269,7 +269,7 @@ it.layer(NodeCrypto.layer)("inbound projection recovery", (it) => {
       const previousSequence = before[0]?.commit_sequence ?? 0
       const subscription = yield* right.publisher.subscribe
       const events = yield* subscription.events.pipe(
-        Stream.filter((event) => event._tag === "Commit"),
+        Stream.filter((candidate) => candidate._tag === "Commit"),
         Stream.take(1),
         Stream.runCollect,
         Effect.forkChild
@@ -297,16 +297,20 @@ it.layer(NodeCrypto.layer)("inbound projection recovery", (it) => {
       assert.deepStrictEqual((yield* right.replica.query(ListNotes)).map((row) => row.text), ["from left"])
     }).pipe(Effect.scoped))
 
-  it.effect("a no-change command preserves an inbound projection that is already ready", () =>
+  test.effect("a no-change command preserves an inbound projection that is already ready", () =>
     Effect.gen(function*() {
       const { documentId, left, right } = yield* seedPair
-      yield* Effect.flatMap(Identity.makeCommandId, (commandId) =>
-        left.replica.mutate(EditNote, { commandId, documentId, payload: "from left" }))
+      yield* Effect.flatMap(
+        Identity.makeCommandId,
+        (commandId) => left.replica.mutate(EditNote, { commandId, documentId, payload: "from left" })
+      )
       yield* drain(documentId, left, right)
       yield* right.publisher.publishPending
 
-      yield* Effect.flatMap(Identity.makeCommandId, (commandId) =>
-        right.replica.mutate(Noop, { commandId, documentId }))
+      yield* Effect.flatMap(
+        Identity.makeCommandId,
+        (commandId) => right.replica.mutate(Noop, { commandId, documentId })
+      )
 
       assert.deepStrictEqual((yield* right.replica.query(ListNotes)).map((row) => row.text), ["from left"])
     }).pipe(Effect.scoped))

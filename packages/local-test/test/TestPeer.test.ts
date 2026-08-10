@@ -55,7 +55,7 @@ describe("TestPeer", () => {
       ]
       const errors = yield* Effect.forEach(
         invalidOptions,
-        (options) => Effect.flip(TestPeer.make(options))
+        (option) => Effect.flip(TestPeer.make(option))
       )
       assert.deepStrictEqual(errors.map((error) => error._tag), [
         "InvalidOptions",

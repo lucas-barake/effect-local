@@ -5,6 +5,7 @@ import * as Context from "effect/Context"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
@@ -90,19 +91,22 @@ const fallbackMessageHash = (message: Uint8Array): string =>
     .padEnd(64, "0")
     .slice(0, 64)
 
+const DeliveryMetadata = Schema.fromJsonString(Schema.Struct({
+  messageHash: Schema.optional(Schema.String)
+}))
+
 const deliveryIdentity = (
   message: Uint8Array,
   relayPeerId: Identity.PeerId,
   senderPeerId: Identity.PeerId
 ): PeerTransport.RelayDeliveryIdentity => {
   let messageHash = fallbackMessageHash(message)
-  try {
-    const decoded = JSON.parse(new TextDecoder().decode(message)) as { readonly messageHash?: unknown }
-    if (typeof decoded.messageHash === "string" && /^[0-9a-f]{64}$/.test(decoded.messageHash)) {
-      messageHash = decoded.messageHash
-    }
-  } catch {
-    // Raw packets are supported by the low level test transport.
+  const decoded = Schema.decodeUnknownOption(DeliveryMetadata)(new TextDecoder().decode(message))
+  if (
+    Option.isSome(decoded) && decoded.value.messageHash !== undefined &&
+    /^[0-9a-f]{64}$/.test(decoded.value.messageHash)
+  ) {
+    messageHash = decoded.value.messageHash
   }
   const relayMessageId = Identity.RelayMessageId.make(
     `rly_${messageHash.slice(0, 8)}-${messageHash.slice(8, 12)}-4${messageHash.slice(13, 16)}-8${
@@ -121,10 +125,10 @@ const deliveryIdentity = (
   }
 }
 
-const toValidatedMillis = (input: Duration.Input) =>
-  typeof input === "number" && Number.isNaN(input)
-    ? Number.NaN
-    : Duration.toMillis(input)
+const toValidatedMillis = (input: Duration.Input) => {
+  if (typeof input === "number" && Number.isNaN(input)) return Number.NaN
+  return Duration.toMillis(input)
+}
 
 export const make = (
   options: Options
@@ -192,15 +196,16 @@ export const make = (
           Array.from({ length: scheduled.decision.copies }, () => scheduled.packet.payload.slice())
         )
         if (offered) return null
-        return scheduled.queue.state._tag === "Open"
-          ? new QueueFull({
+        if (scheduled.queue.state._tag === "Open") {
+          return new QueueFull({
             from: scheduled.packet.from,
             to: scheduled.packet.to,
             capacity: options.queueCapacity
           })
-          : new ConnectionClosed({ from: scheduled.packet.from, to: scheduled.packet.to })
+        }
+        return new ConnectionClosed({ from: scheduled.packet.from, to: scheduled.packet.to })
       })
-      if (failure !== null) return yield* failure
+      if (failure !== null) yield* failure
     })
 
     const send = Effect.fnUntraced(function*(
@@ -218,9 +223,15 @@ export const make = (
       const decision = yield* faults.decide(packet)
       yield* validate(packet, decision)
       const connection = (yield* SubscriptionRef.get(routes)).get(route(from, to))
-      if (connection === undefined) return yield* new ConnectionClosed({ from, to })
+      if (connection === undefined) {
+        yield* new ConnectionClosed({ from, to })
+        return
+      }
       if ((yield* Ref.get(partitions)).has(route(from, to)) || decision.drop) {
-        if (!Ref.getUnsafe(sourceActive)) return yield* new ConnectionClosed({ from, to })
+        if (!Ref.getUnsafe(sourceActive)) {
+          yield* new ConnectionClosed({ from, to })
+          return
+        }
         return
       }
       const scheduled = { packet, decision, queue: connection.queue, sourceActive }
@@ -231,9 +242,13 @@ export const make = (
         if (!Ref.getUnsafe(sourceActive)) return [false, current]
         const key = route(from, to)
         const candidate = current.get(key)
-        const previous = candidate?.queue === scheduled.queue && candidate.sourceActive === scheduled.sourceActive
-          ? candidate
-          : undefined
+        let previous: Scheduled | undefined
+        if (
+          candidate !== undefined && candidate.queue === scheduled.queue &&
+          candidate.sourceActive === scheduled.sourceActive
+        ) {
+          previous = candidate
+        }
         const next = new Map(current)
         next.delete(key)
         if (decision.reorder && previous === undefined) {
@@ -243,46 +258,51 @@ export const make = (
         if (previous === undefined) return [[scheduled], next]
         return [[scheduled, previous], next]
       })
-      if (pending === false) return yield* new ConnectionClosed({ from, to })
+      if (pending === false) {
+        yield* new ConnectionClosed({ from, to })
+        return
+      }
       if (pending === undefined) return
       const [current, ...deferred] = pending
       yield* deliver(current)
       // deferred packets ride a later send; their delivery failure must not fail it
-      yield* Effect.forEach(deferred, (packet) => Effect.catchIf(deliver(packet), () => true, () => Effect.void), {
+      yield* Effect.forEach(deferred, (deferredPacket) =>
+        Effect.catchIf(deliver(deferredPacket), () => true, () => Effect.void), {
         discard: true
       })
     })
 
     const flush = Ref.getAndSet(held, new Map()).pipe(
-      Effect.flatMap((pending) => Effect.forEach(pending.values(), deliver, { discard: true }))
+      Effect.flatMap((pending) =>
+        Effect.forEach(pending.values(), deliver, { discard: true })
+      )
     )
 
     const connect = Effect.fnUntraced(function*(from: Identity.PeerId, to: Identity.PeerId) {
       const inbound = yield* Queue.dropping<ReadonlyArray<Uint8Array>>(options.queueCapacity)
       const active = yield* Ref.make(true)
       const close = Ref.getAndSet(active, false).pipe(
-        Effect.flatMap((wasActive) =>
-          wasActive
-            ? Effect.all([
-              SubscriptionRef.update(routes, (current) => {
-                const key = route(to, from)
-                if (current.get(key)?.queue !== inbound) return current
-                const next = new Map(current)
-                next.delete(key)
-                return next
-              }),
-              Ref.update(held, (current) => {
-                const next = new Map(current)
-                const inboundKey = route(to, from)
-                if (next.get(inboundKey)?.queue === inbound) next.delete(inboundKey)
-                const outboundKey = route(from, to)
-                if (next.get(outboundKey)?.sourceActive === active) next.delete(outboundKey)
-                return next
-              }),
-              Queue.shutdown(inbound)
-            ], { discard: true })
-            : Effect.void
-        )
+        Effect.flatMap((wasActive) => {
+          if (!wasActive) return Effect.void
+          return Effect.all([
+            SubscriptionRef.update(routes, (current) => {
+              const key = route(to, from)
+              if (current.get(key)?.queue !== inbound) return current
+              const next = new Map(current)
+              next.delete(key)
+              return next
+            }),
+            Ref.update(held, (current) => {
+              const next = new Map(current)
+              const inboundKey = route(to, from)
+              if (next.get(inboundKey)?.queue === inbound) next.delete(inboundKey)
+              const outboundKey = route(from, to)
+              if (next.get(outboundKey)?.sourceActive === active) next.delete(outboundKey)
+              return next
+            }),
+            Queue.shutdown(inbound)
+          ], { discard: true })
+        })
       )
       yield* Effect.addFinalizer(() => close)
       yield* Effect.gen(function*() {
@@ -312,9 +332,10 @@ export const make = (
         receive: Stream.fromQueue(inbound).pipe(Stream.flattenIterable),
         send: (message: Uint8Array) =>
           Ref.get(active).pipe(
-            Effect.flatMap((isActive) =>
-              isActive ? send(from, to, active, message) : Effect.fail(new ConnectionClosed({ from, to }))
-            )
+            Effect.flatMap((isActive) => {
+              if (isActive) return send(from, to, active, message)
+              return Effect.fail(new ConnectionClosed({ from, to }))
+            })
           ),
         queued: Queue.size(inbound),
         close
