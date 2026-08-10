@@ -32,7 +32,13 @@ import { deviceByName, type DeviceIdentity, devices } from "./identities.ts"
 
 const relayUrl = `ws://127.0.0.1:${import.meta.env.VITE_RELAY_PORT ?? "4176"}/relay`
 
-const identity = deviceByName(new URL(window.location.href).searchParams.get("device") ?? "alpha")
+const deviceName = new URL(window.location.href).searchParams.get("device") ?? "alpha"
+const identity = deviceByName(deviceName)
+if (identity === undefined) {
+  // Playwright selects the device through the page URL, so this must fail during page bootstrap.
+  // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError
+  throw new Error(`unknown device ${deviceName}`)
+}
 
 const remote = devices.find((device) => device.name !== identity.name)!
 
@@ -41,7 +47,10 @@ const deferred = <A,>() => {
   return {
     promise: Effect.runPromise(Deferred.await(cell)),
     resolve: (value: A) => {
-      globalThis.queueMicrotask(() => {
+      // MessagePort delivery is a native callback boundary. Defer completion to preserve the
+      // native Promise microtask ordering expected by the database bridge.
+      // oxlint-disable-next-line effect/noGlobals
+      queueMicrotask(() => {
         void Effect.runSync(Deferred.succeed(cell, value))
       })
     }
@@ -51,7 +60,9 @@ const deferred = <A,>() => {
 export const databaseBridge = (() => {
   const engine = new MessageChannel()
   const database = new MessageChannel()
-  const worker = new globalThis.Worker(new URL("./opfs.worker.ts", import.meta.url), { type: "module" })
+  // This worker is the browser-native OPFS boundary for the fixture.
+  // oxlint-disable-next-line effect/noGlobals
+  const worker = new Worker(new URL("./opfs.worker.ts", import.meta.url), { type: "module" })
   const requests = new Array<ReturnType<typeof deferred<unknown>>>()
   let gate: {
     readonly response: ReturnType<typeof deferred<void>>
@@ -81,13 +92,18 @@ export const databaseBridge = (() => {
     port: engine.port2,
     arm: () => {
       if (gate !== undefined) {
-        Effect.runSync(Effect.die(new Error("a database response gate is already armed")))
-        return
+        // Playwright calls this harness guard synchronously from page.evaluate.
+        // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError
+        throw new Error("a database response gate is already armed")
       }
       gate = { response: deferred(), requestObserved: false }
     },
     waitForResponse: () => {
-      if (gate === undefined) return Effect.runSync(Effect.die(new Error("no database response gate is armed")))
+      if (gate === undefined) {
+        // Playwright calls this harness guard synchronously from page.evaluate.
+        // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError
+        throw new Error("no database response gate is armed")
+      }
       return gate.response.promise
     },
     nextRequest: () => {
@@ -97,8 +113,9 @@ export const databaseBridge = (() => {
     },
     release: () => {
       if (gate?.held === undefined) {
-        Effect.runSync(Effect.die(new Error("no database response is held")))
-        return
+        // Playwright calls this harness guard synchronously from page.evaluate.
+        // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError
+        throw new Error("no database response is held")
       }
       forward(engine.port1, gate.held)
       gate = undefined

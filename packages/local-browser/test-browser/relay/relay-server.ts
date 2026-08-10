@@ -25,6 +25,10 @@ import * as HttpServer from "effect/unstable/http/HttpServer"
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
+// This fixture is a Node-only entrypoint, and NodeHttpServer requires the native server factory.
+// oxlint-disable-next-line effect/noNodeBuiltinImport
+import { createServer } from "node:http"
+import process from "node:process"
 import { definition } from "./src/domain.ts"
 import { devices } from "./src/identities.ts"
 
@@ -34,7 +38,9 @@ import { devices } from "./src/identities.ts"
  * it. Single runner on purpose - multi-runner ownership is covered by `RelayInboxMultiRunner`.
  */
 
-const port = Number(globalThis.process.env.EFFECT_LOCAL_RELAY_PORT ?? 0)
+// This fixture reads the port selected by the Node test process.
+// oxlint-disable-next-line effect/noNodeBuiltinImport
+const port = Number(process.env.EFFECT_LOCAL_RELAY_PORT ?? 0)
 
 const principals = new Map(devices.map((device) => [device.token, device.principal]))
 
@@ -145,10 +151,7 @@ const Ready = HttpRouter.add("GET", "/ready", HttpServerResponse.text("ok"))
 
 const Main = HttpRouter.serve(Layer.mergeAll(Rpc, Ready)).pipe(
   Layer.provideMerge(
-    NodeHttpServer.layer(
-      () => globalThis.process.getBuiltinModule("node:http").createServer(),
-      { port, host: "127.0.0.1" }
-    )
+    NodeHttpServer.layer(createServer, { port, host: "127.0.0.1" })
   )
 )
 
@@ -157,8 +160,10 @@ Effect.scoped(Effect.gen(function*() {
   const server = Context.get(context, HttpServer.HttpServer)
   if (server.address._tag !== "TcpAddress") return yield* Effect.die(new Error("Relay did not bind a TCP port"))
   const url = `http://127.0.0.1:${server.address.port}`
-  globalThis.process.send?.({ _tag: "RelayReady", url })
-  globalThis.process.stdout.write(`RelayReady ${url}\n`)
+  process.send?.({ _tag: "RelayReady", url })
+  // The test process consumes this native stdout line as the readiness boundary.
+  // oxlint-disable-next-line effect/noNodeBuiltinImport
+  process.stdout.write(`RelayReady ${url}\n`)
   return yield* Effect.never
 })).pipe(
   NodeRuntime.runMain

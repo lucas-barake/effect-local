@@ -7,6 +7,7 @@ import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as ChildProcess from "effect/unstable/process/ChildProcess"
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner"
+import process from "node:process"
 import { fileURLToPath } from "node:url"
 import { makeViteTest } from "../playwright.ts"
 
@@ -16,7 +17,7 @@ const readyPrefix = "RelayReady "
 const startRelay = () => {
   const scope = Scope.makeUnsafe("parallel")
   const command = ChildProcess.make(
-    globalThis.process.execPath,
+    process.execPath,
     ["--import", "tsx", fileURLToPath(new URL("./relay-server.ts", import.meta.url))],
     {
       cwd: fileURLToPath(new URL("../..", import.meta.url)),

@@ -1,5 +1,4 @@
 import * as Identity from "@lucas-barake/effect-local/Identity"
-import * as Effect from "effect/Effect"
 
 /** Shared by the relay server and the page: the peer ids are part of the version 1 handshake. */
 
@@ -39,8 +38,7 @@ export const devices: ReadonlyArray<DeviceIdentity> = [
   }
 ]
 
-export const deviceByName = (name: string): DeviceIdentity => {
-  const found = devices.find((device) => device.name === name)
-  if (found === undefined) return Effect.runSync(Effect.die(new Error(`unknown device ${name}`)))
-  return found
-}
+export const deviceByName = (name: string): DeviceIdentity | undefined =>
+  devices.find(
+    (device) => device.name === name
+  )
