@@ -6,6 +6,7 @@ import type * as PeerTransport from "@lucas-barake/effect-local/PeerTransport"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
+import * as Arr from "effect/Array"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
@@ -53,6 +54,15 @@ export interface Outbound {
   readonly lineage: Identity.DocumentLineage
   readonly writerProvenance: ReadonlyArray<WriterProvenance.ChangeProvenance>
   readonly checkpointTransfer?: Uint8Array
+  readonly receiptReplyId?: number
+}
+
+export interface ReplyFragment {
+  readonly receiptReplyId: number
+  readonly replyIndex: number
+  readonly message: Uint8Array
+  readonly messageHash: string
+  readonly heads: ReadonlyArray<string>
 }
 
 export interface Reply {
@@ -61,6 +71,7 @@ export interface Reply {
   readonly messageHash: string
   readonly heads: ReadonlyArray<string>
   readonly checkpointTransfer?: Uint8Array
+  readonly fragments?: ReadonlyArray<ReplyFragment>
 }
 
 export interface Generated {
@@ -98,8 +109,19 @@ const ReceiptRow = Schema.Struct({
   reply: Schema.NullOr(Schema.Uint8Array),
   reply_hash: Schema.NullOr(Schema.String),
   document_id: Schema.String,
+  row_id: Schema.Int,
   writer_provenance: WriterProvenance.StoredChangeProvenances,
   checkpoint_transfer: Schema.NullOr(Schema.Uint8Array)
+})
+
+const ReceiptReplyRow = Schema.Struct({
+  heads: Heads,
+  message: Schema.Uint8Array,
+  message_hash: Schema.String,
+  receipt_row_id: Schema.NullOr(Schema.Int),
+  reply_index: Schema.Int,
+  row_id: Schema.Int,
+  status: Schema.Literals(["Pending", "Sent"])
 })
 
 const RelayReceiptRow = Schema.Struct({
@@ -155,6 +177,7 @@ const OutboxRow = Schema.Struct({
   lineage: Identity.DocumentLineage,
   message: Schema.Uint8Array,
   message_hash: Schema.String,
+  receipt_reply_id: Schema.NullOr(Schema.Int),
   send_sequence: Schema.Number,
   writer_provenance: WriterProvenance.StoredChangeProvenances
 })
@@ -229,8 +252,18 @@ const ReceiptTotalsRow = Schema.Struct({
   replica_count: Schema.Number
 })
 
-const SendSequenceRow = Schema.Struct({
+const MarkedOutboxRow = Schema.Struct({
+  receipt_reply_id: Schema.NullOr(Schema.Int),
   send_sequence: Schema.Number
+})
+
+const MarkedReceiptReplyRow = Schema.Struct({
+  receipt_row_id: Schema.NullOr(Schema.Int)
+})
+
+const InsertedReceiptReplyRow = Schema.Struct({
+  reply_index: Schema.Int,
+  row_id: Schema.Int
 })
 
 const SequenceRow = Schema.Struct({
@@ -241,13 +274,24 @@ const sessionKey = (session: Session) => `${session.replicaIncarnation}:${sessio
 
 const syncStateKey = (session: Session, documentId: Identity.DocumentId) => `${sessionKey(session)}:${documentId}`
 
-const receivedFromReceipt = (documentId: Identity.DocumentId, receipt: typeof ReceiptRow.Type): Received => ({
-  reply: receipt.reply === null || receipt.reply_hash === null ? null : {
+const receivedFromReceipt = (
+  documentId: Identity.DocumentId,
+  receipt: typeof ReceiptRow.Type,
+  rows: ReadonlyArray<typeof ReceiptReplyRow.Type>
+): Received => ({
+  reply: rows[0] === undefined ? null : {
     documentId,
-    message: receipt.reply,
-    messageHash: receipt.reply_hash,
-    heads: receipt.heads,
-    ...(receipt.checkpoint_transfer === null ? {} : { checkpointTransfer: receipt.checkpoint_transfer })
+    message: rows[0].message,
+    messageHash: rows[0].message_hash,
+    heads: rows[0].heads,
+    ...(receipt.checkpoint_transfer === null ? {} : { checkpointTransfer: receipt.checkpoint_transfer }),
+    fragments: rows.map((row) => ({
+      receiptReplyId: row.row_id,
+      replyIndex: row.reply_index,
+      message: row.message,
+      messageHash: row.message_hash,
+      heads: row.heads
+    }))
   },
   heads: receipt.heads,
   acceptedHeads: receipt.accepted_heads,
@@ -305,7 +349,7 @@ export class PeerSync extends Context.Service<PeerSync, {
       readonly relay?: RelayReceipt
     }
   ) => Effect.Effect<Received, ReplicaError.ReplicaError>
-  readonly enqueue: (session: Session, reply: Reply) => Effect.Effect<Outbound, ReplicaError.ReplicaError>
+  readonly enqueue: (session: Session, reply: Reply) => Effect.Effect<Outbound | null, ReplicaError.ReplicaError>
   readonly pending: (session: Session) => Effect.Effect<ReadonlyArray<Outbound>, ReplicaError.ReplicaError>
   readonly markSent: (
     session: Session,
@@ -386,7 +430,7 @@ const make = (
       Result: ReceiptRow,
       execute: (request) =>
         sql`SELECT accepted_heads, checkpoint_transfer, commit_sequence, document_id, heads, message_hash, reply,
-          reply_hash, writer_provenance
+          reply_hash, row_id, writer_provenance
           FROM effect_local_peer_receipts
           WHERE replica_incarnation = ${request.replicaIncarnation}
             AND peer_id = ${request.peerId}
@@ -405,7 +449,8 @@ const make = (
       Result: RelayReceiptRow,
       execute: (request) =>
         sql`SELECT accepted_heads, checkpoint_transfer, commit_sequence, document_id, heads, message_hash, reply,
-          reply_hash, writer_provenance, relay_encoded_size, relay_outer_envelope_digest, relay_receipt_expires_at
+          reply_hash, row_id, writer_provenance, relay_encoded_size, relay_outer_envelope_digest,
+          relay_receipt_expires_at
           FROM effect_local_peer_receipts
           WHERE replica_incarnation = ${request.replicaIncarnation}
             AND relay_sender_tenant_id = ${request.senderTenantId}
@@ -433,6 +478,15 @@ const make = (
           ORDER BY relay_receipt_expires_at, relay_sender_tenant_id, relay_sender_subject_id,
             relay_sender_peer_id, relay_message_id, row_id
           LIMIT ${request.limit}`
+    })
+    const findReceiptReplies = SqlSchema.findAll({
+      Request: Schema.Int,
+      Result: ReceiptReplyRow,
+      execute: (receiptRowId) =>
+        sql`SELECT heads, message, message_hash, receipt_row_id, reply_index, row_id, status
+          FROM effect_local_peer_receipt_replies
+          WHERE receipt_row_id = ${receiptRowId}
+          ORDER BY reply_index`
     })
     const decrementRelayReceiptUsage = SqlSchema.findAll({
       Request: Schema.Struct({
@@ -705,8 +759,8 @@ const make = (
       }),
       Result: OutboxRow,
       execute: (request) =>
-        sql`SELECT checkpoint_transfer, document_id, heads, lineage, message, message_hash, send_sequence,
-          writer_provenance
+        sql`SELECT checkpoint_transfer, document_id, heads, lineage, message, message_hash, receipt_reply_id,
+          send_sequence, writer_provenance
           FROM effect_local_peer_outbox
           WHERE replica_incarnation = ${request.replicaIncarnation}
             AND peer_id = ${request.peerId}
@@ -724,8 +778,8 @@ const make = (
       }),
       Result: OutboxRow,
       execute: (request) =>
-        sql`SELECT checkpoint_transfer, document_id, heads, lineage, message, message_hash, send_sequence,
-          writer_provenance
+        sql`SELECT checkpoint_transfer, document_id, heads, lineage, message, message_hash, receipt_reply_id,
+          send_sequence, writer_provenance
           FROM effect_local_peer_outbox
           WHERE replica_incarnation = ${request.replicaIncarnation}
             AND peer_id = ${request.peerId}
@@ -734,6 +788,49 @@ const make = (
             AND message_hash = ${request.messageHash}
           ORDER BY send_sequence
           LIMIT 1`
+    })
+    const findReceiptRepliesById = SqlSchema.findAll({
+      Request: Schema.Array(Schema.Int),
+      Result: ReceiptReplyRow,
+      execute: (rowIds) =>
+        sql`SELECT heads, message, message_hash, receipt_row_id, reply_index, row_id, status
+          FROM effect_local_peer_receipt_replies
+          WHERE ${sql.in("row_id", rowIds)}
+          ORDER BY reply_index`
+    })
+    const insertReceiptReplies = SqlSchema.findAll({
+      Request: Schema.Array(Schema.Struct({
+        receipt_row_id: Schema.Int,
+        reply_index: Schema.Int,
+        document_id: Identity.DocumentId,
+        message: Schema.Uint8Array,
+        message_hash: Schema.String,
+        heads: Schema.String,
+        status: Schema.Literal("Pending")
+      })),
+      Result: InsertedReceiptReplyRow,
+      execute: (rows) =>
+        sql`INSERT INTO effect_local_peer_receipt_replies ${sql.insert(rows)}
+          RETURNING reply_index, row_id`
+    })
+    const findOutboxReceiptReplies = SqlSchema.findAll({
+      Request: Schema.Struct({
+        replicaIncarnation: Identity.ReplicaIncarnation,
+        peerId: Identity.PeerId,
+        connectionEpoch: Schema.String,
+        receiptReplyIds: Schema.Array(Schema.Int)
+      }),
+      Result: OutboxRow,
+      execute: (request) =>
+        sql`SELECT checkpoint_transfer, document_id, heads, lineage, message, message_hash, receipt_reply_id,
+          send_sequence, writer_provenance
+          FROM effect_local_peer_outbox
+          WHERE replica_incarnation = ${request.replicaIncarnation}
+            AND peer_id = ${request.peerId}
+            AND connection_epoch = ${request.connectionEpoch}
+            AND status = 'Pending'
+            AND ${sql.in("receipt_reply_id", request.receiptReplyIds)}
+          ORDER BY send_sequence`
     })
     const findChangeProvenance = SqlSchema.findAll({
       Request: Schema.Array(WriterProvenance.ChangeHash),
@@ -969,7 +1066,7 @@ const make = (
         sendSequence: Schema.Number,
         messageHash: Schema.String
       }),
-      Result: SendSequenceRow,
+      Result: MarkedOutboxRow,
       execute: (request) =>
         sql`UPDATE effect_local_peer_outbox
           SET status = 'Sent'
@@ -979,7 +1076,16 @@ const make = (
             AND send_sequence = ${request.sendSequence}
             AND message_hash = ${request.messageHash}
             AND status = 'Pending'
-          RETURNING send_sequence`
+          RETURNING receipt_reply_id, send_sequence`
+    })
+    const markReceiptReplySent = SqlSchema.findAll({
+      Request: Schema.Int,
+      Result: MarkedReceiptReplyRow,
+      execute: (rowId) =>
+        sql`UPDATE effect_local_peer_receipt_replies
+          SET status = 'Sent'
+          WHERE row_id = ${rowId}
+          RETURNING receipt_row_id`
     })
     const pruneRelayReceiptsInTransaction = (
       replicaIncarnation: Identity.ReplicaIncarnation,
@@ -1036,6 +1142,12 @@ const make = (
               })
             }
           }
+          yield* sql`DELETE FROM effect_local_peer_receipt_replies AS reply
+            WHERE receipt_row_id IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM effect_local_peer_outbox AS outbox
+                WHERE outbox.receipt_reply_id = reply.row_id AND outbox.status = 'Pending'
+              )`
           yield* sql`DELETE FROM effect_local_peer_relay_receipt_usage
             WHERE replica_incarnation = ${replicaIncarnation}
               AND receipt_count = 0
@@ -1062,11 +1174,17 @@ const make = (
         WHERE replica_incarnation = ${bootstrap.incarnation}
           AND status = 'Pending'
           AND created_at < ${startupCutoff}`
+      yield* sql`DELETE FROM effect_local_peer_outbox
+        WHERE replica_incarnation != ${bootstrap.incarnation} OR created_at < ${startupCutoff}`
       yield* sql`DELETE FROM effect_local_peer_receipts
         WHERE relay_message_id IS NULL
           AND (replica_incarnation != ${bootstrap.incarnation} OR accepted_at < ${startupCutoff})`
-      yield* sql`DELETE FROM effect_local_peer_outbox
-        WHERE replica_incarnation != ${bootstrap.incarnation} OR created_at < ${startupCutoff}`
+      yield* sql`DELETE FROM effect_local_peer_receipt_replies AS reply
+        WHERE receipt_row_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM effect_local_peer_outbox AS outbox
+            WHERE outbox.receipt_reply_id = reply.row_id AND outbox.status = 'Pending'
+          )`
       if (relayReceiptLimits !== null) {
         yield* pruneRelayReceiptsInTransaction(bootstrap.incarnation, startupAt)
       }
@@ -1199,6 +1317,12 @@ const make = (
             AND relay_message_id IS NULL
             AND pending_message IS NOT NULL
             AND accepted_at < ${cutoff}`
+        yield* sql`DELETE FROM effect_local_peer_receipt_replies AS reply
+          WHERE receipt_row_id IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM effect_local_peer_outbox AS outbox
+              WHERE outbox.receipt_reply_id = reply.row_id AND outbox.status = 'Pending'
+            )`
       }))
 
     // Dominated by `gate.validate` on every path that reaches them, so these are defensive: they keep
@@ -1223,7 +1347,7 @@ const make = (
         : Effect.succeed(Identity.CommitSequence.make(rows[0].commit_sequence))
     ))
 
-    const loadWriterProvenance = (documentId: Identity.DocumentId, message: Uint8Array) =>
+    const decodeWriterProvenanceHashes = (message: Uint8Array) =>
       Effect.gen(function*() {
         const changes = yield* Effect.try({
           try: () => SyncChunks.decodeSyncChanges(Automerge.decodeSyncMessage(message).changes),
@@ -1240,9 +1364,19 @@ const make = (
             })
           })
         }
-        if (changes.length === 0) return []
-        const [rows, checkpoints] = yield* Effect.all([
-          findChangeProvenance(changes.map((change) => change.hash)),
+        return changes.map((change) => change.hash)
+      })
+
+    const loadWriterProvenanceBatch = (
+      documentId: Identity.DocumentId,
+      messages: ReadonlyArray<Uint8Array>
+    ) =>
+      Effect.gen(function*() {
+        const messageHashes = yield* Effect.forEach(messages, decodeWriterProvenanceHashes)
+        const uniqueHashes = [...new Set(messageHashes.flat())]
+        if (uniqueHashes.length === 0) return messages.map(() => [])
+        const [rowGroups, checkpoints] = yield* Effect.all([
+          Effect.forEach(Arr.chunksOf(uniqueHashes, 500), findChangeProvenance),
           findCheckpointProvenance(documentId)
         ]).pipe(
           Effect.catchTags({
@@ -1262,16 +1396,18 @@ const make = (
         )
         return yield* Effect.try({
           try: () =>
-            WriterProvenance.resolve(
-              changes.map((change) => change.hash),
-              [
-                ...rows.map((row) => ({
-                  changeHash: row.change_hash,
-                  writerSchemaVersion: row.writer_schema_version,
-                  writerDefinitionHash: row.writer_definition_hash
-                })),
-                ...checkpoints.flatMap((checkpoint) => WriterProvenance.exactEntries(checkpoint.writer_provenance))
-              ]
+            messageHashes.map((hashes) =>
+              WriterProvenance.resolve(
+                hashes,
+                [
+                  ...rowGroups.flat().map((row) => ({
+                    changeHash: row.change_hash,
+                    writerSchemaVersion: row.writer_schema_version,
+                    writerDefinitionHash: row.writer_definition_hash
+                  })),
+                  ...checkpoints.flatMap((checkpoint) => WriterProvenance.exactEntries(checkpoint.writer_provenance))
+                ]
+              )
             ),
           catch: (cause) =>
             new ReplicaError.ReplicaError({
@@ -1279,6 +1415,11 @@ const make = (
             })
         })
       })
+
+    const loadWriterProvenance = (documentId: Identity.DocumentId, message: Uint8Array) =>
+      loadWriterProvenanceBatch(documentId, [message]).pipe(
+        Effect.map((provenance) => provenance[0]!)
+      )
 
     const persistOutbound = (
       session: Session,
@@ -1366,80 +1507,198 @@ const make = (
               })
             })
           }
-          const rows = yield* findOutboxReply({
+          if (reply.fragments === undefined) {
+            const rows = yield* findOutboxReply({
+              replicaIncarnation: session.replicaIncarnation,
+              peerId: session.peerId,
+              connectionEpoch: session.connectionEpoch,
+              documentId: reply.documentId,
+              messageHash: reply.messageHash
+            })
+            const existing = rows[0]
+            if (existing !== undefined) {
+              if (!Equal.equals(existing.checkpoint_transfer, reply.checkpointTransfer ?? null)) {
+                return yield* new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.ProtocolMismatch({
+                    expected: "matching queued checkpoint transfer",
+                    observed: "conflicting queued checkpoint transfer"
+                  })
+                })
+              }
+              return {
+                sendSequence: existing.send_sequence,
+                documentId: reply.documentId,
+                message: existing.message,
+                messageHash: existing.message_hash,
+                heads: existing.heads,
+                lineage: existing.lineage,
+                writerProvenance: existing.writer_provenance,
+                ...(existing.checkpoint_transfer === null
+                  ? {}
+                  : { checkpointTransfer: existing.checkpoint_transfer }),
+                ...(existing.receipt_reply_id === null ? {} : { receiptReplyId: existing.receipt_reply_id })
+              }
+            }
+            return yield* persistOutbound(
+              session,
+              reply.documentId,
+              reply.message,
+              reply.heads,
+              reply.checkpointTransfer
+            )
+          }
+
+          const fragments = [...reply.fragments].toSorted((left, right) => left.replyIndex - right.replyIndex)
+          if (
+            fragments.length === 0 ||
+            fragments[0]!.messageHash !== reply.messageHash ||
+            !Equal.equals(fragments[0]!.message, reply.message) ||
+            fragments.some((fragment, index) => fragment.replyIndex !== index)
+          ) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause: new Error("Invalid receipt reply batch") })
+            })
+          }
+          const stored = yield* findReceiptRepliesById(fragments.map((fragment) => fragment.receiptReplyId))
+          if (stored.length !== fragments.length) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause: new Error("Missing receipt reply") })
+            })
+          }
+          for (let index = 0; index < fragments.length; index++) {
+            const fragment = fragments[index]!
+            const row = stored[index]!
+            const observedHash = yield* digest(fragment.message)
+            if (
+              row.row_id !== fragment.receiptReplyId || row.reply_index !== fragment.replyIndex ||
+              row.message_hash !== fragment.messageHash || observedHash !== fragment.messageHash ||
+              !Equal.equals(row.message, fragment.message) || !Equal.equals(row.heads, fragment.heads)
+            ) {
+              return yield* new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause: new Error("Conflicting receipt reply") })
+              })
+            }
+          }
+          const pendingRows = stored.filter((row) => row.status === "Pending")
+          if (pendingRows.length === 0) return null
+          const existing = yield* findOutboxReceiptReplies({
             replicaIncarnation: session.replicaIncarnation,
             peerId: session.peerId,
             connectionEpoch: session.connectionEpoch,
-            documentId: reply.documentId,
-            messageHash: reply.messageHash
-          }).pipe(
-            Effect.catchTags({
-              SqlError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageUnavailable({ cause })
-                  })
-                ),
-              SchemaError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageCorrupt({ cause })
-                  })
-                )
+            receiptReplyIds: pendingRows.map((row) => row.row_id)
+          })
+          if (existing.length !== 0 && existing.length !== pendingRows.length) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.StorageCorrupt({ cause: new Error("Partial receipt reply outbox batch") })
             })
-          )
-          const existing = rows[0]
-          if (existing !== undefined) {
-            if (!Equal.equals(existing.checkpoint_transfer, reply.checkpointTransfer ?? null)) {
-              return yield* new ReplicaError.ReplicaError({
-                reason: new ReplicaError.ProtocolMismatch({
-                  expected: "matching queued checkpoint transfer",
-                  observed: "conflicting queued checkpoint transfer"
+          }
+          if (existing.length !== 0) {
+            for (let index = 0; index < existing.length; index++) {
+              const row = existing[index]!
+              const expected = pendingRows[index]!
+              if (
+                row.receipt_reply_id !== expected.row_id || row.message_hash !== expected.message_hash ||
+                !Equal.equals(row.message, expected.message)
+              ) {
+                return yield* new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageCorrupt({ cause: new Error("Conflicting receipt reply outbox") })
                 })
-              })
+              }
             }
+            const first = existing[0]!
             return {
-              sendSequence: existing.send_sequence,
+              sendSequence: first.send_sequence,
               documentId: reply.documentId,
-              message: existing.message,
-              messageHash: existing.message_hash,
-              heads: existing.heads,
-              lineage: existing.lineage,
-              writerProvenance: existing.writer_provenance,
-              ...(existing.checkpoint_transfer === null
-                ? {}
-                : { checkpointTransfer: existing.checkpoint_transfer })
+              message: first.message,
+              messageHash: first.message_hash,
+              heads: first.heads,
+              lineage: first.lineage,
+              writerProvenance: first.writer_provenance,
+              receiptReplyId: first.receipt_reply_id!
             }
           }
-          return yield* persistOutbound(
-            session,
-            reply.documentId,
-            reply.message,
-            reply.heads,
-            reply.checkpointTransfer
-          ).pipe(
-            Effect.catchTags({
-              SqlError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageUnavailable({ cause })
-                  })
-                ),
-              SchemaError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageCorrupt({ cause })
-                  })
-                )
-            })
-          )
-        }))).pipe(
-          Effect.catchTag("SqlError", (cause) =>
-            Effect.fail(
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.StorageUnavailable({ cause })
+          const totals = (yield* findOutboxTotals({
+            replicaIncarnation: session.replicaIncarnation,
+            peerId: session.peerId,
+            connectionEpoch: session.connectionEpoch
+          }))[0]
+          const batchBytes = pendingRows.reduce((total, row) => total + row.message.byteLength, 0)
+          if ((totals?.bytes ?? 0) + batchBytes > limits.maxPendingBytesPerPeer) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.QuotaExceeded({
+                resource: "peer sync outbox bytes",
+                limit: limits.maxPendingBytesPerPeer
               })
-            ))
+            })
+          }
+          if ((totals?.count ?? 0) + pendingRows.length > limits.maxPendingChangesPerPeer) {
+            return yield* new ReplicaError.ReplicaError({
+              reason: new ReplicaError.QuotaExceeded({
+                resource: "peer sync outbox messages",
+                limit: limits.maxPendingChangesPerPeer
+              })
+            })
+          }
+          const sendSequence = (yield* findNextOutboxSequence({
+            replicaIncarnation: session.replicaIncarnation,
+            peerId: session.peerId,
+            connectionEpoch: session.connectionEpoch
+          }))[0]?.sequence ?? 0
+          const lineage = yield* documentLineage(reply.documentId)
+          const createdAt = new Date(yield* Clock.currentTimeMillis).toISOString()
+          const provenances = yield* loadWriterProvenanceBatch(
+            reply.documentId,
+            pendingRows.map((row) => row.message)
+          )
+          const outbounds = pendingRows.map((row, index) => {
+            const writerProvenance = provenances[index]!
+            return {
+              outbound: {
+                sendSequence: sendSequence + index,
+                documentId: reply.documentId,
+                message: row.message,
+                messageHash: row.message_hash,
+                heads: row.heads,
+                lineage,
+                writerProvenance,
+                receiptReplyId: row.row_id
+              } satisfies Outbound,
+              record: {
+                replica_incarnation: session.replicaIncarnation,
+                peer_id: session.peerId,
+                connection_epoch: session.connectionEpoch,
+                document_id: reply.documentId,
+                send_sequence: sendSequence + index,
+                message: row.message,
+                message_hash: row.message_hash,
+                heads: Schema.encodeSync(Heads)(row.heads),
+                status: "Pending",
+                created_at: createdAt,
+                writer_provenance: Schema.encodeSync(
+                  WriterProvenance.StoredChangeProvenances
+                )(writerProvenance),
+                lineage,
+                receipt_reply_id: row.row_id
+              }
+            }
+          })
+          yield* sql`INSERT INTO effect_local_peer_outbox ${sql.insert(outbounds.map((item) => item.record))}`
+          return outbounds[0]?.outbound ?? null
+        }))).pipe(
+          Effect.catchTags({
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageCorrupt({ cause })
+                })
+              ),
+            SqlError: (cause) =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({ cause })
+                })
+              )
+          })
         )
       }))
 
@@ -2472,7 +2731,14 @@ const make = (
                       })
                     }
                   })
-                const receiptRows = yield* loadReceipt().pipe(
+                const storedReceipt = yield* sql.withTransaction(Effect.gen(function*() {
+                  const receipt = (yield* loadReceipt())[0]
+                  if (receipt === undefined) return null
+                  return {
+                    receipt,
+                    replies: yield* findReceiptReplies(receipt.row_id)
+                  }
+                })).pipe(
                   Effect.catchTags({
                     SqlError: (cause) =>
                       Effect.fail(
@@ -2488,14 +2754,13 @@ const make = (
                       )
                   })
                 )
-                const receipt = receiptRows[0]
-                if (receipt !== undefined) {
-                  yield* validateStoredReceipt(receipt)
+                if (storedReceipt !== null) {
+                  yield* validateStoredReceipt(storedReceipt.receipt)
                   yield* quotaLock.withPermit(validateSessionGeneration(generation, sessionGeneration))
-                  if (receipt.checkpoint_transfer !== null) {
+                  if (storedReceipt.receipt.checkpoint_transfer !== null) {
                     yield* Effect.uninterruptible(removeDocumentState(documentId))
                   }
-                  return receivedFromReceipt(documentId, receipt)
+                  return receivedFromReceipt(documentId, storedReceipt.receipt, storedReceipt.replies)
                 }
                 if (checkpointTransfer !== undefined) {
                   return yield* installCheckpoint(
@@ -3147,7 +3412,28 @@ const make = (
                             })
                           })
                       })
-                      if (generated[1] !== null && generated[1].byteLength > limits.maxSyncMessageBytes) {
+                      const replyMessages = generated[1] === null
+                        ? []
+                        : yield* Effect.try({
+                          try: () =>
+                            SyncChunks.batchSyncMessage(generated[1]!, {
+                              maxChanges: Math.min(
+                                limits.maxSyncChangesPerMessage,
+                                PeerSyncEnvelope.maximumWriterProvenanceEntries
+                              ),
+                              maxBytes: limits.maxSyncMessageBytes,
+                              maxMessages: limits.maxPendingChangesPerPeer,
+                              maxTotalBytes: limits.maxPendingBytesPerPeer
+                            }),
+                          catch: (cause) =>
+                            new ReplicaError.ReplicaError({
+                              reason: new ReplicaError.ProtocolMismatch({
+                                expected: "batchable Automerge sync response",
+                                observed: String(cause)
+                              })
+                            })
+                        })
+                      if (replyMessages === null) {
                         return yield* new ReplicaError.ReplicaError({
                           reason: new ReplicaError.QuotaExceeded({
                             resource: "sync response bytes",
@@ -3228,7 +3514,11 @@ const make = (
                           const receipt = receiptRows[0]
                           if (receipt !== undefined) {
                             yield* validateStoredReceipt(receipt)
-                            return { _tag: "Duplicate" as const, received: receivedFromReceipt(documentId, receipt) }
+                            const replies = yield* findReceiptReplies(receipt.row_id)
+                            return {
+                              _tag: "Duplicate" as const,
+                              received: receivedFromReceipt(documentId, receipt, replies)
+                            }
                           }
                           const committedChanges = validationChanges.length === 0 ? [] : yield* findExistingChanges({
                             documentId,
@@ -3392,14 +3682,39 @@ const make = (
                               "Fresh"
                             )
                           }
-                          const reply = generated[1] === null
-                            ? null
-                            : {
-                              documentId,
-                              message: generated[1],
-                              messageHash: yield* digest(generated[1]),
-                              heads: materializedHeads
-                            }
+                          const replyBytes = replyMessages.reduce(
+                            (total, replyMessage) => total + replyMessage.byteLength,
+                            0
+                          )
+                          if (replyMessages.length > limits.maxPendingChangesPerPeer) {
+                            return yield* new ReplicaError.ReplicaError({
+                              reason: new ReplicaError.QuotaExceeded({
+                                resource: "peer sync outbox messages",
+                                limit: limits.maxPendingChangesPerPeer
+                              })
+                            })
+                          }
+                          if (replyBytes > limits.maxPendingBytesPerPeer) {
+                            return yield* new ReplicaError.ReplicaError({
+                              reason: new ReplicaError.QuotaExceeded({
+                                resource: "peer sync outbox bytes",
+                                limit: limits.maxPendingBytesPerPeer
+                              })
+                            })
+                          }
+                          const replyParts = yield* Effect.forEach(
+                            replyMessages,
+                            (replyMessage, replyIndex) =>
+                              Effect.gen(function*() {
+                                return {
+                                  replyIndex,
+                                  message: replyMessage,
+                                  messageHash: yield* digest(replyMessage),
+                                  heads: materializedHeads
+                                }
+                              })
+                          )
+                          const firstReply = replyParts[0]
                           const pendingMessage = unresolvedBytes === 0 ? null : message
                           const encodedWriterProvenance = Schema.encodeSync(
                             WriterProvenance.StoredChangeProvenances
@@ -3407,7 +3722,7 @@ const make = (
                           const relayRetainedSize = relay === undefined
                             ? null
                             : relay.encodedSize +
-                              (reply?.message.byteLength ?? 0) +
+                              replyParts.reduce((total, part) => total + part.message.byteLength, 0) +
                               (pendingMessage?.byteLength ?? 0) +
                               new TextEncoder().encode(encodedWriterProvenance).byteLength
                           yield* sql`INSERT INTO effect_local_peer_receipts (
@@ -3420,7 +3735,7 @@ const make = (
           ) VALUES (
             ${receiptSession.replicaIncarnation}, ${receiptSession.peerId}, ${receiptSession.connectionEpoch},
             ${receiveSequence},
-            ${documentId}, ${messageHash}, ${reply?.message ?? null}, ${reply?.messageHash ?? null},
+            ${documentId}, ${messageHash}, ${firstReply?.message ?? null}, ${firstReply?.messageHash ?? null},
             ${pendingMessage}, ${Schema.encodeSync(Heads)(materializedHeads)},
             ${Schema.encodeSync(Heads)(acceptedHeads)}, ${commitSequence}, ${acceptedAt},
             ${encodedWriterProvenance},
@@ -3429,6 +3744,51 @@ const make = (
             ${relay?.outerEnvelopeDigest ?? null}, ${relay?.receiptExpiresAt ?? null},
             ${relayRetainedSize}, ${checkpointTransfer ?? null}
           )`
+                          const insertedReceipt = (yield* loadReceipt())[0]
+                          if (insertedReceipt === undefined) {
+                            return yield* new ReplicaError.ReplicaError({
+                              reason: new ReplicaError.StorageCorrupt({
+                                cause: new Error("Inserted sync receipt is missing")
+                              })
+                            })
+                          }
+                          const insertedReplies = replyParts.length === 0
+                            ? []
+                            : yield* insertReceiptReplies(replyParts.map((part) => ({
+                              receipt_row_id: insertedReceipt.row_id,
+                              reply_index: part.replyIndex,
+                              document_id: documentId,
+                              message: part.message,
+                              message_hash: part.messageHash,
+                              heads: Schema.encodeSync(Heads)(part.heads),
+                              status: "Pending"
+                            })))
+                          if (insertedReplies.length !== replyParts.length) {
+                            return yield* new ReplicaError.ReplicaError({
+                              reason: new ReplicaError.StorageCorrupt({
+                                cause: new Error("Inserted sync receipt replies are missing")
+                              })
+                            })
+                          }
+                          const replyIds = new Map(
+                            insertedReplies.map((inserted) => [inserted.reply_index, inserted.row_id])
+                          )
+                          const fragments = replyParts.map((part) => ({
+                            receiptReplyId: replyIds.get(part.replyIndex)!,
+                            replyIndex: part.replyIndex,
+                            message: part.message,
+                            messageHash: part.messageHash,
+                            heads: part.heads
+                          }))
+                          const reply: Reply | null = fragments[0] === undefined
+                            ? null
+                            : {
+                              documentId,
+                              message: fragments[0].message,
+                              messageHash: fragments[0].messageHash,
+                              heads: fragments[0].heads,
+                              fragments
+                            }
                           if (relay !== undefined) {
                             yield* recordRelayReceiptUsage(
                               receiptSession.replicaIncarnation,
@@ -3551,6 +3911,12 @@ const make = (
                 AND peer_id = ${session.peerId}
                 AND connection_epoch = ${session.connectionEpoch}
                 AND relay_message_id IS NULL`
+              yield* sql`DELETE FROM effect_local_peer_receipt_replies AS reply
+              WHERE receipt_row_id IS NULL
+                AND NOT EXISTS (
+                  SELECT 1 FROM effect_local_peer_outbox AS outbox
+                  WHERE outbox.receipt_reply_id = reply.row_id AND outbox.status = 'Pending'
+                )`
               yield* Ref.update(generation, (current) => current + 1)
               yield* removeState(session)
             }))).pipe(Effect.catchTag("SqlError", (cause) =>
@@ -3595,7 +3961,8 @@ const make = (
                 writerProvenance: row.writer_provenance,
                 ...(row.checkpoint_transfer === null
                   ? {}
-                  : { checkpointTransfer: row.checkpoint_transfer })
+                  : { checkpointTransfer: row.checkpoint_transfer }),
+                ...(row.receipt_reply_id === null ? {} : { receiptReplyId: row.receipt_reply_id })
               }))
             ),
             Effect.catchTags({
@@ -3629,6 +3996,25 @@ const make = (
                 messageHash
               })
               if (rows.length === 0) return false
+              const receiptReplyId = rows[0]!.receipt_reply_id
+              if (receiptReplyId !== null) {
+                const marked = yield* markReceiptReplySent(receiptReplyId)
+                if (marked.length === 0) {
+                  return yield* new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.StorageCorrupt({
+                      cause: new Error(`Missing pending receipt reply ${receiptReplyId}`)
+                    })
+                  })
+                }
+                if (marked[0]!.receipt_row_id === null) {
+                  yield* sql`DELETE FROM effect_local_peer_receipt_replies AS reply
+                    WHERE row_id = ${receiptReplyId} AND receipt_row_id IS NULL
+                      AND NOT EXISTS (
+                        SELECT 1 FROM effect_local_peer_outbox AS outbox
+                        WHERE outbox.receipt_reply_id = reply.row_id AND outbox.status = 'Pending'
+                      )`
+                }
+              }
               yield* sql`DELETE FROM effect_local_peer_outbox
               WHERE replica_incarnation = ${session.replicaIncarnation}
                 AND peer_id = ${session.peerId}

@@ -38,7 +38,8 @@ const migrationCatalog = [
     name: "backup_document_installations",
     checksum: Migrations.backupDocumentInstallationsChecksum
   },
-  { migration_id: 14, name: "checkpoint_shipping", checksum: Migrations.checkpointShippingChecksum }
+  { migration_id: 14, name: "checkpoint_shipping", checksum: Migrations.checkpointShippingChecksum },
+  { migration_id: 15, name: "batched_sync_replies", checksum: Migrations.batchedSyncRepliesChecksum }
 ]
 
 const migrationsAfter = (appliedThroughId: number) =>
@@ -98,6 +99,9 @@ describe("Migrations", () => {
         "effect_local_peer_outbox_connection_status",
         "effect_local_peer_outbox_document_status",
         "effect_local_peer_outbox_incarnation_created",
+        "effect_local_peer_outbox_pending_receipt_reply",
+        "effect_local_peer_outbox_receipt_reply",
+        "effect_local_peer_receipt_replies_receipt_status",
         "effect_local_peer_receipts_direct_identity",
         "effect_local_peer_receipts_document_sequence",
         "effect_local_peer_receipts_incarnation_accepted",
@@ -290,6 +294,62 @@ describe("Migrations", () => {
         yield* sql`SELECT name FROM sqlite_master
           WHERE type = 'table' AND name = 'effect_local_lineage_transitions'`,
         []
+      )
+    }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
+
+  it.effect("backfills a legacy receipt reply into the ordered fragment ledger", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrator.make({})({
+        loader: Effect.map(Migrations.loader, (migrations) => migrations.slice(0, 13)),
+        table: "effect_local_migrations"
+      })
+      const reply = Uint8Array.of(1, 2, 3)
+      yield* sql`INSERT INTO effect_local_documents (
+        document_id, document_type, schema_version, observed_versions, materialized_heads,
+        accepted_heads, tombstone, projection_status, lineage
+      ) VALUES ('task-1', 'Task', 1, '[]', '[]', '[]', 0, 'Ready', ${Identity.genesisLineage})`
+      yield* sql`INSERT INTO effect_local_peer_receipts (
+        replica_incarnation, peer_id, connection_epoch, receive_sequence, document_id,
+        message_hash, reply, reply_hash, pending_message, heads, accepted_heads,
+        commit_sequence, accepted_at, writer_provenance
+      ) VALUES (
+        0, 'peer-1', 'remote-1', 0, 'task-1',
+        'incoming-hash', ${reply}, 'reply-hash', NULL, '["head-1"]', '[]',
+        1, '2026-01-01T00:00:00.000Z', '[]'
+      )`
+      yield* sql`INSERT INTO effect_local_peer_outbox (
+        replica_incarnation, peer_id, connection_epoch, document_id, send_sequence,
+        message, message_hash, heads, status, created_at, writer_provenance, lineage
+      ) VALUES (
+        0, 'peer-1', 'remote-1', 'task-1', 0,
+        ${reply}, 'reply-hash', '["head-1"]', 'Pending',
+        '2026-01-01T00:00:00.000Z', '[]', ${Identity.genesisLineage}
+      )`
+
+      assert.deepStrictEqual(yield* Migrations.run, migrationsAfter(13))
+      assert.deepStrictEqual(
+        yield* sql`SELECT
+          receipt_row_id, reply_index, document_id, message, message_hash, heads, status
+        FROM effect_local_peer_receipt_replies`,
+        [{
+          receipt_row_id: 1,
+          reply_index: 0,
+          document_id: "task-1",
+          message: reply,
+          message_hash: "reply-hash",
+          heads: "[\"head-1\"]",
+          status: "Pending"
+        }]
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT receipt_reply_id FROM effect_local_peer_outbox`,
+        [{ receipt_reply_id: 1 }]
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT name FROM pragma_table_info('effect_local_peer_outbox')
+          WHERE name = 'receipt_reply_id'`,
+        [{ name: "receipt_reply_id" }]
       )
     }).pipe(Effect.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))))
 

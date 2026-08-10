@@ -201,11 +201,10 @@ const drain = (documentId: Identity.DocumentId, left: Side, right: Side) =>
           packet.outbound.messageHash
         )
         if (received.reply !== null) {
-          pending.push({
-            from: packet.to,
-            outbound: yield* packet.to.sync.enqueue(packet.to.session, received.reply),
-            to: packet.from
-          })
+          const outbound = yield* packet.to.sync.enqueue(packet.to.session, received.reply)
+          if (outbound !== null) {
+            pending.push({ from: packet.to, outbound, to: packet.from })
+          }
         }
       }
       const [fromLeft, fromRight] = yield* Effect.all([

@@ -138,6 +138,32 @@ describe("PeerSync", () => {
   const StrictServices = Layer.mergeAll(StrictInfrastructure, StrictStoreService, Projections)
   const StrictSyncService = PeerSync.layer.pipe(Layer.provide(StrictServices))
   const StrictLayer = Layer.merge(StrictServices, StrictSyncService)
+  const BatchLimits = ReplicaLimits.layer({ ...limits, maxSyncChangesPerMessage: 2 })
+  const BatchInfrastructure = Layer.mergeAll(Base, Gate, BatchLimits)
+  const BatchStoreService = DocumentStore.layer.pipe(Layer.provide(BatchInfrastructure))
+  const BatchServices = Layer.mergeAll(BatchInfrastructure, BatchStoreService, Projections)
+  const BatchSyncService = PeerSync.layer.pipe(Layer.provide(BatchServices))
+  const BatchLayer = Layer.merge(BatchServices, BatchSyncService)
+  const ByteBatchLimits = ReplicaLimits.layer({ ...limits, maxSyncMessageBytes: 1_800 })
+  const ByteBatchInfrastructure = Layer.mergeAll(Base, Gate, ByteBatchLimits)
+  const ByteBatchStoreService = DocumentStore.layer.pipe(Layer.provide(ByteBatchInfrastructure))
+  const ByteBatchServices = Layer.mergeAll(ByteBatchInfrastructure, ByteBatchStoreService, Projections)
+  const ByteBatchSyncService = PeerSync.layer.pipe(Layer.provide(ByteBatchServices))
+  const ByteBatchLayer = Layer.merge(ByteBatchServices, ByteBatchSyncService)
+  const AtomicBatchLimits = ReplicaLimits.layer({
+    ...limits,
+    maxSyncChangesPerMessage: 2,
+    maxPendingChangesPerPeer: 2
+  })
+  const AtomicBatchInfrastructure = Layer.mergeAll(Base, Gate, AtomicBatchLimits)
+  const AtomicBatchStoreService = DocumentStore.layer.pipe(Layer.provide(AtomicBatchInfrastructure))
+  const AtomicBatchServices = Layer.mergeAll(
+    AtomicBatchInfrastructure,
+    AtomicBatchStoreService,
+    Projections
+  )
+  const AtomicBatchSyncService = PeerSync.layer.pipe(Layer.provide(AtomicBatchServices))
+  const AtomicBatchLayer = Layer.merge(AtomicBatchServices, AtomicBatchSyncService)
   const sourceLayer = (
     sourceLimits: ReplicaLimits.Values,
     filename = ":memory:"
@@ -575,6 +601,7 @@ describe("PeerSync", () => {
 
       const afterPrune = yield* sql<{
         readonly deleteTokens: number
+        readonly detachedReplies: number
         readonly directReceipts: number
         readonly relayReceipts: number
         readonly usageRows: number
@@ -583,10 +610,13 @@ describe("PeerSync", () => {
           WHERE relay_message_id IS NULL) AS directReceipts,
         (SELECT COUNT(*) FROM effect_local_peer_receipts
           WHERE relay_message_id IS NOT NULL) AS relayReceipts,
+        (SELECT COUNT(*) FROM effect_local_peer_receipt_replies
+          WHERE receipt_row_id IS NULL) AS detachedReplies,
         (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS usageRows,
         (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_delete_tokens) AS deleteTokens`
       assert.deepStrictEqual(afterPrune, [{
         deleteTokens: 0,
+        detachedReplies: 0,
         directReceipts: 1,
         relayReceipts: 0,
         usageRows: 0
@@ -670,6 +700,69 @@ describe("PeerSync", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(TightRelayTestLayer)))
 
+  it.effect("settles a detached reply fragment after its relay receipt expires", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const senderPeerId = yield* Identity.makePeerId
+      const relayPeerId = yield* Identity.makePeerId
+      const session = yield* sync.open(senderPeerId)
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      const remote = Automerge.init<InternalAutomerge.Root<{ title: string; labels: Array<string> }>>()
+      const message = Automerge.generateSyncMessage(remote, Automerge.initSyncState())[1]!
+      const messageHash = yield* Canonical.digest(message)
+      const received = yield* sync.receive(Task, documentId, session, {
+        remoteConnectionEpoch: "sender-epoch",
+        receiveSequence: 0,
+        lineage: Identity.genesisLineage,
+        message,
+        writerProvenance: [],
+        relay: {
+          relayMessageId: yield* Identity.makeRelayMessageId,
+          relayPeerId,
+          senderTenantId: "tenant",
+          senderSubjectId: "sender",
+          senderPeerId,
+          senderReplicaIncarnation: Identity.ReplicaIncarnation.make(1),
+          messageHash,
+          outerEnvelopeDigest: "a".repeat(64),
+          receiptExpiresAt: new Date(
+            (yield* Clock.currentTimeMillis) + PeerRelayReceiptLimits.defaults.receiptRetentionMillis
+          ).toISOString(),
+          encodedSize: message.byteLength
+        }
+      })
+      if (received.reply === null) return assert.fail("Expected a reply")
+      const outbound = yield* sync.enqueue(session, received.reply)
+      if (outbound === null) return assert.fail("Expected a pending reply fragment")
+
+      yield* sql`UPDATE effect_local_peer_receipts
+        SET relay_receipt_expires_at = '1970-01-01T00:00:00.000Z'
+        WHERE relay_message_id IS NOT NULL`
+      assert.strictEqual(yield* sync.pruneRelayReceipts!, 1)
+      assert.deepStrictEqual(
+        yield* sql`SELECT
+          (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts,
+          (SELECT COUNT(*) FROM effect_local_peer_receipt_replies
+            WHERE receipt_row_id IS NULL AND status = 'Pending') AS detachedPending,
+          (SELECT COUNT(*) FROM effect_local_peer_outbox
+            WHERE receipt_reply_id IS NOT NULL AND status = 'Pending') AS pendingOutbox`,
+        [{ receipts: 0, detachedPending: 1, pendingOutbox: 1 }]
+      )
+
+      assert.isTrue(yield* sync.markSent(session, outbound.sendSequence, outbound.messageHash))
+      assert.deepStrictEqual(
+        yield* sql`SELECT
+          (SELECT COUNT(*) FROM effect_local_peer_receipt_replies) AS replyFragments,
+          (SELECT COUNT(*) FROM effect_local_peer_outbox WHERE status = 'Sent') AS sentOutbox`,
+        [{ replyFragments: 0, sentOutbox: 1 }]
+      )
+      InternalAutomerge.free(remote)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(RelayTestLayer)))
+
   it.effect("persists inbound application and exact retransmission replies", () =>
     Effect.gen(function*() {
       const store = yield* DocumentStore.DocumentStore
@@ -702,7 +795,7 @@ describe("PeerSync", () => {
       if (received.reply !== null) {
         const next = Automerge.receiveSyncMessage(remote, remoteState, received.reply.message)
         remoteState = next[1]
-        const outbound = yield* sync.enqueue(session, received.reply)
+        const outbound = (yield* sync.enqueue(session, received.reply))!
         yield* sync.markSent(session, outbound.sendSequence, outbound.messageHash)
       }
       const nextGenerated = Automerge.generateSyncMessage(remote, remoteState)
@@ -763,22 +856,15 @@ describe("PeerSync", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(TestLayer)))
 
-  it.effect("enqueues a reply that batches several changes for a stale peer", () =>
+  it.effect("enqueues a bounded reply sequence for a stale peer", () =>
     Effect.gen(function*() {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
       const documentId = yield* Identity.makeDocumentId
       const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
 
-      // A first peer contributes a deep shared history, then two more changes on top of it, so
-      // this replica ends up holding exactly two changes a stale copy of that history lacks.
+      // A first peer contributes a deep shared history, then five more changes on top of it.
       let remote = Automerge.clone(created.automerge, { actor: "1".repeat(32) })
-      for (let index = 0; index < 8; index++) {
-        remote = Automerge.change(remote, (draft) => {
-          const value = draft.value as { title: string; labels: Array<string> }
-          value.labels.push(`base-${index}`)
-        })
-      }
       const firstPeer = yield* Identity.makePeerId
       const firstSession = yield* sync.open(firstPeer)
       let remoteState = Automerge.initSyncState()
@@ -802,22 +888,24 @@ describe("PeerSync", () => {
           }
         }
       })
-      yield* drain
+      for (let index = 0; index < 8; index++) {
+        remote = Automerge.change(remote, (draft) => {
+          const value = draft.value as { title: string; labels: Array<string> }
+          value.labels.push(`base-${index}`)
+        })
+        yield* drain
+      }
       const staleDocument = Automerge.clone(remote, { actor: "2".repeat(32) })
-      for (const label of ["from-remote-1", "from-remote-2"]) {
+      for (const label of Array.from({ length: 5 }, (_, index) => `from-remote-${index + 1}`)) {
         remote = Automerge.change(remote, (draft) => {
           const value = draft.value as { title: string; labels: Array<string> }
           value.labels.push(label)
         })
+        yield* drain
       }
-      yield* drain
 
-      // A peer holding the shared history but not the two newest changes announces itself. The
-      // reply must carry exactly those two changes, and automerge's v2 sync protocol
-      // concatenates them into one chunk - the shape every reply takes when the peer is more
-      // than one change behind, which is any peer that was offline while this replica kept
-      // committing. (A peer missing MORE than a third of the history gets a whole-document
-      // chunk instead, which decodes standalone.)
+      // A peer holding the shared history but not the newest changes announces itself. The reply
+      // exceeds the configured two-change wire budget.
       const stalePeer = yield* Identity.makePeerId
       const staleSession = yield* sync.open(stalePeer)
       const [, announce] = Automerge.generateSyncMessage(staleDocument, Automerge.initSyncState())
@@ -831,15 +919,180 @@ describe("PeerSync", () => {
       })
       assert.isNotNull(received.reply)
       const outbound = yield* sync.enqueue(staleSession, received.reply!)
-      assert.isAtLeast(
-        outbound.writerProvenance.length,
-        2,
-        "the batched reply's provenance covers every change it carries"
+      assert.isNotNull(outbound)
+      const fragmentCount = received.reply!.fragments?.length ?? 0
+      assert.isAbove(fragmentCount, 1)
+      const pending = yield* sync.pending(staleSession)
+      assert.strictEqual(pending.length, fragmentCount)
+      assert.deepStrictEqual(
+        pending.map((item) => item.sendSequence),
+        Array.from({ length: fragmentCount }, (_, index) => index)
       )
+      assert.isTrue(pending.every((item) => item.writerProvenance.length <= 2))
+      yield* sync.markSent(staleSession, pending[0]!.sendSequence, pending[0]!.messageHash)
+      yield* sync.markSent(staleSession, pending[1]!.sendSequence, pending[1]!.messageHash)
+      const duplicate = yield* sync.receive(Task, documentId, staleSession, {
+        remoteConnectionEpoch: staleSession.connectionEpoch,
+        receiveSequence: 0,
+        lineage: Identity.genesisLineage,
+        message: announce!,
+        writerProvenance: provenanceFor(announce!)
+      })
+      assert.isTrue(duplicate.duplicate)
+      assert.deepStrictEqual(duplicate.reply?.fragments, received.reply?.fragments)
+      const remaining = yield* sync.enqueue(staleSession, duplicate.reply!)
+      assert.strictEqual(remaining?.sendSequence, 2)
+      assert.deepStrictEqual(
+        (yield* sync.pending(staleSession)).map((item) => item.sendSequence),
+        Array.from({ length: fragmentCount - 2 }, (_, index) => index + 2)
+      )
+      let stale = staleDocument
+      let staleState = Automerge.initSyncState()
+      for (const item of pending) {
+        const applied = Automerge.receiveSyncMessage(stale, staleState, item.message)
+        stale = applied[0]
+        staleState = applied[1]
+      }
+      assert.deepStrictEqual(new Set(Automerge.getHeads(stale)), new Set(Automerge.getHeads(remote)))
       Automerge.free(remote)
-      Automerge.free(staleDocument)
+      Automerge.free(stale)
       InternalAutomerge.free(created.automerge)
-    }).pipe(Effect.provide(TestLayer)))
+    }).pipe(Effect.provide(BatchLayer)))
+
+  it.effect("rolls back every fragment when a reply batch exceeds outbox quota", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      let source = Automerge.clone(created.automerge, { actor: "1".repeat(32) })
+      let sourceState = Automerge.initSyncState()
+      const sourceSession = yield* sync.open(yield* Identity.makePeerId)
+      let receiveSequence = 0
+      const drain = Effect.gen(function*() {
+        for (let attempt = 0; attempt < 10; attempt++) {
+          const generated = Automerge.generateSyncMessage(source, sourceState)
+          sourceState = generated[0]
+          if (generated[1] === null) return
+          const received = yield* sync.receive(Task, documentId, sourceSession, {
+            remoteConnectionEpoch: sourceSession.connectionEpoch,
+            receiveSequence: receiveSequence++,
+            lineage: Identity.genesisLineage,
+            message: generated[1],
+            writerProvenance: provenanceFor(generated[1])
+          })
+          if (received.reply !== null) {
+            const advanced = Automerge.receiveSyncMessage(source, sourceState, received.reply.message)
+            source = advanced[0]
+            sourceState = advanced[1]
+          }
+        }
+        return assert.fail("Source sync did not settle")
+      })
+      for (let index = 0; index < 5; index++) {
+        source = Automerge.change(source, (draft) => {
+          ;(draft.value as unknown as { labels: Array<string> }).labels.push(`change-${index}`)
+        })
+        yield* drain
+      }
+
+      const stale = Automerge.init<InternalAutomerge.Root<{ title: string; labels: Array<string> }>>()
+      const announcement = Automerge.generateSyncMessage(stale, Automerge.initSyncState())[1]!
+      const staleSession = yield* sync.open(yield* Identity.makePeerId)
+      const error = yield* Effect.flip(sync.receive(Task, documentId, staleSession, {
+        remoteConnectionEpoch: staleSession.connectionEpoch,
+        receiveSequence: 0,
+        lineage: Identity.genesisLineage,
+        message: announcement,
+        writerProvenance: []
+      }))
+      assert.strictEqual(error.reason._tag, "QuotaExceeded")
+      assert.deepStrictEqual(
+        yield* sql`SELECT
+          (SELECT COUNT(*) FROM effect_local_peer_outbox
+            WHERE peer_id = ${staleSession.peerId}) AS outbox,
+          (SELECT COUNT(*) FROM effect_local_peer_receipts
+            WHERE peer_id = ${staleSession.peerId}) AS receipts,
+          (SELECT COUNT(*) FROM effect_local_peer_receipt_replies AS reply
+            JOIN effect_local_peer_receipts AS receipt ON receipt.row_id = reply.receipt_row_id
+            WHERE receipt.peer_id = ${staleSession.peerId}) AS replyFragments`,
+        [{ outbox: 0, receipts: 0, replyFragments: 0 }]
+      )
+      InternalAutomerge.free(stale)
+      InternalAutomerge.free(source)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(AtomicBatchLayer)))
+
+  it.effect("splits generated replies by encoded byte size through the production sync path", () =>
+    Effect.gen(function*() {
+      const store = yield* DocumentStore.DocumentStore
+      const sync = yield* PeerSync.PeerSync
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "one", labels: [] })
+      let source = Automerge.clone(created.automerge, { actor: "3".repeat(32) })
+      let sourceState = Automerge.initSyncState()
+      const sourceSession = yield* sync.open(yield* Identity.makePeerId)
+      let receiveSequence = 0
+      const drain = Effect.gen(function*() {
+        for (let attempt = 0; attempt < 10; attempt++) {
+          const generated = Automerge.generateSyncMessage(source, sourceState)
+          sourceState = generated[0]
+          if (generated[1] === null) return
+          const received = yield* sync.receive(Task, documentId, sourceSession, {
+            remoteConnectionEpoch: sourceSession.connectionEpoch,
+            receiveSequence: receiveSequence++,
+            lineage: Identity.genesisLineage,
+            message: generated[1],
+            writerProvenance: provenanceFor(generated[1])
+          })
+          if (received.reply !== null) {
+            const advanced = Automerge.receiveSyncMessage(source, sourceState, received.reply.message)
+            source = advanced[0]
+            sourceState = advanced[1]
+          }
+        }
+        return assert.fail("Source sync did not settle")
+      })
+      for (let index = 0; index < 3; index++) {
+        let seed = index + 1
+        const label = Array.from({ length: 900 }, () => {
+          seed = (seed * 1_664_525 + 1_013_904_223) >>> 0
+          return String.fromCharCode(33 + seed % 90)
+        }).join("")
+        source = Automerge.change(source, (draft) => {
+          ;(draft.value as unknown as { labels: Array<string> }).labels.push(label)
+        })
+        yield* drain
+      }
+
+      let stale = Automerge.init<InternalAutomerge.Root<{ title: string; labels: Array<string> }>>()
+      let staleState = Automerge.initSyncState()
+      const announcement = Automerge.generateSyncMessage(stale, staleState)
+      staleState = announcement[0]
+      const staleSession = yield* sync.open(yield* Identity.makePeerId)
+      const received = yield* sync.receive(Task, documentId, staleSession, {
+        remoteConnectionEpoch: staleSession.connectionEpoch,
+        receiveSequence: 0,
+        lineage: Identity.genesisLineage,
+        message: announcement[1]!,
+        writerProvenance: []
+      })
+      if (received.reply === null) return assert.fail("Expected a byte bounded reply")
+      yield* sync.enqueue(staleSession, received.reply)
+      const pending = yield* sync.pending(staleSession)
+      assert.isAbove(pending.length, 1)
+      assert.isTrue(pending.every((outbound) => outbound.message.byteLength <= 1_800))
+      for (const outbound of pending) {
+        const advanced = Automerge.receiveSyncMessage(stale, staleState, outbound.message)
+        stale = advanced[0]
+        staleState = advanced[1]
+      }
+      assert.deepStrictEqual(new Set(Automerge.getHeads(stale)), new Set(Automerge.getHeads(source)))
+      InternalAutomerge.free(stale)
+      InternalAutomerge.free(source)
+      InternalAutomerge.free(created.automerge)
+    }).pipe(Effect.provide(ByteBatchLayer)))
 
   it.effect(
     "rejects cumulative source changes, operations and bytes atomically and recovers",
@@ -1206,7 +1459,7 @@ describe("PeerSync", () => {
         writerProvenance: []
       })
       assert.isNotNull(received.reply)
-      const outbound = yield* sync.enqueue(session, received.reply!)
+      const outbound = (yield* sync.enqueue(session, received.reply!))!
       assert.deepStrictEqual(
         outbound.writerProvenance,
         provenanceFor(outbound.message, Task.version, definition.hash)
@@ -1464,7 +1717,7 @@ describe("PeerSync", () => {
         writerProvenance: provenanceFor(message, Task.version, definition.hash)
       })
       assert.isNotNull(first.reply)
-      const firstOutbound = yield* sync.enqueue(firstSession, first.reply!)
+      const firstOutbound = (yield* sync.enqueue(firstSession, first.reply!))!
       const secondSession = yield* sync.open(peerId)
       const replayed = yield* sync.receive(Task, documentId, secondSession, {
         remoteConnectionEpoch: "stable-remote-epoch",
@@ -1475,7 +1728,7 @@ describe("PeerSync", () => {
       })
       assert.isTrue(replayed.duplicate)
       assert.isNotNull(replayed.reply)
-      const secondOutbound = yield* sync.enqueue(secondSession, replayed.reply!)
+      const secondOutbound = (yield* sync.enqueue(secondSession, replayed.reply!))!
       assert.notStrictEqual(firstSession.connectionEpoch, secondSession.connectionEpoch)
       assert.strictEqual(firstOutbound.sendSequence, 0)
       assert.strictEqual(secondOutbound.sendSequence, 0)
@@ -1484,6 +1737,13 @@ describe("PeerSync", () => {
       `
       assert.strictEqual(rows.length, 2)
       assert.deepStrictEqual(rows.map((row) => row.send_sequence), [0, 0])
+      assert.isTrue(yield* sync.markSent(firstSession, firstOutbound.sendSequence, firstOutbound.messageHash))
+      yield* sync.reset({
+        peerId,
+        connectionEpoch: "stable-remote-epoch",
+        replicaIncarnation: firstSession.replicaIncarnation
+      })
+      assert.isTrue(yield* sync.markSent(secondSession, secondOutbound.sendSequence, secondOutbound.messageHash))
       InternalAutomerge.free(remote)
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(TestLayer)))
@@ -1649,7 +1909,7 @@ describe("PeerSync", () => {
           writerProvenance: provenanceFor(message, Task.version, definition.hash)
         })
         if (received.reply !== null) {
-          const outbound = yield* sync.enqueue(session, received.reply)
+          const outbound = (yield* sync.enqueue(session, received.reply))!
           yield* sync.markSent(session, outbound.sendSequence, outbound.messageHash)
         }
       }
@@ -1682,7 +1942,7 @@ describe("PeerSync", () => {
           writerProvenance: provenanceFor(message, Task.version, definition.hash)
         })
         if (received.reply !== null) {
-          const outbound = yield* sync.enqueue(session, received.reply)
+          const outbound = (yield* sync.enqueue(session, received.reply))!
           yield* sync.markSent(session, outbound.sendSequence, outbound.messageHash)
         }
       }
@@ -1715,7 +1975,7 @@ describe("PeerSync", () => {
           writerProvenance: provenanceFor(message, Task.version, definition.hash)
         })
         if (received.reply !== null) {
-          const outbound = yield* sync.enqueue(session, received.reply)
+          const outbound = (yield* sync.enqueue(session, received.reply))!
           yield* sync.markSent(session, outbound.sendSequence, outbound.messageHash)
         }
       }
@@ -2434,7 +2694,7 @@ describe("PeerSync", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(TestLayer)))
 
-  it.effect("preserves valid durable outbox and receipts when the sync service restarts", () =>
+  it.effect("preserves a fresh outbox when its older receipt expires during restart", () =>
     Effect.gen(function*() {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
@@ -2452,12 +2712,16 @@ describe("PeerSync", () => {
         writerProvenance: []
       })
       assert.isNotNull(received.reply)
-      const generated = yield* sync.enqueue(session, received.reply!)
+      const generated = (yield* sync.enqueue(session, received.reply!))!
       assert.isAbove(generated.writerProvenance.length, 0)
       assert.deepStrictEqual(
         generated.writerProvenance,
         provenanceFor(generated.message, Task.version, definition.hash)
       )
+      yield* TestClock.setTime(limits.maxPendingAgeMillis + 1)
+      yield* sql`UPDATE effect_local_peer_receipts SET accepted_at = '1970-01-01T00:00:00.000Z'`
+      yield* sql`UPDATE effect_local_peer_outbox
+        SET created_at = '9999-12-31T23:59:59.999Z'`
       yield* Effect.scoped(
         Effect.gen(function*() {
           const restarted = yield* PeerSync.PeerSync
@@ -2465,11 +2729,28 @@ describe("PeerSync", () => {
           assert.strictEqual(pending.length, 1)
           assert.strictEqual(pending[0]?.messageHash, generated.messageHash)
           assert.deepStrictEqual(pending[0]?.writerProvenance, generated.writerProvenance)
-          const rows = yield* sql<{ readonly outbox: number; readonly receipts: number }>`SELECT
+          const rows = yield* sql<{
+            readonly detachedFragments: number
+            readonly outbox: number
+            readonly receipts: number
+          }>`SELECT
             (SELECT COUNT(*) FROM effect_local_peer_outbox) AS outbox,
-            (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts`
-          assert.deepStrictEqual(rows, [{ outbox: 1, receipts: 1 }])
-        }).pipe(Effect.provide(PeerSync.layer))
+            (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts,
+            (SELECT COUNT(*) FROM effect_local_peer_receipt_replies
+              WHERE receipt_row_id IS NULL) AS detachedFragments`
+          assert.deepStrictEqual(rows, [{ detachedFragments: 1, outbox: 1, receipts: 0 }])
+          assert.isTrue(
+            yield* restarted.markSent(
+              session,
+              pending[0]!.sendSequence,
+              pending[0]!.messageHash
+            )
+          )
+          assert.deepStrictEqual(
+            yield* sql`SELECT COUNT(*) AS count FROM effect_local_peer_receipt_replies`,
+            [{ count: 0 }]
+          )
+        }).pipe(Effect.provide(Layer.fresh(PeerSync.layer)))
       )
       InternalAutomerge.free(remote)
       InternalAutomerge.free(created.automerge)
@@ -3398,12 +3679,12 @@ describe("PeerSync", () => {
 
         yield* Deferred.await(loadStarted)
 
-        const enqueued = yield* sync.enqueue(session, {
+        const enqueued = (yield* sync.enqueue(session, {
           documentId,
           message: syncMessage!,
           messageHash,
           heads: created.materializedHeads
-        })
+        }))!
 
         yield* Deferred.succeed(releaseLoad, undefined)
         const generated = yield* Fiber.join(generating)
@@ -4275,11 +4556,10 @@ describe("PeerSync", () => {
               packet.outbound.messageHash
             )
             if (received.reply !== null) {
-              pending.push({
-                from: packet.to,
-                outbound: yield* packet.to.sync.enqueue(packet.to.session, received.reply),
-                to: packet.from
-              })
+              const enqueued = yield* packet.to.sync.enqueue(packet.to.session, received.reply)
+              if (enqueued !== null) {
+                pending.push({ from: packet.to, outbound: enqueued, to: packet.from })
+              }
             }
           }
           const [fromSender, fromRecipient] = yield* Effect.all([

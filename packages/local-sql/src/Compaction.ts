@@ -1372,6 +1372,7 @@ export const layer: Layer.Layer<
           yield* sql`DELETE FROM effect_local_changes WHERE document_id = ${documentId}`
           yield* sql`DELETE FROM effect_local_checkpoints WHERE document_id = ${documentId}`
           yield* sql`DELETE FROM effect_local_peer_outbox WHERE document_id = ${documentId}`
+          yield* sql`DELETE FROM effect_local_peer_receipt_replies WHERE document_id = ${documentId}`
           // Relay receipts are quota reservations as well as duplicate evidence. Decrement each
           // exact sender reservation before deleting its expired receipts. Any mismatch fails the
           // transaction, which restores the document root, receipts, and usage together.

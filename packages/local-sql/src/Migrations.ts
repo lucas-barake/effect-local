@@ -25,6 +25,7 @@ export const commandDeliveryChecksum = "sha256:effect-local-command-delivery-v1"
 export const documentHistoryCountersChecksum = "sha256:effect-local-document-history-counters-v1"
 export const backupDocumentInstallationsChecksum = "sha256:effect-local-backup-document-installations-v1"
 export const checkpointShippingChecksum = "sha256:effect-local-checkpoint-shipping-v1"
+export const batchedSyncRepliesChecksum = "sha256:effect-local-batched-sync-replies-v3"
 
 const migration = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
@@ -1130,6 +1131,116 @@ const checkpointShippingMigration = Effect.gen(function*() {
     VALUES (14, 'checkpoint_shipping', ${checkpointShippingChecksum})`
 })
 
+const batchedSyncRepliesMigration = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`CREATE TABLE effect_local_peer_receipt_replies (
+    row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    receipt_row_id INTEGER REFERENCES effect_local_peer_receipts(row_id) ON DELETE SET NULL,
+    reply_index INTEGER NOT NULL CHECK(reply_index >= 0),
+    document_id TEXT NOT NULL REFERENCES effect_local_documents(document_id) ON DELETE CASCADE,
+    message BLOB NOT NULL,
+    message_hash TEXT NOT NULL,
+    heads TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('Pending', 'Sent')),
+    UNIQUE(receipt_row_id, reply_index)
+  )`
+  yield* sql`INSERT INTO effect_local_peer_receipt_replies (
+    receipt_row_id, reply_index, document_id, message, message_hash, heads, status
+  )
+  SELECT row_id, 0, document_id, reply, reply_hash, heads, 'Pending'
+  FROM effect_local_peer_receipts
+  WHERE reply IS NOT NULL AND reply_hash IS NOT NULL`
+  yield* sql`CREATE INDEX effect_local_peer_receipt_replies_receipt_status
+    ON effect_local_peer_receipt_replies(receipt_row_id, status, reply_index)`
+  yield* sql`ALTER TABLE effect_local_peer_outbox ADD COLUMN receipt_reply_id INTEGER`
+  yield* sql`CREATE INDEX effect_local_migration_15_receipt_match
+    ON effect_local_peer_receipts(
+      replica_incarnation, peer_id, document_id, reply_hash, row_id
+    ) WHERE reply IS NOT NULL AND reply_hash IS NOT NULL`
+  yield* sql`CREATE INDEX effect_local_migration_15_outbox_match
+    ON effect_local_peer_outbox(
+      replica_incarnation, peer_id, document_id, message_hash,
+      connection_epoch, send_sequence, status
+    )`
+  yield* sql`CREATE TEMP TABLE effect_local_migration_15_reply_matches (
+    replica_incarnation INTEGER NOT NULL,
+    peer_id TEXT NOT NULL,
+    connection_epoch TEXT NOT NULL,
+    send_sequence INTEGER NOT NULL,
+    reply_row_id INTEGER NOT NULL,
+    outbox_status TEXT NOT NULL,
+    PRIMARY KEY(replica_incarnation, peer_id, connection_epoch, send_sequence)
+  )`
+  yield* sql`INSERT INTO effect_local_migration_15_reply_matches
+    SELECT outbox.replica_incarnation, outbox.peer_id, outbox.connection_epoch,
+      outbox.send_sequence, MIN(reply.row_id), outbox.status
+    FROM effect_local_peer_outbox AS outbox
+    JOIN effect_local_peer_receipts AS receipt
+      ON receipt.replica_incarnation = outbox.replica_incarnation
+      AND receipt.peer_id = outbox.peer_id
+      AND receipt.document_id = outbox.document_id
+      AND receipt.reply_hash = outbox.message_hash
+    JOIN effect_local_peer_receipt_replies AS reply ON reply.receipt_row_id = receipt.row_id
+    GROUP BY outbox.replica_incarnation, outbox.peer_id, outbox.connection_epoch,
+      outbox.send_sequence, outbox.status`
+  yield* sql`CREATE TEMP TABLE effect_local_migration_15_reply_coverage (
+    reply_row_id INTEGER PRIMARY KEY,
+    has_sent INTEGER NOT NULL
+  )`
+  yield* sql`INSERT INTO effect_local_migration_15_reply_coverage
+    SELECT reply.row_id, MAX(outbox.status = 'Sent')
+    FROM effect_local_peer_receipt_replies AS reply
+    JOIN effect_local_peer_receipts AS receipt ON receipt.row_id = reply.receipt_row_id
+    JOIN effect_local_peer_outbox AS outbox
+      ON outbox.replica_incarnation = receipt.replica_incarnation
+      AND outbox.peer_id = receipt.peer_id
+      AND outbox.document_id = receipt.document_id
+      AND outbox.message_hash = reply.message_hash
+    GROUP BY reply.row_id`
+  yield* sql`UPDATE effect_local_peer_receipt_replies AS reply
+    SET status = 'Sent'
+    WHERE EXISTS (
+      SELECT 1 FROM effect_local_migration_15_reply_coverage AS coverage
+      WHERE coverage.reply_row_id = reply.row_id
+        AND (
+          coverage.has_sent = 1 OR reply.row_id NOT IN (
+            SELECT reply_row_id FROM effect_local_migration_15_reply_matches
+            WHERE outbox_status = 'Pending'
+          )
+        )
+    )`
+  yield* sql`UPDATE effect_local_peer_outbox AS outbox
+    SET receipt_reply_id = (
+      SELECT match.reply_row_id
+      FROM effect_local_migration_15_reply_matches AS match
+      WHERE match.replica_incarnation = outbox.replica_incarnation
+        AND match.peer_id = outbox.peer_id
+        AND match.connection_epoch = outbox.connection_epoch
+        AND match.send_sequence = outbox.send_sequence
+    )
+    WHERE EXISTS (
+      SELECT 1 FROM effect_local_migration_15_reply_matches AS match
+      WHERE match.replica_incarnation = outbox.replica_incarnation
+        AND match.peer_id = outbox.peer_id
+        AND match.connection_epoch = outbox.connection_epoch
+        AND match.send_sequence = outbox.send_sequence
+    )`
+  yield* sql`DROP TABLE effect_local_migration_15_reply_coverage`
+  yield* sql`DROP TABLE effect_local_migration_15_reply_matches`
+  yield* sql`DROP INDEX effect_local_migration_15_outbox_match`
+  yield* sql`DROP INDEX effect_local_migration_15_receipt_match`
+  yield* sql`CREATE UNIQUE INDEX effect_local_peer_outbox_receipt_reply
+    ON effect_local_peer_outbox(
+      replica_incarnation, peer_id, connection_epoch, receipt_reply_id
+    )
+    WHERE receipt_reply_id IS NOT NULL`
+  yield* sql`CREATE INDEX effect_local_peer_outbox_pending_receipt_reply
+    ON effect_local_peer_outbox(receipt_reply_id)
+    WHERE status = 'Pending'`
+  yield* sql`INSERT INTO effect_local_migration_catalog (migration_id, name, checksum)
+    VALUES (15, 'batched_sync_replies', ${batchedSyncRepliesChecksum})`
+})
+
 export const loader = Migrator.fromRecord({
   "1_canonical_store": migration,
   "2_peer_sync": peerSyncMigration,
@@ -1144,7 +1255,8 @@ export const loader = Migrator.fromRecord({
   "11_command_delivery": commandDeliveryMigration,
   "12_document_history_counters": documentHistoryCountersMigration,
   "13_backup_document_installations": backupDocumentInstallationsMigration,
-  "14_checkpoint_shipping": checkpointShippingMigration
+  "14_checkpoint_shipping": checkpointShippingMigration,
+  "15_batched_sync_replies": batchedSyncRepliesMigration
 })
 
 const migrate = Migrator.make({})({ loader, table: "effect_local_migrations" })
@@ -1216,6 +1328,12 @@ export const run = Effect.gen(function*() {
       name: "checkpoint_shipping",
       checksum: checkpointShippingChecksum,
       label: "Checkpoint shipping"
+    },
+    {
+      id: 15,
+      name: "batched_sync_replies",
+      checksum: batchedSyncRepliesChecksum,
+      label: "Batched sync replies"
     }
   ] as const
   // One transaction over migrate + validation so a rejected catalog rolls back

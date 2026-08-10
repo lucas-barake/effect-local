@@ -987,6 +987,11 @@ describe("Compaction", () => {
           ${relayMessageId}, ${"e".repeat(64)}, ${"1970-01-01T00:00:00.000Z"}, ${encodedSize}
         )`
       }
+      yield* sql`INSERT INTO effect_local_peer_receipt_replies (
+        receipt_row_id, reply_index, document_id, message, message_hash, heads, status
+      )
+      SELECT row_id, 0, document_id, ${new Uint8Array([5])}, message_hash, heads, 'Pending'
+      FROM effect_local_peer_receipts`
       yield* sql`INSERT INTO effect_local_peer_relay_receipt_usage (
         replica_incarnation, sender_tenant_id, sender_subject_id, sender_peer_id,
         receipt_count, encoded_bytes
@@ -1012,6 +1017,11 @@ describe("Compaction", () => {
         (yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM effect_local_peer_receipts`)[0]!.count,
         3
       )
+      assert.strictEqual(
+        (yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_peer_receipt_replies`)[0]!.count,
+        3
+      )
       assert.strictEqual((yield* documentRowOf(documentId)).lineage, "")
 
       yield* sql`DROP TRIGGER fail_target_relay_receipt_delete`
@@ -1025,6 +1035,11 @@ describe("Compaction", () => {
           document_id: survivorDocumentId,
           relay_encoded_size: 80
         }]
+      )
+      assert.deepStrictEqual(
+        yield* sql`SELECT document_id, receipt_row_id
+          FROM effect_local_peer_receipt_replies`,
+        [{ document_id: survivorDocumentId, receipt_row_id: 3 }]
       )
       assert.deepStrictEqual(
         yield* sql`SELECT sender_subject_id, sender_peer_id, receipt_count, encoded_bytes

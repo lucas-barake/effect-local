@@ -33,7 +33,8 @@ const migrationCatalog = [
     name: "backup_document_installations",
     checksum: Migrations.backupDocumentInstallationsChecksum
   },
-  { migration_id: 14, name: "checkpoint_shipping", checksum: Migrations.checkpointShippingChecksum }
+  { migration_id: 14, name: "checkpoint_shipping", checksum: Migrations.checkpointShippingChecksum },
+  { migration_id: 15, name: "batched_sync_replies", checksum: Migrations.batchedSyncRepliesChecksum }
 ]
 
 const migrationsAfter = (appliedThroughId: number) =>
