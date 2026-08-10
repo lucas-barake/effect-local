@@ -1324,22 +1324,7 @@ const make = (
               connectionEpoch: session.connectionEpoch,
               documentId: reply.documentId,
               messageHash: reply.messageHash
-            }).pipe(
-              Effect.catchTags({
-                SqlError: (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageUnavailable({ cause })
-                    })
-                  ),
-                SchemaError: (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageCorrupt({ cause })
-                    })
-                  )
-              })
-            )
+            })
             const existing = rows[0]
             if (existing !== undefined) {
               return {
@@ -1353,22 +1338,7 @@ const make = (
                 ...(existing.receipt_reply_id === null ? {} : { receiptReplyId: existing.receipt_reply_id })
               }
             }
-            return yield* persistOutbound(session, reply.documentId, reply.message, reply.heads).pipe(
-              Effect.catchTags({
-                SqlError: (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageUnavailable({ cause })
-                    })
-                  ),
-                SchemaError: (cause) =>
-                  Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.StorageCorrupt({ cause })
-                    })
-                  )
-              })
-            )
+            return yield* persistOutbound(session, reply.documentId, reply.message, reply.heads)
           }
 
           const fragments = [...reply.fragments].toSorted((left, right) => left.replyIndex - right.replyIndex)
@@ -1382,22 +1352,7 @@ const make = (
               reason: new ReplicaError.StorageCorrupt({ cause: new Error("Invalid receipt reply batch") })
             })
           }
-          const stored = yield* findReceiptRepliesById(fragments.map((fragment) => fragment.receiptReplyId)).pipe(
-            Effect.catchTags({
-              SqlError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageUnavailable({ cause })
-                  })
-                ),
-              SchemaError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageCorrupt({ cause })
-                  })
-                )
-            })
-          )
+          const stored = yield* findReceiptRepliesById(fragments.map((fragment) => fragment.receiptReplyId))
           if (stored.length !== fragments.length) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({ cause: new Error("Missing receipt reply") })
@@ -1424,22 +1379,7 @@ const make = (
             peerId: session.peerId,
             connectionEpoch: session.connectionEpoch,
             receiptReplyIds: pendingRows.map((row) => row.row_id)
-          }).pipe(
-            Effect.catchTags({
-              SqlError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageUnavailable({ cause })
-                  })
-                ),
-              SchemaError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageCorrupt({ cause })
-                  })
-                )
-            })
-          )
+          })
           if (existing.length !== 0 && existing.length !== pendingRows.length) {
             return yield* new ReplicaError.ReplicaError({
               reason: new ReplicaError.StorageCorrupt({ cause: new Error("Partial receipt reply outbox batch") })
