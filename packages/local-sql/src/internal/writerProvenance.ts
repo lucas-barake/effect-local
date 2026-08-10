@@ -34,14 +34,16 @@ export type ChangeProvenance = typeof ChangeProvenance.Type
 export const ChangeProvenances = Schema.Array(ChangeProvenance)
 export const StoredChangeProvenances = Schema.fromJsonString(ChangeProvenances)
 
+export const CheckpointBase = Schema.TaggedUnion({
+  Bootstrap: {},
+  Heads: { baseHeads: Conflict.Heads }
+})
+
 export const CompactCheckpointProvenance = Schema.TaggedStruct("Compact", {
   checkpointHash: ChangeHash,
   lineage: Identity.DocumentLineage,
   heads: Conflict.Heads,
-  base: Schema.Union([
-    Schema.TaggedStruct("Bootstrap", {}),
-    Schema.TaggedStruct("Heads", { baseHeads: Conflict.Heads })
-  ]),
+  base: CheckpointBase,
   schemaVersion: WriterSchemaVersion,
   writerDefinitionHash: WriterDefinitionHash,
   authorization: Schema.Uint8ArrayFromBase64.check(
