@@ -1,7 +1,7 @@
-import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as SchemaAST from "effect/SchemaAST"
 import * as Canonical from "./Canonical.js"
+import { throwTypeError } from "./internal/throwTypeError.js"
 
 export type Descriptor =
   | string
@@ -45,7 +45,7 @@ const fromSymbol = (value: symbol): Descriptor => {
   if (globalKey !== undefined) return { _tag: "GlobalSymbol", key: globalKey }
   const wellKnown = wellKnownSymbols.get(value)
   if (wellKnown !== undefined) return { _tag: "WellKnownSymbol", name: wellKnown }
-  return Effect.runSync(Effect.die(new TypeError("Schema descriptors cannot represent local symbols")))
+  return throwTypeError("Schema descriptors cannot represent local symbols")
 }
 
 const fromPropertyKey = (value: PropertyKey): Descriptor => {
@@ -78,12 +78,12 @@ const fromUnknown = (value: unknown, state: State): Descriptor => {
     case "symbol":
       return fromSymbol(value)
     case "function":
-      Effect.runSync(Effect.die(new TypeError("Schema descriptors cannot represent functions")))
+      throwTypeError("Schema descriptors cannot represent functions")
   }
   if (SchemaAST.isAST(value)) return fromAST(value, state, false)
   if (value instanceof RegExp) {
     if (value.global || value.sticky) {
-      Effect.runSync(Effect.die(new TypeError("Schema descriptors cannot represent stateful regular expressions")))
+      throwTypeError("Schema descriptors cannot represent stateful regular expressions")
     }
     return { _tag: "RegExp", source: value.source, flags: value.flags }
   }
@@ -99,39 +99,31 @@ const fromUnknown = (value: unknown, state: State): Descriptor => {
   if (completed !== undefined) return completed
   state.unknownAncestors.set(value, state.unknownStack.length)
   state.unknownStack.push(value)
-  const descriptor = Effect.runSync(
-    Effect.acquireUseRelease(
-      Effect.succeed(undefined),
-      () =>
-        Effect.sync(() => {
-          if (Array.isArray(value)) {
-            return { _tag: "Array", items: value.map((item) => fromUnknown(item, state)) }
-          } else {
-            const prototype = Object.getPrototypeOf(value)
-            if (prototype !== null && prototype !== Object.prototype) {
-              Effect.runSync(Effect.die(new TypeError("Schema descriptors cannot represent non-plain objects")))
-            }
-            const properties = Reflect.ownKeys(value).flatMap((key) => {
-              const property = Object.getOwnPropertyDescriptor(value, key)
-              if (property === undefined || property.enumerable !== true) return []
-              if (!("value" in property)) {
-                Effect.runSync(Effect.die(new TypeError("Schema descriptors cannot represent accessor properties")))
-              }
-              return [[fromPropertyKey(key), property.value]]
-            }).toSorted(([left], [right]) => compareDescriptor(left, right))
-            const entries = properties.map(([key, propertyValue]) =>
-              [key, fromUnknown(propertyValue, state)] satisfies readonly [Descriptor, Descriptor]
-            )
-            return { _tag: "Object", entries }
-          }
-        }),
-      () =>
-        Effect.sync(() => {
-          state.unknownStack.pop()
-          state.unknownAncestors.delete(value)
-        })
-    )
-  )
+  let descriptor: Descriptor
+  // oxlint-disable-next-line effect/noTryCatch -- synchronous descriptor traversal must preserve direct throws while finally cleans traversal state
+  try {
+    if (Array.isArray(value)) {
+      descriptor = { _tag: "Array", items: value.map((item) => fromUnknown(item, state)) }
+    } else {
+      const prototype = Object.getPrototypeOf(value)
+      if (prototype !== null && prototype !== Object.prototype) {
+        throwTypeError("Schema descriptors cannot represent non-plain objects")
+      }
+      const properties = Reflect.ownKeys(value).flatMap((key) => {
+        const property = Object.getOwnPropertyDescriptor(value, key)
+        if (property === undefined || property.enumerable !== true) return []
+        if (!("value" in property)) throwTypeError("Schema descriptors cannot represent accessor properties")
+        return [[fromPropertyKey(key), property.value]]
+      }).toSorted(([left], [right]) => compareDescriptor(left, right))
+      const entries = properties.map(([key, propertyValue]) =>
+        [key, fromUnknown(propertyValue, state)] satisfies readonly [Descriptor, Descriptor]
+      )
+      descriptor = { _tag: "Object", entries }
+    }
+  } finally {
+    state.unknownStack.pop()
+    state.unknownAncestors.delete(value)
+  }
   const reference = intern(descriptor, state)
   if (!state.unknownCyclic.has(value)) state.unknownCompleted.set(value, reference)
   return reference
@@ -219,7 +211,7 @@ const fromCheck = (
   if (annotations !== undefined) result.annotations = annotations
   if (check._tag === "Filter") {
     if (!trustedBehavior && !hasStableMetadata(check.annotations)) {
-      Effect.runSync(Effect.die(new TypeError("Opaque schema checks require an identifier or meta annotation")))
+      throwTypeError("Opaque schema checks require an identifier or meta annotation")
     }
     result.aborted = check.aborted
   } else {
@@ -316,9 +308,7 @@ const fromEncoding = (
     )?.identity
     const identified = trustedBehavior || explicitBehavior(owner)
     if (builtIn === undefined && !identified) {
-      Effect.runSync(
-        Effect.die(new TypeError("Opaque schema transformations require an identifier or meta annotation"))
-      )
+      throwTypeError("Opaque schema transformations require an identifier or meta annotation")
     }
     let transformation: Descriptor
     if (builtIn === undefined) {
@@ -337,7 +327,7 @@ const intern = (descriptor: Descriptor, state: State): Descriptor => {
   const id = Canonical.hash(descriptor)
   const existing = state.nodes.get(id)
   if (existing !== undefined && existing.canonical !== canonical) {
-    Effect.runSync(Effect.die(new TypeError(`Schema descriptor node hash collision: ${id}`)))
+    throwTypeError(`Schema descriptor node hash collision: ${id}`)
   }
   if (existing === undefined) state.nodes.set(id, { canonical, descriptor })
   return { _tag: "Reference", id }
@@ -363,13 +353,12 @@ const fromAST = (
       return { _tag: "Cycle", back: Math.max(1, state.stack.size - ancestor) }
     }
     state.suspends.set(ast, state.stack.size)
-    return Effect.runSync(
-      Effect.acquireUseRelease(
-        Effect.succeed(undefined),
-        () => Effect.sync(() => fromAST(ast.thunk(), state, trustedBehavior)),
-        () => Effect.sync(() => state.suspends.delete(ast))
-      )
-    )
+    // oxlint-disable-next-line effect/noTryCatch -- suspended AST traversal must remove its marker after direct throws or interruption
+    try {
+      return fromAST(ast.thunk(), state, trustedBehavior)
+    } finally {
+      state.suspends.delete(ast)
+    }
   }
   const ancestor = state.stack.get(ast)
   if (ancestor !== undefined) {
@@ -404,9 +393,7 @@ const fromAST = (
           context.defaultValue = { _tag: "LiteralDefault", value: fromUnknown(ast.literal, state) }
         } else {
           if (!hasStableMetadata(ast.annotations) && !hasStableMetadata(ast.context.annotations)) {
-            Effect.runSync(
-              Effect.die(new TypeError("Opaque constructor defaults require an identifier or meta annotation"))
-            )
+            throwTypeError("Opaque constructor defaults require an identifier or meta annotation")
           }
           context.defaultValue = fromEncoding(
             ast,
@@ -421,9 +408,7 @@ const fromAST = (
     switch (ast._tag) {
       case "Declaration": {
         if (!identifiedBehavior) {
-          Effect.runSync(
-            Effect.die(new TypeError("Opaque schema declarations require an identifier or meta annotation"))
-          )
+          throwTypeError("Opaque schema declarations require an identifier or meta annotation")
         }
         node.typeParameters = ast.typeParameters.map((parameter) => fromAST(parameter, state, trustedBehavior))
         const encodingChecks = fromChecks(ast.encodingChecks, state, identifiedBehavior)
@@ -485,13 +470,12 @@ const fromAST = (
     if (!state.cyclic.has(ast)) completedMap.set(ast, reference)
     return reference
   }
-  return Effect.runSync(
-    Effect.acquireUseRelease(
-      Effect.succeed(undefined),
-      () => Effect.sync(build),
-      () => Effect.sync(() => state.stack.delete(ast))
-    )
-  )
+  // oxlint-disable-next-line effect/noTryCatch -- descriptor traversal must remove its stack marker after direct throws or interruption
+  try {
+    return build()
+  } finally {
+    state.stack.delete(ast)
+  }
 }
 
 export interface MakeOptions {

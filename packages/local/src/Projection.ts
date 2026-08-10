@@ -1,6 +1,7 @@
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import type * as Document from "./Document.js"
+import { throwTypeError } from "./internal/throwTypeError.js"
 import * as ReplicaError from "./ReplicaError.js"
 import type * as Snapshot from "./Snapshot.js"
 
@@ -29,9 +30,9 @@ export const make = <const Name extends string, D extends Document.Any, R extend
     readonly project: (snapshot: Snapshot.FromDocument<D>) => ReadonlyArray<R["Type"]>
   }
 ): Projection<Name, D, R> => {
-  if (name.length === 0) Effect.runSync(Effect.die(new TypeError("Projection name must be nonempty")))
+  if (name.length === 0) throwTypeError("Projection name must be nonempty")
   if (!Number.isSafeInteger(options.version) || options.version < 1) {
-    Effect.runSync(Effect.die(new TypeError("Projection version must be a positive integer")))
+    throwTypeError("Projection version must be a positive integer")
   }
   return { name, ...options }
 }
@@ -40,7 +41,7 @@ export const assertUniqueKeys = <P extends Any,>(self: P, rows: ReadonlyArray<P[
   const keys = new Set<string>()
   for (const row of rows) {
     const key = self.key(row)
-    if (keys.has(key)) Effect.runSync(Effect.die(new TypeError(`Duplicate projection key: ${key}`)))
+    if (keys.has(key)) throwTypeError(`Duplicate projection key: ${key}`)
     keys.add(key)
   }
 }

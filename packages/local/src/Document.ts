@@ -2,6 +2,7 @@ import * as Automerge from "@automerge/automerge"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import type * as Identity from "./Identity.js"
+import { throwTypeError } from "./internal/throwTypeError.js"
 import * as ReplicaError from "./ReplicaError.js"
 
 export type WireSchema = Schema.Codec<unknown, unknown>
@@ -37,7 +38,7 @@ export const migration = <S extends DocumentSchema, Out = unknown,>(options: {
   readonly migrate: (value: S["Type"]) => Out
 }): Migration<S, Out> => {
   if (!Number.isSafeInteger(options.from) || options.from < 1) {
-    Effect.runSync(Effect.die(new TypeError("Migration source version must be a positive integer")))
+    throwTypeError("Migration source version must be a positive integer")
   }
   return { from: options.from, schema: options.schema, migrate: options.migrate }
 }
@@ -50,20 +51,18 @@ export const make = <const Name extends string, S extends DocumentSchema,>(
     readonly migrations?: ReadonlyArray<AnyMigration>
   }
 ): Document<Name, S> => {
-  if (name.length === 0) Effect.runSync(Effect.die(new TypeError("Document name must be nonempty")))
+  if (name.length === 0) throwTypeError("Document name must be nonempty")
   if (!Number.isSafeInteger(options.version) || options.version < 1) {
-    Effect.runSync(Effect.die(new TypeError("Document version must be a positive integer")))
+    throwTypeError("Document version must be a positive integer")
   }
   const migrations = options.migrations ?? []
   const sources = new Set<number>()
   for (const step of migrations) {
     if (step.from >= options.version) {
-      Effect.runSync(
-        Effect.die(new TypeError(`Migration source version must be below the document version: ${step.from}`))
-      )
+      throwTypeError(`Migration source version must be below the document version: ${step.from}`)
     }
     if (sources.has(step.from)) {
-      Effect.runSync(Effect.die(new TypeError(`Duplicate migration source version: ${step.from}`)))
+      throwTypeError(`Duplicate migration source version: ${step.from}`)
     }
     sources.add(step.from)
   }
@@ -71,7 +70,7 @@ export const make = <const Name extends string, S extends DocumentSchema,>(
     const oldest = Math.min(...sources)
     for (let version = oldest; version < options.version; version++) {
       if (!sources.has(version)) {
-        Effect.runSync(Effect.die(new TypeError(`Migration chain has a gap at version ${version}`)))
+        throwTypeError(`Migration chain has a gap at version ${version}`)
       }
     }
   }

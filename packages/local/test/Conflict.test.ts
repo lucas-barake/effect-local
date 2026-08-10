@@ -1,10 +1,9 @@
 import * as Automerge from "@automerge/automerge"
+import * as OtherAutomerge from "@automerge/automerge/slim"
 import { assert, describe, it } from "@effect/vitest"
-import * as Cause from "effect/Cause"
 import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
-import { createRequire } from "node:module"
 import * as Conflict from "../src/Conflict.js"
 import * as Identity from "../src/Identity.js"
 
@@ -22,8 +21,18 @@ const JsonString = Schema.fromJsonString(Schema.Unknown)
 const roundTripJson = (value: unknown): unknown =>
   Schema.decodeUnknownSync(JsonString)(Schema.encodeSync(JsonString)(value))
 const encodeUnknownValue = (value: unknown) => Schema.encodeUnknownSync(Conflict.Value)(value)
-const defect = (message: string): unknown =>
-  Cause.squash(Effect.runSync(Effect.exit(Effect.die(new Error(message)))).cause)
+const makeError = (message: string): Error => {
+  // oxlint-disable-next-line effect/noNewError -- this fixture must preserve an arbitrary Error value
+  return new Error(message)
+}
+const throwError = (message: string): never => {
+  // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError -- hostile accessors must throw their direct host Error
+  throw new Error(message)
+}
+const throwRangeError = (message: string): never => {
+  // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError -- hostile accessors must throw their direct host RangeError
+  throw new RangeError(message)
+}
 
 const assertSchemaError = (evaluate: () => unknown, message?: string): void => {
   const failure = Effect.runSync(Effect.flip(Effect.try({ try: evaluate, catch: (cause) => cause })))
@@ -152,7 +161,6 @@ describe("Conflict", () => {
   })
 
   it("accepts wrappers from another module instance and pins lossless counter endpoints", () => {
-    const OtherAutomerge = createRequire(import.meta.url)("@automerge/automerge")
     for (const value of [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER - 1]) {
       const counter = new OtherAutomerge.Counter(value)
       assert.deepStrictEqual(encodeValue(counter), { _tag: "Counter", value })
@@ -212,7 +220,7 @@ describe("Conflict", () => {
       enumerable: true,
       get: () => {
         calls++
-        return Effect.runSync(Effect.die(new RangeError("recursive schema reached past the hard depth limit")))
+        return throwRangeError("recursive schema reached past the hard depth limit")
       }
     })
     let deep: unknown = terminal
@@ -243,7 +251,7 @@ describe("Conflict", () => {
           Object.defineProperty(value, 0, {
             enumerable: true,
             get: () => {
-              return Effect.runSync(Effect.die(new Error("native array getter executed")))
+              return throwError("native array getter executed")
             }
           })
           return value
@@ -257,7 +265,7 @@ describe("Conflict", () => {
           Object.defineProperty(value, "_tag", {
             enumerable: true,
             get: () => {
-              return Effect.runSync(Effect.die(new Error("portable tag getter executed")))
+              return throwError("portable tag getter executed")
             }
           })
           return value
@@ -271,7 +279,7 @@ describe("Conflict", () => {
           Object.defineProperty(values, 0, {
             enumerable: true,
             get: () => {
-              return Effect.runSync(Effect.die(new Error("portable list getter executed")))
+              return throwError("portable list getter executed")
             }
           })
           return { _tag: "List", values }
@@ -285,7 +293,7 @@ describe("Conflict", () => {
           Object.defineProperty(entry, "value", {
             enumerable: true,
             get: () => {
-              return Effect.runSync(Effect.die(new Error("portable map entry getter executed")))
+              return throwError("portable map entry getter executed")
             }
           })
           return { _tag: "Map", entries: [entry] }
@@ -299,7 +307,7 @@ describe("Conflict", () => {
           Object.defineProperty(value, 0, {
             enumerable: true,
             get: () => {
-              return Effect.runSync(Effect.die(new Error("unknown array getter executed")))
+              return throwError("unknown array getter executed")
             }
           })
           return value
@@ -878,7 +886,7 @@ describe("Conflict", () => {
       [
         new Conflict.ConflictResolutionSchemaError({
           path: errorPath,
-          cause: defect("invalid replacement")
+          cause: makeError("invalid replacement")
         }),
         {
           _tag: "ConflictResolutionSchemaError",

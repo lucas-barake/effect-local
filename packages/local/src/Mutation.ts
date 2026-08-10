@@ -8,6 +8,7 @@ import type * as Scope from "effect/Scope"
 import type * as Document from "./Document.js"
 import * as SchemaInput from "./internal/schemaInput.js"
 import type * as TaggedError from "./internal/taggedError.js"
+import { throwTypeError } from "./internal/throwTypeError.js"
 
 export type DraftValue<A,> = A extends Automerge.ScalarValue ? A
   : A extends ReadonlyArray<infer Item> ? Array<DraftValue<Item>>
@@ -114,17 +115,13 @@ export function make<
     readonly error?: E
   }
 ): any {
-  if (name.length === 0) Effect.runSync(Effect.die(new TypeError("Mutation name must be nonempty")))
+  if (name.length === 0) throwTypeError("Mutation name must be nonempty")
   if (name.startsWith("$")) {
-    Effect.runSync(
-      Effect.die(
-        new TypeError(`Mutation name must not start with "$", it is reserved for operation sentinels: ${name}`)
-      )
-    )
+    throwTypeError(`Mutation name must not start with "$", it is reserved for operation sentinels: ${name}`)
   }
   const version = options.version ?? 1
   if (!Number.isSafeInteger(version) || version < 1) {
-    Effect.runSync(Effect.die(new TypeError("Mutation version must be a positive integer")))
+    throwTypeError("Mutation version must be a positive integer")
   }
   const handler = Context.Service<
     HandlerService<Name, D, SchemaInput.Wire<P>, A, E>,

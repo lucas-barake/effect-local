@@ -6,6 +6,7 @@ import * as Stream from "effect/Stream"
 import type * as Document from "./Document.js"
 import type * as Identity from "./Identity.js"
 import * as SchemaInput from "./internal/schemaInput.js"
+import { throwTypeError } from "./internal/throwTypeError.js"
 import * as ReplicaError from "./ReplicaError.js"
 
 export const TypeId: unique symbol = Symbol.for("@lucas-barake/effect-local/Transient")
@@ -77,13 +78,9 @@ export const make = <
     readonly payload: SchemaInput.Valid<P>
   }
 ): Topic<Name, D, SchemaInput.Wire<P>> => {
-  if (name.length === 0) Effect.runSync(Effect.die(new TypeError("Transient name must be nonempty")))
+  if (name.length === 0) throwTypeError("Transient name must be nonempty")
   if (name.startsWith("$")) {
-    Effect.runSync(
-      Effect.die(
-        new TypeError(`Transient name must not start with "$", it is reserved for protocol sentinels: ${name}`)
-      )
-    )
+    throwTypeError(`Transient name must not start with "$", it is reserved for protocol sentinels: ${name}`)
   }
   const topic: Topic<Name, D, SchemaInput.Wire<P>> = {
     [TypeId]: TypeId,
@@ -112,9 +109,7 @@ export const layer = (topics: ReadonlyArray<Any>): Layer.Layer<Transient, never,
       const registered = new Set(topics)
       return Transient.of({
         client: <A,>(topic: Any, documentId: Identity.DocumentId): Client<A> => {
-          if (!registered.has(topic)) {
-            Effect.runSync(Effect.die(new TypeError(`Transient is not registered: ${topic.name}`)))
-          }
+          if (!registered.has(topic)) throwTypeError(`Transient is not registered: ${topic.name}`)
           const payloadCodec = Schema.toCodecJson(topic.payloadSchema)
           return {
             publish: (peerId, payload) =>

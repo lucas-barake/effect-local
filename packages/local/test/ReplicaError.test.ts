@@ -1,12 +1,12 @@
 import { assert, describe, it } from "@effect/vitest"
-import * as Cause from "effect/Cause"
-import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as Identity from "../src/Identity.js"
 import * as ReplicaError from "../src/ReplicaError.js"
 
-const defect = (message: string): unknown =>
-  Cause.squash(Effect.runSync(Effect.exit(Effect.die(new Error(message)))).cause)
+const makeError = (message: string): Error => {
+  // oxlint-disable-next-line effect/noNewError -- this fixture must preserve an arbitrary Error value
+  return new Error(message)
+}
 
 describe("ReplicaError", () => {
   it("round trips public reasons", () => {
@@ -22,7 +22,7 @@ describe("ReplicaError", () => {
   it("round trips arbitrary defect causes", () => {
     const error = new ReplicaError.ReplicaError({
       reason: new ReplicaError.StorageUnavailable({
-        cause: defect("database closed")
+        cause: makeError("database closed")
       })
     })
     const encoded = Schema.encodeSync(ReplicaError.ReplicaError)(error)

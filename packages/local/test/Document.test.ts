@@ -1,8 +1,8 @@
 import * as Automerge from "@automerge/automerge"
+import * as OtherAutomerge from "@automerge/automerge/slim"
 import { assert, describe, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
-import { createRequire } from "node:module"
 import * as Document from "../src/Document.js"
 import * as DocumentSet from "../src/DocumentSet.js"
 
@@ -30,7 +30,6 @@ describe("Document", () => {
   })
 
   it("accepts Automerge scalar wrappers from another module instance", () => {
-    const OtherAutomerge = createRequire(import.meta.url)("@automerge/automerge")
     const counter = new OtherAutomerge.Counter(1)
     const immutableString = new OtherAutomerge.ImmutableString("one")
 

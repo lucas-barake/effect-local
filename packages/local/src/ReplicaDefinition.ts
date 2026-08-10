@@ -1,8 +1,8 @@
-import * as Effect from "effect/Effect"
 import * as Canonical from "./Canonical.js"
 import type * as Document from "./Document.js"
 import type * as DocumentSet from "./DocumentSet.js"
 import type * as Identity from "./Identity.js"
+import { throwTypeError } from "./internal/throwTypeError.js"
 import type * as Mutation from "./Mutation.js"
 import type * as Projection from "./Projection.js"
 import type * as Query from "./Query.js"
@@ -61,7 +61,7 @@ const assertUnique = (kind: string, values: ReadonlyArray<{ readonly name: strin
   const names = new Set<string>()
   for (const value of values) {
     if (names.has(value.name)) {
-      Effect.runSync(Effect.die(new TypeError(`Duplicate ${kind} name: ${value.name}`)))
+      throwTypeError(`Duplicate ${kind} name: ${value.name}`)
     }
     names.add(value.name)
   }
@@ -74,7 +74,7 @@ const assertKnownDocuments = (
 ): void => {
   for (const value of values) {
     if (!documents.has(value.document)) {
-      Effect.runSync(Effect.die(new TypeError(`${kind} references an unknown document: ${value.name}`)))
+      throwTypeError(`${kind} references an unknown document: ${value.name}`)
     }
   }
 }
@@ -109,7 +109,7 @@ export function make<
   readonly queries?: Queries
   readonly transients?: Transients
 }): any {
-  if (options.name.length === 0) Effect.runSync(Effect.die(new TypeError("Replica definition name must be nonempty")))
+  if (options.name.length === 0) throwTypeError("Replica definition name must be nonempty")
   const mutations = Object.freeze([...(options.mutations ?? [])])
   const projections = Object.freeze([...(options.projections ?? [])])
   const queries = Object.freeze([...(options.queries ?? [])])
@@ -129,7 +129,7 @@ export function make<
   for (const query of queries) {
     for (const dependency of query.dependsOn) {
       if (!registeredProjections.has(dependency)) {
-        Effect.runSync(Effect.die(new TypeError(`Query references an unknown projection: ${query.name}`)))
+        throwTypeError(`Query references an unknown projection: ${query.name}`)
       }
     }
   }

@@ -1,6 +1,5 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { assert, it } from "@effect/vitest"
-import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Schema from "effect/Schema"
@@ -8,8 +7,10 @@ import * as CommandOutcome from "../src/CommandOutcome.js"
 import * as Identity from "../src/Identity.js"
 import * as ReplicaError from "../src/ReplicaError.js"
 
-const defect = (message: string): unknown =>
-  Cause.squash(Effect.runSync(Effect.exit(Effect.die(new Error(message)))).cause)
+const makeError = (message: string): Error => {
+  // oxlint-disable-next-line effect/noNewError -- this fixture must preserve an arbitrary Error value
+  return new Error(message)
+}
 
 class Rejected extends Schema.TaggedErrorClass<Rejected>("@test/CommandOutcome/Rejected")("Rejected", {
   message: Schema.String
@@ -30,7 +31,7 @@ it.layer(NodeCrypto.layer)("CommandOutcome", (layered) => {
       const rejected = yield* CommandOutcome.committedOrFail(CommandOutcome.rejected(commandId, error)).pipe(
         Effect.exit
       )
-      const cause = defect("the owner never answered")
+      const cause = makeError("the owner never answered")
       const unknown = yield* CommandOutcome.committedOrFail(CommandOutcome.unknown(commandId), cause).pipe(
         Effect.exit
       )
@@ -66,7 +67,7 @@ it.layer(NodeCrypto.layer)("CommandOutcome", (layered) => {
           new ReplicaError.ReplicaError({
             reason: new ReplicaError.CommandOutcomeUnknown({
               commandId,
-              cause: defect("lost")
+              cause: makeError("lost")
             })
           })
         )),
@@ -75,7 +76,7 @@ it.layer(NodeCrypto.layer)("CommandOutcome", (layered) => {
       // Any other replica failure is not a command result and stays in the error channel.
       const storage = new ReplicaError.ReplicaError({
         reason: new ReplicaError.StorageUnavailable({
-          cause: defect("disk")
+          cause: makeError("disk")
         })
       })
       assert.deepStrictEqual(yield* toOutcome(Effect.fail(storage)).pipe(Effect.exit), Exit.fail(storage))

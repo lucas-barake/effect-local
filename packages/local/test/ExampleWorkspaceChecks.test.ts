@@ -1,11 +1,13 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
-
-const { execFileSync } = globalThis.process.getBuiltinModule("node:child_process")
-const { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = globalThis.process
-  .getBuiltinModule("node:fs")
-const { join } = globalThis.process.getBuiltinModule("node:path")
+// oxlint-disable-next-line effect/noNodeBuiltinImport -- this test executes the real pnpm workspace command
+import { execFileSync } from "node:child_process"
+// oxlint-disable-next-line effect/noNodeBuiltinImport -- this test creates and removes real filesystem fixtures
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+// oxlint-disable-next-line effect/noNodeBuiltinImport -- path behavior must match the host Node test runner
+import { join } from "node:path"
 
 const repoRoot = join(import.meta.dirname, "../../..")
 const JsonString = Schema.fromJsonString(Schema.Unknown)

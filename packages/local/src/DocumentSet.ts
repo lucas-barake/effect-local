@@ -1,5 +1,5 @@
-import * as Effect from "effect/Effect"
 import type * as Document from "./Document.js"
+import { throwTypeError } from "./internal/throwTypeError.js"
 
 export interface DocumentSet<out Documents extends ReadonlyArray<Document.Any>,> {
   readonly documents: Documents
@@ -12,7 +12,7 @@ export const make = <const Documents extends ReadonlyArray<Document.Any>,>(
   const byName = new Map<string, Documents[number]>()
   for (const document of documents) {
     if (byName.has(document.name)) {
-      Effect.runSync(Effect.die(new TypeError(`Duplicate document name: ${document.name}`)))
+      throwTypeError(`Duplicate document name: ${document.name}`)
     }
     byName.set(document.name, document)
   }

@@ -1,11 +1,13 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
-
-const { execFileSync } = globalThis.process.getBuiltinModule("node:child_process")
-const { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } = globalThis.process.getBuiltinModule("node:fs")
-const { tmpdir } = globalThis.process.getBuiltinModule("node:os")
-const { join } = globalThis.process.getBuiltinModule("node:path")
+// oxlint-disable-next-line effect/noNodeBuiltinImport -- this test invokes pnpm and tar as real package tools
+import { execFileSync } from "node:child_process"
+// oxlint-disable-next-line effect/noNodeBuiltinImport -- this test inspects real package directories and archives
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+// oxlint-disable-next-line effect/noNodeBuiltinImport -- path behavior must match the host Node test runner
+import { join } from "node:path"
 
 const repoRoot = join(import.meta.dirname, "../../..")
 const packagesDirectory = join(repoRoot, "packages")
@@ -74,9 +76,8 @@ const publishedPackages = workspacePackages.flatMap((workspacePackage): Readonly
     Schema.decodeUnknownSync(JsonString)(readFileSync(join(workspacePackage.path, "package.json"), "utf8"))
   )
   if (typeof workspacePackage.name !== "string") {
-    return Effect.runSync(
-      Effect.die(new TypeError(`Published workspace at ${workspacePackage.path} has no package name`))
-    )
+    // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError -- malformed pnpm output is a synchronous test setup failure
+    throw new TypeError(`Published workspace at ${workspacePackage.path} has no package name`)
   }
   assert.strictEqual(manifest.name, workspacePackage.name)
   return [{ ...workspacePackage, name: workspacePackage.name, manifest }]

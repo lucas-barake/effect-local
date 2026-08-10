@@ -6,6 +6,7 @@ import * as Scope from "effect/Scope"
 import type * as Document from "./Document.js"
 import * as SchemaInput from "./internal/schemaInput.js"
 import type * as TaggedError from "./internal/taggedError.js"
+import { throwTypeError } from "./internal/throwTypeError.js"
 import type * as Projection from "./Projection.js"
 
 export type Handler<P, A, E, R,> = (payload: P) => Effect.Effect<A, E, R>
@@ -102,15 +103,15 @@ export function make<
     readonly dependsOn: Dependencies
   }
 ): any {
-  if (name.length === 0) Effect.runSync(Effect.die(new TypeError("Query name must be nonempty")))
+  if (name.length === 0) throwTypeError("Query name must be nonempty")
   const version = options.version ?? 1
   if (!Number.isSafeInteger(version) || version < 1) {
-    Effect.runSync(Effect.die(new TypeError("Query version must be a positive integer")))
+    throwTypeError("Query version must be a positive integer")
   }
   const names = new Set<string>()
   for (const projection of options.dependsOn) {
     if (names.has(projection.name)) {
-      Effect.runSync(Effect.die(new TypeError(`Duplicate query dependency: ${projection.name}`)))
+      throwTypeError(`Duplicate query dependency: ${projection.name}`)
     }
     names.add(projection.name)
   }

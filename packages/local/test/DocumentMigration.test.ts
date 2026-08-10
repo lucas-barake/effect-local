@@ -72,7 +72,8 @@ describe("Document migrations", () => {
             from: 1,
             schema: V1,
             migrate: () => {
-              return Effect.runSync(Effect.die(new Error("boom")))
+              // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError -- migration callbacks must exercise direct host exceptions
+              throw new Error("boom")
             }
           })
         ]
