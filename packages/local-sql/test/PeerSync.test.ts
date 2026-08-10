@@ -845,72 +845,78 @@ describe("PeerSync", () => {
       InternalAutomerge.free(created.automerge)
     }).pipe(Effect.provide(TestLayer)))
 
-  it.effect("rejects cumulative source changes, operations and bytes atomically and recovers", () =>
-    Effect.gen(function*() {
-      for (
-        const quota of [
-          {
-            key: "maxConflictSourceChanges",
-            resource: "conflict source changes",
-            value: (boundary: { readonly changes: number }) => boundary.changes
-          },
-          {
-            key: "maxConflictSourceOperations",
-            resource: "conflict source operations",
-            value: (boundary: { readonly operations: number }) => boundary.operations
-          },
-          {
-            key: "maxConflictSourceBytes",
-            resource: "conflict source bytes",
-            value: (boundary: { readonly bytes: number }) => boundary.bytes
-          }
-        ] as const
-      ) {
-        const filename = join(
-          tmpdir(),
-          `effect-local-peer-source-${quota.key}-${globalThis.crypto.randomUUID()}.sqlite`
-        )
-        yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(filename, { force: true })))
-        const seeded = yield* seedSourceReceive(filename)
-        const limit = quota.value(seeded.boundary) - 1
-        const rejectingLimits = { ...limits, [quota.key]: limit }
-        yield* Effect.scoped(
-          Effect.gen(function*() {
-            const sync = yield* PeerSync.PeerSync
-            const before = yield* durableFootprint(seeded.documentId)
-            const session = yield* sync.open(yield* Identity.makePeerId)
-            const result = yield* Effect.result(sync.receive(Task, seeded.documentId, session, {
-              ...seeded.input,
-              remoteConnectionEpoch: session.connectionEpoch,
-              receiveSequence: 0
-            }))
-            assert.isTrue(Result.isFailure(result))
-            if (Result.isFailure(result)) {
-              assert.strictEqual(result.failure.reason._tag, "QuotaExceeded")
-              if (result.failure.reason._tag === "QuotaExceeded") {
-                assert.strictEqual(result.failure.reason.resource, quota.resource)
-                assert.strictEqual(result.failure.reason.limit, limit)
-              }
+  it.effect(
+    "rejects cumulative source changes, operations and bytes atomically and recovers",
+    () =>
+      Effect.gen(function*() {
+        for (
+          const quota of [
+            {
+              key: "maxConflictSourceChanges",
+              resource: "conflict source changes",
+              value: (boundary: { readonly changes: number }) => boundary.changes
+            },
+            {
+              key: "maxConflictSourceOperations",
+              resource: "conflict source operations",
+              value: (boundary: { readonly operations: number }) => boundary.operations
+            },
+            {
+              key: "maxConflictSourceBytes",
+              resource: "conflict source bytes",
+              value: (boundary: { readonly bytes: number }) => boundary.bytes
             }
-            assert.deepStrictEqual(yield* durableFootprint(seeded.documentId), before)
-          }).pipe(Effect.provide(sourceLayer(rejectingLimits, filename)))
-        )
-        yield* Effect.scoped(
-          Effect.gen(function*() {
-            const replica = yield* Replica.Replica
-            const sync = yield* PeerSync.PeerSync
-            const session = yield* sync.open(yield* Identity.makePeerId)
-            const received = yield* sync.receive(Task, seeded.documentId, session, {
-              ...seeded.input,
-              remoteConnectionEpoch: session.connectionEpoch,
-              receiveSequence: 0
-            })
-            assert.isFalse(received.duplicate)
-            assert.strictEqual((yield* replica.get(Task, seeded.documentId)).value.title, "remote")
-          }).pipe(Effect.provide(sourceLayer(limits, filename)))
-        )
-      }
-    }))
+          ] as const
+        ) {
+          const filename = join(
+            tmpdir(),
+            `effect-local-peer-source-${quota.key}-${globalThis.crypto.randomUUID()}.sqlite`
+          )
+          yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(filename, { force: true })))
+          const seeded = yield* seedSourceReceive(filename)
+          const limit = quota.value(seeded.boundary) - 1
+          const rejectingLimits = { ...limits, [quota.key]: limit }
+          yield* Effect.scoped(
+            Effect.gen(function*() {
+              const sync = yield* PeerSync.PeerSync
+              const before = yield* durableFootprint(seeded.documentId)
+              const session = yield* sync.open(yield* Identity.makePeerId)
+              const result = yield* Effect.result(sync.receive(Task, seeded.documentId, session, {
+                ...seeded.input,
+                remoteConnectionEpoch: session.connectionEpoch,
+                receiveSequence: 0
+              }))
+              assert.isTrue(Result.isFailure(result))
+              if (Result.isFailure(result)) {
+                assert.strictEqual(result.failure.reason._tag, "QuotaExceeded")
+                if (result.failure.reason._tag === "QuotaExceeded") {
+                  assert.strictEqual(result.failure.reason.resource, quota.resource)
+                  assert.strictEqual(result.failure.reason.limit, limit)
+                }
+              }
+              assert.deepStrictEqual(yield* durableFootprint(seeded.documentId), before)
+            }).pipe(Effect.provide(sourceLayer(rejectingLimits, filename)))
+          )
+          yield* Effect.scoped(
+            Effect.gen(function*() {
+              const replica = yield* Replica.Replica
+              const sync = yield* PeerSync.PeerSync
+              const session = yield* sync.open(yield* Identity.makePeerId)
+              const received = yield* sync.receive(Task, seeded.documentId, session, {
+                ...seeded.input,
+                remoteConnectionEpoch: session.connectionEpoch,
+                receiveSequence: 0
+              })
+              assert.isFalse(received.duplicate)
+              assert.strictEqual((yield* replica.get(Task, seeded.documentId)).value.title, "remote")
+            }).pipe(Effect.provide(sourceLayer(limits, filename)))
+          )
+        }
+        // Three quotas, each seeding an on-disk replica and building two more to reject and recover.
+        // That is real I/O the default five second budget does not cover on a loaded CI runner.
+      }),
+    30_000
+  )
 
   it.effect("accepts a peer change exactly at every cumulative source boundary", () =>
     Effect.gen(function*() {
