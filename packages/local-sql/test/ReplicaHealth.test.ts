@@ -55,15 +55,14 @@ describe("ReplicaHealth", () => {
       SqlClient.SqlClient,
       Effect.gen(function*() {
         const sql = yield* SqlClient.SqlClient
-        const execute = (...args: ReadonlyArray<unknown>) => {
-          const statement = (sql as unknown as (
-            ...args: ReadonlyArray<unknown>
-          ) => Effect.Effect<unknown, unknown, unknown>)(...args)
+        const execute = (...args: Array<any>) => {
+          const statement = sql(...args)
           const template = args[0]
-          const text = Array.isArray(template) ? template.join("") : ""
+          let text = ""
+          if (Array.isArray(template)) text = template.join("")
           return transform(text, statement)
         }
-        return Object.assign(execute, sql) as SqlClient.SqlClient
+        return Object.assign(execute, sql) satisfies SqlClient.SqlClient
       })
     ).pipe(Layer.provideMerge(BaseSql))
     const InstrumentedDatabase = Layer.merge(InstrumentedSql, NodeCrypto.layer)
@@ -415,9 +414,10 @@ describe("ReplicaHealth", () => {
       const seen = yield* Queue.unbounded<ReplicaStatus.ReplicaStatus>()
       const consumer = yield* health.status.pipe(
         Stream.runForEach((status) =>
-          Queue.offer(seen, status).pipe(
-            Effect.andThen(status._tag === "Ready" ? Deferred.await(release) : Effect.void)
-          )
+          Effect.gen(function*() {
+            yield* Queue.offer(seen, status)
+            if (status._tag === "Ready") yield* Deferred.await(release)
+          })
         ),
         Effect.forkChild({ startImmediately: true })
       )
@@ -504,7 +504,7 @@ describe("ReplicaHealth", () => {
           return Effect.fail(
             new SqlError.SqlError({
               reason: new SqlError.LockTimeoutError({
-                cause: new Error("database is locked"),
+                cause: "database is locked",
                 message: "database is locked"
               })
             })
@@ -776,12 +776,11 @@ describe("ReplicaHealth", () => {
       // lifecycle is observed instead of whichever prefix the consumer happened to be scheduled for.
       const consumer = yield* health.status.pipe(
         Stream.tap((status) =>
-          Effect.sync(() => observed.push(status)).pipe(
-            Effect.andThen(Deferred.succeed(subscribed, undefined)),
-            Effect.andThen(
-              status._tag === "ReadOnly" ? Deferred.succeed(installing, undefined) : Effect.void
-            )
-          )
+          Effect.gen(function*() {
+            yield* Effect.sync(() => observed.push(status))
+            yield* Deferred.succeed(subscribed, undefined)
+            if (status._tag === "ReadOnly") yield* Deferred.succeed(installing, undefined)
+          })
         ),
         Stream.takeUntil((status) => status._tag === "Ready" && observed.some((seen) => seen._tag === "ReadOnly")),
         Stream.runDrain,

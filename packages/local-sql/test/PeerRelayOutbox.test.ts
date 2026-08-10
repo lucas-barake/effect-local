@@ -1,5 +1,5 @@
 import * as Automerge from "@automerge/automerge"
-import { NodeCrypto } from "@effect/platform-node"
+import { NodeCrypto, NodeFileSystem, NodePath } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
@@ -11,14 +11,13 @@ import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Crypto from "effect/Crypto"
 import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
+import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
+import * as Path from "effect/Path"
 import * as Schema from "effect/Schema"
 import { TestClock } from "effect/testing"
 import * as Tracer from "effect/Tracer"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
-import { mkdtempSync, rmSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import * as CommandDeliveryStore from "../src/CommandDeliveryStore.js"
 import * as PeerRelayOutbox from "../src/PeerRelayOutbox.js"
 import * as PeerRelayOutboxLimits from "../src/PeerRelayOutboxLimits.js"
@@ -122,7 +121,9 @@ describe("PeerRelayOutbox", () => {
       Base,
       Gate,
       ReplicaLimitLayer,
-      PeerRelayOutboxLimits.layer(limits)
+      PeerRelayOutboxLimits.layer(limits),
+      NodeFileSystem.layer,
+      NodePath.layer
     )
     const DeliveryStore = CommandDeliveryStore.layer.pipe(Layer.provide(Infrastructure))
     const Outbox = PeerRelayOutbox.layerSql.pipe(Layer.provide(Infrastructure))
@@ -348,7 +349,7 @@ describe("PeerRelayOutbox", () => {
       const payload = yield* makePayload(28)
       yield* trackCommand(commandId, payload)
       const envelope = yield* PeerSyncEnvelope.decodeSyncEnvelope(payload, replicaLimits)
-      const changeHash = envelope.writerProvenance[0]!.changeHash
+      const changeHash = envelope.writerProvenance[0].changeHash
       const permit = yield* gate.current
       const messages = Array.from({ length: 257 }, (_, index) => {
         const suffix = (index + 1).toString(16).padStart(12, "0")
@@ -699,7 +700,7 @@ describe("PeerRelayOutbox", () => {
       )
       const replay = yield* outbox.dueForEndpoint({ ...endpoint, maximum: 2 })
       assert.strictEqual(replay.length, 1)
-      assert.strictEqual(replay[0]!.relayMessageId, entry.relayMessageId)
+      assert.strictEqual(replay[0].relayMessageId, entry.relayMessageId)
       assert.deepStrictEqual(yield* outbox.usage(endpoint), {
         remote: { messageCount: 1, encodedBytes: payload.byteLength },
         replica: { messageCount: 1, encodedBytes: payload.byteLength }
@@ -759,15 +760,19 @@ describe("PeerRelayOutbox", () => {
       const rows = yield* sql`SELECT replica_incarnation
         FROM effect_local_peer_relay_outbox`
       assert.strictEqual(rows.length, 1)
-      assert.strictEqual(rows[0]!.replica_incarnation, before.incarnation)
+      assert.strictEqual(rows[0].replica_incarnation, before.incarnation)
     }).pipe(Effect.provide(layer(":memory:"))))
 
   it.effect("replays and retires a pending row after writer generation changes on restart", () =>
     Effect.acquireUseRelease(
-      Effect.sync(() => mkdtempSync(join(tmpdir(), "effect-local-relay-outbox-"))),
+      Effect.gen(function*() {
+        const fs = yield* FileSystem.FileSystem
+        return yield* fs.makeTempDirectory({ prefix: "effect-local-relay-outbox-" })
+      }),
       (directory) =>
         Effect.gen(function*() {
-          const filename = join(directory, "replica.sqlite")
+          const path = yield* Path.Path
+          const filename = path.join(directory, "replica.sqlite")
           const first = yield* Effect.scoped(
             Effect.gen(function*() {
               yield* insertDocument
@@ -793,10 +798,10 @@ describe("PeerRelayOutbox", () => {
               assert.isAbove(permit.writerGeneration, first.permit.writerGeneration)
               const replay = yield* outbox.dueForEndpoint({ ...endpoint, maximum: 2 })
               assert.strictEqual(replay.length, 1)
-              assert.strictEqual(replay[0]!.relayMessageId, first.entry.relayMessageId)
+              assert.strictEqual(replay[0].relayMessageId, first.entry.relayMessageId)
               yield* outbox.markCustody({
-                relayMessageId: replay[0]!.relayMessageId,
-                outerEnvelopeDigest: replay[0]!.outerEnvelopeDigest
+                relayMessageId: replay[0].relayMessageId,
+                outerEnvelopeDigest: replay[0].outerEnvelopeDigest
               })
               assert.deepStrictEqual(
                 yield* outbox.dueForEndpoint({
@@ -808,6 +813,10 @@ describe("PeerRelayOutbox", () => {
             }).pipe(Effect.provide(layer(filename)))
           )
         }),
-      (directory) => Effect.sync(() => rmSync(directory, { recursive: true, force: true }))
-    ))
+      (directory) =>
+        Effect.gen(function*() {
+          const fs = yield* FileSystem.FileSystem
+          yield* fs.remove(directory, { recursive: true })
+        })
+    ).pipe(Effect.provide(NodeFileSystem.layer), Effect.provide(NodePath.layer)))
 })

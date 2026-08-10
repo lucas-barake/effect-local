@@ -47,7 +47,7 @@ describe("ReplicaOperationScheduler", () => {
         )
       })
     const release = (label: string) => Deferred.succeed(releases.get(label)!, undefined)
-    return { scheduler, attempted, acquired, start, release } as const
+    return { scheduler, attempted, acquired, start, release }
   })
 
   it.effect("prioritizes interactive admission and preserves FIFO within each lane", () =>

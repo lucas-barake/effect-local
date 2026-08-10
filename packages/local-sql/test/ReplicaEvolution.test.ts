@@ -258,12 +258,12 @@ describe("ReplicaEvolution", () => {
         `
         assert.strictEqual(rows[0]?.schema_version, 2)
         const after = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM effect_local_changes`
-        assert.strictEqual(after[0]!.count, before[0]!.count + 1)
+        assert.strictEqual(after[0].count, before[0].count + 1)
         yield* Effect.scoped(Effect.gen(function*() {
           yield* Layer.build(SqlReplica.layerWithBindings(definitionV2, { projections: [] }))
         }))
         const settled = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM effect_local_changes`
-        assert.strictEqual(settled[0]!.count, after[0]!.count)
+        assert.strictEqual(settled[0].count, after[0].count)
       }).pipe(Effect.provide(environment)))
 
     it.effect("skips an unrecoverable document durably while migrating the healthy ones", () =>
@@ -385,7 +385,7 @@ describe("ReplicaEvolution", () => {
           const snapshot = yield* replica.get(TaskV2, documentId)
           assert.deepStrictEqual(snapshot.value, { title: "mutate me", done: true })
           const after = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM effect_local_changes`
-          assert.strictEqual(after[0]!.count, before[0]!.count + 1)
+          assert.strictEqual(after[0].count, before[0].count + 1)
         }))
       }).pipe(Effect.provide(environment)))
   })
@@ -399,8 +399,10 @@ describe("ReplicaEvolution", () => {
           version: 1,
           Row: projectionRow,
           key: (row) => row.sourceDocumentId,
-          project: (snapshot) =>
-            snapshot.tombstone ? [] : [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title }]
+          project: (snapshot) => {
+            if (snapshot.tombstone) return []
+            return [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title }]
+          }
         })
         const TaskTitleSql = SqlProjection.make(TaskTitle, {
           table: "task_title_fencing",
@@ -487,8 +489,10 @@ describe("ReplicaEvolution", () => {
           version: 1,
           Row: projectionRow,
           key: (row) => row.sourceDocumentId,
-          project: (snapshot) =>
-            snapshot.tombstone ? [] : [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title }]
+          project: (snapshot) => {
+            if (snapshot.tombstone) return []
+            return [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title }]
+          }
         })
         const evolved = ReplicaDefinition.make({
           name: "tasks",
@@ -516,8 +520,10 @@ describe("ReplicaEvolution", () => {
           version: 1,
           Row: projectionRow,
           key: (row) => row.sourceDocumentId,
-          project: (snapshot) =>
-            snapshot.tombstone ? [] : [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title }]
+          project: (snapshot) => {
+            if (snapshot.tombstone) return []
+            return [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title }]
+          }
         })
         const initial = ReplicaDefinition.make({
           name: "tasks",
@@ -537,10 +543,10 @@ describe("ReplicaEvolution", () => {
           version: 2,
           Row: projectionRow,
           key: (row) => row.sourceDocumentId,
-          project: (snapshot) =>
-            snapshot.tombstone
-              ? []
-              : [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title.toUpperCase() }]
+          project: (snapshot) => {
+            if (snapshot.tombstone) return []
+            return [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title.toUpperCase() }]
+          }
         })
         const evolved = ReplicaDefinition.make({
           name: "tasks",
@@ -568,8 +574,10 @@ describe("ReplicaEvolution", () => {
           version: 1,
           Row: projectionRow,
           key: (row) => row.sourceDocumentId,
-          project: (snapshot) =>
-            snapshot.tombstone ? [] : [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title }]
+          project: (snapshot) => {
+            if (snapshot.tombstone) return []
+            return [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title }]
+          }
         })
         const initial = ReplicaDefinition.make({
           name: "tasks",
@@ -611,8 +619,10 @@ describe("ReplicaEvolution", () => {
           version: 1,
           Row: projectionRow,
           key: (row) => row.sourceDocumentId,
-          project: (snapshot) =>
-            snapshot.tombstone ? [] : [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title }]
+          project: (snapshot) => {
+            if (snapshot.tombstone) return []
+            return [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title }]
+          }
         })
         const initial = ReplicaDefinition.make({
           name: "tasks",
@@ -640,10 +650,10 @@ describe("ReplicaEvolution", () => {
           version: 2,
           Row: projectionRow,
           key: (row) => row.sourceDocumentId,
-          project: (snapshot) =>
-            snapshot.tombstone
-              ? []
-              : [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title.toUpperCase() }]
+          project: (snapshot) => {
+            if (snapshot.tombstone) return []
+            return [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title.toUpperCase() }]
+          }
         })
         const evolved = ReplicaDefinition.make({
           name: "tasks",

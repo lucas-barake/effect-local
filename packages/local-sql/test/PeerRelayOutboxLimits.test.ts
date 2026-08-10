@@ -33,7 +33,7 @@ describe("PeerRelayOutboxLimits", () => {
       ) {
         assert.strictEqual(
           (yield* Effect.exit(PeerRelayOutboxLimits.make(
-            values as PeerRelayOutboxLimits.Values
+            values satisfies PeerRelayOutboxLimits.Values
           )))._tag,
           "Failure"
         )

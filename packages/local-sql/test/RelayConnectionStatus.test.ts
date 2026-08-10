@@ -25,8 +25,8 @@ import * as RelayConnectionStatus from "../src/RelayConnectionStatus.js"
  * A flaky guard is worse than a stated gap, so it is stated instead.
  */
 const tcpPort = (address: SocketServer.Address) => {
-  assert.strictEqual(address._tag, "TcpAddress")
-  return (address as SocketServer.TcpAddress).port
+  if (address._tag !== "TcpAddress") return assert.fail("expected a TCP address")
+  return address.port
 }
 
 /**

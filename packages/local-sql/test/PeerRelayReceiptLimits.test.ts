@@ -33,7 +33,7 @@ describe("PeerRelayReceiptLimits", () => {
       ) {
         assert.strictEqual(
           (yield* Effect.exit(PeerRelayReceiptLimits.make(
-            values as PeerRelayReceiptLimits.Values
+            values satisfies PeerRelayReceiptLimits.Values
           )))._tag,
           "Failure"
         )

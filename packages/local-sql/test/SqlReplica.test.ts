@@ -20,6 +20,7 @@ import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Latch from "effect/Latch"
 import * as Layer from "effect/Layer"
+import * as Match from "effect/Match"
 import * as Option from "effect/Option"
 import * as Pull from "effect/Pull"
 import * as Queue from "effect/Queue"
@@ -28,7 +29,9 @@ import * as Stream from "effect/Stream"
 import { TestClock } from "effect/testing"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import type * as SqlConnection from "effect/unstable/sql/SqlConnection"
 import * as SqlError from "effect/unstable/sql/SqlError"
+import type * as SqlStatement from "effect/unstable/sql/Statement"
 import * as CommitPublisher from "../src/CommitPublisher.js"
 import * as Compaction from "../src/Compaction.js"
 import * as ClusterStorage from "../src/internal/clusterStorage.js"
@@ -42,6 +45,7 @@ import * as SqlProjection from "../src/SqlProjection.js"
 import * as SqlReplica from "../src/SqlReplica.js"
 
 describe("SqlReplica", () => {
+  const JsonString = Schema.fromJsonString(Schema.Json)
   const concatenate = (chunks: ReadonlyArray<Uint8Array>) => {
     const length = chunks.reduce((total, chunk) => total + chunk.byteLength, 0)
     const result = new Uint8Array(length)
@@ -53,7 +57,9 @@ describe("SqlReplica", () => {
     return result
   }
   const archiveLines = (chunks: ReadonlyArray<Uint8Array>) =>
-    new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n").map((line) => JSON.parse(line))
+    new TextDecoder().decode(concatenate(chunks)).trimEnd().split("\n").map((line) =>
+      Schema.decodeSync(JsonString)(line)
+    )
   const encodeArchive = (lines: Array<any>) =>
     Effect.gen(function*() {
       const manifest = lines[0]!
@@ -66,12 +72,16 @@ describe("SqlReplica", () => {
       manifest.value.recordCount = records.length
       for (let attempt = 0; attempt < 8; attempt++) {
         manifest.checksum = yield* Canonical.digest(manifest.value)
-        const encoded = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+        const encoded = new TextEncoder().encode(
+          `${lines.map((line) => Schema.encodeSync(JsonString)(line)).join("\n")}\n`
+        )
         if (manifest.value.declaredBytes === encoded.byteLength) return encoded
         manifest.value.declaredBytes = encoded.byteLength
       }
       manifest.checksum = yield* Canonical.digest(manifest.value)
-      return new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+      return new TextEncoder().encode(
+        `${lines.map((line) => Schema.encodeSync(JsonString)(line)).join("\n")}\n`
+      )
     })
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
   const Rename = Mutation.make("Rename", { document: Task, payload: Schema.String })
@@ -82,9 +92,10 @@ describe("SqlReplica", () => {
     Row: Schema.Struct({ sourceDocumentId: Identity.DocumentId, title: Schema.String }),
     key: (row) => row.sourceDocumentId,
     project: (snapshot) =>
-      snapshot.tombstone
-        ? []
-        : [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title }]
+      Match.value(snapshot.tombstone).pipe(
+        Match.when(true, () => []),
+        Match.orElse(() => [{ sourceDocumentId: snapshot.documentId, title: snapshot.value.title }])
+      )
   })
   const TaskTitleSql = SqlProjection.make(TaskTitle, {
     table: "task_title_v1",
@@ -202,6 +213,27 @@ describe("SqlReplica", () => {
     Layer.provideMerge(SqlReplica.servicesLayerWithBindings(definition, { projections: [] })),
     Layer.provide(Layer.mergeAll(Database, Handler, PriorityLimits))
   )
+
+  const makeSqlClient = (
+    sql: SqlClient.SqlClient,
+    overrides: Record<string, unknown> = {},
+    onTemplate?: (strings: TemplateStringsArray) => void
+  ): SqlClient.SqlClient => {
+    function query<A extends object = SqlConnection.Row,>(
+      strings: TemplateStringsArray,
+      ...args: Array<unknown>
+    ): SqlStatement.Statement<A>
+    function query(value: string): SqlStatement.Identifier
+    function query<A extends object = SqlConnection.Row,>(
+      strings: TemplateStringsArray | string,
+      ...args: Array<unknown>
+    ): SqlStatement.Statement<A> | SqlStatement.Identifier {
+      if (typeof strings === "string") return sql(strings)
+      onTemplate?.(strings)
+      return sql<A>(strings, ...args)
+    }
+    return Object.assign(query, sql, overrides)
+  }
 
   const assertInteractivePriority = Effect.gen(function*() {
     const replica = yield* Replica.Replica
@@ -335,7 +367,7 @@ describe("SqlReplica", () => {
         eventCapacity: 0,
         publishInterval: "1 second"
       }
-    } as const
+    } satisfies SqlReplica.Options<[]>
     for (
       const build of [
         () => SqlReplica.layer(definition, options),
@@ -385,14 +417,24 @@ describe("SqlReplica", () => {
         }
         // Named rather than merely "it failed": the direct stack has to be rejected for being the
         // wrong `PeerSync`, not for some unrelated wiring fault that would mask a real regression.
-        if (!Exit.isFailure(exit)) return assert.fail("the direct stack must not build a relay runtime")
+        if (!Exit.isFailure(exit)) {
+          assert.fail("the direct stack must not build a relay runtime")
+          return
+        }
         const failure = Cause.findErrorOption(exit.cause)
-        if (Option.isNone(failure)) return assert.fail("expected a typed failure")
+        if (Option.isNone(failure)) {
+          assert.fail("expected a typed failure")
+          return
+        }
         const error = failure.value
-        if (error._tag !== "ReplicaError") return assert.fail(`expected a ReplicaError, got ${error._tag}`)
+        if (error._tag !== "ReplicaError") {
+          assert.fail(`expected a ReplicaError, got ${error._tag}`)
+          return
+        }
         const reason = error.reason
         if (reason._tag !== "ProtocolMismatch") {
-          return assert.fail(`expected a ProtocolMismatch, got ${reason._tag}`)
+          assert.fail(`expected a ProtocolMismatch, got ${reason._tag}`)
+          return
         }
         assert.strictEqual(reason.expected, "relay enabled PeerSync")
       }))
@@ -570,47 +612,43 @@ describe("SqlReplica", () => {
         SqlClient.SqlClient,
         Effect.gen(function*() {
           const sql = yield* SqlClient.SqlClient
-          return Object.assign(
-            ((...args: ReadonlyArray<unknown>) => (sql as any)(...args)) as SqlClient.SqlClient,
-            sql,
-            {
-              reserve: sql.reserve.pipe(
-                Effect.tap(() =>
-                  Effect.sync(() => {
-                    reservedConnections++
-                  })
-                ),
-                Effect.map((connection) =>
-                  Object.assign({}, connection, {
-                    executeUnprepared: (
-                      statement: string,
-                      params: ReadonlyArray<unknown>,
-                      transformRows: Parameters<typeof connection.executeUnprepared>[2]
-                    ) => {
-                      const executed = connection.executeUnprepared(statement, params, transformRows)
-                      if (statement !== "COMMIT" || !loseCommitAcknowledgement) return executed
-                      return executed.pipe(
-                        Effect.tap(() =>
-                          Effect.sync(() => {
-                            loseCommitAcknowledgement = false
+          return makeSqlClient(sql, {
+            reserve: sql.reserve.pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  reservedConnections++
+                })
+              ),
+              Effect.map((connection) =>
+                Object.assign({}, connection, {
+                  executeUnprepared: (
+                    statement: string,
+                    params: ReadonlyArray<unknown>,
+                    transformRows: Parameters<typeof connection.executeUnprepared>[2]
+                  ) => {
+                    const executed = connection.executeUnprepared(statement, params, transformRows)
+                    if (statement !== "COMMIT" || !loseCommitAcknowledgement) return executed
+                    return executed.pipe(
+                      Effect.tap(() =>
+                        Effect.sync(() => {
+                          loseCommitAcknowledgement = false
+                        })
+                      ),
+                      Effect.andThen(Effect.fail(
+                        new SqlError.SqlError({
+                          reason: new SqlError.ConnectionError({
+                            cause: "commit acknowledgement lost",
+                            message: "commit acknowledgement lost",
+                            operation: "commit"
                           })
-                        ),
-                        Effect.andThen(Effect.fail(
-                          new SqlError.SqlError({
-                            reason: new SqlError.ConnectionError({
-                              cause: new Error("commit acknowledgement lost"),
-                              message: "commit acknowledgement lost",
-                              operation: "commit"
-                            })
-                          })
-                        ))
-                      )
-                    }
-                  })
-                )
+                        })
+                      ))
+                    )
+                  }
+                })
               )
-            }
-          )
+            )
+          })
         })
       ).pipe(Layer.provide(baseDatabase))
       const database = Layer.merge(instrumentedDatabase, NodeCrypto.layer)
@@ -632,11 +670,17 @@ describe("SqlReplica", () => {
           payload: "two"
         }))
 
-        if (!Exit.isFailure(exit)) return assert.fail("expected the commit acknowledgement to be lost")
+        if (!Exit.isFailure(exit)) {
+          assert.fail("expected the commit acknowledgement to be lost")
+          return
+        }
         assert.isFalse(Cause.hasDies(exit.cause))
         assert.strictEqual(exit.cause.reasons.length, 1)
         const failure = Cause.findErrorOption(exit.cause)
-        if (Option.isNone(failure)) return assert.fail("expected a typed failure")
+        if (Option.isNone(failure)) {
+          assert.fail("expected a typed failure")
+          return
+        }
         const unknown = failure.value
         assert.strictEqual(unknown.reason._tag, "CommandOutcomeUnknown")
         if (unknown.reason._tag === "CommandOutcomeUnknown") {
@@ -1095,16 +1139,11 @@ describe("SqlReplica", () => {
       SqlClient.SqlClient,
       Effect.gen(function*() {
         const sql = yield* SqlClient.SqlClient
-        return Object.assign(
-          ((...args: ReadonlyArray<unknown>) => {
-            const strings = args[0]
-            if (Array.isArray(strings) && String(strings[0]).includes("INSERT INTO effect_local_changes")) {
-              changeInsertStatements++
-            }
-            return (sql as any)(...args)
-          }) as SqlClient.SqlClient,
-          sql
-        )
+        return makeSqlClient(sql, {}, (strings) => {
+          if (strings[0].includes("INSERT INTO effect_local_changes")) {
+            changeInsertStatements++
+          }
+        })
       })
     ).pipe(Layer.provide(baseDatabase))
     const CountingDatabase = Layer.merge(countingDatabase, NodeCrypto.layer)
@@ -1166,7 +1205,7 @@ describe("SqlReplica", () => {
       const keys = yield* sql<{ readonly invalidation_keys: string }>`
         SELECT invalidation_keys FROM effect_local_commit_outbox ORDER BY commit_sequence DESC LIMIT 1
       `
-      assert.deepStrictEqual(JSON.parse(keys[0]!.invalidation_keys), [
+      assert.deepStrictEqual(Schema.decodeSync(JsonString)(keys[0].invalidation_keys), [
         Task.name,
         ReplicaDefinition.documentInstanceKey(Task.name, documentId),
         TaskTitle.name
@@ -1205,24 +1244,24 @@ describe("SqlReplica", () => {
         SqlClient.SqlClient,
         Effect.gen(function*() {
           const sql = yield* SqlClient.SqlClient
-          return Object.assign(
-            ((...args: ReadonlyArray<unknown>) => (sql as any)(...args)) as SqlClient.SqlClient,
-            sql,
-            {
-              withTransaction: <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
-                Effect.serviceOption(sql.transactionService).pipe(
-                  Effect.flatMap((transaction) =>
-                    sql.withTransaction(effect).pipe(
-                      Effect.tap(() =>
-                        armed && Option.isNone(transaction)
-                          ? Deferred.succeed(committed, undefined).pipe(Effect.andThen(release.await))
-                          : Effect.void
+          return makeSqlClient(sql, {
+            withTransaction: <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
+              Effect.serviceOption(sql.transactionService).pipe(
+                Effect.flatMap((transaction) =>
+                  sql.withTransaction(effect).pipe(
+                    Effect.tap(() =>
+                      Match.value(armed && Option.isNone(transaction)).pipe(
+                        Match.when(true, () =>
+                          Deferred.succeed(committed, undefined).pipe(Effect.andThen(release.await))),
+                        Match.orElse(() =>
+                          Effect.void
+                        )
                       )
                     )
                   )
                 )
-            }
-          )
+              )
+          })
         })
       ).pipe(Layer.provideMerge(baseDatabase))
       const database = Layer.merge(instrumentedDatabase, NodeCrypto.layer)
@@ -1246,12 +1285,14 @@ describe("SqlReplica", () => {
           mode: "replace",
           source: Stream.fromIterable(backup).pipe(
             Stream.mapEffect((chunk, index) =>
-              index === 1
-                ? Deferred.succeed(ingesting, undefined).pipe(
-                  Effect.andThen(Deferred.await(continueIngest)),
-                  Effect.as(chunk)
-                )
-                : Effect.succeed(chunk)
+              Match.value(index).pipe(
+                Match.when(1, () =>
+                  Deferred.succeed(ingesting, undefined).pipe(
+                    Effect.andThen(Deferred.await(continueIngest)),
+                    Effect.as(chunk)
+                  )),
+                Match.orElse(() => Effect.succeed(chunk))
+              )
             )
           )
         }).pipe(Effect.forkChild({ startImmediately: true }))
@@ -1260,7 +1301,7 @@ describe("SqlReplica", () => {
           yield* Stream.runHead(replica.status),
           Option.some<ReplicaStatus.ReplicaStatus>({
             _tag: "Restoring",
-            processedBytes: backup[0]!.byteLength
+            processedBytes: backup[0].byteLength
           })
         )
         yield* Deferred.succeed(continueIngest, undefined)
@@ -1304,24 +1345,24 @@ describe("SqlReplica", () => {
         SqlClient.SqlClient,
         Effect.gen(function*() {
           const sql = yield* SqlClient.SqlClient
-          const instrumented = Object.assign(
-            ((...args: ReadonlyArray<unknown>) => (sql as any)(...args)) as SqlClient.SqlClient,
-            sql,
-            {
-              withTransaction: <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
-                Effect.serviceOption(sql.transactionService).pipe(
-                  Effect.flatMap((transaction) =>
-                    sql.withTransaction(effect).pipe(
-                      Effect.tap(() =>
-                        armed && Option.isNone(transaction)
-                          ? Deferred.succeed(committed, undefined).pipe(Effect.andThen(release.await))
-                          : Effect.void
+          const instrumented = makeSqlClient(sql, {
+            withTransaction: <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
+              Effect.serviceOption(sql.transactionService).pipe(
+                Effect.flatMap((transaction) =>
+                  sql.withTransaction(effect).pipe(
+                    Effect.tap(() =>
+                      Match.value(armed && Option.isNone(transaction)).pipe(
+                        Match.when(true, () =>
+                          Deferred.succeed(committed, undefined).pipe(Effect.andThen(release.await))),
+                        Match.orElse(() =>
+                          Effect.void
+                        )
                       )
                     )
                   )
                 )
-            }
-          )
+              )
+          })
           return instrumented
         })
       ).pipe(Layer.provideMerge(baseDatabase))
@@ -1377,7 +1418,7 @@ describe("SqlReplica", () => {
           const sql = yield* SqlClient.SqlClient
           return new Proxy(sql, {
             apply(target, thisArg, args) {
-              const statement = Reflect.apply(target, thisArg, args) as Effect.Effect<unknown, unknown>
+              const statement = Reflect.apply(target, thisArg, args)
               const strings = args[0]
               if (!Array.isArray(strings) || !armed) return statement
               const query = strings.join("?").replace(/\s+/g, " ").trim()
@@ -1388,7 +1429,7 @@ describe("SqlReplica", () => {
                 Effect.andThen(statement)
               )
             }
-          }) as SqlClient.SqlClient
+          })
         })
       ).pipe(Layer.provide(baseDatabase))
       const database = Layer.merge(probedDatabase, NodeCrypto.layer)

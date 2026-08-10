@@ -56,7 +56,7 @@ describe("ReplicaGate", () => {
         gate.claim(() => Deferred.succeed(acquired, undefined).pipe(Effect.andThen(Deferred.await(release))))
       )
       yield* Deferred.await(acquired)
-      return { release, fiber } as const
+      return { release, fiber }
     })
 
   const probeAdmission = (gate: ReplicaGate.ReplicaGate["Service"]) =>
@@ -73,7 +73,7 @@ describe("ReplicaGate", () => {
         }))
       )
       yield* Effect.yieldNow
-      return { acquired, fiber } as const
+      return { acquired, fiber }
     })
 
   const assertQuotaExceeded = (admission: Admission, limit: number) => {

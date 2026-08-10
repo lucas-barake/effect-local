@@ -95,17 +95,17 @@ describe("PeerSyncEnvelope", () => {
       )
       assert.deepStrictEqual(decoded.manifest.heads, ["a", "z"])
       assert.deepStrictEqual(decoded.manifest.base, { _tag: "Heads", baseHeads: ["b", "d"] })
-      assert.deepStrictEqual(decoded.transitions[0]!.priorHeads, ["a", "c"])
-      assert.deepStrictEqual(decoded.transitions[0]!.resultingHeads, ["a", "z"])
+      assert.deepStrictEqual(decoded.transitions[0].priorHeads, ["a", "c"])
+      assert.deepStrictEqual(decoded.transitions[0].resultingHeads, ["a", "z"])
       assert.deepStrictEqual(decoded.snapshot, checkpointTransfer.snapshot)
-      assert.deepStrictEqual(decoded.transitions[0]!.priorSnapshot, Uint8Array.of(8, 9))
+      assert.deepStrictEqual(decoded.transitions[0].priorSnapshot, Uint8Array.of(8, 9))
     }))
 
   it.effect("preserves legacy envelopes without a checkpoint transfer", () =>
     Effect.gen(function*() {
       const envelope = yield* makeSyncEnvelope
       const bytes = yield* PeerSyncEnvelope.encodeSyncEnvelope(envelope)
-      const json = JSON.parse(new TextDecoder().decode(bytes))
+      const json = Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(new TextDecoder().decode(bytes))
       assert.isFalse(Object.hasOwn(json, "checkpointTransfer"))
       const decoded = yield* PeerSyncEnvelope.decodeSyncEnvelope(bytes, limits)
       assert.isFalse(Object.hasOwn(decoded, "checkpointTransfer"))
@@ -198,7 +198,7 @@ describe("PeerSyncEnvelope", () => {
             ...checkpointTransfer,
             transitions: Array.from(
               { length: PeerSyncEnvelope.maximumCheckpointTransitions + 1 },
-              () => checkpointTransfer.transitions[0]!
+              () => checkpointTransfer.transitions[0]
             )
           })
         ))._tag,
@@ -220,7 +220,7 @@ describe("PeerSyncEnvelope", () => {
           "Failure"
         )
       }
-      const encodedJson = JSON.parse(new TextDecoder().decode(encoded))
+      const encodedJson = Schema.decodeUnknownSync(Schema.UnknownFromJsonString)(new TextDecoder().decode(encoded))
       for (
         const malformed of [
           {
@@ -235,7 +235,7 @@ describe("PeerSyncEnvelope", () => {
       ) {
         assert.strictEqual(
           (yield* Effect.exit(PeerSyncEnvelope.decodeCheckpointTransfer(
-            new TextEncoder().encode(JSON.stringify(malformed)),
+            new TextEncoder().encode(Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(malformed)),
             limits.maxSyncMessageBytes
           )))._tag,
           "Failure"
@@ -323,13 +323,13 @@ describe("PeerSyncEnvelope", () => {
       const envelope = yield* makeSyncEnvelope
       const chunks = Automerge.decodeSyncMessage(envelope.message).changes
       assert.strictEqual(chunks.length, 1)
-      assert.throws(() => Automerge.decodeChange(chunks[0]!))
-      const document = Automerge.load(chunks[0]!)
-      try {
-        assert.strictEqual(Automerge.getAllChanges(document).length, 1)
-      } finally {
-        Automerge.free(document)
-      }
+      assert.throws(() => Automerge.decodeChange(chunks[0]))
+      const document = Automerge.load(chunks[0])
+      yield* Effect.acquireUseRelease(
+        Effect.succeed(document),
+        (owned) => Effect.sync(() => assert.strictEqual(Automerge.getAllChanges(owned).length, 1)),
+        (owned) => Effect.sync(() => Automerge.free(owned))
+      )
       const bytes = yield* PeerSyncEnvelope.encodeSyncEnvelope(envelope)
       const decoded = yield* PeerSyncEnvelope.decodeSyncEnvelope(bytes, {
         ...limits,
@@ -375,7 +375,7 @@ describe("PeerSyncEnvelope", () => {
           ...envelope,
           writerProvenance: Array.from(
             { length: limits.maxSyncChangesPerMessage + 1 },
-            () => envelope.writerProvenance[0]!
+            () => envelope.writerProvenance[0]
           )
         }, limits)))._tag,
         "Failure"
@@ -547,23 +547,23 @@ describe("RelayOuterEnvelope", () => {
         {
           ...base,
           writerProvenance: [{
-            ...base.writerProvenance[0]!,
+            ...base.writerProvenance[0],
             writerSchemaVersion: 3
-          }, base.writerProvenance[1]!]
+          }, base.writerProvenance[1]]
         },
         {
           ...base,
           writerProvenance: [{
-            ...base.writerProvenance[0]!,
+            ...base.writerProvenance[0],
             changeHash: "e".repeat(64)
-          }, base.writerProvenance[1]!]
+          }, base.writerProvenance[1]]
         },
         {
           ...base,
           writerProvenance: [{
-            ...base.writerProvenance[0]!,
+            ...base.writerProvenance[0],
             writerDefinitionHash: "definition-c"
-          }, base.writerProvenance[1]!]
+          }, base.writerProvenance[1]]
         },
         { ...base, messageHash: "d".repeat(64) },
         { ...base, payload: Uint8Array.of(1, 2, 3, 5) }

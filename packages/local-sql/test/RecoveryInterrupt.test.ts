@@ -19,16 +19,14 @@ import * as ReplicaGate from "../src/ReplicaGate.js"
 import { withGateLimits } from "./fixtures/limits.js"
 
 const automergeMock = vi.hoisted(() => ({ freeCount: 0 }))
-vi.mock("../src/internal/automerge.js", async (importActual) => {
-  const actual = await importActual<typeof InternalAutomerge>()
-  return {
+vi.mock("../src/internal/automerge.js", (importActual) =>
+  importActual<typeof InternalAutomerge>().then((actual) => ({
     ...actual,
     free: (document: InternalAutomerge.AnyDocument) => {
       automergeMock.freeCount++
       return actual.free(document)
     }
-  }
-})
+  })))
 
 describe("Recovery interruption", () => {
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
@@ -56,14 +54,15 @@ describe("Recovery interruption", () => {
       } = { active: false }
       const Suspending = Document.make("Suspending", {
         schema: Schema.Struct({ title: Schema.String }).pipe(
-          Schema.middlewareDecoding((effect) =>
-            control.active && control.entered && control.release
-              ? Deferred.succeed(control.entered, undefined).pipe(
+          Schema.middlewareDecoding((effect) => {
+            if (control.active && control.entered && control.release) {
+              return Deferred.succeed(control.entered, undefined).pipe(
                 Effect.andThen(Deferred.await(control.release)),
                 Effect.andThen(effect)
               )
-              : effect
-          )
+            }
+            return effect
+          })
         ),
         version: 1
       })

@@ -1,6 +1,6 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
-import { assert, it } from "@effect/vitest"
+import { assert, it as rootIt } from "@effect/vitest"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as CommandOutcome from "@lucas-barake/effect-local/CommandOutcome"
 import * as Document from "@lucas-barake/effect-local/Document"
@@ -44,6 +44,11 @@ import * as ReplicaGate from "../src/ReplicaGate.js"
 import * as ReplicaOperationScheduler from "../src/ReplicaOperationScheduler.js"
 import { gateLimits } from "./fixtures/limits.js"
 
+type TestEntityClient = ReturnType<Effect.Success<typeof DocumentEntity.DocumentEntity.client>>
+
+const makeEntityClient = (client: Pick<TestEntityClient, "ApplySync">): TestEntityClient =>
+  Object.assign(Object.create(Object.prototype), client)
+
 const deliveryStore = CommandDeliveryStore.CommandDeliveryStore.of({
   lookup: () => Effect.die("unexpected command delivery lookup"),
   snapshotWithCursor: () => Effect.die("unexpected command delivery snapshot"),
@@ -56,7 +61,7 @@ const deliveryStore = CommandDeliveryStore.CommandDeliveryStore.of({
   cursor: Effect.die("unexpected command delivery cursor")
 })
 
-it.layer(Layer.mergeAll(
+rootIt.layer(Layer.mergeAll(
   NodeCrypto.layer,
   PeerRelayReceiptLimits.layerDefaults,
   ReplicaOperationScheduler.layer.pipe(Layer.provide(ReplicaLimits.layer(gateLimits))),
@@ -143,9 +148,9 @@ it.layer(Layer.mergeAll(
     acceptedHeads: [],
     commitSequence: Identity.CommitSequence.make(1),
     observedByPeer: true,
-    durableConfirmation: false as const,
+    durableConfirmation: false,
     duplicate: false
-  }
+  } satisfies PeerSession.Received
   const gate = ReplicaGate.ReplicaGate.of({
     current: Effect.succeed(permit),
     claiming: Effect.succeed(false),
@@ -157,18 +162,19 @@ it.layer(Layer.mergeAll(
   })
   const testRelayPeerId = Identity.PeerId.make("peer_00000000-0000-4000-8000-000000000099")
   let relayMessageSequence = 0
+  const RelayMessageJson = Schema.fromJsonString(
+    Schema.Struct({ messageHash: Schema.optional(Schema.String) })
+  )
   const acknowledged = (
     peerId: Identity.PeerId,
     stream: Stream.Stream<Uint8Array, ReplicaError.ReplicaError>
   ): Stream.Stream<PeerTransport.Inbound, ReplicaError.ReplicaError> =>
     Stream.map(stream, (message) => {
-      let messageHash = "0".repeat(64)
-      try {
-        const decoded = JSON.parse(new TextDecoder().decode(message)) as { readonly messageHash?: unknown }
-        if (typeof decoded.messageHash === "string") messageHash = decoded.messageHash
-      } catch {
-        // The production decoder must classify malformed bytes, not this test adapter.
-      }
+      const decoded = Schema.decodeUnknownOption(RelayMessageJson)(new TextDecoder().decode(message))
+      const messageHash = Option.match(decoded, {
+        onNone: () => "0".repeat(64),
+        onSome: ({ messageHash: decodedMessageHash }) => decodedMessageHash ?? "0".repeat(64)
+      })
       relayMessageSequence += 1
       const suffix = relayMessageSequence.toString(16).padStart(12, "0").slice(-12)
       return {
@@ -187,19 +193,19 @@ it.layer(Layer.mergeAll(
           },
           receiptRetentionMillis: PeerRelayReceiptLimits.defaults.receiptRetentionMillis,
           acknowledge: Effect.void,
-          reject: (reason) =>
-            reason === "ApplicationRejected"
-              ? Effect.void
-              : Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.ProtocolMismatch({
-                    expected: "valid relay delivery",
-                    observed: "invalid relay delivery"
-                  })
+          reject: (reason) => {
+            if (reason === "ApplicationRejected") return Effect.void
+            return Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.ProtocolMismatch({
+                  expected: "valid relay delivery",
+                  observed: "invalid relay delivery"
                 })
-              )
+              })
+            )
+          }
         }
-      } as const
+      } satisfies PeerTransport.Inbound
     })
 
   const makeLiveFixture = (documents: ReadonlyArray<PeerSession.SelectedDocument>) =>
@@ -221,7 +227,7 @@ it.layer(Layer.mergeAll(
       const subscriberEnded = yield* Deferred.make<void>()
       const closed = yield* Ref.make(0)
       const generateError = new ReplicaError.ReplicaError({
-        reason: new ReplicaError.StorageUnavailable({ cause: new Error("generate failed") })
+        reason: new ReplicaError.StorageUnavailable({ cause: "generate failed" })
       })
       const sync = PeerSync.PeerSync.of({
         withDocumentInvalidation: (_documentId, effect) => effect,
@@ -239,10 +245,12 @@ it.layer(Layer.mergeAll(
             Effect.andThen(Ref.get(generateFailures)),
             Effect.flatMap((failures) => {
               const failure = failures.get(documentId)
-              return failure !== undefined ? Effect.fail(failure) : Ref.get(failGenerate).pipe(
-                Effect.flatMap((shouldFail) =>
-                  shouldFail ? Effect.fail(generateError) : Queue.offer(generated, documentId)
-                )
+              if (failure !== undefined) return Effect.fail(failure)
+              return Ref.get(failGenerate).pipe(
+                Effect.flatMap((shouldFail) => {
+                  if (shouldFail) return Effect.fail(generateError)
+                  return Queue.offer(generated, documentId)
+                })
               )
             }),
             Effect.as({ outbound: null, observedByPeer: false, dirty: false })
@@ -283,9 +291,8 @@ it.layer(Layer.mergeAll(
           })
         )
       })
-      const sharding = Sharding.Sharding.of({
-        ...({} as Sharding.Sharding["Service"]),
-        makeClient: () => Effect.succeed(() => Effect.die("unexpected entity request") as never)
+      const sharding: Sharding.Sharding["Service"] = Object.assign(Object.create(Object.prototype), {
+        makeClient: () => Effect.succeed(() => Effect.die("unexpected entity request"))
       })
       return {
         peerId,
@@ -318,6 +325,21 @@ it.layer(Layer.mergeAll(
     })
 
   const SyncEnvelopeJson = Schema.fromJsonString(Schema.toCodecJson(PeerSyncEnvelope.SyncEnvelope))
+  const SyncEnvelopeWire = Schema.Struct({
+    connectionEpoch: Schema.String,
+    sequence: Schema.Number,
+    documentId: Schema.String,
+    documentType: Schema.String,
+    messageHash: Schema.String,
+    message: Schema.String,
+    lineage: Schema.optional(Schema.String),
+    writerProvenance: Schema.optional(Schema.Array(Schema.Struct({
+      changeHash: Schema.String,
+      writerSchemaVersion: Schema.Number,
+      writerDefinitionHash: Schema.String
+    })))
+  })
+  const SyncEnvelopeWireJson = Schema.fromJsonString(SyncEnvelopeWire)
   // The longest value the lineage schema admits, so the envelope size bound is checked against the
   // worst case rather than against an absent or genesis lineage.
   const maximalLineage = Identity.DocumentLineage.make("lin_ffffffff-ffff-4fff-bfff-ffffffffffff")
@@ -373,27 +395,30 @@ it.layer(Layer.mergeAll(
         message,
         writerProvenance: []
       })
-      const wire = JSON.parse(new TextDecoder().decode(encoded))
+      const wire = { ...(yield* Schema.decodeUnknownEffect(SyncEnvelopeWireJson)(new TextDecoder().decode(encoded))) }
       delete wire.lineage
       assert.strictEqual(
-        (yield* Effect.exit(Schema.decodeUnknownEffect(SyncEnvelopeJson)(JSON.stringify(wire))))._tag,
+        (yield* Effect.exit(
+          Schema.decodeUnknownEffect(SyncEnvelopeJson)(yield* Schema.encodeEffect(SyncEnvelopeWireJson)(wire))
+        ))._tag,
         "Failure"
       )
 
       const withLineage = yield* Schema.decodeUnknownEffect(SyncEnvelopeJson)(
-        JSON.stringify({ ...wire, lineage: maximalLineage })
+        yield* Schema.encodeEffect(SyncEnvelopeWireJson)({ ...wire, lineage: maximalLineage })
       )
       assert.strictEqual(withLineage.lineage, maximalLineage)
 
       for (const lineage of ["x".repeat(257), "界".repeat(256), "\0".repeat(256), "lin_not-a-uuid"]) {
+        const encodedWire = yield* Schema.encodeEffect(SyncEnvelopeWireJson)({ ...wire, lineage })
         const exit = yield* Effect.exit(
-          Schema.decodeUnknownEffect(SyncEnvelopeJson)(JSON.stringify({ ...wire, lineage }))
+          Schema.decodeUnknownEffect(SyncEnvelopeJson)(encodedWire)
         )
-        assert.strictEqual(exit._tag, "Failure", `expected ${JSON.stringify(lineage)} to be rejected`)
+        assert.strictEqual(exit._tag, "Failure", `expected ${lineage} to be rejected`)
       }
 
       const genesisOnTheWire = yield* Schema.decodeUnknownEffect(SyncEnvelopeJson)(
-        JSON.stringify({ ...wire, lineage: Identity.genesisLineage })
+        yield* Schema.encodeEffect(SyncEnvelopeWireJson)({ ...wire, lineage: Identity.genesisLineage })
       )
       assert.strictEqual(genesisOnTheWire.lineage, Identity.genesisLineage)
     }))
@@ -416,9 +441,13 @@ it.layer(Layer.mergeAll(
           writerDefinitionHash: definition.hash
         }]
       })
-      const tampered = JSON.parse(new TextDecoder().decode(valid))
-      tampered.writerProvenance[0].writerDefinitionHash = "a".repeat(130_000)
-      const json = JSON.stringify(tampered)
+      const tampered = { ...(yield* Schema.decodeUnknownEffect(SyncEnvelopeWireJson)(new TextDecoder().decode(valid))) }
+      if (tampered.writerProvenance === undefined) {
+        yield* Effect.die("expected writer provenance")
+      } else {
+        tampered.writerProvenance[0].writerDefinitionHash = "a".repeat(130_000)
+      }
+      const json = yield* Schema.encodeEffect(SyncEnvelopeWireJson)(tampered)
       assert.isBelow(
         new TextEncoder().encode(json).byteLength,
         PeerSyncEnvelope.maximumSyncEnvelopeBytes(limits.maxSyncMessageBytes, limits.maxSyncChangesPerMessage)
@@ -560,22 +589,24 @@ it.layer(Layer.mergeAll(
         })
         const session = yield* PeerSession.makeTestClient(
           { peerId, documents: [{ document: Task, documentId }] },
-          () =>
-            Effect.succeed({
+          () => {
+            return Effect.succeed(makeEntityClient({
               ApplySync: () =>
                 Ref.updateAndGet(applyCalls, (count) => count + 1).pipe(
-                  Effect.flatMap((call) =>
-                    call === 1
-                      ? Deferred.succeed(applyCompleted, undefined).pipe(
+                  Effect.flatMap((call) => {
+                    if (call === 1) {
+                      return Deferred.succeed(applyCompleted, undefined).pipe(
                         Effect.andThen(Deferred.await(releaseApply)),
                         Effect.as({ ...result, observedByPeer: true })
                       )
-                      : Deferred.succeed(firstInboundCompleted, undefined).pipe(
-                        Effect.andThen(Effect.never)
-                      )
-                  )
+                    }
+                    return Deferred.succeed(firstInboundCompleted, undefined).pipe(
+                      Effect.andThen(Effect.never)
+                    )
+                  })
                 )
-            } as never)
+            }))
+          }
         ).pipe(
           Effect.provideService(PeerTransport.PeerTransport, transport),
           Effect.provide(PeerConnectionStatus.layer),
@@ -637,7 +668,7 @@ it.layer(Layer.mergeAll(
 
     return Effect.scoped(
       Effect.gen(function*() {
-        const gate = yield* ReplicaGate.ReplicaGate
+        const localGate = yield* ReplicaGate.ReplicaGate
         const crypto = yield* Crypto.Crypto
         const inbound = yield* Queue.unbounded<Uint8Array>()
         const digestArmed = yield* Ref.make(false)
@@ -650,7 +681,7 @@ it.layer(Layer.mergeAll(
         const peerId = yield* Identity.makePeerId
         const message = Uint8Array.of(1)
         const messageHash = yield* Canonical.digest(message)
-        const permit = yield* gate.current
+        const currentPermit = yield* localGate.current
         let generateCalls = 0
         const sync = PeerSync.PeerSync.of({
           withDocumentInvalidation: (_documentId, effect) => effect,
@@ -659,18 +690,17 @@ it.layer(Layer.mergeAll(
             Effect.succeed({
               peerId: id,
               connectionEpoch: "local-epoch",
-              replicaIncarnation: permit.incarnation
+              replicaIncarnation: currentPermit.incarnation
             }),
           reset: () => Effect.void,
           generate: () => {
             generateCalls++
-            return generateCalls === 1
-              ? Effect.succeed({ outbound: null, observedByPeer: false, dirty: false })
-              : Deferred.succeed(generateLocked, undefined).pipe(
-                Effect.andThen(Deferred.await(releaseGenerate)),
-                Effect.andThen(Effect.scoped(gate.shared)),
-                Effect.as({ outbound: null, observedByPeer: false, dirty: false })
-              )
+            if (generateCalls === 1) return Effect.succeed({ outbound: null, observedByPeer: false, dirty: false })
+            return Deferred.succeed(generateLocked, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseGenerate)),
+              Effect.andThen(Effect.scoped(localGate.shared)),
+              Effect.as({ outbound: null, observedByPeer: false, dirty: false })
+            )
           },
           receive: () => Effect.die("unexpected direct receive"),
           enqueue: (_session, reply) =>
@@ -697,9 +727,10 @@ it.layer(Layer.mergeAll(
             crypto.digest(algorithm, data).pipe(
               Effect.tap(() =>
                 Ref.get(digestArmed).pipe(
-                  Effect.flatMap((armed) =>
-                    armed ? Deferred.succeed(inboundDigested, undefined).pipe(Effect.asVoid) : Effect.void
-                  )
+                  Effect.flatMap((armed) => {
+                    if (armed) return Deferred.succeed(inboundDigested, undefined).pipe(Effect.asVoid)
+                    return Effect.void
+                  })
                 )
               )
             )
@@ -707,15 +738,15 @@ it.layer(Layer.mergeAll(
         const session = yield* PeerSession.makeTestClient(
           { peerId, documents: [{ document: Task, documentId }] },
           () =>
-            Effect.succeed({
+            Effect.succeed(makeEntityClient({
               ApplySync: () => Effect.succeed(result)
-            } as never)
+            }))
         ).pipe(
           Effect.provideService(Crypto.Crypto, instrumentedCrypto),
           Effect.provideService(PeerTransport.PeerTransport, transport),
           Effect.provide(PeerConnectionStatus.layer),
           Effect.provideService(PeerSync.PeerSync, sync),
-          Effect.provideService(ReplicaGate.ReplicaGate, gate),
+          Effect.provideService(ReplicaGate.ReplicaGate, localGate),
           Effect.provideService(
             CommitPublisher.CommitPublisher,
             CommitPublisher.CommitPublisher.of({
@@ -752,7 +783,7 @@ it.layer(Layer.mergeAll(
           })
         )
         yield* Deferred.await(inboundDigested)
-        const claiming = yield* gate.claim(() => Deferred.succeed(claimAcquired, undefined)).pipe(
+        const claiming = yield* localGate.claim(() => Deferred.succeed(claimAcquired, undefined)).pipe(
           Effect.forkChild({ startImmediately: true })
         )
         const acquired = yield* Deferred.await(claimAcquired).pipe(
@@ -839,7 +870,10 @@ it.layer(Layer.mergeAll(
               writerProvenance: replyProvenance
             }
             return Ref.updateAndGet(enqueueCalls, (count) => count + 1).pipe(
-              Effect.flatMap((call) => call === 1 ? Ref.set(pending, [outbound]) : Effect.void),
+              Effect.flatMap((call) => {
+                if (call === 1) return Ref.set(pending, [outbound])
+                return Effect.void
+              }),
               Effect.as(outbound)
             )
           },
@@ -1000,18 +1034,19 @@ it.layer(Layer.mergeAll(
           reset: () => Effect.void,
           generate: () =>
             Ref.get(pending).pipe(
-              Effect.flatMap((current) =>
-                current.length === 0
-                  ? Effect.succeed({ outbound: generated, observedByPeer: false, dirty: false })
-                  : Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.QuotaExceeded({
-                        resource: "peer sync outbox messages",
-                        limit: 1
-                      })
+              Effect.flatMap((current) => {
+                if (current.length === 0) {
+                  return Effect.succeed({ outbound: generated, observedByPeer: false, dirty: false })
+                }
+                return Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.QuotaExceeded({
+                      resource: "peer sync outbox messages",
+                      limit: 1
                     })
-                  )
-              )
+                  })
+                )
+              })
             ),
           receive: () => Effect.succeed({ ...result, reply }),
           enqueue: (_session, value) => {
@@ -1023,9 +1058,10 @@ it.layer(Layer.mergeAll(
           },
           pending: () =>
             Ref.updateAndGet(pendingCalls, (count) => count + 1).pipe(
-              Effect.flatMap((call): Effect.Effect<ReadonlyArray<PeerSync.Outbound>> =>
-                call === 1 ? Effect.succeed([initial]) : Ref.get(pending)
-              )
+              Effect.flatMap((call): Effect.Effect<ReadonlyArray<PeerSync.Outbound>> => {
+                if (call === 1) return Effect.succeed([initial])
+                return Ref.get(pending)
+              })
             ),
           markSent: (_session, sendSequence) =>
             Ref.update(pending, (current) => current.filter((outbound) => outbound.sendSequence !== sendSequence)).pipe(
@@ -1043,13 +1079,14 @@ it.layer(Layer.mergeAll(
               send: (bytes) =>
                 Schema.decodeUnknownEffect(SyncEnvelopeJson)(new TextDecoder().decode(bytes)).pipe(
                   Effect.tap((envelope) => Queue.offer(sent, envelope.sequence)),
-                  Effect.tap((envelope) =>
-                    envelope.sequence === 0
-                      ? Deferred.succeed(firstSendStarted, undefined).pipe(
+                  Effect.tap((envelope) => {
+                    if (envelope.sequence === 0) {
+                      return Deferred.succeed(firstSendStarted, undefined).pipe(
                         Effect.andThen(Deferred.await(releaseFirstSend))
                       )
-                      : Effect.void
-                  ),
+                    }
+                    return Effect.void
+                  }),
                   Effect.asVoid,
                   Effect.orDie
                 ),
@@ -1138,9 +1175,9 @@ it.layer(Layer.mergeAll(
           reset: () => Effect.void,
           generate: (_document, documentId) =>
             Ref.get(pendingCount).pipe(
-              Effect.flatMap((count) =>
-                count >= 1
-                  ? Effect.fail(
+              Effect.flatMap((count) => {
+                if (count >= 1) {
+                  return Effect.fail(
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.QuotaExceeded({
                         resource: "peer sync outbox messages",
@@ -1148,8 +1185,9 @@ it.layer(Layer.mergeAll(
                       })
                     })
                   )
-                  : Ref.set(pendingCount, 1)
-              ),
+                }
+                return Ref.set(pendingCount, 1)
+              }),
               Effect.andThen(Ref.getAndUpdate(nextSequence, (sequence) => sequence + 1)),
               Effect.map((sendSequence) => ({
                 outbound: {
@@ -1242,21 +1280,28 @@ it.layer(Layer.mergeAll(
           reset: () => Effect.void,
           generate: () =>
             Ref.updateAndGet(generateCalls, (count) => count + 1).pipe(
-              Effect.map((call) => ({
-                outbound: call === 2
-                  ? {
-                    sendSequence: 9,
-                    documentId,
-                    message: Uint8Array.of(9),
-                    messageHash: "9".repeat(64),
-                    heads: [],
-                    lineage: Identity.genesisLineage,
-                    writerProvenance: []
+              Effect.map((call) => {
+                if (call === 2) {
+                  return {
+                    outbound: {
+                      sendSequence: 9,
+                      documentId,
+                      message: Uint8Array.of(9),
+                      messageHash: "9".repeat(64),
+                      heads: [],
+                      lineage: Identity.genesisLineage,
+                      writerProvenance: []
+                    },
+                    observedByPeer: false,
+                    dirty: false
                   }
-                  : null,
-                observedByPeer: false,
-                dirty: false
-              }))
+                }
+                return {
+                  outbound: null,
+                  observedByPeer: false,
+                  dirty: false
+                }
+              })
             ),
           receive: () => Effect.succeed(result),
           enqueue: (_session, reply) =>
@@ -1274,11 +1319,10 @@ it.layer(Layer.mergeAll(
               receive: Stream.never,
               send: () =>
                 Ref.updateAndGet(sendCalls, (count) => count + 1).pipe(
-                  Effect.flatMap((call) =>
-                    call === 1
-                      ? Effect.die(new Error("send defect"))
-                      : Effect.void
-                  ),
+                  Effect.flatMap((call) => {
+                    if (call === 1) return Effect.die("send defect")
+                    return Effect.void
+                  }),
                   Effect.asVoid
                 ),
               transient: () => Effect.void,
@@ -1357,7 +1401,7 @@ it.layer(Layer.mergeAll(
               relayPeerId: testRelayPeerId,
               capabilities: {},
               receive: acknowledged(peerId, Stream.fromQueue(inbound)),
-              send: () => Effect.die(new Error("automatic send defect")),
+              send: () => Effect.die("automatic send defect"),
               transient: () => Effect.void,
               close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
             })
@@ -1474,11 +1518,18 @@ it.layer(Layer.mergeAll(
               writerDefinitionHash: definition.hash
             }]
           }).pipe(
-            Effect.map((valid) => {
-              const tampered = JSON.parse(new TextDecoder().decode(valid))
-              tampered.writerProvenance[0].writerSchemaVersion = 0
-              return new TextEncoder().encode(JSON.stringify(tampered))
-            })
+            Effect.flatMap((valid) =>
+              Schema.decodeUnknownEffect(SyncEnvelopeWireJson)(new TextDecoder().decode(valid)).pipe(
+                Effect.flatMap((decoded) => {
+                  const tampered = { ...decoded }
+                  if (tampered.writerProvenance === undefined) return Effect.die("expected writer provenance")
+                  tampered.writerProvenance[0].writerSchemaVersion = 0
+                  return Schema.encodeEffect(SyncEnvelopeWireJson)(tampered).pipe(
+                    Effect.map((encoded) => new TextEncoder().encode(encoded))
+                  )
+                })
+              )
+            )
           )
         },
         {
@@ -1496,11 +1547,18 @@ it.layer(Layer.mergeAll(
               writerDefinitionHash: definition.hash
             }]
           }).pipe(
-            Effect.map((valid) => {
-              const tampered = JSON.parse(new TextDecoder().decode(valid))
-              tampered.writerProvenance[0].writerDefinitionHash = ""
-              return new TextEncoder().encode(JSON.stringify(tampered))
-            })
+            Effect.flatMap((valid) =>
+              Schema.decodeUnknownEffect(SyncEnvelopeWireJson)(new TextDecoder().decode(valid)).pipe(
+                Effect.flatMap((decoded) => {
+                  const tampered = { ...decoded }
+                  if (tampered.writerProvenance === undefined) return Effect.die("expected writer provenance")
+                  tampered.writerProvenance[0].writerDefinitionHash = ""
+                  return Schema.encodeEffect(SyncEnvelopeWireJson)(tampered).pipe(
+                    Effect.map((encoded) => new TextEncoder().encode(encoded))
+                  )
+                })
+              )
+            )
           )
         },
         {
@@ -1518,11 +1576,17 @@ it.layer(Layer.mergeAll(
               writerDefinitionHash: definition.hash
             }]
           }).pipe(
-            Effect.map((valid) => {
-              const tampered = JSON.parse(new TextDecoder().decode(valid))
-              delete tampered.writerProvenance
-              return new TextEncoder().encode(JSON.stringify(tampered))
-            })
+            Effect.flatMap((valid) =>
+              Schema.decodeUnknownEffect(SyncEnvelopeWireJson)(new TextDecoder().decode(valid)).pipe(
+                Effect.flatMap((decoded) => {
+                  const tampered = { ...decoded }
+                  delete tampered.writerProvenance
+                  return Schema.encodeEffect(SyncEnvelopeWireJson)(tampered).pipe(
+                    Effect.map((encoded) => new TextEncoder().encode(encoded))
+                  )
+                })
+              )
+            )
           )
         }
       ]
@@ -1561,16 +1625,17 @@ it.layer(Layer.mergeAll(
                 // The reject is observed rather than failed: settling an invalid envelope is the
                 // session's job, and the session outliving it is part of what this test pins.
                 receive: acknowledged(peerId, Stream.fromQueue(inbound)).pipe(
-                  Stream.map((inbound) =>
-                    inbound._tag === "Transient" ? inbound : ({
+                  Stream.map((delivery) => {
+                    if (delivery._tag === "Transient") return delivery
+                    return {
                       _tag: "Durable",
                       delivery: {
-                        ...inbound.delivery,
+                        ...delivery.delivery,
                         reject: (reason: PeerTransport.PermanentRejectReason) =>
                           Deferred.succeed(rejected, reason).pipe(Effect.asVoid)
                       }
-                    })
-                  )
+                    } satisfies PeerTransport.Inbound
+                  })
                 ),
                 send: () => Effect.die(`unexpected send for ${testCase.name}`),
                 transient: () => Effect.void,
@@ -1661,9 +1726,9 @@ it.layer(Layer.mergeAll(
         PeerSession.makeTestClient({ peerId, documents: [] }, () => Effect.die("unexpected entity request")).pipe(
           Effect.tap(() =>
             Effect.all({ gateReleased: Ref.get(gateReleased), transportReleased: Ref.get(released) }).pipe(
-              Effect.tap(({ gateReleased, transportReleased }) =>
+              Effect.tap(({ gateReleased: observedGateReleased, transportReleased }) =>
                 Effect.sync(() => {
-                  assert.isTrue(gateReleased)
+                  assert.isTrue(observedGateReleased)
                   assert.isFalse(transportReleased)
                 })
               )
@@ -1724,10 +1789,10 @@ it.layer(Layer.mergeAll(
         invalidateDocument: () => Effect.void,
         open: (id) =>
           Ref.get(current).pipe(
-            Effect.map((current) => ({
+            Effect.map((permitState) => ({
               peerId: id,
               connectionEpoch: "local-epoch",
-              replicaIncarnation: current.incarnation
+              replicaIncarnation: permitState.incarnation
             }))
           ),
         reset: () => Effect.void,
@@ -1742,7 +1807,10 @@ it.layer(Layer.mergeAll(
         capabilities: {},
         connect: ({ replicaId }) =>
           Ref.get(sharedHeld).pipe(
-            Effect.flatMap((held) => held ? Effect.void : Ref.set(current, nextPermit)),
+            Effect.flatMap((held) => {
+              if (held) return Effect.void
+              return Ref.set(current, nextPermit)
+            }),
             Effect.andThen(Ref.set(connectedReplica, replicaId)),
             Effect.as({
               peerId,
@@ -1974,7 +2042,7 @@ it.layer(Layer.mergeAll(
             yield* PeerSession.makeTestClient(
               { peerId, documents: [{ document: Task, documentId }] },
               () =>
-                Effect.succeed({
+                Effect.succeed(makeEntityClient({
                   ApplySync: () =>
                     Deferred.succeed(receiveStarted, undefined).pipe(
                       Effect.andThen(Deferred.await(releaseReceive)),
@@ -1989,7 +2057,7 @@ it.layer(Layer.mergeAll(
                         }
                       })
                     )
-                } as never)
+                }))
             ).pipe(
               Effect.provideService(Scope.Scope, scope),
               Effect.provideService(PeerTransport.PeerTransport, transport),
@@ -2158,23 +2226,22 @@ it.layer(Layer.mergeAll(
         reset: () => Ref.update(resets, (count) => count + 1),
         generate: (_document, id) =>
           Ref.updateAndGet(generateCalls, (count) => count + 1).pipe(
-            Effect.map((call) =>
-              call === 1
-                ? { outbound: null, observedByPeer: false, dirty: false }
-                : {
-                  outbound: {
-                    sendSequence: call,
-                    documentId: id,
-                    message: new Uint8Array([call]),
-                    messageHash: call.toString(16).padStart(64, "0"),
-                    heads: [],
-                    lineage: Identity.genesisLineage,
-                    writerProvenance: []
-                  },
-                  observedByPeer: false,
-                  dirty: false
-                }
-            )
+            Effect.map((call) => {
+              if (call === 1) return { outbound: null, observedByPeer: false, dirty: false }
+              return {
+                outbound: {
+                  sendSequence: call,
+                  documentId: id,
+                  message: new Uint8Array([call]),
+                  messageHash: call.toString(16).padStart(64, "0"),
+                  heads: [],
+                  lineage: Identity.genesisLineage,
+                  writerProvenance: []
+                },
+                observedByPeer: false,
+                dirty: false
+              }
+            })
           ),
         receive: () => Effect.succeed(result),
         enqueue: (_session, reply) =>
@@ -2280,14 +2347,13 @@ it.layer(Layer.mergeAll(
         ...gate,
         shared: Effect.acquireRelease(
           Ref.updateAndGet(sharedCalls, (count) => count + 1).pipe(
-            Effect.flatMap((call) =>
-              call === 1
-                ? Effect.succeed(permit)
-                : Deferred.succeed(gateRequested, undefined).pipe(
-                  Effect.andThen(Deferred.await(releaseGate)),
-                  Effect.as(permit)
-                )
-            )
+            Effect.flatMap((call) => {
+              if (call === 1) return Effect.succeed(permit)
+              return Deferred.succeed(gateRequested, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseGate)),
+                Effect.as(permit)
+              )
+            })
           ),
           () => Effect.void,
           { interruptible: true }
@@ -2321,7 +2387,10 @@ it.layer(Layer.mergeAll(
           Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
         pending: () =>
           Ref.updateAndGet(pendingCalls, (count) => count + 1).pipe(
-            Effect.map((call) => call === 1 ? [] : [outbound])
+            Effect.map((call) => {
+              if (call === 1) return []
+              return [outbound]
+            })
           ),
         markSent: () => Effect.succeed(true)
       })
@@ -2390,7 +2459,8 @@ it.layer(Layer.mergeAll(
 
   it.effect("interrupts blocked pending and generated output before teardown reset", () =>
     Effect.gen(function*() {
-      for (const blocked of ["pending", "generate"] as const) {
+      const blockedValues: ReadonlyArray<"pending" | "generate"> = ["pending", "generate"]
+      for (const blocked of blockedValues) {
         const blockedStarted = yield* Deferred.make<void>()
         const releaseBlocked = yield* Deferred.make<void>()
         const pendingCalls = yield* Ref.make(0)
@@ -2399,7 +2469,7 @@ it.layer(Layer.mergeAll(
         const closed = yield* Ref.make(false)
         const documentId = yield* Identity.makeDocumentId
         const peerId = yield* Identity.makePeerId
-        const generated = { outbound: null, observedByPeer: false, dirty: false } as const
+        const generated = { outbound: null, observedByPeer: false, dirty: false } satisfies PeerSync.Generated
         const sync = PeerSync.PeerSync.of({
           withDocumentInvalidation: (_documentId, effect) => effect,
           invalidateDocument: () => Effect.void,
@@ -2412,28 +2482,30 @@ it.layer(Layer.mergeAll(
           reset: () => Ref.update(resets, (count) => count + 1),
           generate: () =>
             Ref.updateAndGet(generateCalls, (count) => count + 1).pipe(
-              Effect.flatMap((call) =>
-                blocked === "generate" && call === 2
-                  ? Deferred.succeed(blockedStarted, undefined).pipe(
+              Effect.flatMap((call) => {
+                if (blocked === "generate" && call === 2) {
+                  return Deferred.succeed(blockedStarted, undefined).pipe(
                     Effect.andThen(Deferred.await(releaseBlocked)),
                     Effect.as(generated)
                   )
-                  : Effect.succeed(generated)
-              )
+                }
+                return Effect.succeed(generated)
+              })
             ),
           receive: () => Effect.succeed(result),
           enqueue: (_session, reply) =>
             Effect.succeed({ ...reply, sendSequence: 0, lineage: Identity.genesisLineage, writerProvenance: [] }),
           pending: () =>
             Ref.updateAndGet(pendingCalls, (count) => count + 1).pipe(
-              Effect.flatMap((call) =>
-                blocked === "pending" && call === 2
-                  ? Deferred.succeed(blockedStarted, undefined).pipe(
+              Effect.flatMap((call) => {
+                if (blocked === "pending" && call === 2) {
+                  return Deferred.succeed(blockedStarted, undefined).pipe(
                     Effect.andThen(Deferred.await(releaseBlocked)),
                     Effect.as([])
                   )
-                  : Effect.succeed([])
-              )
+                }
+                return Effect.succeed([])
+              })
             ),
           markSent: () => Effect.succeed(true)
         })
@@ -2488,7 +2560,9 @@ it.layer(Layer.mergeAll(
               assert.strictEqual(yield* Ref.get(resets), 1)
               assert.isTrue(yield* Ref.get(closed))
               assert.strictEqual(yield* Ref.get(pendingCalls), 2)
-              assert.strictEqual(yield* Ref.get(generateCalls), blocked === "pending" ? 1 : 2)
+              let expectedGenerateCalls = 2
+              if (blocked === "pending") expectedGenerateCalls = 1
+              assert.strictEqual(yield* Ref.get(generateCalls), expectedGenerateCalls)
             }),
           (scope) =>
             Deferred.succeed(releaseBlocked, undefined).pipe(
@@ -2524,15 +2598,16 @@ it.layer(Layer.mergeAll(
           Ref.get(currentPermit),
           () =>
             Ref.getAndSet(rotateAfterSharedRelease, false).pipe(
-              Effect.flatMap((rotate) =>
-                rotate
-                  ? Ref.set(currentPermit, {
+              Effect.flatMap((rotate) => {
+                if (rotate) {
+                  return Ref.set(currentPermit, {
                     ...permit,
                     incarnation: Identity.ReplicaIncarnation.make(2),
                     writerGeneration: Identity.WriterGeneration.make(3)
                   })
-                  : Effect.void
-              )
+                }
+                return Effect.void
+              })
             )
         ),
         admit: Effect.acquireRelease(Ref.get(currentPermit), () => Effect.void),
@@ -2543,11 +2618,12 @@ it.layer(Layer.mergeAll(
       const message = yield* Effect.acquireUseRelease(
         Effect.sync(() => Automerge.init()),
         (document) =>
-          Effect.sync(() => {
-            const encoded = Automerge.generateSyncMessage(document, Automerge.initSyncState())[1]
-            if (encoded === null) throw new TypeError("Expected an initial sync message")
-            return encoded
-          }),
+          Effect.sync(() => Automerge.generateSyncMessage(document, Automerge.initSyncState())[1]).pipe(
+            Effect.flatMap((encoded) => {
+              if (encoded === null) return Effect.die("Expected an initial sync message")
+              return Effect.succeed(encoded)
+            })
+          ),
         (document) => Effect.sync(() => Automerge.free(document))
       )
       const messageHash = yield* Canonical.digest(message)
@@ -2584,7 +2660,7 @@ it.layer(Layer.mergeAll(
             relayPeerId,
             capabilities: {},
             receive: Stream.fromQueue(deliveries).pipe(
-              Stream.map((delivery) => ({ _tag: "Durable", delivery }) as const)
+              Stream.map((delivery) => ({ _tag: "Durable", delivery } satisfies PeerTransport.Inbound))
             ),
             send: () => Effect.void,
             transient: () => Effect.void,
@@ -2621,8 +2697,16 @@ it.layer(Layer.mergeAll(
         sequence: number,
         relayMessageId: Identity.RelayMessageId,
         selectedDocumentId = documentId
-      ): Effect.Effect<PeerTransport.AcknowledgedDelivery, ReplicaError.ReplicaError> =>
-        envelope(connectionEpoch, sequence, selectedDocumentId).pipe(
+      ): Effect.Effect<PeerTransport.AcknowledgedDelivery, ReplicaError.ReplicaError> => {
+        let acknowledge = Queue.offer(events, "ack").pipe(Effect.asVoid)
+        if (connectionEpoch === "sender-epoch-a" && sequence === 0) {
+          acknowledge = Deferred.succeed(firstAcknowledgementStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseFirstAcknowledgement)),
+            Effect.andThen(Queue.offer(events, "ack")),
+            Effect.asVoid
+          )
+        }
+        return envelope(connectionEpoch, sequence, selectedDocumentId).pipe(
           Effect.map((bytes) => ({
             message: bytes,
             identity: {
@@ -2636,13 +2720,7 @@ it.layer(Layer.mergeAll(
               outerEnvelopeDigest: "a".repeat(64)
             },
             receiptRetentionMillis: PeerRelayReceiptLimits.defaults.receiptRetentionMillis,
-            acknowledge: connectionEpoch === "sender-epoch-a" && sequence === 0
-              ? Deferred.succeed(firstAcknowledgementStarted, undefined).pipe(
-                Effect.andThen(Deferred.await(releaseFirstAcknowledgement)),
-                Effect.andThen(Queue.offer(events, "ack")),
-                Effect.asVoid
-              )
-              : Queue.offer(events, "ack").pipe(Effect.asVoid),
+            acknowledge,
             reject: (reason) =>
               Ref.update(rejections, (current) => [...current, reason]).pipe(
                 Effect.andThen(Queue.offer(events, `reject:${reason}`)),
@@ -2650,6 +2728,7 @@ it.layer(Layer.mergeAll(
               )
           }))
         )
+      }
       yield* Effect.scoped(
         Effect.gen(function*() {
           yield* PeerSession.makeTestClient(
@@ -2661,43 +2740,49 @@ it.layer(Layer.mergeAll(
               ]
             },
             () =>
-              Effect.succeed({
+              Effect.succeed(makeEntityClient({
                 ApplySync: (request: typeof DocumentEntity.ApplySync.payloadSchema.Type) =>
                   Queue.offer(events, "apply").pipe(
                     Effect.andThen(Ref.get(currentPermit)),
-                    Effect.flatMap((current) =>
-                      request.replicaIncarnation === current.incarnation
-                        ? Effect.void
-                        : Effect.fail(
-                          new ReplicaError.ReplicaError({
-                            reason: new ReplicaError.ProtocolMismatch({
-                              expected: String(current.incarnation),
-                              observed: String(request.replicaIncarnation)
-                            })
+                    Effect.flatMap((current) => {
+                      if (request.replicaIncarnation === current.incarnation) return Effect.void
+                      return Effect.fail(
+                        new ReplicaError.ReplicaError({
+                          reason: new ReplicaError.ProtocolMismatch({
+                            expected: String(current.incarnation),
+                            observed: String(request.replicaIncarnation)
                           })
-                        )
-                    ),
+                        })
+                      )
+                    }),
                     Effect.andThen(
-                      request.relay === undefined
-                        ? Effect.die("Expected relay receipt")
-                        : Ref.update(received, (current) => [...current, request.relay!])
+                      Effect.gen(function*() {
+                        if (request.relay === undefined) {
+                          yield* Effect.die("Expected relay receipt")
+                        } else {
+                          yield* Ref.update(received, (current) => [...current, request.relay])
+                        }
+                      })
                     ),
                     Effect.andThen(Ref.update(receivedLineages, (current) => [...current, request.lineage!])),
                     Effect.andThen(
-                      request.receiveSequence === 1
-                        ? Effect.fail(
-                          new ReplicaError.ReplicaError({
-                            reason: new ReplicaError.DocumentLineageChanged({
-                              documentId,
-                              localLineage: Identity.genesisLineage,
-                              remoteLineage: request.lineage!
+                      Effect.gen(function*() {
+                        if (request.receiveSequence === 1) {
+                          yield* Effect.fail(
+                            new ReplicaError.ReplicaError({
+                              reason: new ReplicaError.DocumentLineageChanged({
+                                documentId,
+                                localLineage: Identity.genesisLineage,
+                                remoteLineage: request.lineage!
+                              })
                             })
-                          })
-                        )
-                        : Effect.succeed({ ...result, reply })
+                          )
+                        }
+                        return { ...result, reply }
+                      })
                     )
                   )
-              } as never)
+              }))
           )
           yield* Queue.offer(
             deliveries,
@@ -2812,11 +2897,12 @@ it.layer(Layer.mergeAll(
       const message = yield* Effect.acquireUseRelease(
         Effect.sync(() => Automerge.init()),
         (document) =>
-          Effect.sync(() => {
-            const encoded = Automerge.generateSyncMessage(document, Automerge.initSyncState())[1]
-            if (encoded === null) throw new TypeError("Expected an initial sync message")
-            return encoded
-          }),
+          Effect.sync(() => Automerge.generateSyncMessage(document, Automerge.initSyncState())[1]).pipe(
+            Effect.flatMap((encoded) => {
+              if (encoded === null) return Effect.die("Expected an initial sync message")
+              return Effect.succeed(encoded)
+            })
+          ),
         (document) => Effect.sync(() => Automerge.free(document))
       )
       const messageHash = yield* Canonical.digest(message)
@@ -2857,7 +2943,7 @@ it.layer(Layer.mergeAll(
             relayPeerId,
             capabilities: {},
             receive: Stream.fromQueue(deliveries).pipe(
-              Stream.map((delivery) => ({ _tag: "Durable", delivery }) as const)
+              Stream.map((delivery) => ({ _tag: "Durable", delivery } satisfies PeerTransport.Inbound))
             ),
             send: () => Effect.void,
             transient: () => Effect.void,
@@ -2914,23 +3000,27 @@ it.layer(Layer.mergeAll(
           yield* PeerSession.makeTestClient(
             { peerId: senderPeerId, documents: [{ document: Task, documentId }] },
             () =>
-              Effect.succeed({
+              Effect.succeed(makeEntityClient({
                 ApplySync: (request: typeof DocumentEntity.ApplySync.payloadSchema.Type) =>
                   Queue.offer(events, "apply").pipe(
                     Effect.andThen(
-                      request.receiveSequence === 0
-                        ? Effect.fail(
-                          new ReplicaError.ReplicaError({
-                            reason: new ReplicaError.QuotaExceeded({
-                              resource: "relay receipt bytes per remote",
-                              limit: 64
+                      Effect.gen(function*() {
+                        if (request.receiveSequence === 0) {
+                          return yield* Effect.fail(
+                            new ReplicaError.ReplicaError({
+                              reason: new ReplicaError.QuotaExceeded({
+                                resource: "relay receipt bytes per remote",
+                                limit: 64
+                              })
                             })
-                          })
-                        )
-                        : Effect.succeed(request.receiveSequence === 1 ? replyResult : result)
+                          )
+                        }
+                        if (request.receiveSequence === 1) return replyResult
+                        return result
+                      })
                     )
                   )
-              } as never)
+              }))
           )
           yield* Queue.offer(
             deliveries,
@@ -2989,11 +3079,12 @@ it.layer(Layer.mergeAll(
       const message = yield* Effect.acquireUseRelease(
         Effect.sync(() => Automerge.init()),
         (document) =>
-          Effect.sync(() => {
-            const encoded = Automerge.generateSyncMessage(document, Automerge.initSyncState())[1]
-            if (encoded === null) throw new TypeError("Expected an initial sync message")
-            return encoded
-          }),
+          Effect.sync(() => Automerge.generateSyncMessage(document, Automerge.initSyncState())[1]).pipe(
+            Effect.flatMap((encoded) => {
+              if (encoded === null) return Effect.die("Expected an initial sync message")
+              return Effect.succeed(encoded)
+            })
+          ),
         (document) => Effect.sync(() => Automerge.free(document))
       )
       const messageHash = yield* Canonical.digest(message)
@@ -3022,7 +3113,7 @@ it.layer(Layer.mergeAll(
             relayPeerId,
             capabilities: {},
             receive: Stream.fromQueue(deliveries).pipe(
-              Stream.map((delivery) => ({ _tag: "Durable", delivery }) as const)
+              Stream.map((delivery) => ({ _tag: "Durable", delivery } satisfies PeerTransport.Inbound))
             ),
             send: () => Effect.void,
             transient: () => Effect.void,
@@ -3112,9 +3203,9 @@ it.layer(Layer.mergeAll(
           yield* PeerSession.makeTestClient(
             { peerId: senderPeerId, documents: [{ document: Task, documentId }] },
             () =>
-              Effect.succeed({
+              Effect.succeed(makeEntityClient({
                 ApplySync: () => Queue.offer(events, "apply").pipe(Effect.as(result))
-              } as never)
+              }))
           ).pipe(Effect.provideService(ReplicaOperationScheduler.ReplicaOperationScheduler, scheduler))
 
           yield* Queue.offer(
@@ -3181,11 +3272,12 @@ it.layer(Layer.mergeAll(
       const message = yield* Effect.acquireUseRelease(
         Effect.sync(() => Automerge.init()),
         (document) =>
-          Effect.sync(() => {
-            const encoded = Automerge.generateSyncMessage(document, Automerge.initSyncState())[1]
-            if (encoded === null) throw new TypeError("Expected an initial sync message")
-            return encoded
-          }),
+          Effect.sync(() => Automerge.generateSyncMessage(document, Automerge.initSyncState())[1]).pipe(
+            Effect.flatMap((encoded) => {
+              if (encoded === null) return Effect.die("Expected an initial sync message")
+              return Effect.succeed(encoded)
+            })
+          ),
         (document) => Effect.sync(() => Automerge.free(document))
       )
       const messageHash = yield* Canonical.digest(message)
@@ -3236,7 +3328,7 @@ it.layer(Layer.mergeAll(
             relayPeerId,
             capabilities: {},
             receive: Stream.fromQueue(deliveries).pipe(
-              Stream.map((delivery) => ({ _tag: "Durable", delivery }) as const)
+              Stream.map((delivery) => ({ _tag: "Durable", delivery } satisfies PeerTransport.Inbound))
             ),
             send: () => Effect.void,
             transient: () => Effect.void,
@@ -3320,23 +3412,22 @@ it.layer(Layer.mergeAll(
         reset: () => Effect.void,
         generate: (_document, documentId) =>
           Ref.updateAndGet(generated, (current) => [...current, documentId]).pipe(
-            Effect.map((current) =>
-              current.length <= 2
-                ? { outbound: null, observedByPeer: false, dirty: false }
-                : {
-                  outbound: {
-                    sendSequence: current.length,
-                    documentId,
-                    message: new Uint8Array([current.length]),
-                    messageHash: current.length.toString(16).padStart(64, "0"),
-                    heads: [],
-                    lineage: Identity.genesisLineage,
-                    writerProvenance: []
-                  },
-                  observedByPeer: false,
-                  dirty: false
-                }
-            )
+            Effect.map((current) => {
+              if (current.length <= 2) return { outbound: null, observedByPeer: false, dirty: false }
+              return {
+                outbound: {
+                  sendSequence: current.length,
+                  documentId,
+                  message: new Uint8Array([current.length]),
+                  messageHash: current.length.toString(16).padStart(64, "0"),
+                  heads: [],
+                  lineage: Identity.genesisLineage,
+                  writerProvenance: []
+                },
+                observedByPeer: false,
+                dirty: false
+              }
+            })
           ),
         receive: () => Effect.succeed(result),
         enqueue: (_session, reply) =>
@@ -3357,17 +3448,18 @@ it.layer(Layer.mergeAll(
                 Effect.orDie,
                 Effect.tap((envelope) => Ref.update(sentSequences, (current) => [...current, envelope.sequence])),
                 Effect.andThen(Ref.updateAndGet(sends, (count) => count + 1)),
-                Effect.flatMap((attempt) =>
-                  attempt === 1
-                    ? Effect.fail(
+                Effect.flatMap((attempt) => {
+                  if (attempt === 1) {
+                    return Effect.fail(
                       new ReplicaError.ReplicaError({
                         reason: new ReplicaError.StorageUnavailable({
-                          cause: new Error("offline")
+                          cause: "offline"
                         })
                       })
                     )
-                    : Effect.void
-                )
+                  }
+                  return Effect.void
+                })
               ),
             transient: () => Effect.void,
             close: Effect.void
@@ -3420,7 +3512,7 @@ it.layer(Layer.mergeAll(
       markDirty: () => Effect.void,
       flush: Effect.void,
       observedByPeer: () => Effect.succeed(false),
-      durableConfirmation: () => Effect.succeed(false as const),
+      durableConfirmation: () => Effect.succeed(false),
       transient: () => Effect.void,
       transients: Stream.never
     }
@@ -3615,7 +3707,7 @@ it.layer(Layer.mergeAll(
           Effect.provide(fixture.layer)
         )
         const receiveError = new ReplicaError.ReplicaError({
-          reason: new ReplicaError.StorageUnavailable({ cause: new Error("receive failed") })
+          reason: new ReplicaError.StorageUnavailable({ cause: "receive failed" })
         })
         yield* Deferred.fail(fixture.receiveFailure, receiveError)
         assert.strictEqual(yield* Effect.flip(session.awaitDisconnect), receiveError)
@@ -3633,7 +3725,7 @@ it.layer(Layer.mergeAll(
         )
         assert.strictEqual((yield* Deferred.poll(fixture.subscribed))._tag, "None")
         const receiveError = new ReplicaError.ReplicaError({
-          reason: new ReplicaError.StorageUnavailable({ cause: new Error("supervised receive failed") })
+          reason: new ReplicaError.StorageUnavailable({ cause: "supervised receive failed" })
         })
         yield* Deferred.fail(fixture.receiveFailure, receiveError)
         assert.strictEqual(yield* Effect.flip(session.awaitDisconnect), receiveError)
@@ -3661,7 +3753,7 @@ it.layer(Layer.mergeAll(
       // reach awaitDisconnect unchanged.
       const terminalFailures = [
         new ReplicaError.ReplicaError({
-          reason: new ReplicaError.StorageUnavailable({ cause: new Error("generate failed") })
+          reason: new ReplicaError.StorageUnavailable({ cause: "generate failed" })
         }),
         new ReplicaError.ReplicaError({
           reason: new ReplicaError.ProtocolMismatch({ expected: "expected", observed: "observed" })
@@ -3804,16 +3896,21 @@ it.layer(Layer.mergeAll(
           })
         })
         const entity = (documentId: Identity.DocumentId) =>
-          Effect.succeed(
+          Effect.succeed(makeEntityClient(
             {
               ApplySync: () =>
                 Queue.offer(dispatched, documentId).pipe(
                   Effect.andThen(
-                    documentId === refusedId ? Effect.fail(lineageChanged) : Effect.succeed(result)
+                    Effect.gen(function*() {
+                      if (documentId === refusedId) {
+                        yield* Effect.fail(lineageChanged)
+                      }
+                      return result
+                    })
                   )
                 )
-            } as unknown as ReturnType<Effect.Success<typeof DocumentEntity.DocumentEntity.client>>
-          )
+            }
+          ))
         const sync = PeerSync.PeerSync.of({
           withDocumentInvalidation: (_documentId, effect) => effect,
           invalidateDocument: () => Effect.void,
@@ -3919,9 +4016,9 @@ it.layer(Layer.mergeAll(
       ReplicaGate.layer.pipe(Layer.provide(ReplicaLimits.layer(limits)), Layer.provide(Dependencies))
     )
     return Effect.gen(function*() {
-      const gate = yield* ReplicaGate.ReplicaGate
+      const localGate = yield* ReplicaGate.ReplicaGate
       const crypto = yield* Crypto.Crypto
-      const initial = yield* gate.current
+      const initial = yield* localGate.current
       const documentId = yield* Identity.makeDocumentId
       const peerId = yield* Identity.makePeerId
       const message = Uint8Array.of(1)
@@ -3935,22 +4032,22 @@ it.layer(Layer.mergeAll(
         acceptedHeads: [],
         commitSequence: Identity.CommitSequence.make(1),
         observedByPeer: false,
-        durableConfirmation: false as const,
+        durableConfirmation: false,
         duplicate: false
       }
       const entity = (): Effect.Effect<ReturnType<Effect.Success<typeof DocumentEntity.DocumentEntity.client>>> =>
-        Effect.succeed(
+        Effect.succeed(makeEntityClient(
           {
             ApplySync: () =>
               Deferred.succeed(applyReady, undefined).pipe(
                 Effect.andThen(Deferred.await(applyProceed)),
-                Effect.andThen(Effect.scoped(gate.shared)),
+                Effect.andThen(Effect.scoped(localGate.shared)),
                 Effect.as(applyResult),
                 Effect.forkChild,
                 Effect.flatMap(Fiber.join)
               )
-          } as unknown as ReturnType<Effect.Success<typeof DocumentEntity.DocumentEntity.client>>
-        )
+          }
+        ))
       const inbound = yield* Queue.unbounded<Uint8Array>()
       const sync = PeerSync.PeerSync.of({
         withDocumentInvalidation: (_documentId, effect) => effect,
@@ -3982,7 +4079,7 @@ it.layer(Layer.mergeAll(
         Effect.provideService(PeerTransport.PeerTransport, transport),
         Effect.provide(PeerConnectionStatus.layer),
         Effect.provideService(PeerSync.PeerSync, sync),
-        Effect.provideService(ReplicaGate.ReplicaGate, gate),
+        Effect.provideService(ReplicaGate.ReplicaGate, localGate),
         Effect.provideService(
           CommitPublisher.CommitPublisher,
           CommitPublisher.CommitPublisher.of({
@@ -4015,7 +4112,7 @@ it.layer(Layer.mergeAll(
         })
       )
       yield* Deferred.await(applyReady)
-      yield* Effect.forkChild(gate.claim(() => Deferred.succeed(claimRan, undefined)))
+      yield* Effect.forkChild(localGate.claim(() => Deferred.succeed(claimRan, undefined)))
       for (let index = 0; index < 20; index++) yield* Effect.yieldNow
       yield* Deferred.succeed(applyProceed, undefined)
       for (let index = 0; index < 200; index++) yield* Effect.yieldNow

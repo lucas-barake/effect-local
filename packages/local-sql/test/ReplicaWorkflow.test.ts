@@ -209,11 +209,11 @@ describe("ReplicaWorkflow", () => {
 
           const result = yield* runtime.poll(execution)
           assert.isTrue(Option.isSome(result))
-          if (!Option.isSome(result)) throw new Error("unreachable")
+          if (!Option.isSome(result)) yield* Effect.die("unreachable")
           assert.strictEqual(result.value._tag, "Complete")
-          if (result.value._tag !== "Complete") throw new Error("unreachable")
+          if (result.value._tag !== "Complete") yield* Effect.die("unreachable")
           assert.isTrue(Exit.isSuccess(result.value.exit))
-          if (!Exit.isSuccess(result.value.exit)) throw new Error("unreachable")
+          if (!Exit.isSuccess(result.value.exit)) yield* Effect.die("unreachable")
           assert.notStrictEqual(result.value.exit.value, Identity.genesisLineage)
 
           // Exactly the rewritten document, exactly once. Nothing else evicts the in-memory sync

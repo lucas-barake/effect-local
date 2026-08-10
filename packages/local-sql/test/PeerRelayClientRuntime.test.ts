@@ -114,18 +114,21 @@ describe("PeerRelayClientRuntime", () => {
 
   const fakePeerSync = (
     pruneRelayReceipts: PeerSync.PeerSync["Service"]["pruneRelayReceipts"]
-  ): PeerSync.PeerSync["Service"] => ({
-    withDocumentInvalidation: (_documentId, effect) => effect,
-    invalidateDocument: () => Effect.void,
-    open: () => Effect.die(new Error("unused")),
-    reset: () => Effect.die(new Error("unused")),
-    generate: () => Effect.die(new Error("unused")),
-    receive: () => Effect.die(new Error("unused")),
-    enqueue: () => Effect.die(new Error("unused")),
-    pending: () => Effect.die(new Error("unused")),
-    markSent: () => Effect.die(new Error("unused")),
-    ...(pruneRelayReceipts === undefined ? {} : { pruneRelayReceipts })
-  })
+  ): PeerSync.PeerSync["Service"] => {
+    const service = {
+      withDocumentInvalidation: (_documentId: Identity.DocumentId, effect: Effect.Effect<unknown>) => effect,
+      invalidateDocument: () => Effect.void,
+      open: () => Effect.die(new Error("unused")),
+      reset: () => Effect.die(new Error("unused")),
+      generate: () => Effect.die(new Error("unused")),
+      receive: () => Effect.die(new Error("unused")),
+      enqueue: () => Effect.die(new Error("unused")),
+      pending: () => Effect.die(new Error("unused")),
+      markSent: () => Effect.die(new Error("unused"))
+    }
+    if (pruneRelayReceipts === undefined) return service
+    return { ...service, pruneRelayReceipts }
+  }
 
   const layers = (
     pruneRelayReceipts: PeerSync.PeerSync["Service"]["pruneRelayReceipts"] | null = Effect.succeed(0)
@@ -149,7 +152,7 @@ describe("PeerRelayClientRuntime", () => {
       PeerRelayReceiptLimits.layer(receiptLimits),
       Layer.succeed(
         PeerSync.PeerSync,
-        fakePeerSync(pruneRelayReceipts === null ? undefined : pruneRelayReceipts)
+        fakePeerSync(pruneRelayReceipts ?? undefined)
       )
     )
     const Outbox = PeerRelayOutbox.layerSql.pipe(Layer.provide(Dependencies))
@@ -259,7 +262,7 @@ describe("PeerRelayClientRuntime", () => {
       Effect.gen(function*() {
         const runtime = yield* PeerRelayClientRuntime.PeerRelayClientRuntime
         const peerId = yield* Identity.makePeerId
-        const documentId = yield* Identity.makeDocumentId
+        const routeDocumentId = yield* Identity.makeDocumentId
         const inbound = yield* Effect.acquireRelease(
           PubSub.sliding<PeerRelayClientRuntime.TransientMessage>(64),
           PubSub.shutdown
@@ -276,7 +279,7 @@ describe("PeerRelayClientRuntime", () => {
             Queue.offer(target, payload).pipe(Effect.asVoid),
           transients: Stream.fromPubSub(inbound)
         })
-        const documents = [{ document: Task, documentId }]
+        const documents = [{ document: Task, documentId: routeDocumentId }]
         const first = yield* runtime.register(makeSession(sends), documents)
         const duplicate = yield* Effect.exit(runtime.register(makeSession(sends), documents))
         assert.strictEqual(duplicate._tag, "Failure")
@@ -286,7 +289,7 @@ describe("PeerRelayClientRuntime", () => {
           Effect.provideService(Scope.Scope, priorScope)
         )
         const priorFiber = yield* priorPull.pipe(Effect.forkChild({ startImmediately: true }))
-        const missed = { peerId, documentId, payload: Uint8Array.of(1) }
+        const missed = { peerId, documentId: routeDocumentId, payload: Uint8Array.of(1) }
         yield* PubSub.publish(inbound, missed)
         assert.deepStrictEqual((yield* Fiber.join(priorFiber))[0], missed)
         yield* Scope.close(priorScope, Exit.void)
@@ -295,12 +298,12 @@ describe("PeerRelayClientRuntime", () => {
         const secondPull = yield* Stream.toPull(runtime.transients)
         const firstFiber = yield* firstPull.pipe(Effect.forkChild({ startImmediately: true }))
         const secondFiber = yield* secondPull.pipe(Effect.forkChild({ startImmediately: true }))
-        const accepted = { peerId, documentId, payload: Uint8Array.of(2) }
+        const accepted = { peerId, documentId: routeDocumentId, payload: Uint8Array.of(2) }
         yield* PubSub.publish(inbound, accepted)
         assert.deepStrictEqual((yield* Fiber.join(firstFiber))[0], accepted)
         assert.deepStrictEqual((yield* Fiber.join(secondFiber))[0], accepted)
 
-        yield* runtime.send(peerId, documentId, Uint8Array.of(3))
+        yield* runtime.send(peerId, routeDocumentId, Uint8Array.of(3))
         assert.deepStrictEqual(yield* Queue.take(sends), Uint8Array.of(3))
         yield* first.unregister
 
@@ -308,18 +311,18 @@ describe("PeerRelayClientRuntime", () => {
         const afterUnregisterFiber = yield* afterUnregisterPull.pipe(
           Effect.forkChild({ startImmediately: true })
         )
-        yield* PubSub.publish(inbound, { peerId, documentId, payload: Uint8Array.of(99) })
+        yield* PubSub.publish(inbound, { peerId, documentId: routeDocumentId, payload: Uint8Array.of(99) })
 
         const replacementSends = yield* Queue.unbounded<Uint8Array>()
         const replacement = yield* runtime.register(makeSession(replacementSends), documents)
         yield* first.unregister
-        const replacementInbound = { peerId, documentId, payload: Uint8Array.of(100) }
+        const replacementInbound = { peerId, documentId: routeDocumentId, payload: Uint8Array.of(100) }
         yield* PubSub.publish(inbound, replacementInbound)
         assert.deepStrictEqual((yield* Fiber.join(afterUnregisterFiber))[0], replacementInbound)
-        yield* runtime.send(peerId, documentId, Uint8Array.of(4))
+        yield* runtime.send(peerId, routeDocumentId, Uint8Array.of(4))
         assert.deepStrictEqual(yield* Queue.take(replacementSends), Uint8Array.of(4))
         yield* replacement.unregister
-        const unavailable = yield* Effect.exit(runtime.send(peerId, documentId, Uint8Array.of(5)))
+        const unavailable = yield* Effect.exit(runtime.send(peerId, routeDocumentId, Uint8Array.of(5)))
         assert.strictEqual(unavailable._tag, "Failure")
       }).pipe(Effect.provide(layers()))
     ))
@@ -329,7 +332,7 @@ describe("PeerRelayClientRuntime", () => {
       Effect.gen(function*() {
         const runtime = yield* PeerRelayClientRuntime.PeerRelayClientRuntime
         const peerId = yield* Identity.makePeerId
-        const documentId = yield* Identity.makeDocumentId
+        const routeDocumentId = yield* Identity.makeDocumentId
         const inbound = yield* Effect.acquireRelease(
           PubSub.sliding<PeerRelayClientRuntime.TransientMessage>(64),
           PubSub.shutdown
@@ -344,7 +347,7 @@ describe("PeerRelayClientRuntime", () => {
           transient: () => Effect.void,
           transients: Stream.fromPubSub(inbound)
         }
-        yield* runtime.register(session, [{ document: Task, documentId }])
+        yield* runtime.register(session, [{ document: Task, documentId: routeDocumentId }])
         const slowPull = yield* Stream.toPull(runtime.transients)
         const fastPull = yield* Stream.toPull(runtime.transients)
         const slowFirst = yield* slowPull.pipe(Effect.forkChild({ startImmediately: true }))
@@ -352,7 +355,7 @@ describe("PeerRelayClientRuntime", () => {
           const fast = yield* fastPull.pipe(Effect.forkChild({ startImmediately: true }))
           yield* PubSub.publish(inbound, {
             peerId,
-            documentId,
+            documentId: routeDocumentId,
             payload: Uint8Array.of(index)
           })
           assert.strictEqual((yield* Fiber.join(fast))[0]?.payload[0], index)

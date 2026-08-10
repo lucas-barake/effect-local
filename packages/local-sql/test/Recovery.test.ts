@@ -110,7 +110,7 @@ describe("Recovery", () => {
       const agreeing = yield* recovery.recover(Task, documentId)
       assert.deepStrictEqual(agreeing.snapshot.value, { title: "one" })
       InternalAutomerge.free(agreeing.automerge)
-      assert.deepStrictEqual(yield* checkpointsOf(documentId), [{ lineage: lineage as string, verified: 1 }])
+      assert.deepStrictEqual(yield* checkpointsOf(documentId), [{ lineage, verified: 1 }])
 
       // A checkpoint left on the genesis lineage under a rewritten document. Replaying it would
       // rebuild the document from a history it no longer belongs to, and its heads happen to match

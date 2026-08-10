@@ -36,7 +36,7 @@ it.layer(Layer.mergeAll(
   NodeCrypto.layer,
   ReplicaOperationScheduler.layer.pipe(Layer.provide(ReplicaLimits.layer(gateLimits))),
   Layer.succeed(CommandDeliveryStore.CommandDeliveryStore, deliveryStore)
-))("PeerSession coverage", (it) => {
+))("PeerSession coverage", (suite) => {
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
   const limits = {
     maxBackupBytes: 1_000_000,
@@ -100,7 +100,7 @@ it.layer(Layer.mergeAll(
     acceptedHeads: [],
     commitSequence: Identity.CommitSequence.make(1),
     observedByPeer: true,
-    durableConfirmation: false as const,
+    durableConfirmation: false,
     duplicate: false
   }
   const makeSync = (incarnation: Identity.ReplicaIncarnation) =>
@@ -124,7 +124,7 @@ it.layer(Layer.mergeAll(
           Effect.succeed({
             peerId,
             relayPeerId: testRelayPeerId,
-            capabilities: {} as const,
+            capabilities: {},
             receive: Stream.never,
             send: () => Effect.void,
             transient: () => Effect.void,
@@ -157,7 +157,7 @@ it.layer(Layer.mergeAll(
       Effect.provideService(ReplicaLimits.ReplicaLimits, limits)
     )
 
-  it.effect("rejects duplicate selected documents", () =>
+  suite.effect("rejects duplicate selected documents", () =>
     Effect.gen(function*() {
       const documentId = yield* Identity.makeDocumentId
       const peerId = yield* Identity.makePeerId
@@ -186,59 +186,67 @@ it.layer(Layer.mergeAll(
       assert.strictEqual(yield* Ref.get(closed), 0)
     }))
 
-  it.effect("fails when the opened session incarnation does not match the gate permit", () =>
-    Effect.gen(function*() {
-      const peerId = yield* Identity.makePeerId
-      const closed = yield* Ref.make(0)
-      const sync = makeSync(Identity.ReplicaIncarnation.make(2))
-      const transport = makeScopedTransport(peerId, closed)
-      const exit = yield* Effect.exit(Effect.scoped(
-        provide(
-          PeerSession.makeTestClient({ peerId, documents: [] }, () => Effect.die("unexpected entity request")),
+  suite.effect(
+    "fails when the opened session incarnation does not match the gate permit",
+    () =>
+      Effect.gen(function*() {
+        const peerId = yield* Identity.makePeerId
+        const closed = yield* Ref.make(0)
+        const sync = makeSync(Identity.ReplicaIncarnation.make(2))
+        const transport = makeScopedTransport(peerId, closed)
+        const exit = yield* Effect.exit(Effect.scoped(
+          provide(
+            PeerSession.makeTestClient({ peerId, documents: [] }, () => Effect.die("unexpected entity request")),
+            sync,
+            transport
+          )
+        ))
+        assert.strictEqual(exit._tag, "Failure")
+        if (exit._tag === "Failure") {
+          const error = Option.getOrThrow(Cause.findErrorOption(exit.cause))
+          assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+          if (error.reason._tag === "ProtocolMismatch") {
+            assert.strictEqual(error.reason.expected, "1")
+            assert.strictEqual(error.reason.observed, "2")
+          }
+        }
+        assert.isAbove(yield* Ref.get(closed), 0)
+      })
+  )
+
+  suite.effect(
+    "fails the session when marking an unselected document dirty",
+    () =>
+      Effect.scoped(Effect.gen(function*() {
+        const documentId = yield* Identity.makeDocumentId
+        const otherDocumentId = yield* Identity.makeDocumentId
+        const peerId = yield* Identity.makePeerId
+        const closed = yield* Ref.make(0)
+        const sync = makeSync(permit.incarnation)
+        const transport = makeScopedTransport(peerId, closed)
+        const session = yield* provide(
+          PeerSession.makeTestClient(
+            { peerId, documents: [{ document: Task, documentId }] },
+            () => Effect.die("unexpected entity request")
+          ),
           sync,
           transport
         )
-      ))
-      assert.strictEqual(exit._tag, "Failure")
-      if (exit._tag === "Failure") {
-        const error = Option.getOrThrow(Cause.findErrorOption(exit.cause))
-        assert.strictEqual(error.reason._tag, "ProtocolMismatch")
-        if (error.reason._tag === "ProtocolMismatch") {
-          assert.strictEqual(error.reason.expected, "1")
-          assert.strictEqual(error.reason.observed, "2")
+        const exit = yield* Effect.exit(session.markDirty(otherDocumentId))
+        assert.strictEqual(exit._tag, "Failure")
+        if (exit._tag === "Failure") {
+          const error = Option.getOrThrow(Cause.findErrorOption(exit.cause))
+          assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+          if (error.reason._tag === "ProtocolMismatch") {
+            assert.strictEqual(error.reason.expected, "selected document")
+            assert.strictEqual(error.reason.observed, otherDocumentId)
+          }
         }
-      }
-      assert.isAbove(yield* Ref.get(closed), 0)
-    }))
-
-  it.effect("fails the session when marking an unselected document dirty", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const documentId = yield* Identity.makeDocumentId
-      const otherDocumentId = yield* Identity.makeDocumentId
-      const peerId = yield* Identity.makePeerId
-      const closed = yield* Ref.make(0)
-      const sync = makeSync(permit.incarnation)
-      const transport = makeScopedTransport(peerId, closed)
-      const session = yield* provide(
-        PeerSession.makeTestClient({ peerId, documents: [{ document: Task, documentId }] }, () =>
-          Effect.die("unexpected entity request")),
-        sync,
-        transport
-      )
-      const exit = yield* Effect.exit(session.markDirty(otherDocumentId))
-      assert.strictEqual(exit._tag, "Failure")
-      if (exit._tag === "Failure") {
-        const error = Option.getOrThrow(Cause.findErrorOption(exit.cause))
-        assert.strictEqual(error.reason._tag, "ProtocolMismatch")
-        if (error.reason._tag === "ProtocolMismatch") {
-          assert.strictEqual(error.reason.expected, "selected document")
-          assert.strictEqual(error.reason.observed, otherDocumentId)
-        }
-      }
-      const supervised = session as PeerSession.SupervisedPeerSession
-      const disconnect = yield* Effect.exit(supervised.awaitDisconnect)
-      assert.strictEqual(disconnect._tag, "Failure")
-      const flushed = yield* Effect.exit(session.flush)
-      assert.strictEqual(flushed._tag, "Failure")
-    })))
+        const supervised = session
+        const disconnect = yield* Effect.exit(supervised.awaitDisconnect)
+        assert.strictEqual(disconnect._tag, "Failure")
+        const flushed = yield* Effect.exit(session.flush)
+        assert.strictEqual(flushed._tag, "Failure")
+      }))
+  )
 })

@@ -16,8 +16,14 @@ describe("quick start example", () => {
       const handler = yield* ListTasks.handler
       const exit = yield* Effect.exit(handler({ search: "" }))
 
-      if (!Exit.isFailure(exit)) return assert.fail("the missing projection table must fail")
+      if (!Exit.isFailure(exit)) {
+        assert.fail("the missing projection table must fail")
+        yield* Effect.die("unreachable")
+      }
       const failure = Cause.findErrorOption(exit.cause)
-      if (Option.isNone(failure)) return assert.fail("expected a typed failure")
+      if (Option.isNone(failure)) {
+        assert.fail("expected a typed failure")
+        yield* Effect.die("unreachable")
+      }
     }).pipe(Effect.provide(HandlerLive)))
 })

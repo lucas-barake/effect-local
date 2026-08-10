@@ -9,7 +9,7 @@ import * as DocumentStore from "../../src/DocumentStore.js"
 import * as InternalAutomerge from "../../src/internal/automerge.js"
 import { AckLineJson, acknowledgedTitle, ChildMode, ReadLineJson, storeLayer, Task } from "./fixture.js"
 
-const [modeArg, dbPath, documentIdArg] = process.argv.slice(2)
+const [modeArg, dbPath, documentIdArg] = globalThis.process.argv.slice(2)
 const mode = Schema.decodeUnknownSync(ChildMode)(modeArg)
 
 const journalMode = SqlClient.SqlClient.pipe(
@@ -35,12 +35,12 @@ const write = Effect.gen(function*() {
     documentId,
     title: acknowledgedTitle
   })
-  yield* Effect.sync(() => process.stdout.write(line + "\n"))
+  yield* Effect.sync(() => globalThis.process.stdout.write(line + "\n"))
   // Hold the process open with a referenced timer so the WAL is never
   // checkpointed by a clean shutdown; the parent ends it with SIGKILL.
   yield* Effect.callback<never>(() => {
-    const timer = setInterval(() => {}, 2_147_483_647)
-    return Effect.sync(() => clearInterval(timer))
+    const timer = globalThis.setInterval(() => {}, 2_147_483_647)
+    return Effect.sync(() => globalThis.clearInterval(timer))
   })
 })
 
@@ -50,27 +50,40 @@ const read = Effect.gen(function*() {
   const result = yield* store.load(Task, documentId).pipe(
     Effect.map((stored) => {
       InternalAutomerge.free(stored.automerge)
-      return { kind: "read" as const, found: true, title: stored.snapshot.value.title }
+      return { kind: "read", found: true, title: stored.snapshot.value.title } satisfies {
+        kind: "read"
+        found: boolean
+        title: string | null
+      }
     }),
     Effect.catchReason(
       "ReplicaError",
       "DocumentNotFound",
-      () => Effect.succeed({ kind: "read" as const, found: false, title: null })
+      () =>
+        Effect.succeed(
+          { kind: "read", found: false, title: null } satisfies {
+            kind: "read"
+            found: boolean
+            title: string | null
+          }
+        )
     )
   )
   const line = Schema.encodeSync(ReadLineJson)(result)
-  yield* Effect.sync(() => process.stdout.write(line + "\n"))
+  yield* Effect.sync(() => globalThis.process.stdout.write(line + "\n"))
 })
 
-const program = (mode === "write" ? write : read).pipe(
+let selectedProgram = read
+if (mode === "write") selectedProgram = write
+const program = selectedProgram.pipe(
   Effect.scoped,
   Effect.provide(storeLayer(dbPath))
 )
 
-Effect.runPromiseExit(program).then((exit) => {
+void Effect.runPromiseExit(program).then((exit) => {
   if (Exit.isFailure(exit)) {
-    process.stderr.write(Cause.pretty(exit.cause) + "\n")
-    process.exit(1)
+    globalThis.process.stderr.write(Cause.pretty(exit.cause) + "\n")
+    globalThis.process.exit(1)
   }
-  process.exit(0)
+  globalThis.process.exit(0)
 })

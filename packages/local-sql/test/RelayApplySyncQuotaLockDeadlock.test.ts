@@ -198,7 +198,7 @@ describe("relay ApplySync quota lock", () => {
           writerGeneration: permit.writerGeneration,
           commandId,
           documentType: Task.name,
-          payload: new TextEncoder().encode(JSON.stringify(value)),
+          payload: new TextEncoder().encode(Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(value)),
           requestHash
         })
 
@@ -230,7 +230,7 @@ describe("relay ApplySync quota lock", () => {
 
         // Stands in for the `PeerRelayClientRuntime` receipt maintenance fiber, which runs this same
         // effect every `maintenanceIntervalMillis` (1s by default).
-        yield* Effect.forkDetach(sync.pruneRelayReceipts!)
+        yield* Effect.forkDetach(sync.pruneRelayReceipts)
         yield* Effect.sleep("200 millis")
         yield* Deferred.succeed(proceed, undefined)
 
