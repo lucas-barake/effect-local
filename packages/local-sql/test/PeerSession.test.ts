@@ -43,6 +43,7 @@ import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
 import * as ReplicaOperationScheduler from "../src/ReplicaOperationScheduler.js"
 import { gateLimits } from "./fixtures/limits.js"
+import { nativeError, nativeTypeError } from "./TestErrors.js"
 
 type TestEntityClient = ReturnType<Effect.Success<typeof DocumentEntity.DocumentEntity.client>>
 
@@ -227,7 +228,7 @@ rootIt.layer(Layer.mergeAll(
       const subscriberEnded = yield* Deferred.make<void>()
       const closed = yield* Ref.make(0)
       const generateError = new ReplicaError.ReplicaError({
-        reason: new ReplicaError.StorageUnavailable({ cause: "generate failed" })
+        reason: new ReplicaError.StorageUnavailable({ cause: nativeError("generate failed") })
       })
       const sync = PeerSync.PeerSync.of({
         withDocumentInvalidation: (_documentId, effect) => effect,
@@ -1320,7 +1321,7 @@ rootIt.layer(Layer.mergeAll(
               send: () =>
                 Ref.updateAndGet(sendCalls, (count) => count + 1).pipe(
                   Effect.flatMap((call) => {
-                    if (call === 1) return Effect.die("send defect")
+                    if (call === 1) return Effect.die(nativeError("send defect"))
                     return Effect.void
                   }),
                   Effect.asVoid
@@ -1401,7 +1402,7 @@ rootIt.layer(Layer.mergeAll(
               relayPeerId: testRelayPeerId,
               capabilities: {},
               receive: acknowledged(peerId, Stream.fromQueue(inbound)),
-              send: () => Effect.die("automatic send defect"),
+              send: () => Effect.die(nativeError("automatic send defect")),
               transient: () => Effect.void,
               close: Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
             })
@@ -2620,7 +2621,7 @@ rootIt.layer(Layer.mergeAll(
         (document) =>
           Effect.sync(() => Automerge.generateSyncMessage(document, Automerge.initSyncState())[1]).pipe(
             Effect.flatMap((encoded) => {
-              if (encoded === null) return Effect.die("Expected an initial sync message")
+              if (encoded === null) return Effect.die(nativeTypeError("Expected an initial sync message"))
               return Effect.succeed(encoded)
             })
           ),
@@ -2899,7 +2900,7 @@ rootIt.layer(Layer.mergeAll(
         (document) =>
           Effect.sync(() => Automerge.generateSyncMessage(document, Automerge.initSyncState())[1]).pipe(
             Effect.flatMap((encoded) => {
-              if (encoded === null) return Effect.die("Expected an initial sync message")
+              if (encoded === null) return Effect.die(nativeTypeError("Expected an initial sync message"))
               return Effect.succeed(encoded)
             })
           ),
@@ -3081,7 +3082,7 @@ rootIt.layer(Layer.mergeAll(
         (document) =>
           Effect.sync(() => Automerge.generateSyncMessage(document, Automerge.initSyncState())[1]).pipe(
             Effect.flatMap((encoded) => {
-              if (encoded === null) return Effect.die("Expected an initial sync message")
+              if (encoded === null) return Effect.die(nativeTypeError("Expected an initial sync message"))
               return Effect.succeed(encoded)
             })
           ),
@@ -3274,7 +3275,7 @@ rootIt.layer(Layer.mergeAll(
         (document) =>
           Effect.sync(() => Automerge.generateSyncMessage(document, Automerge.initSyncState())[1]).pipe(
             Effect.flatMap((encoded) => {
-              if (encoded === null) return Effect.die("Expected an initial sync message")
+              if (encoded === null) return Effect.die(nativeTypeError("Expected an initial sync message"))
               return Effect.succeed(encoded)
             })
           ),
@@ -3453,7 +3454,7 @@ rootIt.layer(Layer.mergeAll(
                     return Effect.fail(
                       new ReplicaError.ReplicaError({
                         reason: new ReplicaError.StorageUnavailable({
-                          cause: "offline"
+                          cause: nativeError("offline")
                         })
                       })
                     )
@@ -3707,7 +3708,7 @@ rootIt.layer(Layer.mergeAll(
           Effect.provide(fixture.layer)
         )
         const receiveError = new ReplicaError.ReplicaError({
-          reason: new ReplicaError.StorageUnavailable({ cause: "receive failed" })
+          reason: new ReplicaError.StorageUnavailable({ cause: nativeError("receive failed") })
         })
         yield* Deferred.fail(fixture.receiveFailure, receiveError)
         assert.strictEqual(yield* Effect.flip(session.awaitDisconnect), receiveError)
@@ -3725,7 +3726,7 @@ rootIt.layer(Layer.mergeAll(
         )
         assert.strictEqual((yield* Deferred.poll(fixture.subscribed))._tag, "None")
         const receiveError = new ReplicaError.ReplicaError({
-          reason: new ReplicaError.StorageUnavailable({ cause: "supervised receive failed" })
+          reason: new ReplicaError.StorageUnavailable({ cause: nativeError("supervised receive failed") })
         })
         yield* Deferred.fail(fixture.receiveFailure, receiveError)
         assert.strictEqual(yield* Effect.flip(session.awaitDisconnect), receiveError)
@@ -3753,7 +3754,7 @@ rootIt.layer(Layer.mergeAll(
       // reach awaitDisconnect unchanged.
       const terminalFailures = [
         new ReplicaError.ReplicaError({
-          reason: new ReplicaError.StorageUnavailable({ cause: "generate failed" })
+          reason: new ReplicaError.StorageUnavailable({ cause: nativeError("generate failed") })
         }),
         new ReplicaError.ReplicaError({
           reason: new ReplicaError.ProtocolMismatch({ expected: "expected", observed: "observed" })

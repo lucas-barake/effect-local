@@ -43,6 +43,7 @@ import * as ReplicaOperationScheduler from "../src/ReplicaOperationScheduler.js"
 import * as ReplicaWorkflow from "../src/ReplicaWorkflow.js"
 import * as SqlProjection from "../src/SqlProjection.js"
 import * as SqlReplica from "../src/SqlReplica.js"
+import { nativeError } from "./TestErrors.js"
 
 describe("SqlReplica", () => {
   const JsonString = Schema.fromJsonString(Schema.Json)
@@ -637,7 +638,7 @@ describe("SqlReplica", () => {
                       Effect.andThen(Effect.fail(
                         new SqlError.SqlError({
                           reason: new SqlError.ConnectionError({
-                            cause: "commit acknowledgement lost",
+                            cause: nativeError("commit acknowledgement lost"),
                             message: "commit acknowledgement lost",
                             operation: "commit"
                           })

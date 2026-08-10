@@ -3751,11 +3751,12 @@ describe("PeerSync", () => {
       (SELECT COUNT(*) FROM effect_local_lineage_transitions) AS transitions`
   })
 
-  const lineageFailure = (exit: Exit.Exit<unknown, ReplicaError.ReplicaError>) => {
-    assert.strictEqual(exit._tag, "Failure")
-    if (exit._tag !== "Failure") return assert.fail("Expected a failure")
-    return Option.getOrThrow(Cause.findErrorOption(exit.cause)).reason
-  }
+  const lineageFailure = (exit: Exit.Exit<unknown, ReplicaError.ReplicaError>) =>
+    Effect.gen(function*() {
+      assert.strictEqual(exit._tag, "Failure")
+      if (exit._tag !== "Failure") return yield* Effect.die(nativeTypeError("Expected a failure"))
+      return Option.getOrThrow(Cause.findErrorOption(exit.cause)).reason
+    })
 
   it.effect("refuses a sync message from a peer on a superseded lineage without durable mutation", () =>
     Effect.gen(function*() {
@@ -3782,7 +3783,7 @@ describe("PeerSync", () => {
         writerProvenance: provenanceFor(message, Task.version, definition.hash)
       }))
 
-      const reason = lineageFailure(exit)
+      const reason = yield* lineageFailure(exit)
       assert.strictEqual(reason._tag, "DocumentLineageChanged")
       if (reason._tag === "DocumentLineageChanged") {
         assert.strictEqual(reason.documentId, documentId)
@@ -3824,7 +3825,7 @@ describe("PeerSync", () => {
 
       const exit = yield* Effect.exit(sync.receive(Task, documentId, session, input))
 
-      const reason = lineageFailure(exit)
+      const reason = yield* lineageFailure(exit)
       assert.strictEqual(reason._tag, "DocumentLineageChanged")
       assert.deepStrictEqual(yield* durableSnapshot, before)
       InternalAutomerge.free(remote)
@@ -3871,7 +3872,7 @@ describe("PeerSync", () => {
             writerProvenance: provenanceFor(message, Task.version, definition.hash)
           }
         ]))
-        const reason = lineageFailure(exit)
+        const reason = yield* lineageFailure(exit)
         assert.isTrue(
           reason._tag === "DocumentLineageChanged" || reason._tag === "ProtocolMismatch",
           `unexpected reason ${reason._tag} for ${lineage}`
@@ -3897,7 +3898,7 @@ describe("PeerSync", () => {
         sync.generate(Task, documentId, session, { lineageAware: false })
       )
 
-      const reason = lineageFailure(exit)
+      const reason = yield* lineageFailure(exit)
       assert.strictEqual(reason._tag, "DocumentLineageChanged")
       if (reason._tag === "DocumentLineageChanged") {
         assert.strictEqual(reason.documentId, documentId)

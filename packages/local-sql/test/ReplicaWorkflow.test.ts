@@ -25,6 +25,7 @@ import * as Recovery from "../src/Recovery.js"
 import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
 import * as ReplicaWorkflow from "../src/ReplicaWorkflow.js"
+import { nativeError } from "./TestErrors.js"
 
 describe("ReplicaWorkflow", () => {
   it.effect("derives stable execution ids from the replica incarnation and operation id", () =>
@@ -209,11 +210,11 @@ describe("ReplicaWorkflow", () => {
 
           const result = yield* runtime.poll(execution)
           assert.isTrue(Option.isSome(result))
-          if (!Option.isSome(result)) yield* Effect.die("unreachable")
+          if (!Option.isSome(result)) yield* Effect.die(nativeError("unreachable"))
           assert.strictEqual(result.value._tag, "Complete")
-          if (result.value._tag !== "Complete") yield* Effect.die("unreachable")
+          if (result.value._tag !== "Complete") yield* Effect.die(nativeError("unreachable"))
           assert.isTrue(Exit.isSuccess(result.value.exit))
-          if (!Exit.isSuccess(result.value.exit)) yield* Effect.die("unreachable")
+          if (!Exit.isSuccess(result.value.exit)) yield* Effect.die(nativeError("unreachable"))
           assert.notStrictEqual(result.value.exit.value, Identity.genesisLineage)
 
           // Exactly the rewritten document, exactly once. Nothing else evicts the in-memory sync

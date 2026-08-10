@@ -26,6 +26,7 @@ import * as ReplicaBootstrap from "../src/ReplicaBootstrap.js"
 import * as ReplicaGate from "../src/ReplicaGate.js"
 import * as ReplicaHealth from "../src/ReplicaHealth.js"
 import { withGateLimits } from "./fixtures/limits.js"
+import { nativeError } from "./TestErrors.js"
 
 describe("ReplicaHealth", () => {
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
@@ -504,7 +505,7 @@ describe("ReplicaHealth", () => {
           return Effect.fail(
             new SqlError.SqlError({
               reason: new SqlError.LockTimeoutError({
-                cause: "database is locked",
+                cause: nativeError("database is locked"),
                 message: "database is locked"
               })
             })
