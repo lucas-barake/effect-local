@@ -140,13 +140,9 @@ describe("PeerSync", () => {
   const StrictLayer = Layer.merge(StrictServices, StrictSyncService)
   const sourceLayer = (
     sourceLimits: ReplicaLimits.Values,
-    filename = ":memory:",
-    checkpointAuthority?: CheckpointAuthority.Implementation
+    filename = ":memory:"
   ) =>
-    SqlReplica.layerWithBindings(definition, {
-      projections: [],
-      ...(checkpointAuthority === undefined ? {} : { checkpointAuthority })
-    }).pipe(
+    SqlReplica.layerWithBindings(definition, { projections: [] }).pipe(
       Layer.provideMerge([
         SqliteClient.layer({ filename, disableWAL: true }),
         NodeCrypto.layer,
@@ -3453,20 +3449,26 @@ describe("PeerSync", () => {
     return yield* sql<{
       readonly changes: number
       readonly checkpoints: number
+      readonly commit_outbox: number
       readonly commit_sequence: number
       readonly documents: string
       readonly outbox: number
       readonly quarantine: number
       readonly receipts: number
+      readonly relay_receipt_usage: number
+      readonly transitions: number
     }>`SELECT
       (SELECT COUNT(*) FROM effect_local_changes) AS changes,
       (SELECT COUNT(*) FROM effect_local_checkpoints) AS checkpoints,
+      (SELECT COUNT(*) FROM effect_local_commit_outbox) AS commit_outbox,
       (SELECT commit_sequence FROM effect_local_metadata WHERE singleton = 1) AS commit_sequence,
       (SELECT group_concat(materialized_heads || '|' || accepted_heads || '|' || lineage)
         FROM effect_local_documents) AS documents,
       (SELECT COUNT(*) FROM effect_local_peer_outbox) AS outbox,
       (SELECT COUNT(*) FROM effect_local_quarantine) AS quarantine,
-      (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts`
+      (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts,
+      (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS relay_receipt_usage,
+      (SELECT COUNT(*) FROM effect_local_lineage_transitions) AS transitions`
   })
 
   const lineageFailure = (exit: Exit.Exit<unknown, ReplicaError.ReplicaError>) => {
@@ -3850,9 +3852,8 @@ describe("PeerSync", () => {
     return Layer.merge(services, peerSync)
   }
 
-  const generateColdCheckpoint = Effect.gen(function*() {
+  const seedHistoryPastChangeCap = Effect.gen(function*() {
     const store = yield* DocumentStore.DocumentStore
-    const sync = yield* PeerSync.PeerSync
     const documentId = yield* Identity.makeDocumentId
     let stored = yield* store.create(Task, documentId, { title: "write-0", labels: [] })
     for (let index = 1; index <= 3; index++) {
@@ -3864,6 +3865,24 @@ describe("PeerSync", () => {
       InternalAutomerge.free(stored.automerge)
       stored = next
     }
+    return { documentId, stored }
+  })
+
+  const checkpointOf = (documentId: Identity.DocumentId, automerge: InternalAutomerge.AnyDocument) =>
+    Effect.gen(function*() {
+      const snapshot = InternalAutomerge.save(automerge)
+      return {
+        automerge,
+        snapshot,
+        heads: InternalAutomerge.heads(automerge),
+        checkpointHash: yield* Canonical.digest({ documentId, bytes: snapshot })
+      }
+    })
+
+  const coldCheckpointFromSource = Effect.gen(function*() {
+    const store = yield* DocumentStore.DocumentStore
+    const sync = yield* PeerSync.PeerSync
+    const { documentId, stored } = yield* seedHistoryPastChangeCap
     const session = yield* sync.open(yield* Identity.makePeerId)
     const generated = yield* sync.generate(Task, documentId, session, {
       lineageAware: true,
@@ -3889,13 +3908,11 @@ describe("PeerSync", () => {
     InternalAutomerge.free(staged)
     InternalAutomerge.free(stored.automerge)
     return { documentId, outbound: generated.outbound! }
-  })
+  }).pipe(Effect.provide(checkpointSourceLayer(checkpointAuthority)))
 
   it.effect("converges an oversized cold sync through a compact checkpoint and replays its receipt", () =>
     Effect.gen(function*() {
-      const generated = yield* generateColdCheckpoint.pipe(
-        Effect.provide(checkpointSourceLayer(checkpointAuthority))
-      )
+      const generated = yield* coldCheckpointFromSource
       yield* Effect.gen(function*() {
         const sync = yield* PeerSync.PeerSync
         const store = yield* DocumentStore.DocumentStore
@@ -3924,7 +3941,7 @@ describe("PeerSync", () => {
         }, CheckpointLimits.maxSyncMessageBytes)
         yield* sql`UPDATE effect_local_peer_receipts SET pending_message = ${new Uint8Array([1])}
           WHERE document_id = ${generated.documentId}`
-        const rejected = yield* Effect.result(sync.receive(Task, generated.documentId, session, {
+        const rejected = yield* Effect.flip(sync.receive(Task, generated.documentId, session, {
           ...input,
           receiveSequence: 1,
           checkpointTransfer: replacement
@@ -3940,10 +3957,7 @@ describe("PeerSync", () => {
 
         assert.isFalse(received.duplicate)
         assert.isTrue(duplicate.duplicate)
-        assert.isTrue(Result.isFailure(rejected))
-        if (Result.isFailure(rejected)) {
-          assert.strictEqual(rejected.failure.reason._tag, "CheckpointRejected")
-        }
+        assert.strictEqual(rejected.reason._tag, "CheckpointRejected")
         assert.strictEqual(loaded.snapshot.value.title, "write-3")
         assert.strictEqual(rows[0]?.receipts, 1)
         const provenance = Schema.decodeSync(WriterProvenance.StoredCheckpointProvenance)(
@@ -3956,19 +3970,8 @@ describe("PeerSync", () => {
 
   it.effect("keeps the legacy cold announcement when checkpoint transfer is not advertised", () =>
     Effect.gen(function*() {
-      const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
-      const documentId = yield* Identity.makeDocumentId
-      let stored = yield* store.create(Task, documentId, { title: "write-0", labels: [] })
-      for (let index = 1; index <= 3; index++) {
-        const staged = yield* store.stage(stored, (draft) => {
-          draft.title = `write-${index}`
-        })
-        const next = yield* store.persist(Task, documentId, stored, staged)
-        InternalAutomerge.free(staged)
-        InternalAutomerge.free(stored.automerge)
-        stored = next
-      }
+      const { documentId, stored } = yield* seedHistoryPastChangeCap
       const session = yield* sync.open(yield* Identity.makePeerId)
       const result = yield* sync.generate(Task, documentId, session, {
         lineageAware: true
@@ -3981,19 +3984,8 @@ describe("PeerSync", () => {
 
   it.effect("falls back to the ordinary cold announcement when checkpoint signing is unavailable", () =>
     Effect.gen(function*() {
-      const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
-      const documentId = yield* Identity.makeDocumentId
-      let stored = yield* store.create(Task, documentId, { title: "write-0", labels: [] })
-      for (let index = 1; index <= 3; index++) {
-        const staged = yield* store.stage(stored, (draft) => {
-          draft.title = `write-${index}`
-        })
-        const next = yield* store.persist(Task, documentId, stored, staged)
-        InternalAutomerge.free(staged)
-        InternalAutomerge.free(stored.automerge)
-        stored = next
-      }
+      const { documentId, stored } = yield* seedHistoryPastChangeCap
       const session = yield* sync.open(yield* Identity.makePeerId)
       const result = yield* sync.generate(Task, documentId, session, {
         lineageAware: true,
@@ -4008,9 +4000,7 @@ describe("PeerSync", () => {
 
   it.effect("rejects a checkpoint with invalid authorization without durable mutation", () =>
     Effect.gen(function*() {
-      const generated = yield* generateColdCheckpoint.pipe(
-        Effect.provide(checkpointSourceLayer(checkpointAuthority))
-      )
+      const generated = yield* coldCheckpointFromSource
       const decoded = yield* PeerSyncEnvelope.decodeCheckpointTransfer(
         generated.outbound.checkpointTransfer!,
         CheckpointLimits.maxSyncMessageBytes
@@ -4021,9 +4011,9 @@ describe("PeerSync", () => {
       }, CheckpointLimits.maxSyncMessageBytes)
       yield* Effect.gen(function*() {
         const sync = yield* PeerSync.PeerSync
-        const sql = yield* SqlClient.SqlClient
         const session = yield* sync.open(yield* Identity.makePeerId)
-        const result = yield* Effect.result(sync.receive(Task, generated.documentId, session, {
+        const before = yield* durableSnapshot
+        const failure = yield* Effect.flip(sync.receive(Task, generated.documentId, session, {
           remoteConnectionEpoch: "hostile-checkpoint",
           receiveSequence: 0,
           lineage: generated.outbound.lineage,
@@ -4031,22 +4021,15 @@ describe("PeerSync", () => {
           writerProvenance: [],
           checkpointTransfer: hostile
         }))
-        assert.isTrue(Result.isFailure(result))
-        if (Result.isFailure(result)) {
-          assert.strictEqual(result.failure.reason._tag, "CheckpointRejected")
-        }
-        const rows = yield* sql<{ readonly documents: number; readonly receipts: number }>`SELECT
-          (SELECT COUNT(*) FROM effect_local_documents) AS documents,
-          (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts`
-        assert.deepStrictEqual(rows, [{ documents: 0, receipts: 0 }])
+
+        assert.strictEqual(failure.reason._tag, "CheckpointRejected")
+        assert.deepStrictEqual(yield* durableSnapshot, before)
       }).pipe(Effect.provide(checkpointSourceLayer(checkpointAuthority)))
     }))
 
   it.effect("accepts and idempotently replays a relayed checkpoint receipt with usage", () =>
     Effect.gen(function*() {
-      const generated = yield* generateColdCheckpoint.pipe(
-        Effect.provide(checkpointSourceLayer(checkpointAuthority))
-      )
+      const generated = yield* coldCheckpointFromSource
       yield* Effect.gen(function*() {
         const sync = yield* PeerSync.PeerSync
         const sql = yield* SqlClient.SqlClient
@@ -4099,12 +4082,9 @@ describe("PeerSync", () => {
 
   it.effect("rolls back a relayed checkpoint when retained receipt bytes exceed quota", () =>
     Effect.gen(function*() {
-      const generated = yield* generateColdCheckpoint.pipe(
-        Effect.provide(checkpointSourceLayer(checkpointAuthority))
-      )
+      const generated = yield* coldCheckpointFromSource
       yield* Effect.gen(function*() {
         const sync = yield* PeerSync.PeerSync
-        const sql = yield* SqlClient.SqlClient
         const senderPeerId = yield* Identity.makePeerId
         const session = yield* sync.open(senderPeerId)
         const relay: PeerSync.RelayReceipt = {
@@ -4121,7 +4101,8 @@ describe("PeerSync", () => {
           ).toISOString(),
           encodedSize: 1
         }
-        const result = yield* Effect.result(sync.receive(Task, generated.documentId, session, {
+        const before = yield* durableSnapshot
+        const failure = yield* Effect.flip(sync.receive(Task, generated.documentId, session, {
           remoteConnectionEpoch: "relay-checkpoint-quota",
           receiveSequence: 0,
           lineage: generated.outbound.lineage,
@@ -4130,33 +4111,12 @@ describe("PeerSync", () => {
           checkpointTransfer: generated.outbound.checkpointTransfer!,
           relay
         }))
-        const rows = yield* sql<{
-          readonly checkpoints: number
-          readonly commits: number
-          readonly documents: number
-          readonly receipts: number
-          readonly usage: number
-        }>`SELECT
-          (SELECT COUNT(*) FROM effect_local_documents) AS documents,
-          (SELECT COUNT(*) FROM effect_local_checkpoints) AS checkpoints,
-          (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts,
-          (SELECT COUNT(*) FROM effect_local_peer_relay_receipt_usage) AS usage,
-          (SELECT COUNT(*) FROM effect_local_commit_outbox) AS commits`
 
-        assert.isTrue(Result.isFailure(result))
-        if (Result.isFailure(result)) {
-          assert.strictEqual(result.failure.reason._tag, "QuotaExceeded")
-          if (result.failure.reason._tag === "QuotaExceeded") {
-            assert.strictEqual(result.failure.reason.resource, "relay receipt bytes per remote")
-          }
+        assert.strictEqual(failure.reason._tag, "QuotaExceeded")
+        if (failure.reason._tag === "QuotaExceeded") {
+          assert.strictEqual(failure.reason.resource, "relay receipt bytes per remote")
         }
-        assert.deepStrictEqual(rows, [{
-          checkpoints: 0,
-          commits: 0,
-          documents: 0,
-          receipts: 0,
-          usage: 0
-        }])
+        assert.deepStrictEqual(yield* durableSnapshot, before)
       }).pipe(Effect.provide(checkpointRelayLayer({
         ...PeerRelayReceiptLimits.defaults,
         maxEncodedBytesPerRemote: 1,
@@ -4166,9 +4126,7 @@ describe("PeerSync", () => {
 
   it.effect("rejects an in-flight checkpoint install after its session resets", () =>
     Effect.gen(function*() {
-      const generated = yield* generateColdCheckpoint.pipe(
-        Effect.provide(checkpointSourceLayer(checkpointAuthority))
-      )
+      const generated = yield* coldCheckpointFromSource
       const verificationStarted = yield* Deferred.make<void>()
       const releaseVerification = yield* Deferred.make<void>()
       const blockingAuthority: CheckpointAuthority.Implementation = {
@@ -4181,32 +4139,25 @@ describe("PeerSync", () => {
       }
       yield* Effect.gen(function*() {
         const sync = yield* PeerSync.PeerSync
-        const sql = yield* SqlClient.SqlClient
         const session = yield* sync.open(yield* Identity.makePeerId)
-        const input = {
-          remoteConnectionEpoch: "checkpoint-reset",
-          receiveSequence: 0,
-          lineage: generated.outbound.lineage,
-          message: new Uint8Array(),
-          writerProvenance: [] as const,
-          checkpointTransfer: generated.outbound.checkpointTransfer!
-        }
+        const before = yield* durableSnapshot
         const installing = yield* Effect.exit(
-          sync.receive(Task, generated.documentId, session, input)
+          sync.receive(Task, generated.documentId, session, {
+            remoteConnectionEpoch: "checkpoint-reset",
+            receiveSequence: 0,
+            lineage: generated.outbound.lineage,
+            message: new Uint8Array(),
+            writerProvenance: [] as const,
+            checkpointTransfer: generated.outbound.checkpointTransfer!
+          })
         ).pipe(Effect.forkChild({ startImmediately: true }))
         yield* Deferred.await(verificationStarted)
         yield* sync.reset(session)
         yield* Deferred.succeed(releaseVerification, undefined)
         const exit = yield* Fiber.join(installing)
-        const rows = yield* sql<{
-          readonly documents: number
-          readonly receipts: number
-        }>`SELECT
-          (SELECT COUNT(*) FROM effect_local_documents) AS documents,
-          (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts`
 
         assert.strictEqual(exit._tag, "Failure")
-        assert.deepStrictEqual(rows, [{ documents: 0, receipts: 0 }])
+        assert.deepStrictEqual(yield* durableSnapshot, before)
       }).pipe(
         Effect.provide(checkpointSourceLayer(blockingAuthority)),
         Effect.ensuring(Deferred.succeed(releaseVerification, undefined))
@@ -4219,23 +4170,23 @@ describe("PeerSync", () => {
       const sync = yield* PeerSync.PeerSync
       const documentId = yield* Identity.makeDocumentId
       const local = yield* store.create(Task, documentId, { title: "prefix", labels: [] })
-      const current = Automerge.change(
-        Automerge.clone(local.automerge, { actor: "3".repeat(32) }),
-        (draft) => {
-          ;(draft.value as { title: string }).title = "same-lineage-current"
-        }
+      const current = yield* checkpointOf(
+        documentId,
+        Automerge.change(
+          Automerge.clone(local.automerge, { actor: "3".repeat(32) }),
+          (draft) => {
+            ;(draft.value as { title: string }).title = "same-lineage-current"
+          }
+        )
       )
-      const snapshot = InternalAutomerge.save(current)
-      const heads = InternalAutomerge.heads(current)
-      const checkpointHash = yield* Canonical.digest({ documentId, bytes: snapshot })
       const transfer = yield* PeerSyncEnvelope.encodeCheckpointTransfer({
-        snapshot,
+        snapshot: current.snapshot,
         manifest: {
           purpose: CheckpointAuthority.manifestPurpose,
           documentId,
           lineage: Identity.genesisLineage,
-          checkpointHash,
-          heads,
+          checkpointHash: current.checkpointHash,
+          heads: current.heads,
           base: { _tag: "Bootstrap" },
           schemaVersion: Task.version,
           writerDefinitionHash: definition.hash,
@@ -4254,7 +4205,7 @@ describe("PeerSync", () => {
       })
       const loaded = yield* store.load(Task, documentId)
       assert.strictEqual(loaded.snapshot.value.title, "same-lineage-current")
-      assert.deepStrictEqual(loaded.materializedHeads, heads)
+      assert.deepStrictEqual(loaded.materializedHeads, current.heads)
       const staged = yield* store.stage(loaded, (draft) => {
         draft.title = "after-checkpoint-receive"
       })
@@ -4269,38 +4220,28 @@ describe("PeerSync", () => {
       InternalAutomerge.free(advanced.automerge)
       InternalAutomerge.free(staged)
       InternalAutomerge.free(loaded.automerge)
-      InternalAutomerge.free(current)
+      InternalAutomerge.free(current.automerge)
       InternalAutomerge.free(local.automerge)
     }).pipe(Effect.provide(checkpointSourceLayer(checkpointAuthority))))
 
   it.effect("syncs ordinary edits in both directions after installing a compact checkpoint", () =>
     Effect.scoped(Effect.gen(function*() {
-      const senderContext = yield* Layer.build(checkpointSourceLayer(checkpointAuthority))
-      const recipientContext = yield* Layer.build(checkpointSourceLayer(checkpointAuthority))
-      const sender = {
-        store: Context.get(senderContext, DocumentStore.DocumentStore),
-        sync: Context.get(senderContext, PeerSync.PeerSync),
-        session: undefined as unknown as PeerSync.Session
-      }
-      const recipient = {
-        store: Context.get(recipientContext, DocumentStore.DocumentStore),
-        sync: Context.get(recipientContext, PeerSync.PeerSync),
-        session: undefined as unknown as PeerSync.Session
-      }
-      sender.session = yield* sender.sync.open(yield* Identity.makePeerId)
-      recipient.session = yield* recipient.sync.open(yield* Identity.makePeerId)
+      const openPeer = Effect.gen(function*() {
+        const context = yield* Layer.build(checkpointSourceLayer(checkpointAuthority))
+        const sync = Context.get(context, PeerSync.PeerSync)
+        return {
+          context,
+          store: Context.get(context, DocumentStore.DocumentStore),
+          sync,
+          session: yield* sync.open(yield* Identity.makePeerId)
+        }
+      })
+      const sender = yield* openPeer
+      const recipient = yield* openPeer
 
-      const documentId = yield* Identity.makeDocumentId
-      let stored = yield* sender.store.create(Task, documentId, { title: "write-0", labels: [] })
-      for (let index = 1; index <= 3; index++) {
-        const staged = yield* sender.store.stage(stored, (draft) => {
-          draft.title = `write-${index}`
-        })
-        const next = yield* sender.store.persist(Task, documentId, stored, staged)
-        InternalAutomerge.free(staged)
-        InternalAutomerge.free(stored.automerge)
-        stored = next
-      }
+      const { documentId, stored } = yield* seedHistoryPastChangeCap.pipe(
+        Effect.provide(sender.context)
+      )
       InternalAutomerge.free(stored.automerge)
 
       type Side = typeof sender
@@ -4391,23 +4332,14 @@ describe("PeerSync", () => {
 
   it.effect("rejects generation when the retained lineage chain exceeds the wire bound", () =>
     Effect.gen(function*() {
-      const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
       const sql = yield* SqlClient.SqlClient
-      const documentId = yield* Identity.makeDocumentId
-      let stored = yield* store.create(Task, documentId, { title: "write-0", labels: [] })
-      for (let index = 1; index <= 3; index++) {
-        const staged = yield* store.stage(stored, (draft) => {
-          draft.title = `write-${index}`
-        })
-        const next = yield* store.persist(Task, documentId, stored, staged)
-        InternalAutomerge.free(staged)
-        InternalAutomerge.free(stored.automerge)
-        stored = next
-      }
+      const { documentId, stored } = yield* seedHistoryPastChangeCap
       const snapshot = InternalAutomerge.save(stored.automerge)
-      const heads = stored.materializedHeads
       const checkpointHash = yield* Canonical.digest({ documentId, bytes: snapshot })
+      const encodedHeads = Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)))(
+        stored.materializedHeads
+      )
       const lineages = Array.from({ length: PeerSyncEnvelope.maximumCheckpointTransitions + 1 }, (_, index) =>
         Identity.DocumentLineage.make(
           `lin_${(index + 1).toString(16).padStart(8, "0")}-0000-4000-8000-${
@@ -4421,23 +4353,19 @@ describe("PeerSync", () => {
           authorization, created_at
         ) VALUES (
           ${documentId}, ${index === 0 ? Identity.genesisLineage : lineages[index - 1]!},
-          ${checkpointHash}, ${Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)))(heads)},
-          ${snapshot}, ${lineage}, ${checkpointHash},
-          ${Schema.encodeSync(Schema.fromJsonString(Schema.Array(Schema.String)))(heads)},
+          ${checkpointHash}, ${encodedHeads}, ${snapshot}, ${lineage}, ${checkpointHash}, ${encodedHeads},
           ${Task.version}, ${definition.hash}, ${checkpointToken}, ${new Date(0).toISOString()}
         )`
       }
       yield* sql`UPDATE effect_local_documents SET lineage = ${lineages.at(-1)!}
         WHERE document_id = ${documentId}`
       const session = yield* sync.open(yield* Identity.makePeerId)
-      const result = yield* Effect.result(sync.generate(Task, documentId, session, {
+      const failure = yield* Effect.flip(sync.generate(Task, documentId, session, {
         lineageAware: true,
         checkpointTransfer: true
       }))
-      assert.isTrue(Result.isFailure(result))
-      if (Result.isFailure(result)) {
-        assert.strictEqual(result.failure.reason._tag, "QuotaExceeded")
-      }
+
+      assert.strictEqual(failure.reason._tag, "QuotaExceeded")
       InternalAutomerge.free(stored.automerge)
     }).pipe(Effect.provide(checkpointSourceLayer(checkpointAuthority))))
 
@@ -4454,41 +4382,37 @@ describe("PeerSync", () => {
       const sync = yield* PeerSync.PeerSync
       const documentId = yield* Identity.makeDocumentId
       const local = yield* store.create(Task, documentId, { title: "local-prefix", labels: [] })
-      const prior = Automerge.change(
-        Automerge.clone(local.automerge, { actor: "a".repeat(32) }),
-        (draft) => {
-          ;(draft.value as { title: string }).title = "before-rewrite"
-        }
+      const prior = yield* checkpointOf(
+        documentId,
+        Automerge.change(
+          Automerge.clone(local.automerge, { actor: "a".repeat(32) }),
+          (draft) => {
+            ;(draft.value as { title: string }).title = "before-rewrite"
+          }
+        )
       )
-      const priorSnapshot = InternalAutomerge.save(prior)
-      const priorHeads = InternalAutomerge.heads(prior)
-      const priorCheckpointHash = yield* Canonical.digest({ documentId, bytes: priorSnapshot })
-      const anchor = InternalAutomerge.reroot(
-        InternalAutomerge.value(prior),
-        false,
-        "b".repeat(32)
+      const anchor = yield* checkpointOf(
+        documentId,
+        InternalAutomerge.reroot(InternalAutomerge.value(prior.automerge), false, "b".repeat(32))
       )
-      const anchorSnapshot = InternalAutomerge.save(anchor)
-      const anchorHeads = InternalAutomerge.heads(anchor)
-      const anchorCheckpointHash = yield* Canonical.digest({ documentId, bytes: anchorSnapshot })
-      const current = Automerge.change(
-        Automerge.clone(anchor, { actor: "c".repeat(32) }),
-        (draft) => {
-          ;(draft.value as { title: string }).title = "after-rewrite-mutation"
-        }
+      const current = yield* checkpointOf(
+        documentId,
+        Automerge.change(
+          Automerge.clone(anchor.automerge, { actor: "c".repeat(32) }),
+          (draft) => {
+            ;(draft.value as { title: string }).title = "after-rewrite-mutation"
+          }
+        )
       )
-      const snapshot = InternalAutomerge.save(current)
-      const heads = InternalAutomerge.heads(current)
-      const checkpointHash = yield* Canonical.digest({ documentId, bytes: snapshot })
-      assert.notStrictEqual(checkpointHash, anchorCheckpointHash)
+      assert.notStrictEqual(current.checkpointHash, anchor.checkpointHash)
       const transfer = yield* PeerSyncEnvelope.encodeCheckpointTransfer({
-        snapshot,
+        snapshot: current.snapshot,
         manifest: {
           purpose: CheckpointAuthority.manifestPurpose,
           documentId,
           lineage: firstRewrittenLineage,
-          checkpointHash,
-          heads,
+          checkpointHash: current.checkpointHash,
+          heads: current.heads,
           base: { _tag: "Heads", baseHeads: local.materializedHeads },
           schemaVersion: Task.version,
           writerDefinitionHash: definition.hash,
@@ -4498,12 +4422,12 @@ describe("PeerSync", () => {
           purpose: CheckpointAuthority.transitionPurpose,
           documentId,
           priorLineage: Identity.genesisLineage,
-          priorCheckpointHash,
-          priorHeads,
-          priorSnapshot,
+          priorCheckpointHash: prior.checkpointHash,
+          priorHeads: prior.heads,
+          priorSnapshot: prior.snapshot,
           resultingLineage: firstRewrittenLineage,
-          anchorCheckpointHash,
-          resultingHeads: anchorHeads,
+          anchorCheckpointHash: anchor.checkpointHash,
+          resultingHeads: anchor.heads,
           schemaVersion: Task.version,
           writerDefinitionHash: definition.hash,
           authorization: checkpointToken
@@ -4520,14 +4444,14 @@ describe("PeerSync", () => {
       })
       const loaded = yield* store.load(Task, documentId)
 
-      assert.deepStrictEqual(received.heads, heads)
+      assert.deepStrictEqual(received.heads, current.heads)
       assert.strictEqual(loaded.snapshot.value.title, "after-rewrite-mutation")
-      assert.deepStrictEqual(loaded.materializedHeads, heads)
+      assert.deepStrictEqual(loaded.materializedHeads, current.heads)
 
       InternalAutomerge.free(loaded.automerge)
-      InternalAutomerge.free(current)
-      InternalAutomerge.free(anchor)
-      InternalAutomerge.free(prior)
+      InternalAutomerge.free(current.automerge)
+      InternalAutomerge.free(anchor.automerge)
+      InternalAutomerge.free(prior.automerge)
       InternalAutomerge.free(local.automerge)
     }).pipe(Effect.provide(checkpointSourceLayer(checkpointAuthority))))
 
@@ -4535,71 +4459,48 @@ describe("PeerSync", () => {
     Effect.gen(function*() {
       const store = yield* DocumentStore.DocumentStore
       const sync = yield* PeerSync.PeerSync
-      const sql = yield* SqlClient.SqlClient
       const documentId = yield* Identity.makeDocumentId
       const local = yield* store.create(Task, documentId, { title: "local-prefix", labels: [] })
-      const firstPrior = Automerge.change(
-        Automerge.clone(local.automerge, { actor: "d".repeat(32) }),
-        (draft) => {
-          ;(draft.value as { title: string }).title = "first-prior"
-        }
+      const firstPrior = yield* checkpointOf(
+        documentId,
+        Automerge.change(
+          Automerge.clone(local.automerge, { actor: "d".repeat(32) }),
+          (draft) => {
+            ;(draft.value as { title: string }).title = "first-prior"
+          }
+        )
       )
-      const firstPriorSnapshot = InternalAutomerge.save(firstPrior)
-      const firstPriorHeads = InternalAutomerge.heads(firstPrior)
-      const firstPriorHash = yield* Canonical.digest({ documentId, bytes: firstPriorSnapshot })
-      const firstAnchor = InternalAutomerge.reroot(
-        InternalAutomerge.value(firstPrior),
-        false,
-        "e".repeat(32)
+      const firstAnchor = yield* checkpointOf(
+        documentId,
+        InternalAutomerge.reroot(InternalAutomerge.value(firstPrior.automerge), false, "e".repeat(32))
       )
-      const firstAnchorSnapshot = InternalAutomerge.save(firstAnchor)
-      const firstAnchorHeads = InternalAutomerge.heads(firstAnchor)
-      const firstAnchorHash = yield* Canonical.digest({ documentId, bytes: firstAnchorSnapshot })
-      const mismatchedPrior = InternalAutomerge.reroot(
-        { title: "mismatched-intermediate", labels: [] },
-        false,
-        "f".repeat(32)
+      const mismatchedPrior = yield* checkpointOf(
+        documentId,
+        InternalAutomerge.reroot({ title: "mismatched-intermediate", labels: [] }, false, "f".repeat(32))
       )
-      const mismatchedPriorSnapshot = InternalAutomerge.save(mismatchedPrior)
-      const mismatchedPriorHeads = InternalAutomerge.heads(mismatchedPrior)
-      const mismatchedPriorHash = yield* Canonical.digest({ documentId, bytes: mismatchedPriorSnapshot })
-      assert.isFalse(sameHeadsForTest(firstAnchorHeads, mismatchedPriorHeads))
-      const secondAnchor = InternalAutomerge.reroot(
-        InternalAutomerge.value(mismatchedPrior),
-        false,
-        "1".repeat(32)
+      assert.isFalse(sameHeadsForTest(firstAnchor.heads, mismatchedPrior.heads))
+      const secondAnchor = yield* checkpointOf(
+        documentId,
+        InternalAutomerge.reroot(InternalAutomerge.value(mismatchedPrior.automerge), false, "1".repeat(32))
       )
-      const secondAnchorSnapshot = InternalAutomerge.save(secondAnchor)
-      const secondAnchorHeads = InternalAutomerge.heads(secondAnchor)
-      const secondAnchorHash = yield* Canonical.digest({ documentId, bytes: secondAnchorSnapshot })
-      const current = Automerge.change(
-        Automerge.clone(secondAnchor, { actor: "2".repeat(32) }),
-        (draft) => {
-          ;(draft.value as { title: string }).title = "post-rewrite-mutation"
-        }
+      const current = yield* checkpointOf(
+        documentId,
+        Automerge.change(
+          Automerge.clone(secondAnchor.automerge, { actor: "2".repeat(32) }),
+          (draft) => {
+            ;(draft.value as { title: string }).title = "post-rewrite-mutation"
+          }
+        )
       )
-      const snapshot = InternalAutomerge.save(current)
-      const heads = InternalAutomerge.heads(current)
-      const checkpointHash = yield* Canonical.digest({ documentId, bytes: snapshot })
-      assert.notStrictEqual(checkpointHash, secondAnchorHash)
-      const before = yield* sql<{
-        readonly checkpoints: number
-        readonly documents: string
-        readonly receipts: number
-        readonly transitions: number
-      }>`SELECT
-        (SELECT COUNT(*) FROM effect_local_checkpoints) AS checkpoints,
-        (SELECT group_concat(materialized_heads || '|' || lineage) FROM effect_local_documents) AS documents,
-        (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts,
-        (SELECT COUNT(*) FROM effect_local_lineage_transitions) AS transitions`
+      assert.notStrictEqual(current.checkpointHash, secondAnchor.checkpointHash)
       const transfer = yield* PeerSyncEnvelope.encodeCheckpointTransfer({
-        snapshot,
+        snapshot: current.snapshot,
         manifest: {
           purpose: CheckpointAuthority.manifestPurpose,
           documentId,
           lineage: secondRewrittenLineage,
-          checkpointHash,
-          heads,
+          checkpointHash: current.checkpointHash,
+          heads: current.heads,
           base: { _tag: "Heads", baseHeads: local.materializedHeads },
           schemaVersion: Task.version,
           writerDefinitionHash: definition.hash,
@@ -4609,12 +4510,12 @@ describe("PeerSync", () => {
           purpose: CheckpointAuthority.transitionPurpose,
           documentId,
           priorLineage: Identity.genesisLineage,
-          priorCheckpointHash: firstPriorHash,
-          priorHeads: firstPriorHeads,
-          priorSnapshot: firstPriorSnapshot,
+          priorCheckpointHash: firstPrior.checkpointHash,
+          priorHeads: firstPrior.heads,
+          priorSnapshot: firstPrior.snapshot,
           resultingLineage: firstRewrittenLineage,
-          anchorCheckpointHash: firstAnchorHash,
-          resultingHeads: firstAnchorHeads,
+          anchorCheckpointHash: firstAnchor.checkpointHash,
+          resultingHeads: firstAnchor.heads,
           schemaVersion: Task.version,
           writerDefinitionHash: definition.hash,
           authorization: checkpointToken
@@ -4622,19 +4523,20 @@ describe("PeerSync", () => {
           purpose: CheckpointAuthority.transitionPurpose,
           documentId,
           priorLineage: firstRewrittenLineage,
-          priorCheckpointHash: mismatchedPriorHash,
-          priorHeads: mismatchedPriorHeads,
-          priorSnapshot: mismatchedPriorSnapshot,
+          priorCheckpointHash: mismatchedPrior.checkpointHash,
+          priorHeads: mismatchedPrior.heads,
+          priorSnapshot: mismatchedPrior.snapshot,
           resultingLineage: secondRewrittenLineage,
-          anchorCheckpointHash: secondAnchorHash,
-          resultingHeads: secondAnchorHeads,
+          anchorCheckpointHash: secondAnchor.checkpointHash,
+          resultingHeads: secondAnchor.heads,
           schemaVersion: Task.version,
           writerDefinitionHash: definition.hash,
           authorization: checkpointToken
         }]
       }, CheckpointLimits.maxSyncMessageBytes)
       const session = yield* sync.open(yield* Identity.makePeerId)
-      const result = yield* Effect.result(sync.receive(Task, documentId, session, {
+      const before = yield* durableSnapshot
+      const failure = yield* Effect.flip(sync.receive(Task, documentId, session, {
         remoteConnectionEpoch: "mismatched-transition",
         receiveSequence: 0,
         lineage: secondRewrittenLineage,
@@ -4642,28 +4544,15 @@ describe("PeerSync", () => {
         writerProvenance: [],
         checkpointTransfer: transfer
       }))
-      const after = yield* sql<{
-        readonly checkpoints: number
-        readonly documents: string
-        readonly receipts: number
-        readonly transitions: number
-      }>`SELECT
-        (SELECT COUNT(*) FROM effect_local_checkpoints) AS checkpoints,
-        (SELECT group_concat(materialized_heads || '|' || lineage) FROM effect_local_documents) AS documents,
-        (SELECT COUNT(*) FROM effect_local_peer_receipts) AS receipts,
-        (SELECT COUNT(*) FROM effect_local_lineage_transitions) AS transitions`
 
-      assert.isTrue(Result.isFailure(result))
-      if (Result.isFailure(result)) {
-        assert.strictEqual(result.failure.reason._tag, "CheckpointRejected")
-      }
-      assert.deepStrictEqual(after, before)
+      assert.strictEqual(failure.reason._tag, "CheckpointRejected")
+      assert.deepStrictEqual(yield* durableSnapshot, before)
 
-      InternalAutomerge.free(current)
-      InternalAutomerge.free(secondAnchor)
-      InternalAutomerge.free(mismatchedPrior)
-      InternalAutomerge.free(firstAnchor)
-      InternalAutomerge.free(firstPrior)
+      InternalAutomerge.free(current.automerge)
+      InternalAutomerge.free(secondAnchor.automerge)
+      InternalAutomerge.free(mismatchedPrior.automerge)
+      InternalAutomerge.free(firstAnchor.automerge)
+      InternalAutomerge.free(firstPrior.automerge)
       InternalAutomerge.free(local.automerge)
     }).pipe(Effect.provide(checkpointSourceLayer(checkpointAuthority))))
 })
