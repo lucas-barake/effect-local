@@ -307,34 +307,36 @@ const BootstrapMessage = Schema.Struct({
 self.onconnect = (connectEvent) => {
   const controlPort = connectEvent.ports[0]
   controlPort.addEventListener("message", (bootstrapEvent) => {
-    const { databasePort, rpcPort } = Schema.decodeUnknownSync(BootstrapMessage)(bootstrapEvent.data)
-    databasePort.start()
-    rpcPort.start()
-
-    const DatabaseLive = SqliteClient.layer({
-      worker: Effect.acquireRelease(
-        Effect.succeed(databasePort),
-        (port) => Effect.sync(() => port.close())
-      )
-    })
-
-    const EngineLive = Layer.mergeAll(
-      ApplicationSchemaLive,
-      ClusterLive
-    ).pipe(
-      Layer.provideMerge(BrowserCrypto.layer),
-      Layer.provideMerge(DatabaseLive)
-    )
-
-    const MainLive = RpcServer.layer(PageApi).pipe(
-      Layer.provide(PageHandlersLive),
-      Layer.provide(RpcServer.layerProtocolWorkerRunner),
-      Layer.provide(BrowserWorkerRunner.layerMessagePort(rpcPort)),
-      Layer.provide(EngineLive)
-    )
-
     Effect.runFork(
-      Layer.launch(MainLive).pipe(
+      Effect.gen(function*() {
+        const { databasePort, rpcPort } = yield* Schema.decodeUnknownEffect(BootstrapMessage)(bootstrapEvent.data)
+        databasePort.start()
+        rpcPort.start()
+
+        const DatabaseLive = SqliteClient.layer({
+          worker: Effect.acquireRelease(
+            Effect.succeed(databasePort),
+            (port) => Effect.sync(() => port.close())
+          )
+        })
+
+        const EngineLive = Layer.mergeAll(
+          ApplicationSchemaLive,
+          ClusterLive
+        ).pipe(
+          Layer.provideMerge(BrowserCrypto.layer),
+          Layer.provideMerge(DatabaseLive)
+        )
+
+        const MainLive = RpcServer.layer(PageApi).pipe(
+          Layer.provide(PageHandlersLive),
+          Layer.provide(RpcServer.layerProtocolWorkerRunner),
+          Layer.provide(BrowserWorkerRunner.layerMessagePort(rpcPort)),
+          Layer.provide(EngineLive)
+        )
+
+        yield* Layer.launch(MainLive)
+      }).pipe(
         Effect.tapCause((cause) =>
           Effect.sync(() => diagnostics.postMessage(`shared worker failure: ${String(cause)}`))
         ),

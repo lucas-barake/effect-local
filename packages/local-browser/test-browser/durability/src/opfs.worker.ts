@@ -8,12 +8,14 @@ const diagnostics = new BroadcastChannel("effect-local-stage0-diagnostics")
 diagnostics.postMessage("OPFS worker loaded")
 
 self.addEventListener("message", (event) => {
-  const port = Schema.decodeUnknownSync(Schema.instanceOf(MessagePort))(event.data)
-  port.start()
   Effect.runFork(
-    OpfsWorker.run({
-      port,
-      dbName: "effect-local-stage0.sqlite"
+    Effect.gen(function*() {
+      const port = yield* Schema.decodeUnknownEffect(Schema.instanceOf(MessagePort))(event.data)
+      port.start()
+      yield* OpfsWorker.run({
+        port,
+        dbName: "effect-local-stage0.sqlite"
+      })
     }).pipe(
       Effect.tapCause((cause) => Effect.sync(() => diagnostics.postMessage(`OPFS failure: ${String(cause)}`))),
       Effect.ensuring(Effect.sync(() => diagnostics.close()))

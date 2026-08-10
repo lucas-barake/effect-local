@@ -116,7 +116,7 @@ test("streams pulses while a database request remains active", async ({ page }) 
   await openDurabilityProof(page)
 
   const result = await page.evaluate(async () => {
-    window.stage0.armNextDatabaseResponse()
+    await window.stage0.armNextDatabaseResponse()
     let completed = false
     const databasePromise = window.stage0.stressDatabase(250_000).then((database) => {
       completed = true
@@ -128,7 +128,7 @@ test("streams pulses while a database request remains active", async ({ page }) 
     try {
       const pulses = await window.stage0.heartbeat(3)
       const completedWhileHeld = completed
-      window.stage0.releaseDatabaseResponse()
+      await window.stage0.releaseDatabaseResponse()
       released = true
       return {
         completedWhileHeld,
@@ -136,7 +136,7 @@ test("streams pulses while a database request remains active", async ({ page }) 
         pulseCount: pulses.length
       }
     } finally {
-      if (!released) window.stage0.releaseDatabaseResponse()
+      if (!released) await window.stage0.releaseDatabaseResponse()
     }
   })
 
