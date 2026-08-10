@@ -32,13 +32,15 @@ import { deviceByName, type DeviceIdentity, devices } from "./identities.ts"
 
 const relayUrl = `ws://127.0.0.1:${import.meta.env.VITE_RELAY_PORT ?? "4176"}/relay`
 
-const deviceName = new URL(window.location.href).searchParams.get("device") ?? "alpha"
-const identity = deviceByName(deviceName)
-if (identity === undefined) {
-  // Playwright selects the device through the page URL, so this must fail during page bootstrap.
+const throwHarnessError = (message: string): never => {
+  // The page bridge and bootstrap are synchronous Playwright boundaries, so these failures must
+  // remain native throws rather than becoming rejected promises or Effect defects.
   // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError
-  throw new Error(`unknown device ${deviceName}`)
+  throw new Error(message)
 }
+
+const deviceName = new URL(window.location.href).searchParams.get("device") ?? "alpha"
+const identity = deviceByName(deviceName) ?? throwHarnessError(`unknown device ${deviceName}`)
 
 const remote = devices.find((device) => device.name !== identity.name)!
 
@@ -47,12 +49,9 @@ const deferred = <A,>() => {
   return {
     promise: Effect.runPromise(Deferred.await(cell)),
     resolve: (value: A) => {
-      // MessagePort delivery is a native callback boundary. Defer completion to preserve the
-      // native Promise microtask ordering expected by the database bridge.
-      // oxlint-disable-next-line effect/noGlobals
-      queueMicrotask(() => {
-        void Effect.runSync(Deferred.succeed(cell, value))
-      })
+      // MessagePort delivery is a native callback boundary. Completing the Deferred directly
+      // leaves only the Promise reaction microtask, matching the native resolver ordering.
+      void Effect.runSync(Deferred.succeed(cell, value))
     }
   }
 }
@@ -74,13 +73,15 @@ export const databaseBridge = (() => {
   }
   engine.port1.addEventListener("message", (event) => {
     requests.shift()?.resolve(event.data)
-    if (gate !== undefined) gate.requestObserved = true
+    const currentGate = gate
+    if (currentGate !== undefined) currentGate.requestObserved = true
     forward(database.port2, event)
   })
   database.port2.addEventListener("message", (event) => {
-    if (gate !== undefined && gate.requestObserved && gate.held === undefined) {
-      gate.held = event
-      gate.response.resolve()
+    const currentGate = gate
+    if (currentGate !== undefined && currentGate.requestObserved && currentGate.held === undefined) {
+      currentGate.held = event
+      currentGate.response.resolve()
       return
     }
     forward(engine.port1, event)
@@ -91,20 +92,13 @@ export const databaseBridge = (() => {
   return {
     port: engine.port2,
     arm: () => {
-      if (gate !== undefined) {
-        // Playwright calls this harness guard synchronously from page.evaluate.
-        // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError
-        throw new Error("a database response gate is already armed")
-      }
+      if (gate !== undefined) throwHarnessError("a database response gate is already armed")
       gate = { response: deferred(), requestObserved: false }
     },
     waitForResponse: () => {
-      if (gate === undefined) {
-        // Playwright calls this harness guard synchronously from page.evaluate.
-        // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError
-        throw new Error("no database response gate is armed")
-      }
-      return gate.response.promise
+      const currentGate = gate
+      if (currentGate === undefined) return throwHarnessError("no database response gate is armed")
+      return currentGate.response.promise
     },
     nextRequest: () => {
       const request = deferred<unknown>()
@@ -112,13 +106,11 @@ export const databaseBridge = (() => {
       return request.promise
     },
     release: () => {
-      if (gate?.held === undefined) {
-        // Playwright calls this harness guard synchronously from page.evaluate.
-        // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError
-        throw new Error("no database response is held")
-      }
-      forward(engine.port1, gate.held)
+      const currentGate = gate
+      if (currentGate?.held === undefined) return throwHarnessError("no database response is held")
+      forward(engine.port1, currentGate.held)
       gate = undefined
+      return undefined
     }
   }
 })()
