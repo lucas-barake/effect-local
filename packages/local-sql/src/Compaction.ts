@@ -1168,6 +1168,11 @@ export const layer: Layer.Layer<
         )
         const priorSnapshot = InternalAutomerge.save(stored.automerge)
         const priorCheckpointHash = yield* digest({ documentId, bytes: priorSnapshot })
+        // The heads the rebuilt document was actually derived from, captured here rather than
+        // re-read below. `recover` ran in its own transaction and released the connection, so a
+        // writer can advance the document before this one opens. Feeding the swap the re-read heads
+        // would make it match that advanced row and commit a document rebuilt from a stale value,
+        // silently discarding every write in between. These are what make the swap a real fence.
         const priorMaterializedHeads = encodeHeads(stored.materializedHeads)
         const priorAcceptedHeads = encodeHeads(stored.acceptedHeads)
         const preparedGuard = yield* findRewriteGuard(documentId)
@@ -1259,11 +1264,6 @@ export const layer: Layer.Layer<
         })
         const encodedHeads = encodeHeads(heads)
         const storedProvenance = Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(writerProvenance)
-        // The heads the rebuilt document was actually derived from, captured here rather than
-        // re-read below. `recover` ran in its own transaction and released the connection, so a
-        // writer can advance the document before this one opens. Feeding the swap the re-read heads
-        // would make it match that advanced row and commit a document rebuilt from a stale value,
-        // silently discarding every write in between. These are what make the swap a real fence.
         return yield* sql.withTransaction(Effect.gen(function*() {
           yield* gate.validate(permit)
           // Rechecked inside the transaction that performs the write, and before every guard and
