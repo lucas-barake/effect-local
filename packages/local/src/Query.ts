@@ -10,6 +10,14 @@ import type * as Projection from "./Projection.js"
 
 export type Handler<P, A, E, R,> = (payload: P) => Effect.Effect<A, E, R>
 
+function provideAll<A, E, R,>(
+  effect: Effect.Effect<A, E, R>,
+  context: Context.Context<Exclude<R, Scope.Scope>>
+): Effect.Effect<A, E>
+function provideAll(effect: Effect.Effect<any, any, any>, context: Context.Context<any>): any {
+  return Effect.provide(context)(effect)
+}
+
 let handlerId = 0
 
 export interface HandlerService<
@@ -62,7 +70,7 @@ export interface Any {
   readonly handler: Context.Service.Any
 }
 
-export const make = <
+export function make<
   const Name extends string,
   P extends SchemaInput.Input = typeof Schema.Void,
   A extends Document.WireSchema = typeof Schema.Void,
@@ -77,13 +85,33 @@ export const make = <
     readonly error?: E
     readonly dependsOn: Dependencies
   }
-): Query<Name, SchemaInput.Wire<P>, A, E, Dependencies> => {
-  if (name.length === 0) throw new TypeError("Query name must be nonempty")
+): Query<Name, SchemaInput.Wire<P>, A, E, Dependencies>
+export function make<
+  const Name extends string,
+  P extends SchemaInput.Input = typeof Schema.Void,
+  A extends Document.WireSchema = typeof Schema.Void,
+  E extends TaggedError.Schema = typeof Schema.Never,
+  const Dependencies extends ReadonlyArray<Projection.Any> = readonly [],
+>(
+  name: Name,
+  options: {
+    readonly payload?: SchemaInput.Valid<P>
+    readonly version?: number
+    readonly success?: A
+    readonly error?: E
+    readonly dependsOn: Dependencies
+  }
+): any {
+  if (name.length === 0) Effect.runSync(Effect.die(new TypeError("Query name must be nonempty")))
   const version = options.version ?? 1
-  if (!Number.isSafeInteger(version) || version < 1) throw new TypeError("Query version must be a positive integer")
+  if (!Number.isSafeInteger(version) || version < 1) {
+    Effect.runSync(Effect.die(new TypeError("Query version must be a positive integer")))
+  }
   const names = new Set<string>()
   for (const projection of options.dependsOn) {
-    if (names.has(projection.name)) throw new TypeError(`Duplicate query dependency: ${projection.name}`)
+    if (names.has(projection.name)) {
+      Effect.runSync(Effect.die(new TypeError(`Duplicate query dependency: ${projection.name}`)))
+    }
     names.add(projection.name)
   }
   const handler = Context.Service<
@@ -102,28 +130,26 @@ export const make = <
     Layer.effect(
       handler,
       Effect.gen(function*() {
-        const context = (yield* Effect.context<R | Scope.Scope>()).pipe(
-          Context.omit(Scope.Scope)
-        ) as Context.Context<R>
-        const implementation = Effect.isEffect(build) ? yield* build : build
-        return (payload: SchemaInput.Wire<P>["Type"]) =>
-          implementation(payload).pipe(
-            Effect.provide(context),
-            Effect.scoped
-          )
+        const context = (yield* Effect.context<R | Scope.Scope>()).pipe(Context.omit(Scope.Scope))
+        let implementation
+        if (Effect.isEffect(build)) implementation = yield* build
+        else implementation = build
+        return (payload: SchemaInput.Wire<P>["Type"]) => Effect.scoped(provideAll(implementation(payload), context))
       })
     )
   return {
     name,
     version,
-    payloadSchema: options.payload === undefined
-      ? Schema.Void as SchemaInput.Wire<P>
-      : SchemaInput.normalize(options.payload),
-    successSchema: (options.success ?? Schema.Void) as unknown as A,
-    errorSchema: (options.error ?? Schema.Never) as unknown as E,
-    dependsOn: Object.freeze([...options.dependsOn]) as unknown as Dependencies,
+    payloadSchema: (() => {
+      let payloadSchema: unknown = Schema.Void
+      if (options.payload !== undefined) payloadSchema = SchemaInput.normalize(options.payload)
+      return payloadSchema
+    })(),
+    successSchema: options.success ?? Schema.Void,
+    errorSchema: options.error ?? Schema.Never,
+    dependsOn: Object.freeze([...options.dependsOn]),
     handler,
-    of: (implementation) => implementation,
+    of: <R,>(implementation: Handler<SchemaInput.Wire<P>["Type"], A["Type"], E["Type"], R>) => implementation,
     toLayer
   }
 }

@@ -1,5 +1,6 @@
 import * as Automerge from "@automerge/automerge"
 import { assert, describe, it } from "@effect/vitest"
+import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import { createRequire } from "node:module"
 import * as Document from "../src/Document.js"
@@ -29,7 +30,7 @@ describe("Document", () => {
   })
 
   it("accepts Automerge scalar wrappers from another module instance", () => {
-    const OtherAutomerge = createRequire(import.meta.url)("@automerge/automerge") as typeof Automerge
+    const OtherAutomerge = createRequire(import.meta.url)("@automerge/automerge")
     const counter = new OtherAutomerge.Counter(1)
     const immutableString = new OtherAutomerge.ImmutableString("one")
 
@@ -66,28 +67,34 @@ describe("Document", () => {
         value: Number.MAX_VALUE,
         expected: false
       }
-    ] as const
+    ]
 
     for (const test of values) {
       const original = Automerge.from({ value: test.value })
       const loaded = Automerge.load<{ value: unknown }>(Automerge.save(original))
-      try {
-        assert.strictEqual(Document.isAutomergeValue(test.value), test.expected, test.name)
-        if (test.expected) {
-          assert.strictEqual(typeof loaded.value, "number", test.name)
-          assert.isTrue(Object.is(loaded.value, test.value), test.name)
-          assert.isTrue(Document.isAutomergeValue(loaded.value), test.name)
-        } else {
-          assert.isFalse(
-            typeof loaded.value === "number" && Object.is(loaded.value, test.value),
-            test.name
-          )
-          assert.isFalse(Document.isAutomergeValue(loaded.value), test.name)
-        }
-      } finally {
-        Automerge.free(original)
-        Automerge.free(loaded)
-      }
+      Effect.runSync(Effect.acquireUseRelease(
+        Effect.succeed({ original, loaded }),
+        ({ loaded: currentLoaded }) =>
+          Effect.sync(() => {
+            assert.strictEqual(Document.isAutomergeValue(test.value), test.expected, test.name)
+            if (test.expected) {
+              assert.strictEqual(typeof currentLoaded.value, "number", test.name)
+              assert.isTrue(Object.is(currentLoaded.value, test.value), test.name)
+              assert.isTrue(Document.isAutomergeValue(currentLoaded.value), test.name)
+            } else {
+              assert.isFalse(
+                typeof currentLoaded.value === "number" && Object.is(currentLoaded.value, test.value),
+                test.name
+              )
+              assert.isFalse(Document.isAutomergeValue(currentLoaded.value), test.name)
+            }
+          }),
+        ({ original: currentOriginal, loaded: currentLoaded }) =>
+          Effect.sync(() => {
+            Automerge.free(currentOriginal)
+            Automerge.free(currentLoaded)
+          })
+      ))
     }
 
     const counters = [
@@ -111,30 +118,36 @@ describe("Document", () => {
         value: Number.MIN_SAFE_INTEGER - 1,
         expected: false
       }
-    ] as const
+    ]
 
     for (const test of counters) {
       const counter = new Automerge.Counter(test.value)
       const original = Automerge.from({ counter })
       const loaded = Automerge.load<{ counter: Automerge.Counter }>(Automerge.save(original))
-      try {
-        assert.strictEqual(Document.isAutomergeValue(counter), test.expected, test.name)
-        if (test.expected) {
-          assert.strictEqual(typeof loaded.counter.value, "number", test.name)
-          assert.isTrue(Object.is(loaded.counter.value, test.value), test.name)
-          assert.isTrue(Document.isAutomergeValue(loaded.counter), test.name)
-        } else {
-          assert.isFalse(
-            typeof loaded.counter.value === "number" &&
-              Object.is(loaded.counter.value, test.value),
-            test.name
-          )
-          assert.isFalse(Document.isAutomergeValue(loaded.counter), test.name)
-        }
-      } finally {
-        Automerge.free(original)
-        Automerge.free(loaded)
-      }
+      Effect.runSync(Effect.acquireUseRelease(
+        Effect.succeed({ original, loaded }),
+        ({ loaded: currentLoaded }) =>
+          Effect.sync(() => {
+            assert.strictEqual(Document.isAutomergeValue(counter), test.expected, test.name)
+            if (test.expected) {
+              assert.strictEqual(typeof currentLoaded.counter.value, "number", test.name)
+              assert.isTrue(Object.is(currentLoaded.counter.value, test.value), test.name)
+              assert.isTrue(Document.isAutomergeValue(currentLoaded.counter), test.name)
+            } else {
+              assert.isFalse(
+                typeof currentLoaded.counter.value === "number" &&
+                  Object.is(currentLoaded.counter.value, test.value),
+                test.name
+              )
+              assert.isFalse(Document.isAutomergeValue(currentLoaded.counter), test.name)
+            }
+          }),
+        ({ original: currentOriginal, loaded: currentLoaded }) =>
+          Effect.sync(() => {
+            Automerge.free(currentOriginal)
+            Automerge.free(currentLoaded)
+          })
+      ))
     }
 
     assert.isFalse(Document.isAutomergeValue(Number.POSITIVE_INFINITY))

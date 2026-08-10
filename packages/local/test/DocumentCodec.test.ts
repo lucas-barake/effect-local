@@ -1,5 +1,6 @@
 import * as Automerge from "@automerge/automerge"
 import { assert, describe, it } from "@effect/vitest"
+import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as Document from "../src/Document.js"
@@ -30,20 +31,24 @@ describe("Document codec", () => {
 
   it.effect("maps encode failures to a tagged DocumentEncodeError carrying the id", () =>
     Effect.gen(function*() {
-      const error = yield* Document.encode(Task, documentId, { title: 1, done: false } as never).pipe(Effect.flip)
+      const error = yield* Document.encode.call(undefined, Task, documentId, { title: 1, done: false }).pipe(
+        Effect.flip
+      )
       assert.strictEqual(error.reason._tag, "DocumentEncodeError")
       if (error.reason._tag !== "DocumentEncodeError") return
       assert.strictEqual(error.reason.documentId, documentId)
     }))
 
   it("classifies the remaining Automerge value branches", () => {
-    assert.isTrue(Document.isAutomergeValue(new Date()))
+    assert.isTrue(Document.isAutomergeValue(DateTime.toDate(DateTime.nowUnsafe())))
     assert.isTrue(Document.isAutomergeValue(new Uint8Array([1, 2])))
     assert.isTrue(Document.isAutomergeValue(new Automerge.Counter(1)))
     assert.isTrue(Document.isAutomergeValue({ a: { b: [1, "x", true, null] } }))
     assert.isFalse(Document.isAutomergeValue({ v: Number.NaN }))
     assert.isFalse(Document.isAutomergeValue({ v: 1n }))
-    assert.isFalse(Document.isAutomergeValue(new Date(Number.NaN)))
+    const invalidDate = DateTime.toDate(DateTime.makeUnsafe(0))
+    invalidDate.setTime(Number.NaN)
+    assert.isFalse(Document.isAutomergeValue(invalidDate))
     assert.isFalse(Document.isAutomergeValue(new Automerge.Counter(1.5)))
     assert.isFalse(Document.isAutomergeValue(
       new (class Point {

@@ -21,7 +21,7 @@ describe("wire contracts", () => {
 
   it("round trips a Backup header and pins the format version", () => {
     const header = {
-      formatVersion: 1 as const,
+      formatVersion: 1,
       definitionHash: "def_x",
       replicaId: Identity.ReplicaId.make("rep_00000000-0000-4000-8000-000000000001"),
       incarnation: Identity.ReplicaIncarnation.make(0),

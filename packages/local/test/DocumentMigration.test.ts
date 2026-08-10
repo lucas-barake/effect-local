@@ -72,7 +72,7 @@ describe("Document migrations", () => {
             from: 1,
             schema: V1,
             migrate: () => {
-              throw new Error("boom")
+              return Effect.runSync(Effect.die(new Error("boom")))
             }
           })
         ]

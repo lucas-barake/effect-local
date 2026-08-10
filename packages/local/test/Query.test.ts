@@ -47,7 +47,7 @@ describe("Query", () => {
     dependsOn.push(OtherProjection)
     assert.strictEqual(query.dependsOn.length, 1)
     assert.deepStrictEqual(query.dependsOn, [TaskRows])
-    assert.throws(() => (query.dependsOn as Array<Projection.Any>).push(OtherProjection))
+    assert.throws(() => Array.prototype.push.call(query.dependsOn, OtherProjection))
   })
 
   it.effect("provides its effectful handler", () =>

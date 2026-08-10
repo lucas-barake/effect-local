@@ -8,7 +8,7 @@ import * as Document from "../src/Document.js"
 import * as Identity from "../src/Identity.js"
 import * as Transient from "../src/Transient.js"
 
-it.layer(NodeCrypto.layer)("Transient", (it) => {
+it.layer(NodeCrypto.layer)("Transient", (layered) => {
   class Typing extends Schema.TaggedClass<Typing>()("Typing", { userId: Schema.String }) {}
   class ReadPosition extends Schema.TaggedClass<ReadPosition>()("ReadPosition", { messageId: Schema.String }) {}
   const Chat = Document.make("Chat", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
@@ -17,7 +17,7 @@ it.layer(NodeCrypto.layer)("Transient", (it) => {
     payload: Schema.Union([Typing, ReadPosition])
   })
 
-  it.effect("encodes, routes, and decodes a tagged payload", () =>
+  layered.effect("encodes, routes, and decodes a tagged payload", () =>
     Effect.gen(function*() {
       const peerId = yield* Identity.makePeerId
       const documentId = yield* Identity.makeDocumentId
@@ -30,20 +30,20 @@ it.layer(NodeCrypto.layer)("Transient", (it) => {
       }).pipe(
         Effect.provide(Transient.layer([ChatTransient])),
         Effect.provideService(Transient.Transport, {
-          send: (peerId, documentId, payload) =>
-            Effect.asVoid(Queue.offer(deliveries, { peerId, documentId, payload })),
+          send: (innerPeerId, innerDocumentId, payload) =>
+            Effect.asVoid(Queue.offer(deliveries, { peerId: innerPeerId, documentId: innerDocumentId, payload })),
           messages: Stream.fromQueue(deliveries)
         })
       )
       assert.deepStrictEqual(received, [{ peerId, payload: new Typing({ userId: "lucas" }) }])
     }))
 
-  it("rejects invalid contract names", () => {
+  layered("rejects invalid contract names", () => {
     assert.throws(() => Transient.make("", { document: Chat, payload: Typing }))
     assert.throws(() => Transient.make("$reserved", { document: Chat, payload: Typing }))
   })
 
-  it.effect("fails malformed wire values with a typed decode error", () =>
+  layered.effect("fails malformed wire values with a typed decode error", () =>
     Effect.gen(function*() {
       const peerId = yield* Identity.makePeerId
       const documentId = yield* Identity.makeDocumentId

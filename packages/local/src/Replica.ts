@@ -32,8 +32,8 @@ export class Replica extends Context.Service<Replica, {
     Conflict.Inspection<D["schema"]["Type"]>,
     Conflict.InspectionError | ReplicaError.ReplicaError
   >
-  readonly resolveConflict: <D extends Document.Any,>(
-    document: D,
+  readonly resolveConflict: (
+    document: Document.Any,
     options: {
       readonly commandId: Identity.CommandId
       readonly documentId: Identity.DocumentId
@@ -50,8 +50,8 @@ export class Replica extends Context.Service<Replica, {
     M["successSchema"]["Type"],
     M["errorSchema"]["Type"] | ReplicaError.ReplicaError
   >
-  readonly delete: <D extends Document.Any,>(
-    document: D,
+  readonly delete: (
+    document: Document.Any,
     options: {
       readonly commandId: Identity.CommandId
       readonly documentId: Identity.DocumentId
@@ -69,16 +69,16 @@ export class Replica extends Context.Service<Replica, {
     CommandOutcome.CommandOutcome<M["successSchema"]["Type"], M["errorSchema"]["Type"]>,
     ReplicaError.ReplicaError
   >
-  readonly lookupCreate: <D extends Document.Any,>(
-    document: D,
+  readonly lookupCreate: (
+    document: Document.Any,
     commandId: Identity.CommandId
   ) => Effect.Effect<CommandOutcome.CommandOutcome<Identity.DocumentId>, ReplicaError.ReplicaError>
-  readonly lookupDelete: <D extends Document.Any,>(
-    document: D,
+  readonly lookupDelete: (
+    document: Document.Any,
     commandId: Identity.CommandId
   ) => Effect.Effect<CommandOutcome.CommandOutcome<void>, ReplicaError.ReplicaError>
-  readonly lookupConflictResolution: <D extends Document.Any,>(
-    document: D,
+  readonly lookupConflictResolution: (
+    document: Document.Any,
     options: {
       readonly commandId: Identity.CommandId
       readonly documentId: Identity.DocumentId
@@ -100,8 +100,8 @@ export class Replica extends Context.Service<Replica, {
   readonly restoreBackup: <R,>(
     options: Backup.RestoreOptions<R>
   ) => Effect.Effect<void, ReplicaError.ReplicaError, R>
-  readonly installBackupDocument: <D extends Document.Any, R,>(
-    document: D,
+  readonly installBackupDocument: <R,>(
+    document: Document.Any,
     options: Backup.InstallDocumentOptions<R>
   ) => Effect.Effect<void, ReplicaError.ReplicaError, R>
   readonly exportDocument: <D extends Document.Any,>(

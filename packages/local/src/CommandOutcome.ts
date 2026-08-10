@@ -77,24 +77,29 @@ export const match = <A, E, B,>(
  * third command result: it becomes `OutcomeUnknown` so the peer can resolve it with its own lookup.
  * Its `cause` does not survive, because it describes this side's ambiguity and not the peer's.
  */
-export const toOutcome = <A, E, R,>(
+export function toOutcome<A, E, R,>(
   commandId: Identity.CommandId,
   effect: Effect.Effect<A, E, R>
 ): Effect.Effect<
   CommandOutcome<A, Exclude<E, ReplicaError.ReplicaError>>,
   ReplicaError.ReplicaError,
   R
-> => {
-  type Declared = Exclude<E, ReplicaError.ReplicaError>
+>
+export function toOutcome<A, E, R,>(
+  commandId: Identity.CommandId,
+  effect: Effect.Effect<A, E, R>
+): Effect.Effect<CommandOutcome<A, E>, ReplicaError.ReplicaError, R> {
   return effect.pipe(
-    Effect.map((value): CommandOutcome<A, Declared> => durablyCommitted(commandId, value)),
-    Effect.catch((error): Effect.Effect<CommandOutcome<A, Declared>, ReplicaError.ReplicaError> =>
-      ReplicaError.isReplicaError(error)
-        ? error.reason._tag === "CommandOutcomeUnknown"
-          ? Effect.succeed(unknown(error.reason.commandId))
-          : Effect.fail(error)
-        : Effect.succeed(rejected(commandId, error as Declared))
-    )
+    Effect.map((value): CommandOutcome<A, E> => durablyCommitted(commandId, value)),
+    Effect.catch((error): Effect.Effect<CommandOutcome<A, E>, ReplicaError.ReplicaError> => {
+      if (ReplicaError.isReplicaError(error)) {
+        if (error.reason._tag === "CommandOutcomeUnknown") {
+          return Effect.succeed(unknown(error.reason.commandId))
+        }
+        return Effect.fail(error)
+      }
+      return Effect.succeed(rejected(commandId, error))
+    })
   )
 }
 

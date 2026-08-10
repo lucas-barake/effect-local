@@ -77,9 +77,13 @@ export const make = <
     readonly payload: SchemaInput.Valid<P>
   }
 ): Topic<Name, D, SchemaInput.Wire<P>> => {
-  if (name.length === 0) throw new TypeError("Transient name must be nonempty")
+  if (name.length === 0) Effect.runSync(Effect.die(new TypeError("Transient name must be nonempty")))
   if (name.startsWith("$")) {
-    throw new TypeError(`Transient name must not start with "$", it is reserved for protocol sentinels: ${name}`)
+    Effect.runSync(
+      Effect.die(
+        new TypeError(`Transient name must not start with "$", it is reserved for protocol sentinels: ${name}`)
+      )
+    )
   }
   const topic: Topic<Name, D, SchemaInput.Wire<P>> = {
     [TypeId]: TypeId,
@@ -108,7 +112,9 @@ export const layer = (topics: ReadonlyArray<Any>): Layer.Layer<Transient, never,
       const registered = new Set(topics)
       return Transient.of({
         client: <A,>(topic: Any, documentId: Identity.DocumentId): Client<A> => {
-          if (!registered.has(topic)) throw new TypeError(`Transient is not registered: ${topic.name}`)
+          if (!registered.has(topic)) {
+            Effect.runSync(Effect.die(new TypeError(`Transient is not registered: ${topic.name}`)))
+          }
           const payloadCodec = Schema.toCodecJson(topic.payloadSchema)
           return {
             publish: (peerId, payload) =>
@@ -127,13 +133,14 @@ export const layer = (topics: ReadonlyArray<Any>): Layer.Layer<Transient, never,
               Stream.filter((message) => message.documentId === documentId),
               Stream.mapEffect((message) =>
                 Schema.decodeUnknownEffect(EnvelopeJson)(decoder.decode(message.payload)).pipe(
-                  Effect.flatMap((envelope) =>
-                    envelope.topic === topic.name
-                      ? Schema.decodeUnknownEffect(payloadCodec)(envelope.payload).pipe(
-                        Effect.map((decoded) => ({ peerId: message.peerId, payload: decoded as A }))
+                  Effect.flatMap((envelope) => {
+                    if (envelope.topic === topic.name) {
+                      return Schema.decodeUnknownEffect(payloadCodec)(envelope.payload).pipe(
+                        Effect.map((decoded) => ({ peerId: message.peerId, payload: decoded }))
                       )
-                      : Effect.succeed(undefined)
-                  ),
+                    }
+                    return Effect.succeed(undefined)
+                  }),
                   Effect.mapError((cause) =>
                     new ReplicaError.ReplicaError({
                       reason: new ReplicaError.TransientDecodeError({ topic: topic.name, documentId, cause })

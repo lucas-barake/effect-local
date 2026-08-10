@@ -16,7 +16,7 @@ import {
 import type { CommandOutcome, Conflict, Replica } from "../src/index.js"
 import type * as ReplicaError from "../src/ReplicaError.js"
 
-type Equal<A, B,> = (<T,>() => T extends A ? 1 : 2) extends <T,>() => T extends B ? 1 : 2 ? true : false
+type Equal<A, B,> = [A] extends [B] ? ([B] extends [A] ? true : false) : false
 
 type ExpectedInspectionError =
   | Conflict.UnsupportedConflictValue

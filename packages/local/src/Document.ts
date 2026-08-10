@@ -4,11 +4,11 @@ import * as Schema from "effect/Schema"
 import type * as Identity from "./Identity.js"
 import * as ReplicaError from "./ReplicaError.js"
 
-export type WireSchema = Schema.Codec<unknown, unknown, never, never>
+export type WireSchema = Schema.Codec<unknown, unknown>
 export type AutomergeEncoded = Automerge.ScalarValue | {
   readonly [key: string]: AutomergeEncoded
 } | ReadonlyArray<AutomergeEncoded>
-export type DocumentSchema = Schema.Codec<unknown, AutomergeEncoded, never, never>
+export type DocumentSchema = Schema.Codec<unknown, AutomergeEncoded>
 
 export interface Migration<S extends DocumentSchema, out Out = unknown,> {
   readonly from: number
@@ -37,7 +37,7 @@ export const migration = <S extends DocumentSchema, Out = unknown,>(options: {
   readonly migrate: (value: S["Type"]) => Out
 }): Migration<S, Out> => {
   if (!Number.isSafeInteger(options.from) || options.from < 1) {
-    throw new TypeError("Migration source version must be a positive integer")
+    Effect.runSync(Effect.die(new TypeError("Migration source version must be a positive integer")))
   }
   return { from: options.from, schema: options.schema, migrate: options.migrate }
 }
@@ -50,24 +50,28 @@ export const make = <const Name extends string, S extends DocumentSchema,>(
     readonly migrations?: ReadonlyArray<AnyMigration>
   }
 ): Document<Name, S> => {
-  if (name.length === 0) throw new TypeError("Document name must be nonempty")
+  if (name.length === 0) Effect.runSync(Effect.die(new TypeError("Document name must be nonempty")))
   if (!Number.isSafeInteger(options.version) || options.version < 1) {
-    throw new TypeError("Document version must be a positive integer")
+    Effect.runSync(Effect.die(new TypeError("Document version must be a positive integer")))
   }
   const migrations = options.migrations ?? []
   const sources = new Set<number>()
   for (const step of migrations) {
     if (step.from >= options.version) {
-      throw new TypeError(`Migration source version must be below the document version: ${step.from}`)
+      Effect.runSync(
+        Effect.die(new TypeError(`Migration source version must be below the document version: ${step.from}`))
+      )
     }
-    if (sources.has(step.from)) throw new TypeError(`Duplicate migration source version: ${step.from}`)
+    if (sources.has(step.from)) {
+      Effect.runSync(Effect.die(new TypeError(`Duplicate migration source version: ${step.from}`)))
+    }
     sources.add(step.from)
   }
   if (migrations.length > 0) {
     const oldest = Math.min(...sources)
     for (let version = oldest; version < options.version; version++) {
       if (!sources.has(version)) {
-        throw new TypeError(`Migration chain has a gap at version ${version}`)
+        Effect.runSync(Effect.die(new TypeError(`Migration chain has a gap at version ${version}`)))
       }
     }
   }
@@ -182,17 +186,17 @@ export const decodeStored = <Name extends string, S extends DocumentSchema,>(
   }
   if (steps.length === 0) return unsupportedVersion()
   return Effect.gen(function*() {
-    let value: unknown = yield* Schema.decodeUnknownEffect(steps[0]!.schema)(input).pipe(
+    let value: unknown = yield* Schema.decodeUnknownEffect(steps[0].schema)(input).pipe(
       Effect.mapError((cause) => decodeFailure(documentId, cause))
     )
     for (let index = 0; index < steps.length; index++) {
-      const step = steps[index]!
+      const step = steps[index]
       value = yield* Effect.try({
         try: () => step.migrate(value),
         catch: (cause) => decodeFailure(documentId, cause)
       })
       if (index + 1 < steps.length) {
-        value = yield* Schema.decodeUnknownEffect(Schema.toType(steps[index + 1]!.schema))(value).pipe(
+        value = yield* Schema.decodeUnknownEffect(Schema.toType(steps[index + 1].schema))(value).pipe(
           Effect.mapError((cause) => decodeFailure(documentId, cause))
         )
       }

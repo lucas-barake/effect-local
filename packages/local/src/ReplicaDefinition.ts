@@ -1,3 +1,4 @@
+import * as Effect from "effect/Effect"
 import * as Canonical from "./Canonical.js"
 import type * as Document from "./Document.js"
 import type * as DocumentSet from "./DocumentSet.js"
@@ -59,7 +60,9 @@ export const invalidationKeys = (definition: Any): ReadonlyArray<string> =>
 const assertUnique = (kind: string, values: ReadonlyArray<{ readonly name: string }>): void => {
   const names = new Set<string>()
   for (const value of values) {
-    if (names.has(value.name)) throw new TypeError(`Duplicate ${kind} name: ${value.name}`)
+    if (names.has(value.name)) {
+      Effect.runSync(Effect.die(new TypeError(`Duplicate ${kind} name: ${value.name}`)))
+    }
     names.add(value.name)
   }
 }
@@ -71,12 +74,12 @@ const assertKnownDocuments = (
 ): void => {
   for (const value of values) {
     if (!documents.has(value.document)) {
-      throw new TypeError(`${kind} references an unknown document: ${value.name}`)
+      Effect.runSync(Effect.die(new TypeError(`${kind} references an unknown document: ${value.name}`)))
     }
   }
 }
 
-export const make = <
+export function make<
   const Name extends string,
   const Documents extends ReadonlyArray<Document.Any>,
   const Mutations extends ReadonlyArray<Mutation.Any> = readonly [],
@@ -90,14 +93,29 @@ export const make = <
   readonly projections?: Projections
   readonly queries?: Queries
   readonly transients?: Transients
-}): ReplicaDefinition<Name, Documents, Mutations, Projections, Queries, Transients> => {
-  if (options.name.length === 0) throw new TypeError("Replica definition name must be nonempty")
-  const mutations = Object.freeze([...(options.mutations ?? [])]) as unknown as Mutations
-  const projections = Object.freeze([...(options.projections ?? [])]) as unknown as Projections
-  const queries = Object.freeze([...(options.queries ?? [])]) as unknown as Queries
-  const transients = Object.freeze([...(options.transients ?? [])]) as unknown as Transients
-  const documentSet: DocumentSet.DocumentSet<Documents> = {
-    documents: Object.freeze([...options.documents.documents]) as unknown as Documents,
+}): ReplicaDefinition<Name, Documents, Mutations, Projections, Queries, Transients>
+export function make<
+  const Name extends string,
+  const Documents extends ReadonlyArray<Document.Any>,
+  const Mutations extends ReadonlyArray<Mutation.Any> = readonly [],
+  const Projections extends ReadonlyArray<Projection.Any> = readonly [],
+  const Queries extends ReadonlyArray<Query.Any> = readonly [],
+  const Transients extends ReadonlyArray<Transient.Any> = readonly [],
+>(options: {
+  readonly name: Name
+  readonly documents: DocumentSet.DocumentSet<Documents>
+  readonly mutations?: Mutations
+  readonly projections?: Projections
+  readonly queries?: Queries
+  readonly transients?: Transients
+}): any {
+  if (options.name.length === 0) Effect.runSync(Effect.die(new TypeError("Replica definition name must be nonempty")))
+  const mutations = Object.freeze([...(options.mutations ?? [])])
+  const projections = Object.freeze([...(options.projections ?? [])])
+  const queries = Object.freeze([...(options.queries ?? [])])
+  const transients = Object.freeze([...(options.transients ?? [])])
+  const documentSet = {
+    documents: Object.freeze([...options.documents.documents]),
     byName: new Map(options.documents.byName)
   }
   assertUnique("mutation", mutations)
@@ -105,17 +123,25 @@ export const make = <
   assertUnique("query", queries)
   assertUnique("transient", transients)
   const documents = new Set(documentSet.documents)
-  const registeredProjections = new Set(projections)
+  const registeredProjections: Set<Projection.Any> = new Set(projections)
   assertKnownDocuments("Mutation", mutations, documents)
   assertKnownDocuments("Projection", projections, documents)
   for (const query of queries) {
     for (const dependency of query.dependsOn) {
       if (!registeredProjections.has(dependency)) {
-        throw new TypeError(`Query references an unknown projection: ${query.name}`)
+        Effect.runSync(Effect.die(new TypeError(`Query references an unknown projection: ${query.name}`)))
       }
     }
   }
   assertKnownDocuments("Transient", transients, documents)
+  const transientHash: { transients?: ReadonlyArray<unknown> } = {}
+  if (transients.length > 0) {
+    transientHash.transients = transients.map((transient) => ({
+      document: transient.document.name,
+      name: transient.name,
+      payload: SchemaDescriptor.make(transient.payloadSchema)
+    }))
+  }
   const definitionHash = `def_${
     Canonical.hash({
       name: options.name,
@@ -146,15 +172,7 @@ export const make = <
         success: SchemaDescriptor.make(query.successSchema),
         version: query.version
       })),
-      ...(transients.length === 0
-        ? {}
-        : {
-          transients: transients.map((transient) => ({
-            document: transient.document.name,
-            name: transient.name,
-            payload: SchemaDescriptor.make(transient.payloadSchema)
-          }))
-        })
+      ...transientHash
     })
   }`
   return { ...options, documents: documentSet, mutations, projections, queries, transients, hash: definitionHash }

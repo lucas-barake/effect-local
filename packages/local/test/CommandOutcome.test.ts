@@ -1,5 +1,6 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { assert, it } from "@effect/vitest"
+import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Schema from "effect/Schema"
@@ -7,26 +8,29 @@ import * as CommandOutcome from "../src/CommandOutcome.js"
 import * as Identity from "../src/Identity.js"
 import * as ReplicaError from "../src/ReplicaError.js"
 
+const defect = (message: string): unknown =>
+  Cause.squash(Effect.runSync(Effect.exit(Effect.die(new Error(message)))).cause)
+
 class Rejected extends Schema.TaggedErrorClass<Rejected>("@test/CommandOutcome/Rejected")("Rejected", {
   message: Schema.String
 }) {}
 
-it.layer(NodeCrypto.layer)("CommandOutcome", (it) => {
-  it.effect("extracts committed values", () =>
+it.layer(NodeCrypto.layer)("CommandOutcome", (layered) => {
+  layered.effect("extracts committed values", () =>
     Effect.gen(function*() {
       const commandId = yield* Identity.makeCommandId
       const value = yield* CommandOutcome.committedOrFail(CommandOutcome.durablyCommitted(commandId, 42))
       assert.strictEqual(value, 42)
     }))
 
-  it.effect("fails with the domain rejection or a tagged ambiguity error", () =>
+  layered.effect("fails with the domain rejection or a tagged ambiguity error", () =>
     Effect.gen(function*() {
       const commandId = yield* Identity.makeCommandId
       const error = new Rejected({ message: "no" })
       const rejected = yield* CommandOutcome.committedOrFail(CommandOutcome.rejected(commandId, error)).pipe(
         Effect.exit
       )
-      const cause = new Error("the owner never answered")
+      const cause = defect("the owner never answered")
       const unknown = yield* CommandOutcome.committedOrFail(CommandOutcome.unknown(commandId), cause).pipe(
         Effect.exit
       )
@@ -41,7 +45,7 @@ it.layer(NodeCrypto.layer)("CommandOutcome", (it) => {
       )
     }))
 
-  it.effect("carries an outcome back out to a boundary that has to transmit one", () =>
+  layered.effect("carries an outcome back out to a boundary that has to transmit one", () =>
     Effect.gen(function*() {
       const commandId = yield* Identity.makeCommandId
       const error = new Rejected({ message: "no" })
@@ -60,19 +64,24 @@ it.layer(NodeCrypto.layer)("CommandOutcome", (it) => {
       assert.deepStrictEqual(
         yield* toOutcome(Effect.fail(
           new ReplicaError.ReplicaError({
-            reason: new ReplicaError.CommandOutcomeUnknown({ commandId, cause: new Error("lost") })
+            reason: new ReplicaError.CommandOutcomeUnknown({
+              commandId,
+              cause: defect("lost")
+            })
           })
         )),
         CommandOutcome.unknown(commandId)
       )
       // Any other replica failure is not a command result and stays in the error channel.
       const storage = new ReplicaError.ReplicaError({
-        reason: new ReplicaError.StorageUnavailable({ cause: new Error("disk") })
+        reason: new ReplicaError.StorageUnavailable({
+          cause: defect("disk")
+        })
       })
       assert.deepStrictEqual(yield* toOutcome(Effect.fail(storage)).pipe(Effect.exit), Exit.fail(storage))
     }))
 
-  it("round trips every durable outcome through its generated schema", () => {
+  layered("round trips every durable outcome through its generated schema", () => {
     const commandId = Identity.CommandId.make("cmd_00000000-0000-4000-8000-000000000001")
     const Outcome = CommandOutcome.schema(Schema.Number, Rejected)
     const values = [

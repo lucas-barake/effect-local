@@ -9,5 +9,10 @@ export type Valid<S extends Input,> = Normalized<S> extends Document.WireSchema 
 
 export type Wire<S extends Input,> = Extract<Normalized<S>, Document.WireSchema>
 
-export const normalize = <S extends Input,>(input: Valid<S>): Wire<S> =>
-  (Schema.isSchema(input) ? input : Schema.Struct(input)) as Wire<S>
+export function normalize<S extends Document.WireSchema,>(input: S): S
+export function normalize<S extends Schema.Struct.Fields,>(input: S): Schema.Struct<S>
+export function normalize<S extends Input,>(input: Valid<S>): Wire<S>
+export function normalize(input: Input): Schema.Constraint {
+  if (Schema.isSchema(input)) return input
+  return Schema.Struct(input)
+}

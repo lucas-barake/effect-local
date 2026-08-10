@@ -1,8 +1,12 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
+import * as Schema from "effect/Schema"
 import * as vm from "node:vm"
 import * as Canonical from "../src/Canonical.js"
+
+const JsonString = Schema.fromJsonString(Schema.Unknown)
 
 describe("Canonical", () => {
   it("orders object keys independently of declaration order", () => {
@@ -29,7 +33,9 @@ describe("Canonical", () => {
 
   it.effect("fails digest with a tagged CanonicalEncodeError instead of an unhandled defect for an invalid Date", () =>
     Effect.gen(function*() {
-      const error = yield* Canonical.digest(new Date(Number.NaN)).pipe(Effect.flip)
+      const invalidDate = DateTime.toDate(DateTime.makeUnsafe(0))
+      invalidDate.setTime(Number.NaN)
+      const error = yield* Canonical.digest(invalidDate).pipe(Effect.flip)
       assert.strictEqual(error.reason._tag, "CanonicalEncodeError")
     }).pipe(Effect.provide(NodeCrypto.layer)))
 })
@@ -41,7 +47,7 @@ describe("Canonical injectivity", () => {
   })
 
   it("distinguishes Date from a plain object of its encoded shape", () => {
-    const date = new Date("2020-01-02T03:04:05.006Z")
+    const date = DateTime.toDate(DateTime.makeUnsafe("2020-01-02T03:04:05.006Z"))
     assert.notStrictEqual(
       Canonical.hash(date),
       Canonical.hash({ _tag: "Date", value: date.toISOString() })
@@ -56,16 +62,20 @@ describe("Canonical injectivity", () => {
   })
 
   it("does not let re-encoding a value's own output forge its identity", () => {
-    const values = [10n, new Date("2020-01-02T03:04:05.006Z"), new Uint8Array([0, 1, 255])]
+    const values = [
+      10n,
+      DateTime.toDate(DateTime.makeUnsafe("2020-01-02T03:04:05.006Z")),
+      new Uint8Array([0, 1, 255])
+    ]
     for (const value of values) {
-      const forged: unknown = JSON.parse(Canonical.stringify(value))
+      const forged: unknown = Schema.decodeUnknownSync(JsonString)(Canonical.stringify(value))
       assert.notStrictEqual(Canonical.hash(forged), Canonical.hash(value))
     }
   })
 
   it("normalizes a cross-realm Date identically to a native Date", () => {
     const foreign: unknown = vm.runInNewContext(`new Date("2020-01-02T03:04:05.006Z")`)
-    const native = new Date("2020-01-02T03:04:05.006Z")
+    const native = DateTime.toDate(DateTime.makeUnsafe("2020-01-02T03:04:05.006Z"))
     assert.strictEqual(Canonical.hash(foreign), Canonical.hash(native))
     assert.notStrictEqual(Canonical.hash(foreign), Canonical.hash({}))
   })

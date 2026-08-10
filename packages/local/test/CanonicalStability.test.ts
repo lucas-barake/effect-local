@@ -1,4 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
+import * as DateTime from "effect/DateTime"
 import * as Canonical from "../src/Canonical.js"
 
 describe("Canonical stability", () => {
@@ -16,7 +17,7 @@ describe("Canonical stability", () => {
 
   it("encodes Date as a sentinel-prefixed ISO string", () => {
     assert.strictEqual(
-      Canonical.stringify({ at: new Date("2020-01-02T03:04:05.006Z") }),
+      Canonical.stringify({ at: DateTime.toDate(DateTime.makeUnsafe("2020-01-02T03:04:05.006Z")) }),
       "{\"at\":\"\\u001ddate:2020-01-02T03:04:05.006Z\"}"
     )
   })

@@ -82,7 +82,7 @@ export interface Any {
   readonly handler: Context.Service.Any
 }
 
-export const make = <
+export function make<
   const Name extends string,
   D extends Document.Any,
   P extends SchemaInput.Input = typeof Schema.Void,
@@ -97,13 +97,35 @@ export const make = <
     readonly success?: A
     readonly error?: E
   }
-): Mutation<Name, D, SchemaInput.Wire<P>, A, E> => {
-  if (name.length === 0) throw new TypeError("Mutation name must be nonempty")
+): Mutation<Name, D, SchemaInput.Wire<P>, A, E>
+export function make<
+  const Name extends string,
+  D extends Document.Any,
+  P extends SchemaInput.Input = typeof Schema.Void,
+  A extends Document.WireSchema = typeof Schema.Void,
+  E extends TaggedError.Schema = typeof Schema.Never,
+>(
+  name: Name,
+  options: {
+    readonly document: D
+    readonly version?: number
+    readonly payload?: SchemaInput.Valid<P>
+    readonly success?: A
+    readonly error?: E
+  }
+): any {
+  if (name.length === 0) Effect.runSync(Effect.die(new TypeError("Mutation name must be nonempty")))
   if (name.startsWith("$")) {
-    throw new TypeError(`Mutation name must not start with "$", it is reserved for operation sentinels: ${name}`)
+    Effect.runSync(
+      Effect.die(
+        new TypeError(`Mutation name must not start with "$", it is reserved for operation sentinels: ${name}`)
+      )
+    )
   }
   const version = options.version ?? 1
-  if (!Number.isSafeInteger(version) || version < 1) throw new TypeError("Mutation version must be a positive integer")
+  if (!Number.isSafeInteger(version) || version < 1) {
+    Effect.runSync(Effect.die(new TypeError("Mutation version must be a positive integer")))
+  }
   const handler = Context.Service<
     HandlerService<Name, D, SchemaInput.Wire<P>, A, E>,
     Handler<D, SchemaInput.Wire<P>["Type"], A["Type"], E["Type"]>
@@ -112,13 +134,22 @@ export const make = <
     name,
     version,
     document: options.document,
-    payloadSchema: options.payload === undefined
-      ? Schema.Void as SchemaInput.Wire<P>
-      : SchemaInput.normalize(options.payload),
-    successSchema: (options.success ?? Schema.Void) as unknown as A,
-    errorSchema: (options.error ?? Schema.Never) as unknown as E,
+    payloadSchema: (() => {
+      let payloadSchema: unknown = Schema.Void
+      if (options.payload !== undefined) payloadSchema = SchemaInput.normalize(options.payload)
+      return payloadSchema
+    })(),
+    successSchema: options.success ?? Schema.Void,
+    errorSchema: options.error ?? Schema.Never,
     handler,
     of: handler.of,
-    toLayer: (build) => Layer.effect(handler, Effect.isEffect(build) ? build : Effect.succeed(build))
+    toLayer: (
+      build:
+        | Handler<D, SchemaInput.Wire<P>["Type"], A["Type"], E["Type"]>
+        | Effect.Effect<Handler<D, SchemaInput.Wire<P>["Type"], A["Type"], E["Type"]>, unknown, unknown>
+    ) => {
+      if (Effect.isEffect(build)) return Layer.effect(handler, build)
+      return Layer.effect(handler, Effect.succeed(build))
+    }
   }
 }

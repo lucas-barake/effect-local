@@ -154,14 +154,21 @@ describe("ReplicaDefinition", () => {
       readonly mutation?: Mutation.Any
       readonly projection?: Projection.Any
       readonly query?: Query.Any
-    }) =>
-      ReplicaDefinition.make({
+    }) => {
+      let mutations: ReadonlyArray<Mutation.Any> = []
+      let projections: ReadonlyArray<Projection.Any> = []
+      let queries: ReadonlyArray<Query.Any> = []
+      if (options.mutation !== undefined) mutations = [options.mutation]
+      if (options.projection !== undefined) projections = [options.projection]
+      if (options.query !== undefined) queries = [options.query]
+      return ReplicaDefinition.make({
         name: "tasks",
         documents: DocumentSet.make(Task),
-        mutations: options.mutation === undefined ? [] : [options.mutation],
-        projections: options.projection === undefined ? [] : [options.projection],
-        queries: options.query === undefined ? [] : [options.query]
+        mutations,
+        projections,
+        queries
       }).hash
+    }
     const mutationSuccess = (success: Document.WireSchema) =>
       make({ mutation: Mutation.make("Change", { document: Task, success }) })
     const mutationError = (error: typeof StringFailure | typeof NumberFailure) =>
@@ -225,7 +232,7 @@ describe("ReplicaDefinition", () => {
     })
     const hashBefore = def.hash
     const Extra = Document.make("Extra", { schema: Schema.String, version: 1 })
-    ;(documents.byName as unknown as Map<string, Document.Any>).set("Extra", Extra)
+    Map.prototype.set.call(documents.byName, "Extra", Extra)
 
     assert.strictEqual(DocumentSet.get(def.documents, "Extra"), undefined)
     assert.strictEqual(def.documents.byName.size, 1)
@@ -280,7 +287,7 @@ describe("ReplicaDefinition", () => {
     mutations.push(Delete)
     projections.push(OtherProjection)
     queries.push(OtherQuery)
-    assert.throws(() => (documents.documents as unknown as Array<Document.Any>).push(OtherTask))
+    assert.throws(() => Array.prototype.push.call(documents.documents, OtherTask))
 
     assert.strictEqual(def.mutations.length, 1)
     assert.strictEqual(def.projections.length, 1)
@@ -289,9 +296,9 @@ describe("ReplicaDefinition", () => {
     assert.strictEqual(def.hash, hashBefore)
     assert.deepStrictEqual(def.mutations, [fixture.Rename])
 
-    assert.throws(() => (def.mutations as Array<Mutation.Any>).push(Delete))
-    assert.throws(() => (def.projections as Array<Projection.Any>).push(OtherProjection))
-    assert.throws(() => (def.queries as Array<Query.Any>).push(OtherQuery))
+    assert.throws(() => Array.prototype.push.call(def.mutations, Delete))
+    assert.throws(() => Array.prototype.push.call(def.projections, OtherProjection))
+    assert.throws(() => Array.prototype.push.call(def.queries, OtherQuery))
   })
 
   it("rejects foreign references and duplicate names", () => {

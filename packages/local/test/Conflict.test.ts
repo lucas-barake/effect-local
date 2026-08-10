@@ -1,5 +1,8 @@
 import * as Automerge from "@automerge/automerge"
 import { assert, describe, it } from "@effect/vitest"
+import * as Cause from "effect/Cause"
+import * as DateTime from "effect/DateTime"
+import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import { createRequire } from "node:module"
 import * as Conflict from "../src/Conflict.js"
@@ -15,23 +18,24 @@ const maxConflictNodesHardLimit = 100_000
 const maxConflictAlternativesHardLimit = 10_000
 const maxConflictPathSegmentsHardLimit = 128
 const maxConflictValueBytesHardLimit = 16 * 1_024 * 1_024
+const JsonString = Schema.fromJsonString(Schema.Unknown)
+const roundTripJson = (value: unknown): unknown =>
+  Schema.decodeUnknownSync(JsonString)(Schema.encodeSync(JsonString)(value))
+const encodeUnknownValue = (value: unknown) => Schema.encodeUnknownSync(Conflict.Value)(value)
+const defect = (message: string): unknown =>
+  Cause.squash(Effect.runSync(Effect.exit(Effect.die(new Error(message)))).cause)
 
 const assertSchemaError = (evaluate: () => unknown, message?: string): void => {
-  let failure: unknown
-  try {
-    evaluate()
-  } catch (cause) {
-    failure = cause
-  }
+  const failure = Effect.runSync(Effect.flip(Effect.try({ try: evaluate, catch: (cause) => cause })))
   assert.isTrue(Schema.isSchemaError(failure), message)
 }
 
-const path = (key: string) => ({
+const makePath = (key: string) => ({
   parents: [],
   target: { _tag: "Key", key }
-} as const)
+})
 
-const alternative = (id: string, value: unknown = { _tag: "Null" }) => ({
+const makeAlternative = (id: string, value: unknown = { _tag: "Null" }) => ({
   id,
   value
 })
@@ -40,8 +44,8 @@ const record = (
   key: string,
   alternatives: ReadonlyArray<{ readonly id: string; readonly value: unknown }>
 ) => ({
-  path: path(key),
-  visible: alternatives[0]!.id,
+  path: makePath(key),
+  visible: alternatives[0].id,
   alternatives
 })
 
@@ -52,7 +56,7 @@ describe("Conflict", () => {
       true,
       1.5,
       "text",
-      new Date("2026-07-29T00:00:00.000Z"),
+      DateTime.toDate(DateTime.makeUnsafe("2026-07-29T00:00:00.000Z")),
       new Uint8Array([0, 1, 255]),
       new Automerge.Counter(Number.MAX_SAFE_INTEGER - 1),
       new Automerge.ImmutableString("atomic"),
@@ -62,7 +66,7 @@ describe("Conflict", () => {
 
     for (const value of values) {
       const encoded = encodeValue(value)
-      const decoded = decodeValue(JSON.parse(JSON.stringify(encoded)))
+      const decoded = decodeValue(roundTripJson(encoded))
       assert.deepStrictEqual(encodeValue(decoded), encoded)
     }
   })
@@ -70,10 +74,10 @@ describe("Conflict", () => {
   it("round trips every resolution choice", () => {
     const alternativeId = Conflict.AlternativeId.make("1@actor")
     const heads = ["b", "a", "a"]
-    const path = {
+    const resolutionPath = {
       parents: [{ _tag: "Key", key: "messages", alternative: alternativeId }],
       target: { _tag: "Index", index: 1 }
-    } as const
+    } satisfies Conflict.Path
     const choices: ReadonlyArray<Conflict.Choice> = [
       { _tag: "SelectAlternative", alternativeId },
       { _tag: "ReplaceValue", value: new Automerge.ImmutableString("chosen") },
@@ -81,7 +85,7 @@ describe("Conflict", () => {
     ]
 
     for (const choice of choices) {
-      const resolution = Conflict.Resolution.make({ heads, path, choice })
+      const resolution = Conflict.Resolution.make({ heads, path: resolutionPath, choice })
       const encoded = Schema.encodeSync(Conflict.Resolution)(resolution)
       const decoded = Schema.decodeUnknownSync(Conflict.Resolution)(encoded)
       assert.deepStrictEqual(decoded.heads, ["a", "b"])
@@ -92,12 +96,12 @@ describe("Conflict", () => {
   it("round trips composite replacement values through the JSON resolution codec", () => {
     const resolution = Conflict.Resolution.make({
       heads: ["one"],
-      path: path("value"),
+      path: makePath("value"),
       choice: { _tag: "ReplaceValue", value: ["replacement"] }
     })
     const codec = Schema.toCodecJson(Conflict.Resolution)
     const encoded = Schema.encodeSync(codec)(resolution)
-    const decoded = Schema.decodeUnknownSync(codec)(JSON.parse(JSON.stringify(encoded)))
+    const decoded = Schema.decodeUnknownSync(codec)(roundTripJson(encoded))
     assert.deepStrictEqual(decoded, resolution)
   })
 
@@ -125,27 +129,30 @@ describe("Conflict", () => {
     }
     const document = Automerge.from({ value: 1 })
 
-    try {
-      const unsupported: ReadonlyArray<unknown> = [
-        undefined,
-        () => undefined,
-        1n,
-        new Unsupported(),
-        document,
-        cycle,
-        sparse,
-        new Automerge.Counter(Number.MAX_SAFE_INTEGER + 1)
-      ]
-      for (const value of unsupported) {
-        assertSchemaError(() => encodeValue(value as Automerge.AutomergeValue))
-      }
-    } finally {
-      Automerge.free(document)
-    }
+    Effect.runSync(Effect.acquireUseRelease(
+      Effect.succeed(document),
+      (currentDocument) =>
+        Effect.sync(() => {
+          const unsupported: ReadonlyArray<unknown> = [
+            undefined,
+            () => undefined,
+            1n,
+            new Unsupported(),
+            currentDocument,
+            cycle,
+            sparse,
+            new Automerge.Counter(Number.MAX_SAFE_INTEGER + 1)
+          ]
+          for (const value of unsupported) {
+            assertSchemaError(() => encodeUnknownValue(value))
+          }
+        }),
+      (currentDocument) => Effect.sync(() => Automerge.free(currentDocument))
+    ))
   })
 
   it("accepts wrappers from another module instance and pins lossless counter endpoints", () => {
-    const OtherAutomerge = createRequire(import.meta.url)("@automerge/automerge") as typeof Automerge
+    const OtherAutomerge = createRequire(import.meta.url)("@automerge/automerge")
     for (const value of [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER - 1]) {
       const counter = new OtherAutomerge.Counter(value)
       assert.deepStrictEqual(encodeValue(counter), { _tag: "Counter", value })
@@ -182,7 +189,7 @@ describe("Conflict", () => {
     )
 
     const multibyte = { _tag: "Text", value: "é" }
-    const exactBytes = new TextEncoder().encode(JSON.stringify(multibyte)).byteLength
+    const exactBytes = new TextEncoder().encode(Schema.encodeSync(JsonString)(multibyte)).byteLength
     assert.isUndefined(Conflict.preflightPortableValue(multibyte, {
       maxConflictDepth: 1,
       maxConflictNodes: 1,
@@ -205,7 +212,7 @@ describe("Conflict", () => {
       enumerable: true,
       get: () => {
         calls++
-        throw new RangeError("recursive schema reached past the hard depth limit")
+        return Effect.runSync(Effect.die(new RangeError("recursive schema reached past the hard depth limit")))
       }
     })
     let deep: unknown = terminal
@@ -214,11 +221,10 @@ describe("Conflict", () => {
     }
 
     let failure: unknown
-    try {
-      decodeValue(deep)
-    } catch (cause) {
-      failure = cause
-    }
+    failure = Effect.runSync(Effect.flip(Effect.try({
+      try: () => decodeValue(deep),
+      catch: (cause) => cause
+    })))
     assert.isDefined(failure)
     assert.notInstanceOf(failure, RangeError)
     assert.strictEqual(calls, 0)
@@ -237,7 +243,7 @@ describe("Conflict", () => {
           Object.defineProperty(value, 0, {
             enumerable: true,
             get: () => {
-              throw new Error("native array getter executed")
+              return Effect.runSync(Effect.die(new Error("native array getter executed")))
             }
           })
           return value
@@ -251,7 +257,7 @@ describe("Conflict", () => {
           Object.defineProperty(value, "_tag", {
             enumerable: true,
             get: () => {
-              throw new Error("portable tag getter executed")
+              return Effect.runSync(Effect.die(new Error("portable tag getter executed")))
             }
           })
           return value
@@ -265,7 +271,7 @@ describe("Conflict", () => {
           Object.defineProperty(values, 0, {
             enumerable: true,
             get: () => {
-              throw new Error("portable list getter executed")
+              return Effect.runSync(Effect.die(new Error("portable list getter executed")))
             }
           })
           return { _tag: "List", values }
@@ -279,7 +285,7 @@ describe("Conflict", () => {
           Object.defineProperty(entry, "value", {
             enumerable: true,
             get: () => {
-              throw new Error("portable map entry getter executed")
+              return Effect.runSync(Effect.die(new Error("portable map entry getter executed")))
             }
           })
           return { _tag: "Map", entries: [entry] }
@@ -293,7 +299,7 @@ describe("Conflict", () => {
           Object.defineProperty(value, 0, {
             enumerable: true,
             get: () => {
-              throw new Error("unknown array getter executed")
+              return Effect.runSync(Effect.die(new Error("unknown array getter executed")))
             }
           })
           return value
@@ -326,7 +332,11 @@ describe("Conflict", () => {
         value: [null],
         preflight: Conflict.preflightUnknown
       }
-    ] as const
+    ] satisfies ReadonlyArray<{
+      readonly name: string
+      readonly value: unknown
+      readonly preflight: (value: unknown, limits: Conflict.PreflightLimits) => Conflict.PreflightIssue | undefined
+    }>
 
     for (const test of cases) {
       assert.isUndefined(
@@ -465,7 +475,7 @@ describe("Conflict", () => {
       true,
       -0,
       "é\"\n\uD800",
-      new Date("2026-07-29T00:00:00.000Z"),
+      DateTime.toDate(DateTime.makeUnsafe("2026-07-29T00:00:00.000Z")),
       new Uint8Array([0, 1, 255]),
       new Automerge.Counter(Number.MIN_SAFE_INTEGER),
       new Automerge.ImmutableString("é"),
@@ -503,7 +513,7 @@ describe("Conflict", () => {
     ]
 
     for (const test of cases) {
-      const exactBytes = new TextEncoder().encode(JSON.stringify(test.encoded)).byteLength
+      const exactBytes = new TextEncoder().encode(Schema.encodeSync(JsonString)(test.encoded)).byteLength
       assert.isUndefined(
         test.preflight(test.value, {
           ...Conflict.hardPreflightLimits,
@@ -524,7 +534,7 @@ describe("Conflict", () => {
 
   it("exposes a reusable exact JSON UTF8 byte budget", () => {
     const value = "\u0000\b\t\n\f\r\\\"é\uD800"
-    const exactBytes = new TextEncoder().encode(JSON.stringify(value)).byteLength
+    const exactBytes = new TextEncoder().encode(Schema.encodeSync(JsonString)(value)).byteLength
     const budget = Conflict.createJsonByteBudget(exactBytes)
 
     assert.isFalse(Conflict.addJsonStringBytes(budget, value))
@@ -557,7 +567,13 @@ describe("Conflict", () => {
       ["native", nativeCycle, Conflict.preflightNativeValue],
       ["portable", portableCycle, Conflict.preflightPortableValue],
       ["unknown", unknownCycle, Conflict.preflightUnknown]
-    ] as const
+    ] satisfies ReadonlyArray<
+      readonly [
+        string,
+        unknown,
+        (value: unknown, limits: Conflict.PreflightLimits) => Conflict.PreflightIssue | undefined
+      ]
+    >
     for (const [name, value, preflight] of cases) {
       assert.strictEqual(
         preflight(value, {
@@ -588,8 +604,8 @@ describe("Conflict", () => {
     for (const value of ordinary) assert.isUndefined(Conflict.preflightUnknown(value, limits))
 
     const twoAlternatives = [
-      alternative("one"),
-      alternative("two")
+      makeAlternative("one"),
+      makeAlternative("two")
     ]
     assert.isUndefined(Conflict.preflightUnknown(
       { conflicts: [record("one", twoAlternatives)] },
@@ -626,7 +642,7 @@ describe("Conflict", () => {
       ["maxConflictAlternatives", "Alternatives", maxConflictAlternativesHardLimit],
       ["maxConflictPathSegments", "PathSegments", maxConflictPathSegmentsHardLimit],
       ["maxConflictValueBytes", "Bytes", maxConflictValueBytesHardLimit]
-    ] as const
+    ] satisfies ReadonlyArray<readonly [keyof Conflict.PreflightLimits, string, number]>
     const invalid = [-1, 0, 1.5, Number.NaN, Number.POSITIVE_INFINITY]
 
     for (const [field, issue, hardLimit] of fields) {
@@ -679,9 +695,9 @@ describe("Conflict", () => {
   })
 
   it("normalizes records and enforces conflict inspection invariants", () => {
-    const one = alternative("one")
-    const two = alternative("two")
-    const three = alternative("three")
+    const one = makeAlternative("one")
+    const two = makeAlternative("two")
+    const three = makeAlternative("three")
 
     assertSchemaError(() => Schema.decodeUnknownSync(Conflict.Record)(record("one", [one])))
     assertSchemaError(() =>
@@ -732,7 +748,7 @@ describe("Conflict", () => {
     }
 
     const half = maxConflictAlternativesHardLimit / 2 + 1
-    const many = (prefix: string) => Array.from({ length: half }, (_, index) => alternative(`${prefix}${index}`))
+    const many = (prefix: string) => Array.from({ length: half }, (_, index) => makeAlternative(`${prefix}${index}`))
     assertSchemaError(() =>
       Schema.decodeUnknownSync(Inspection)({
         snapshot,
@@ -743,14 +759,14 @@ describe("Conflict", () => {
 
   it("preflights semantic resolutions and inspections with native values", () => {
     const native = {
-      date: new Date("2026-07-29T00:00:00.000Z"),
+      date: DateTime.toDate(DateTime.makeUnsafe("2026-07-29T00:00:00.000Z")),
       counter: new Automerge.Counter(1),
       immutable: new Automerge.ImmutableString("one"),
       bytes: new Uint8Array([0, 1, 2])
     }
     const resolution = Conflict.Resolution.make({
       heads: ["one"],
-      path: path("value"),
+      path: makePath("value"),
       choice: { _tag: "ReplaceValue", value: native }
     })
     assert.isUndefined(Conflict.preflightResolution(resolution))
@@ -772,7 +788,7 @@ describe("Conflict", () => {
         projection: "Ready"
       },
       conflicts: [{
-        path: path("value"),
+        path: makePath("value"),
         visible: Conflict.AlternativeId.make("one"),
         alternatives: [
           {
@@ -797,7 +813,7 @@ describe("Conflict", () => {
   })
 
   it("round trips every public conflict error codec with exact encoded fields", () => {
-    const errorPath = path("title")
+    const errorPath = makePath("title")
     const alternativeId = Conflict.AlternativeId.make("one")
     const cases: ReadonlyArray<readonly [Conflict.ResolutionError, unknown]> = [
       [
@@ -862,7 +878,7 @@ describe("Conflict", () => {
       [
         new Conflict.ConflictResolutionSchemaError({
           path: errorPath,
-          cause: new Error("invalid replacement")
+          cause: defect("invalid replacement")
         }),
         {
           _tag: "ConflictResolutionSchemaError",
@@ -973,10 +989,10 @@ describe("Conflict", () => {
     assert.deepStrictEqual(
       Conflict.normalizeRecords([
         Schema.decodeUnknownSync(Conflict.Record)(
-          record("ä", [alternative("one"), alternative("two")])
+          record("ä", [makeAlternative("one"), makeAlternative("two")])
         ),
         Schema.decodeUnknownSync(Conflict.Record)(
-          record("z", [alternative("one"), alternative("two")])
+          record("z", [makeAlternative("one"), makeAlternative("two")])
         )
       ]).map((entry) => entry.path.target._tag === "Key" && entry.path.target.key),
       ["z", "ä"]

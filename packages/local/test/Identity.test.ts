@@ -20,7 +20,7 @@ describe("Identity", () => {
       assert.strictEqual(Schema.decodeUnknownSync(Identity.PeerId)(peerId), peerId)
       assert.strictEqual(Schema.decodeUnknownSync(Identity.RelayMessageId)(relayMessageId), relayMessageId)
       assert.isTrue(relayMessageId.startsWith("rly_"))
-      assert.throws(() => Schema.decodeUnknownSync(Identity.DocumentId)(commandId as unknown as Identity.DocumentId))
+      assert.throws(() => Schema.decodeUnknownSync(Identity.DocumentId)(commandId))
       assert.throws(() => Schema.decodeUnknownSync(Identity.PeerId)(relayMessageId))
     }).pipe(Effect.provide(NodeCrypto.layer)))
 

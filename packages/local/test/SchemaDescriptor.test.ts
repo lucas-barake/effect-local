@@ -1,13 +1,16 @@
 import { assert, describe, it } from "@effect/vitest"
+import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as SchemaGetter from "effect/SchemaGetter"
 import * as Canonical from "../src/Canonical.js"
 import * as SchemaDescriptor from "../src/SchemaDescriptor.js"
 
+const JsonString = Schema.fromJsonString(Schema.Unknown)
+
 describe("SchemaDescriptor", () => {
   const hash = (schema: Schema.Constraint) => Canonical.hash(SchemaDescriptor.make(schema))
-  const metadata = <A,>(value: A): never => value as never
+  const metadata = (value: unknown): unknown => value
 
   it("ignores documentation annotations", () => {
     const plain = Schema.Struct({ title: Schema.String })
@@ -249,7 +252,7 @@ describe("SchemaDescriptor", () => {
   })
 
   it("keeps non-JSON semantic metadata collision free", () => {
-    const metaHash = (value: unknown) => hash(Schema.String.annotate({ meta: { _tag: "TestMeta", value } as never }))
+    const metaHash = (value: unknown) => hash(Schema.String.annotate({ meta: metadata({ _tag: "TestMeta", value }) }))
     assert.notStrictEqual(metaHash(undefined), metaHash(null))
     assert.notStrictEqual(metaHash(Number.NaN), metaHash("NaN"))
     assert.notStrictEqual(metaHash(0), metaHash(-0))
@@ -257,7 +260,7 @@ describe("SchemaDescriptor", () => {
     assert.notStrictEqual(metaHash(Symbol.iterator), metaHash(Symbol.for("iterator")))
     assert.notStrictEqual(metaHash(1n), metaHash("1"))
     assert.notStrictEqual(
-      metaHash(new Date("2024-01-01T00:00:00.000Z")),
+      metaHash(DateTime.toDate(DateTime.makeUnsafe("2024-01-01T00:00:00.000Z"))),
       metaHash("2024-01-01T00:00:00.000Z")
     )
     assert.notStrictEqual(metaHash(["value"]), metaHash({ 0: "value" }))
@@ -318,7 +321,7 @@ describe("SchemaDescriptor", () => {
       y.next = x
       return { x, y }
     }
-    const metaHash = (value: unknown) => hash(Schema.String.annotate({ meta: { _tag: "Cycle", value } as never }))
+    const metaHash = (value: unknown) => hash(Schema.String.annotate({ meta: metadata({ _tag: "Cycle", value }) }))
 
     const pair = makePair()
     assert.strictEqual(metaHash({ x: pair.x, y: pair.y }), metaHash({ y: pair.y, x: pair.x }))
@@ -340,7 +343,7 @@ describe("SchemaDescriptor", () => {
       Schema.decodeTo(decoded),
       Schema.annotate({ meta: metadata({ _tag: "SharedDecodedDag" }) })
     )
-    assert.isBelow(JSON.stringify(SchemaDescriptor.make(codec)).length, 1_000_000)
+    assert.isBelow(Schema.encodeSync(JsonString)(SchemaDescriptor.make(codec)).length, 1_000_000)
   })
 
   it("keeps shared semantic metadata growth bounded", () => {
@@ -348,8 +351,8 @@ describe("SchemaDescriptor", () => {
     for (let index = 0; index < 16; index++) {
       value = { left: value, right: value }
     }
-    const schema = Schema.String.annotate({ meta: { _tag: "SharedMeta", value } as never })
-    assert.isBelow(JSON.stringify(SchemaDescriptor.make(schema)).length, 1_000_000)
+    const schema = Schema.String.annotate({ meta: metadata({ _tag: "SharedMeta", value }) })
+    assert.isBelow(Schema.encodeSync(JsonString)(SchemaDescriptor.make(schema)).length, 1_000_000)
   })
 
   it("captures the remaining structural AST contracts", () => {
@@ -445,7 +448,7 @@ describe("SchemaDescriptor", () => {
         left: Schema.NullOr(Schema.suspend((): Schema.Codec<Left, Left> => LeftSchema)),
         label
       })
-      return [hash(LeftSchema), hash(RightSchema)] as const
+      return [hash(LeftSchema), hash(RightSchema)]
     }
     assert.deepStrictEqual(makePair(Schema.String), makePair(Schema.String))
     assert.notDeepEqual(makePair(Schema.String), makePair(Schema.Trim))
@@ -566,11 +569,11 @@ describe("SchemaDescriptor", () => {
     const descriptorHash = (
       schema: Schema.Constraint,
       includeConstructorDefaults?: boolean
-    ) =>
-      Canonical.hash(SchemaDescriptor.make(
-        schema,
-        includeConstructorDefaults === undefined ? undefined : { includeConstructorDefaults }
-      ))
+    ) => {
+      let options: { readonly includeConstructorDefaults?: boolean } | undefined
+      if (includeConstructorDefaults !== undefined) options = { includeConstructorDefaults }
+      return Canonical.hash(SchemaDescriptor.make(schema, options))
+    }
     const literal = Schema.Literal("Task")
     const defaultedLiteral = Schema.tag("Task")
     assert.notStrictEqual(descriptorHash(literal), descriptorHash(defaultedLiteral))

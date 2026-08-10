@@ -61,7 +61,7 @@ describe("ReplicaLimits", () => {
     "maxRestorePullMillis",
     "maxRestoreCoalesceMillis",
     "maxRestoreErrorBytes"
-  ] as const
+  ] satisfies ReadonlyArray<keyof ReplicaLimits.Values>
   const conflictLimitKeys = [
     "maxConflictDepth",
     "maxConflictNodes",
@@ -71,7 +71,7 @@ describe("ReplicaLimits", () => {
     "maxConflictSourceChanges",
     "maxConflictSourceOperations",
     "maxConflictSourceBytes"
-  ] as const
+  ] satisfies ReadonlyArray<keyof ReplicaLimits.Values>
 
   it.effect("requires and provides validated owner limits", () =>
     Effect.gen(function*() {
@@ -192,7 +192,7 @@ describe("ReplicaLimits", () => {
         ["maxRestorePullMillis", Number.MAX_VALUE],
         ["maxRestoreCoalesceMillis", Number.MAX_VALUE],
         ["maxRestoreErrorBytes", Number.MAX_VALUE]
-      ] as const
+      ] satisfies ReadonlyArray<readonly [keyof ReplicaLimits.Values, number]>
       for (const [key, value] of invalid) {
         const error = yield* assertSchemaFailure(
           ReplicaLimits.make({ ...values, [key]: value }),

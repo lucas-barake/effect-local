@@ -1,5 +1,7 @@
 import * as Automerge from "@automerge/automerge/slim"
+import * as DateTime from "effect/DateTime"
 import * as Encoding from "effect/Encoding"
+import * as Option from "effect/Option"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as SchemaGetter from "effect/SchemaGetter"
@@ -18,10 +20,15 @@ import type * as Snapshot from "./Snapshot.js"
 const nonNegativeSafeInteger = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 const prototypeKeys = new Set([...Object.getOwnPropertyNames(Object.prototype), "prototype"])
 const textEncoder = new TextEncoder()
+const JsonString = Schema.fromJsonString(Schema.Unknown)
 
 export const isSupportedKey = (key: string): boolean => !prototypeKeys.has(key)
 
-export const compareCodeUnits = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0
+export const compareCodeUnits = (left: string, right: string): number => {
+  if (left < right) return -1
+  if (left > right) return 1
+  return 0
+}
 
 const ConflictKey = Schema.String.check(
   Schema.makeFilter(isSupportedKey, { expected: "a key that is safe for Automerge object traversal" })
@@ -256,13 +263,16 @@ export const addJsonStringBytes = (budget: JsonByteBudget, value: string): boole
     if (codeUnit === 0x22 || codeUnit === 0x5c) {
       bytes = 2
     } else if (codeUnit <= 0x1f) {
-      bytes = codeUnit === 0x08 ||
-          codeUnit === 0x09 ||
-          codeUnit === 0x0a ||
-          codeUnit === 0x0c ||
-          codeUnit === 0x0d
-        ? 2
-        : 6
+      bytes = 6
+      if (
+        codeUnit === 0x08 ||
+        codeUnit === 0x09 ||
+        codeUnit === 0x0a ||
+        codeUnit === 0x0c ||
+        codeUnit === 0x0d
+      ) {
+        bytes = 2
+      }
     } else if (codeUnit <= 0x7f) {
       bytes = 1
     } else if (codeUnit <= 0x7ff) {
@@ -322,9 +332,8 @@ const boundedDenseArrayValues = (
     }
     values.push(descriptor.value)
   }
-  return value.length > remainingNodes
-    ? { _tag: "Nodes" }
-    : { _tag: "Values", values }
+  if (value.length > remainingNodes) return { _tag: "Nodes" }
+  return { _tag: "Values", values }
 }
 
 type BoundedObjectEntries =
@@ -343,7 +352,7 @@ const boundedObjectEntries = (
   const inspected = Math.min(keys.length, Math.max(0, remainingNodes))
   const entries: Array<readonly [string, unknown]> = []
   for (let index = 0; index < inspected; index++) {
-    const key = keys[index]!
+    const key = keys[index]
     if (typeof key !== "string") return { _tag: "Unsupported" }
     const descriptor = Object.getOwnPropertyDescriptor(value, key)
     if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
@@ -351,9 +360,8 @@ const boundedObjectEntries = (
     }
     entries.push([key, descriptor.value])
   }
-  return keys.length > remainingNodes
-    ? { _tag: "Nodes" }
-    : { _tag: "Entries", entries }
+  if (keys.length > remainingNodes) return { _tag: "Nodes" }
+  return { _tag: "Entries", entries }
 }
 
 const isPlainObject = (value: object): value is { readonly [key: string]: unknown } => {
@@ -381,6 +389,7 @@ const valueLimitsIssue = (
   if (!isValidPreflightLimit(limits.maxConflictValueBytes, maxConflictValueBytesHardLimit)) {
     return { _tag: "Bytes", limit: maxConflictValueBytesHardLimit }
   }
+  return undefined
 }
 
 const preflightLimitsIssue = (limits: PreflightLimits): PreflightIssue | undefined => {
@@ -392,6 +401,7 @@ const preflightLimitsIssue = (limits: PreflightLimits): PreflightIssue | undefin
   if (!isValidPreflightLimit(limits.maxConflictPathSegments, maxConflictPathSegmentsHardLimit)) {
     return { _tag: "PathSegments", limit: maxConflictPathSegmentsHardLimit }
   }
+  return undefined
 }
 
 const nativeValueIssue = (
@@ -424,9 +434,11 @@ const nativeValueIssue = (
       continue
     }
     if (typeof value === "boolean") {
+      let booleanBytes = 5
+      if (value) booleanBytes = 4
       if (
         addJsonBytes(budget, `{"_tag":"Boolean","value":`.length) ||
-        addJsonBytes(budget, value ? 4 : 5) ||
+        addJsonBytes(budget, booleanBytes) ||
         addJsonBytes(budget, 1)
       ) {
         return bytesIssue(budget.limit)
@@ -435,10 +447,12 @@ const nativeValueIssue = (
     }
     if (typeof value === "number") {
       if (!Number.isFinite(value) || value >= Number.MAX_SAFE_INTEGER) {
+        let kind = "nonfinite number"
+        if (Number.isFinite(value)) kind = "nonportable number"
         return {
           _tag: "UnsupportedValue",
           pathDepth: depth,
-          kind: Number.isFinite(value) ? "nonportable number" : "nonfinite number"
+          kind
         }
       }
       if (
@@ -507,7 +521,7 @@ const nativeValueIssue = (
         }
       }
       for (let index = entries.length - 1; index >= 0; index--) {
-        const [, child] = entries[index]!
+        const [, child] = entries[index]
         stack.push({ value: child, depth: depth + 1 })
       }
       continue
@@ -564,6 +578,7 @@ const nativeValueIssue = (
     }
     return { _tag: "UnsupportedValue", pathDepth: depth, kind: "object" }
   }
+  return undefined
 }
 
 const exactKeys = (value: { readonly [key: string]: unknown }, expected: ReadonlyArray<string>): boolean => {
@@ -593,7 +608,7 @@ const portableValueIssue = (
     }
     if (seen.has(value)) return { _tag: "Cycle", pathDepth: depth }
     seen.add(value)
-    const record = value as { readonly [key: string]: unknown }
+    const record = value
     const tag = record._tag
     const remainingNodes = limits.maxConflictNodes - nodes - stack.length
 
@@ -608,9 +623,11 @@ const portableValueIssue = (
         if (!exactKeys(record, ["_tag", "value"]) || typeof record.value !== "boolean") {
           return { _tag: "UnsupportedValue", pathDepth: depth, kind: "Boolean" }
         }
+        let booleanBytes = 5
+        if (record.value) booleanBytes = 4
         if (
           addJsonBytes(budget, `{"_tag":"Boolean","value":`.length) ||
-          addJsonBytes(budget, record.value ? 4 : 5) ||
+          addJsonBytes(budget, booleanBytes) ||
           addJsonBytes(budget, 1)
         ) {
           return bytesIssue(budget.limit)
@@ -636,7 +653,7 @@ const portableValueIssue = (
       case "Text":
       case "ImmutableString":
         if (!exactKeys(record, ["_tag", "value"]) || typeof record.value !== "string") {
-          return { _tag: "UnsupportedValue", pathDepth: depth, kind: String(tag) }
+          return { _tag: "UnsupportedValue", pathDepth: depth, kind: tag }
         }
         if (
           addJsonBytes(budget, `{"_tag":"${tag}","value":`.length) ||
@@ -657,8 +674,8 @@ const portableValueIssue = (
         ) {
           return bytesIssue(budget.limit)
         }
-        const date = new Date(record.value)
-        if (Number.isNaN(date.getTime()) || date.toISOString() !== record.value) {
+        const date = DateTime.make(record.value)
+        if (Option.isNone(date) || DateTime.formatIso(date.value) !== record.value) {
           return { _tag: "UnsupportedValue", pathDepth: depth, kind: "Date" }
         }
         break
@@ -745,7 +762,16 @@ const portableValueIssue = (
           }
         }
         for (let index = entryValues.length - 1; index >= 0; index--) {
-          const entry = entryValues[index] as { readonly value: unknown }
+          const entry = entryValues[index]
+          if (
+            typeof entry !== "object" ||
+            entry === null ||
+            Array.isArray(entry) ||
+            !isPlainObject(entry) ||
+            !("value" in entry)
+          ) {
+            return { _tag: "UnsupportedValue", pathDepth: depth + 1, kind: "Map entry" }
+          }
           stack.push({ value: entry.value, depth: depth + 1 })
         }
         break
@@ -779,6 +805,7 @@ const portableValueIssue = (
         return { _tag: "UnsupportedValue", pathDepth: depth, kind: "unknown tag" }
     }
   }
+  return undefined
 }
 
 export const preflightNativeValue = (
@@ -802,17 +829,18 @@ const isPathSegmentShape = (value: unknown, parent: boolean): boolean => {
   ) {
     return false
   }
-  const record = value as { readonly [key: string]: unknown }
+  const record = value
   if (record._tag === "Key") {
-    return typeof record.key === "string" &&
-      exactKeys(record, parent && record.alternative !== undefined ? ["_tag", "alternative", "key"] : ["_tag", "key"])
+    if (typeof record.key !== "string") return false
+    const expected = ["_tag", "key"]
+    if (parent && record.alternative !== undefined) expected.splice(1, 0, "alternative")
+    return exactKeys(record, expected)
   }
   if (record._tag === "Index") {
-    return Number.isSafeInteger(record.index) &&
-      exactKeys(
-        record,
-        parent && record.alternative !== undefined ? ["_tag", "alternative", "index"] : ["_tag", "index"]
-      )
+    if (!Number.isSafeInteger(record.index)) return false
+    const expected = ["_tag", "index"]
+    if (parent && record.alternative !== undefined) expected.splice(1, 0, "alternative")
+    return exactKeys(record, expected)
   }
   return false
 }
@@ -828,7 +856,7 @@ const pathSegments = (value: unknown): number | undefined => {
   ) {
     return undefined
   }
-  const record = value as { readonly [key: string]: unknown }
+  const record = value
   if (!exactKeys(record, ["parents", "target"]) || !Array.isArray(record.parents)) return undefined
   const parents = denseArrayValues(record.parents)
   if (
@@ -880,7 +908,9 @@ export const preflightUnknown = (
       continue
     }
     if (typeof value === "boolean") {
-      if (addJsonBytes(budget, value ? 4 : 5)) return bytesIssue(budget.limit)
+      let booleanBytes = 5
+      if (value) booleanBytes = 4
+      if (addJsonBytes(budget, booleanBytes)) return bytesIssue(budget.limit)
       continue
     }
     if (typeof value === "number") {
@@ -927,7 +957,7 @@ export const preflightUnknown = (
       return { _tag: "UnsupportedValue", pathDepth: depth, kind: "object" }
     }
     const entries = bounded.entries
-    const record = value as { readonly [key: string]: unknown }
+    const record = value
     const recordAlternatives = alternativeCount(record)
     if (recordAlternatives !== undefined) {
       alternatives += recordAlternatives
@@ -954,10 +984,11 @@ export const preflightUnknown = (
       }
     }
     for (let index = entries.length - 1; index >= 0; index--) {
-      const [, child] = entries[index]!
+      const [, child] = entries[index]
       stack.push({ value: child, depth: depth + 1 })
     }
   }
+  return undefined
 }
 
 const nativeToPortableUnchecked = (input: Automerge.AutomergeValue): PortableValue => {
@@ -991,7 +1022,7 @@ const nativeToPortableUnchecked = (input: Automerge.AutomergeValue): PortableVal
       current.assign({ _tag: "List", values })
       for (let index = value.length - 1; index >= 0; index--) {
         stack.push({
-          input: value[index]!,
+          input: value[index],
           assign: (child) => {
             values[index] = child
           }
@@ -1002,7 +1033,7 @@ const nativeToPortableUnchecked = (input: Automerge.AutomergeValue): PortableVal
       const portableEntries = Array.from<MapEntry>({ length: entries.length })
       current.assign({ _tag: "Map", entries: portableEntries })
       for (let index = entries.length - 1; index >= 0; index--) {
-        const [key, child] = entries[index]!
+        const [key, child] = entries[index]
         stack.push({
           input: child,
           assign: (portable) => {
@@ -1021,6 +1052,9 @@ const NativeValueSchema = Schema.declare<Automerge.AutomergeValue>(
   { expected: "a bounded native Automerge conflict value" }
 )
 
+const isPortableValue = (value: unknown): value is PortableValue =>
+  portableValueIssue(value, hardPreflightLimits) === undefined
+
 const BoundedPortableValue = Schema.declare<PortableValue>(
   (input): input is PortableValue => portableValueIssue(input, hardPreflightLimits) === undefined,
   {
@@ -1030,10 +1064,13 @@ const BoundedPortableValue = Schema.declare<PortableValue>(
         Schema.Json,
         {
           decode: SchemaGetter.transform<PortableValue, Schema.Json>(
-            (value) => value as unknown as PortableValue
+            (value) => {
+              if (isPortableValue(value)) return value
+              return Schema.decodeUnknownSync(Schema.Never)(value)
+            }
           ),
           encode: SchemaGetter.transform<Schema.Json, PortableValue>(
-            (value) => value as unknown as Schema.Json
+            (value) => Schema.encodeUnknownSync(Schema.Json)(value)
           )
         }
       )
@@ -1063,11 +1100,12 @@ const portableToNativeUnchecked = (input: PortableValue): Automerge.AutomergeVal
         current.assign(new Automerge.ImmutableString(value.value))
         break
       case "Date":
-        current.assign(new Date(value.value))
+        current.assign(DateTime.toDate(DateTime.makeUnsafe(value.value)))
         break
       case "Bytes": {
         const decoded = Encoding.decodeBase64(value.value)
-        current.assign(Result.isSuccess(decoded) ? decoded.success : new Uint8Array())
+        if (Result.isSuccess(decoded)) current.assign(decoded.success)
+        else current.assign(new Uint8Array())
         break
       }
       case "Counter":
@@ -1077,7 +1115,7 @@ const portableToNativeUnchecked = (input: PortableValue): Automerge.AutomergeVal
         const decoded: { [key: string]: Automerge.AutomergeValue } = {}
         current.assign(decoded)
         for (let index = value.entries.length - 1; index >= 0; index--) {
-          const entry = value.entries[index]!
+          const entry = value.entries[index]
           stack.push({
             input: entry.value,
             assign: (child) => {
@@ -1092,7 +1130,7 @@ const portableToNativeUnchecked = (input: PortableValue): Automerge.AutomergeVal
         current.assign(decoded)
         for (let index = value.values.length - 1; index >= 0; index--) {
           stack.push({
-            input: value.values[index]!,
+            input: value.values[index],
             assign: (child) => {
               decoded[index] = child
             }
@@ -1106,9 +1144,9 @@ const portableToNativeUnchecked = (input: PortableValue): Automerge.AutomergeVal
   return output
 }
 
-export const Value: Schema.Codec<Automerge.AutomergeValue, PortableValue, never, never> = BoundedPortableValue.pipe(
-  Schema.decodeTo(
-    NativeValueSchema,
+export const Value: Schema.Codec<Automerge.AutomergeValue, PortableValue> = NativeValueSchema.pipe(
+  Schema.encodeTo(
+    BoundedPortableValue,
     SchemaTransformation.transform({
       decode: portableToNativeUnchecked,
       encode: nativeToPortableUnchecked
@@ -1171,15 +1209,16 @@ export const Record = Schema.Struct({
 )
 export type Record = typeof Record.Type
 
-const pathOrderKey = (path: Path): string =>
-  JSON.stringify([
-    ...path.parents.map((segment) =>
-      segment._tag === "Key"
-        ? ["Key", segment.key, segment.alternative ?? ""]
-        : ["Index", segment.index, segment.alternative ?? ""]
-    ),
-    path.target._tag === "Key" ? ["Key", path.target.key] : ["Index", path.target.index]
-  ])
+const pathOrderKey = (path: Path): string => {
+  const parents = path.parents.map((segment) => {
+    if (segment._tag === "Key") return ["Key", segment.key, segment.alternative ?? ""]
+    return ["Index", segment.index, segment.alternative ?? ""]
+  })
+  let target: ReadonlyArray<string | number>
+  if (path.target._tag === "Key") target = ["Key", path.target.key]
+  else target = ["Index", path.target.index]
+  return Schema.encodeSync(JsonString)([...parents, target])
+}
 
 export const normalizeRecords = (records: ReadonlyArray<Record>): ReadonlyArray<Record> =>
   records
@@ -1236,17 +1275,18 @@ export const preflightResolution = (
   input: Resolution,
   limits: PreflightLimits = hardPreflightLimits
 ): PreflightIssue | undefined => {
-  const structural = input.choice._tag === "ReplaceValue"
-    ? {
+  let structural: unknown = input
+  if (input.choice._tag === "ReplaceValue") {
+    structural = {
       heads: input.heads,
       path: input.path,
       choice: { _tag: input.choice._tag, value: null }
     }
-    : input
-  return preflightUnknown(structural, limits) ??
-    (input.choice._tag === "ReplaceValue"
-      ? preflightNativeValue(input.choice.value, limits)
-      : undefined)
+  }
+  const structuralIssue = preflightUnknown(structural, limits)
+  if (structuralIssue !== undefined) return structuralIssue
+  if (input.choice._tag === "ReplaceValue") return preflightNativeValue(input.choice.value, limits)
+  return undefined
 }
 
 export const preflightInspection = <A,>(
@@ -1281,6 +1321,7 @@ export const preflightInspection = <A,>(
       if (issue !== undefined) return issue
     }
   }
+  return undefined
 }
 
 export class UnsupportedConflictValue extends Schema.TaggedErrorClass<UnsupportedConflictValue>(

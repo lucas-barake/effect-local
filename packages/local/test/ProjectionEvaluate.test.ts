@@ -14,7 +14,7 @@ describe("Projection evaluate failures", () => {
     version: 1,
     heads: [],
     tombstone: false,
-    projection: "Ready" as const
+    projection: "Ready"
   }
 
   it.effect("wraps colliding keys as a tagged ProjectionBlocked reason", () =>
@@ -39,7 +39,7 @@ describe("Projection evaluate failures", () => {
         version: 1,
         Row: Schema.Struct({ id: Schema.String }),
         key: (row) => row.id,
-        project: () => [{ id: 1 } as never]
+        project: () => [{ id: 1 }]
       })
       const error = yield* Projection.evaluate(Invalid, snapshot).pipe(Effect.flip)
       assert.strictEqual(error.reason._tag, "ProjectionBlocked")
