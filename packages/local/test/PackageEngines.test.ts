@@ -29,13 +29,15 @@ interface PackageManifest {
   readonly private?: unknown
 }
 
+type WorkspacePackage = Schema.Schema.Type<typeof WorkspacePackageSchema>
+
 interface PublishedPackage extends WorkspacePackage {
   readonly name: string
   readonly manifest: PackageManifest
 }
 
 const JsonString = Schema.fromJsonString(Schema.Unknown)
-const WorkspacePackage = Schema.Struct({
+const WorkspacePackageSchema = Schema.Struct({
   name: Schema.optionalKey(Schema.String),
   path: Schema.String,
   private: Schema.Boolean
@@ -46,7 +48,7 @@ const PackageManifest = Schema.Struct({
   private: Schema.optionalKey(Schema.Unknown)
 })
 const Packed = Schema.Struct({ filename: Schema.String, name: Schema.String })
-const workspacePackages = Schema.decodeUnknownSync(Schema.Array(WorkspacePackage))(
+const workspacePackages = Schema.decodeUnknownSync(Schema.Array(WorkspacePackageSchema))(
   Schema.decodeUnknownSync(JsonString)(
     execFileSync("pnpm", ["list", "--recursive", "--depth", "-1", "--json"], {
       cwd: repoRoot,

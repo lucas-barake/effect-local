@@ -31,9 +31,9 @@ describe("Document codec", () => {
 
   it.effect("maps encode failures to a tagged DocumentEncodeError carrying the id", () =>
     Effect.gen(function*() {
-      const error = yield* Document.encode.call(undefined, Task, documentId, { title: 1, done: false }).pipe(
-        Effect.flip
-      )
+      const invalidValue = { title: "one", done: false }
+      Object.defineProperty(invalidValue, "title", { value: 1 })
+      const error = yield* Document.encode(Task, documentId, invalidValue).pipe(Effect.flip)
       assert.strictEqual(error.reason._tag, "DocumentEncodeError")
       if (error.reason._tag !== "DocumentEncodeError") return
       assert.strictEqual(error.reason.documentId, documentId)

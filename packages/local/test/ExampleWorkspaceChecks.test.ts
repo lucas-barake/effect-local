@@ -5,7 +5,6 @@ import * as Schema from "effect/Schema"
 import { execFileSync } from "node:child_process"
 // oxlint-disable-next-line effect/noNodeBuiltinImport -- this test creates and removes real filesystem fixtures
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
 // oxlint-disable-next-line effect/noNodeBuiltinImport -- path behavior must match the host Node test runner
 import { join } from "node:path"
 

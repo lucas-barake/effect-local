@@ -42,7 +42,7 @@ const assertSchemaError = (evaluate: () => unknown, message?: string): void => {
 const makePath = (key: string) => ({
   parents: [],
   target: { _tag: "Key", key }
-})
+} satisfies Conflict.Path)
 
 const makeAlternative = (id: string, value: unknown = { _tag: "Null" }) => ({
   id,

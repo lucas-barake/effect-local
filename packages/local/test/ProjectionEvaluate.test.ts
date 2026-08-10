@@ -4,11 +4,12 @@ import * as Schema from "effect/Schema"
 import * as Document from "../src/Document.js"
 import * as Identity from "../src/Identity.js"
 import * as Projection from "../src/Projection.js"
+import type * as Snapshot from "../src/Snapshot.js"
 
 describe("Projection evaluate failures", () => {
   const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
   const Task = Document.make("Task", { schema: Schema.Struct({ title: Schema.String }), version: 1 })
-  const snapshot = {
+  const snapshot: Snapshot.FromDocument<typeof Task> = {
     documentId,
     value: { title: "one" },
     version: 1,
@@ -39,7 +40,11 @@ describe("Projection evaluate failures", () => {
         version: 1,
         Row: Schema.Struct({ id: Schema.String }),
         key: (row) => row.id,
-        project: () => [{ id: 1 }]
+        project: () => {
+          const invalidRow = { id: "one" }
+          Object.defineProperty(invalidRow, "id", { value: 1 })
+          return [invalidRow]
+        }
       })
       const error = yield* Projection.evaluate(Invalid, snapshot).pipe(Effect.flip)
       assert.strictEqual(error.reason._tag, "ProjectionBlocked")

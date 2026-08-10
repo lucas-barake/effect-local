@@ -26,7 +26,7 @@ describe("wire contracts", () => {
       replicaId: Identity.ReplicaId.make("rep_00000000-0000-4000-8000-000000000001"),
       incarnation: Identity.ReplicaIncarnation.make(0),
       createdAt: "2020-01-01T00:00:00.000Z"
-    }
+    } satisfies Backup.Header
     const encoded = Schema.encodeSync(Backup.Header)(header)
     assert.deepStrictEqual(Schema.decodeUnknownSync(Backup.Header)(encoded), header)
     // Both readable versions, and nothing beyond them. Version 2 is what an archive carrying a
