@@ -12,6 +12,7 @@ import * as Metric from "effect/Metric"
 import * as Option from "effect/Option"
 import * as Redacted from "effect/Redacted"
 import * as Result from "effect/Result"
+import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
@@ -46,13 +47,13 @@ const invoke = (
   headers = Headers.empty,
   rpc: typeof PeerRpc.OpenRpc | typeof PeerRpc.PushRpc = PeerRpc.PushRpc
 ) =>
-  middleware(PeerAuthentication.AuthenticatedPeer as never, {
+  middleware(PeerAuthentication.AuthenticatedPeer, {
     client: new Rpc.ServerClient(clientId),
     requestId: RpcMessage.RequestId(clientId),
     rpc,
     payload,
     headers
-  }) as unknown as Effect.Effect<
+  }) satisfies Effect.Effect<
     PeerAuthentication.AuthenticatedPeer["Service"],
     PeerRpcError.AuthenticationFailure | PeerRpcError.RequestCapacityExceeded,
     Scope.Scope
@@ -67,7 +68,7 @@ const authenticated = {
 describe("PeerAuthentication", () => {
   it.effect("supports constant credentials", () =>
     Effect.gen(function*() {
-      const authenticatedWith = yield* Deferred.make<Redacted.Redacted<string>>()
+      const authenticatedWith = yield* Deferred.make<Redacted.Redacted>()
       const handlers = PeerRpc.Rpcs.toLayer(PeerRpc.Rpcs.of({
         Open: () => Stream.empty,
         Push: () => Effect.void,
@@ -113,8 +114,8 @@ describe("PeerAuthentication", () => {
       const handlers = PeerRpc.Rpcs.toLayer(PeerRpc.Rpcs.of({
         Open: () =>
           Stream.fromEffect(PeerAuthentication.AuthenticatedPeer).pipe(
-            Stream.map((authenticated) => {
-              assert.deepStrictEqual(authenticated.principal, principal)
+            Stream.map((authenticatedPeer) => {
+              assert.deepStrictEqual(authenticatedPeer.principal, principal)
               return PeerRpc.Opened.make({
                 _tag: "Opened",
                 protocolVersion: PeerRpc.protocolVersion,
@@ -170,8 +171,8 @@ describe("PeerAuthentication", () => {
   it.effect("awaits asynchronous credentials before invoking the authenticator", () =>
     Effect.gen(function*() {
       const requested = yield* Deferred.make<void>()
-      const credential = yield* Deferred.make<Redacted.Redacted<string>>()
-      const authenticatedWith = yield* Deferred.make<Redacted.Redacted<string>>()
+      const credential = yield* Deferred.make<Redacted.Redacted>()
+      const authenticatedWith = yield* Deferred.make<Redacted.Redacted>()
       const handlers = PeerRpc.Rpcs.toLayer(PeerRpc.Rpcs.of({
         Open: () => Stream.empty,
         Push: () => Effect.void,
@@ -257,12 +258,13 @@ describe("PeerAuthentication", () => {
         currentTimeMillisUnsafe: () => currentTime,
         currentTimeMillis: Effect.suspend(() => {
           timeReads += 1
-          return timeReads === 1
-            ? Deferred.succeed(firstTimeRead, undefined).pipe(
+          if (timeReads === 1) {
+            return Deferred.succeed(firstTimeRead, undefined).pipe(
               Effect.andThen(Deferred.await(releaseFirstTimeRead)),
               Effect.as(0)
             )
-            : Effect.succeed(currentTime)
+          }
+          return Effect.succeed(currentTime)
         }),
         currentTimeNanosUnsafe: () => BigInt(currentTime) * 1_000_000n,
         currentTimeNanos: Effect.sync(() => BigInt(currentTime) * 1_000_000n),
@@ -337,14 +339,16 @@ describe("PeerAuthentication", () => {
       const middleware = yield* PeerAuthentication.PeerAuthentication.pipe(
         Effect.provide(PeerAuthentication.layerServer),
         Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
-          authenticate: (credential) =>
-            Redacted.value(credential) === "first"
-              ? Effect.gen(function*() {
+          authenticate: (credential) => {
+            if (Redacted.value(credential) === "first") {
+              return Effect.gen(function*() {
                 yield* Deferred.succeed(started, undefined)
                 yield* Deferred.await(release)
                 return authenticated
               })
-              : Effect.succeed(authenticated)
+            }
+            return Effect.succeed(authenticated)
+          }
         }),
         Effect.provideService(PeerRelayLimits.PeerRelayLimits, {
           ...PeerRelayLimits.defaults,
@@ -395,7 +399,7 @@ describe("PeerAuthentication", () => {
     const [description, elapsed, expected] of [
       ["retains an exhausted inactive connection just before idle expiry", 999, "Capacity"],
       ["refreshes an exhausted inactive connection exactly at idle expiry", 1_000, "Authenticated"]
-    ] as const
+    ] satisfies ReadonlyArray<readonly [string, number, "Capacity" | "Authenticated"]>
   ) {
     it.effect(description, () =>
       Effect.gen(function*() {
@@ -415,14 +419,10 @@ describe("PeerAuthentication", () => {
         yield* invoke(middleware, { credential: Redacted.make("first") }, 1)
         yield* TestClock.adjust(elapsed)
         const result = yield* Effect.result(invoke(middleware, { credential: Redacted.make("second") }, 1))
-        assert.strictEqual(
-          Result.isSuccess(result)
-            ? "Authenticated"
-            : result.failure._tag === "RequestCapacityExceeded"
-            ? "Capacity"
-            : "Failure",
-          expected
-        )
+        let observed = "Failure"
+        if (Result.isSuccess(result)) observed = "Authenticated"
+        else if (result.failure._tag === "RequestCapacityExceeded") observed = "Capacity"
+        assert.strictEqual(observed, expected)
       }))
   }
 
@@ -485,15 +485,18 @@ describe("PeerAuthentication", () => {
         (yield* Metric.value(PeerRpcObservability.boundary("Authentication", "AuthenticationDenied"))).count,
         1
       )
-      const span = spans.find((span) => span.name === "effect_local_rpc.authentication")
+      const span = spans.find((candidate) => candidate.name === "effect_local_rpc.authentication")
       assert.isDefined(span)
-      assert.strictEqual(span!.status._tag, "Ended")
-      if (span!.status._tag === "Ended") assert.isTrue(Exit.isSuccess(span!.status.exit))
-      assert.deepStrictEqual(span!.events, [])
-      const telemetry = JSON.stringify([...span!.attributes]) +
-        (span!.status._tag === "Ended" && Exit.isFailure(span!.status.exit)
-          ? Cause.pretty(span!.status.exit.cause)
-          : span!.status._tag) +
+      if (span === undefined) return yield* Effect.die("authentication span was not recorded")
+      assert.strictEqual(span.status._tag, "Ended")
+      if (span.status._tag === "Ended") assert.isTrue(Exit.isSuccess(span.status.exit))
+      assert.deepStrictEqual(span.events, [])
+      let status = span.status._tag
+      if (span.status._tag === "Ended" && Exit.isFailure(span.status.exit)) {
+        status = Cause.pretty(span.status.exit.cause)
+      }
+      const telemetry = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))([...span.attributes]) +
+        status +
         (yield* Metric.dump)
       for (
         const forbidden of [
@@ -508,6 +511,7 @@ describe("PeerAuthentication", () => {
       ) {
         assert.notInclude(telemetry, forbidden)
       }
+      return yield* Effect.void
     }).pipe(
       Effect.provide(PeerAuthentication.layerServer),
       Effect.provideService(PeerAuthenticator.PeerAuthenticator, {

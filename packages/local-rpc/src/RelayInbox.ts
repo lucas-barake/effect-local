@@ -255,8 +255,16 @@ interface Session {
  * both busy from one delivery and lets a stale epoch's unsettled head hold the live epoch's stream
  * for the life of the session.
  */
+const ChannelKeyJson = Schema.fromJsonString(Schema.Tuple([
+  Schema.String,
+  Schema.String,
+  Schema.String,
+  Schema.Number,
+  Schema.String
+]))
+
 const channelId = (channel: RelayInboxStore.ChannelKey): string =>
-  JSON.stringify([
+  Schema.encodeSync(ChannelKeyJson)([
     channel.tenantId,
     channel.senderSubjectId,
     channel.senderPeerId,
@@ -396,7 +404,7 @@ export const layer = (options: Options) =>
           // The outbound queue is a rendezvous, so this suspends until the recipient actually
           // takes the message. Everything before it is bookkeeping that costs the message nothing.
           yield* Queue.offer(session.outbound, {
-            _tag: "StoredMessage" as const,
+            _tag: "StoredMessage",
             ...head.envelope,
             claimToken
           })
@@ -432,7 +440,7 @@ export const layer = (options: Options) =>
             Effect.catchTag("TimeoutError", () =>
               Effect.logWarning("Relay inbox delivery went unsettled past the settle deadline").pipe(
                 Effect.annotateLogs({ inboxKey, relayMessageId: head.relayMessageId }),
-                Effect.as("Abandoned" as const)
+                Effect.as<"Abandoned">("Abandoned")
               ))
           )
           if (outcome === "Abandoned") return
@@ -488,9 +496,8 @@ export const layer = (options: Options) =>
           // holding the entity's single handler permit against every other request for the device.
           Effect.ensuring(Effect.suspend(() => {
             const settlement = session.settlements.get(head.relayMessageId)
-            return settlement === undefined
-              ? Effect.void
-              : Effect.ignore(Deferred.fail(settlement.durable, new PeerRpcError.ServerUnavailable()))
+            if (settlement === undefined) return Effect.void
+            return Effect.ignore(Deferred.fail(settlement.durable, new PeerRpcError.ServerUnavailable()))
           })),
           Effect.ensuring(Effect.sync(() => {
             session.settlements.delete(head.relayMessageId)
@@ -519,12 +526,18 @@ export const layer = (options: Options) =>
             })
             for (const head of heads) {
               const channel = channelId(head.channel)
-              if (session.busyChannels.has(channel)) continue
+              if (session.busyChannels.has(channel)) {
+                continue
+              }
               // Skipped for this session only. Re-offering a head the front door just withheld
               // would spin, and passing over it to reach the next message in the same channel
               // would break the ordering the channel exists to preserve.
-              if (session.withheldChannels.has(channel)) continue
-              if (session.busyChannels.size >= options.maxConcurrentChannels) break
+              if (session.withheldChannels.has(channel)) {
+                continue
+              }
+              if (session.busyChannels.size >= options.maxConcurrentChannels) {
+                break
+              }
               session.busyChannels.add(channel)
               yield* Effect.forkIn(deliverHead(session, head), session.scope)
             }
@@ -539,20 +552,26 @@ export const layer = (options: Options) =>
               Effect.andThen(Effect.sleep(options.storeRetry)),
               Effect.andThen(dispatch(session))
             ))
-        ) as Effect.Effect<never>
+        )
 
       // A single long lived sweeper rather than a fiber inside each session scope, so that closing
       // a session is never performed by a fiber the close itself must interrupt.
       yield* Effect.gen(function*() {
         const current = yield* Ref.get(sessionRef)
-        if (Option.isNone(current)) return
+        if (Option.isNone(current)) {
+          return
+        }
         const now = yield* Clock.currentTimeMillis
         const deadlineAt = yield* Ref.get(current.value.deadlineAt)
-        if (now < deadlineAt) return
+        if (now < deadlineAt) {
+          return
+        }
         yield* sessionLock.withPermit(
           Effect.gen(function*() {
             const latest = yield* Ref.get(sessionRef)
-            if (Option.isNone(latest) || latest.value.sessionId !== current.value.sessionId) return
+            if (Option.isNone(latest) || latest.value.sessionId !== current.value.sessionId) {
+              return
+            }
             yield* Effect.logInfo("Relay inbox session deadline lapsed; releasing session").pipe(
               Effect.annotateLogs({ inboxKey, sessionId: current.value.sessionId })
             )
@@ -576,16 +595,18 @@ export const layer = (options: Options) =>
       // reference to the outer scope, so this is a property of the deployment's
       // `entityTerminationTimeout`, not something the entity can fix: size it knowing a rebalance
       // costs each moving device up to that long before its next session can be served.
-      yield* Effect.addFinalizer(() => Effect.orDie(closeCurrentSession))
+      yield* Effect.addFinalizer(() =>
+        Effect.orDie(closeCurrentSession)
+      )
 
       const currentSession = (sessionId: Identity.SessionId) =>
         Ref.get(sessionRef).pipe(
           Effect.flatMap(Option.match({
             onNone: () => Effect.fail(new PeerRpcError.SessionUnavailable()),
-            onSome: (session) =>
-              session.sessionId === sessionId
-                ? Effect.succeed(session)
-                : Effect.fail(new PeerRpcError.SessionUnavailable())
+            onSome: (session) => {
+              if (session.sessionId === sessionId) return Effect.succeed(session)
+              return Effect.fail(new PeerRpcError.SessionUnavailable())
+            }
           }))
         )
 
@@ -631,6 +652,7 @@ export const layer = (options: Options) =>
             if (Option.isSome(session)) {
               yield* session.value.wake.open
             }
+            return yield* Effect.void
           }).pipe(
             // Discriminated per reason rather than collapsed. Reporting a permanent fault as a
             // transient one makes the sender's outbox retry it forever.
@@ -719,16 +741,15 @@ export const layer = (options: Options) =>
                       // opens a fresh one. The cause is preserved rather than translated, because a
                       // dead dispatcher is a bug in the relay and not a decision about this peer.
                       yield* dispatch(session).pipe(
-                        Effect.onExit((exit) =>
-                          Exit.isFailure(exit) && Cause.hasDies(exit.cause)
-                            ? Effect.logFatal("Relay inbox dispatcher died", exit.cause).pipe(
+                        Effect.onExit((exit) => {
+                          if (Exit.isFailure(exit) && Cause.hasDies(exit.cause)) {
+                            return Effect.logFatal("Relay inbox dispatcher died", exit.cause).pipe(
                               Effect.annotateLogs({ inboxKey, sessionId: payload.sessionId }),
-                              Effect.andThen(
-                                Queue.fail(outbound, new PeerRpcError.ServerUnavailable())
-                              )
+                              Effect.andThen(Queue.fail(outbound, new PeerRpcError.ServerUnavailable()))
                             )
-                            : Effect.void
-                        ),
+                          }
+                          return Effect.void
+                        }),
                         Effect.forkIn(scope)
                       )
                       yield* Ref.set(sessionRef, Option.some(session))
@@ -770,6 +791,7 @@ export const layer = (options: Options) =>
             // relay receipt on this reply, so a premature success would leave neither side holding
             // the message.
             yield* Deferred.await(settlement.durable)
+            return yield* Effect.void
           }).pipe(
             Effect.withSpan("RelayInbox.Settle", {
               attributes: {

@@ -161,7 +161,7 @@ export const make = Effect.gen(function*() {
         request.channel.senderReplicaIncarnation !== sender.replicaIncarnation ||
         request.channel.senderConnectionEpoch !== sender.connectionEpoch
       ) {
-        return { _tag: "Conflict" } as const
+        return { _tag: "Conflict" } satisfies { readonly _tag: "Conflict" }
       }
 
       const existing = yield* findExisting({
@@ -175,7 +175,7 @@ export const make = Effect.gen(function*() {
         // relay, sequence, epoch, document, lineage and provenance. The message hash covers only
         // the inner payload, and both peers key their own deduplication on the digest.
         if (row.outer_envelope_digest !== request.envelope.outerEnvelopeDigest) {
-          return { _tag: "Conflict" } as const
+          return { _tag: "Conflict" } satisfies { readonly _tag: "Conflict" }
         }
         const state = yield* Schema.decodeUnknownEffect(RelayInboxStore.InboxState)(row.state).pipe(
           Effect.mapError(() =>
@@ -185,7 +185,10 @@ export const make = Effect.gen(function*() {
           )
         )
         if (state !== "DeadLettered" && state !== "Expired") {
-          return { _tag: "Duplicate", state } as const
+          return { _tag: "Duplicate", state } satisfies {
+            readonly _tag: "Duplicate"
+            readonly state: RelayInboxStore.InboxState
+          }
         }
         // The sender still holds custody and is replaying, which is better evidence than this
         // inbox's earlier decision to give up. Revived as a fresh attempt so the message is not
@@ -198,7 +201,7 @@ export const make = Effect.gen(function*() {
           revivedUsage.pending_count + 1 > request.quota.maxPendingMessages ||
           revivedUsage.pending_bytes + row.byte_size > request.quota.maxPendingBytes
         ) {
-          return { _tag: "QuotaExceeded" } as const
+          return { _tag: "QuotaExceeded" } satisfies { readonly _tag: "QuotaExceeded" }
         }
         yield* sql`
           UPDATE ${sql(table)}
@@ -211,7 +214,7 @@ export const make = Effect.gen(function*() {
           WHERE inbox_key = ${request.inboxKey}
             AND relay_message_id = ${request.envelope.relayMessageId}
         `
-        return { _tag: "Admitted" } as const
+        return { _tag: "Admitted" } satisfies { readonly _tag: "Admitted" }
       }
 
       const usage = yield* findUsage(request.inboxKey)
@@ -227,7 +230,7 @@ export const make = Effect.gen(function*() {
         usage.pending_count + 1 > request.quota.maxPendingMessages ||
         usage.pending_bytes + byteSize > request.quota.maxPendingBytes
       ) {
-        return { _tag: "QuotaExceeded" } as const
+        return { _tag: "QuotaExceeded" } satisfies { readonly _tag: "QuotaExceeded" }
       }
 
       const channelKey = yield* channelDigest(request.channel).pipe(
@@ -255,7 +258,7 @@ export const make = Effect.gen(function*() {
           ${request.now + request.messageTtlMillis}, ${deduplicateUntil}, NULL
         )
       `
-      return { _tag: "Admitted" } as const
+      return { _tag: "Admitted" } satisfies { readonly _tag: "Admitted" }
     })).pipe(
       Effect.catchTag("SqlError", (cause) =>
         Effect.fail(
@@ -443,19 +446,23 @@ export const make = Effect.gen(function*() {
     sql.withTransaction(Effect.gen(function*() {
       const before = yield* findCharge({ inboxKey, relayMessageId })
       if (Option.isNone(before)) {
-        return { _tag: "Recorded", deliveries: 0 } as const
+        return { _tag: "Recorded", deliveries: 0 } satisfies { readonly _tag: "Recorded"; readonly deliveries: number }
       }
       // Charged only for rows that are still `Pending`, so a message settled concurrently by its
       // recipient cannot be charged for a delivery it no longer needs.
       if (before.value.state !== "Pending") {
-        return { _tag: "Recorded", deliveries: before.value.deliveries } as const
+        return { _tag: "Recorded", deliveries: before.value.deliveries } satisfies {
+          readonly _tag: "Recorded"
+          readonly deliveries: number
+        }
       }
       // The budget counts consecutive transmissions with zero settled progress in the inbox, not
       // lifetime transmissions. Session churn that still drains something restarts every other
       // message's streak, so only a recipient that settles nothing across the whole budget — a
       // poisoned message or a peer that never comes back — loses custody to dead letter.
       const progressed = yield* findProgress({ inboxKey, since: before.value.charged_at })
-      const deliveries = progressed.progressed > 0 ? 1 : before.value.deliveries + 1
+      let deliveries = before.value.deliveries + 1
+      if (progressed.progressed > 0) deliveries = 1
       // Strictly greater: the attempt that spends the last of the budget is still a real delivery
       // the recipient can settle, so dead lettering at equality would waste it.
       if (deliveries > options.maxDeliveries) {
@@ -465,14 +472,17 @@ export const make = Effect.gen(function*() {
           WHERE inbox_key = ${inboxKey} AND relay_message_id = ${relayMessageId}
             AND state = 'Pending'
         `
-        return { _tag: "DeadLettered", deliveries } as const
+        return { _tag: "DeadLettered", deliveries } satisfies {
+          readonly _tag: "DeadLettered"
+          readonly deliveries: number
+        }
       }
       yield* sql`
         UPDATE ${sql(table)} SET deliveries = ${deliveries}, charged_at = ${options.now}
         WHERE inbox_key = ${inboxKey} AND relay_message_id = ${relayMessageId}
           AND state = 'Pending'
       `
-      return { _tag: "Recorded", deliveries } as const
+      return { _tag: "Recorded", deliveries } satisfies { readonly _tag: "Recorded"; readonly deliveries: number }
     })).pipe(
       Effect.catchTag("SqlError", (cause) =>
         Effect.fail(
@@ -554,11 +564,11 @@ export const make = Effect.gen(function*() {
   ) =>
     sql.withTransaction(Effect.gen(function*() {
       const current = yield* findExisting({ inboxKey, relayMessageId })
-      if (Option.isNone(current)) return "NotPending" as const
-      if (current.value.state !== "Pending") return "NotPending" as const
+      if (Option.isNone(current)) return "NotPending" satisfies "NotPending"
+      if (current.value.state !== "Pending") return "NotPending" satisfies "NotPending"
       // Checked against the stored row rather than the delivering fiber's memory, which is lost on
       // runner death and on defect restart.
-      if (current.value.message_hash !== options.messageHash) return "HashMismatch" as const
+      if (current.value.message_hash !== options.messageHash) return "HashMismatch" satisfies "HashMismatch"
 
       const horizon = options.now + options.terminalRetentionMillis
       // The horizon only ever grows. Shrinking it would reopen a deduplication window a sender may
@@ -579,10 +589,11 @@ export const make = Effect.gen(function*() {
       // in between; reporting success then would tell the recipient an acknowledgement is durable
       // when it never applied.
       const after = yield* findExisting({ inboxKey, relayMessageId })
-      if (Option.isNone(after)) return "NotPending" as const
-      return after.value.state === options.outcome && after.value.terminal_at === options.now
-        ? "Settled" as const
-        : "NotPending" as const
+      if (Option.isNone(after)) return "NotPending" satisfies "NotPending"
+      if (after.value.state === options.outcome && after.value.terminal_at === options.now) {
+        return "Settled" satisfies "Settled"
+      }
+      return "NotPending" satisfies "NotPending"
     })).pipe(
       Effect.catchTag("SqlError", (cause) =>
         Effect.fail(

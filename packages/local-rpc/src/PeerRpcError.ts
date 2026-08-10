@@ -78,6 +78,6 @@ export type PeerRpcError = typeof PeerRpcError.Type
 export const Defect: Rpc.DefectSchema = Schema.Unknown.pipe(
   Schema.encodeTo(Schema.Struct({ _tag: Schema.Literal("InternalError") }), {
     decode: SchemaGetter.transform(() => undefined),
-    encode: SchemaGetter.transform(() => ({ _tag: "InternalError" as const }))
+    encode: SchemaGetter.transform(() => ({ _tag: "InternalError" } satisfies { readonly _tag: "InternalError" }))
   })
 )

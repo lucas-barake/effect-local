@@ -106,14 +106,14 @@ const receiptLimits: PeerRelayReceiptLimits.Values = PeerRelayReceiptLimits.defa
 const checkpointToken = Uint8Array.of(17, 29, 43)
 const rejectForeignToken =
   (reason: string) =>
-  (claims: { readonly documentId: Identity.DocumentId }, token: CheckpointAuthority.AuthorizationToken) =>
-    Equal.equals(token, checkpointToken)
-      ? Effect.void
-      : Effect.fail(
-        new ReplicaError.ReplicaError({
-          reason: new ReplicaError.CheckpointRejected({ documentId: claims.documentId, reason })
-        })
-      )
+  (claims: { readonly documentId: Identity.DocumentId }, token: CheckpointAuthority.AuthorizationToken) => {
+    if (Equal.equals(token, checkpointToken)) return Effect.void
+    return Effect.fail(
+      new ReplicaError.ReplicaError({
+        reason: new ReplicaError.CheckpointRejected({ documentId: claims.documentId, reason })
+      })
+    )
+  }
 const checkpointAuthority: CheckpointAuthority.Implementation = {
   signManifest: () => Effect.succeed(Option.some(checkpointToken)),
   verifyManifest: rejectForeignToken("Invalid deterministic checkpoint token"),
@@ -183,7 +183,7 @@ const relayBackend = (inboxOverrides?: Partial<RelayInbox.Options>) =>
           }),
         (request) =>
           Effect.succeed({
-            _tag: "UnsafeUnboundedAutomerge3DecodeGrant" as const,
+            _tag: "UnsafeUnboundedAutomerge3DecodeGrant",
             risk: PeerRelayAuthorization.unsafeUnboundedAutomerge3DecodeRisk,
             principal: request.principal,
             remote: {
@@ -278,13 +278,12 @@ const relayBackend = (inboxOverrides?: Partial<RelayInbox.Options>) =>
       Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
         authenticate: (secret) => {
           const principal = principals.get(Redacted.value(secret))
-          return principal === undefined
-            ? Effect.fail(new PeerRpcError.AuthenticationFailure())
-            : Effect.succeed({
-              principal,
-              validUntil: Number.MAX_SAFE_INTEGER,
-              invalidated: Effect.never
-            })
+          if (principal === undefined) return Effect.fail(new PeerRpcError.AuthenticationFailure())
+          return Effect.succeed({
+            principal,
+            validUntil: Number.MAX_SAFE_INTEGER,
+            invalidated: Effect.never
+          })
         }
       }),
       Effect.provideService(PeerRelayLimits.PeerRelayLimits, PeerRelayLimits.defaults)
@@ -344,10 +343,14 @@ const clientStack = (
     PeerRelayReceiptLimits.layer(receiptLimits),
     PeerRelayOutboxLimits.layer(outboxLimits)
   )
-  const ReplicaLayer = SqlReplica.layerRelay(definition, {
-    projections: [],
-    ...(authority === undefined ? {} : { checkpointAuthority: authority })
-  }).pipe(
+  const replicaOptions: {
+    projections: ReadonlyArray<never>
+    checkpointAuthority?: CheckpointAuthority.Implementation
+  } = {
+    projections: []
+  }
+  if (authority !== undefined) replicaOptions.checkpointAuthority = authority
+  const ReplicaLayer = SqlReplica.layerRelay(definition, replicaOptions).pipe(
     Layer.provide(Handlers),
     Layer.provideMerge(Base),
     Layer.orDie
@@ -501,16 +504,17 @@ describe("relay custody against a real relay", () => {
           const expectedChangeHashes = new Set(commandHashes.map((row) => row.change_hash))
           const unavailable: PeerRpc.RpcClient = {
             ...client,
-            Push: ((request) =>
+            Push: (request) =>
               PeerSyncEnvelope.decodeSyncEnvelope(request.payload, replicaLimits).pipe(
                 Effect.provideService(Crypto.Crypto, backend.crypto),
                 Effect.orDie,
-                Effect.flatMap((envelope) =>
-                  envelope.writerProvenance.some((entry) => expectedChangeHashes.has(entry.changeHash))
-                    ? Effect.fail<PeerRpcError.PeerRpcError>(new PeerRpcError.ServerUnavailable())
-                    : client.Push(request)
-                )
-              )) as PeerRpc.RpcClient["Push"]
+                Effect.flatMap((envelope) => {
+                  if (envelope.writerProvenance.some((entry) => expectedChangeHashes.has(entry.changeHash))) {
+                    return Effect.fail<PeerRpcError.PeerRpcError>(new PeerRpcError.ServerUnavailable())
+                  }
+                  return client.Push(request)
+                })
+              )
           }
           const attempt = yield* Effect.exit(Effect.scoped(Effect.gen(function*() {
             yield* connectRecipient(recipientClient, recipient, documentId)
@@ -535,7 +539,7 @@ describe("relay custody against a real relay", () => {
             if (delivery._tag !== "TrackedCommand") continue
             assert.strictEqual(delivery.localChangeCount, 1)
             assert.strictEqual(delivery.destinations.length, 1)
-            const destination = delivery.destinations[0]!
+            const destination = delivery.destinations[0]
             assert.strictEqual(destination.relayPeerId, relayPeerId)
             assert.strictEqual(destination.remotePeerId, remotePeerId)
             assert.strictEqual(destination.state._tag, "PendingRelayCustody")
@@ -559,7 +563,7 @@ describe("relay custody against a real relay", () => {
             if (delivery._tag !== "TrackedCommand") continue
             assert.strictEqual(delivery.localChangeCount, 1)
             assert.strictEqual(delivery.destinations.length, 1)
-            const destination = delivery.destinations[0]!
+            const destination = delivery.destinations[0]
             assert.strictEqual(destination.relayPeerId, relayPeerId)
             assert.strictEqual(destination.remotePeerId, remotePeerId)
             assert.strictEqual(destination.state._tag, "RelayCustodyAccepted")
@@ -612,7 +616,7 @@ describe("relay custody against a real relay", () => {
           const [side, label] of [
             [sender, "from-sender"],
             [recipient, "from-recipient"]
-          ] as const
+          ] satisfies ReadonlyArray<readonly [typeof sender, string]>
         ) {
           yield* side.replica.mutate(AddLabel, {
             commandId: yield* Identity.makeCommandId,
@@ -778,10 +782,10 @@ describe("relay custody against a real relay", () => {
             ORDER BY commit_sequence DESC
             LIMIT 1
           `
-          assert.strictEqual(
-            (JSON.parse(checkpointRows[0]!.writer_provenance) as { readonly _tag?: string })._tag,
-            "Compact"
-          )
+          const provenance = Schema.decodeUnknownSync(
+            Schema.fromJsonString(Schema.Struct({ _tag: Schema.optional(Schema.String) }))
+          )(checkpointRows[0].writer_provenance)
+          assert.strictEqual(provenance._tag, "Compact")
 
           for (const side of [sender, recipient]) {
             assert.strictEqual((yield* outboxRows(side.sql)).length, 0)
@@ -904,10 +908,13 @@ describe("relay custody against a real relay", () => {
         const blockPush = yield* Ref.make(false)
         const blockedRecipientClient: PeerRpc.RpcClient = {
           ...recipientClient,
-          Push: ((request) =>
+          Push: (request) =>
             Ref.get(blockPush).pipe(
-              Effect.flatMap((blocked) => blocked ? Effect.never : recipientClient.Push(request))
-            )) as PeerRpc.RpcClient["Push"]
+              Effect.flatMap((blocked) => {
+                if (blocked) return Effect.never
+                return recipientClient.Push(request)
+              })
+            )
         }
 
         yield* recipient.replica.mutate(AddLabel, {
@@ -1067,8 +1074,8 @@ describe("relay custody against a real relay", () => {
         // A session that takes the head and cannot settle it spends the head's whole budget.
         const failingSettles: PeerRpc.RpcClient = {
           ...recipientClient,
-          Acknowledge: ((() => Effect.fail(new PeerRpcError.ServerUnavailable())) as PeerRpc.RpcClient["Acknowledge"]),
-          Reject: ((() => Effect.fail(new PeerRpcError.ServerUnavailable())) as PeerRpc.RpcClient["Reject"])
+          Acknowledge: () => Effect.fail(new PeerRpcError.ServerUnavailable()),
+          Reject: () => Effect.fail(new PeerRpcError.ServerUnavailable())
         }
         yield* Effect.exit(Effect.scoped(Effect.gen(function*() {
           yield* connectRecipient(failingSettles, recipient, documentId)
@@ -1078,7 +1085,7 @@ describe("relay custody against a real relay", () => {
         const recipientInbox = yield* inboxKeyOf(remotePrincipal, backend.crypto)
         const exhausted = yield* backend.store.pendingHeads(recipientInbox, { limit: 10, now: 0 }).pipe(Effect.orDie)
         assert.isAbove(exhausted.length, 0, "the unsettled head stays pending")
-        assert.isAbove(exhausted[0]!.deliveries, 0, "the failed session spent the head's budget")
+        assert.isAbove(exhausted[0].deliveries, 0, "the failed session spent the head's budget")
 
         // A fresh honest session must not die on the exhausted head: the relay dead letters it
         // without transmitting it, and the rest of the backlog drains and settles normally.
@@ -1135,7 +1142,7 @@ describe("relay custody against a real relay", () => {
               return Effect.fail(new PeerRpcError.ServerUnavailable())
             }
             return recipientClient.Acknowledge(request)
-          }) as PeerRpc.RpcClient["Acknowledge"]
+          })
         }
         yield* Effect.scoped(Effect.gen(function*() {
           yield* connectRecipient(flakySettles, recipient, documentId)
@@ -1181,7 +1188,7 @@ describe("relay custody against a real relay", () => {
         // here would lose it with nobody holding a copy.
         const unavailable: PeerRpc.RpcClient = {
           ...client,
-          Push: ((() => Effect.fail(new PeerRpcError.ServerUnavailable())) as PeerRpc.RpcClient["Push"])
+          Push: () => Effect.fail(new PeerRpcError.ServerUnavailable())
         }
         // A failed push is fatal to the connection, so closing the scope reports it too.
         const attempt = yield* Effect.exit(Effect.scoped(Effect.gen(function*() {
@@ -1201,7 +1208,7 @@ describe("relay custody against a real relay", () => {
 
           const heads = yield* backend.store.pendingHeads(recipientInbox, { limit: 10, now: 0 }).pipe(Effect.orDie)
           assert.isTrue(
-            heads.some((head) => head.relayMessageId === pending[0]!.relay_message_id),
+            heads.some((head) => head.relayMessageId === pending[0].relay_message_id),
             "the entry the failed session admitted reached the relay through the replay"
           )
           assert.strictEqual((yield* outboxRows(sender.sql)).length, 0)

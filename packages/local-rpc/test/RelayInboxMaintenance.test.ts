@@ -76,7 +76,7 @@ const admission = (now: number, ttl: number) => ({
       sequence: 0
     },
     recipient: { tenantId: "tenant-a", subjectId: "recipient-a", peerId: peer("00000000bbb1") },
-    payloadVersion: 1 as const,
+    payloadVersion: 1,
     document: { documentId: documentId("00000000dddd"), documentType: "note" },
     writerProvenance: [],
     messageHash: "a".repeat(64),

@@ -197,29 +197,29 @@ const harness = (options?: {
     const authorization = yield* PeerRelayAuthorization.PeerRelayAuthorization.pipe(
       Effect.provide(PeerRelayAuthorization.layer(
         (request) =>
-          knobs.onAuthorize(request).pipe(Effect.andThen(
-            knobs.allow(request)
-              ? Effect.succeed({
-                remote: {
-                  tenantId: request.principal.tenantId,
-                  subjectId: request.remote.subjectId,
-                  peerId: request.remote.peerId
-                },
-                documents: request.documents.map((requested) => ({
-                  document: Task,
-                  documentId: requested.documentId
-                })),
-                validUntil: knobs.grantValidUntil(request),
-                invalidated: Effect.never
-              })
-              : Effect.fail(new PeerRpcError.AccessDenied())
-          )),
+          knobs.onAuthorize(request).pipe(Effect.flatMap(() => {
+            if (!knobs.allow(request)) return Effect.fail(new PeerRpcError.AccessDenied())
+            return Effect.succeed({
+              remote: {
+                tenantId: request.principal.tenantId,
+                subjectId: request.remote.subjectId,
+                peerId: request.remote.peerId
+              },
+              documents: request.documents.map((requested) => ({
+                document: Task,
+                documentId: requested.documentId
+              })),
+              validUntil: knobs.grantValidUntil(request),
+              invalidated: Effect.never
+            })
+          })),
         // Deliberately independent of `allow`. Tying the two together would make removing either
         // port from production invisible, since revoking one knob would revoke both gates at once.
         (request) =>
-          knobs.allowRisk(request)
-            ? Effect.succeed({
-              _tag: "UnsafeUnboundedAutomerge3DecodeGrant" as const,
+          (() => {
+            if (!knobs.allowRisk(request)) return Effect.fail(new PeerRpcError.AccessDenied())
+            return Effect.succeed({
+              _tag: "UnsafeUnboundedAutomerge3DecodeGrant",
               risk: PeerRelayAuthorization.unsafeUnboundedAutomerge3DecodeRisk,
               principal: request.principal,
               remote: {
@@ -232,7 +232,7 @@ const harness = (options?: {
               validUntil: Number.MAX_SAFE_INTEGER,
               invalidated: Effect.never
             })
-            : Effect.fail(new PeerRpcError.AccessDenied())
+          })()
       ))
     )
 
@@ -244,13 +244,14 @@ const harness = (options?: {
       Layer.orDie
     )
     const decorate = options?.store
-    const storeLayer = decorate === undefined
-      ? realStore
-      : Layer.effect(RelayInboxStore.RelayInboxStore)(
+    let storeLayer = realStore
+    if (decorate !== undefined) {
+      storeLayer = Layer.effect(RelayInboxStore.RelayInboxStore)(
         Effect.gen(function*() {
           return decorate(yield* RelayInboxStore.RelayInboxStore)
         })
       ).pipe(Layer.provide(realStore))
+    }
 
     const cluster = Sharding.layer.pipe(
       Layer.provide(Runners.layerNoop),
@@ -263,11 +264,11 @@ const harness = (options?: {
 
     // Either the handlers alone, which most tests want because they can then drive the entity
     // directly, or the exported layer a deployment actually builds.
-    const relay = options?.composed === undefined
-      ? RelayServer.layerHandlers(serverOptions).pipe(
-        Layer.provideMerge(RelayInbox.layer(inboxOptions))
-      )
-      : RelayServer.layer({
+    let relay = RelayServer.layerHandlers(serverOptions).pipe(
+      Layer.provideMerge(RelayInbox.layer(inboxOptions))
+    )
+    if (options?.composed !== undefined) {
+      relay = RelayServer.layer({
         ...serverOptions,
         ...options.composed,
         inbox: inboxOptions,
@@ -278,6 +279,7 @@ const harness = (options?: {
           enabled: true
         }
       })
+    }
 
     const context = yield* Layer.build(
       relay.pipe(
@@ -302,13 +304,12 @@ const harness = (options?: {
       Effect.provideService(PeerAuthenticator.PeerAuthenticator, {
         authenticate: (secret) => {
           const principal = principals.get(Redacted.value(secret))
-          return principal === undefined
-            ? Effect.fail(new PeerRpcError.AuthenticationFailure())
-            : Effect.succeed({
-              principal,
-              validUntil: knobs.authority.validUntil,
-              invalidated: knobs.authority.invalidated
-            })
+          if (principal === undefined) return Effect.fail(new PeerRpcError.AuthenticationFailure())
+          return Effect.succeed({
+            principal,
+            validUntil: knobs.authority.validUntil,
+            invalidated: knobs.authority.invalidated
+          })
         }
       }),
       Effect.provideService(PeerRelayLimits.PeerRelayLimits, limits)
@@ -446,11 +447,13 @@ describe("RelayServer", () => {
       let observeReceive = false
       const peer = yield* harness({
         knobs: {
-          onAuthorize: (request) =>
-            observeReceive && request.direction === "Receive" &&
+          onAuthorize: (request) => {
+            if (
+              observeReceive && request.direction === "Receive" &&
               request.principal.subjectId === recipient.subjectId
-              ? Deferred.succeed(receiveChecked, undefined).pipe(Effect.asVoid)
-              : Effect.void
+            ) return Deferred.succeed(receiveChecked, undefined).pipe(Effect.asVoid)
+            return Effect.void
+          }
         }
       })
       const senderSession = yield* open(peer, sender, recipient)
@@ -648,6 +651,7 @@ describe("RelayServer", () => {
         { limit: 10, now: 0 }
       )
       assert.strictEqual(pending.length, 0, "an acknowledged message is terminal")
+      return yield* Effect.void
     })))
 
   it.effect("replaces the incumbent session and refuses its session id afterwards", () =>
@@ -805,11 +809,12 @@ describe("RelayServer", () => {
       const keepOpen = yield* Deferred.make<void>()
       const run = (client: PeerRpc.RpcClient) =>
         client.Open(openRequest(sender, recipient)).pipe(
-          Stream.runForEach((event) =>
-            event._tag === "Opened"
-              ? Queue.offer(outcomes, "Opened").pipe(Effect.andThen(Deferred.await(keepOpen)))
-              : Effect.void
-          ),
+          Stream.runForEach((event) => {
+            if (event._tag === "Opened") {
+              return Queue.offer(outcomes, "Opened").pipe(Effect.andThen(Deferred.await(keepOpen)))
+            }
+            return Effect.void
+          }),
           Effect.catch((error) => Queue.offer(outcomes, error)),
           Effect.forkScoped
         )
@@ -872,7 +877,7 @@ describe("RelayServer", () => {
         !(
           request.direction === "Receive" &&
           request.documents.length === 1 &&
-          request.documents[0]!.documentId === documentId
+          request.documents[0].documentId === documentId
         )
 
       // One withheld channel per concurrent delivery slot, admitted first so they are the older
@@ -979,7 +984,11 @@ describe("RelayServer", () => {
           ...openRequest(sender, recipient),
           expectedLocal: PeerAuthentication.PeerPrincipal.make(claimed)
         }).pipe(Stream.runDrain, Effect.flip)
-        assert.strictEqual(failure._tag, "PeerMismatch", `expectedLocal ${JSON.stringify(claimed)}`)
+        assert.strictEqual(
+          failure._tag,
+          "PeerMismatch",
+          `expectedLocal ${Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(claimed)}`
+        )
       }
     })))
 
@@ -1030,6 +1039,7 @@ describe("RelayServer", () => {
         { limit: 10, now: 0 }
       )
       assert.strictEqual(pending.length, 1, "the terminal transition never ran")
+      return yield* Effect.void
     })))
 
   it.effect("surfaces an internal authorization fault as a defect rather than a typed error", () =>
@@ -1037,7 +1047,7 @@ describe("RelayServer", () => {
       const peer = yield* harness({
         knobs: {
           allow: () => {
-            throw new Error("authorization backend is broken")
+            return Effect.runSync(Effect.die("authorization backend is broken"))
           }
         }
       })
@@ -1106,7 +1116,7 @@ describe("RelayServer", () => {
       // A session is bidirectional the moment it opens: the client may push, and the relay attaches
       // a delivery stream. Each direction therefore has to be granted on its own, and denying one
       // must not be answered by the other having said yes.
-      for (const denied of ["Send", "Receive"] as const) {
+      for (const denied of ["Send", "Receive"] satisfies ReadonlyArray<PeerRelayAuthorization.Direction>) {
         peer.knobs.allow = (request) => request.direction !== denied
         const failure = yield* peer.client.Open(openRequest(sender, recipient)).pipe(
           Stream.runDrain,
@@ -1125,9 +1135,14 @@ describe("RelayServer", () => {
       // still fresh by the time the session is minted. The authorization port itself only refuses a
       // grant that was already expired when it answered, so the relay has to re-check both against
       // the clock afterwards or it opens a session on authority that has since run out.
-      peer.knobs.grantValidUntil = (request) =>
-        request.direction === "Send" ? openedAt + 1_000 : Number.MAX_SAFE_INTEGER
-      peer.knobs.onAuthorize = (request) => request.direction === "Receive" ? TestClock.adjust(2_000) : Effect.void
+      peer.knobs.grantValidUntil = (request) => {
+        if (request.direction === "Send") return openedAt + 1_000
+        return Number.MAX_SAFE_INTEGER
+      }
+      peer.knobs.onAuthorize = (request) => {
+        if (request.direction === "Receive") return TestClock.adjust(2_000)
+        return Effect.void
+      }
 
       const failure = yield* peer.client.Open(openRequest(sender, recipient)).pipe(
         Stream.runDrain,
@@ -1146,7 +1161,10 @@ describe("RelayServer", () => {
       // credential is an authentication problem, not an authorization one, because the client has
       // to renew rather than ask for different permissions.
       peer.knobs.authority.validUntil = openedAt + 1_000
-      peer.knobs.onAuthorize = (request) => request.direction === "Receive" ? TestClock.adjust(2_000) : Effect.void
+      peer.knobs.onAuthorize = (request) => {
+        if (request.direction === "Receive") return TestClock.adjust(2_000)
+        return Effect.void
+      }
 
       const failure = yield* peer.client.Open(openRequest(sender, recipient)).pipe(
         Stream.runDrain,
@@ -1299,6 +1317,7 @@ describe("RelayServer", () => {
         { limit: 10, now: 0 }
       )
       assert.strictEqual(pending.length, 1, "the terminal transition never ran")
+      return yield* Effect.void
     })))
 
   it.effect("withholds a delivery whose unbounded decode risk is not acknowledged", () =>
@@ -1396,6 +1415,7 @@ describe("RelayServer", () => {
         { limit: 10, now: 0 }
       )
       assert.strictEqual(pending.length, 1, "the terminal transition never ran")
+      return yield* Effect.void
     })))
 
   it.effect(
@@ -1468,11 +1488,12 @@ describe("RelayServer", () => {
         ]
       ) {
         const exit = yield* Effect.scoped(composed(broken)).pipe(Effect.exit)
-        assert.isTrue(exit._tag === "Failure", JSON.stringify(broken))
+        const brokenJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(broken)
+        assert.isTrue(exit._tag === "Failure", brokenJson)
         if (exit._tag !== "Failure") continue
         // A defect, not a typed failure: nothing downstream can recover from a relay that was
         // configured to reap its own sessions.
-        assert.isTrue(Cause.hasDies(exit.cause), JSON.stringify(broken))
+        assert.isTrue(Cause.hasDies(exit.cause), brokenJson)
       }
     }))
 })

@@ -104,8 +104,8 @@ const RelaySyncEnvelopeJson = Schema.fromJsonString(
 )
 
 const tcpPort = (address: SocketServer.Address) => {
-  assert.strictEqual(address._tag, "TcpAddress")
-  return (address as SocketServer.TcpAddress).port
+  if (address._tag === "TcpAddress") return address.port
+  return Schema.decodeUnknownSync(Schema.Never)(address)
 }
 
 describe("relay wire format", () => {
@@ -135,7 +135,7 @@ describe("relay wire format", () => {
               }),
             (request) =>
               Effect.succeed({
-                _tag: "UnsafeUnboundedAutomerge3DecodeGrant" as const,
+                _tag: "UnsafeUnboundedAutomerge3DecodeGrant",
                 risk: PeerRelayAuthorization.unsafeUnboundedAutomerge3DecodeRisk,
                 principal: request.principal,
                 remote: {
@@ -155,13 +155,12 @@ describe("relay wire format", () => {
         const authenticator = PeerAuthenticator.PeerAuthenticator.of({
           authenticate: (secret) => {
             const principal = principals.get(Redacted.value(secret))
-            return principal === undefined
-              ? Effect.fail(new PeerRpcError.AuthenticationFailure())
-              : Effect.succeed({
-                principal,
-                validUntil: Number.MAX_SAFE_INTEGER,
-                invalidated: Effect.never
-              })
+            if (principal === undefined) return Effect.fail(new PeerRpcError.AuthenticationFailure())
+            return Effect.succeed({
+              principal,
+              validUntil: Number.MAX_SAFE_INTEGER,
+              invalidated: Effect.never
+            })
           }
         })
 
@@ -285,12 +284,16 @@ describe("relay wire format", () => {
         assert.deepStrictEqual(stored.recipient, recipient)
         assert.strictEqual(stored.sender.peerId, senderPeerId)
 
-        yield* recipientClient.Acknowledge({
-          sessionId: (recipientOpened as PeerRpc.Opened).sessionId,
-          relayMessageId: stored.relayMessageId,
-          claimToken: stored.claimToken,
-          messageHash: stored.messageHash
-        })
+        if (recipientOpened._tag !== "Opened") {
+          yield* Effect.die("Expected opened recipient")
+        } else {
+          yield* recipientClient.Acknowledge({
+            sessionId: recipientOpened.sessionId,
+            relayMessageId: stored.relayMessageId,
+            claimToken: stored.claimToken,
+            messageHash: stored.messageHash
+          })
+        }
 
         // Reconnecting proves the acknowledgement crossed the wire and was applied durably. Rather
         // than waiting a while and asserting nothing arrived, push a second message and require it
@@ -332,6 +335,7 @@ describe("relay wire format", () => {
           secondRelayMessageId,
           "an acknowledged message must not be redelivered"
         )
+        yield* Effect.void
       })),
     { timeout: 30_000 }
   )

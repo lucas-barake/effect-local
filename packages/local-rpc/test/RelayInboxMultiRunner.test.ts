@@ -64,13 +64,14 @@ const clientFor = (database?: string) =>
   Layer.unwrap(Effect.gen(function*() {
     const container = yield* PgContainer
     const uri = container.getConnectionUri()
-    const url = database === undefined ? uri : uri.slice(0, uri.lastIndexOf("/")) + "/" + database
+    let url = uri
+    if (database !== undefined) url = uri.slice(0, uri.lastIndexOf("/")) + "/" + database
     return Layer.orDie(PgClient.layer({ url: Redacted.make(url) }))
   }))
 
 const tcpPort = (address: SocketServer.Address) => {
-  assert.strictEqual(address._tag, "TcpAddress")
-  return (address as SocketServer.TcpAddress).port
+  if (address._tag !== "TcpAddress") return assert.fail("Expected TCP address")
+  return address.port
 }
 
 const createDatabase = (name: string) =>
@@ -113,8 +114,8 @@ const runner = (
     Layer.updateService(RunnerStorage.RunnerStorage, (storage) => {
       return RunnerStorage.RunnerStorage.of({
         ...storage,
-        register: (runner, healthy) =>
-          storage.register(runner, healthy).pipe(
+        register: (runnerRegistration, healthy) =>
+          storage.register(runnerRegistration, healthy).pipe(
             Effect.tap(() => Deferred.succeed(probe.registered, undefined)),
             Effect.tap(() => Deferred.await(probe.clusterReady))
           ),
@@ -184,7 +185,7 @@ const deliver = (id: string, sequence: number) => ({
       subjectId: "recipient-a",
       peerId: peer("00000000bbb1")
     },
-    payloadVersion: 1 as const,
+    payloadVersion: 1,
     document: { documentId: documentId("00000000dddd"), documentType: "note" },
     writerProvenance: [],
     messageHash: id.padStart(64, "a"),
@@ -219,12 +220,14 @@ const probe = (options: { readonly isolated: boolean }) =>
     const socketServerA = Context.get(listenerA, SocketServer.SocketServer)
     const socketServerB = Context.get(listenerB, SocketServer.SocketServer)
     const contextA = yield* Layer.build(runner(tcpPort(socketServerA.address), socketServerA, probeA, clientFor()))
+    let databaseB: string | undefined
+    if (options.isolated) databaseB = "runner_b"
     const contextB = yield* Layer.build(
       runner(
         tcpPort(socketServerB.address),
         socketServerB,
         probeB,
-        clientFor(options.isolated ? "runner_b" : undefined)
+        clientFor(databaseB)
       )
     )
 
@@ -239,7 +242,8 @@ const probe = (options: { readonly isolated: boolean }) =>
     const shardId = yield* RelayInbox.RelayInbox.getShardId(EntityId.make(inboxKey)).pipe(
       Effect.provideContext(contextA)
     )
-    const expectedOwners = options.isolated ? 2 : 1
+    let expectedOwners = 1
+    if (options.isolated) expectedOwners = 2
     const ownership = yield* Effect.all([Queue.take(probeA.ownership), Queue.take(probeB.ownership)])
     assert.strictEqual(
       ownership.filter((shards) => shards.some((owned) => Equal.equals(owned, shardId))).length,
@@ -272,12 +276,12 @@ const probe = (options: { readonly isolated: boolean }) =>
       )
     )
     const headB = yield* Queue.take(deliveredB)
-    assert.strictEqual(
-      headB.relayMessageId,
-      relayId(options.isolated ? "000000000002" : "000000000001")
-    )
+    let expectedHead = "000000000001"
+    if (options.isolated) expectedHead = "000000000002"
+    assert.strictEqual(headB.relayMessageId, relayId(expectedHead))
 
-    const exit = options.isolated ? undefined : yield* Fiber.await(streamA)
+    let exit: Exit.Exit<unknown, unknown> | undefined
+    if (!options.isolated) exit = yield* Fiber.await(streamA)
 
     const owners = yield* Effect.forEach([contextA, contextB], (context) =>
       Sharding.Sharding.pipe(
@@ -306,7 +310,7 @@ describe("RelayInbox multi-runner", () => {
       const { exit, hosting } = yield* probe({ isolated: false })
 
       assert.deepStrictEqual(
-        hosting.toSorted(),
+        hosting.toSorted((left, right) => left - right),
         [0, 1],
         "exactly one of the two runners hosts this inbox key, and the other serves its client over the wire"
       )

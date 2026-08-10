@@ -63,7 +63,7 @@ const envelope = (options: {
       subjectId: "recipient-a",
       peerId: peer("00000000bbb1")
     },
-    payloadVersion: 1 as const,
+    payloadVersion: 1,
     document: { documentId: documentId("00000000dddd"), documentType: "note" },
     writerProvenance: [],
     messageHash: "a".repeat(64),
@@ -135,7 +135,7 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
 
       const heads = yield* store.pendingHeads("admit", { limit: 10, now: 0 })
       assert.strictEqual(heads.length, 1)
-      assert.strictEqual(heads[0]!.relayMessageId, relayId("000000000001"))
+      assert.strictEqual(heads[0].relayMessageId, relayId("000000000001"))
     })
   },
   {
@@ -146,7 +146,7 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
       const replay = yield* store.admit(admission({ inboxKey: "replay", id: "000000000001", sequence: 0, now: 1 }))
 
       assert.strictEqual(replay._tag, "Duplicate")
-      assert.strictEqual(replay._tag === "Duplicate" ? replay.state : "", "Pending")
+      if (replay._tag === "Duplicate") assert.strictEqual(replay.state, "Pending")
       const heads = yield* store.pendingHeads("replay", { limit: 10, now: 0 })
       assert.strictEqual(heads.length, 1, "a replay must not create a second row")
     })
@@ -339,7 +339,7 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
 
       const heads = yield* store.pendingHeads("order", { limit: 10, now: 0 })
       assert.strictEqual(heads.length, 1, "one head per channel")
-      assert.strictEqual(heads[0]!.relayMessageId, relayId("000000000001"))
+      assert.strictEqual(heads[0].relayMessageId, relayId("000000000001"))
     })
   },
   {
@@ -476,7 +476,7 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
       const exits = yield* Effect.all(
         ids.slice(0, 4).map((id) =>
           store.settle("concurrent", relayId(id), {
-            outcome: "Acknowledged" as const,
+            outcome: "Acknowledged",
             messageHash: "a".repeat(64),
             now: 2,
             terminalRetentionMillis: 1_000
@@ -499,7 +499,7 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
 
       const abandoned = yield* store.abandoned("abandoned", { limit: 10 })
       assert.strictEqual(abandoned.length, 1)
-      assert.strictEqual(abandoned[0]!.state, "DeadLettered")
+      assert.strictEqual(abandoned[0].state, "DeadLettered")
     })
   },
   {
@@ -544,7 +544,7 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
       const store = yield* RelayInboxStore.RelayInboxStore
       yield* store.admit(admission({ inboxKey: "resettle", id: "000000000001", sequence: 0, now: 0 }))
       const options = {
-        outcome: "Acknowledged" as const,
+        outcome: "Acknowledged",
         messageHash: "a".repeat(64),
         now: 10,
         terminalRetentionMillis: 1_000
@@ -608,7 +608,7 @@ export const relayInboxStoreContract: ReadonlyArray<ContractCheck> = [
         admission({ inboxKey: "erase-ack", id: "000000000001", sequence: 0, now: 20, horizon: 100_000 })
       )
       assert.strictEqual(replay._tag, "Duplicate")
-      assert.strictEqual(replay._tag === "Duplicate" ? replay.state : "", "Acknowledged")
+      if (replay._tag === "Duplicate") assert.strictEqual(replay.state, "Acknowledged")
     })
   },
   {

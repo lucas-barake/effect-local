@@ -102,6 +102,7 @@ interface TransientBucket {
 const RelayEnvelopeJson = Schema.fromJsonString(
   Schema.toCodecJson(PeerSyncEnvelope.SyncEnvelope)
 )
+const SubjectKey = Schema.fromJsonString(Schema.Tuple([Schema.String, Schema.String]))
 
 export const layerHandlers = (options: Options) =>
   PeerRpc.Rpcs.toLayer(Effect.gen(function*() {
@@ -243,6 +244,7 @@ export const layerHandlers = (options: Options) =>
         yield* Effect.sync(() => {
           session.delivered.delete(payload.relayMessageId)
         })
+        return yield* Effect.void
       }).pipe(
         // Identifiers only. The session id is unguessable but not secret, and the message hash is
         // already a digest; the payload is never an attribute.
@@ -322,12 +324,12 @@ export const layerHandlers = (options: Options) =>
 
             // The slot is acquired with its scope finalizer before any asynchronous session setup.
             // Concurrent Open calls therefore count reservations, not only fully registered sessions.
-            const subjectKey = JSON.stringify([principal.tenantId, principal.subjectId])
+            const subjectKey = Schema.encodeSync(SubjectKey)([principal.tenantId, principal.subjectId])
             yield* Effect.acquireRelease(
               Ref.modify(sessionSlots, (current) => {
                 const held = current.get(subjectKey) ?? 0
-                if (held >= limits.maxSessionsPerSubject) return [false, current] as const
-                return [true, new Map(current).set(subjectKey, held + 1)] as const
+                if (held >= limits.maxSessionsPerSubject) return [false, current]
+                return [true, new Map(current).set(subjectKey, held + 1)]
               }).pipe(
                 Effect.filterOrFail(
                   (reserved) => reserved,
@@ -481,18 +483,19 @@ export const layerHandlers = (options: Options) =>
                     documentType: message.document.documentType,
                     documentId: message.document.documentId
                   }]
-                  return Effect.suspend(() =>
+                  return Effect.suspend(() => {
                     // A grant can only ever name a remote inside the caller's own tenant, so a row
                     // claiming a foreign one is refused outright rather than put to the policy port.
-                    message.sender.tenantId !== session.principal.tenantId
-                      ? Effect.fail(new PeerRpcError.AccessDenied())
-                      : authorization.authorize({
-                        direction: "Receive",
-                        principal: session.principal,
-                        remote,
-                        documents
-                      })
-                  ).pipe(
+                    if (message.sender.tenantId !== session.principal.tenantId) {
+                      return Effect.fail(new PeerRpcError.AccessDenied())
+                    }
+                    return authorization.authorize({
+                      direction: "Receive",
+                      principal: session.principal,
+                      remote,
+                      documents
+                    })
+                  }).pipe(
                     // Delivering commits this peer to decoding the document, so the same risk
                     // acknowledgement the sender needed is required again on the receiving side, per
                     // message rather than once at the handshake.
@@ -512,7 +515,7 @@ export const layerHandlers = (options: Options) =>
                         const oldest = session.delivered.keys().next()
                         if (!oldest.done) session.delivered.delete(oldest.value)
                       }
-                      session.delivered.set(message.relayMessageId, { remote, document: documents[0]! })
+                      session.delivered.set(message.relayMessageId, { remote, document: documents[0] })
                     })),
                     Effect.as(true),
                     Effect.catchTag("AccessDenied", () =>
@@ -671,6 +674,7 @@ export const layerHandlers = (options: Options) =>
             Effect.catchTag("AlreadyProcessingMessage", () => new PeerRpcError.SessionOverloaded()),
             Effect.catchTag("PersistenceError", () => new PeerRpcError.ServerUnavailable())
           )
+          return yield* Effect.void
         }).pipe(
           Effect.withSpan("RelayServer.Push", {
             attributes: { relay_message_id: payload.relayMessageId }
@@ -729,6 +733,7 @@ export const layerHandlers = (options: Options) =>
             Effect.catchTag("AlreadyProcessingMessage", () => new PeerRpcError.SessionOverloaded()),
             Effect.catchTag("PersistenceError", () => new PeerRpcError.ServerUnavailable())
           )
+          return yield* Effect.void
         }).pipe(Effect.withSpan("RelayServer.Transient")),
 
       Acknowledge: (payload) => settle(payload, "Acknowledged"),
@@ -767,19 +772,20 @@ export const layer = (
     // cycle and no client can hold a delivery stream — a total outage that only appears under a
     // particular configuration, so it is refused at construction rather than discovered in
     // production. The factor of two leaves room for one lost heartbeat.
-    Layer.provide(Layer.effectDiscard(Effect.suspend(() =>
+    Layer.provide(Layer.effectDiscard(Effect.suspend(() => {
       // Suspended, because `Duration.toMillis` throws on an input that is not a duration at all.
       // Evaluated eagerly it would throw out of `RelayServer.layer(...)` itself, before there is a
       // layer to fail, which is not where a consumer looks for a configuration error.
-      Duration.toMillis(options.heartbeatInterval) * 2 <
+      if (
+        Duration.toMillis(options.heartbeatInterval) * 2 <
           Duration.toMillis(options.inbox.sessionDeadline) &&
         Duration.toMillis(options.entityCallTimeout) > 0
-        ? Effect.void
-        : Effect.die(
-          new Error(
-            "RelayServer: heartbeatInterval * 2 must be less than " +
-              "inbox.sessionDeadline, and entityCallTimeout must be positive"
-          )
+      ) return Effect.void
+      return Effect.die(
+        new Error(
+          "RelayServer: heartbeatInterval * 2 must be less than " +
+            "inbox.sessionDeadline, and entityCallTimeout must be positive"
         )
-    )))
+      )
+    })))
   )

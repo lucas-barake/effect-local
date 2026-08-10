@@ -49,9 +49,9 @@ const createTable = Effect.gen(function*() {
     Effect.gen(function*() {
       const existing = yield* countIndex(name)
       if (existing.count > 0) return
-      yield* sql.unsafe(
-        `CREATE ${unique ? "UNIQUE " : ""}INDEX ${name} ON ${tableName} (${columns})`
-      )
+      let uniqueness = ""
+      if (unique) uniqueness = "UNIQUE "
+      yield* sql.unsafe(`CREATE ${uniqueness}INDEX ${name} ON ${tableName} (${columns})`)
     })
 
   yield* sql.onDialectOrElse({

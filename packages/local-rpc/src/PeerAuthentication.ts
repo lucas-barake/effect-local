@@ -16,6 +16,11 @@ import * as PeerCredentials from "./PeerCredentials.js"
 import * as PeerRelayLimits from "./PeerRelayLimits.js"
 import * as PeerRpcError from "./PeerRpcError.js"
 
+type StringCredential = Redacted.Redacted
+
+const isStringCredential = (value: unknown): value is StringCredential =>
+  Redacted.isRedacted(value) && typeof Redacted.value(value) === "string"
+
 export { PeerPrincipal } from "./internal/peerPrincipal.js"
 
 const AuthenticationError = Schema.Union([
@@ -126,10 +131,10 @@ export const layerServer = Layer.effect(
           if (typeof options.payload !== "object" || options.payload === null || !("credential" in options.payload)) {
             return yield* new PeerRpcError.AuthenticationFailure()
           }
-          if (!Redacted.isRedacted(options.payload.credential)) {
+          if (!isStringCredential(options.payload.credential)) {
             return yield* new PeerRpcError.AuthenticationFailure()
           }
-          const credential = options.payload.credential as Redacted.Redacted<string>
+          const credential = options.payload.credential
 
           const admittedAt = yield* Clock.currentTimeMillis
           if (!(yield* admit(options.client.id, admittedAt))) {
@@ -137,11 +142,10 @@ export const layerServer = Layer.effect(
           }
 
           const verified = yield* authenticator.authenticate(credential).pipe(
-            Effect.catchCause((cause) =>
-              Cause.hasInterruptsOnly(cause)
-                ? Effect.failCause(cause)
-                : Effect.fail(new PeerRpcError.AuthenticationFailure())
-            ),
+            Effect.catchCause((cause) => {
+              if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
+              return Effect.fail(new PeerRpcError.AuthenticationFailure())
+            }),
             verifierPermits.withPermitsIfAvailable(1),
             Effect.flatMap(Effect.fromOption(() => new PeerRpcError.RequestCapacityExceeded())),
             Effect.ensuring(Clock.currentTimeMillis.pipe(Effect.flatMap((now) => release(options.client.id, now))))
@@ -157,13 +161,10 @@ export const layerServer = Layer.effect(
         attributes: {},
         result: (exit) => {
           const error = PeerRpcObservability.failure(exit)
-          return error?._tag === "AuthenticationFailure"
-            ? "AuthenticationDenied"
-            : error?._tag === "RequestCapacityExceeded"
-            ? "CapacityRejected"
-            : Exit.isSuccess(exit)
-            ? "Success"
-            : "Failure"
+          if (error?._tag === "AuthenticationFailure") return "AuthenticationDenied"
+          if (error?._tag === "RequestCapacityExceeded") return "CapacityRejected"
+          if (Exit.isSuccess(exit)) return "Success"
+          return "Failure"
         }
       }).pipe(Effect.flatMap((verified) => Effect.provideService(effect, AuthenticatedPeer, verified)))
     )
@@ -175,17 +176,18 @@ export const layerClient = RpcMiddleware.layerClient(
   PeerCredentials.PeerCredentials.pipe(
     Effect.map((credentials) => ({ next, request }) =>
       credentials.get.pipe(
-        Effect.flatMap((credential) =>
-          next(
-            {
-              ...request,
-              payload: {
-                ...(typeof request.payload === "object" && request.payload !== null ? request.payload : {}),
-                credential
-              }
-            } as typeof request
-          )
-        )
+        Effect.flatMap((credential) => {
+          let payload: unknown = { credential }
+          if (typeof request.payload === "object" && request.payload !== null) {
+            const enriched: Record<string, unknown> = {}
+            Object.assign(enriched, request.payload)
+            enriched.credential = credential
+            payload = enriched
+          }
+          const nextRequest = { ...request }
+          Reflect.set(nextRequest, "payload", payload)
+          return next(nextRequest)
+        })
       )
     )
   )

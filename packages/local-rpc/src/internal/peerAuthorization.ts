@@ -1,11 +1,15 @@
 import type * as PeerSession from "@lucas-barake/effect-local-sql/PeerSession"
 import * as Clock from "effect/Clock"
 import * as Effect from "effect/Effect"
+import * as Schema from "effect/Schema"
 import type * as PeerAuthentication from "../PeerAuthentication.js"
 import * as PeerRpcError from "../PeerRpcError.js"
 
 const key = (documentType: string, documentId: PeerSession.SelectedDocument["documentId"]) =>
-  JSON.stringify([documentType, documentId])
+  Schema.encodeSync(Schema.fromJsonString(Schema.Tuple([Schema.String, Schema.String])))([
+    documentType,
+    documentId
+  ])
 
 export const validateRequest = (
   documents: ReadonlyArray<{

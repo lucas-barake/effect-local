@@ -29,22 +29,23 @@ const credential = Redacted.make("benchmark-credential")
 const wireParsers = (envelope: RpcMessage.FromClientEncoded | RpcMessage.FromServerEncoded) => {
   const encoder = RpcSerialization.msgPack.makeUnsafe()
   const encoded = encoder.encode(envelope)
-  if (!(encoded instanceof Uint8Array)) throw new Error("MessagePack encoder did not return bytes")
+  if (!(encoded instanceof Uint8Array)) return Schema.decodeUnknownSync(Schema.Never)(encoded)
   const decoder = RpcSerialization.msgPack.makeUnsafe()
-  if (decoder.decode(encoded).length !== 1) throw new Error("MessagePack decoder did not return one envelope")
+  if (decoder.decode(encoded).length !== 1) return Schema.decodeUnknownSync(Schema.Never)(decoder.decode(encoded))
   return { encoder, decoder, encoded }
 }
 
 const nonEmptyValues = (value: Schema.Json) => {
-  if (!Array.isArray(value) || value.length === 0) throw new Error("Stream schema did not encode a non-empty array")
-  return value as ReadonlyArray<unknown> as readonly [unknown, ...Array<unknown>]
+  if (!Array.isArray(value) || value.length === 0) return Schema.decodeUnknownSync(Schema.Never)(value)
+  const [head, ...tail] = value
+  return [head, ...tail] satisfies readonly [unknown, ...Array<unknown>]
 }
 
 const openPayloadCodec = Schema.toCodecJson(PeerRpc.OpenRpc.payloadSchema)
 const encodeOpenPayload = Schema.encodeSync(openPayloadCodec)
 const decodeOpenPayload = Schema.decodeUnknownSync(openPayloadCodec)
 
-for (const documentCount of [1, 16, 64] as const) {
+for (const documentCount of [1, 16, 64]) {
   const decoded = PeerRpc.OpenRpc.payloadSchema.make({
     protocolVersion: PeerRpc.protocolVersion,
     expectedRelayPeerId: peerId,
@@ -128,7 +129,7 @@ for (
     ["1 KiB", 1024, 500],
     ["64 KiB", 64 * 1024, 100],
     ["1 MiB", 1024 * 1024, 30]
-  ] as const
+  ] satisfies ReadonlyArray<readonly [string, number, number]>
 ) {
   const bytes = makeBytes(size)
   const decodedPush = PeerRpc.PushRpc.payloadSchema.make({ sessionId, relayMessageId, payload: bytes, credential })
@@ -164,7 +165,7 @@ for (
     messageHash: "1".repeat(64),
     outerEnvelopeDigest: "2".repeat(64),
     payload: bytes
-  })] as const
+  })] satisfies readonly [PeerRpc.StoredMessage]
   const encodedChunk = nonEmptyValues(encodeOpenChunk(decodedChunk))
   const chunkEnvelope: RpcMessage.ResponseChunkEncoded = {
     _tag: "Chunk",

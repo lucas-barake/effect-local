@@ -25,7 +25,7 @@ import type * as PeerRpcError from "./PeerRpcError.js"
 
 const unavailable = () =>
   new ReplicaError.ReplicaError({
-    reason: new ReplicaError.StorageUnavailable({ cause: new Error("RPC peer connection unavailable") })
+    reason: new ReplicaError.StorageUnavailable({ cause: "RPC peer connection unavailable" })
   })
 
 const protocolFailure = (observed: string) =>
@@ -78,21 +78,23 @@ const mapError = (error: PeerRpcError.PeerRpcError | RpcClientError) => {
     case "DocumentLineageChanged":
       return protocolFailure(error._tag)
   }
+  return protocolFailure("unknown RPC error")
 }
 
 export const isRetryable = (error: ReplicaError.ReplicaError) => error.reason._tag === "StorageUnavailable"
 
 const adapterResult = (exit: Exit.Exit<unknown, ReplicaError.ReplicaError>) => {
-  if (Exit.isSuccess(exit)) return "Success" as const
+  if (Exit.isSuccess(exit)) return "Success"
   const error = PeerRpcObservability.failure(exit)
-  return error !== undefined && (
+  if (
+    error !== undefined && (
       error.reason._tag === "ProtocolMismatch" ||
       error.reason._tag === "QuotaExceeded" ||
       // Peer caused: a rewritten lineage is a rejection of the exchange, not an adapter fault.
       error.reason._tag === "DocumentLineageChanged"
     )
-    ? "ProtocolRejected" as const
-    : "Failure" as const
+  ) return "ProtocolRejected"
+  return "Failure"
 }
 
 const adapterAcknowledgeResult = (
@@ -101,17 +103,17 @@ const adapterAcknowledgeResult = (
 (exit: Exit.Exit<unknown, ReplicaError.ReplicaError>) => {
   if (Exit.isSuccess(exit)) return success
   const error = PeerRpcObservability.failure(exit)
-  if (error === undefined) return "Failure" as const
+  if (error === undefined) return "Failure"
   switch (error.reason._tag) {
     case "ProtocolMismatch":
     case "DocumentLineageChanged":
-      return "ProtocolRejected" as const
+      return "ProtocolRejected"
     case "QuotaExceeded":
-      return "CapacityRejected" as const
+      return "CapacityRejected"
     case "StorageUnavailable":
-      return "Unavailable" as const
+      return "Unavailable"
     default:
-      return "Failure" as const
+      return "Failure"
   }
 }
 
@@ -144,7 +146,7 @@ const validateRelayOptions = (options: Options) =>
       const [name, value] of [
         ["receipt retention", options.receiptRetentionMillis],
         ["sender retry horizon", options.senderRetryHorizonMillis]
-      ] as const
+      ] satisfies ReadonlyArray<readonly [string, number]>
     ) {
       if (
         !Number.isSafeInteger(value) ||
@@ -212,6 +214,7 @@ const validateStoredMessage = (
     if (digest !== event.outerEnvelopeDigest) {
       return yield* protocolFailure("relay outer envelope digest")
     }
+    return yield* Effect.void
   })
 
 const validateTransientMessage = (
@@ -261,7 +264,7 @@ export const layer = (
           peerId: options.remote.peerId
         },
         relayPeerId: options.expectedRelayPeerId
-      } as const
+      } satisfies PeerRelayOutbox.Endpoint
 
       return {
         capabilities,
@@ -315,14 +318,15 @@ export const layer = (
                       closing = true
                       return true
                     }).pipe(
-                      stateLock.withPermit,
-                      Effect.flatMap((owner) =>
-                        owner
-                          ? Scope.close(connectionScope, exit).pipe(
+                      (effect) => stateLock.withPermit(effect),
+                      Effect.flatMap((owner) => {
+                        if (owner) {
+                          return Scope.close(connectionScope, exit).pipe(
                             Effect.ensuring(Deferred.succeed(closeCompleted, undefined))
                           )
-                          : Deferred.await(closeCompleted)
-                      ),
+                        }
+                        return Deferred.await(closeCompleted)
+                      }),
                       Effect.uninterruptible
                     )
                   const closeWithExit = (exit: Exit.Exit<unknown, unknown>) =>
@@ -353,12 +357,12 @@ export const layer = (
                   yield* Scope.addFinalizerExit(lifetimeScope, closeConnection)
                   yield* runtime.awaitFatal.pipe(
                     Effect.exit,
-                    Effect.flatMap((exit) =>
-                      Exit.isFailure(exit) &&
-                        !Cause.hasInterruptsOnly(exit.cause)
-                        ? Deferred.succeed(fatalCause, exit.cause)
-                        : Effect.void
-                    ),
+                    Effect.flatMap((exit) => {
+                      if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) {
+                        return Deferred.succeed(fatalCause, exit.cause)
+                      }
+                      return Effect.void
+                    }),
                     Effect.forkIn(lifetimeScope, { startImmediately: true })
                   )
 
@@ -394,11 +398,10 @@ export const layer = (
                       Effect.onExit((exit) => Deferred.succeed(openCompleted, exit).pipe(Effect.asVoid))
                     )
                     const openFiber = yield* stateLock.withPermit(
-                      Effect.suspend(() =>
-                        closing
-                          ? Effect.fail(unavailable())
-                          : Effect.forkIn(openRequest, connectionScope)
-                      )
+                      Effect.suspend(() => {
+                        if (closing) return Effect.fail(unavailable())
+                        return Effect.forkIn(openRequest, connectionScope)
+                      })
                     )
                     const [first, remainder] = yield* Effect.raceFirst(
                       awaitFatal,
@@ -423,6 +426,7 @@ export const layer = (
                         if (yield* Deferred.isDone(fatalCause)) {
                           return yield* awaitFatal
                         }
+                        return yield* Effect.void
                       })
                     )
 
@@ -446,7 +450,7 @@ export const layer = (
                             Effect.ensuring(release),
                             Effect.forkIn(connectionScope, { startImmediately: true })
                           )
-                          return [fiber, completed] as const
+                          return [fiber, completed] satisfies readonly [typeof fiber, typeof completed]
                         }).pipe(
                           Effect.flatMap(([fiber, completed]) =>
                             Deferred.await(completed).pipe(
@@ -493,11 +497,10 @@ export const layer = (
                             payload: message,
                             retryHorizonMillis: options.senderRetryHorizonMillis
                           }).pipe(
-                            Effect.flatMap((admission) =>
-                              admission._tag === "PendingRelayCustody"
-                                ? pushEntry(admission)
-                                : Effect.void
-                            )
+                            Effect.flatMap((admission) => {
+                              if (admission._tag === "PendingRelayCustody") return pushEntry(admission)
+                              return Effect.void
+                            })
                           ),
                           sendLock
                         ),
@@ -552,7 +555,7 @@ export const layer = (
                     ): Effect.Effect<PeerTransport.Inbound, ReplicaError.ReplicaError> => {
                       if (event._tag === "TransientMessage") {
                         return validateTransientMessage(event, options).pipe(
-                          Effect.map((delivery) => ({ _tag: "Transient", delivery }) as const)
+                          Effect.map((delivery) => ({ _tag: "Transient", delivery }))
                         )
                       }
                       if (event._tag !== "StoredMessage") {

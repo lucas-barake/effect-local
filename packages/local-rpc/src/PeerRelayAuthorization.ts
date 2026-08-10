@@ -24,7 +24,7 @@ const RequestedDocument = Schema.Struct({
 })
 const RequestedDocuments = Schema.Array(RequestedDocument).check(Schema.isMinLength(1))
 
-export const unsafeUnboundedAutomerge3DecodeRisk = "Automerge3.3.2DecodeIsNotAllocationBounded" as const
+export const unsafeUnboundedAutomerge3DecodeRisk = "Automerge3.3.2DecodeIsNotAllocationBounded"
 
 export const UnsafeUnboundedAutomerge3DecodeRequest = Schema.Struct({
   risk: Schema.Literal(unsafeUnboundedAutomerge3DecodeRisk),
@@ -95,39 +95,43 @@ const validateRequestShape = (request: Request) =>
   ]).pipe(
     Effect.catchTag("SchemaError", () => new PeerRpcError.AccessDenied()),
     Effect.flatMap(() => validateRequest(request.documents)),
-    Effect.flatMap((requested) =>
-      new Set(request.documents.map((document) => document.documentId)).size ===
-          request.documents.length
-        ? Effect.succeed(requested)
-        : Effect.fail(new PeerRpcError.AccessDenied())
-    )
+    Effect.flatMap((requested) => {
+      if (new Set(request.documents.map((document) => document.documentId)).size === request.documents.length) {
+        return Effect.succeed(requested)
+      }
+      return Effect.fail(new PeerRpcError.AccessDenied())
+    })
   )
 
 const validateResult = (request: Request, result: Result) =>
   PeerAuthentication.PeerPrincipal.makeEffect(result.remote).pipe(
     Effect.catchTag("SchemaError", () => new PeerRpcError.AccessDenied()),
-    Effect.flatMap((remote) =>
-      remote.tenantId === request.principal.tenantId &&
+    Effect.flatMap((remote) => {
+      if (
+        remote.tenantId === request.principal.tenantId &&
         remote.subjectId === request.remote.subjectId &&
         remote.peerId === request.remote.peerId
-        ? validate(request, result)
-        : Effect.fail(new PeerRpcError.AccessDenied())
-    ),
+      ) return validate(request, result)
+      return Effect.fail(new PeerRpcError.AccessDenied())
+    }),
     Effect.as(result)
   )
 
 const documentKey = (
   document: UnsafeUnboundedAutomerge3DecodeRequest["documents"][number]
-) => JSON.stringify([document.documentType, document.documentId])
+) =>
+  Schema.encodeSync(Schema.fromJsonString(Schema.Tuple([Schema.String, Schema.String])))([
+    document.documentType,
+    document.documentId
+  ])
 
 const validateUnsafeDocuments = (
   documents: UnsafeUnboundedAutomerge3DecodeRequest["documents"]
 ) => {
   const keys = new Set(documents.map(documentKey))
   const documentIds = new Set(documents.map((document) => document.documentId))
-  return keys.size === documents.length && documentIds.size === documents.length
-    ? Effect.succeed(keys)
-    : Effect.fail(new PeerRpcError.AccessDenied())
+  if (keys.size === documents.length && documentIds.size === documents.length) return Effect.succeed(keys)
+  return Effect.fail(new PeerRpcError.AccessDenied())
 }
 
 const canonicalDocuments = (
@@ -136,7 +140,9 @@ const canonicalDocuments = (
   documents.toSorted((left, right) => {
     const leftKey = documentKey(left)
     const rightKey = documentKey(right)
-    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0
+    if (leftKey < rightKey) return -1
+    if (leftKey > rightKey) return 1
+    return 0
   })
 
 const validateUnsafeRequest = (request: UnsafeUnboundedAutomerge3DecodeRequest) =>

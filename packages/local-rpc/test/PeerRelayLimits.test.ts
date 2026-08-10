@@ -44,7 +44,7 @@ describe("PeerRelayLimits", () => {
       ["transientRatePerSecond", 0],
       ["transientBurst", 0],
       ["transientRecipientQueueCapacity", 0]
-    ] as const
+    ] satisfies ReadonlyArray<readonly [keyof PeerRelayLimits.Values, unknown]>
   )("rejects scalar %s with the stable configuration error", ([field, value]) =>
     Effect.gen(function*() {
       const error = yield* PeerRelayLimits.make({
@@ -65,7 +65,7 @@ describe("PeerRelayLimits", () => {
       // constraint — so the pool is sized for a concurrency it is never allowed to reach.
       ["authenticationBurst", { authenticationBurst: 1 }],
       ["transientBurst", { transientRatePerSecond: 33 }]
-    ] as const
+    ] satisfies ReadonlyArray<readonly [keyof PeerRelayLimits.Values, Partial<PeerRelayLimits.Values>]>
   )(
     "rejects the %s cross field constraint through the production Layer",
     ([field, overrides]) =>
@@ -97,7 +97,7 @@ describe("PeerRelayLimits", () => {
     Effect.gen(function*() {
       // The point of taking `Duration.Input` rather than a number of milliseconds: a deployment
       // writes whichever form reads best, and none of them is a different amount of time.
-      for (const horizon of [Duration.days(7), "7 days", 7 * 24 * 60 * 60 * 1_000] as const) {
+      for (const horizon of [Duration.days(7), "7 days", 7 * 24 * 60 * 60 * 1_000]) {
         const values = yield* PeerRelayLimits.make({
           ...PeerRelayLimits.defaults,
           maximumSenderRetryHorizon: horizon

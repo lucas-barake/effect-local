@@ -5,6 +5,7 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Metric from "effect/Metric"
 import * as References from "effect/References"
+import * as Schema from "effect/Schema"
 import * as Tracer from "effect/Tracer"
 import * as PeerRpcObservability from "../src/internal/peerRpcObservability.js"
 
@@ -17,7 +18,7 @@ describe("PeerRpcObservability", () => {
         let reads = 0
         const currentTimeNanosUnsafe = () => {
           reads += 1
-          if (reads === defectAtRead) throw new Error("telemetry clock defect")
+          if (reads === defectAtRead) return Effect.runSync(Effect.die("telemetry clock defect"))
           return clock.currentTimeNanosUnsafe()
         }
         return {
@@ -76,9 +77,7 @@ describe("PeerRpcObservability", () => {
       }
     })
     const original = Cause.fail({ _tag: "OriginalFailure" })
-    const throwTelemetry = () => {
-      throw new Error("telemetry defect")
-    }
+    const throwTelemetry = () => Effect.runSync(Effect.die("telemetry defect"))
 
     return Effect.gen(function*() {
       const exits = [
@@ -128,17 +127,13 @@ describe("PeerRpcObservability", () => {
     const original = Cause.fail({ _tag: "OriginalFailure" })
     let createRan = false
     const createTracer = Tracer.make({
-      span: () => {
-        throw new Error("span create defect")
-      }
+      span: () => Effect.runSync(Effect.die("span create defect"))
     })
     let endRan = false
     const endTracer = Tracer.make({
       span: (options) => {
         const span = new Tracer.NativeSpan(options)
-        span.end = () => {
-          throw new Error("span end defect")
-        }
+        span.end = () => Effect.runSync(Effect.die("span end defect"))
         return span
       }
     })
@@ -201,7 +196,7 @@ describe("PeerRpcObservability", () => {
       Cause.fail({ _tag: "ExpectedFailure", forbidden }),
       Cause.die(new Error(forbidden)),
       Cause.interrupt(123)
-    ] as const
+    ] satisfies ReadonlyArray<Cause.Cause<unknown>>
     const metricValue = <Input, State,>(
       metric: Metric.Metric<Input, State>
     ) =>
@@ -350,7 +345,7 @@ describe("PeerRpcObservability", () => {
       }
 
       assert.notInclude(
-        JSON.stringify(spans.map((span) => ({
+        Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(spans.map((span) => ({
           attributes: [...span.attributes],
           status: span.status._tag
         }))) + (yield* Metric.dump),

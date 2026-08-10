@@ -4,8 +4,7 @@ import type * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as Rpc from "effect/unstable/rpc/Rpc"
-import { make as makeClient } from "effect/unstable/rpc/RpcClient"
-import type * as RpcClient_ from "effect/unstable/rpc/RpcClient"
+import { type FromGroup, make as makeClient, type Protocol } from "effect/unstable/rpc/RpcClient"
 import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
@@ -174,10 +173,10 @@ export class Rpcs extends RpcGroup.make(
   RejectRpc
 ).middleware(PeerAuthentication.PeerAuthentication) {}
 
-export interface RpcClient extends RpcClient_.FromGroup<typeof Rpcs, RpcClientError> {}
+export interface RpcClient extends FromGroup<typeof Rpcs, RpcClientError> {}
 
 export const makeRpcClient: Effect.Effect<
   RpcClient,
   never,
-  RpcClient_.Protocol | RpcMiddleware.ForClient<PeerAuthentication.PeerAuthentication> | Scope.Scope
+  Protocol | RpcMiddleware.ForClient<PeerAuthentication.PeerAuthentication> | Scope.Scope
 > = makeClient(Rpcs)

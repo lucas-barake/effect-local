@@ -53,7 +53,7 @@ const SqliteLayer = Effect.gen(function*() {
 }).pipe(Layer.unwrap, Layer.provide(NodeFileSystem.layer))
 
 // Merged out rather than kept private: observing payload erasure means reading the row.
-const storeFor = (client: Layer.Layer<SqlClient.SqlClient, unknown, never>) =>
+const storeFor = (client: Layer.Layer<SqlClient.SqlClient, unknown>) =>
   SqlRelayInboxStore.layer.pipe(
     Layer.provideMerge(client),
     Layer.provide(NodeCrypto.layer),
@@ -70,9 +70,9 @@ describe("RelayInboxStore", () => {
   ) {
     it.layer(storeFor(dialect.client), {
       timeout: dialect.timeout
-    })(dialect.name, (it) => {
+    })(dialect.name, (testApi) => {
       for (const check of relayInboxStoreContract) {
-        it.effect(check.name, () => check.run)
+        testApi.effect(check.name, () => check.run)
       }
     })
   }

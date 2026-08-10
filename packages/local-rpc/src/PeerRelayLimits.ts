@@ -33,11 +33,22 @@ const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0))
 const PositiveNumber = Schema.Number.check(Schema.isFinite(), Schema.isGreaterThan(0))
 
 /** Milliseconds for a finite, positive duration input, or `undefined` if it is neither. */
-const finiteMillis = (input: unknown): number | undefined =>
-  Option.match(Duration.fromInput(input as Duration.Input), {
+const isDurationInput = (input: unknown): input is Duration.Input =>
+  typeof input === "number" ||
+  typeof input === "string" ||
+  Array.isArray(input) ||
+  (typeof input === "object" && input !== null)
+
+const finiteMillis = (input: unknown): number | undefined => {
+  if (!isDurationInput(input)) return undefined
+  return Option.match(Duration.fromInput(input), {
     onNone: () => undefined,
-    onSome: (duration) => Duration.isFinite(duration) ? Duration.toMillis(duration) : undefined
+    onSome: (duration) => {
+      if (Duration.isFinite(duration)) return Duration.toMillis(duration)
+      return undefined
+    }
   })
+}
 
 /**
  * A configured duration.
@@ -136,7 +147,8 @@ const invalid = (field: keyof Values) => Effect.fail(new InvalidPeerRelayLimits(
 const firstField = (issue: SchemaIssue.Issue): string | undefined => {
   if (issue._tag === "Pointer") {
     const field = issue.path[0]
-    return typeof field === "string" ? field : firstField(issue.issue)
+    if (typeof field === "string") return field
+    return firstField(issue.issue)
   }
   if (issue._tag === "Composite" || issue._tag === "AnyOf") {
     for (const nested of issue.issues) {
@@ -174,7 +186,8 @@ const validate = (values: Values) => {
     ]
   ]
   const firstInvalid = relations.find(([, valid]) => !valid)
-  return firstInvalid === undefined ? Effect.succeed(values) : invalid(firstInvalid[0])
+  if (firstInvalid === undefined) return Effect.succeed(values)
+  return invalid(firstInvalid[0])
 }
 
 export const make = (values: Values) =>

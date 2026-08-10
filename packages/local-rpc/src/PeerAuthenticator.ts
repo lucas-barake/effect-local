@@ -5,7 +5,7 @@ import type { PeerPrincipal } from "./internal/peerPrincipal.js"
 import type * as PeerRpcError from "./PeerRpcError.js"
 
 export class PeerAuthenticator extends Context.Service<PeerAuthenticator, {
-  readonly authenticate: (credential: Redacted.Redacted<string>) => Effect.Effect<{
+  readonly authenticate: (credential: Redacted.Redacted) => Effect.Effect<{
     readonly principal: PeerPrincipal
     readonly validUntil: number
     readonly invalidated: Effect.Effect<void>

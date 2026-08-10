@@ -103,7 +103,7 @@ const makeRelayClient = (
     Transient: transient,
     Acknowledge: acknowledge,
     Reject: reject
-  }) as never
+  }) satisfies PeerRpc.RpcClient
 
 const relayEntry = (payload: Uint8Array): PeerRelayOutbox.Entry => ({
   _tag: "PendingRelayCustody",
@@ -285,7 +285,7 @@ const makeRuntime = (overrides: RuntimeOverrides = {}) =>
 
 const durable = (inbound: PeerTransport.Inbound): PeerTransport.AcknowledgedDelivery => {
   assert.strictEqual(inbound._tag, "Durable")
-  if (inbound._tag !== "Durable") throw new Error("Expected durable delivery")
+  if (inbound._tag !== "Durable") return Effect.runSync(Effect.die("Expected durable delivery"))
   return inbound.delivery
 }
 
@@ -418,7 +418,10 @@ describe("RpcPeerTransport", () => {
         maximumPendingHorizon: () => Effect.succeed(relayOptions.senderRetryHorizonMillis),
         dueForEndpoint: () =>
           Ref.updateAndGet(dueCalls, (count) => count + 1).pipe(
-            Effect.map((count) => count === 1 ? [relayEntry(replayPayload)] : [])
+            Effect.map((count) => {
+              if (count === 1) return [relayEntry(replayPayload)]
+              return []
+            })
           ),
         admit: (input) =>
           Ref.set(admitted, true).pipe(
@@ -458,7 +461,10 @@ describe("RpcPeerTransport", () => {
         admit: () => Effect.succeed(entry),
         dueForEndpoint: () =>
           Ref.getAndSet(replayed, true).pipe(
-            Effect.map((alreadyReplayed) => alreadyReplayed ? [] : [entry])
+            Effect.map((alreadyReplayed) => {
+              if (alreadyReplayed) return []
+              return [entry]
+            })
           )
       })
       const client = makeRelayClient(
@@ -466,11 +472,10 @@ describe("RpcPeerTransport", () => {
         (request) =>
           Queue.offer(pushedIds, request.relayMessageId).pipe(
             Effect.andThen(Ref.updateAndGet(pushAttempts, (count) => count + 1)),
-            Effect.flatMap((attempt) =>
-              attempt === 1
-                ? Effect.fail(new PeerRpcError.ServerUnavailable())
-                : Effect.void
-            )
+            Effect.flatMap((attempt) => {
+              if (attempt === 1) return Effect.fail(new PeerRpcError.ServerUnavailable())
+              return Effect.void
+            })
           )
       )
       const first = yield* connectRelay(client, firstRuntime)
@@ -518,7 +523,7 @@ describe("RpcPeerTransport", () => {
           ...relayOpened.authenticatedLocal,
           subjectId: "other-subject"
         }
-      } as PeerRpc.Opened
+      } satisfies PeerRpc.Opened
       const client = makeRelayClient(
         () =>
           Stream.concat(Stream.make(mismatched), Stream.never).pipe(
@@ -771,7 +776,7 @@ describe("RpcPeerTransport", () => {
       yield* Deferred.await(pushStarted)
       const fatalError = new ReplicaError.ReplicaError({
         reason: new ReplicaError.StorageUnavailable({
-          cause: new Error("runtime maintenance failed")
+          cause: "runtime maintenance failed"
         })
       })
       yield* Deferred.fail(
@@ -925,7 +930,7 @@ describe("RpcPeerTransport", () => {
       const connection = yield* connectRelay(client, makeRuntime())
       yield* connection.send(Uint8Array.of(201, 202, 203))
       yield* connection.close
-      const telemetry = JSON.stringify(
+      const telemetry = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(
         spans
           .filter((span) => span.name.startsWith("effect_local_rpc.adapter.relay_"))
           .map((span) => ({
@@ -962,7 +967,7 @@ describe("RpcPeerTransport", () => {
       assert.isTrue(
         RpcPeerTransport.isRetryable(
           new ReplicaError.ReplicaError({
-            reason: new ReplicaError.StorageUnavailable({ cause: new Error("relay down") })
+            reason: new ReplicaError.StorageUnavailable({ cause: "relay down" })
           })
         )
       )

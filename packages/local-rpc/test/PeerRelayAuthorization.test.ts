@@ -40,7 +40,7 @@ const resolvedRemote = PeerAuthentication.PeerPrincipal.make({
 const documents = [
   { documentType: task.name, documentId: taskId },
   { documentType: note.name, documentId: noteId }
-] as const
+] satisfies ReadonlyArray<{ readonly documentType: string; readonly documentId: Identity.DocumentId }>
 
 const request = (direction: PeerRelayAuthorization.Direction): PeerRelayAuthorization.Request => ({
   direction,
@@ -120,7 +120,7 @@ describe("PeerRelayAuthorization", () => {
     )
   })
 
-  it.effect.each(["Send", "Receive"] as const)(
+  it.effect.each(["Send", "Receive"] satisfies ReadonlyArray<PeerRelayAuthorization.Direction>)(
     "validates and canonicalizes the explicit unsafe Automerge decode grant for %s",
     (direction) =>
       Effect.gen(function*() {
@@ -191,12 +191,14 @@ describe("PeerRelayAuthorization", () => {
         ...unsafeRequest("Send"),
         documents: [{ ...documents[0], documentId: "doc_invalid" }]
       }
-    ] as const
+    ] satisfies ReadonlyArray<unknown>
     return Effect.gen(function*() {
       const authorization = yield* PeerRelayAuthorization.PeerRelayAuthorization
       for (const invalid of cases) {
-        const error = yield* authorization.authorizeUnsafeUnboundedAutomerge3Decode(
-          invalid as unknown as PeerRelayAuthorization.UnsafeUnboundedAutomerge3DecodeRequest
+        const error = yield* Reflect.apply(
+          authorization.authorizeUnsafeUnboundedAutomerge3Decode,
+          undefined,
+          [invalid]
         ).pipe(Effect.flip)
         assert.deepStrictEqual(error, new PeerRpcError.AccessDenied())
       }
@@ -277,7 +279,7 @@ describe("PeerRelayAuthorization", () => {
       ["wrong risk", { ...unsafeGrant(), risk: "AutomergeDecodeIsSafe" }],
       ["missing invalidation", { ...unsafeGrant(), invalidated: undefined }],
       ["malformed invalidation", { ...unsafeGrant(), invalidated: "not-an-effect" }]
-    ] as const
+    ] satisfies ReadonlyArray<unknown>
   )("rejects an unsafe grant with %s", ([, grant]) =>
     Effect.gen(function*() {
       yield* TestClock.setTime(1_000)
@@ -292,13 +294,13 @@ describe("PeerRelayAuthorization", () => {
           () => Effect.succeed(result()),
           () =>
             Effect.succeed(
-              grant as unknown as PeerRelayAuthorization.UnsafeUnboundedAutomerge3DecodeGrant
+              Reflect.apply(Effect.succeed, undefined, [grant])
             )
         )
       )
     ))
 
-  it.effect.each(["Send", "Receive"] as const)(
+  it.effect.each(["Send", "Receive"] satisfies ReadonlyArray<PeerRelayAuthorization.Direction>)(
     "resolves the exact duplex endpoint and document set for %s",
     (direction) => {
       let observed: PeerRelayAuthorization.Request | undefined
@@ -342,14 +344,12 @@ describe("PeerRelayAuthorization", () => {
           { documentType: note.name, documentId: taskId }
         ]
       }
-    ] as const
+    ] satisfies ReadonlyArray<unknown>
 
     return Effect.gen(function*() {
       const authorization = yield* PeerRelayAuthorization.PeerRelayAuthorization
       for (const invalid of cases) {
-        const error = yield* authorization.authorize(
-          invalid as unknown as PeerRelayAuthorization.Request
-        ).pipe(Effect.flip)
+        const error = yield* Reflect.apply(authorization.authorize, undefined, [invalid]).pipe(Effect.flip)
         assert.deepStrictEqual(error, new PeerRpcError.AccessDenied())
       }
       assert.strictEqual(calls, 0)
@@ -419,7 +419,7 @@ describe("PeerRelayAuthorization", () => {
       ["NaN", Number.NaN],
       ["positive infinity", Number.POSITIVE_INFINITY],
       ["negative infinity", Number.NEGATIVE_INFINITY]
-    ] as const
+    ] satisfies ReadonlyArray<readonly [string, number]>
   )("rejects a %s authorization lease", ([, validUntil]) =>
     Effect.gen(function*() {
       yield* TestClock.setTime(1_000)
@@ -438,11 +438,10 @@ describe("PeerRelayAuthorization", () => {
       let allowed = true
       const authorization = yield* PeerRelayAuthorization.PeerRelayAuthorization.pipe(
         Effect.provide(
-          authorizationLayer(() =>
-            allowed
-              ? Effect.succeed(result(undefined, undefined, 2_000, Deferred.await(invalidated)))
-              : Effect.fail(new PeerRpcError.AccessDenied())
-          )
+          authorizationLayer(() => {
+            if (allowed) return Effect.succeed(result(undefined, undefined, 2_000, Deferred.await(invalidated)))
+            return Effect.fail(new PeerRpcError.AccessDenied())
+          })
         )
       )
       yield* TestClock.setTime(1_000)
@@ -467,7 +466,7 @@ describe("PeerRelayAuthorization", () => {
         new PeerRpcError.ServerUnavailable()
       )
 
-      const defect = new Error("policy defect")
+      const defect = "policy defect"
       const defective = yield* PeerRelayAuthorization.PeerRelayAuthorization.pipe(
         Effect.provide(authorizationLayer(() => Effect.die(defect)))
       )

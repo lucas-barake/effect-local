@@ -118,7 +118,7 @@ const storeFailing = (
   ).pipe(Layer.provide(sqliteStore))
 
 const unavailable = new ReplicaError.ReplicaError({
-  reason: new ReplicaError.StorageUnavailable({ cause: new Error("injected") })
+  reason: new ReplicaError.StorageUnavailable({ cause: "injected" })
 })
 
 const channel = (options?: { readonly epoch?: string; readonly subject?: string }) => ({
@@ -156,7 +156,7 @@ const deliver = (message: Message) => {
         subjectId: "recipient-a",
         peerId: peer("00000000bbb1")
       },
-      payloadVersion: 1 as const,
+      payloadVersion: 1,
       document: { documentId: documentId("00000000dddd"), documentType: "note" },
       writerProvenance: [],
       messageHash: message.id.padStart(64, "a"),
@@ -477,9 +477,9 @@ describe("RelayInbox", () => {
       const settling = yield* Effect.forkChild(
         client.Settle({
           sessionId: session,
-          relayMessageId: delivered[0]!.relayMessageId,
-          claimToken: delivered[0]!.claimToken,
-          messageHash: delivered[0]!.messageHash,
+          relayMessageId: delivered[0].relayMessageId,
+          claimToken: delivered[0].claimToken,
+          messageHash: delivered[0].messageHash,
           outcome: "Acknowledged"
           // Covers the complete declared failure channel, so only an out-of-channel outcome fails.
         }).pipe(Effect.catch(() => Effect.void), Effect.exit)
@@ -710,7 +710,7 @@ describe("RelayInbox", () => {
         ),
         Stream.runCollect
       )
-      assert.isTrue(outcome[0]!._tag === "Failure")
+      assert.isTrue(outcome[0]._tag === "Failure")
 
       const redelivered = yield* receiveOnly(client, sessionId("000000000002"), 1)
       assert.deepStrictEqual(
@@ -740,7 +740,7 @@ describe("RelayInbox", () => {
         ),
         Stream.runCollect
       )
-      assert.isTrue(outcome[0]!._tag === "Failure")
+      assert.isTrue(outcome[0]._tag === "Failure")
 
       const store = yield* RelayInboxStore.RelayInboxStore
       const pending = yield* store.pendingHeads(inboxKey, { limit: 10, now: 0 })
@@ -771,7 +771,7 @@ describe("RelayInbox", () => {
         ),
         Stream.runCollect
       )
-      assert.isTrue(outcome[0]!._tag === "Failure")
+      assert.isTrue(outcome[0]._tag === "Failure")
 
       const store = yield* RelayInboxStore.RelayInboxStore
       const pending = yield* store.pendingHeads(inboxKey, { limit: 10, now: 0 })
@@ -800,7 +800,7 @@ describe("RelayInbox", () => {
         ),
         Stream.runCollect
       )
-      assert.isTrue(outcome[0]!._tag === "Failure")
+      assert.isTrue(outcome[0]._tag === "Failure")
     }).pipe(Effect.provide(relay({
       store: storeFailing(() => ({ settle: () => Effect.fail(unavailable) }))
     }))))
@@ -861,17 +861,17 @@ describe("RelayInbox", () => {
         "the abandoned head is redelivered on the same session"
       )
       assert.notStrictEqual(
-        messages[0]!.claimToken,
-        messages[1]!.claimToken,
+        messages[0].claimToken,
+        messages[1].claimToken,
         "the redelivery is a fresh attempt"
       )
 
       // The redelivered attempt is fully settleable: abandonment cost the attempt, not the row.
       yield* client.Settle({
         sessionId: session,
-        relayMessageId: messages[1]!.relayMessageId,
-        claimToken: messages[1]!.claimToken,
-        messageHash: messages[1]!.messageHash,
+        relayMessageId: messages[1].relayMessageId,
+        claimToken: messages[1].claimToken,
+        messageHash: messages[1].messageHash,
         outcome: "Acknowledged"
       })
       const store = yield* RelayInboxStore.RelayInboxStore
@@ -929,11 +929,13 @@ describe("RelayInbox", () => {
       const store = yield* RelayInboxStore.RelayInboxStore
       const pending = yield* store.pendingHeads(inboxKey, { limit: 10, now: 0 })
       assert.deepStrictEqual(
-        pending.map((message) => [message.relayMessageId, message.deliveries]).toSorted(),
+        pending.map((message) => [message.relayMessageId, message.deliveries]).toSorted((left, right) =>
+          left[0].localeCompare(right[0])
+        ),
         [
           [relayId("000000000001"), 1],
           [relayId("000000000003"), 1]
-        ].toSorted(),
+        ].toSorted((left, right) => left[0].localeCompare(right[0])),
         "each transmitted head is charged exactly once"
       )
 

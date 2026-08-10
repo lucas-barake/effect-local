@@ -85,9 +85,9 @@ const sweep = (
  */
 export const layer = (
   options: Options
-): Layer.Layer<never, never, RelayInboxStore.RelayInboxStore | Sharding.Sharding> =>
-  options.enabled
-    ? Singleton.make(
+): Layer.Layer<never, never, RelayInboxStore.RelayInboxStore | Sharding.Sharding> => {
+  if (options.enabled) {
+    return Singleton.make(
       "EffectLocalRelayInboxMaintenance",
       Effect.gen(function*() {
         // Resolved once here rather than per sweep, so the loop carries no requirement of its own.
@@ -99,4 +99,6 @@ export const layer = (
         )
       })
     )
-    : Layer.empty
+  }
+  return Layer.empty
+}

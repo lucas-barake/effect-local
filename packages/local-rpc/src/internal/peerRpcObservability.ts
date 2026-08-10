@@ -110,10 +110,13 @@ export interface RelayFacts {
   readonly latencyMillis?: number
 }
 
-const relayVersion = (version: number): "1" | "3" | "Unsupported" =>
-  version === 1 ? "1" : version === 3 ? "3" : "Unsupported"
+const relayVersion = (version: number): "1" | "3" | "Unsupported" => {
+  if (version === 1) return "1"
+  if (version === 3) return "3"
+  return "Unsupported"
+}
 
-const relaySpanName = (operation: RelayOperation) => {
+const relaySpanName = (operation: RelayOperation): string => {
   switch (operation) {
     case "RelayAdmit":
       return "effect_local_rpc.relay.admit"
@@ -128,6 +131,7 @@ const relaySpanName = (operation: RelayOperation) => {
     case "AdapterAcknowledge":
       return "effect_local_rpc.adapter.relay_acknowledge"
   }
+  return "effect_local_rpc.unknown"
 }
 
 const relayAttributes = (
@@ -135,12 +139,20 @@ const relayAttributes = (
   direction: RelayDirection,
   result: RelayResult,
   stage?: RelayMaintenanceStage
-) => ({
-  operation,
-  direction,
-  result,
-  ...(stage === undefined ? {} : { stage })
-})
+) => {
+  const attributes: {
+    operation: RelayOperation
+    direction: RelayDirection
+    result: RelayResult
+    stage?: RelayMaintenanceStage
+  } = {
+    operation,
+    direction,
+    result
+  }
+  if (stage !== undefined) attributes.stage = stage
+  return attributes
+}
 
 export const relayOutcomes = (
   operation: RelayOperation,
@@ -227,6 +239,13 @@ const withoutMetricAttributes = <A, E, R,>(effect: Effect.Effect<A, E, R>) =>
 
 const bestEffort = <A, E, R,>(effect: Effect.Effect<A, E, R>) => effect.pipe(Effect.ignoreCause)
 
+const safe = <A,>(thunk: () => A, fallback: A): A =>
+  Effect.runSync(
+    Effect.try({ try: thunk, catch: () => fallback }).pipe(
+      Effect.orElseSucceed(() => fallback)
+    )
+  )
+
 const safeSpan = (span: Tracer.Span): Tracer.Span => {
   let status = span.status
   return {
@@ -251,32 +270,16 @@ const safeSpan = (span: Tracer.Span): Tracer.Span => {
         endTime,
         exit
       }
-      try {
-        span.end(endTime, exit)
-      } catch {
-        // Telemetry must never replace the business outcome.
-      }
+      safe(() => span.end(endTime, exit), undefined)
     },
     attribute(key, value) {
-      try {
-        span.attribute(key, value)
-      } catch {
-        // Telemetry must never replace the business outcome.
-      }
+      safe(() => span.attribute(key, value), undefined)
     },
     event(name, startTime, attributes) {
-      try {
-        span.event(name, startTime, attributes)
-      } catch {
-        // Telemetry must never replace the business outcome.
-      }
+      safe(() => span.event(name, startTime, attributes), undefined)
     },
     addLinks(links) {
-      try {
-        span.addLinks(links)
-      } catch {
-        // Telemetry must never replace the business outcome.
-      }
+      safe(() => span.addLinks(links), undefined)
     }
   }
 }
@@ -284,11 +287,7 @@ const safeSpan = (span: Tracer.Span): Tracer.Span => {
 const safeTracer = (tracer: Tracer.Tracer): Tracer.Tracer =>
   Tracer.make({
     span: (options) => {
-      try {
-        return safeSpan(tracer.span(options))
-      } catch {
-        return new Tracer.NativeSpan(options)
-      }
+      return safe(() => safeSpan(tracer.span(options)), new Tracer.NativeSpan(options))
     }
   })
 
@@ -297,25 +296,19 @@ const safeClock = (clock: Clock.Clock): Clock.Clock => {
   let lastNanos = BigInt(0)
   let lastMonotonicNanos = BigInt(0)
   const currentTimeMillisUnsafe = () => {
-    try {
-      return lastMillis = clock.currentTimeMillisUnsafe()
-    } catch {
-      return lastMillis
-    }
+    const current = safe(() => clock.currentTimeMillisUnsafe(), lastMillis)
+    lastMillis = current
+    return current
   }
   const currentTimeNanosUnsafe = () => {
-    try {
-      return lastNanos = clock.currentTimeNanosUnsafe()
-    } catch {
-      return lastNanos
-    }
+    const current = safe(() => clock.currentTimeNanosUnsafe(), lastNanos)
+    lastNanos = current
+    return current
   }
   const monotonicTimeNanosUnsafe = () => {
-    try {
-      return lastMonotonicNanos = clock.monotonicTimeNanosUnsafe()
-    } catch {
-      return lastMonotonicNanos
-    }
+    const current = safe(() => clock.monotonicTimeNanosUnsafe(), lastMonotonicNanos)
+    lastMonotonicNanos = current
+    return current
   }
   return {
     currentTimeMillisUnsafe,
@@ -469,7 +462,7 @@ export const observe = <A, E, R,>(options: {
                   // silently absorb interruption alongside it.
                   Effect.catchDefect((defect) =>
                     Effect.logWarning("Peer rpc observability classifier died", defect).pipe(
-                      Effect.as("Failure" as const)
+                      Effect.as<Result>("Failure")
                     )
                   ),
                   Effect.flatMap((result) =>
@@ -484,11 +477,10 @@ export const observe = <A, E, R,>(options: {
             )
         ).pipe(
           Effect.exit,
-          Effect.flatMap(() =>
-            captured === undefined
-              ? restore(options.effect).pipe(Effect.provideService(Clock.Clock, clock))
-              : captured
-          )
+          Effect.flatMap(() => {
+            if (captured === undefined) return restore(options.effect).pipe(Effect.provideService(Clock.Clock, clock))
+            return captured
+          })
         ))
     )
   })
@@ -513,14 +505,20 @@ export const observeRelay = <A, E, R,>(options: {
           },
           clock,
           (span) =>
-            Effect.suspend(() =>
-              recordRelayOutcome({
+            Effect.suspend(() => {
+              const attempt: {
+                operation: RelayOperation
+                direction: RelayDirection
+                result: RelayResult
+                stage?: RelayMaintenanceStage
+              } = {
                 operation: options.operation,
                 direction: options.direction,
-                result: "Attempt",
-                ...(options.stage === undefined ? {} : { stage: options.stage })
-              })
-            ).pipe(
+                result: "Attempt"
+              }
+              if (options.stage !== undefined) attempt.stage = options.stage
+              return recordRelayOutcome(attempt)
+            }).pipe(
               bestEffort,
               Effect.andThen(
                 restore(options.effect).pipe(
@@ -542,7 +540,7 @@ export const observeRelay = <A, E, R,>(options: {
                   const result = yield* Effect.sync(() => options.result(exit)).pipe(
                     Effect.catchDefect((defect) =>
                       Effect.logWarning("Relay observability classifier died", defect).pipe(
-                        Effect.as("Failure" as const)
+                        Effect.as<RelayResult>("Failure")
                       )
                     )
                   )
@@ -566,14 +564,22 @@ export const observeRelay = <A, E, R,>(options: {
                     }
                     span.attribute("rpc.duration_millis", durationMillis)
                   })
-                  yield* recordRelayOutcome({
+                  const outcome: {
+                    operation: RelayOperation
+                    direction: RelayDirection
+                    result: RelayResult
+                    facts: RelayFacts
+                    durationMillis: number
+                    stage?: RelayMaintenanceStage
+                  } = {
                     operation: options.operation,
                     direction: options.direction,
                     result,
                     facts,
-                    durationMillis,
-                    ...(options.stage === undefined ? {} : { stage: options.stage })
-                  })
+                    durationMillis
+                  }
+                  if (options.stage !== undefined) outcome.stage = options.stage
+                  yield* recordRelayOutcome(outcome)
                 }).pipe(
                   bestEffort
                 )
@@ -582,11 +588,10 @@ export const observeRelay = <A, E, R,>(options: {
             )
         ).pipe(
           Effect.exit,
-          Effect.flatMap(() =>
-            captured === undefined
-              ? restore(options.effect).pipe(Effect.provideService(Clock.Clock, clock))
-              : captured
-          )
+          Effect.flatMap(() => {
+            if (captured === undefined) return restore(options.effect).pipe(Effect.provideService(Clock.Clock, clock))
+            return captured
+          })
         ))
     )
   })
