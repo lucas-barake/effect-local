@@ -241,6 +241,8 @@ const validateTransientMessage = (
     )
   })
 
+const capabilities: PeerTransport.Capabilities = { checkpointTransfer: true, lineageAware: true }
+
 export const layer = (
   client: PeerRpc.RpcClient,
   options: Options
@@ -262,7 +264,7 @@ export const layer = (
       } as const
 
       return {
-        capabilities: { checkpointTransfer: true, lineageAware: true },
+        capabilities,
         connect: (connectOptions) =>
           PeerRpcObservability.observe({
             effect: Effect.gen(function*() {
@@ -651,16 +653,8 @@ export const layer = (
                     return {
                       peerId: handshake.remotePeerId,
                       relayPeerId: options.expectedRelayPeerId,
-                      relayEndpoint: {
-                        expectedLocal: options.expectedLocal,
-                        remote: {
-                          tenantId: options.expectedLocal.tenantId,
-                          subjectId: options.remote.subjectId,
-                          peerId: options.remote.peerId
-                        },
-                        relayPeerId: options.expectedRelayPeerId
-                      },
-                      capabilities: { checkpointTransfer: true, lineageAware: true },
+                      relayEndpoint: endpoint,
+                      capabilities,
                       receive: inbound,
                       send,
                       transient,
