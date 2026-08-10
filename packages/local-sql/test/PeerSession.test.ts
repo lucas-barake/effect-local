@@ -2652,13 +2652,7 @@ it.layer(Layer.mergeAll(
           )
           yield* Deferred.await(firstAcknowledgementStarted)
           const scheduler = yield* ReplicaOperationScheduler.ReplicaOperationScheduler
-          const interactiveAcquired = yield* Deferred.make<void>()
-          const interactive = yield* Effect.forkChild(
-            Effect.scoped(scheduler.interactive.pipe(Effect.andThen(Deferred.succeed(interactiveAcquired, undefined)))),
-            { startImmediately: true }
-          )
-          yield* Deferred.await(interactiveAcquired)
-          yield* Fiber.join(interactive)
+          yield* Effect.scoped(scheduler.interactive)
           yield* Deferred.succeed(releaseFirstAcknowledgement, undefined)
           assert.strictEqual(yield* Queue.take(events), "ack")
           assert.isTrue(Option.isNone(yield* Deferred.poll(closed)))
