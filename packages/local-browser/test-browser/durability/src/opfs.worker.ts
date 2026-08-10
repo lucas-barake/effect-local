@@ -1,6 +1,6 @@
 /// <reference lib="webworker" />
 import { OpfsWorker } from "@effect/sql-sqlite-wasm"
-import { Effect } from "effect"
+import { Effect, Schema } from "effect"
 
 declare const self: DedicatedWorkerGlobalScope
 
@@ -8,7 +8,7 @@ const diagnostics = new BroadcastChannel("effect-local-stage0-diagnostics")
 diagnostics.postMessage("OPFS worker loaded")
 
 self.addEventListener("message", (event) => {
-  const port = event.data as MessagePort
+  const port = Schema.decodeUnknownSync(Schema.instanceOf(MessagePort))(event.data)
   port.start()
   Effect.runFork(
     OpfsWorker.run({

@@ -1,7 +1,7 @@
 /// <reference lib="webworker" />
 import { BrowserCrypto, BrowserWorkerRunner } from "@effect/platform-browser"
 import { SqliteClient } from "@effect/sql-sqlite-wasm"
-import { Effect, Exit, Layer, Option, Schema, Stream } from "effect"
+import { Clock, Effect, Exit, Layer, Option, Schema, Stream } from "effect"
 import { ClusterWorkflowEngine, SingleRunner } from "effect/unstable/cluster"
 import { RpcServer } from "effect/unstable/rpc"
 import { SqlClient, SqlSchema } from "effect/unstable/sql"
@@ -42,14 +42,15 @@ const DocumentEntityLive = DocumentEntity.toLayer(Effect.gen(function*() {
     }),
     Result: CommandResult,
     execute: ({ commandId, documentId, value }) =>
-      sql`
+      Effect.flatMap(Clock.currentTimeMillis, (createdAt) =>
+        sql`
       INSERT INTO document_events (command_id, document_id, revision, value, created_at)
       SELECT
         ${commandId},
         ${documentId},
         COALESCE(MAX(revision), 0) + 1,
         ${value},
-        ${Date.now()}
+        ${createdAt}
       FROM document_events
       WHERE document_id = ${documentId}
       RETURNING
@@ -57,7 +58,7 @@ const DocumentEntityLive = DocumentEntity.toLayer(Effect.gen(function*() {
         document_id AS documentId,
         revision,
         value
-    `
+    `)
   })
 
   diagnostics.postMessage("entity handlers ready")
@@ -277,13 +278,16 @@ const PageHandlersLive = PageApi.toLayer(Effect.gen(function*() {
     InspectWorkflow: Effect.fnUntraced(function*({ executionId, id }) {
       const counts = yield* inspectWorkflow(id)
       const result = yield* RecoveryWorkflow.poll(executionId)
-      const status = Option.isNone(result)
-        ? "Pending"
-        : result.value._tag === "Suspended"
-        ? "Suspended"
-        : Exit.isSuccess(result.value.exit)
-        ? "Complete"
-        : "Failed"
+      let status: "Pending" | "Suspended" | "Complete" | "Failed"
+      if (Option.isNone(result)) {
+        status = "Pending"
+      } else if (result.value._tag === "Suspended") {
+        status = "Suspended"
+      } else if (Exit.isSuccess(result.value.exit)) {
+        status = "Complete"
+      } else {
+        status = "Failed"
+      }
       return { executionId, status, ...counts }
     }, Effect.orDie),
     Heartbeat: ({ count }) =>
@@ -295,13 +299,15 @@ const PageHandlersLive = PageApi.toLayer(Effect.gen(function*() {
 
 declare const self: SharedWorkerGlobalScope
 
+const BootstrapMessage = Schema.Struct({
+  databasePort: Schema.instanceOf(MessagePort),
+  rpcPort: Schema.instanceOf(MessagePort)
+})
+
 self.onconnect = (connectEvent) => {
   const controlPort = connectEvent.ports[0]
   controlPort.addEventListener("message", (bootstrapEvent) => {
-    const { databasePort, rpcPort } = bootstrapEvent.data as {
-      readonly databasePort: MessagePort
-      readonly rpcPort: MessagePort
-    }
+    const { databasePort, rpcPort } = Schema.decodeUnknownSync(BootstrapMessage)(bootstrapEvent.data)
     databasePort.start()
     rpcPort.start()
 

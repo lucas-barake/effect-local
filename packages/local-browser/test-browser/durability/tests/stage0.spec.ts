@@ -47,14 +47,14 @@ test("rolls back application state and Cluster reply together", async ({ page })
 
   const commandId = crypto.randomUUID()
   const documentId = `rollback-${commandId}`
-  await page.evaluate(({ commandId, documentId }) => {
-    void window.stage0.rollback({ commandId, documentId, value: "must-roll-back" }).catch(() => undefined)
+  await page.evaluate((input) => {
+    void window.stage0.rollback({ ...input, value: "must-roll-back" }).catch(() => undefined)
   }, { commandId, documentId })
 
   try {
     await expect.poll(() =>
       page.evaluate(
-        ({ commandId, documentId }) => window.stage0.inspectRollback({ commandId, documentId }),
+        (input) => window.stage0.inspectRollback(input),
         { commandId, documentId }
       )
     ).toEqual({
@@ -68,12 +68,12 @@ test("rolls back application state and Cluster reply together", async ({ page })
     })
   } finally {
     await page.evaluate(
-      ({ commandId, documentId }) => window.stage0.cleanupRollback({ commandId, documentId }),
+      (input) => window.stage0.cleanupRollback(input),
       { commandId, documentId }
     )
     await expect.poll(() =>
       page.evaluate(
-        ({ commandId, documentId }) => window.stage0.inspectRollback({ commandId, documentId }),
+        (input) => window.stage0.inspectRollback(input),
         { commandId, documentId }
       )
     ).toMatchObject({ messageCount: 0, triggerCount: 0 })
