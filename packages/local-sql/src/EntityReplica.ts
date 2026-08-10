@@ -93,12 +93,16 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
         lookup: () => Semaphore.make(1)
       })
 
-      const withPermit = <A, E, R,>(f: (permit: ReplicaGate.Permit) => Effect.Effect<A, E, R>) =>
-        Effect.scoped(Effect.gen(function*() {
+      // Interactive admission is taken before the gate so a queued backlog cannot hold a permit.
+      const admitted = <A, E, R,>(f: (permit: ReplicaGate.Permit) => Effect.Effect<A, E, R>) =>
+        Effect.gen(function*() {
           yield* scheduler.interactive
           const permit = yield* gate.admit
           return yield* f(permit)
-        }))
+        })
+
+      const withPermit = <A, E, R,>(f: (permit: ReplicaGate.Permit) => Effect.Effect<A, E, R>) =>
+        Effect.scoped(admitted(f))
 
       const withCommandPermit = <A, E, R,>(
         commandId: Identity.CommandId,
@@ -115,11 +119,7 @@ export const layer = (definition: ReplicaDefinition.Any): Layer.Layer<
               })
             )
           )
-          return yield* lock.withPermit(Effect.gen(function*() {
-            yield* scheduler.interactive
-            const permit = yield* gate.admit
-            return yield* f(permit)
-          }))
+          return yield* lock.withPermit(admitted(f))
         }))
 
       const service: Replica.Replica["Service"] = {
