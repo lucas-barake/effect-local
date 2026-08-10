@@ -266,6 +266,8 @@ describe("PeerAuthentication", () => {
         }),
         currentTimeNanosUnsafe: () => BigInt(currentTime) * 1_000_000n,
         currentTimeNanos: Effect.sync(() => BigInt(currentTime) * 1_000_000n),
+        monotonicTimeNanosUnsafe: () => BigInt(currentTime) * 1_000_000n,
+        monotonicTimeNanos: Effect.sync(() => BigInt(currentTime) * 1_000_000n),
         sleep: () => Effect.never
       } satisfies Clock.Clock
       const middleware = yield* PeerAuthentication.PeerAuthentication.pipe(

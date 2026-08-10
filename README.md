@@ -7,7 +7,7 @@ maintenance, and Effect Atom exposes reactive views. An optional RPC package syn
 relay with durable store and forward plus a bounded transient channel. Application reads and writes commit against
 the local replica; synchronization never blocks a local commit.
 
-> **Beta:** Effect Local targets Effect `4.0.0-beta.101` and Automerge `3.3.2`. Durable formats, worker protocols,
+> **Beta:** Effect Local targets Effect `4.0.0-beta.103` and Automerge `3.3.2`. Durable formats, worker protocols,
 > and public APIs can still change. Read [Guarantees and limitations](#guarantees-and-limitations) before storing
 > user data.
 
@@ -30,24 +30,24 @@ All five packages are ESM. Install only what the application surface uses.
 
 ```sh
 # Core model: documents, mutations, projections, queries, Replica
-pnpm add @lucas-barake/effect-local effect@4.0.0-beta.101 @automerge/automerge@3.3.2
+pnpm add @lucas-barake/effect-local effect@4.0.0-beta.103 @automerge/automerge@3.3.2
 
 # Durable Node replica
-pnpm add @lucas-barake/effect-local-sql @effect/platform-node@4.0.0-beta.101 @effect/platform-node-shared@4.0.0-beta.101 @effect/sql-sqlite-node@4.0.0-beta.101
+pnpm add @lucas-barake/effect-local-sql @effect/platform-node@4.0.0-beta.103 @effect/platform-node-shared@4.0.0-beta.103 @effect/sql-sqlite-node@4.0.0-beta.103
 
 # Durable browser replica
 pnpm add @lucas-barake/effect-local-sql @lucas-barake/effect-local-browser
-pnpm add @effect/platform-browser@4.0.0-beta.101 @effect/sql-sqlite-wasm@4.0.0-beta.101 @effect/wa-sqlite@0.1.2
+pnpm add @effect/platform-browser@4.0.0-beta.103 @effect/sql-sqlite-wasm@4.0.0-beta.103 @effect/wa-sqlite@0.1.2
 
 # Peer synchronization over Effect RPC
 pnpm add @lucas-barake/effect-local-rpc
 
 # Reactive state (optional)
-pnpm add @effect/atom-react@4.0.0-beta.101
+pnpm add @effect/atom-react@4.0.0-beta.103
 
 # Tests
-pnpm add -D @lucas-barake/effect-local-test @effect/vitest@4.0.0-beta.101 vitest@4.1.10
-pnpm add -D @effect/platform-node@4.0.0-beta.101 @effect/platform-node-shared@4.0.0-beta.101
+pnpm add -D @lucas-barake/effect-local-test @effect/vitest@4.0.0-beta.103 vitest@4.1.10
+pnpm add -D @effect/platform-node@4.0.0-beta.103 @effect/platform-node-shared@4.0.0-beta.103
 ```
 
 | Package                              | Purpose                                                                                          |
@@ -2207,7 +2207,7 @@ Run commands from the repository root.
 - [packages/local-sql/examples/](packages/local-sql/examples/): the compile checked quick start sources.
 - [packages/local-browser/test-browser/ownership/src/](packages/local-browser/test-browser/ownership/src/): a
   complete checked browser application.
-- Effect `4.0.0-beta.101` source:
+- Effect `4.0.0-beta.103` source:
   [Context](https://github.com/Effect-TS/effect/blob/6184a7dc53cb9310e299b65ad6d6c712c2cbf202/packages/effect/src/Context.ts),
   [Layer](https://github.com/Effect-TS/effect/blob/6184a7dc53cb9310e299b65ad6d6c712c2cbf202/packages/effect/src/Layer.ts),
   [Atom](https://github.com/Effect-TS/effect/blob/6184a7dc53cb9310e299b65ad6d6c712c2cbf202/packages/effect/src/unstable/reactivity/Atom.ts).

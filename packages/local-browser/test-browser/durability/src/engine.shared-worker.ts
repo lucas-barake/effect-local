@@ -314,9 +314,11 @@ self.onconnect = (connectEvent) => {
 
     const EngineLive = Layer.mergeAll(
       ApplicationSchemaLive,
-      ClusterLive,
-      BrowserCrypto.layer
-    ).pipe(Layer.provideMerge(DatabaseLive))
+      ClusterLive
+    ).pipe(
+      Layer.provideMerge(BrowserCrypto.layer),
+      Layer.provideMerge(DatabaseLive)
+    )
 
     const MainLive = RpcServer.layer(PageApi).pipe(
       Layer.provide(PageHandlersLive),

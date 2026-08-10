@@ -84,32 +84,32 @@ const commandContaining = (token: string): ReadonlyArray<string> => {
 
 const baseCommand = [
   "@lucas-barake/effect-local",
-  "effect@4.0.0-beta.101",
+  "effect@4.0.0-beta.103",
   "@automerge/automerge@3.3.2"
 ]
 const nodeCommand = [
   "@lucas-barake/effect-local-sql",
-  "@effect/platform-node@4.0.0-beta.101",
-  "@effect/platform-node-shared@4.0.0-beta.101",
-  "@effect/sql-sqlite-node@4.0.0-beta.101"
+  "@effect/platform-node@4.0.0-beta.103",
+  "@effect/platform-node-shared@4.0.0-beta.103",
+  "@effect/sql-sqlite-node@4.0.0-beta.103"
 ]
 const browserPackagesCommand = [
   "@lucas-barake/effect-local-sql",
   "@lucas-barake/effect-local-browser"
 ]
 const browserProvidersCommand = [
-  "@effect/platform-browser@4.0.0-beta.101",
-  "@effect/sql-sqlite-wasm@4.0.0-beta.101",
+  "@effect/platform-browser@4.0.0-beta.103",
+  "@effect/sql-sqlite-wasm@4.0.0-beta.103",
   "@effect/wa-sqlite@0.1.2"
 ]
 const testPackagesCommand = [
   "@lucas-barake/effect-local-test",
-  "@effect/vitest@4.0.0-beta.101",
+  "@effect/vitest@4.0.0-beta.103",
   "vitest@4.1.10"
 ]
 const testNodeCommand = [
-  "@effect/platform-node@4.0.0-beta.101",
-  "@effect/platform-node-shared@4.0.0-beta.101"
+  "@effect/platform-node@4.0.0-beta.103",
+  "@effect/platform-node-shared@4.0.0-beta.103"
 ]
 
 const consumerRecipes: ReadonlyArray<ConsumerRecipe> = [
@@ -241,15 +241,15 @@ describe("dependency peer invariants", () => {
   })
 
   it("documents the exact Node, browser, and test install recipes", () => {
-    expect(commandContaining("effect@4.0.0-beta.101")).toEqual(baseCommand)
-    expect(commandContaining("@effect/sql-sqlite-node@4.0.0-beta.101")).toEqual(nodeCommand)
+    expect(commandContaining("effect@4.0.0-beta.103")).toEqual(baseCommand)
+    expect(commandContaining("@effect/sql-sqlite-node@4.0.0-beta.103")).toEqual(nodeCommand)
     expect(commandContaining("@lucas-barake/effect-local-browser")).toEqual(browserPackagesCommand)
-    expect(commandContaining("@effect/sql-sqlite-wasm@4.0.0-beta.101")).toEqual(browserProvidersCommand)
-    expect(commandContaining("@effect/vitest@4.0.0-beta.101")).toEqual(testPackagesCommand)
-    expect(commandContaining("@effect/platform-node-shared@4.0.0-beta.101")).toEqual(nodeCommand)
+    expect(commandContaining("@effect/sql-sqlite-wasm@4.0.0-beta.103")).toEqual(browserProvidersCommand)
+    expect(commandContaining("@effect/vitest@4.0.0-beta.103")).toEqual(testPackagesCommand)
+    expect(commandContaining("@effect/platform-node-shared@4.0.0-beta.103")).toEqual(nodeCommand)
     expect(documentedInstallCommands.filter((command) =>
       command.includes(
-        "@effect/platform-node-shared@4.0.0-beta.101"
+        "@effect/platform-node-shared@4.0.0-beta.103"
       )
     )).toEqual([nodeCommand, testNodeCommand])
   })

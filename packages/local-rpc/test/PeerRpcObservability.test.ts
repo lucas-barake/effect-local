@@ -25,6 +25,8 @@ describe("PeerRpcObservability", () => {
           currentTimeMillis: clock.currentTimeMillis,
           currentTimeNanosUnsafe,
           currentTimeNanos: Effect.sync(currentTimeNanosUnsafe),
+          monotonicTimeNanosUnsafe: () => clock.monotonicTimeNanosUnsafe(),
+          monotonicTimeNanos: clock.monotonicTimeNanos,
           sleep: (duration) => clock.sleep(duration)
         }
       }

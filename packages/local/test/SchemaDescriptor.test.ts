@@ -1,5 +1,4 @@
 import { assert, describe, it } from "@effect/vitest"
-import * as Combiner from "effect/Combiner"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as SchemaGetter from "effect/SchemaGetter"
@@ -126,13 +125,6 @@ describe("SchemaDescriptor", () => {
             Schema.optionalKey,
             Schema.withConstructorDefault(Effect.succeed("default"))
           )
-        })),
-      /identifier or meta annotation/
-    )
-    assert.throws(
-      () =>
-        hash(Schema.Record(Schema.String, Schema.Number, {
-          keyValueCombiner: { decode: Combiner.first() }
         })),
       /identifier or meta annotation/
     )
@@ -287,14 +279,34 @@ describe("SchemaDescriptor", () => {
     assert.notStrictEqual(metaHash(circular), metaHash({ self: "[Circular]" }))
   })
 
+  // Effect's own `isPattern` now records `{ source, flags }` strings rather than the RegExp
+  // object, so consumer-supplied metadata is the remaining way a live RegExp reaches a descriptor.
   it("rejects stateful regular expressions in semantic metadata", () => {
     assert.throws(
-      () => hash(Schema.String.check(Schema.isPattern(/a/g))),
+      () => hash(Schema.String.annotate({ meta: metadata({ _tag: "Pattern", regExp: /a/g }) })),
       /stateful regular expressions/
     )
     assert.throws(
-      () => hash(Schema.String.check(Schema.isPattern(/a/y))),
+      () => hash(Schema.String.annotate({ meta: metadata({ _tag: "Pattern", regExp: /a/y }) })),
       /stateful regular expressions/
+    )
+  })
+
+  it("keeps stateless regular expressions in semantic metadata distinguishable", () => {
+    assert.notStrictEqual(
+      hash(Schema.String.annotate({ meta: metadata({ _tag: "Pattern", regExp: /a/ }) })),
+      hash(Schema.String.annotate({ meta: metadata({ _tag: "Pattern", regExp: /b/ }) }))
+    )
+  })
+
+  it("distinguishes built-in pattern checks by source and flags", () => {
+    assert.notStrictEqual(
+      hash(Schema.String.check(Schema.isPattern(/a/))),
+      hash(Schema.String.check(Schema.isPattern(/b/)))
+    )
+    assert.notStrictEqual(
+      hash(Schema.String.check(Schema.isPattern(/a/))),
+      hash(Schema.String.check(Schema.isPattern(/a/i)))
     )
   })
 
@@ -517,12 +529,8 @@ describe("SchemaDescriptor", () => {
       Schema.optionalKey,
       Schema.withConstructorDefault(Effect.succeed("x"))
     )
-    const combined = Schema.Record(Schema.String, Schema.Number, {
-      keyValueCombiner: { decode: Combiner.first() }
-    }).annotate({ meta: metadata({ _tag: "FirstValue" }) })
     assert.doesNotThrow(() => hash(transform))
     assert.doesNotThrow(() => hash(defaulted))
-    assert.doesNotThrow(() => hash(combined))
     assert.doesNotThrow(() => hash(Schema.tag("Task")))
     assert.doesNotThrow(() =>
       hash(

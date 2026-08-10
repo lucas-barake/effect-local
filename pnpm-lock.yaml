@@ -5,7 +5,7 @@ settings:
   excludeLinksFromLockfile: false
 
 overrides:
-  '@effect/platform-node-shared': 4.0.0-beta.101
+  '@effect/platform-node-shared': 4.0.0-beta.103
 
 importers:
 
@@ -24,8 +24,8 @@ importers:
         specifier: ^0.87.2
         version: 0.87.2
       '@effect/vitest':
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101(effect@4.0.0-beta.101)(vitest@4.1.10)
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)(vitest@4.1.10)
       '@types/node':
         specifier: ^25.7.0
         version: 25.9.5
@@ -39,8 +39,8 @@ importers:
         specifier: ^0.55.2
         version: 0.55.2
       effect:
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103
       glob:
         specifier: ^13.0.6
         version: 13.0.6
@@ -55,7 +55,7 @@ importers:
         version: 1.77.0(oxlint-tsgolint@7.0.2001)
       oxlint-plugin-effect:
         specifier: 0.6.0
-        version: 0.6.0(effect@4.0.0-beta.101)
+        version: 0.6.0(effect@4.0.0-beta.103)
       oxlint-tsgolint:
         specifier: 7.0.2001
         version: 7.0.2001
@@ -72,11 +72,11 @@ importers:
         specifier: 3.3.2
         version: 3.3.2
       '@effect/platform-node':
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101(effect@4.0.0-beta.101)(ioredis@5.11.1)
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)(ioredis@5.11.1)
       effect:
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103
 
   packages/local-browser:
     dependencies:
@@ -88,20 +88,20 @@ importers:
         version: link:../local-sql
     devDependencies:
       '@effect/atom-react':
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101(effect@4.0.0-beta.101)(react@19.2.7)(scheduler@0.27.0)
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)(react@19.2.7)(scheduler@0.27.0)
       '@effect/platform-browser':
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101(effect@4.0.0-beta.101)
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)
       '@effect/platform-node':
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101(effect@4.0.0-beta.101)(ioredis@5.11.1)
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)(ioredis@5.11.1)
       '@effect/sql-sqlite-node':
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101(effect@4.0.0-beta.101)
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)
       '@effect/sql-sqlite-wasm':
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101(@effect/wa-sqlite@0.1.2)(effect@4.0.0-beta.101)
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(@effect/wa-sqlite@0.1.2)(effect@4.0.0-beta.103)
       '@effect/wa-sqlite':
         specifier: 0.1.2
         version: 0.1.2
@@ -118,8 +118,8 @@ importers:
         specifier: ^19.2.0
         version: 19.2.3(@types/react@19.2.17)
       effect:
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103
       lucide-react:
         specifier: ^0.468.0
         version: 0.468.0(react@19.2.7)
@@ -149,17 +149,17 @@ importers:
         version: link:../local-sql
     devDependencies:
       '@effect/platform-node':
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101(effect@4.0.0-beta.101)(ioredis@5.11.1)
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)(ioredis@5.11.1)
       '@effect/sql-mysql2':
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101(@types/node@25.9.5)(effect@4.0.0-beta.101)
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(@types/node@25.9.5)(effect@4.0.0-beta.103)
       '@effect/sql-pg':
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101(effect@4.0.0-beta.101)
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)
       '@effect/sql-sqlite-node':
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101(effect@4.0.0-beta.101)
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)
       '@lucas-barake/effect-local-test':
         specifier: workspace:^
         version: link:../local-test
@@ -170,8 +170,8 @@ importers:
         specifier: 11.14.0
         version: 11.14.0
       effect:
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103
 
   packages/local-sql:
     dependencies:
@@ -183,14 +183,14 @@ importers:
         specifier: 3.3.2
         version: 3.3.2
       '@effect/platform-node':
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101(effect@4.0.0-beta.101)(ioredis@5.11.1)
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)(ioredis@5.11.1)
       '@effect/sql-sqlite-node':
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101(effect@4.0.0-beta.101)
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)
       effect:
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103
       tsx:
         specifier: 4.20.6
         version: 4.20.6
@@ -198,14 +198,14 @@ importers:
   packages/local-test:
     dependencies:
       '@effect/platform-node':
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101(effect@4.0.0-beta.101)(ioredis@5.11.1)
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)(ioredis@5.11.1)
       '@effect/platform-node-shared':
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101(effect@4.0.0-beta.101)
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)
       '@effect/sql-sqlite-node':
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101(effect@4.0.0-beta.101)
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)
       '@lucas-barake/effect-local':
         specifier: workspace:^
         version: link:../local
@@ -214,8 +214,8 @@ importers:
         version: link:../local-sql
     devDependencies:
       effect:
-        specifier: 4.0.0-beta.101
-        version: 4.0.0-beta.101
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103
 
 packages:
 
@@ -394,10 +394,10 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@effect/atom-react@4.0.0-beta.101':
-    resolution: {integrity: sha512-Sjp0K4Yw+xvDtfjuk2n5BCCX2NMEejlRocZEwQ4mdVd82pqI9dtO1QD2fdUzFEZQeBwcEuj8ZCBYbIegj7OLQw==}
+  '@effect/atom-react@4.0.0-beta.103':
+    resolution: {integrity: sha512-1HJ+Cyq4ssLnH2UZ8OVnhtMGAySabtzZo7imKC+vEfxOW3lvJYpGZeicxQX5Ii/7AdvlR+19p/6K2a5IPKYAow==}
     peerDependencies:
-      effect: ^4.0.0-beta.101
+      effect: ^4.0.0-beta.103
       react: ^19.2.4
       scheduler: '*'
 
@@ -405,50 +405,50 @@ packages:
     resolution: {integrity: sha512-CfiSoaVQO8pZgaMZGw5VvMvRGybsJ2LaSDoLYaqiVGvo/YYPYVR2GzUKY0h1NtIweq/+SQ5XLrvtzPIttWQ0GQ==}
     hasBin: true
 
-  '@effect/platform-browser@4.0.0-beta.101':
-    resolution: {integrity: sha512-05//60oEzMyQyNjk8Ll1mML6gU2RvT9TTaomq5cGmNQu6Gzb6jlWfzn2/ZGzFtehhB9iOpqtjy0QkT5tDh9ElA==}
+  '@effect/platform-browser@4.0.0-beta.103':
+    resolution: {integrity: sha512-3GXGzjv+dB5E9sCCj/JhPVyNB2NrBquGY2tYQ8VQqGK4uOpME6I5oLqRt+MmB7BWqWYPXUqvXj0wvMJRlQC4fw==}
     peerDependencies:
-      effect: ^4.0.0-beta.101
+      effect: ^4.0.0-beta.103
 
-  '@effect/platform-node-shared@4.0.0-beta.101':
-    resolution: {integrity: sha512-g4L7XiyJSNJLJVhlslyg2zBCQsoKQf1y1gd+Yfd+3wD9ymC+m7ymbd/5FGqnT1aXV6E2AwRr4D/R1eyRUikvWQ==}
+  '@effect/platform-node-shared@4.0.0-beta.103':
+    resolution: {integrity: sha512-0aCZMBid5ifqmY55TkfCDLaGTIM8qu3bNFUW7qL9vh/7jFOkaIAMX2MA8muG4deqW17XWxawddWu4v0fK+UW3g==}
     engines: {node: '>=18.0.0'}
     peerDependencies:
-      effect: ^4.0.0-beta.101
+      effect: ^4.0.0-beta.103
 
-  '@effect/platform-node@4.0.0-beta.101':
-    resolution: {integrity: sha512-pClk7dmMtHgM6Byu7CzGfrPvZ1/4BwmrRlCg2Op+iJozMkwVUxq8v4beK8b9SvxsliJjHZFznjvkVLX7LQjBqw==}
+  '@effect/platform-node@4.0.0-beta.103':
+    resolution: {integrity: sha512-VD8fbpendwFokMwzC7/MxazjhEVDihPC5NZtomYEyZwGaA1LXMvwP1y8pfXwfshUkG56TN4EMQqzu72c0B9FhA==}
     engines: {node: '>=18.0.0'}
     peerDependencies:
-      effect: ^4.0.0-beta.101
+      effect: ^4.0.0-beta.103
       ioredis: ^5.7.0
 
-  '@effect/sql-mysql2@4.0.0-beta.101':
-    resolution: {integrity: sha512-pkqUI5KaK3QGFgzTzKNwOT6Mk6uwB9vUTsCBwi9XDigNFqSatYo5CTWWIy3o2EYfBnZfUMmxeNeEnL25HXiIGw==}
+  '@effect/sql-mysql2@4.0.0-beta.103':
+    resolution: {integrity: sha512-jbz/fo68XmDcua1TQe0jaR6sa3P0PcZxxls3/T5JFziBOSr7tD0F4bdMA9OfuQMMbEGgR9vAdTcy6bn9NrUuOA==}
     peerDependencies:
-      effect: ^4.0.0-beta.101
+      effect: ^4.0.0-beta.103
 
-  '@effect/sql-pg@4.0.0-beta.101':
-    resolution: {integrity: sha512-Ur8SZFqVefviQzMyM/utVjPvKvYO139NLMrJlS1ZaNWfdT0HbwCsfEhY/cn0OolxbzJ2UX/dx24gqOe/NDuu4w==}
+  '@effect/sql-pg@4.0.0-beta.103':
+    resolution: {integrity: sha512-jzlTFtFaaoOmT87rQMKUBhkFeIQQwDKtlB+MOYn1jIPssLvXZVnMqo9GahCjsNcXVlB6QGBkUgD1HCA6+tJvBw==}
     peerDependencies:
-      effect: ^4.0.0-beta.101
+      effect: ^4.0.0-beta.103
 
-  '@effect/sql-sqlite-node@4.0.0-beta.101':
-    resolution: {integrity: sha512-RLvbKeEPkU6GEocEalOnDbRcJb6ZMigVDMe1ECSj9H0SGeY/Zdxi8f9KX3v8tNJjav3toXCwZAl4vKZ0uZYewQ==}
+  '@effect/sql-sqlite-node@4.0.0-beta.103':
+    resolution: {integrity: sha512-abODpsX80oHt6TExeSEFNklrC3M4LpR63n1IbJaTFSzK6nOPFtwegg7Zgn8ErZkOcShD7cg38dqf055qBijn6w==}
     peerDependencies:
-      effect: ^4.0.0-beta.101
+      effect: ^4.0.0-beta.103
 
-  '@effect/sql-sqlite-wasm@4.0.0-beta.101':
-    resolution: {integrity: sha512-om2gFvwQ5QJXRnKovkRo2gYzPtVaMiwwkiZxb4lpBzB9ccH1gw+XZW/q8m1MYWAmthgQdwd2X2ICmXGd7prWMg==}
+  '@effect/sql-sqlite-wasm@4.0.0-beta.103':
+    resolution: {integrity: sha512-W4xT1y2mypgSgURXuIsbj4mbpBZLqjNJUNVTvUnYT1PkIJzASLQSMwgWyY5YyUPmkv3DeJ8edv4g7+Emsqs9mw==}
     peerDependencies:
       '@effect/wa-sqlite': ^0.1.2
-      effect: ^4.0.0-beta.101
+      effect: ^4.0.0-beta.103
 
-  '@effect/vitest@4.0.0-beta.101':
-    resolution: {integrity: sha512-F5Ur8pZYti0xkZFyb4hPZt8RrKQ1XBoC28ZkKxc7N1iPbhE9fWOvlWA1NC2XlN2wWG08yb5g5jR53LdOxjlhpQ==}
+  '@effect/vitest@4.0.0-beta.103':
+    resolution: {integrity: sha512-Kz3gemVuJNAZ3e4V6A7BwAP87x2Av8LyHOlCjy9jbZzlncwJXO7Olk1Sje3hdKaet3wEl51A/0/89xJ2IYSgNg==}
     peerDependencies:
-      effect: ^4.0.0-beta.101
-      vitest: ^3.0.0 || ^4.0.0
+      effect: ^4.0.0-beta.103
+      vitest: ^4.1.0
 
   '@effect/wa-sqlite@0.1.2':
     resolution: {integrity: sha512-2JvJ9BDkBOwfeY/gXsC0XwEKC0AwisP2W5ABJ6mx14QyXTK12MGDIybDlHieuZt1TEFSMiKfpg7yyqyRWRooJQ==}
@@ -1952,8 +1952,8 @@ packages:
   eastasianwidth@0.2.0:
     resolution: {integrity: sha512-I88TYZWc9XiYHRQ4/3c5rjjfgkjhLyW2luGIheGERbNQ6OY7yTybanSpDXZa8y7VUP9YmDcYa+eyq4ca7iLqWA==}
 
-  effect@4.0.0-beta.101:
-    resolution: {integrity: sha512-HjowumlIo+orthn4jMlEJPuzIYPBV+uq/XiciHWhiedLsXQpWHdNJHO5d59BVDP5s1LPuvERcktwFqRXnJqnhA==}
+  effect@4.0.0-beta.103:
+    resolution: {integrity: sha512-pE8TxF4m2tQzVI+77dIlm3s+81TACV1AiX1JEkvY+zVuxgQQ8aGSkqXNJF6b/ST+coCSk5cUdbULpQ7sm4oHyw==}
 
   emoji-regex@8.0.0:
     resolution: {integrity: sha512-MSjYzcWNOA0ewAHpz0MxpYFvwg6yjy1NG3xteoqz644VCo/RPgnr1/GGt+ic3iJTzQ8Eu3TdM14SawnVUmGE6A==}
@@ -3518,32 +3518,32 @@ snapshots:
   '@dprint/win32-x64@0.55.2':
     optional: true
 
-  '@effect/atom-react@4.0.0-beta.101(effect@4.0.0-beta.101)(react@19.2.7)(scheduler@0.27.0)':
+  '@effect/atom-react@4.0.0-beta.103(effect@4.0.0-beta.103)(react@19.2.7)(scheduler@0.27.0)':
     dependencies:
-      effect: 4.0.0-beta.101
+      effect: 4.0.0-beta.103
       react: 19.2.7
       scheduler: 0.27.0
 
   '@effect/language-service@0.87.2': {}
 
-  '@effect/platform-browser@4.0.0-beta.101(effect@4.0.0-beta.101)':
+  '@effect/platform-browser@4.0.0-beta.103(effect@4.0.0-beta.103)':
     dependencies:
-      effect: 4.0.0-beta.101
+      effect: 4.0.0-beta.103
       multipasta: 0.2.8
 
-  '@effect/platform-node-shared@4.0.0-beta.101(effect@4.0.0-beta.101)':
+  '@effect/platform-node-shared@4.0.0-beta.103(effect@4.0.0-beta.103)':
     dependencies:
       '@types/ws': 8.18.1
-      effect: 4.0.0-beta.101
+      effect: 4.0.0-beta.103
       ws: 8.21.1
     transitivePeerDependencies:
       - bufferutil
       - utf-8-validate
 
-  '@effect/platform-node@4.0.0-beta.101(effect@4.0.0-beta.101)(ioredis@5.11.1)':
+  '@effect/platform-node@4.0.0-beta.103(effect@4.0.0-beta.103)(ioredis@5.11.1)':
     dependencies:
-      '@effect/platform-node-shared': 4.0.0-beta.101(effect@4.0.0-beta.101)
-      effect: 4.0.0-beta.101
+      '@effect/platform-node-shared': 4.0.0-beta.103(effect@4.0.0-beta.103)
+      effect: 4.0.0-beta.103
       ioredis: 5.11.1
       mime: 4.1.0
       undici: 8.8.0
@@ -3551,16 +3551,16 @@ snapshots:
       - bufferutil
       - utf-8-validate
 
-  '@effect/sql-mysql2@4.0.0-beta.101(@types/node@25.9.5)(effect@4.0.0-beta.101)':
+  '@effect/sql-mysql2@4.0.0-beta.103(@types/node@25.9.5)(effect@4.0.0-beta.103)':
     dependencies:
-      effect: 4.0.0-beta.101
+      effect: 4.0.0-beta.103
       mysql2: 3.23.1(@types/node@25.9.5)
     transitivePeerDependencies:
       - '@types/node'
 
-  '@effect/sql-pg@4.0.0-beta.101(effect@4.0.0-beta.101)':
+  '@effect/sql-pg@4.0.0-beta.103(effect@4.0.0-beta.103)':
     dependencies:
-      effect: 4.0.0-beta.101
+      effect: 4.0.0-beta.103
       pg: 8.22.0
       pg-connection-string: 2.14.0
       pg-cursor: 2.21.0(pg@8.22.0)
@@ -3569,18 +3569,18 @@ snapshots:
     transitivePeerDependencies:
       - pg-native
 
-  '@effect/sql-sqlite-node@4.0.0-beta.101(effect@4.0.0-beta.101)':
+  '@effect/sql-sqlite-node@4.0.0-beta.103(effect@4.0.0-beta.103)':
     dependencies:
-      effect: 4.0.0-beta.101
+      effect: 4.0.0-beta.103
 
-  '@effect/sql-sqlite-wasm@4.0.0-beta.101(@effect/wa-sqlite@0.1.2)(effect@4.0.0-beta.101)':
+  '@effect/sql-sqlite-wasm@4.0.0-beta.103(@effect/wa-sqlite@0.1.2)(effect@4.0.0-beta.103)':
     dependencies:
       '@effect/wa-sqlite': 0.1.2
-      effect: 4.0.0-beta.101
+      effect: 4.0.0-beta.103
 
-  '@effect/vitest@4.0.0-beta.101(effect@4.0.0-beta.101)(vitest@4.1.10)':
+  '@effect/vitest@4.0.0-beta.103(effect@4.0.0-beta.103)(vitest@4.1.10)':
     dependencies:
-      effect: 4.0.0-beta.101
+      effect: 4.0.0-beta.103
       vitest: 4.1.10(@types/node@25.9.5)(@vitest/coverage-v8@4.1.10)(vite@7.3.6(@types/node@25.9.5)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0))
 
   '@effect/wa-sqlite@0.1.2': {}
@@ -4778,7 +4778,7 @@ snapshots:
 
   eastasianwidth@0.2.0: {}
 
-  effect@4.0.0-beta.101:
+  effect@4.0.0-beta.103:
     dependencies:
       '@standard-schema/spec': 1.1.0
       fast-check: 4.9.0
@@ -5417,10 +5417,10 @@ snapshots:
       '@oxc-resolver/binding-win32-arm64-msvc': 11.24.2
       '@oxc-resolver/binding-win32-x64-msvc': 11.24.2
 
-  oxlint-plugin-effect@0.6.0(effect@4.0.0-beta.101):
+  oxlint-plugin-effect@0.6.0(effect@4.0.0-beta.103):
     dependencies:
       '@oxlint/plugins': 1.77.0
-      effect: 4.0.0-beta.101
+      effect: 4.0.0-beta.103
 
   oxlint-tsgolint@7.0.2001:
     optionalDependencies:

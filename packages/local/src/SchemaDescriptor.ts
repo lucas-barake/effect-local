@@ -128,11 +128,17 @@ type SupportedAnnotations =
   | Schema.Annotations.Filter
   | Schema.Annotations.Key<unknown>
 
+// Effect 4.0.0-beta.102 renamed the annotation that carries a built-in's stable identity from
+// `meta` to `representation`. Consumers still reach for `meta` on their own filters, and Effect
+// passes unrecognized annotation keys through untouched, so both spellings stay supported.
+const representationOf = (annotations: SupportedAnnotations): unknown => Reflect.get(annotations, "representation")
+
 const hasStableMetadata = (annotations: SupportedAnnotations | undefined): boolean =>
   annotations !== undefined &&
   (
     typeof annotations.identifier === "string" ||
     ("meta" in annotations && annotations.meta !== undefined) ||
+    representationOf(annotations) !== undefined ||
     ("typeConstructor" in annotations && annotations.typeConstructor !== undefined)
   )
 
@@ -142,6 +148,7 @@ const hasSemanticAnnotations = (annotations: SupportedAnnotations | undefined): 
     typeof annotations.identifier === "string" ||
     ("brands" in annotations && Array.isArray(annotations.brands)) ||
     ("meta" in annotations && annotations.meta !== undefined) ||
+    representationOf(annotations) !== undefined ||
     ("typeConstructor" in annotations && annotations.typeConstructor !== undefined) ||
     ("parseOptions" in annotations && annotations.parseOptions !== undefined) ||
     typeof Reflect.get(annotations, structuralAnnotationKey) === "boolean"
@@ -171,6 +178,10 @@ const fromAnnotations = (
   }
   if ("meta" in annotations && annotations.meta !== undefined) {
     result.meta = fromUnknown(annotations.meta, state)
+  }
+  const representation = representationOf(annotations)
+  if (representation !== undefined) {
+    result.representation = fromUnknown(representation, state)
   }
   if ("typeConstructor" in annotations && annotations.typeConstructor !== undefined) {
     result.typeConstructor = fromUnknown(annotations.typeConstructor, state)
@@ -420,23 +431,10 @@ const fromAST = (
           return byName === 0 ? compareDescriptor(leftType, rightType) : byName
         })
         if (ast.indexSignatures.length > 0) {
-          node.indexSignatures = ast.indexSignatures.map((signature) => {
-            const descriptor: Record<string, Descriptor> = {
-              parameter: fromAST(signature.parameter, state, trustedBehavior),
-              type: fromAST(signature.type, state, trustedBehavior)
-            }
-            if (signature.merge !== undefined) {
-              if (!identifiedBehavior) {
-                throw new TypeError("Opaque index combiners require an identifier or meta annotation")
-              }
-              descriptor.merge = {
-                decode: signature.merge.decode !== undefined,
-                encode: signature.merge.encode !== undefined,
-                identity: "Annotated"
-              }
-            }
-            return descriptor
-          })
+          node.indexSignatures = ast.indexSignatures.map((signature) => ({
+            parameter: fromAST(signature.parameter, state, trustedBehavior),
+            type: fromAST(signature.type, state, trustedBehavior)
+          }))
         }
         const encodingChecks = fromChecks(ast.encodingChecks, state, identifiedBehavior)
         if (encodingChecks !== undefined) node.encodingChecks = encodingChecks

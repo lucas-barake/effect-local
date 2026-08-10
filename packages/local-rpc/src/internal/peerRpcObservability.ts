@@ -295,6 +295,7 @@ const safeTracer = (tracer: Tracer.Tracer): Tracer.Tracer =>
 const safeClock = (clock: Clock.Clock): Clock.Clock => {
   let lastMillis = 0
   let lastNanos = BigInt(0)
+  let lastMonotonicNanos = BigInt(0)
   const currentTimeMillisUnsafe = () => {
     try {
       return lastMillis = clock.currentTimeMillisUnsafe()
@@ -309,11 +310,20 @@ const safeClock = (clock: Clock.Clock): Clock.Clock => {
       return lastNanos
     }
   }
+  const monotonicTimeNanosUnsafe = () => {
+    try {
+      return lastMonotonicNanos = clock.monotonicTimeNanosUnsafe()
+    } catch {
+      return lastMonotonicNanos
+    }
+  }
   return {
     currentTimeMillisUnsafe,
     currentTimeMillis: Effect.sync(currentTimeMillisUnsafe),
     currentTimeNanosUnsafe,
     currentTimeNanos: Effect.sync(currentTimeNanosUnsafe),
+    monotonicTimeNanosUnsafe,
+    monotonicTimeNanos: Effect.sync(monotonicTimeNanosUnsafe),
     sleep: (duration) => clock.sleep(duration)
   }
 }

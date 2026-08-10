@@ -48,8 +48,10 @@ const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   return result
 }
 
+const UnknownFromJsonString = Schema.fromJsonString(Schema.Unknown)
+
 export const stringify = (value: unknown): string =>
-  Schema.encodeSync(Schema.UnknownFromJsonString)(normalize(value, new WeakSet()))
+  Schema.encodeSync(UnknownFromJsonString)(normalize(value, new WeakSet()))
 
 export const hash = (value: unknown): string => {
   const input = stringify(value)
