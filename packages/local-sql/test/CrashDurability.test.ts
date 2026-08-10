@@ -1,11 +1,14 @@
 import { NodeFileSystem, NodePath } from "@effect/platform-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
 import * as Path from "effect/Path"
 import * as Schema from "effect/Schema"
 import { nativeError } from "./helpers/json.js"
+// Effect's process services do not expose the raw ChildProcess kill and stdout lifecycle
+// needed to assert SIGKILL cleanup in this crash harness.
 // oxlint-disable-next-line effect/noNodeBuiltinImport
 import { type ChildProcess, spawn } from "node:child_process"
 import { StringDecoder } from "node:string_decoder"
@@ -24,8 +27,8 @@ interface ChildCompletion {
 
 interface SpawnedChild {
   readonly process: ChildProcess
-  readonly firstLine: Promise<string>
-  readonly completion: Promise<ChildCompletion>
+  readonly firstLine: Deferred.Deferred<string, Error>
+  readonly completion: Deferred.Deferred<ChildCompletion>
 }
 
 const childError = (cause: unknown) => {
@@ -33,13 +36,9 @@ const childError = (cause: unknown) => {
   return nativeError(String(cause))
 }
 
-const awaitFirstLine = (child: SpawnedChild) =>
-  Effect.tryPromise({
-    try: () => child.firstLine,
-    catch: childError
-  })
+const awaitFirstLine = (child: SpawnedChild) => Deferred.await(child.firstLine)
 
-const awaitCompletion = (child: SpawnedChild) => Effect.promise(() => child.completion)
+const awaitCompletion = (child: SpawnedChild) => Deferred.await(child.completion)
 
 const spawnChild = (args: ReadonlyArray<string>) =>
   Effect.acquireRelease(
@@ -48,23 +47,17 @@ const spawnChild = (args: ReadonlyArray<string>) =>
         cwd: packageRoot,
         stdio: ["ignore", "pipe", "inherit"]
       })
+      const firstLine = Deferred.makeUnsafe<string, Error>()
+      const completion = Deferred.makeUnsafe<ChildCompletion>()
       const decoder = new StringDecoder("utf8")
       let stdout = ""
       let firstLineSettled = false
-      let resolveFirstLine: (line: string) => void
-      let rejectFirstLine: (error: Error) => void
-      // oxlint-disable-next-line effect/noNewPromise
-      const firstLine = new Promise<string>((resolve, reject) => {
-        resolveFirstLine = resolve
-        rejectFirstLine = reject
-      })
-      void firstLine.catch(() => {})
       const settleFirstLine = () => {
         if (firstLineSettled) return
         const newline = stdout.indexOf("\n")
         if (newline < 0) return
         firstLineSettled = true
-        resolveFirstLine(stdout.slice(0, newline))
+        Deferred.doneUnsafe(firstLine, Effect.succeed(stdout.slice(0, newline)))
       }
       child.stdout.on("data", (chunk: Buffer) => {
         stdout += decoder.write(chunk)
@@ -73,19 +66,19 @@ const spawnChild = (args: ReadonlyArray<string>) =>
       child.once("error", (error) => {
         if (firstLineSettled) return
         firstLineSettled = true
-        rejectFirstLine(error)
+        Deferred.doneUnsafe(firstLine, Effect.fail(error))
       })
-      // oxlint-disable-next-line effect/noNewPromise
-      const completion = new Promise<ChildCompletion>((resolve) => {
-        child.once("close", (code, signal) => {
-          stdout += decoder.end()
-          settleFirstLine()
-          if (!firstLineSettled) {
-            firstLineSettled = true
-            rejectFirstLine(nativeError(`child closed before emitting a line (code=${code}, signal=${signal})`))
-          }
-          resolve({ code, signal, stdout })
-        })
+      child.once("close", (code, signal) => {
+        stdout += decoder.end()
+        settleFirstLine()
+        if (!firstLineSettled) {
+          firstLineSettled = true
+          Deferred.doneUnsafe(
+            firstLine,
+            Effect.fail(nativeError(`child closed before emitting a line (code=${code}, signal=${signal})`))
+          )
+        }
+        Deferred.doneUnsafe(completion, Effect.succeed({ code, signal, stdout }))
       })
       return { process: child, firstLine, completion } satisfies SpawnedChild
     }),
