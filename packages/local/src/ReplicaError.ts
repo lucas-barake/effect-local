@@ -53,6 +53,10 @@ export class ProtocolInvalid extends Schema.TaggedErrorClass<ProtocolInvalid>(
   "@lucas-barake/effect-local/ProtocolInvalid"
 )("ProtocolInvalid", { message: Schema.String, cause: Schema.optionalKey(Schema.Defect()) }) {}
 
+export class ServerUnavailable extends Schema.TaggedErrorClass<ServerUnavailable>(
+  "@lucas-barake/effect-local/ServerUnavailable"
+)("ServerUnavailable", {}) {}
+
 export class AuthorizationDenied extends Schema.TaggedErrorClass<AuthorizationDenied>(
   "@lucas-barake/effect-local/AuthorizationDenied"
 )("AuthorizationDenied", { reason: Schema.Json }) {}
@@ -73,6 +77,7 @@ export const ReplicaError = Schema.Union([
   InvalidConfiguration,
   UnknownCommitOutcome,
   ProtocolInvalid,
+  ServerUnavailable,
   AuthorizationDenied
 ])
 export type ReplicaError = typeof ReplicaError.Type

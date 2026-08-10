@@ -1,14 +1,25 @@
+import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as Canonical from "./Canonical.js"
 import * as Identity from "./Identity.js"
+import type * as ReplicaError from "./ReplicaError.js"
 
 export const maximumMutationBytes = 256 * 1024
 export const maximumBatchEntries = 1_000
 export const maximumBatchBytes = 4 * 1024 * 1024
+export const maximumReceiptBytes = 4 * 1024 * 1024
 export const maximumPresenceBytes = 16 * 1024
 export const maximumPresenceTtlMillis = 60_000
 
 export const encodedBytes = (value: unknown): number => new TextEncoder().encode(Canonical.stringify(value)).byteLength
+
+export const encodedBytesEffect = (
+  value: unknown
+): Effect.Effect<number, ReplicaError.CanonicalEncodeError> =>
+  Canonical.stringifyEffect(value).pipe(Effect.map((encoded) => new TextEncoder().encode(encoded).byteLength))
+
+export const MutationDigest = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
+export type MutationDigest = typeof MutationDigest.Type
 
 export const MutationEnvelope = Schema.Struct({
   spaceId: Identity.SpaceId,
@@ -18,7 +29,7 @@ export const MutationEnvelope = Schema.Struct({
   basis: Identity.ServerSequence,
   name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
   payload: Schema.Json,
-  digest: Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
+  digest: MutationDigest
 })
 export type MutationEnvelope = typeof MutationEnvelope.Type
 
@@ -61,8 +72,11 @@ export type Receipt = typeof Receipt.Type
 
 export const AcceptedMutation = Schema.Struct({
   sequence: Identity.ServerSequence,
-  envelope: MutationEnvelope,
-  result: Schema.Json,
+  spaceId: Identity.SpaceId,
+  clientId: Identity.ClientId,
+  mutationId: Identity.MutationId,
+  localSequence: Identity.LocalSequence,
+  digest: MutationDigest,
   changes: Schema.Array(EntityChange)
 })
 export type AcceptedMutation = typeof AcceptedMutation.Type

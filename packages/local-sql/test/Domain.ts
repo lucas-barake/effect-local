@@ -2,6 +2,7 @@ import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Field from "@lucas-barake/effect-local/Field"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Query from "@lucas-barake/effect-local/Query"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -40,6 +41,22 @@ export const AddLabel = Mutation.make("AddLabel", {
   success: Schema.Array(Schema.String)
 })
 
+export const RejectAfterWrite = Mutation.make("RejectAfterWrite", {
+  payload: Todo.schema,
+  rejection: Schema.Literal("Rejected")
+})
+
+export const PutHugeTodo = Mutation.make("PutHugeTodo", {
+  payload: { id: Schema.String },
+  success: Todo.schema
+})
+
+export const ReturnHugeResult = Mutation.make("ReturnHugeResult", {
+  success: Schema.String
+})
+
+const hugeTitle = "x".repeat(Protocol.maximumBatchBytes)
+
 const ListTodos = Query.make("ListTodos", {
   success: Schema.Array(Todo.schema),
   dependsOn: [Todo]
@@ -47,7 +64,7 @@ const ListTodos = Query.make("ListTodos", {
 
 export const definition = Definition.make({
   models: [Todo],
-  mutations: [PutTodo, RenameTodo, IncrementTodo, AddLabel],
+  mutations: [PutTodo, RenameTodo, IncrementTodo, AddLabel, RejectAfterWrite, PutHugeTodo, ReturnHugeResult],
   queries: [ListTodos]
 })
 
@@ -89,6 +106,14 @@ export const handlers = Layer.mergeAll(
       return labels
     })
   ),
+  RejectAfterWrite.toLayer(({ payload, transaction }) =>
+    transaction.set(Todo, payload.id, payload).pipe(Effect.andThen(Effect.fail("Rejected" as const)))
+  ),
+  PutHugeTodo.toLayer(({ payload, transaction }) => {
+    const value = todo(payload.id, hugeTitle)
+    return transaction.set(Todo, payload.id, value).pipe(Effect.as(value))
+  }),
+  ReturnHugeResult.toLayer(() => Effect.succeed(hugeTitle)),
   ListTodos.toLayer(({ query }) => query.all(Todo))
 )
 

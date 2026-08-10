@@ -3,7 +3,6 @@ import type * as Definition from "@lucas-barake/effect-local/Definition"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Model from "@lucas-barake/effect-local/Model"
 import type * as Protocol from "@lucas-barake/effect-local/Protocol"
-import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
@@ -13,8 +12,7 @@ import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as Codec from "./codec.js"
 import * as Rows from "./rows.js"
-
-const storageError = (cause: unknown) => new ReplicaError.StorageUnavailable({ cause })
+import * as StorageUnavailable from "./storageUnavailable.js"
 
 const encodeEntity = <M extends Model.Any,>(model: M, key: Model.Key<M>, value?: Model.Value<M>) =>
   Effect.gen(function*() {
@@ -46,7 +44,7 @@ export const local = (options: {
       Effect.gen(function*() {
         const { keyJson } = yield* encodeEntity(model, key)
         const row = yield* find({ model: model.name, key: keyJson }).pipe(
-          Effect.mapError(storageError)
+          Effect.mapError(StorageUnavailable.make)
         )
         if (Option.isNone(row)) return Option.none()
         const value = yield* Codec.parse(row.value.value_json).pipe(
@@ -71,7 +69,7 @@ export const local = (options: {
           entity: { model: model.name, key: encoded.encodedKey as any },
           value: encoded.encodedValue as any
         })
-      }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(storageError(cause)))),
+      }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     delete: (model, key) =>
       Effect.gen(function*() {
         const encoded = yield* encodeEntity(model, key)
@@ -83,7 +81,7 @@ export const local = (options: {
             .sql`DELETE FROM effect_local_canonical_entities WHERE model = ${model.name} AND entity_key = ${encoded.keyJson}`
         }
         options.changes?.push({ _tag: "Delete", entity: { model: model.name, key: encoded.encodedKey as any } })
-      }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(storageError(cause)))),
+      }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     applyField: (semantics, current, operation) => semantics.apply(current, operation)
   }
 }
@@ -106,7 +104,7 @@ export const server = (options: {
       Effect.gen(function*() {
         const { keyJson } = yield* encodeEntity(model, key)
         const row = yield* find({ spaceId: options.spaceId, model: model.name, key: keyJson }).pipe(
-          Effect.mapError(storageError)
+          Effect.mapError(StorageUnavailable.make)
         )
         if (Option.isNone(row)) return Option.none()
         const value = yield* Codec.parse(row.value.value_json).pipe(
@@ -125,14 +123,14 @@ export const server = (options: {
           entity: { model: model.name, key: encoded.encodedKey as any },
           value: encoded.encodedValue as any
         })
-      }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(storageError(cause)))),
+      }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     delete: (model, key) =>
       Effect.gen(function*() {
         const encoded = yield* encodeEntity(model, key)
         yield* options.sql`DELETE FROM effect_local_server_entities
         WHERE space_id = ${options.spaceId} AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
         options.changes.push({ _tag: "Delete", entity: { model: model.name, key: encoded.encodedKey as any } })
-      }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(storageError(cause)))),
+      }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     applyField: (semantics, current, operation) => semantics.apply(current, operation)
   }
 }
@@ -162,6 +160,6 @@ export const applyLocalChange = (
         VALUES (${change.entity.model}, ${keyJson}, ${valueJson})
         ON CONFLICT (model, entity_key) DO UPDATE SET value_json = excluded.value_json`
     }
-  }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(storageError(cause))))
+  }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
 export const entityKey = (entity: Protocol.EntityKey) => `${entity.model}\u0000${Canonical.stringify(entity.key)}`

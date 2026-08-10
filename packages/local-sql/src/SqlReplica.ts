@@ -8,6 +8,18 @@ import * as LocalStore from "./LocalStore.js"
 import * as MutationRuntime from "./MutationRuntime.js"
 import * as QueryExecutor from "./QueryExecutor.js"
 import * as Reconciler from "./Reconciler.js"
+import * as ReconciliationWorkflow from "./ReconciliationWorkflow.js"
+
+export interface Options<D extends Definition.Any,> {
+  readonly definition: D
+  readonly spaceId: Identity.SpaceId
+  readonly clientId: Identity.ClientId
+  readonly maximumPendingMutations?: number
+  readonly pageSize?: number
+  readonly retryDelay?: Duration.Input
+  readonly maximumRetryDelay?: Duration.Input
+  readonly maximumAttempts?: number
+}
 
 export const layerFromServices: Layer.Layer<
   Replica.Replica,
@@ -29,21 +41,22 @@ export const layerFromServices: Layer.Layer<
   })
 )
 
-export const layer = <D extends Definition.Any,>(options: {
-  readonly definition: D
-  readonly spaceId: Identity.SpaceId
-  readonly clientId: Identity.ClientId
-  readonly maximumPendingMutations?: number
-  readonly pageSize?: number
-  readonly retryDelay?: Duration.Input
-}) => {
+const makeLayer = <D extends Definition.Any, E, R,>(
+  options: Options<D>,
+  reconcilerLayer: Layer.Layer<Reconciler.Reconciler, E, LocalStore.Store | R>
+) => {
   const mutationRuntime = MutationRuntime.layer(options.definition)
   const local = LocalStore.layer(options).pipe(Layer.provide(mutationRuntime))
   const queries = QueryExecutor.layer(options.definition)
-  const reconciler = Reconciler.layer(options).pipe(Layer.provide(local))
+  const reconciler = reconcilerLayer.pipe(Layer.provide(local))
   return layerFromServices.pipe(
     Layer.provideMerge(local),
     Layer.provideMerge(queries),
     Layer.provideMerge(reconciler)
   )
 }
+
+export const layer = <D extends Definition.Any,>(options: Options<D>) => makeLayer(options, Reconciler.layer(options))
+
+export const layerWorkflow = <D extends Definition.Any,>(options: Options<D>) =>
+  makeLayer(options, ReconciliationWorkflow.layer(options))

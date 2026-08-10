@@ -1,11 +1,10 @@
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
-import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
 
-const storageError = (cause: unknown) => new ReplicaError.StorageUnavailable({ cause })
+import * as StorageUnavailable from "./internal/storageUnavailable.js"
 
 export const client = (options: {
   readonly definition: Definition.Any
@@ -21,7 +20,11 @@ export const client = (options: {
     definition_hash TEXT NOT NULL,
     next_local_sequence INTEGER NOT NULL,
     server_cursor INTEGER NOT NULL,
-    visible_revision INTEGER NOT NULL
+    visible_revision INTEGER NOT NULL,
+    requested_generation INTEGER NOT NULL DEFAULT 0 CHECK (requested_generation >= 0),
+    completed_generation INTEGER NOT NULL DEFAULT 0 CHECK (
+      completed_generation >= 0 AND completed_generation <= requested_generation
+    )
   )`
     yield* sql`CREATE TABLE IF NOT EXISTS effect_local_pending (
     mutation_id TEXT PRIMARY KEY,
@@ -56,10 +59,11 @@ export const client = (options: {
     PRIMARY KEY (model, entity_key)
   )`
     yield* sql`INSERT INTO effect_local_client_meta
-    (singleton, space_id, client_id, definition_hash, next_local_sequence, server_cursor, visible_revision)
-    VALUES (1, ${options.spaceId}, ${options.clientId}, ${options.definition.hash}, 1, 0, 0)
+    (singleton, space_id, client_id, definition_hash, next_local_sequence, server_cursor, visible_revision,
+      requested_generation, completed_generation)
+    VALUES (1, ${options.spaceId}, ${options.clientId}, ${options.definition.hash}, 1, 0, 0, 0, 0)
     ON CONFLICT (singleton) DO NOTHING`
-  }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(storageError(cause))))
+  }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
 export const server = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
@@ -88,6 +92,7 @@ export const server = Effect.gen(function*() {
     space_id TEXT NOT NULL,
     server_sequence INTEGER NOT NULL,
     mutation_id TEXT NOT NULL,
+    entry_bytes INTEGER NOT NULL CHECK (entry_bytes > 0),
     entry_json TEXT NOT NULL,
     PRIMARY KEY (space_id, server_sequence),
     UNIQUE (space_id, mutation_id)
@@ -99,4 +104,4 @@ export const server = Effect.gen(function*() {
     value_json TEXT NOT NULL,
     PRIMARY KEY (space_id, model, entity_key)
   )`
-}).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(storageError(cause))))
+}).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))

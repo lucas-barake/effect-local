@@ -51,6 +51,12 @@ const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
 export const stringify = (value: unknown): string =>
   Schema.encodeSync(Schema.UnknownFromJsonString)(normalize(value, new WeakSet()))
 
+export const stringifyEffect = (value: unknown): Effect.Effect<string, ReplicaError.CanonicalEncodeError> =>
+  Effect.try({
+    try: () => stringify(value),
+    catch: (cause) => new ReplicaError.CanonicalEncodeError({ cause })
+  })
+
 export const hash = (value: unknown): string => {
   const input = stringify(value)
   let current = 0xcbf29ce484222325n
@@ -62,10 +68,7 @@ export const hash = (value: unknown): string => {
 }
 
 export const digest = (value: unknown) =>
-  Effect.try({
-    try: () => stringify(value),
-    catch: (cause) => new ReplicaError.CanonicalEncodeError({ cause })
-  }).pipe(
+  stringifyEffect(value).pipe(
     Effect.flatMap((input) =>
       Crypto.Crypto.use((crypto) => crypto.digest("SHA-256", new TextEncoder().encode(input))).pipe(
         Effect.map(Encoding.encodeHex),

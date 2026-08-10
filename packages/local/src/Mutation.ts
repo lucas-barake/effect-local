@@ -62,7 +62,7 @@ export const make = <
   if (name.startsWith("$")) throw new TypeError(`Mutation name must not start with $: ${name}`)
   const payloadSchema = options?.payload === undefined ?
     SchemaInput.Void as unknown as SchemaInput.Wire<P> :
-    (Schema.isSchema(options.payload) ? options.payload : Schema.Struct(options.payload)) as SchemaInput.Wire<P>
+    SchemaInput.normalize(options.payload)
   const successSchema = (options?.success ?? SchemaInput.Void) as A
   const rejectionSchema = (options?.rejection ?? Schema.Never) as E
   const handler = Context.Service<

@@ -43,7 +43,7 @@ const service = <I, S, E, R,>(tag: Context.Service<I, S>, layer: Layer.Layer<I, 
 const makeServices = Effect.gen(function*() {
   const server = yield* service(
     ServerStore.ServerStore,
-    ServerStore.layer({ definition }).pipe(
+    ServerStore.layerTrusted({ definition }).pipe(
       Layer.provide(runtime),
       Layer.provide(database())
     )
@@ -68,7 +68,7 @@ const makeServices = Effect.gen(function*() {
 
 describe("test synchronization faults", () => {
   it.effect("keeps optimistic state while partitioned and reconciles after healing", () =>
-    Effect.scoped(Effect.gen(function*() {
+    Effect.gen(function*() {
       const { faults, local, sync } = yield* makeServices
       const pending = yield* local.mutate(PutTodo, { id: "1", title: "offline" })
       yield* faults.partition
@@ -78,15 +78,16 @@ describe("test synchronization faults", () => {
       assert.strictEqual(yield* local.pendingCount, 1)
 
       yield* faults.heal
-      yield* sync.submit(pending.envelope)
+      const receipt = yield* sync.submit(pending.envelope)
+      yield* local.applyReceipt(receipt)
       const page = yield* sync.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
       yield* local.applyEntries(page.entries)
       assert.strictEqual(yield* local.pendingCount, 0)
       assert.strictEqual(yield* local.cursor, 1)
-    })))
+    }))
 
   it.effect("resolves a dropped receipt through an exact retry", () =>
-    Effect.scoped(Effect.gen(function*() {
+    Effect.gen(function*() {
       const { faults, local, sync } = yield* makeServices
       const pending = yield* local.mutate(PutTodo, { id: "1", title: "ambiguous" })
       yield* faults.dropNextReceipt
@@ -97,18 +98,19 @@ describe("test synchronization faults", () => {
       if (receipt._tag === "Accepted") assert.strictEqual(receipt.serverSequence, 1)
       const page = yield* sync.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
       assert.strictEqual(page.entries.length, 1)
-    })))
+    }))
 
   it.effect("duplicates a catch up entry without corrupting local order", () =>
-    Effect.scoped(Effect.gen(function*() {
+    Effect.gen(function*() {
       const { faults, local, sync } = yield* makeServices
       const pending = yield* local.mutate(PutTodo, { id: "1", title: "duplicate" })
-      yield* sync.submit(pending.envelope)
+      const receipt = yield* sync.submit(pending.envelope)
+      yield* local.applyReceipt(receipt)
       yield* faults.duplicateNextPage
       const page = yield* sync.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
       assert.deepStrictEqual(page.entries.map((entry) => entry.sequence), [1, 1])
       yield* local.applyEntries(page.entries)
       assert.strictEqual(yield* local.cursor, 1)
       assert.strictEqual(yield* local.pendingCount, 0)
-    })))
+    }))
 })

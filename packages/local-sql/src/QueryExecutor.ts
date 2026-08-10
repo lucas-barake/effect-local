@@ -7,9 +7,11 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as Codec from "./internal/codec.js"
 import * as Rows from "./internal/rows.js"
+import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as SqlTransaction from "./internal/transaction.js"
 
 export interface Service {
@@ -50,7 +52,7 @@ export const layer = <D extends Definition.Any,>(
         get: SqlTransaction.local({ sql, definition, table: "visible" }).get,
         all: <M extends Model.Any,>(model: M) =>
           allRows(model.name).pipe(
-            Effect.mapError((cause) => new ReplicaError.StorageUnavailable({ cause })),
+            Effect.mapError(StorageUnavailable.make),
             Effect.flatMap((rows) =>
               Effect.forEach(
                 rows,
@@ -61,7 +63,7 @@ export const layer = <D extends Definition.Any,>(
       }
       return QueryExecutor.of({
         execute: (query, payload) =>
-          Effect.gen(function*() {
+          sql.withTransaction(Effect.gen(function*() {
             const handler = handlers.get(query.name)
             if (handler === undefined) {
               return yield* new ReplicaError.ProtocolInvalid({ message: `Unknown query: ${query.name}` })
@@ -71,7 +73,12 @@ export const layer = <D extends Definition.Any,>(
             const result = yield* handler.execute({ query: queryCapability, payload: decodedPayload })
             const encoded = yield* Codec.encode(query.successSchema, result)
             return yield* Codec.decode(query.successSchema, encoded)
-          })
+          })).pipe(
+            Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
+            Effect.withSpan("QueryExecutor.execute", {
+              attributes: { "query.name": query.name }
+            })
+          )
       })
     })
   )

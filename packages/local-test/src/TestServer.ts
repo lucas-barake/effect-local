@@ -7,21 +7,24 @@ import * as Layer from "effect/Layer"
 import * as Stream from "effect/Stream"
 import * as FaultInjection from "./FaultInjection.js"
 
-const offline = () => new ReplicaError.ProtocolInvalid({ message: "The test network is partitioned" })
-
 export const layer: Layer.Layer<SyncEngine.SyncEngine, never, ServerStore.ServerStore | FaultInjection.FaultInjection> =
   Layer.effect(
     SyncEngine.SyncEngine,
     Effect.gen(function*() {
       const server = yield* ServerStore.ServerStore
       const faults = yield* FaultInjection.FaultInjection
-      const online = faults.state.pipe(Effect.filterOrFail((state) => state.online, offline))
+      const online = faults.state.pipe(Effect.filterOrFail(
+        (state) => state.online,
+        () => new ReplicaError.ProtocolInvalid({ message: "The test network is partitioned" })
+      ))
       return SyncEngine.SyncEngine.of({
         submit: (envelope) =>
           Effect.gen(function*() {
             yield* online
             const receipt = yield* server.submit(envelope)
-            if (yield* faults.takeDroppedReceipt) return yield* offline()
+            if (yield* faults.takeDroppedReceipt) {
+              return yield* new ReplicaError.ProtocolInvalid({ message: "The test network is partitioned" })
+            }
             return receipt
           }),
         pull: (request) =>
@@ -37,7 +40,7 @@ export const layer: Layer.Layer<SyncEngine.SyncEngine, never, ServerStore.Server
         watch: (spaceId) =>
           server.watch(spaceId).pipe(
             Stream.filterEffect(() => faults.state.pipe(Effect.map((state) => state.online))),
-            Stream.mapError(() => offline())
+            Stream.mapError(() => new ReplicaError.ProtocolInvalid({ message: "The test network is partitioned" }))
           )
       })
     })
