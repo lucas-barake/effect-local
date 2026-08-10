@@ -20,8 +20,11 @@ const coordinator = Effect.runPromise(Effect.gen(function*() {
     workerUrl.searchParams.has("effectLocalTestRejectImport")
   ) {
     yield* Effect.callback<void>((resume) => {
+      let released = false
       const release = (event: MessageEvent<unknown>) => {
-        if (event.data !== "effectLocalTestReleaseImport") return
+        if (released || event.data !== "effectLocalTestReleaseImport") return
+        released = true
+        globalThis.removeEventListener("message", release)
         resume(Effect.void)
       }
       globalThis.addEventListener("message", release)
