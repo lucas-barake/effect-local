@@ -262,21 +262,13 @@ const sameHeads = (left: ReadonlyArray<string>, right: ReadonlyArray<string>) =>
 const syncStateAtHeads = (
   heads: ReadonlyArray<string>,
   sentHashes: ReadonlyArray<string>
-): Automerge.SyncState => {
-  const state = Automerge.initSyncState() as Automerge.SyncState & {
-    sharedHeads: ReadonlyArray<string>
-    lastSentHeads: ReadonlyArray<string>
-    theirHeads: ReadonlyArray<string> | null
-    sentHashes: ReadonlyArray<string>
-  }
-  return {
-    ...state,
-    sharedHeads: [...heads],
-    lastSentHeads: [...heads],
-    theirHeads: [...heads],
-    sentHashes: [...sentHashes]
-  }
-}
+): Automerge.SyncState => ({
+  ...Automerge.initSyncState(),
+  sharedHeads: [...heads],
+  lastSentHeads: [...heads],
+  theirHeads: [...heads],
+  sentHashes: [...sentHashes]
+})
 
 export class PeerSync extends Context.Service<PeerSync, {
   readonly open: (peerId: Identity.PeerId) => Effect.Effect<Session, ReplicaError.ReplicaError>
@@ -500,6 +492,62 @@ const make = (
           FROM effect_local_peer_relay_receipt_usage
           WHERE replica_incarnation = ${replicaIncarnation}`
     })
+    const recordRelayReceiptUsage = (
+      replicaIncarnation: Identity.ReplicaIncarnation,
+      relay: RelayReceipt,
+      encodedBytes: number
+    ) =>
+      Effect.gen(function*() {
+        yield* sql`INSERT INTO effect_local_peer_relay_receipt_usage (
+          replica_incarnation, sender_tenant_id, sender_subject_id, sender_peer_id,
+          receipt_count, encoded_bytes
+        ) VALUES (
+          ${replicaIncarnation}, ${relay.senderTenantId}, ${relay.senderSubjectId},
+          ${relay.senderPeerId}, 1, ${encodedBytes}
+        ) ON CONFLICT(replica_incarnation, sender_tenant_id, sender_subject_id, sender_peer_id)
+        DO UPDATE SET
+          receipt_count = effect_local_peer_relay_receipt_usage.receipt_count + 1,
+          encoded_bytes = effect_local_peer_relay_receipt_usage.encoded_bytes + excluded.encoded_bytes`
+        const remote = (yield* findRelayReceiptUsage({
+          replicaIncarnation,
+          senderPeerId: relay.senderPeerId,
+          senderSubjectId: relay.senderSubjectId,
+          senderTenantId: relay.senderTenantId
+        }))[0]
+        const replica = (yield* findRelayReplicaReceiptUsage(replicaIncarnation))[0]
+        if ((remote?.receipt_count ?? 0) > relayReceiptLimits!.maxReceiptsPerRemote) {
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.QuotaExceeded({
+              resource: "relay receipts per remote",
+              limit: relayReceiptLimits!.maxReceiptsPerRemote
+            })
+          })
+        }
+        if ((remote?.encoded_bytes ?? 0) > relayReceiptLimits!.maxEncodedBytesPerRemote) {
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.QuotaExceeded({
+              resource: "relay receipt bytes per remote",
+              limit: relayReceiptLimits!.maxEncodedBytesPerRemote
+            })
+          })
+        }
+        if ((replica?.count ?? 0) > relayReceiptLimits!.maxReceiptsPerReplica) {
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.QuotaExceeded({
+              resource: "relay receipts per replica",
+              limit: relayReceiptLimits!.maxReceiptsPerReplica
+            })
+          })
+        }
+        if ((replica?.bytes ?? 0) > relayReceiptLimits!.maxEncodedBytesPerReplica) {
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.QuotaExceeded({
+              resource: "relay receipt bytes per replica",
+              limit: relayReceiptLimits!.maxEncodedBytesPerReplica
+            })
+          })
+        }
+      })
     const findExistingChanges = SqlSchema.findAll({
       Request: Schema.Struct({
         documentId: Identity.DocumentId,
@@ -1222,9 +1270,7 @@ const make = (
                   writerSchemaVersion: row.writer_schema_version,
                   writerDefinitionHash: row.writer_definition_hash
                 })),
-                ...checkpoints.flatMap((checkpoint) =>
-                  Array.isArray(checkpoint.writer_provenance) ? checkpoint.writer_provenance : []
-                )
+                ...checkpoints.flatMap((checkpoint) => WriterProvenance.exactEntries(checkpoint.writer_provenance))
               ]
             ),
           catch: (cause) =>
@@ -1821,36 +1867,12 @@ const make = (
             ),
             Effect.onError(() => Effect.sync(() => InternalAutomerge.free(automerge)))
           )
-          return { automerge, encoded, heads, manifest, priorChangeHashes, transfer, value }
-        }).pipe(
-          Effect.catchTags({
-            NoSuchElementError: () =>
-              Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.ReplicaMetadataMissing({
-                    operation: "PeerSync.receive checkpoint"
-                  })
-                })
-              ),
-            SqlError: (cause) =>
-              Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageUnavailable({ cause })
-                })
-              ),
-            SchemaError: (cause) =>
-              Effect.fail(
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.StorageCorrupt({ cause })
-                })
-              )
-          })
-        ),
+          return { automerge, heads, manifest, priorChangeHashes, transfer, value }
+        }),
         (prepared) =>
           Effect.gen(function*() {
             const { automerge, heads, manifest, priorChangeHashes, transfer, value } = prepared
-            const existingBefore = yield* findCheckpointDocument(documentId)
-            const existing = Option.getOrUndefined(existingBefore)
+            const existing = Option.getOrUndefined(yield* findCheckpointDocument(documentId))
             if (existing === undefined) {
               if (manifest.base._tag !== "Bootstrap") {
                 return yield* new ReplicaError.ReplicaError({
@@ -2111,57 +2133,7 @@ const make = (
                 ${relay?.receiptExpiresAt ?? null}, ${relayRetainedSize}
               )`
               if (relay !== undefined) {
-                yield* sql`INSERT INTO effect_local_peer_relay_receipt_usage (
-                  replica_incarnation, sender_tenant_id, sender_subject_id, sender_peer_id,
-                  receipt_count, encoded_bytes
-                ) VALUES (
-                  ${receiptSession.replicaIncarnation}, ${relay.senderTenantId},
-                  ${relay.senderSubjectId}, ${relay.senderPeerId}, 1, ${relayRetainedSize!}
-                ) ON CONFLICT(replica_incarnation, sender_tenant_id, sender_subject_id, sender_peer_id)
-                DO UPDATE SET
-                  receipt_count = effect_local_peer_relay_receipt_usage.receipt_count + 1,
-                  encoded_bytes = effect_local_peer_relay_receipt_usage.encoded_bytes + excluded.encoded_bytes`
-                const remote = (yield* findRelayReceiptUsage({
-                  replicaIncarnation: receiptSession.replicaIncarnation,
-                  senderPeerId: relay.senderPeerId,
-                  senderSubjectId: relay.senderSubjectId,
-                  senderTenantId: relay.senderTenantId
-                }))[0]
-                const replica = (yield* findRelayReplicaReceiptUsage(
-                  receiptSession.replicaIncarnation
-                ))[0]
-                if ((remote?.receipt_count ?? 0) > relayReceiptLimits!.maxReceiptsPerRemote) {
-                  return yield* new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.QuotaExceeded({
-                      resource: "relay receipts per remote",
-                      limit: relayReceiptLimits!.maxReceiptsPerRemote
-                    })
-                  })
-                }
-                if ((remote?.encoded_bytes ?? 0) > relayReceiptLimits!.maxEncodedBytesPerRemote) {
-                  return yield* new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.QuotaExceeded({
-                      resource: "relay receipt bytes per remote",
-                      limit: relayReceiptLimits!.maxEncodedBytesPerRemote
-                    })
-                  })
-                }
-                if ((replica?.count ?? 0) > relayReceiptLimits!.maxReceiptsPerReplica) {
-                  return yield* new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.QuotaExceeded({
-                      resource: "relay receipts per replica",
-                      limit: relayReceiptLimits!.maxReceiptsPerReplica
-                    })
-                  })
-                }
-                if ((replica?.bytes ?? 0) > relayReceiptLimits!.maxEncodedBytesPerReplica) {
-                  return yield* new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.QuotaExceeded({
-                      resource: "relay receipt bytes per replica",
-                      limit: relayReceiptLimits!.maxEncodedBytesPerReplica
-                    })
-                  })
-                }
+                yield* recordRelayReceiptUsage(receiptSession.replicaIncarnation, relay, relayRetainedSize!)
               }
               yield* gate.validate(permit)
               return {
@@ -2589,51 +2561,6 @@ const make = (
                     })
                   }
                 })
-                const validateRelayReceiptQuota = relay === undefined
-                  ? Effect.void
-                  : Effect.gen(function*() {
-                    const remote = (yield* findRelayReceiptUsage({
-                      replicaIncarnation: receiptSession.replicaIncarnation,
-                      senderPeerId: relay.senderPeerId,
-                      senderSubjectId: relay.senderSubjectId,
-                      senderTenantId: relay.senderTenantId
-                    }))[0]
-                    const replica = (yield* findRelayReplicaReceiptUsage(
-                      receiptSession.replicaIncarnation
-                    ))[0]
-                    if ((remote?.receipt_count ?? 0) > relayReceiptLimits!.maxReceiptsPerRemote) {
-                      return yield* new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.QuotaExceeded({
-                          resource: "relay receipts per remote",
-                          limit: relayReceiptLimits!.maxReceiptsPerRemote
-                        })
-                      })
-                    }
-                    if ((remote?.encoded_bytes ?? 0) > relayReceiptLimits!.maxEncodedBytesPerRemote) {
-                      return yield* new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.QuotaExceeded({
-                          resource: "relay receipt bytes per remote",
-                          limit: relayReceiptLimits!.maxEncodedBytesPerRemote
-                        })
-                      })
-                    }
-                    if ((replica?.count ?? 0) > relayReceiptLimits!.maxReceiptsPerReplica) {
-                      return yield* new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.QuotaExceeded({
-                          resource: "relay receipts per replica",
-                          limit: relayReceiptLimits!.maxReceiptsPerReplica
-                        })
-                      })
-                    }
-                    if ((replica?.bytes ?? 0) > relayReceiptLimits!.maxEncodedBytesPerReplica) {
-                      return yield* new ReplicaError.ReplicaError({
-                        reason: new ReplicaError.QuotaExceeded({
-                          resource: "relay receipt bytes per replica",
-                          limit: relayReceiptLimits!.maxEncodedBytesPerReplica
-                        })
-                      })
-                    }
-                  })
                 const decoded = yield* Effect.try({
                   try: () => Automerge.decodeSyncMessage(message),
                   catch: (cause) =>
@@ -3105,7 +3032,7 @@ const make = (
                       }
                       for (
                         const entry of checkpointProvenanceRows.flatMap((row) =>
-                          Array.isArray(row.writer_provenance) ? row.writer_provenance : []
+                          WriterProvenance.exactEntries(row.writer_provenance)
                         )
                       ) {
                         const existing = checkpointProvenanceByHash.get(entry.changeHash)
@@ -3503,17 +3430,11 @@ const make = (
             ${relayRetainedSize}, ${checkpointTransfer ?? null}
           )`
                           if (relay !== undefined) {
-                            yield* sql`INSERT INTO effect_local_peer_relay_receipt_usage (
-              replica_incarnation, sender_tenant_id, sender_subject_id, sender_peer_id,
-              receipt_count, encoded_bytes
-            ) VALUES (
-              ${receiptSession.replicaIncarnation}, ${relay.senderTenantId}, ${relay.senderSubjectId},
-              ${relay.senderPeerId}, 1, ${relayRetainedSize!}
-            ) ON CONFLICT(replica_incarnation, sender_tenant_id, sender_subject_id, sender_peer_id)
-            DO UPDATE SET
-              receipt_count = effect_local_peer_relay_receipt_usage.receipt_count + 1,
-              encoded_bytes = effect_local_peer_relay_receipt_usage.encoded_bytes + excluded.encoded_bytes`
-                            yield* validateRelayReceiptQuota
+                            yield* recordRelayReceiptUsage(
+                              receiptSession.replicaIncarnation,
+                              relay,
+                              relayRetainedSize!
+                            )
                           }
                           if (unresolvedBytes !== 0) {
                             yield* validateReceiptQuota
