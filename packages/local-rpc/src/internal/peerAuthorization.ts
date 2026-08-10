@@ -5,8 +5,11 @@ import * as Schema from "effect/Schema"
 import type * as PeerAuthentication from "../PeerAuthentication.js"
 import * as PeerRpcError from "../PeerRpcError.js"
 
+const DocumentKeyJson = Schema.fromJsonString(Schema.Tuple([Schema.String, Schema.String]))
+const encodeDocumentKey = Schema.encodeSync(DocumentKeyJson)
+
 const key = (documentType: string, documentId: PeerSession.SelectedDocument["documentId"]) =>
-  Schema.encodeSync(Schema.fromJsonString(Schema.Tuple([Schema.String, Schema.String])))([
+  encodeDocumentKey([
     documentType,
     documentId
   ])

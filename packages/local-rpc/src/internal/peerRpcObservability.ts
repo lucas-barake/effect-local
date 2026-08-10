@@ -239,10 +239,10 @@ const withoutMetricAttributes = <A, E, R,>(effect: Effect.Effect<A, E, R>) =>
 
 const bestEffort = <A, E, R,>(effect: Effect.Effect<A, E, R>) => effect.pipe(Effect.ignoreCause)
 
-const safe = <A,>(thunk: () => A, fallback: A): A =>
+const safe = <A,>(thunk: () => A, fallback: () => A): A =>
   Effect.runSync(
-    Effect.try({ try: thunk, catch: () => fallback }).pipe(
-      Effect.orElseSucceed(() => fallback)
+    Effect.try({ try: thunk, catch: fallback }).pipe(
+      Effect.orElseSucceed(fallback)
     )
   )
 
@@ -270,16 +270,16 @@ const safeSpan = (span: Tracer.Span): Tracer.Span => {
         endTime,
         exit
       }
-      safe(() => span.end(endTime, exit), undefined)
+      safe(() => span.end(endTime, exit), () => undefined)
     },
     attribute(key, value) {
-      safe(() => span.attribute(key, value), undefined)
+      safe(() => span.attribute(key, value), () => undefined)
     },
     event(name, startTime, attributes) {
-      safe(() => span.event(name, startTime, attributes), undefined)
+      safe(() => span.event(name, startTime, attributes), () => undefined)
     },
     addLinks(links) {
-      safe(() => span.addLinks(links), undefined)
+      safe(() => span.addLinks(links), () => undefined)
     }
   }
 }
@@ -287,7 +287,7 @@ const safeSpan = (span: Tracer.Span): Tracer.Span => {
 const safeTracer = (tracer: Tracer.Tracer): Tracer.Tracer =>
   Tracer.make({
     span: (options) => {
-      return safe(() => safeSpan(tracer.span(options)), new Tracer.NativeSpan(options))
+      return safe(() => safeSpan(tracer.span(options)), () => new Tracer.NativeSpan(options))
     }
   })
 
@@ -296,17 +296,17 @@ const safeClock = (clock: Clock.Clock): Clock.Clock => {
   let lastNanos = BigInt(0)
   let lastMonotonicNanos = BigInt(0)
   const currentTimeMillisUnsafe = () => {
-    const current = safe(() => clock.currentTimeMillisUnsafe(), lastMillis)
+    const current = safe(() => clock.currentTimeMillisUnsafe(), () => lastMillis)
     lastMillis = current
     return current
   }
   const currentTimeNanosUnsafe = () => {
-    const current = safe(() => clock.currentTimeNanosUnsafe(), lastNanos)
+    const current = safe(() => clock.currentTimeNanosUnsafe(), () => lastNanos)
     lastNanos = current
     return current
   }
   const monotonicTimeNanosUnsafe = () => {
-    const current = safe(() => clock.monotonicTimeNanosUnsafe(), lastMonotonicNanos)
+    const current = safe(() => clock.monotonicTimeNanosUnsafe(), () => lastMonotonicNanos)
     lastMonotonicNanos = current
     return current
   }

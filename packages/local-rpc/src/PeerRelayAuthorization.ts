@@ -117,10 +117,13 @@ const validateResult = (request: Request, result: Result) =>
     Effect.as(result)
   )
 
+const DocumentKeyJson = Schema.fromJsonString(Schema.Tuple([Schema.String, Schema.String]))
+const encodeDocumentKey = Schema.encodeSync(DocumentKeyJson)
+
 const documentKey = (
   document: UnsafeUnboundedAutomerge3DecodeRequest["documents"][number]
 ) =>
-  Schema.encodeSync(Schema.fromJsonString(Schema.Tuple([Schema.String, Schema.String])))([
+  encodeDocumentKey([
     document.documentType,
     document.documentId
   ])
