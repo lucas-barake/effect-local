@@ -3,6 +3,7 @@ import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Cause from "effect/Cause"
 import * as DateTime from "effect/DateTime"
 import * as Effect from "effect/Effect"
+import * as Schema from "effect/Schema"
 import {
   Check,
   Circle,
@@ -18,7 +19,7 @@ import {
   X
 } from "lucide-react"
 import { type ChangeEvent, type FormEvent, useEffect, useMemo, useRef, useState } from "react"
-import type { TaskRow } from "./domain.ts"
+import { ListTasks, type TaskRow } from "./domain.ts"
 import {
   createTask,
   deleteTask,
@@ -256,8 +257,8 @@ export const App = () => {
   }
 
   const rows: ReadonlyArray<TaskRow> = (() => {
-    if (result._tag === "Success") return result.value
-    return []
+    if (result._tag !== "Success") return []
+    return Schema.decodeUnknownSync(ListTasks.successSchema)(result.value)
   })()
   const activeCount = rows.filter((task) => !task.completed).length
   let statusText = "Starting local replica"
