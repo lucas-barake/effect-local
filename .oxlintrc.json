@@ -56,6 +56,28 @@
         "oxc/no-async-endpoint-handlers": "off",
         "unicorn/prefer-add-event-listener": "off"
       }
+    },
+    {
+      "files": [
+        "packages/local-browser/test-browser/**/tests/**/*.spec.ts",
+        "packages/local-browser/test-browser/**/tests-production/**/*.spec.ts"
+      ],
+      "rules": {
+        "effect/noAsyncFunction": "off",
+        "effect/noGlobals": "off",
+        "effect/noNewPromise": "off",
+        "effect/noTryCatch": "off",
+        "effect/noNewError": "off",
+        "effect/noThrowStatement": "off"
+      }
+    },
+    {
+      "files": ["packages/local-browser/test-browser/ownership/public/service-worker.js"],
+      "rules": {
+        "effect/noNewPromise": "off",
+        "effect/noGlobals": "off",
+        "effect/noAsyncFunction": "off"
+      }
     }
   ]
 }
