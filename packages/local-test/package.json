@@ -42,9 +42,9 @@
     "dist/**/*.d.ts.map"
   ],
   "scripts": {
-    "build": "tsc -b tsconfig.json",
-    "build:tsgo": "tsgo -b tsconfig.json",
-    "check": "tsc -b tsconfig.json",
+    "build": "tsgo -b tsconfig.json",
+    "build:tsc": "tsc -b tsconfig.json",
+    "check": "tsgo -b tsconfig.json",
     "test": "vitest --config vitest.config.ts"
   },
   "dependencies": {

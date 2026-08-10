@@ -1023,7 +1023,9 @@ it.layer(Layer.mergeAll(
           },
           pending: () =>
             Ref.updateAndGet(pendingCalls, (count) => count + 1).pipe(
-              Effect.flatMap((call) => call === 1 ? Effect.succeed([initial]) : Ref.get(pending))
+              Effect.flatMap((call): Effect.Effect<ReadonlyArray<PeerSync.Outbound>> =>
+                call === 1 ? Effect.succeed([initial]) : Ref.get(pending)
+              )
             ),
           markSent: (_session, sendSequence) =>
             Ref.update(pending, (current) => current.filter((outbound) => outbound.sendSequence !== sendSequence)).pipe(
