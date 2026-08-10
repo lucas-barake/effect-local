@@ -18,6 +18,7 @@ import type * as Migrator from "effect/unstable/sql/Migrator"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as BackupStore from "./BackupStore.js"
+import * as CheckpointAuthority from "./CheckpointAuthority.js"
 import * as CommandDeliveryPublisher from "./CommandDeliveryPublisher.js"
 import * as CommandDeliveryStore from "./CommandDeliveryStore.js"
 import * as CommandExecutor from "./CommandExecutor.js"
@@ -43,6 +44,7 @@ import type * as ReplicaWorkflow from "./ReplicaWorkflow.js"
 import type * as SqlProjection from "./SqlProjection.js"
 
 export interface Options<Bindings extends ReadonlyArray<SqlProjection.Any>,> {
+  readonly checkpointAuthority?: CheckpointAuthority.Implementation
   readonly deliveryPublisher?: CommandDeliveryPublisher.Options
   readonly health?: ReplicaHealth.Options
   readonly projections: Bindings
@@ -293,10 +295,15 @@ export const servicesLayer = <
     throw new TypeError("SqlReplica requires exactly one SQL binding for every projection")
   }
   const bootstrap = ReplicaBootstrap.layer(definition)
+  const checkpointAuthority = options.checkpointAuthority === undefined
+    ? CheckpointAuthority.layerRejectAll
+    : CheckpointAuthority.layer(options.checkpointAuthority)
   const gate = ReplicaGate.layer.pipe(Layer.provideMerge(bootstrap))
   const recovery = Recovery.layer.pipe(Layer.provideMerge(gate))
   const store = DocumentStore.layer.pipe(Layer.provideMerge(recovery))
-  const compaction = Compaction.layer.pipe(Layer.provideMerge(recovery))
+  const compaction = Compaction.layer.pipe(
+    Layer.provideMerge(Layer.merge(recovery, checkpointAuthority))
+  )
   const projections = ProjectionStore.layer(options.projections).pipe(Layer.provideMerge(store))
   const evolution = ReplicaEvolution.layer(definition).pipe(Layer.provideMerge(projections))
   const health = ReplicaHealth.layer(definition, options.health ?? ReplicaHealth.defaultOptions).pipe(
@@ -314,12 +321,13 @@ export const servicesLayer = <
     Layer.provideMerge(deliveryStore)
   )
   const backups = BackupStore.layer(definition).pipe(
-    Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
+    Layer.provideMerge(Layer.mergeAll(publisher, deliveryPublisher, checkpointAuthority))
   )
   // Retain the client so service-level consumers observe the same database instance as the graph.
   const sql = Layer.effect(SqlClient.SqlClient, SqlClient.SqlClient)
   const infrastructure = Layer.mergeAll(
     backups,
+    checkpointAuthority,
     compaction,
     deliveryStore,
     deliveryPublisher,
@@ -418,7 +426,7 @@ export const servicesLayerWithBindings = <
   const Bindings extends ReadonlyArray<SqlProjection.Any>,
 >(
   definition: D,
-  options: { readonly health?: ReplicaHealth.Options; readonly projections: Bindings }
+  options: Options<Bindings>
 ) => servicesLayer(definition, options).pipe(Layer.provide(bindingLayers(options.projections)))
 
 export const layerWithBindings = <

@@ -1,4 +1,6 @@
 import * as Automerge from "@automerge/automerge"
+import * as Conflict from "@lucas-barake/effect-local/Conflict"
+import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Equal from "effect/Equal"
 import * as Schema from "effect/Schema"
 import * as SyncChunks from "./syncChunks.js"
@@ -14,6 +16,13 @@ export const ChangeHash = Schema.String.check(
   Schema.isPattern(/^[0-9a-f]{64}$/)
 )
 
+export const maximumAuthorizationTokenBytes = 16 * 1_024
+export const AuthorizationToken = Schema.Uint8Array.check(
+  Schema.isMinLength(1),
+  Schema.isMaxLength(maximumAuthorizationTokenBytes)
+)
+export type AuthorizationToken = typeof AuthorizationToken.Type
+
 export const ChangeProvenance = Schema.Struct({
   changeHash: ChangeHash,
   writerSchemaVersion: WriterSchemaVersion,
@@ -24,6 +33,42 @@ export type ChangeProvenance = typeof ChangeProvenance.Type
 
 export const ChangeProvenances = Schema.Array(ChangeProvenance)
 export const StoredChangeProvenances = Schema.fromJsonString(ChangeProvenances)
+
+export const CheckpointBase = Schema.TaggedUnion({
+  Bootstrap: {},
+  Heads: { baseHeads: Conflict.Heads }
+})
+
+export const CompactCheckpointProvenance = Schema.TaggedStruct("Compact", {
+  checkpointHash: ChangeHash,
+  lineage: Identity.DocumentLineage,
+  heads: Conflict.Heads,
+  base: CheckpointBase,
+  schemaVersion: WriterSchemaVersion,
+  writerDefinitionHash: WriterDefinitionHash,
+  authorization: Schema.Uint8ArrayFromBase64.check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(maximumAuthorizationTokenBytes)
+  )
+})
+export type CompactCheckpointProvenance = typeof CompactCheckpointProvenance.Type
+
+export const CheckpointProvenance = Schema.Union([
+  ChangeProvenances,
+  CompactCheckpointProvenance
+])
+export type CheckpointProvenance = typeof CheckpointProvenance.Type
+export const StoredCheckpointProvenance = Schema.fromJsonString(
+  Schema.toCodecJson(CheckpointProvenance)
+)
+
+export const isCompactCheckpoint = (
+  provenance: CheckpointProvenance
+): provenance is CompactCheckpointProvenance => !Array.isArray(provenance)
+
+export const exactEntries = (
+  provenance: CheckpointProvenance
+): ReadonlyArray<ChangeProvenance> => Array.isArray(provenance) ? provenance : []
 
 export const canonicalize = (values: ReadonlyArray<ChangeProvenance>): ReadonlyArray<ChangeProvenance> =>
   values.toSorted((left, right) => left.changeHash.localeCompare(right.changeHash))

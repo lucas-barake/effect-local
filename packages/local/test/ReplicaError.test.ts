@@ -80,6 +80,33 @@ describe("ReplicaError", () => {
     assert.deepStrictEqual(Schema.decodeUnknownSync(ReplicaError.ReplicaError)(encoded), error)
   })
 
+  it("round trips bounded checkpoint rejection metadata", () => {
+    const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
+    const error = new ReplicaError.ReplicaError({
+      reason: new ReplicaError.CheckpointRejected({
+        documentId,
+        reason: "local history diverges from the checkpoint"
+      })
+    })
+    const encoded = Schema.encodeSync(ReplicaError.ReplicaError)(error)
+    assert.deepStrictEqual(encoded.reason, {
+      _tag: "CheckpointRejected",
+      documentId: "doc_00000000-0000-4000-8000-000000000001",
+      reason: "local history diverges from the checkpoint"
+    })
+    assert.deepStrictEqual(Schema.decodeUnknownSync(ReplicaError.ReplicaError)(encoded), error)
+    assert.throws(() =>
+      Schema.decodeUnknownSync(ReplicaError.ReplicaError)({
+        _tag: "ReplicaError",
+        reason: {
+          _tag: "CheckpointRejected",
+          documentId,
+          reason: "x".repeat(1_025)
+        }
+      })
+    )
+  })
+
   it("round trips operation timeout metadata", () => {
     const error = new ReplicaError.ReplicaError({
       reason: new ReplicaError.OperationTimeout({

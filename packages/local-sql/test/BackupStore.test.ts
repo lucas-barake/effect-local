@@ -12,12 +12,15 @@ import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Effect from "effect/Effect"
+import * as Encoding from "effect/Encoding"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as BackupStore from "../src/BackupStore.js"
+import type * as CheckpointAuthority from "../src/CheckpointAuthority.js"
 import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as Compaction from "../src/Compaction.js"
 import * as DocumentStore from "../src/DocumentStore.js"
@@ -122,7 +125,40 @@ describe("BackupStore", () => {
     NodeCrypto.layer
   )
   const Limits = ReplicaLimits.layer(limits)
+  const authorityToken = Uint8Array.of(7, 8, 9) as CheckpointAuthority.AuthorizationToken
+  const checkpointAuthority: CheckpointAuthority.Implementation = {
+    signManifest: () => Effect.succeed(Option.some(authorityToken)),
+    verifyManifest: (claims, token) =>
+      token.length === authorityToken.length && token.every((byte, index) => byte === authorityToken[index])
+        ? Effect.void
+        : Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.CheckpointRejected({
+              documentId: claims.documentId,
+              reason: "Invalid backup checkpoint authorization"
+            })
+          })
+        ),
+    signTransition: () => Effect.succeed(Option.some(authorityToken)),
+    verifyTransition: (claims, token) =>
+      token.length === authorityToken.length && token.every((byte, index) => byte === authorityToken[index])
+        ? Effect.void
+        : Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.CheckpointRejected({
+              documentId: claims.documentId,
+              reason: "Invalid backup transition authorization"
+            })
+          })
+        )
+  }
   const Live = SqlReplica.servicesLayerWithBindings(definition, { projections: [] }).pipe(
+    Layer.provideMerge(Layer.mergeAll(Database, Limits))
+  )
+  const AuthorityLive = SqlReplica.servicesLayerWithBindings(definition, {
+    projections: [],
+    checkpointAuthority
+  }).pipe(
     Layer.provideMerge(Layer.mergeAll(Database, Limits))
   )
   const ProjectedLive = SqlReplica.servicesLayerWithBindings(projectedDefinition, {
@@ -522,7 +558,274 @@ describe("BackupStore", () => {
       const restored = yield* store.load(Task, documentId)
       assert.strictEqual(restored.snapshot.value.title, "rewritten")
       InternalAutomerge.free(restored.automerge)
-    }).pipe(Effect.provide(Live)))
+    }).pipe(Effect.provide(AuthorityLive)))
+
+  it.effect("round trips compact checkpoint provenance and a multi hop lineage transition chain", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "transitioned" })
+      InternalAutomerge.free(created.automerge)
+      const firstLineage = yield* compaction.rewriteHistory(
+        Task,
+        documentId,
+        Compaction.OperationId.make("backup-transition-one")
+      )
+      const secondLineage = yield* compaction.rewriteHistory(
+        Task,
+        documentId,
+        Compaction.OperationId.make("backup-transition-two")
+      )
+      const checkpoints = yield* sql<{
+        readonly checkpoint_hash: string
+        readonly heads: string
+        readonly lineage: string
+      }>`SELECT checkpoint_hash, heads, lineage FROM effect_local_checkpoints WHERE document_id = ${documentId}`
+      const checkpoint = checkpoints[0]!
+      const compactProvenance = {
+        _tag: "Compact",
+        checkpointHash: checkpoint.checkpoint_hash,
+        lineage: checkpoint.lineage,
+        heads: JSON.parse(checkpoint.heads),
+        base: { _tag: "Bootstrap" },
+        schemaVersion: Task.version,
+        writerDefinitionHash: definition.hash,
+        authorization: Encoding.encodeBase64(authorityToken)
+      }
+      yield* sql`UPDATE effect_local_checkpoints
+        SET writer_provenance = ${JSON.stringify(compactProvenance)}
+        WHERE checkpoint_hash = ${checkpoint.checkpoint_hash}`
+      const transitionsBefore = yield* sql<{
+        readonly authorization: Uint8Array | null
+        readonly checkpoint_hash: string
+        readonly created_at: string
+        readonly document_id: string
+        readonly heads: string
+        readonly lineage: string
+        readonly prior_checkpoint_hash: string
+        readonly prior_heads: string
+        readonly prior_lineage: string
+        readonly prior_snapshot: Uint8Array
+        readonly schema_version: number
+        readonly writer_definition_hash: string
+      }>`SELECT * FROM effect_local_lineage_transitions ORDER BY created_at, lineage`
+      assert.strictEqual(transitionsBefore.length, 2)
+      const firstTransition = transitionsBefore.find((transition) => transition.lineage === firstLineage)!
+      const secondTransition = transitionsBefore.find((transition) => transition.lineage === secondLineage)!
+      assert.strictEqual(firstTransition.prior_lineage, Identity.genesisLineage)
+      assert.strictEqual(secondTransition.prior_lineage, firstLineage)
+
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      const lines = archiveLinesOf(chunks)
+      assert.strictEqual(lines.filter((line) => line.kind === "Transition").length, 2)
+      const archivedCheckpoint = lines.find((line) => line.kind === "Checkpoint")!
+      assert.deepStrictEqual(archivedCheckpoint.value.writer_provenance, compactProvenance)
+
+      yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.fromIterable(chunks),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      })
+
+      const transitionsAfter = yield* sql<typeof transitionsBefore[number]>`
+        SELECT * FROM effect_local_lineage_transitions ORDER BY created_at, lineage
+      `
+      assert.deepStrictEqual(transitionsAfter, transitionsBefore)
+      const restoredCheckpoint = yield* sql<{ readonly writer_provenance: string }>`
+        SELECT writer_provenance FROM effect_local_checkpoints WHERE checkpoint_hash = ${checkpoint.checkpoint_hash}
+      `
+      assert.deepStrictEqual(JSON.parse(restoredCheckpoint[0]!.writer_provenance), compactProvenance)
+      assert.deepStrictEqual(
+        yield* sql<{ readonly lineage: string }>`
+          SELECT lineage FROM effect_local_documents WHERE document_id = ${documentId}`,
+        [{ lineage: secondLineage as string }]
+      )
+      const restored = yield* store.load(Task, documentId)
+      assert.strictEqual(restored.snapshot.value.title, "transitioned")
+      InternalAutomerge.free(restored.automerge)
+    }).pipe(Effect.provide(AuthorityLive)))
+
+  it.effect("rejects invalid compact checkpoint authorization before replacement", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const archived = yield* store.create(Task, documentId, { title: "archived" })
+      InternalAutomerge.free(archived.automerge)
+      yield* compaction.compact(Task, documentId)
+      const checkpoint = (yield* sql<{
+        readonly checkpoint_hash: string
+        readonly heads: string
+        readonly lineage: string
+      }>`SELECT checkpoint_hash, heads, lineage FROM effect_local_checkpoints WHERE document_id = ${documentId}`)[0]!
+      yield* sql`UPDATE effect_local_checkpoints SET writer_provenance = ${
+        JSON.stringify({
+          _tag: "Compact",
+          checkpointHash: checkpoint.checkpoint_hash,
+          lineage: checkpoint.lineage,
+          heads: JSON.parse(checkpoint.heads),
+          base: { _tag: "Bootstrap" },
+          schemaVersion: Task.version,
+          writerDefinitionHash: definition.hash,
+          authorization: Encoding.encodeBase64(Uint8Array.of(8))
+        })
+      } WHERE checkpoint_hash = ${checkpoint.checkpoint_hash}`
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      const current = yield* store.load(Task, documentId)
+      const staged = yield* store.stage(current, (draft) => {
+        draft.title = "preserved"
+      })
+      const preserved = yield* store.persist(Task, documentId, current, staged)
+      InternalAutomerge.free(preserved.automerge)
+      InternalAutomerge.free(staged)
+      InternalAutomerge.free(current.automerge)
+
+      const result = yield* Effect.result(backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.fromIterable(chunks),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      }))
+
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) assert.strictEqual(result.failure.reason._tag, "CheckpointRejected")
+      const after = yield* store.load(Task, documentId)
+      assert.strictEqual(after.snapshot.value.title, "preserved")
+      assert.deepStrictEqual(yield* sql`SELECT installation_id FROM effect_local_backup_installations`, [])
+      InternalAutomerge.free(after.automerge)
+    }).pipe(Effect.provide(AuthorityLive)))
+
+  it.effect("rejects invalid transition authorization before document installation", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "transition" })
+      InternalAutomerge.free(created.automerge)
+      yield* compaction.rewriteHistory(
+        Task,
+        documentId,
+        Compaction.OperationId.make("invalid-backup-transition-authorization")
+      )
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      const lines = archiveLinesOf(chunks)
+      const transition = lines.find((line) => line.kind === "Transition")!
+      transition.value.authorization = Encoding.encodeBase64(Uint8Array.of(8))
+      transition.checksum = yield* Canonical.digest(transition.value)
+      const end = lines.at(-1)!
+      end.value.recordsChecksum = yield* Canonical.digest(lines.slice(1, -1).map((line) => line.checksum))
+      end.checksum = yield* Canonical.digest(end.value)
+      const manifest = lines[0]!
+      for (let attempt = 0; attempt < 8; attempt++) {
+        manifest.checksum = yield* Canonical.digest(manifest.value)
+        const encoded = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+        if (manifest.value.declaredBytes === encoded.byteLength) break
+        manifest.value.declaredBytes = encoded.byteLength
+      }
+      manifest.checksum = yield* Canonical.digest(manifest.value)
+      const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+      yield* sql`DELETE FROM effect_local_documents WHERE document_id = ${documentId}`
+
+      const result = yield* Effect.result(backups.installDocument(Task, {
+        installationId: yield* Identity.makeBackupInstallationId,
+        documentId,
+        source: Stream.make(archive),
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      }))
+
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) assert.strictEqual(result.failure.reason._tag, "CheckpointRejected")
+      assert.deepStrictEqual(yield* sql`SELECT document_id FROM effect_local_documents`, [])
+      assert.deepStrictEqual(yield* sql`SELECT installation_id FROM effect_local_backup_installations`, [])
+    }).pipe(Effect.provide(AuthorityLive)))
+
+  it.effect("removes preexisting lineage transitions during replacement", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const store = yield* DocumentStore.DocumentStore
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "replacement" })
+      InternalAutomerge.free(created.automerge)
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      yield* sql`INSERT INTO effect_local_lineage_transitions (
+        document_id, prior_lineage, prior_checkpoint_hash, prior_heads, prior_snapshot,
+        lineage, checkpoint_hash, heads, schema_version, writer_definition_hash,
+        authorization, created_at
+      ) VALUES (
+        ${documentId}, ${Identity.genesisLineage}, ${"1".repeat(64)}, '[]', ${Uint8Array.of(1)},
+        ${Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000099")}, ${"2".repeat(64)},
+        '[]', ${Task.version}, ${definition.hash}, NULL, '2026-08-09T00:00:00.000Z'
+      )`
+
+      yield* backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.fromIterable(chunks),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      })
+
+      assert.deepStrictEqual(yield* sql`SELECT * FROM effect_local_lineage_transitions`, [])
+    }).pipe(Effect.provide(AuthorityLive)))
+
+  it.effect("rejects conflicting lineage transition forks", () =>
+    Effect.gen(function*() {
+      const backups = yield* BackupStore.BackupStore
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const created = yield* store.create(Task, documentId, { title: "forked" })
+      InternalAutomerge.free(created.automerge)
+      yield* compaction.rewriteHistory(
+        Task,
+        documentId,
+        Compaction.OperationId.make("backup-fork-one")
+      )
+      yield* compaction.rewriteHistory(
+        Task,
+        documentId,
+        Compaction.OperationId.make("backup-fork-two")
+      )
+      const chunks = yield* backups.export({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
+      const lines = archiveLinesOf(chunks)
+      const transitions = lines.filter((line) => line.kind === "Transition")
+      assert.strictEqual(transitions.length, 2)
+      transitions[1]!.value.prior_lineage = transitions[0]!.value.prior_lineage
+      transitions[1]!.checksum = yield* Canonical.digest(transitions[1]!.value)
+      const end = lines.at(-1)!
+      end.value.recordsChecksum = yield* Canonical.digest(lines.slice(1, -1).map((line) => line.checksum))
+      end.checksum = yield* Canonical.digest(end.value)
+      const manifest = lines[0]!
+      for (let attempt = 0; attempt < 8; attempt++) {
+        manifest.checksum = yield* Canonical.digest(manifest.value)
+        const encoded = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+        if (manifest.value.declaredBytes === encoded.byteLength) break
+        manifest.value.declaredBytes = encoded.byteLength
+      }
+      manifest.checksum = yield* Canonical.digest(manifest.value)
+      const archive = new TextEncoder().encode(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`)
+
+      const error = yield* Effect.flip(backups.restore({
+        installationId: yield* Identity.makeBackupInstallationId,
+        source: Stream.make(archive),
+        mode: "replace",
+        maxBytes: limits.maxBackupBytes,
+        expectedDefinitionHash: definition.hash
+      }))
+      assert.strictEqual(error.reason._tag, "BackupInvalid")
+    }).pipe(Effect.provide(AuthorityLive)))
 
   it.effect("rejects checkpoint and change provenance conflicts during restore", () =>
     Effect.gen(function*() {

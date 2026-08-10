@@ -15,6 +15,7 @@ import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as CheckpointAuthority from "./CheckpointAuthority.js"
 import * as InternalAutomerge from "./internal/automerge.js"
 import * as HistoryCounters from "./internal/historyCounters.js"
 import * as WriterProvenance from "./internal/writerProvenance.js"
@@ -111,6 +112,7 @@ const RewriteGuardRow = Schema.Struct({
   accepted_heads: Schema.String,
   checkpoint_hash: Schema.NullOr(Schema.String),
   document_type: Schema.String,
+  lineage: Identity.DocumentLineage,
   materialized_heads: Schema.String,
   tombstone: Schema.Int
 })
@@ -215,6 +217,10 @@ export const layer: Layer.Layer<
   Compaction,
   Effect.gen(function*() {
     const crypto = yield* Crypto.Crypto
+    const checkpointAuthority = Option.getOrElse(
+      yield* Effect.serviceOption(CheckpointAuthority.CheckpointAuthority),
+      () => CheckpointAuthority.rejectAll
+    )
     const digest = (value: unknown) => Canonical.digest(value).pipe(Effect.provideService(Crypto.Crypto, crypto))
     const recovery = yield* Recovery.Recovery
     const gate = yield* ReplicaGate.ReplicaGate
@@ -371,7 +377,7 @@ export const layer: Layer.Layer<
       Request: Identity.DocumentId,
       Result: RewriteGuardRow,
       execute: (documentId) =>
-        sql`SELECT accepted_heads, checkpoint_hash, document_type, materialized_heads, tombstone
+        sql`SELECT accepted_heads, checkpoint_hash, document_type, lineage, materialized_heads, tombstone
           FROM effect_local_documents WHERE document_id = ${documentId}`
     })
     const findRewriteMarker = SqlSchema.findOneOption({
@@ -1160,6 +1166,22 @@ export const layer: Layer.Layer<
           recovery.recover(document, documentId),
           (stored) => Effect.sync(() => InternalAutomerge.free(stored.automerge))
         )
+        const priorSnapshot = InternalAutomerge.save(stored.automerge)
+        const priorCheckpointHash = yield* digest({ documentId, bytes: priorSnapshot })
+        // The heads the rebuilt document was actually derived from, captured here rather than
+        // re-read below. `recover` ran in its own transaction and released the connection, so a
+        // writer can advance the document before this one opens. Feeding the swap the re-read heads
+        // would make it match that advanced row and commit a document rebuilt from a stale value,
+        // silently discarding every write in between. These are what make the swap a real fence.
+        const priorMaterializedHeads = encodeHeads(stored.materializedHeads)
+        const priorAcceptedHeads = encodeHeads(stored.acceptedHeads)
+        const preparedGuard = yield* findRewriteGuard(documentId)
+        if (Option.isNone(preparedGuard)) {
+          return yield* new ReplicaError.ReplicaError({
+            reason: new ReplicaError.DocumentNotFound({ documentId })
+          })
+        }
+        const priorLineage = preparedGuard.value.lineage
         const lineage = yield* makeLineage
         const rebuilt = yield* Effect.acquireRelease(
           Effect.try({
@@ -1200,6 +1222,26 @@ export const layer: Layer.Layer<
               })
             ))
         )
+        const transitionClaims = yield* Schema.decodeUnknownEffect(CheckpointAuthority.TransitionClaims)({
+          purpose: CheckpointAuthority.transitionPurpose,
+          documentId,
+          priorLineage,
+          priorCheckpointHash,
+          priorHeads: stored.materializedHeads,
+          resultingLineage: lineage,
+          anchorCheckpointHash: checkpointHash,
+          resultingHeads: heads,
+          schemaVersion: stored.snapshot.version,
+          writerDefinitionHash: definitionHash
+        }).pipe(
+          Effect.catchTag("SchemaError", (cause) =>
+            Effect.fail(
+              new ReplicaError.ReplicaError({
+                reason: new ReplicaError.StorageCorrupt({ cause })
+              })
+            ))
+        )
+        const authorization = yield* checkpointAuthority.signTransition(transitionClaims)
         // The stored schema version, not `document.version`: `recover` decodes at the version the
         // row records and does not migrate, so the value the re-rooted change carries is encoded at
         // exactly that version. `document.version` would attribute a newer encoding to bytes that do
@@ -1222,14 +1264,6 @@ export const layer: Layer.Layer<
         })
         const encodedHeads = encodeHeads(heads)
         const storedProvenance = Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(writerProvenance)
-        // The heads the rebuilt document was actually derived from, captured here rather than
-        // re-read below. `recover` ran in its own transaction and released the connection, so a
-        // writer can advance the document before this one opens. Feeding the swap the re-read heads
-        // would make it match that advanced row and commit a document rebuilt from a stale value,
-        // silently discarding every write in between. These are what make the swap a real fence.
-        const priorMaterializedHeads = encodeHeads(stored.materializedHeads)
-        const priorAcceptedHeads = encodeHeads(stored.acceptedHeads)
-
         return yield* sql.withTransaction(Effect.gen(function*() {
           yield* gate.validate(permit)
           // Rechecked inside the transaction that performs the write, and before every guard and
@@ -1250,6 +1284,15 @@ export const layer: Layer.Layer<
             })
           }
           const row = guard.value
+          const currentDefinitionHash = yield* findDefinitionHash(undefined).pipe(
+            Effect.map((row) => row.definition_hash),
+            Effect.catchTag("NoSuchElementError", () =>
+              Effect.fail(
+                new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.ReplicaMetadataMissing({ operation: "Compaction.rewriteHistory" })
+                })
+              ))
+          )
           // Re-read from SQL rather than reused from the `recover` above: that read committed its
           // own transaction and released the connection, so anything it observed is stale here.
           const receiptExpiryCutoff = DateTime.formatIso(yield* DateTime.now)
@@ -1263,7 +1306,9 @@ export const layer: Layer.Layer<
           ])
           const nonZero = (count: Option.Option<typeof CountRow.Type>) => Option.exists(count, (row) => row.count !== 0)
           if (
-            row.document_type !== document.name || row.materialized_heads !== row.accepted_heads ||
+            row.document_type !== document.name || row.lineage !== transitionClaims.priorLineage ||
+            row.materialized_heads !== priorMaterializedHeads || row.accepted_heads !== priorAcceptedHeads ||
+            row.materialized_heads !== row.accepted_heads || currentDefinitionHash !== definitionHash ||
             nonZero(unapplied) || nonZero(receipts) || nonZero(outbox) || nonZero(relayOutbox) ||
             nonZero(unexpiredRelayReceipts)
           ) {
@@ -1440,6 +1485,17 @@ export const layer: Layer.Layer<
           ) VALUES (
             ${commitSequence}, ${documentId},
             ${encodeHeads(ReplicaDefinition.documentCommitKeys(document.name, documentId))}, 0
+          )`
+          yield* sql`INSERT INTO effect_local_lineage_transitions (
+            document_id, prior_lineage, prior_checkpoint_hash, prior_heads, prior_snapshot,
+            lineage, checkpoint_hash, heads, schema_version, writer_definition_hash,
+            authorization, created_at
+          ) VALUES (
+            ${documentId}, ${transitionClaims.priorLineage}, ${transitionClaims.priorCheckpointHash},
+            ${encodeHeads(transitionClaims.priorHeads)}, ${priorSnapshot}, ${transitionClaims.resultingLineage},
+            ${transitionClaims.anchorCheckpointHash}, ${encodeHeads(transitionClaims.resultingHeads)},
+            ${transitionClaims.schemaVersion}, ${transitionClaims.writerDefinitionHash},
+            ${Option.getOrNull(authorization)}, ${DateTime.formatIso(yield* DateTime.now)}
           )`
           // The marker the replay above consults, written by the same transaction as the rewrite it
           // records so it can never be observed apart from it. A plain insert rather than an upsert:

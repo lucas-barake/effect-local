@@ -10,34 +10,33 @@ import * as Rpc from "effect/unstable/rpc/Rpc"
 import * as RestoreProtocol from "../src/internal/restoreProtocol.js"
 import * as ReplicaRpc from "../src/ReplicaRpc.js"
 
-it.effect("round trips a typed restore error through its wire schema", () =>
+/** Every field of the reason must survive the encode, the wire schema and the reconstruction. */
+const roundTripsThroughWire = (reason: ReplicaError.Reason) =>
   Effect.gen(function*() {
-    const original = new ReplicaError.ReplicaError({
-      reason: new ReplicaError.ProtocolMismatch({
-        expected: "expected protocol",
-        observed: "observed protocol"
-      })
-    })
+    const original = new ReplicaError.ReplicaError({ reason })
     const encoded = RestoreProtocol.encodeReplicaError(original, 4_096)
     const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
     assert.deepStrictEqual(RestoreProtocol.replicaErrorFromWire(decoded), original)
-  }))
+  })
+
+it.effect("round trips a typed restore error through its wire schema", () =>
+  roundTripsThroughWire(
+    new ReplicaError.ProtocolMismatch({
+      expected: "expected protocol",
+      observed: "observed protocol"
+    })
+  ))
 
 it.effect("round trips a superseded checkpoint reason through the restore wire", () =>
-  Effect.gen(function*() {
-    const original = new ReplicaError.ReplicaError({
-      reason: new ReplicaError.CheckpointSuperseded({
-        documentIds: [
-          Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001"),
-          Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000002")
-        ],
-        attempts: 9
-      })
+  roundTripsThroughWire(
+    new ReplicaError.CheckpointSuperseded({
+      documentIds: [
+        Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001"),
+        Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000002")
+      ],
+      attempts: 9
     })
-    const encoded = RestoreProtocol.encodeReplicaError(original, 4_096)
-    const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
-    assert.deepStrictEqual(RestoreProtocol.replicaErrorFromWire(decoded), original)
-  }))
+  ))
 
 it.effect("drops whole document ids rather than truncating them when the budget is tight", () =>
   Effect.gen(function*() {
@@ -66,18 +65,21 @@ it.effect("drops whole document ids rather than truncating them when the budget 
   }))
 
 it.effect("round trips a changed document lineage reason through the restore wire", () =>
-  Effect.gen(function*() {
-    const original = new ReplicaError.ReplicaError({
-      reason: new ReplicaError.DocumentLineageChanged({
-        documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001"),
-        localLineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000003"),
-        remoteLineage: Identity.genesisLineage
-      })
+  roundTripsThroughWire(
+    new ReplicaError.DocumentLineageChanged({
+      documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001"),
+      localLineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000003"),
+      remoteLineage: Identity.genesisLineage
     })
-    const encoded = RestoreProtocol.encodeReplicaError(original, 4_096)
-    const decoded = yield* Schema.decodeUnknownEffect(RestoreProtocol.RestoreWireError)(encoded)
-    assert.deepStrictEqual(RestoreProtocol.replicaErrorFromWire(decoded), original)
-  }))
+  ))
+
+it.effect("round trips a rejected checkpoint reason through the restore wire", () =>
+  roundTripsThroughWire(
+    new ReplicaError.CheckpointRejected({
+      documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001"),
+      reason: "checkpoint authorization failed"
+    })
+  ))
 
 it.effect("drops both lineages whole rather than truncating them when the budget is tight", () =>
   Effect.gen(function*() {
@@ -263,6 +265,10 @@ it.effect("encodes every restore error and defect at the minimum configured budg
         documentId,
         localLineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000003"),
         remoteLineage: Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000004")
+      }),
+      new ReplicaError.CheckpointRejected({
+        documentId,
+        reason: "checkpoint rejected".repeat(32)
       })
     ]
 

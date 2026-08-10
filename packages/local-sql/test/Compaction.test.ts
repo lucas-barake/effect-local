@@ -2,14 +2,17 @@ import * as Automerge from "@automerge/automerge"
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Document from "@lucas-barake/effect-local/Document"
 import * as DocumentSet from "@lucas-barake/effect-local/DocumentSet"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as CheckpointAuthority from "../src/CheckpointAuthority.js"
 import * as CommandExecutor from "../src/CommandExecutor.js"
 import * as Compaction from "../src/Compaction.js"
 import * as DocumentStore from "../src/DocumentStore.js"
@@ -41,14 +44,39 @@ describe("Compaction", () => {
   const Gate = ReplicaGate.layer.pipe(withGateLimits, Layer.provide(Base))
   const StoreService = DocumentStore.layer.pipe(Layer.provide(Layer.merge(Base, Gate)))
   const RecoveryService = Recovery.layer.pipe(Layer.provide(Layer.mergeAll(Base, Gate)))
-  const CompactionService = Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Base, Gate, RecoveryService)))
   const Projections = ProjectionStore.layer([]).pipe(Layer.provide(Base))
   // `definition` declares no mutations, so `MutationHandlers` resolves to `never` and the executor
   // needs no handler layer. It is here only to write real command receipts through production code.
   const Executor = CommandExecutor.layer(definition).pipe(
     Layer.provide(Layer.mergeAll(Base, Gate, StoreService, Projections))
   )
-  const Services = Layer.mergeAll(Base, Gate, StoreService, RecoveryService, CompactionService, Executor)
+  const servicesWithAuthority = (Authority: Layer.Layer<CheckpointAuthority.CheckpointAuthority>) =>
+    Layer.mergeAll(
+      Base,
+      Gate,
+      StoreService,
+      RecoveryService,
+      Compaction.layer.pipe(Layer.provide(Layer.mergeAll(Base, Gate, RecoveryService, Authority))),
+      Executor
+    )
+  const Services = servicesWithAuthority(CheckpointAuthority.layerRejectAll)
+
+  /**
+   * The rewrite's own authority, recording every claim it is asked to sign. `Services` cannot show
+   * this: its `layerRejectAll` authority signs nothing.
+   */
+  const recordingAuthority = (token: Option.Option<CheckpointAuthority.AuthorizationToken>) => {
+    const signed: Array<CheckpointAuthority.TransitionClaims> = []
+    return {
+      signed,
+      Services: servicesWithAuthority(CheckpointAuthority.layer({
+        signManifest: () => Effect.succeed(Option.none()),
+        verifyManifest: () => Effect.void,
+        signTransition: (claims) => Effect.sync(() => signed.push(claims)).pipe(Effect.as(token)),
+        verifyTransition: () => Effect.void
+      }))
+    }
+  }
 
   /** Commits a real create command under the current incarnation and reports the receipt it wrote. */
   const commitReceipt = Effect.gen(function*() {
@@ -178,6 +206,29 @@ describe("Compaction", () => {
     }>`SELECT replica_incarnation, operation_id, document_id, lineage
       FROM effect_local_history_rewrites ORDER BY replica_incarnation, rewritten_at, operation_id`
   })
+
+  const lineageTransitionsOf = (documentId: Identity.DocumentId) =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      return yield* sql<{
+        readonly authorization: Uint8Array | null
+        readonly checkpoint_hash: string
+        readonly created_at: string
+        readonly heads: string
+        readonly lineage: string
+        readonly prior_checkpoint_hash: string
+        readonly prior_heads: string
+        readonly prior_lineage: string
+        readonly prior_snapshot: Uint8Array
+        readonly schema_version: number
+        readonly writer_definition_hash: string
+      }>`SELECT authorization, checkpoint_hash, created_at, heads, lineage,
+          prior_checkpoint_hash, prior_heads, prior_lineage, prior_snapshot,
+          schema_version, writer_definition_hash
+        FROM effect_local_lineage_transitions
+        WHERE document_id = ${documentId}
+        ORDER BY created_at, lineage`
+    })
 
   const commitOutboxOf = (documentId: Identity.DocumentId) =>
     Effect.gen(function*() {
@@ -646,6 +697,47 @@ describe("Compaction", () => {
       InternalAutomerge.free(recovered.automerge)
     }).pipe(Effect.provide(Services)))
 
+  it.effect("stores the exact unsigned boundary and resulting checkpoint claims", () =>
+    Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const store = yield* DocumentStore.DocumentStore
+      const documentId = yield* Identity.makeDocumentId
+      const value = yield* churn(documentId, 4)
+      yield* compaction.compact(Task, documentId)
+
+      const before = yield* store.load(Task, documentId)
+      const priorSnapshot = InternalAutomerge.save(before.automerge)
+      const priorHeads = [...before.materializedHeads].toSorted()
+      InternalAutomerge.free(before.automerge)
+      const priorCheckpointHash = yield* Canonical.digest({ documentId, bytes: priorSnapshot })
+
+      const lineage = yield* compaction.rewriteHistory(Task, documentId, operationId)
+      const rewritten = yield* rewrittenCheckpointOf(documentId)
+      const transitions = yield* lineageTransitionsOf(documentId)
+
+      assert.strictEqual(transitions.length, 1)
+      const transition = transitions[0]!
+      assert.deepStrictEqual(transition.prior_snapshot, priorSnapshot)
+      assert.strictEqual(transition.prior_checkpoint_hash, priorCheckpointHash)
+      assert.deepStrictEqual(JSON.parse(transition.prior_heads), priorHeads)
+      assert.strictEqual(transition.prior_lineage, Identity.genesisLineage)
+      assert.strictEqual(transition.lineage, lineage)
+      assert.strictEqual(transition.checkpoint_hash, rewritten.checkpoint_hash)
+      assert.deepStrictEqual(JSON.parse(transition.heads), JSON.parse(rewritten.heads))
+      assert.strictEqual(transition.schema_version, Task.version)
+      assert.strictEqual(transition.writer_definition_hash, definition.hash)
+      assert.strictEqual(transition.authorization, null)
+      assert.isNotEmpty(transition.created_at)
+
+      const recoveredPrior = Automerge.load<InternalAutomerge.Root<typeof value>>(transition.prior_snapshot)
+      try {
+        assert.deepStrictEqual(InternalAutomerge.value(recoveredPrior), value)
+        assert.deepStrictEqual(Automerge.getHeads(recoveredPrior), priorHeads)
+      } finally {
+        InternalAutomerge.free(recoveredPrior)
+      }
+    }).pipe(Effect.provide(Services)))
+
   it.effect("refuses to rewrite while materialized and accepted heads are diverged", () =>
     Effect.gen(function*() {
       const compaction = yield* Compaction.Compaction
@@ -1070,11 +1162,88 @@ describe("Compaction", () => {
         (yield* rewriteMarkers).map((row) => ({ document_id: row.document_id, lineage: row.lineage })),
         [{ document_id: documentId as string, lineage: lineage as string }]
       )
+      assert.strictEqual((yield* lineageTransitionsOf(documentId)).length, 1)
 
       const reloaded = yield* store.load(Task, documentId)
       assert.deepStrictEqual(reloaded.snapshot.value, value)
       InternalAutomerge.free(reloaded.automerge)
     }).pipe(Effect.provide(Services)))
+
+  it.effect("signs canonical transition claims once across an operation retry", () => {
+    const token = Uint8Array.of(7, 8, 9) as CheckpointAuthority.AuthorizationToken
+    const authority = recordingAuthority(Option.some(token))
+
+    return Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const documentId = yield* Identity.makeDocumentId
+      yield* churn(documentId, 3)
+      yield* compaction.compact(Task, documentId)
+
+      const lineage = yield* compaction.rewriteHistory(Task, documentId, operationId)
+      const replayed = yield* compaction.rewriteHistory(Task, documentId, operationId)
+      const transitions = yield* lineageTransitionsOf(documentId)
+
+      assert.strictEqual(replayed, lineage)
+      assert.strictEqual(authority.signed.length, 1)
+      assert.strictEqual(transitions.length, 1)
+      const claims = authority.signed[0]!
+      assert.deepStrictEqual(claims.priorHeads, [...new Set(claims.priorHeads)].toSorted())
+      assert.deepStrictEqual(claims.resultingHeads, [...new Set(claims.resultingHeads)].toSorted())
+      assert.strictEqual(claims.purpose, CheckpointAuthority.transitionPurpose)
+      assert.strictEqual(claims.documentId, documentId)
+      assert.strictEqual(claims.resultingLineage, lineage)
+      assert.strictEqual(claims.schemaVersion, Task.version)
+      assert.strictEqual(claims.writerDefinitionHash, definition.hash)
+      assert.strictEqual(transitions[0]!.prior_checkpoint_hash, claims.priorCheckpointHash)
+      assert.deepStrictEqual(JSON.parse(transitions[0]!.prior_heads), claims.priorHeads)
+      assert.strictEqual(transitions[0]!.checkpoint_hash, claims.anchorCheckpointHash)
+      assert.deepStrictEqual(JSON.parse(transitions[0]!.heads), claims.resultingHeads)
+      assert.deepStrictEqual(transitions[0]!.authorization, token)
+    }).pipe(Effect.provide(authority.Services))
+  })
+
+  it.effect("signs the stored encoding version when the current definition is newer", () => {
+    const authority = recordingAuthority(Option.none())
+    const TaskV2 = Document.make("Task", {
+      schema: Schema.Struct({ title: Schema.String, labels: Schema.Array(Schema.String), done: Schema.Boolean }),
+      version: 2,
+      migrations: [
+        Document.migration({
+          from: 1,
+          schema: Task.schema,
+          migrate: (value) => ({ ...value, done: false })
+        })
+      ]
+    })
+    const evolvedDefinition = ReplicaDefinition.make({
+      name: "tasks",
+      documents: DocumentSet.make(TaskV2),
+      mutations: [],
+      projections: [],
+      queries: []
+    })
+
+    return Effect.gen(function*() {
+      const compaction = yield* Compaction.Compaction
+      const sql = yield* SqlClient.SqlClient
+      const documentId = yield* Identity.makeDocumentId
+      yield* churn(documentId, 2)
+      yield* sql`UPDATE effect_local_metadata
+        SET definition_hash = ${evolvedDefinition.hash}
+        WHERE singleton = 1`
+
+      yield* compaction.rewriteHistory(TaskV2, documentId, operationId)
+
+      assert.strictEqual(TaskV2.version, 2)
+      assert.strictEqual(authority.signed.length, 1)
+      assert.strictEqual(authority.signed[0]!.schemaVersion, 1)
+      assert.strictEqual((yield* lineageTransitionsOf(documentId))[0]!.schema_version, 1)
+      const rewrittenChange = (yield* sql<{ readonly writer_schema_version: number }>`
+        SELECT writer_schema_version FROM effect_local_changes WHERE document_id = ${documentId}
+      `)[0]!
+      assert.strictEqual(rewrittenChange.writer_schema_version, 1)
+    }).pipe(Effect.provide(authority.Services))
+  })
 
   it.effect("rewrites a second time under a different operation id", () =>
     Effect.gen(function*() {

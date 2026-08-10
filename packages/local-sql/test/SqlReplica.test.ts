@@ -1132,7 +1132,7 @@ describe("SqlReplica", () => {
       const deliveryPublisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
         Layer.provideMerge(deliveryStore)
       )
-      const backups = BackupStore.layer(definition).pipe(
+      const backups = BackupStore.layerRejectAll(definition).pipe(
         Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
       )
       const direct = SqlReplica.layerFromServices(definition).pipe(
@@ -1254,7 +1254,7 @@ describe("SqlReplica", () => {
       const deliveryPublisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
         Layer.provideMerge(deliveryStore)
       )
-      const backups = BackupStore.layer(definition).pipe(
+      const backups = BackupStore.layerRejectAll(definition).pipe(
         Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
       )
       const direct = SqlReplica.layerFromServices(definition).pipe(
@@ -1386,7 +1386,7 @@ describe("SqlReplica", () => {
     const deliveryPublisher = CommandDeliveryPublisher.layer(CommandDeliveryPublisher.defaultOptions).pipe(
       Layer.provideMerge(deliveryStore)
     )
-    const backups = BackupStore.layer(definition).pipe(
+    const backups = BackupStore.layerRejectAll(definition).pipe(
       Layer.provideMerge(Layer.merge(publisher, deliveryPublisher))
     )
     const direct = SqlReplica.layerFromServices(definition).pipe(

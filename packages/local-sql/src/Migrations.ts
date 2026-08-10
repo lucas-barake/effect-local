@@ -24,6 +24,7 @@ export const peerRelayStateChecksum = "sha256:effect-local-peer-relay-state-v3"
 export const commandDeliveryChecksum = "sha256:effect-local-command-delivery-v1"
 export const documentHistoryCountersChecksum = "sha256:effect-local-document-history-counters-v1"
 export const backupDocumentInstallationsChecksum = "sha256:effect-local-backup-document-installations-v1"
+export const checkpointShippingChecksum = "sha256:effect-local-checkpoint-shipping-v1"
 
 const migration = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
@@ -1097,6 +1098,38 @@ const backupDocumentInstallationsMigration = Effect.gen(function*() {
     VALUES (13, 'backup_document_installations', ${backupDocumentInstallationsChecksum})`
 })
 
+const checkpointShippingMigration = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`CREATE TABLE effect_local_lineage_transitions (
+    document_id TEXT NOT NULL REFERENCES effect_local_documents(document_id) ON DELETE CASCADE,
+    prior_lineage TEXT NOT NULL,
+    prior_checkpoint_hash TEXT NOT NULL,
+    prior_heads TEXT NOT NULL,
+    prior_snapshot BLOB NOT NULL,
+    lineage TEXT NOT NULL,
+    checkpoint_hash TEXT NOT NULL,
+    heads TEXT NOT NULL,
+    schema_version INTEGER NOT NULL CHECK (schema_version >= 1),
+    writer_definition_hash TEXT NOT NULL,
+    authorization BLOB CHECK (
+      authorization IS NULL OR length(authorization) BETWEEN 1 AND 16384
+    ),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(document_id, lineage),
+    UNIQUE(document_id, prior_lineage)
+  )`
+  yield* sql`ALTER TABLE effect_local_peer_outbox
+    ADD COLUMN checkpoint_transfer BLOB`
+  yield* sql`ALTER TABLE effect_local_peer_receipts
+    ADD COLUMN checkpoint_transfer BLOB`
+  yield* sql`CREATE INDEX effect_local_peer_outbox_document_status
+    ON effect_local_peer_outbox(document_id, status)`
+  yield* sql`CREATE INDEX effect_local_peer_relay_outbox_document
+    ON effect_local_peer_relay_outbox(document_id)`
+  yield* sql`INSERT INTO effect_local_migration_catalog (migration_id, name, checksum)
+    VALUES (14, 'checkpoint_shipping', ${checkpointShippingChecksum})`
+})
+
 export const loader = Migrator.fromRecord({
   "1_canonical_store": migration,
   "2_peer_sync": peerSyncMigration,
@@ -1110,7 +1143,8 @@ export const loader = Migrator.fromRecord({
   "10_peer_relay_state": peerRelayStateMigration,
   "11_command_delivery": commandDeliveryMigration,
   "12_document_history_counters": documentHistoryCountersMigration,
-  "13_backup_document_installations": backupDocumentInstallationsMigration
+  "13_backup_document_installations": backupDocumentInstallationsMigration,
+  "14_checkpoint_shipping": checkpointShippingMigration
 })
 
 const migrate = Migrator.make({})({ loader, table: "effect_local_migrations" })
@@ -1176,6 +1210,12 @@ export const run = Effect.gen(function*() {
       name: "backup_document_installations",
       checksum: backupDocumentInstallationsChecksum,
       label: "Backup document installations"
+    },
+    {
+      id: 14,
+      name: "checkpoint_shipping",
+      checksum: checkpointShippingChecksum,
+      label: "Checkpoint shipping"
     }
   ] as const
   // One transaction over migrate + validation so a rejected catalog rolls back

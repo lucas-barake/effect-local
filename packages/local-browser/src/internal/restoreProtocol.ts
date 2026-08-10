@@ -126,6 +126,10 @@ export const RestoreWireError = Schema.TaggedUnion({
     localLineage: Identity.DocumentLineage,
     remoteLineage: Identity.DocumentLineage
   },
+  CheckpointRejected: {
+    documentId: Identity.DocumentId,
+    reason: Schema.String
+  },
   CommandOutcomeUnknown: {
     commandId: Identity.CommandId,
     cause: BoundedErrorDescription
@@ -556,6 +560,16 @@ export const encodeReplicaError = (
           }
         }
       )
+    case "CheckpointRejected":
+      return encodeWithinBudget(
+        maxBytes,
+        { _tag: reason._tag, documentId: reason.documentId, reason: "" },
+        ({ text }) => ({
+          _tag: reason._tag,
+          documentId: reason.documentId,
+          reason: text(reason.reason)
+        })
+      )
   }
 }
 
@@ -685,6 +699,12 @@ export const replicaErrorFromWire = (wire: RestoreWireError): ReplicaError.Repli
         documentId: wire.documentId,
         localLineage: wire.localLineage,
         remoteLineage: wire.remoteLineage
+      })
+      break
+    case "CheckpointRejected":
+      reason = new ReplicaError.CheckpointRejected({
+        documentId: wire.documentId,
+        reason: wire.reason
       })
       break
   }

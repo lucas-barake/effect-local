@@ -2,9 +2,11 @@ import * as Automerge from "@automerge/automerge"
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto"
 import { assert, describe, it } from "@effect/vitest"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
+import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
+import * as CheckpointAuthority from "../src/CheckpointAuthority.js"
 import * as PeerSyncEnvelope from "../src/PeerSyncEnvelope.js"
 
 const limits: PeerSyncEnvelope.SyncEnvelopeLimits = {
@@ -14,7 +16,43 @@ const limits: PeerSyncEnvelope.SyncEnvelopeLimits = {
   maxSyncOperationsPerMessage: 10_000
 }
 
+const documentId = Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001")
 const rewrittenLineage = Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000011")
+const priorLineage = Identity.DocumentLineage.make("lin_00000000-0000-4000-8000-000000000012")
+
+const checkpointTransfer = PeerSyncEnvelope.CheckpointTransfer.make({
+  snapshot: Uint8Array.of(1, 2, 3),
+  manifest: {
+    purpose: CheckpointAuthority.manifestPurpose,
+    documentId,
+    lineage: rewrittenLineage,
+    checkpointHash: "a".repeat(64),
+    heads: Conflict.Heads.make(["z", "a", "z"]),
+    base: { _tag: "Heads", baseHeads: Conflict.Heads.make(["d", "b", "d"]) },
+    schemaVersion: 1,
+    writerDefinitionHash: "definition-1",
+    authorization: Uint8Array.of(4, 5)
+  },
+  transitions: [{
+    purpose: CheckpointAuthority.transitionPurpose,
+    documentId,
+    priorLineage,
+    priorCheckpointHash: "b".repeat(64),
+    priorHeads: Conflict.Heads.make(["c", "a", "c"]),
+    resultingLineage: rewrittenLineage,
+    anchorCheckpointHash: "a".repeat(64),
+    resultingHeads: Conflict.Heads.make(["z", "a", "z"]),
+    schemaVersion: 1,
+    writerDefinitionHash: "definition-1",
+    priorSnapshot: Uint8Array.of(8, 9),
+    authorization: Uint8Array.of(6, 7)
+  }]
+})
+
+const encodedCheckpointTransfer = PeerSyncEnvelope.encodeCheckpointTransfer(
+  checkpointTransfer,
+  limits.maxSyncMessageBytes
+)
 
 const makeSyncEnvelope = Effect.gen(function*() {
   let source = Automerge.from(
@@ -35,7 +73,7 @@ const makeSyncEnvelope = Effect.gen(function*() {
   const envelope = PeerSyncEnvelope.SyncEnvelope.make({
     connectionEpoch: "epoch-1",
     sequence: 1,
-    documentId: Identity.DocumentId.make("doc_00000000-0000-4000-8000-000000000001"),
+    documentId,
     documentType: "Task",
     messageHash: yield* Canonical.digest(message),
     message,
@@ -48,6 +86,225 @@ const makeSyncEnvelope = Effect.gen(function*() {
 })
 
 describe("PeerSyncEnvelope", () => {
+  it.effect("round trips checkpoint transfers with canonical heads", () =>
+    Effect.gen(function*() {
+      const bytes = yield* encodedCheckpointTransfer
+      const decoded = yield* PeerSyncEnvelope.decodeCheckpointTransfer(
+        bytes,
+        limits.maxSyncMessageBytes
+      )
+      assert.deepStrictEqual(decoded.manifest.heads, ["a", "z"])
+      assert.deepStrictEqual(decoded.manifest.base, { _tag: "Heads", baseHeads: ["b", "d"] })
+      assert.deepStrictEqual(decoded.transitions[0]!.priorHeads, ["a", "c"])
+      assert.deepStrictEqual(decoded.transitions[0]!.resultingHeads, ["a", "z"])
+      assert.deepStrictEqual(decoded.snapshot, checkpointTransfer.snapshot)
+      assert.deepStrictEqual(decoded.transitions[0]!.priorSnapshot, Uint8Array.of(8, 9))
+    }))
+
+  it.effect("preserves legacy envelopes without a checkpoint transfer", () =>
+    Effect.gen(function*() {
+      const envelope = yield* makeSyncEnvelope
+      const bytes = yield* PeerSyncEnvelope.encodeSyncEnvelope(envelope)
+      const json = JSON.parse(new TextDecoder().decode(bytes))
+      assert.isFalse(Object.hasOwn(json, "checkpointTransfer"))
+      const decoded = yield* PeerSyncEnvelope.decodeSyncEnvelope(bytes, limits)
+      assert.isFalse(Object.hasOwn(decoded, "checkpointTransfer"))
+    }).pipe(Effect.provide(NodeCrypto.layer)))
+
+  it.effect("admits maximum ordinary and checkpoint payload envelopes", () =>
+    Effect.gen(function*() {
+      const maximumHeader = {
+        connectionEpoch: "x".repeat(256),
+        sequence: Number.MAX_SAFE_INTEGER,
+        documentId,
+        documentType: "x".repeat(256),
+        lineage: rewrittenLineage
+      }
+      const ordinaryMessage = new Uint8Array(limits.maxSyncMessageBytes)
+      const ordinaryEnvelope = PeerSyncEnvelope.SyncEnvelope.make({
+        ...maximumHeader,
+        messageHash: yield* Canonical.digest(ordinaryMessage),
+        message: ordinaryMessage,
+        writerProvenance: Array.from(
+          { length: limits.maxSyncChangesPerMessage },
+          (_, index) => ({
+            changeHash: index.toString(16).padStart(64, "0"),
+            writerSchemaVersion: Number.MAX_SAFE_INTEGER,
+            writerDefinitionHash: "x".repeat(256)
+          })
+        )
+      })
+      const ordinaryBytes = yield* PeerSyncEnvelope.encodeSyncEnvelope(ordinaryEnvelope)
+      assert.deepStrictEqual(
+        yield* PeerSyncEnvelope.decodeSyncEnvelope(ordinaryBytes, limits),
+        ordinaryEnvelope
+      )
+
+      const emptyMessage = new Uint8Array()
+      const checkpointEnvelope = PeerSyncEnvelope.SyncEnvelope.make({
+        ...maximumHeader,
+        messageHash: yield* Canonical.digest(emptyMessage),
+        message: emptyMessage,
+        writerProvenance: [],
+        checkpointTransfer: new Uint8Array(limits.maxSyncMessageBytes)
+      })
+      const checkpointBytes = yield* PeerSyncEnvelope.encodeSyncEnvelope(checkpointEnvelope)
+      assert.deepStrictEqual(
+        yield* PeerSyncEnvelope.decodeSyncEnvelope(checkpointBytes, limits),
+        checkpointEnvelope
+      )
+    }).pipe(Effect.provide(NodeCrypto.layer)))
+
+  it.effect("rejects one byte over the mutually exclusive envelope admission bound", () =>
+    Effect.gen(function*() {
+      const ordinaryPayloadBudget = limits.maxSyncMessageBytes * 2 + limits.maxSyncChangesPerMessage * 512
+      const checkpointPayloadBudget = Math.ceil(limits.maxSyncMessageBytes / 3) * 4
+      const expectedAdmissionBound = Math.max(
+        ordinaryPayloadBudget,
+        checkpointPayloadBudget
+      ) + 4_096
+      const error = yield* Effect.flip(
+        PeerSyncEnvelope.decodeSyncEnvelope(
+          new Uint8Array(expectedAdmissionBound + 1),
+          limits
+        )
+      )
+      assert.strictEqual(error.reason._tag, "ProtocolMismatch")
+      if (error.reason._tag === "ProtocolMismatch") {
+        assert.strictEqual(error.reason.observed, "oversized sync envelope")
+      }
+    }).pipe(Effect.provide(NodeCrypto.layer)))
+
+  it.effect("bounds checkpoint transfer bytes, transitions, and authorization tokens", () =>
+    Effect.gen(function*() {
+      const encoded = yield* encodedCheckpointTransfer
+      assert.strictEqual(
+        (yield* Effect.exit(PeerSyncEnvelope.encodeCheckpointTransfer(
+          checkpointTransfer,
+          encoded.byteLength - 1
+        )))._tag,
+        "Failure"
+      )
+      assert.strictEqual(
+        (yield* Effect.exit(PeerSyncEnvelope.decodeCheckpointTransfer(
+          encoded,
+          encoded.byteLength - 1
+        )))._tag,
+        "Failure"
+      )
+      assert.strictEqual(
+        (yield* Effect.exit(
+          Schema.decodeUnknownEffect(PeerSyncEnvelope.CheckpointTransfer)({
+            ...checkpointTransfer,
+            transitions: Array.from(
+              { length: PeerSyncEnvelope.maximumCheckpointTransitions + 1 },
+              () => checkpointTransfer.transitions[0]!
+            )
+          })
+        ))._tag,
+        "Failure"
+      )
+      for (
+        const authorization of [
+          new Uint8Array(),
+          new Uint8Array(CheckpointAuthority.maximumAuthorizationTokenBytes + 1)
+        ]
+      ) {
+        assert.strictEqual(
+          (yield* Effect.exit(
+            Schema.decodeUnknownEffect(PeerSyncEnvelope.CheckpointTransfer)({
+              ...checkpointTransfer,
+              manifest: { ...checkpointTransfer.manifest, authorization }
+            })
+          ))._tag,
+          "Failure"
+        )
+      }
+      const encodedJson = JSON.parse(new TextDecoder().decode(encoded))
+      for (
+        const malformed of [
+          {
+            ...encodedJson,
+            manifest: { ...encodedJson.manifest, authorization: "not base64!" }
+          },
+          {
+            ...encodedJson,
+            transitions: [{ ...encodedJson.transitions[0], authorization: "not base64!" }]
+          }
+        ]
+      ) {
+        assert.strictEqual(
+          (yield* Effect.exit(PeerSyncEnvelope.decodeCheckpointTransfer(
+            new TextEncoder().encode(JSON.stringify(malformed)),
+            limits.maxSyncMessageBytes
+          )))._tag,
+          "Failure"
+        )
+      }
+    }))
+
+  it.effect("requires checkpoint envelopes to carry only the hash-bound empty message", () =>
+    Effect.gen(function*() {
+      const transferBytes = yield* encodedCheckpointTransfer
+      const emptyMessage = new Uint8Array()
+      const base = PeerSyncEnvelope.SyncEnvelope.make({
+        connectionEpoch: "epoch-1",
+        sequence: 2,
+        documentId,
+        documentType: "Task",
+        messageHash: yield* Canonical.digest(emptyMessage),
+        message: emptyMessage,
+        lineage: rewrittenLineage,
+        writerProvenance: [],
+        checkpointTransfer: transferBytes
+      })
+      assert.deepStrictEqual(
+        yield* PeerSyncEnvelope.validateSyncEnvelope(base, limits),
+        base
+      )
+      const maximumTransferEnvelope = {
+        ...base,
+        checkpointTransfer: new Uint8Array(limits.maxSyncMessageBytes)
+      }
+      const maximumTransferEnvelopeBytes = yield* PeerSyncEnvelope.encodeSyncEnvelope(
+        maximumTransferEnvelope
+      )
+      assert.isAtMost(
+        maximumTransferEnvelopeBytes.byteLength,
+        PeerSyncEnvelope.maximumSyncEnvelopeBytes(
+          limits.maxSyncMessageBytes,
+          limits.maxSyncChangesPerMessage
+        )
+      )
+      assert.deepStrictEqual(
+        yield* PeerSyncEnvelope.decodeSyncEnvelope(maximumTransferEnvelopeBytes, limits),
+        maximumTransferEnvelope
+      )
+      for (
+        const invalid of [
+          { ...base, message: Uint8Array.of(1) },
+          {
+            ...base,
+            writerProvenance: [{
+              changeHash: "c".repeat(64),
+              writerSchemaVersion: 1,
+              writerDefinitionHash: "definition-1"
+            }]
+          },
+          { ...base, messageHash: "f".repeat(64) },
+          {
+            ...base,
+            checkpointTransfer: new Uint8Array(limits.maxSyncMessageBytes + 1)
+          }
+        ]
+      ) {
+        assert.strictEqual(
+          (yield* Effect.exit(PeerSyncEnvelope.validateSyncEnvelope(invalid, limits)))._tag,
+          "Failure"
+        )
+      }
+    }).pipe(Effect.provide(NodeCrypto.layer)))
+
   it.effect("round trips and validates a bounded Automerge sync envelope", () =>
     Effect.gen(function*() {
       const envelope = yield* makeSyncEnvelope

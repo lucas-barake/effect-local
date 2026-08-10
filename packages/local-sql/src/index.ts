@@ -1,4 +1,5 @@
 export * as BackupStore from "./BackupStore.js"
+export * as CheckpointAuthority from "./CheckpointAuthority.js"
 export * as CommandDeliveryPublisher from "./CommandDeliveryPublisher.js"
 export * as CommandDeliveryStore from "./CommandDeliveryStore.js"
 export * as CommandExecutor from "./CommandExecutor.js"
