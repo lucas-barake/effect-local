@@ -1660,25 +1660,27 @@ const make = (
             writerProvenance: provenances[index]!,
             receiptReplyId: row.row_id
           } satisfies Outbound))
-          yield* sql`INSERT INTO effect_local_peer_outbox ${
-            sql.insert(outbounds.map((outbound) => ({
-              replica_incarnation: session.replicaIncarnation,
-              peer_id: session.peerId,
-              connection_epoch: session.connectionEpoch,
-              document_id: outbound.documentId,
-              send_sequence: outbound.sendSequence,
-              message: outbound.message,
-              message_hash: outbound.messageHash,
-              heads: Schema.encodeSync(Heads)(outbound.heads),
-              status: "Pending",
-              created_at: createdAt,
-              writer_provenance: Schema.encodeSync(WriterProvenance.StoredChangeProvenances)(
-                outbound.writerProvenance
-              ),
-              lineage: outbound.lineage,
-              receipt_reply_id: outbound.receiptReplyId
-            })))
-          }`
+          const records = yield* Effect.forEach(outbounds, (outbound) =>
+            Effect.gen(function*() {
+              return {
+                replica_incarnation: session.replicaIncarnation,
+                peer_id: session.peerId,
+                connection_epoch: session.connectionEpoch,
+                document_id: outbound.documentId,
+                send_sequence: outbound.sendSequence,
+                message: outbound.message,
+                message_hash: outbound.messageHash,
+                heads: yield* Schema.encodeEffect(Heads)(outbound.heads),
+                status: "Pending" as const,
+                created_at: createdAt,
+                writer_provenance: yield* Schema.encodeEffect(
+                  WriterProvenance.StoredChangeProvenances
+                )(outbound.writerProvenance),
+                lineage: outbound.lineage,
+                receipt_reply_id: outbound.receiptReplyId
+              }
+            }))
+          yield* sql`INSERT INTO effect_local_peer_outbox ${sql.insert(records)}`
           return outbounds[0] ?? null
         }))).pipe(
           Effect.catchTags({
