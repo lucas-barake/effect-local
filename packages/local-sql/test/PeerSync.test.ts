@@ -13,6 +13,7 @@ import * as ReplicaLimits from "@lucas-barake/effect-local/ReplicaLimits"
 import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
+import * as Crypto from "effect/Crypto"
 import * as DateTime from "effect/DateTime"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -45,6 +46,11 @@ const formatTime = (millis: number) => DateTime.formatIso(DateTime.makeUnsafe(mi
 const StringArrayJson = Schema.fromJsonString(Schema.Array(Schema.String))
 const encodeStringArray = (value: ReadonlyArray<string>) => Schema.encodeSync(StringArrayJson)(value)
 const temporaryPath = (name: string) => `/tmp/${name}`
+const temporaryDatabasePath = (prefix: string) =>
+  Effect.gen(function*() {
+    const crypto = yield* Crypto.Crypto
+    return temporaryPath(`${prefix}-${yield* crypto.randomUUIDv4}.sqlite`)
+  })
 
 describe("PeerSync", () => {
   const Task = Document.make("Task", {
@@ -1106,9 +1112,7 @@ describe("PeerSync", () => {
             }
           ]
         ) {
-          const filename = temporaryPath(
-            `effect-local-peer-source-${quota.key}-${globalThis.crypto.randomUUID()}.sqlite`
-          )
+          const filename = yield* temporaryDatabasePath(`effect-local-peer-source-${quota.key}`)
           const fs = yield* FileSystem.FileSystem
           yield* Effect.addFinalizer(() => Effect.ignore(fs.remove(filename)))
           const seeded = yield* seedSourceReceive(filename)
@@ -1152,13 +1156,13 @@ describe("PeerSync", () => {
         }
         // Three quotas, each seeding an on-disk replica and building two more to reject and recover.
         // That is real I/O the default five second budget does not cover on a loaded CI runner.
-      }).pipe(Effect.provide(NodeFileSystem.layer)),
+      }).pipe(Effect.provide(NodeFileSystem.layer), Effect.provide(NodeCrypto.layer)),
     30_000
   )
 
   it.effect("accepts a peer change exactly at every cumulative source boundary", () =>
     Effect.gen(function*() {
-      const filename = temporaryPath(`effect-local-peer-source-boundary-${globalThis.crypto.randomUUID()}.sqlite`)
+      const filename = yield* temporaryDatabasePath("effect-local-peer-source-boundary")
       const fs = yield* FileSystem.FileSystem
       yield* Effect.addFinalizer(() => Effect.ignore(fs.remove(filename)))
       const seeded = yield* seedSourceReceive(filename)
@@ -1184,7 +1188,7 @@ describe("PeerSync", () => {
           assert.strictEqual(footprint[0]?.history_operations, seeded.boundary.operations)
         }).pipe(Effect.provide(sourceLayer(boundaryLimits, filename)))
       )
-    }).pipe(Effect.provide(NodeFileSystem.layer)))
+    }).pipe(Effect.provide(NodeFileSystem.layer), Effect.provide(NodeCrypto.layer)))
 
   it.effect("rejects unmeasured and corrupt history counters without durable effects", () =>
     Effect.gen(function*() {
@@ -1199,9 +1203,7 @@ describe("PeerSync", () => {
           { expected: "StorageCorrupt", state: "mismatched" }
         ]
       ) {
-        const filename = temporaryPath(
-          `effect-local-peer-source-${counterCase.state}-${globalThis.crypto.randomUUID()}.sqlite`
-        )
+        const filename = yield* temporaryDatabasePath(`effect-local-peer-source-${counterCase.state}`)
         const fs = yield* FileSystem.FileSystem
         yield* Effect.addFinalizer(() => Effect.ignore(fs.remove(filename)))
         const seeded = yield* seedSourceReceive(filename, counterCase.state)
@@ -1229,11 +1231,11 @@ describe("PeerSync", () => {
           }).pipe(Effect.provide(sourceLayer(limits, filename)))
         )
       }
-    }).pipe(Effect.provide(NodeFileSystem.layer)), 20_000)
+    }).pipe(Effect.provide(NodeFileSystem.layer), Effect.provide(NodeCrypto.layer)), 20_000)
 
   it.effect("interrupts a blocked receive without durable effects and accepts a retry", () =>
     Effect.gen(function*() {
-      const filename = temporaryPath(`effect-local-peer-source-interrupt-${globalThis.crypto.randomUUID()}.sqlite`)
+      const filename = yield* temporaryDatabasePath("effect-local-peer-source-interrupt")
       const fs = yield* FileSystem.FileSystem
       yield* Effect.addFinalizer(() => Effect.ignore(fs.remove(filename)))
       const seeded = yield* seedSourceReceive(filename)
@@ -1278,7 +1280,7 @@ describe("PeerSync", () => {
           assert.strictEqual((yield* replica.get(Task, seeded.documentId)).value.title, "remote")
         }).pipe(Effect.provide(sourceLayer(limits, filename)))
       )
-    }).pipe(Effect.provide(NodeFileSystem.layer)))
+    }).pipe(Effect.provide(NodeFileSystem.layer), Effect.provide(NodeCrypto.layer)))
 
   it.effect("persists the wire declared writer provenance for an inbound change, not the receiver's own", () =>
     Effect.gen(function*() {
@@ -3269,7 +3271,7 @@ describe("PeerSync", () => {
 
   it.effect("reports startup storage failures through the typed error channel", () =>
     Effect.gen(function*() {
-      const filename = temporaryPath(`effect-local-peer-sync-${globalThis.crypto.randomUUID()}.sqlite`)
+      const filename = yield* temporaryDatabasePath("effect-local-peer-sync")
       const fs = yield* FileSystem.FileSystem
       yield* Effect.addFinalizer(() => Effect.ignore(fs.remove(filename)))
       const database = Layer.merge(SqliteClient.layer({ filename, disableWAL: true }), NodeCrypto.layer)
@@ -3297,7 +3299,7 @@ describe("PeerSync", () => {
       if (Result.isFailure(result) && result.failure._tag === "ReplicaError") {
         assert.strictEqual(result.failure.reason._tag, "StorageUnavailable")
       }
-    }).pipe(Effect.provide(NodeFileSystem.layer)))
+    }).pipe(Effect.provide(NodeFileSystem.layer), Effect.provide(NodeCrypto.layer)))
 
   it.effect("retries peer recovery without dropping a concurrent local or remote commit", () =>
     Effect.gen(function*() {

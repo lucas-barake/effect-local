@@ -5,11 +5,15 @@ import * as Exit from "effect/Exit"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+// oxlint-disable-next-line effect/noNodeBuiltinImport -- The child process boundary owns IPC, stdio, exit, and its referenced keep-alive timer.
+import { argv, exit, stderr, stdout } from "node:process"
+// oxlint-disable-next-line effect/noNodeBuiltinImport -- The crash harness needs a referenced timer to keep the WAL child alive until SIGKILL.
+import { clearInterval, setInterval } from "node:timers"
 import * as DocumentStore from "../../src/DocumentStore.js"
 import * as InternalAutomerge from "../../src/internal/automerge.js"
 import { AckLineJson, acknowledgedTitle, ChildMode, ReadLineJson, storeLayer, Task } from "./fixture.js"
 
-const [modeArg, dbPath, documentIdArg] = globalThis.process.argv.slice(2)
+const [modeArg, dbPath, documentIdArg] = argv.slice(2)
 const mode = Schema.decodeUnknownSync(ChildMode)(modeArg)
 
 const journalMode = SqlClient.SqlClient.pipe(
@@ -35,12 +39,12 @@ const write = Effect.gen(function*() {
     documentId,
     title: acknowledgedTitle
   })
-  yield* Effect.sync(() => globalThis.process.stdout.write(line + "\n"))
+  yield* Effect.sync(() => stdout.write(line + "\n"))
   // Hold the process open with a referenced timer so the WAL is never
   // checkpointed by a clean shutdown; the parent ends it with SIGKILL.
   yield* Effect.callback<never>(() => {
-    const timer = globalThis.setInterval(() => {}, 2_147_483_647)
-    return Effect.sync(() => globalThis.clearInterval(timer))
+    const timer = setInterval(() => {}, 2_147_483_647)
+    return Effect.sync(() => clearInterval(timer))
   })
 })
 
@@ -70,7 +74,7 @@ const read = Effect.gen(function*() {
     )
   )
   const line = Schema.encodeSync(ReadLineJson)(result)
-  yield* Effect.sync(() => globalThis.process.stdout.write(line + "\n"))
+  yield* Effect.sync(() => stdout.write(line + "\n"))
 })
 
 let selectedProgram = read
@@ -80,10 +84,10 @@ const program = selectedProgram.pipe(
   Effect.provide(storeLayer(dbPath))
 )
 
-void Effect.runPromiseExit(program).then((exit) => {
-  if (Exit.isFailure(exit)) {
-    globalThis.process.stderr.write(Cause.pretty(exit.cause) + "\n")
-    globalThis.process.exit(1)
+void Effect.runPromiseExit(program).then((completion) => {
+  if (Exit.isFailure(completion)) {
+    stderr.write(Cause.pretty(completion.cause) + "\n")
+    exit(1)
   }
-  globalThis.process.exit(0)
+  exit(0)
 })
