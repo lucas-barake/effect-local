@@ -215,7 +215,8 @@ export const layer: Layer.Layer<ReplicaOperationScheduler, never, ReplicaLimits.
         const waiters: Array<Deferred.Deferred<void>> = []
         current.closed = true
         for (const lane of [current.interactive, current.background]) {
-          waiters.push(...lane.queued, ...lane.running)
+          for (const granted of lane.queued) waiters.push(granted)
+          for (const granted of lane.running) waiters.push(granted)
           lane.queued.clear()
           lane.running.clear()
         }
