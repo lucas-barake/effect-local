@@ -56,12 +56,16 @@ const transitionProjectionStatus = SqlClient.SqlClient.use((sql) =>
   })
 )
 
-bench("projection readiness across 400k rows", () => setup.then(() => runtime.runPromise(countBlocked)), {
-  iterations: 500,
-  time: 0,
-  warmupIterations: 20,
-  warmupTime: 0
-})
+bench(
+  "projection readiness across 400k rows",
+  () => setup.then(() => runtime.runPromise(Effect.asVoid(countBlocked))),
+  {
+    iterations: 500,
+    time: 0,
+    warmupIterations: 20,
+    warmupTime: 0
+  }
+)
 
 bench(
   "projection status transition across 400k rows",
