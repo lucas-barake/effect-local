@@ -3721,8 +3721,7 @@ const make = (
                           )(writerProvenance)
                           const relayRetainedSize = relay === undefined
                             ? null
-                            : relay.encodedSize +
-                              replyParts.reduce((total, part) => total + part.message.byteLength, 0) +
+                            : relay.encodedSize + replyBytes +
                               (pendingMessage?.byteLength ?? 0) +
                               new TextEncoder().encode(encodedWriterProvenance).byteLength
                           yield* sql`INSERT INTO effect_local_peer_receipts (
@@ -3780,13 +3779,13 @@ const make = (
                             messageHash: part.messageHash,
                             heads: part.heads
                           }))
-                          const reply: Reply | null = fragments[0] === undefined
+                          const reply: Reply | null = firstReply === undefined
                             ? null
                             : {
                               documentId,
-                              message: fragments[0].message,
-                              messageHash: fragments[0].messageHash,
-                              heads: fragments[0].heads,
+                              message: firstReply.message,
+                              messageHash: firstReply.messageHash,
+                              heads: firstReply.heads,
                               fragments
                             }
                           if (relay !== undefined) {
