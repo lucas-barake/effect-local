@@ -103,31 +103,21 @@ const replicaLimits: ReplicaLimits.Values = {
 const outboxLimits: PeerRelayOutboxLimits.Values = PeerRelayOutboxLimits.defaults
 const receiptLimits: PeerRelayReceiptLimits.Values = PeerRelayReceiptLimits.defaults
 const checkpointToken = Uint8Array.of(17, 29, 43)
-const checkpointAuthority: CheckpointAuthority.Implementation = {
-  signManifest: () => Effect.succeed(Option.some(checkpointToken)),
-  verifyManifest: (claims, token) =>
+const rejectForeignToken =
+  (reason: string) =>
+  (claims: { readonly documentId: Identity.DocumentId }, token: CheckpointAuthority.AuthorizationToken) =>
     Equal.equals(token, checkpointToken)
       ? Effect.void
       : Effect.fail(
         new ReplicaError.ReplicaError({
-          reason: new ReplicaError.CheckpointRejected({
-            documentId: claims.documentId,
-            reason: "Invalid deterministic checkpoint token"
-          })
-        })
-      ),
-  signTransition: () => Effect.succeed(Option.some(checkpointToken)),
-  verifyTransition: (claims, token) =>
-    Equal.equals(token, checkpointToken)
-      ? Effect.void
-      : Effect.fail(
-        new ReplicaError.ReplicaError({
-          reason: new ReplicaError.CheckpointRejected({
-            documentId: claims.documentId,
-            reason: "Invalid deterministic transition token"
-          })
+          reason: new ReplicaError.CheckpointRejected({ documentId: claims.documentId, reason })
         })
       )
+const checkpointAuthority: CheckpointAuthority.Implementation = {
+  signManifest: () => Effect.succeed(Option.some(checkpointToken)),
+  verifyManifest: rejectForeignToken("Invalid deterministic checkpoint token"),
+  signTransition: () => Effect.succeed(Option.some(checkpointToken)),
+  verifyTransition: rejectForeignToken("Invalid deterministic transition token")
 }
 
 /**
@@ -401,12 +391,15 @@ const directOutboxRows = (sql: SqlClient.SqlClient) =>
  */
 const seedPairWith = (
   limits: ReplicaLimits.Values,
-  authority?: CheckpointAuthority.Implementation,
-  cloneRecipient = true
+  options?: {
+    readonly authority?: CheckpointAuthority.Implementation
+    /** `false` leaves the recipient without the document, which is the gap a checkpoint closes. */
+    readonly cloneRecipient?: boolean
+  }
 ) =>
   Effect.gen(function*() {
-    const senderContext = yield* Layer.build(clientStack(limits, authority))
-    const recipientContext = yield* Layer.build(clientStack(limits, authority))
+    const senderContext = yield* Layer.build(clientStack(limits, options?.authority))
+    const recipientContext = yield* Layer.build(clientStack(limits, options?.authority))
     const sender = Context.get(senderContext, Replica.Replica)
     const recipient = Context.get(recipientContext, Replica.Replica)
 
@@ -414,7 +407,7 @@ const seedPairWith = (
       commandId: yield* Identity.makeCommandId,
       value: { title: "one", labels: [] }
     })
-    if (cloneRecipient) {
+    if (options?.cloneRecipient !== false) {
       const backup = yield* sender.exportBackup({ maxBytes: limits.maxBackupBytes }).pipe(Stream.runCollect)
       yield* recipient.restoreBackup({
         expectedDefinitionHash: definition.hash,
@@ -446,6 +439,33 @@ const seedPairWith = (
 
 const seedPair = seedPairWith(replicaLimits)
 
+type SeededSide = Effect.Success<typeof seedPair>["sender"]
+
+/**
+ * Every exchange here runs between the same two roles, so a side determines both principals and the
+ * replica context its session must run under. Passing the client separately is what lets a test hand
+ * a role a deliberately broken one.
+ */
+const connectSender = (
+  client: PeerRpc.RpcClient,
+  sender: SeededSide,
+  documentId: Identity.DocumentId
+) =>
+  RpcPeerTransport.makeSession(
+    client,
+    transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
+  ).pipe(Effect.provideContext(sender.context))
+
+const connectRecipient = (
+  client: PeerRpc.RpcClient,
+  recipient: SeededSide,
+  documentId: Identity.DocumentId
+) =>
+  RpcPeerTransport.makeSession(
+    client,
+    transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
+  ).pipe(Effect.provideContext(recipient.context))
+
 describe("relay custody against a real relay", () => {
   it.effect("reports exact public command custody and complete document confirmation", () =>
     Effect.scoped(
@@ -469,12 +489,6 @@ describe("relay custody against a real relay", () => {
         yield* TestClock.adjust(5000)
 
         yield* Effect.scoped(Effect.gen(function*() {
-          const options = transportOptions(
-            localPrincipal,
-            remotePrincipal,
-            sender.incarnation,
-            documentId
-          )
           const commandHashes = yield* sender.sql<{
             readonly command_id: string
             readonly change_hash: string
@@ -498,18 +512,8 @@ describe("relay custody against a real relay", () => {
               )) as PeerRpc.RpcClient["Push"]
           }
           const attempt = yield* Effect.exit(Effect.scoped(Effect.gen(function*() {
-            yield* RpcPeerTransport.makeSession(
-              recipientClient,
-              transportOptions(
-                remotePrincipal,
-                localPrincipal,
-                recipient.incarnation,
-                documentId
-              )
-            ).pipe(Effect.provideContext(recipient.context))
-            const session = yield* RpcPeerTransport.makeSession(unavailable, options).pipe(
-              Effect.provideContext(sender.context)
-            )
+            yield* connectRecipient(recipientClient, recipient, documentId)
+            const session = yield* connectSender(unavailable, sender, documentId)
             assert.isFalse(yield* session.durableConfirmation(documentId))
             yield* session.markDirty(documentId)
             yield* session.flush
@@ -540,9 +544,7 @@ describe("relay custody against a real relay", () => {
             }
           }
 
-          const session = yield* RpcPeerTransport.makeSession(client, options).pipe(
-            Effect.provideContext(sender.context)
-          )
+          const session = yield* connectSender(client, sender, documentId)
           assert.isTrue(yield* session.durableConfirmation(documentId))
 
           for (
@@ -631,14 +633,8 @@ describe("relay custody against a real relay", () => {
 
         yield* Effect.scoped(Effect.gen(function*() {
           // The recipient subscribes first so the relay has a session to dispatch to.
-          yield* RpcPeerTransport.makeSession(
-            recipientClient,
-            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
-          ).pipe(Effect.provideContext(recipient.context))
-          const senderSession = yield* RpcPeerTransport.makeSession(
-            senderClient,
-            transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
-          ).pipe(Effect.provideContext(sender.context))
+          yield* connectRecipient(recipientClient, recipient, documentId)
+          const senderSession = yield* connectSender(senderClient, sender, documentId)
 
           yield* senderSession.markDirty(documentId)
           yield* senderSession.flush
@@ -686,14 +682,8 @@ describe("relay custody against a real relay", () => {
         yield* TestClock.adjust(5000)
 
         const sessions = Effect.gen(function*() {
-          yield* RpcPeerTransport.makeSession(
-            recipientClient,
-            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
-          ).pipe(Effect.provideContext(recipient.context))
-          const senderSession = yield* RpcPeerTransport.makeSession(
-            senderClient,
-            transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
-          ).pipe(Effect.provideContext(sender.context))
+          yield* connectRecipient(recipientClient, recipient, documentId)
+          const senderSession = yield* connectSender(senderClient, sender, documentId)
           yield* senderSession.markDirty(documentId)
           yield* senderSession.flush
           yield* TestClock.adjust(5000)
@@ -751,11 +741,10 @@ describe("relay custody against a real relay", () => {
         const backend = yield* relayBackend()
         const senderClient = yield* backend.clientFor("local")
         const recipientClient = yield* backend.clientFor("remote")
-        const { documentId, recipient, sender } = yield* seedPairWith(
-          checkpointLimits,
-          checkpointAuthority,
-          false
-        )
+        const { documentId, recipient, sender } = yield* seedPairWith(checkpointLimits, {
+          authority: checkpointAuthority,
+          cloneRecipient: false
+        })
 
         const offlineLabels = Array.from({ length: 4 }, (_, index) => `offline-${index}`)
         for (const label of offlineLabels) {
@@ -768,14 +757,8 @@ describe("relay custody against a real relay", () => {
         yield* TestClock.adjust(5000)
 
         yield* Effect.scoped(Effect.gen(function*() {
-          const recipientSession = yield* RpcPeerTransport.makeSession(
-            recipientClient,
-            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
-          ).pipe(Effect.provideContext(recipient.context))
-          const senderSession = yield* RpcPeerTransport.makeSession(
-            senderClient,
-            transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
-          ).pipe(Effect.provideContext(sender.context))
+          const recipientSession = yield* connectRecipient(recipientClient, recipient, documentId)
+          const senderSession = yield* connectSender(senderClient, sender, documentId)
 
           yield* senderSession.markDirty(documentId)
           yield* senderSession.flush
@@ -867,14 +850,8 @@ describe("relay custody against a real relay", () => {
         yield* TestClock.adjust(5000)
 
         const sessions = Effect.gen(function*() {
-          yield* RpcPeerTransport.makeSession(
-            recipientClient,
-            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
-          ).pipe(Effect.provideContext(recipient.context))
-          const senderSession = yield* RpcPeerTransport.makeSession(
-            senderClient,
-            transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
-          ).pipe(Effect.provideContext(sender.context))
+          yield* connectRecipient(recipientClient, recipient, documentId)
+          const senderSession = yield* connectSender(senderClient, sender, documentId)
           yield* senderSession.markDirty(documentId)
           yield* senderSession.flush
           yield* TestClock.adjust(5000)
@@ -925,10 +902,7 @@ describe("relay custody against a real relay", () => {
         // its inbox: the polluted-inbox shape a fresh client faces after its peer worked alone.
         const total = 3
         yield* Effect.scoped(Effect.gen(function*() {
-          const session = yield* RpcPeerTransport.makeSession(
-            senderClient,
-            transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
-          ).pipe(Effect.provideContext(sender.context))
+          const session = yield* connectSender(senderClient, sender, documentId)
           for (let index = 0; index < total; index++) {
             yield* sender.replica.mutate(AddLabel, {
               commandId: yield* Identity.makeCommandId,
@@ -946,10 +920,7 @@ describe("relay custody against a real relay", () => {
         assert.isAbove(flooded.pendingCount, 1, "the backlog holds more than a coalesced message")
 
         yield* Effect.scoped(Effect.gen(function*() {
-          yield* RpcPeerTransport.makeSession(
-            recipientClient,
-            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
-          ).pipe(Effect.provideContext(recipient.context))
+          yield* connectRecipient(recipientClient, recipient, documentId)
 
           // The fresh session must drain the whole backlog by itself: apply and settle every
           // message, one channel head at a time, without the session dying.
@@ -958,10 +929,7 @@ describe("relay custody against a real relay", () => {
           // The backlog alone cannot converge the document: sync messages generated against a
           // silent peer only announce state, and the changes travel once the sender processes
           // the replies the drain filed into its inbox. The sender coming back completes it.
-          yield* RpcPeerTransport.makeSession(
-            senderClient,
-            transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
-          ).pipe(Effect.provideContext(sender.context))
+          yield* connectSender(senderClient, sender, documentId)
 
           const expected = Array.from({ length: total }, (_, index) => `label-${index}`).toSorted()
           yield* awaitUsage(backend, senderInbox, (usage) => usage.pendingCount === 0)
@@ -991,10 +959,7 @@ describe("relay custody against a real relay", () => {
 
         // Two messages queue on one channel while the recipient is offline.
         yield* Effect.scoped(Effect.gen(function*() {
-          const session = yield* RpcPeerTransport.makeSession(
-            senderClient,
-            transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
-          ).pipe(Effect.provideContext(sender.context))
+          const session = yield* connectSender(senderClient, sender, documentId)
           yield* sender.replica.mutate(AddLabel, {
             commandId: yield* Identity.makeCommandId,
             documentId,
@@ -1012,10 +977,7 @@ describe("relay custody against a real relay", () => {
           Reject: ((() => Effect.fail(new PeerRpcError.ServerUnavailable())) as PeerRpc.RpcClient["Reject"])
         }
         yield* Effect.exit(Effect.scoped(Effect.gen(function*() {
-          yield* RpcPeerTransport.makeSession(
-            failingSettles,
-            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
-          ).pipe(Effect.provideContext(recipient.context))
+          yield* connectRecipient(failingSettles, recipient, documentId)
           yield* TestClock.adjust(5000)
         })))
 
@@ -1027,10 +989,7 @@ describe("relay custody against a real relay", () => {
         // A fresh honest session must not die on the exhausted head: the relay dead letters it
         // without transmitting it, and the rest of the backlog drains and settles normally.
         yield* Effect.scoped(Effect.gen(function*() {
-          yield* RpcPeerTransport.makeSession(
-            recipientClient,
-            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
-          ).pipe(Effect.provideContext(recipient.context))
+          yield* connectRecipient(recipientClient, recipient, documentId)
           yield* awaitUsage(backend, recipientInbox, (usage) => usage.pendingCount === 0)
         }))
 
@@ -1056,10 +1015,7 @@ describe("relay custody against a real relay", () => {
         // so the recipient's drain has a second head to prove the session outlived the failure.
         for (const label of ["first-epoch", "second-epoch"]) {
           yield* Effect.scoped(Effect.gen(function*() {
-            const session = yield* RpcPeerTransport.makeSession(
-              senderClient,
-              transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
-            ).pipe(Effect.provideContext(sender.context))
+            const session = yield* connectSender(senderClient, sender, documentId)
             yield* sender.replica.mutate(AddLabel, {
               commandId: yield* Identity.makeCommandId,
               documentId,
@@ -1088,10 +1044,7 @@ describe("relay custody against a real relay", () => {
           }) as PeerRpc.RpcClient["Acknowledge"]
         }
         yield* Effect.scoped(Effect.gen(function*() {
-          yield* RpcPeerTransport.makeSession(
-            flakySettles,
-            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
-          ).pipe(Effect.provideContext(recipient.context))
+          yield* connectRecipient(flakySettles, recipient, documentId)
           const progress = yield* awaitUsage(
             backend,
             recipientInbox,
@@ -1109,10 +1062,7 @@ describe("relay custody against a real relay", () => {
         // The unsettled message is redelivered to the next session, deduplicated by the durable
         // receipt the apply already wrote, and acknowledged without a second apply.
         yield* Effect.scoped(Effect.gen(function*() {
-          yield* RpcPeerTransport.makeSession(
-            recipientClient,
-            transportOptions(remotePrincipal, localPrincipal, recipient.incarnation, documentId)
-          ).pipe(Effect.provideContext(recipient.context))
+          yield* connectRecipient(recipientClient, recipient, documentId)
           yield* awaitUsage(backend, recipientInbox, (usage) => usage.pendingCount === 0)
         }))
       }).pipe(Effect.provide(NodeCrypto.layer))
@@ -1131,7 +1081,6 @@ describe("relay custody against a real relay", () => {
         })
         yield* TestClock.adjust(5000)
 
-        const options = transportOptions(localPrincipal, remotePrincipal, sender.incarnation, documentId)
         const recipientInbox = yield* inboxKeyOf(remotePrincipal, backend.crypto)
 
         // The situation the outbox exists for: the change is already durably admitted, so dropping it
@@ -1142,9 +1091,7 @@ describe("relay custody against a real relay", () => {
         }
         // A failed push is fatal to the connection, so closing the scope reports it too.
         const attempt = yield* Effect.exit(Effect.scoped(Effect.gen(function*() {
-          const session = yield* RpcPeerTransport.makeSession(unavailable, options).pipe(
-            Effect.provideContext(sender.context)
-          )
+          const session = yield* connectSender(unavailable, sender, documentId)
           yield* session.markDirty(documentId)
           yield* session.flush
         })))
@@ -1156,7 +1103,7 @@ describe("relay custody against a real relay", () => {
         // Nothing here marks dirty or flushes, so the entry can only arrive through connect-time replay.
         // Identified by relay message id because the new session also sends one of its own.
         yield* Effect.scoped(Effect.gen(function*() {
-          yield* RpcPeerTransport.makeSession(client, options).pipe(Effect.provideContext(sender.context))
+          yield* connectSender(client, sender, documentId)
 
           const heads = yield* backend.store.pendingHeads(recipientInbox, { limit: 10, now: 0 }).pipe(Effect.orDie)
           assert.isTrue(

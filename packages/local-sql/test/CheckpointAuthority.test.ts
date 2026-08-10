@@ -12,6 +12,9 @@ const resultingLineage = Identity.DocumentLineage.make("lin_00000000-0000-4000-8
 const priorCheckpointHash = "1".repeat(64)
 const anchorCheckpointHash = "2".repeat(64)
 const writerDefinitionHash = "def_0123456789abcdef"
+const oversizedToken = new Uint8Array(
+  CheckpointAuthority.maximumAuthorizationTokenBytes + 1
+) as CheckpointAuthority.AuthorizationToken
 
 const manifestClaims: CheckpointAuthority.ManifestClaims = {
   purpose: CheckpointAuthority.manifestPurpose,
@@ -70,28 +73,20 @@ describe("CheckpointAuthority", () => {
       assert.isTrue(Option.isNone(yield* authority.signTransition(transitionClaims)))
 
       for (
-        const result of [
-          yield* Effect.result(authority.verifyManifest(manifestClaims, Uint8Array.of(1))),
-          yield* Effect.result(authority.verifyTransition(transitionClaims, Uint8Array.of(1)))
+        const error of [
+          yield* Effect.flip(authority.verifyManifest(manifestClaims, Uint8Array.of(1))),
+          yield* Effect.flip(authority.verifyTransition(transitionClaims, Uint8Array.of(1)))
         ]
       ) {
-        assert.strictEqual(result._tag, "Failure")
-        if (result._tag === "Failure") {
-          assert.strictEqual(result.failure._tag, "ReplicaError")
-          assert.strictEqual(result.failure.reason._tag, "CheckpointRejected")
-        }
+        assert.strictEqual(error._tag, "ReplicaError")
+        assert.strictEqual(error.reason._tag, "CheckpointRejected")
       }
     }).pipe(Effect.provide(CheckpointAuthority.layerRejectAll)))
 
   it.effect("rejects absent and oversized tokens before a permissive verifier runs", () => {
     let verificationCalls = 0
     const Permissive = CheckpointAuthority.layer({
-      signManifest: () =>
-        Effect.succeed(Option.some(
-          new Uint8Array(
-            CheckpointAuthority.maximumAuthorizationTokenBytes + 1
-          ) as CheckpointAuthority.AuthorizationToken
-        )),
+      signManifest: () => Effect.succeed(Option.some(oversizedToken)),
       verifyManifest: () => Effect.sync(() => verificationCalls++).pipe(Effect.asVoid),
       signTransition: () => Effect.succeed(Option.none()),
       verifyTransition: () => Effect.sync(() => verificationCalls++).pipe(Effect.asVoid)
@@ -99,46 +94,40 @@ describe("CheckpointAuthority", () => {
 
     return Effect.gen(function*() {
       const authority = yield* CheckpointAuthority.CheckpointAuthority
-      const absent = yield* Effect.result(
-        authority.verifyManifest(
-          manifestClaims,
-          undefined as unknown as CheckpointAuthority.AuthorizationToken
-        )
-      )
-      const oversized = yield* Effect.result(
-        authority.verifyTransition(
-          transitionClaims,
-          new Uint8Array(
-            CheckpointAuthority.maximumAuthorizationTokenBytes + 1
-          ) as CheckpointAuthority.AuthorizationToken
-        )
-      )
-      const signed = yield* Effect.result(authority.signManifest(manifestClaims))
 
-      assert.strictEqual(absent._tag, "Failure")
-      assert.strictEqual(oversized._tag, "Failure")
-      assert.strictEqual(signed._tag, "Failure")
+      for (
+        const error of [
+          yield* Effect.flip(
+            authority.verifyManifest(
+              manifestClaims,
+              undefined as unknown as CheckpointAuthority.AuthorizationToken
+            )
+          ),
+          yield* Effect.flip(authority.verifyTransition(transitionClaims, oversizedToken)),
+          yield* Effect.flip(authority.signManifest(manifestClaims))
+        ]
+      ) {
+        assert.strictEqual(error.reason._tag, "CheckpointRejected")
+      }
       assert.strictEqual(verificationCalls, 0)
     }).pipe(Effect.provide(Permissive))
   })
 
   it.effect("rejects oversized authorization in durable compact provenance", () =>
     Effect.gen(function*() {
-      const decoded = yield* Effect.result(
+      const error = yield* Effect.flip(
         Schema.decodeUnknownEffect(WriterProvenance.StoredCheckpointProvenance)(JSON.stringify({
           _tag: "Compact",
-          checkpointHash: "1".repeat(64),
+          checkpointHash: priorCheckpointHash,
           lineage: priorLineage,
           heads: ["a".repeat(64)],
           base: { _tag: "Bootstrap" },
           schemaVersion: 1,
           writerDefinitionHash,
-          authorization: Buffer.alloc(
-            CheckpointAuthority.maximumAuthorizationTokenBytes + 1
-          ).toString("base64")
+          authorization: Buffer.from(oversizedToken).toString("base64")
         }))
       )
-      assert.strictEqual(decoded._tag, "Failure")
+      assert.strictEqual(error._tag, "SchemaError")
     }))
 
   it("distinguishes an explicit bootstrap base from bound base heads", () => {
