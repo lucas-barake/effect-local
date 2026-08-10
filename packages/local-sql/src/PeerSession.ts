@@ -663,17 +663,18 @@ const makeWithTerminal = (
           const enqueueOutcome = yield* sync.enqueue(session, result.reply).pipe(
             Effect.flatMap((outbound) => outbound === null ? Effect.void : schedule(outbound)),
             Effect.as("Enqueued" as const),
-            Effect.catchIf(
-              (error) => error.reason._tag === "QuotaExceeded",
-              (error) =>
+            Effect.catchReason(
+              "ReplicaError",
+              "QuotaExceeded",
+              (reason) =>
                 Effect.logWarning(
                   "Peer session parked an inbound message after reply enqueue quota was exceeded; the message stays in relay custody"
                 ).pipe(
                   Effect.annotateLogs({
                     documentId: envelope.documentId,
                     peerId: connection.peerId,
-                    resource: error.reason._tag === "QuotaExceeded" ? error.reason.resource : undefined,
-                    limit: error.reason._tag === "QuotaExceeded" ? error.reason.limit : undefined
+                    resource: reason.resource,
+                    limit: reason.limit
                   }),
                   Effect.as("Parked" as const)
                 )
