@@ -28,11 +28,10 @@ export const layerReactivity = Layer.effectDiscard(Effect.gen(function*() {
     Stream.runForEach((event) => reactivity.invalidate(event.keys)),
     // Restarting after a noninterrupt failure keeps remote invalidations live. Interruption remains
     // terminal so the owning scope controls shutdown.
-    Effect.catchCause((cause) =>
-      Cause.hasInterrupts(cause)
-        ? Effect.failCause(cause)
-        : Effect.logWarning("replica invalidation stream restarting", cause)
-    ),
+    Effect.catchCause((cause) => {
+      if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+      return Effect.logWarning("replica invalidation stream restarting", cause)
+    }),
     Effect.repeat(Schedule.spaced(1_000)),
     Effect.forkScoped
   )
@@ -99,10 +98,7 @@ export const queryFamily = <R, E, Q extends Query.Any,>(
 ) => {
   const family = Atom.family((entry: QueryKey<Q["payloadSchema"]["Type"]>) =>
     runtime.atom(Replica.Replica.use((replica) => {
-      const execute = replica.query as (
-        query: Q,
-        payload: Q["payloadSchema"]["Type"]
-      ) => Effect.Effect<Q["successSchema"]["Type"], Q["errorSchema"]["Type"] | ReplicaError.ReplicaError>
+      const execute = (candidateQuery: Query.Any, payload: unknown) => replica.query(candidateQuery, payload)
       return execute(query, entry.payload)
     })).pipe(
       runtime.factory.withReactivity([
@@ -116,7 +112,8 @@ export const queryFamily = <R, E, Q extends Query.Any,>(
   ) => {
     const value = payload[0]
     const encoded = Schema.encodeSync(query.payloadSchema)(value)
-    const key = `${query.name}:${query.version}:${payload.length === 0 ? "void" : Canonical.hash(encoded)}`
+    let key = `${query.name}:${query.version}:void`
+    if (payload.length > 0) key = `${query.name}:${query.version}:${Canonical.hash(encoded)}`
     return family(new QueryKey(key, value))
   }
 }
@@ -138,9 +135,9 @@ export const mutation = <R, E, M extends Mutation.Any,>(
     { concurrent: true }
   )
 
-export const resolveConflict = <R, E, D extends Document.Any,>(
+export const resolveConflict = <R, E,>(
   runtime: Atom.AtomRuntime<Replica.Replica | R, E>,
-  document: D
+  document: Document.Any
 ) =>
   runtime.fn<{
     readonly commandId: Identity.CommandId

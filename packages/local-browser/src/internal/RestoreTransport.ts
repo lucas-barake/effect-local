@@ -44,6 +44,12 @@ export interface FinishOptions {
   readonly nonce: RestoreProtocol.RestoreNonce
 }
 
+const runSyncSafe = <A,>(thunk: () => A, fallback: A): A => {
+  const exit = Effect.runSyncExit(Effect.try({ try: thunk, catch: () => fallback }))
+  if (Exit.isSuccess(exit)) return exit.value
+  return fallback
+}
+
 export class RestoreTransport extends Context.Service<RestoreTransport, {
   readonly begin: (options: BeginOptions) => Effect.Effect<BeginResult, ReplicaError.ReplicaError>
   readonly finish: (
@@ -136,15 +142,18 @@ const ownExactProperties = (
   input: object,
   fields: ReadonlySet<string>
 ): ReadonlyMap<string, unknown> | undefined => {
-  const properties = new Map<string, unknown>()
-  for (const key in input) {
-    if (!Object.prototype.hasOwnProperty.call(input, key)) continue
-    if (properties.size >= fields.size || !fields.has(key)) return undefined
-    const descriptor = Object.getOwnPropertyDescriptor(input, key)
-    if (descriptor === undefined || !("value" in descriptor)) return undefined
-    properties.set(key, descriptor.value)
-  }
-  return properties.size === fields.size ? properties : undefined
+  return runSyncSafe(() => {
+    const properties = new Map<string, unknown>()
+    for (const key in input) {
+      if (!Object.prototype.hasOwnProperty.call(input, key)) continue
+      if (properties.size >= fields.size || !fields.has(key)) return undefined
+      const descriptor = Object.getOwnPropertyDescriptor(input, key)
+      if (descriptor === undefined || !("value" in descriptor)) return undefined
+      properties.set(key, descriptor.value)
+    }
+    if (properties.size !== fields.size) return undefined
+    return properties
+  }, undefined)
 }
 
 const preflightFrame = (
@@ -152,7 +161,7 @@ const preflightFrame = (
   maxErrorBytes: number,
   maxChunkBytes: number
 ): boolean => {
-  try {
+  return runSyncSafe(() => {
     if (typeof input !== "object" || input === null || Array.isArray(input)) return false
     const tagDescriptor = Object.getOwnPropertyDescriptor(input, "_tag")
     if (tagDescriptor === undefined || !("value" in tagDescriptor)) return false
@@ -179,9 +188,7 @@ const preflightFrame = (
       return RestoreProtocol.preflightReplicaError(properties.get("error"), maxErrorBytes)
     }
     return true
-  } catch {
-    return false
-  }
+  }, false)
 }
 
 const encodeFrame = <A, I, R,>(
@@ -212,12 +219,17 @@ const post = <A, I, R,>(
 ): Effect.Effect<void, ReplicaError.ReplicaError, R> =>
   encodeFrame(schema, frame).pipe(
     Effect.flatMap((encoded) =>
-      Effect.try({
-        try: () => {
-          if (controller.port === undefined) throw new Error("restore transport endpoint is unavailable")
-          controller.port.postMessage(encoded, transfer === undefined ? [] : [...transfer])
-        },
-        catch: unavailable
+      Effect.suspend(() => {
+        if (controller.port === undefined) {
+          return Effect.fail(unavailable("restore transport endpoint is unavailable"))
+        }
+        const port = controller.port
+        const transfers: Array<Transferable> = []
+        if (transfer !== undefined) transfers.push(...transfer)
+        return Effect.try({
+          try: () => port.postMessage(encoded, transfers),
+          catch: unavailable
+        })
       })
     )
   )
@@ -256,7 +268,7 @@ const makeLayer = Layer.effect(
       }).pipe(
         Effect.filterOrFail(
           (entered) => entered,
-          () => unavailable(new Error("restore transport is closed"))
+          () => unavailable("restore transport is closed")
         )
       )
 
@@ -273,18 +285,21 @@ const makeLayer = Layer.effect(
         if (port === undefined) return
         controller.port = undefined
         if (controller.listenersInstalled) {
-          if (controller.messageListener !== undefined) {
-            port.removeEventListener("message", controller.messageListener)
+          const messageListener = controller.messageListener
+          if (messageListener !== undefined) {
+            runSyncSafe(() => port.removeEventListener("message", messageListener), undefined)
           }
-          if (controller.messageErrorListener !== undefined) {
-            port.removeEventListener("messageerror", controller.messageErrorListener)
+          const messageErrorListener = controller.messageErrorListener
+          if (messageErrorListener !== undefined) {
+            runSyncSafe(() => port.removeEventListener("messageerror", messageErrorListener), undefined)
           }
-          if (controller.closeListener !== undefined) {
-            port.removeEventListener("close", controller.closeListener)
+          const closeListener = controller.closeListener
+          if (closeListener !== undefined) {
+            runSyncSafe(() => port.removeEventListener("close", closeListener), undefined)
           }
           controller.listenersInstalled = false
         }
-        port.close()
+        runSyncSafe(() => port.close(), undefined)
       }
 
       const failAwaiting = (awaiting: AwaitingFrame, error: ReplicaError.ReplicaError) => {
@@ -397,17 +412,11 @@ const makeLayer = Layer.effect(
 
       const installIngress = (controller: Controller, port: MessagePort) => {
         const onMessage = (event: MessageEvent<unknown>) => {
-          let decoded: Exit.Exit<RestoreProtocol.PageToOwnerFrame, unknown>
-          try {
-            decoded = decodePageFrame(
-              event.data,
-              sessions.maxRestoreErrorBytes,
-              sessions.maxChunkBytes
-            )
-          } catch {
-            invalidFrame(controller)
-            return
-          }
+          const decoded = decodePageFrame(
+            event.data,
+            sessions.maxRestoreErrorBytes,
+            sessions.maxChunkBytes
+          )
           if (Exit.isFailure(decoded)) {
             invalidFrame(controller)
             return
@@ -417,12 +426,12 @@ const makeLayer = Layer.effect(
         const onMessageError = () =>
           disconnect(
             controller,
-            unavailable(new Error("restore transport message decoding failed"))
+            unavailable("restore transport message decoding failed")
           )
         const onClose = () =>
           disconnect(
             controller,
-            unavailable(new Error("restore transport peer closed"))
+            unavailable("restore transport peer closed")
           )
         controller.messageListener = onMessage
         controller.messageErrorListener = onMessageError
@@ -481,7 +490,7 @@ const makeLayer = Layer.effect(
             if (frame._tag === "SourceFailure") {
               return yield* Effect.fail(RestoreProtocol.replicaErrorFromWire(frame.error))
             }
-            return [frame.bytes, sequence + 1] as const
+            return [frame.bytes, sequence + 1] satisfies readonly [Uint8Array, number]
           }))
 
       const work = (controller: Controller): Effect.Effect<void, WorkFailure> =>
@@ -490,21 +499,22 @@ const makeLayer = Layer.effect(
             yield* awaitStart(controller)
             yield* awaitResultClaim(controller)
             controller.phase = "Running"
-            return yield* controller.options.mode === "document"
-              ? replica.installBackupDocument(controller.options.document, {
+            if (controller.options.mode === "document") {
+              return yield* replica.installBackupDocument(controller.options.document, {
                 source: source(controller),
                 documentId: controller.options.documentId,
                 maxBytes: controller.options.maxBytes,
                 expectedDefinitionHash: controller.options.expectedDefinitionHash,
                 installationId: controller.options.installationId
               })
-              : replica.restoreBackup({
-                source: source(controller),
-                mode: controller.options.mode,
-                maxBytes: controller.options.maxBytes,
-                expectedDefinitionHash: controller.options.expectedDefinitionHash,
-                installationId: controller.options.installationId
-              })
+            }
+            return yield* replica.restoreBackup({
+              source: source(controller),
+              mode: controller.options.mode,
+              maxBytes: controller.options.maxBytes,
+              expectedDefinitionHash: controller.options.expectedDefinitionHash,
+              installationId: controller.options.installationId
+            })
           }).pipe(
             Effect.catchCause((cause) =>
               Effect.failCause(Cause.map(
@@ -571,7 +581,7 @@ const makeLayer = Layer.effect(
             const result = controller.result
             if (result !== undefined && !(yield* Deferred.isDone(result))) {
               const error = controller.shutdownReason ??
-                unavailable(new Error("restore operation ended before producing a result"))
+                unavailable("restore operation ended before producing a result")
               yield* Deferred.fail(
                 result,
                 new RestoreProtocol.RestoreResultRestoreFailure({
@@ -594,17 +604,24 @@ const makeLayer = Layer.effect(
       const supervise = (controller: Controller) =>
         Effect.gen(function*() {
           const setup = yield* Effect.raceFirst(
-            Deferred.await(controller.setupReady).pipe(Effect.as("Ready" as const)),
-            Deferred.await(controller.shutdown).pipe(Effect.as("Shutdown" as const))
+            Deferred.await(controller.setupReady).pipe(Effect.as("Ready")),
+            Deferred.await(controller.shutdown).pipe(Effect.as("Shutdown"))
           )
           if (setup === "Shutdown") return
           const worker = yield* work(controller).pipe(
             Effect.forkIn(controller.operationScope, { startImmediately: true })
           )
           const outcome = yield* Effect.raceAllFirst([
-            Fiber.await(worker).pipe(Effect.map((exit) => ({ _tag: "Worker" as const, exit }))),
+            Fiber.await(worker).pipe(
+              Effect.map((
+                exit
+              ) => ({ _tag: "Worker", exit } satisfies {
+                readonly _tag: "Worker"
+                readonly exit: Exit.Exit<void, WorkFailure>
+              }))
+            ),
             Deferred.await(controller.shutdown).pipe(
-              Effect.map(() => ({ _tag: "Shutdown" as const }))
+              Effect.map(() => ({ _tag: "Shutdown" } satisfies { readonly _tag: "Shutdown" }))
             ),
             Effect.sleep(sessions.maxRestoreMillis).pipe(
               Effect.tap(() =>
@@ -615,7 +632,7 @@ const makeLayer = Layer.effect(
                   )
                 )
               ),
-              Effect.as({ _tag: "Deadline" as const })
+              Effect.as({ _tag: "Deadline" } satisfies { readonly _tag: "Deadline" })
             )
           ])
           if (outcome._tag !== "Worker") {
@@ -625,33 +642,38 @@ const makeLayer = Layer.effect(
           if (controller.phase === "ShutdownRequested") return
           const result = controller.result
           if (result === undefined) return
-          const resultExit = Exit.isSuccess(outcome.exit)
-            ? Exit.void
-            : Exit.failCause(
-              Cause.map(outcome.exit.cause, (failure): RestoreProtocol.RestoreResultFailure =>
-                failure._tag === "SessionFailure"
-                  ? new RestoreProtocol.RestoreResultSessionFailure({
+          let resultExit: Exit.Exit<void, RestoreProtocol.RestoreResultFailure>
+          if (Exit.isSuccess(outcome.exit)) {
+            resultExit = Exit.void
+          } else {
+            resultExit = Exit.failCause(
+              Cause.map(outcome.exit.cause, (failure): RestoreProtocol.RestoreResultFailure => {
+                if (failure._tag === "SessionFailure") {
+                  return new RestoreProtocol.RestoreResultSessionFailure({
                     error: RestoreProtocol.encodeReplicaError(
                       failure.error,
                       sessions.maxRestoreErrorBytes
                     )
                   })
-                  : new RestoreProtocol.RestoreResultRestoreFailure({
-                    error: RestoreProtocol.encodeReplicaError(
-                      failure.error,
-                      sessions.maxRestoreErrorBytes
-                    )
-                  }))
+                }
+                return new RestoreProtocol.RestoreResultRestoreFailure({
+                  error: RestoreProtocol.encodeReplicaError(
+                    failure.error,
+                    sessions.maxRestoreErrorBytes
+                  )
+                })
+              })
             )
+          }
           yield* Deferred.done(result, resultExit)
           controller.phase = "Finishing"
-          controller.ignoredOutstandingSequence = controller.awaiting?._tag === "Source"
-            ? controller.awaiting.sequence
-            : undefined
+          controller.ignoredOutstandingSequence = undefined
+          if (controller.awaiting?._tag === "Source") {
+            controller.ignoredOutstandingSequence = controller.awaiting.sequence
+          }
           const acquireFinishing = Effect.acquireRelease(
             finishing.take(1),
-            () =>
-              finishing.release(1),
+            () => finishing.release(1),
             { interruptible: true }
           ).pipe(
             Effect.provideService(Scope.Scope, controller.operationScope),
@@ -669,9 +691,7 @@ const makeLayer = Layer.effect(
           )
           yield* sendReleasedAndAwaitAck(controller)
         }).pipe(
-          Effect.onExit((exit) =>
-            cleanup(controller, exit)
-          )
+          Effect.onExit((exit) => cleanup(controller, exit))
         )
 
       const begin: RestoreTransport["Service"]["begin"] = (options) =>
@@ -729,9 +749,9 @@ const makeLayer = Layer.effect(
                 return true
               })
               if (!accepted) {
-                beginShutdown(controller, unavailable(new Error("restore transport is closed")))
+                beginShutdown(controller, unavailable("restore transport is closed"))
                 yield* Deferred.await(controller.cleanupComplete)
-                return yield* unavailable(new Error("restore transport is closed"))
+                return yield* unavailable("restore transport is closed")
               }
               const channel = yield* Effect.sync(() => new MessageChannel())
               if (
@@ -739,11 +759,11 @@ const makeLayer = Layer.effect(
                 controller.phase !== "SettingUp" ||
                 controllers.get(controller.nonce) !== controller
               ) {
-                channel.port1.close()
-                channel.port2.close()
-                beginShutdown(controller, unavailable(new Error("restore transport is closed")))
+                runSyncSafe(() => channel.port1.close(), undefined)
+                runSyncSafe(() => channel.port2.close(), undefined)
+                beginShutdown(controller, unavailable("restore transport is closed"))
                 yield* Deferred.await(controller.cleanupComplete)
-                return yield* unavailable(new Error("restore transport is closed"))
+                return yield* unavailable("restore transport is closed")
               }
               controller.port = channel.port1
               controller.peerPort = channel.port2
@@ -753,7 +773,7 @@ const makeLayer = Layer.effect(
               return yield* restore(
                 Effect.succeed({ nonce, port: channel.port2 }).pipe(
                   Effect.onInterrupt(() =>
-                    Effect.sync(() => beginShutdown(controller!, unavailable(new Error("restore begin interrupted"))))
+                    Effect.sync(() => beginShutdown(controller!, unavailable("restore begin interrupted")))
                       .pipe(Effect.andThen(Deferred.await(controller!.cleanupComplete)))
                   )
                 )
@@ -766,7 +786,7 @@ const makeLayer = Layer.effect(
                   if (controller !== undefined && supervisorLive) {
                     const peerPort = controller.peerPort
                     controller.peerPort = undefined
-                    if (peerPort !== undefined) peerPort.close()
+                    if (peerPort !== undefined) runSyncSafe(() => peerPort.close(), undefined)
                     beginShutdown(controller, unavailable(Cause.squash(exit.cause)))
                     yield* Deferred.await(controller.cleanupComplete)
                   } else if (operationScope !== undefined) {
@@ -801,9 +821,8 @@ const makeLayer = Layer.effect(
           if (claimed === undefined) {
             const result = yield* Deferred.make<void, RestoreProtocol.RestoreResultFailure>()
             const validSession = yield* sessions.contains(options.sessionId)
-            const maxErrorBytes = validSession
-              ? sessions.maxRestoreErrorBytes
-              : ReplicaLimits.minimumRestoreErrorBytes
+            let maxErrorBytes = ReplicaLimits.minimumRestoreErrorBytes
+            if (validSession) maxErrorBytes = sessions.maxRestoreErrorBytes
             yield* Deferred.fail(
               result,
               new RestoreProtocol.RestoreResultSessionFailure({
@@ -824,7 +843,7 @@ const makeLayer = Layer.effect(
                 Effect.sync(() =>
                   beginShutdown(
                     claimed.controller,
-                    unavailable(new Error("restore result consumer interrupted"))
+                    unavailable("restore result consumer interrupted")
                   )
                 )
               ),
@@ -838,17 +857,17 @@ const makeLayer = Layer.effect(
         Effect.gen(function*() {
           const snapshot = yield* Effect.sync(() => {
             closed = true
-            const snapshot = Array.from(controllers.values())
-            for (const controller of snapshot) {
-              beginShutdown(controller, unavailable(new Error("restore transport is shutting down")))
+            const controllersSnapshot = Array.from(controllers.values())
+            for (const controller of controllersSnapshot) {
+              beginShutdown(controller, unavailable("restore transport is shutting down"))
             }
-            return snapshot
+            return controllersSnapshot
           })
           yield* startingZero.await
           yield* Effect.forEach(
             snapshot,
             (controller) => Deferred.await(controller.cleanupComplete),
-            { concurrency: snapshot.length === 0 ? 1 : snapshot.length, discard: true }
+            { concurrency: Math.max(1, snapshot.length), discard: true }
           )
           yield* Scope.close(supervisorScope, Exit.void)
         })

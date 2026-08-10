@@ -89,7 +89,7 @@ export const layer = Layer.effect(
     const queued = yield* Ref.make(0)
 
     const expire = Effect.fnUntraced(function*(now: number) {
-      const expired = yield* Ref.modify(state, (current) => {
+      const expiredEntries = yield* Ref.modify(state, (current) => {
         const live = new Map<Identity.SessionId, SessionEntry>()
         const expired: Array<readonly [Identity.SessionId, SessionEntry]> = []
         for (const entry of current.sessions) {
@@ -99,7 +99,7 @@ export const layer = Layer.effect(
         return [expired, { ...current, sessions: live }]
       })
       yield* Effect.forEach(
-        expired,
+        expiredEntries,
         ([sessionId, entry]) =>
           Deferred.fail(
             entry.expired,
@@ -201,7 +201,12 @@ export const layer = Layer.effect(
     const acquireQueued = Effect.gen(function*() {
       const admitted = yield* Ref.modify(
         queued,
-        (current) => current >= limits.maxQueuedRpc ? [false, current] as const : [true, current + 1] as const
+        (current) => {
+          if (current >= limits.maxQueuedRpc) {
+            return [false, current] satisfies readonly [boolean, number]
+          }
+          return [true, current + 1] satisfies readonly [boolean, number]
+        }
       )
       if (!admitted) {
         return yield* new ReplicaError.ReplicaError({
@@ -211,6 +216,7 @@ export const layer = Layer.effect(
           })
         })
       }
+      return yield* Effect.void
     })
     const releaseQueued = Ref.update(queued, (current) => current - 1)
 
@@ -306,9 +312,12 @@ export const layer = Layer.effect(
         }
         const reservation = yield* Effect.fromResult(result)
         const release = Effect.uninterruptible(
-          Ref.modify(released, (current) => current ? [false, true] : [true, true]).pipe(
-            Effect.flatMap((owned) => {
-              if (!owned) return Effect.void
+          Ref.modify(released, (current) => {
+            if (current) return [false, true]
+            return [true, true]
+          }).pipe(
+            Effect.flatMap((releaseOwned) => {
+              if (!releaseOwned) return Effect.void
               return Ref.update(state, (current) => {
                 const entry = current.sessions.get(sessionId)
                 if (entry === undefined || entry.token !== reservation.token) {
@@ -394,9 +403,9 @@ export const layer = Layer.effect(
           SessionState
         ] => {
           const live = new Map<Identity.SessionId, SessionEntry>()
-          const expiredEntries: Array<readonly [Identity.SessionId, SessionEntry]> = []
+          const expiredSessions: Array<readonly [Identity.SessionId, SessionEntry]> = []
           for (const entry of current.sessions) {
-            if (entry[1].expiresAt <= now) expiredEntries.push(entry)
+            if (entry[1].expiresAt <= now) expiredSessions.push(entry)
             else live.set(...entry)
           }
           const existing = live.get(sessionId)
@@ -411,11 +420,11 @@ export const layer = Layer.effect(
                     })
                   })
                 ),
-                expiredEntries
+                expiredSessions
               ], { ...current, sessions: live }]
             }
             live.set(sessionId, { ...existing, expiresAt: now + leaseDurationMillis })
-            return [[Result.void, expiredEntries], { ...current, sessions: live }]
+            return [[Result.void, expiredSessions], { ...current, sessions: live }]
           }
           if (live.size >= limits.maxSessions) {
             return [[
@@ -427,7 +436,7 @@ export const layer = Layer.effect(
                   })
                 })
               ),
-              expiredEntries
+              expiredSessions
             ], { ...current, sessions: live }]
           }
           live.set(sessionId, {
@@ -439,7 +448,7 @@ export const layer = Layer.effect(
             streams,
             expired
           })
-          return [[Result.void, expiredEntries], { ...current, sessions: live }]
+          return [[Result.void, expiredSessions], { ...current, sessions: live }]
         })
         yield* Effect.forEach(
           expiredEntries,

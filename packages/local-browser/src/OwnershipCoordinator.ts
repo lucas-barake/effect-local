@@ -125,6 +125,29 @@ interface Client {
   served: boolean
 }
 
+const runSyncSafe = <A,>(thunk: () => A, fallback: A): A => {
+  const exit = Effect.runSyncExit(Effect.try({ try: thunk, catch: () => fallback }))
+  if (Exit.isSuccess(exit)) return exit.value
+  return fallback
+}
+
+const safeCall = (thunk: () => void): void => {
+  runSyncSafe(() => {
+    thunk()
+  }, undefined)
+}
+
+const safePostMessage = (
+  port: MessagePort,
+  value: unknown,
+  transfer?: ReadonlyArray<Transferable>
+): void => {
+  safeCall(() => {
+    if (transfer === undefined) port.postMessage(value)
+    else port.postMessage(value, [...transfer])
+  })
+}
+
 const DatabaseActivityFrame = Schema.Union([
   Schema.Tuple([Schema.Int, Schema.Unknown, Schema.Unknown]),
   Schema.Tuple([Schema.Literal("update_hook"), Schema.String, Schema.Number])
@@ -276,7 +299,15 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
       })
 
       const post = (port: MessagePort, frame: OwnershipProtocol.OwnerToPageFrame) =>
-        Effect.sync(() => port.postMessage(Schema.encodeSync(OwnershipProtocol.OwnerToPageFrame)(frame)))
+        Schema.encodeUnknownEffect(OwnershipProtocol.OwnerToPageFrame)(frame).pipe(
+          Effect.flatMap((encoded) =>
+            Effect.try({
+              try: () => port.postMessage(encoded),
+              catch: () => undefined
+            })
+          ),
+          Effect.catch(() => Effect.void)
+        )
 
       const postOwnerError = (port: MessagePort, message: string, reason?: unknown) =>
         post(port, { _tag: "OwnerError", message, reason })
@@ -304,12 +335,16 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
         )
         return engine.runtime.contextEffect.pipe(
           Effect.flatMap((context) => server.pipe(Effect.provide(context))),
-          Effect.tapCause((cause) =>
-            Cause.hasInterruptsOnly(cause)
-              ? Effect.void
-              : postOwnerError(client.controlPort, Cause.pretty(cause))
+          Effect.tapCause((cause) => {
+            if (Cause.hasInterruptsOnly(cause)) return Effect.void
+            return postOwnerError(client.controlPort, Cause.pretty(cause))
+          }),
+          Effect.ensuring(
+            Effect.try({
+              try: () => rpcPort.close(),
+              catch: () => undefined
+            }).pipe(Effect.catch(() => Effect.void))
           ),
-          Effect.ensuring(Effect.sync(() => rpcPort.close())),
           Effect.forkIn(engine.scope),
           Effect.asVoid
         )
@@ -318,7 +353,7 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
       const provideRuntime = <A2, E2_,>(
         runtime: ManagedRuntime.ManagedRuntime<EngineServices, unknown>,
         effect: Effect.Effect<A2, E2_, EngineServices>
-      ): Effect.Effect<A2, unknown, never> =>
+      ): Effect.Effect<A2, unknown> =>
         Effect.flatMap(runtime.contextEffect, (context) => Effect.provide(effect, context))
 
       const startEngine = (
@@ -347,17 +382,23 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
               Effect.andThen(
                 runtime.disposeEffect.pipe(Effect.timeout(engineDisposeTimeoutMillis), Effect.ignore)
               ),
-              Effect.andThen(Effect.sync(() => {
-                detachDatabaseObserver()
-                databasePort.close()
-              }))
+              Effect.andThen(
+                Effect.try({ try: detachDatabaseObserver, catch: () => undefined }).pipe(
+                  Effect.catch(() => Effect.void)
+                )
+              ),
+              Effect.andThen(
+                Effect.try({ try: () => databasePort.close(), catch: () => undefined }).pipe(
+                  Effect.catch(() => Effect.void)
+                )
+              )
             )
           const started = yield* Effect.exit(
             Effect.gen(function*() {
               yield* provideRuntime(runtime, healthProbe).pipe(
                 Effect.timeoutOrElse({
                   duration: engineStartTimeoutMillis,
-                  orElse: () => Effect.fail(new Error("replica engine start timed out"))
+                  orElse: () => Effect.die(new Error("replica engine start timed out"))
                 })
               )
               let info: unknown
@@ -429,15 +470,21 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
         const current = Ref.getUnsafe(state)
         if (current.failures === 0) return kickProvisioning
         if (current.exhausted) return Effect.void
-        const acquireStep = current.retryStep !== undefined
-          ? Effect.succeed(current.retryStep)
-          : Schedule.toStepWithSleep(retrySchedule).pipe(
+        let acquireStep: Effect.Effect<
+          (input: void) => Pull.Pull<unknown, never, unknown>,
+          unknown
+        >
+        if (current.retryStep !== undefined) {
+          acquireStep = Effect.succeed(current.retryStep)
+        } else {
+          acquireStep = Schedule.toStepWithSleep(retrySchedule).pipe(
             Effect.tap((made) =>
               Effect.sync(() => {
                 current.retryStep = made
               })
             )
           )
+        }
         current.retryGeneration += 1
         const generation = current.retryGeneration
         current.backingOff = true
@@ -447,11 +494,12 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
               onSuccess: () => Queue.offer(events, { _tag: "BackoffElapsed", generation }),
               onDone: () => Queue.offer(events, { _tag: "RetryExhausted", generation }),
               onFailure: (cause) =>
-                Cause.hasInterruptsOnly(cause)
-                  ? Effect.failCause(cause)
-                  : Effect.logError("replica engine retry schedule failed", cause).pipe(
+                (() => {
+                  if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
+                  return Effect.logError("replica engine retry schedule failed", cause).pipe(
                     Effect.andThen(Queue.offer(events, { _tag: "RetryExhausted", generation }))
                   )
+                })()
             })
           ),
           Effect.forkIn(layerScope),
@@ -490,7 +538,11 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
           Effect.andThen(engine.runtime.disposeEffect),
           Effect.timeout(engineDisposeTimeoutMillis),
           Effect.ignore,
-          Effect.ensuring(Effect.sync(engine.detachDatabaseObserver))
+          Effect.ensuring(
+            Effect.try({ try: engine.detachDatabaseObserver, catch: () => undefined }).pipe(
+              Effect.catch(() => Effect.void)
+            )
+          )
         )
 
       const resetEngine = (reason: string, mode?: { readonly failure: boolean }): Effect.Effect<void> =>
@@ -506,18 +558,28 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
             // its first serve has nothing to re-establish; the next engine serves it as is.
             if (client.served && client.rpcPort !== undefined) {
               // Reattach carries the reset cause because closing the RPC port loses it.
-              reattach.push(post(client.controlPort, {
-                _tag: "Reattach",
-                ownerId: engine.ownerId,
-                ...(mode?.failure === true ? { reason } : {})
-              }))
+              if (mode?.failure === true) {
+                reattach.push(post(client.controlPort, {
+                  _tag: "Reattach",
+                  ownerId: engine.ownerId,
+                  reason
+                }))
+              } else {
+                reattach.push(post(client.controlPort, {
+                  _tag: "Reattach",
+                  ownerId: engine.ownerId
+                }))
+              }
             }
             client.served = false
           }
           return Effect.logInfo("replica owner engine reset").pipe(
             Effect.annotateLogs({ reason, epoch: engine.epoch, ownerId: engine.ownerId }),
             Effect.andThen(Effect.forEach(reattach, (effect) => effect, { discard: true })),
-            Effect.andThen(mode?.failure === true ? noteEngineFailure() : Effect.void),
+            Effect.andThen(Effect.suspend(() => {
+              if (mode?.failure === true) return noteEngineFailure()
+              return Effect.void
+            })),
             Effect.andThen(
               disposeEngine(engine, Exit.void).pipe(
                 Effect.andThen(Queue.offer(events, { _tag: "EngineDisposed", epoch: engine.epoch })),
@@ -576,16 +638,15 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                         ok: Option.isSome(result)
                       })
                     ),
-                    Effect.catchCause((cause) =>
-                      Cause.hasInterruptsOnly(cause)
-                        ? Effect.failCause(cause)
-                        : Queue.offer(events, {
-                          _tag: "AttachVerified",
-                          controlPort: event.controlPort,
-                          epoch: engine.epoch,
-                          ok: false
-                        })
-                    ),
+                    Effect.catchCause((cause) => {
+                      if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
+                      return Queue.offer(events, {
+                        _tag: "AttachVerified",
+                        controlPort: event.controlPort,
+                        epoch: engine.epoch,
+                        ok: false
+                      })
+                    }),
                     Effect.forkIn(layerScope),
                     Effect.asVoid
                   )
@@ -612,7 +673,8 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                       Effect.asVoid
                     )
                   }
-                  return wasCandidate ? kickProvisioning : Effect.void
+                  if (wasCandidate) return kickProvisioning
+                  return Effect.void
                 }
                 case "Provision": {
                   if (
@@ -768,18 +830,18 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
                 health.probeStartedAt = now
                 health.warned = false
                 return provideRuntime(engine.runtime, healthProbe).pipe(
-                  Effect.flatMap((result) =>
-                    Option.isSome(result)
-                      ? Queue.offer(events, { _tag: "HealthProbeSettled", epoch: engine.epoch })
-                      : Queue.offer(events, { _tag: "HealthFailed", epoch: engine.epoch })
-                  ),
+                  Effect.flatMap((result) => {
+                    if (Option.isSome(result)) {
+                      return Queue.offer(events, { _tag: "HealthProbeSettled", epoch: engine.epoch })
+                    }
+                    return Queue.offer(events, { _tag: "HealthFailed", epoch: engine.epoch })
+                  }),
                   // A failed or defecting database round trip means the database worker is gone or
                   // broken; both are takeover conditions. Interruption passes through untouched.
-                  Effect.catchCause((cause) =>
-                    Cause.hasInterruptsOnly(cause)
-                      ? Effect.failCause(cause)
-                      : Queue.offer(events, { _tag: "HealthFailed", epoch: engine.epoch })
-                  ),
+                  Effect.catchCause((cause) => {
+                    if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
+                    return Queue.offer(events, { _tag: "HealthFailed", epoch: engine.epoch })
+                  }),
                   Effect.forkIn(layerScope),
                   Effect.asVoid
                 )
@@ -846,15 +908,15 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
               )
             }
           }
+          return Effect.void
         })
 
       yield* Queue.take(events).pipe(
         Effect.flatMap(handle),
-        Effect.catchCause((cause) =>
-          Cause.hasInterruptsOnly(cause)
-            ? Effect.failCause(cause)
-            : Effect.logError("ownership coordinator event failed", cause)
-        ),
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
+          return Effect.logError("ownership coordinator event failed", cause)
+        }),
         Effect.forever,
         Effect.forkIn(layerScope)
       )
@@ -864,21 +926,16 @@ export const layerSharedWorker = <E, A = unknown, E2 = never,>(
           Effect.sync(() => {
             controlPort.addEventListener("message", (event: MessageEvent<unknown>) => {
               let frame: OwnershipProtocol.PageToOwnerFrame
-              try {
-                frame = Schema.decodeUnknownSync(OwnershipProtocol.PageToOwnerFrame)(event.data)
-              } catch (cause) {
-                try {
-                  controlPort.postMessage(
-                    Schema.encodeSync(OwnershipProtocol.OwnerToPageFrame)({
-                      _tag: "OwnerError",
-                      message: `undecodable ownership frame: ${String(cause)}`.slice(0, 512)
-                    })
-                  )
-                } catch {
-                  // The peer is gone; nothing left to notify.
-                }
+              const decoded = Schema.decodeUnknownExit(OwnershipProtocol.PageToOwnerFrame)(event.data)
+              if (Exit.isFailure(decoded)) {
+                const response = Schema.encodeUnknownExit(OwnershipProtocol.OwnerToPageFrame)({
+                  _tag: "OwnerError",
+                  message: `undecodable ownership frame: ${String(decoded.cause)}`.slice(0, 512)
+                })
+                if (Exit.isSuccess(response)) safePostMessage(controlPort, response.value)
                 return
               }
+              frame = decoded.value
               Queue.offerUnsafe(events, { _tag: "Frame", controlPort, frame })
             })
             controlPort.start()
@@ -893,8 +950,9 @@ const firstConnectPort = (event: Event): MessagePort | undefined => {
   if (!("ports" in event)) return undefined
   const ports: unknown = event.ports
   if (typeof ports !== "object" || ports === null) return undefined
-  const first: unknown = Reflect.get(ports, 0)
-  return ReplicaRpc.isMessagePort(first) ? first : undefined
+  const first: unknown = runSyncSafe(() => Reflect.get(ports, 0), undefined)
+  if (ReplicaRpc.isMessagePort(first)) return first
+  return undefined
 }
 
 /**
@@ -924,26 +982,21 @@ export const runSharedWorker = <E, A = unknown, E2 = never,>(
     if (startupFailure !== undefined) {
       const failure = startupFailure
       for (const controlPort of pending.splice(0)) {
-        try {
-          controlPort.postMessage(
-            Schema.encodeSync(OwnershipProtocol.OwnerToPageFrame)({
-              _tag: "OwnerError",
-              message: failure.message,
-              reason: { _tag: "RuntimeLoadFailure", message: failure.message, name: failure.name }
-            })
-          )
-        } catch {
-          // The peer is gone; nothing left to notify.
-        }
-        controlPort.close()
+        const response = Schema.encodeUnknownExit(OwnershipProtocol.OwnerToPageFrame)({
+          _tag: "OwnerError",
+          message: failure.message,
+          reason: { _tag: "RuntimeLoadFailure", message: failure.message, name: failure.name }
+        })
+        if (Exit.isSuccess(response)) safePostMessage(controlPort, response.value)
+        safeCall(() => controlPort.close())
       }
     }
   }
   let coordinatorRuntime: ManagedRuntime.ManagedRuntime<OwnershipCoordinator, unknown> | undefined
-  const describe = (cause: unknown) =>
-    cause instanceof Error
-      ? { message: cause.message, name: cause.name }
-      : { message: String(cause), name: "UnknownError" }
+  const describe = (cause: unknown) => {
+    if (cause instanceof Error) return { message: cause.message, name: cause.name }
+    return { message: String(cause), name: "UnknownError" }
+  }
   globalThis.addEventListener("connect", (event) => {
     const controlPort = firstConnectPort(event)
     if (controlPort === undefined) return
@@ -1013,7 +1066,7 @@ export const layerTab = <A = unknown,>(
 ): Layer.Layer<Worker.WorkerPlatform | Worker.Spawner> => layerTabImpl(options)
 
 const layerTabImpl = (
-  options: TabOptions<unknown>
+  options: TabOptions
 ): Layer.Layer<Worker.WorkerPlatform | Worker.Spawner> => {
   const spawner = Layer.effect(
     Worker.Spawner,
@@ -1037,16 +1090,16 @@ const layerTabImpl = (
           // The ready frame comes first on purpose: a run still waiting for its initial ready
           // latch never observes an error event, so it must be released into the failure rather
           // than left hanging on the latch with its requests buffered.
-          port.dispatchEvent(new MessageEvent("message", { data: [0] }))
-          port.dispatchEvent(new ErrorEvent("error", { message }))
+          safeCall(() => port.dispatchEvent(new MessageEvent("message", { data: [0] })))
+          safeCall(() => port.dispatchEvent(new ErrorEvent("error", { message })))
         }
       }
 
       const postFrame = (current: Connection, frame: OwnershipProtocol.PageToOwnerFrame) => {
-        current.controlPort.postMessage(
-          Schema.encodeSync(OwnershipProtocol.PageToOwnerFrame)(frame),
-          [...OwnershipProtocol.transferOf(frame)]
-        )
+        runSyncSafe(() => {
+          const encoded = Schema.encodeSync(OwnershipProtocol.PageToOwnerFrame)(frame)
+          safePostMessage(current.controlPort, encoded, OwnershipProtocol.transferOf(frame))
+        }, undefined)
       }
 
       const teardown = (current: Connection, message: string | undefined) => {
@@ -1056,19 +1109,15 @@ const layerTabImpl = (
         // never reach the worker protocol's listeners, and the connection must already read as
         // cleared when the protocol reacts and reconnects.
         if (message !== undefined) failRpcPorts(current, message)
-        current.controlPort.removeEventListener("message", current.onMessage)
-        current.worker.removeEventListener("error", current.onWorkerError)
-        try {
-          postFrame(current, { _tag: "Detach" })
-        } catch {
-          // The owner is gone; nothing left to notify.
-        }
-        current.controlPort.close()
-        current.provisioning?.worker.terminate()
+        safeCall(() => current.controlPort.removeEventListener("message", current.onMessage))
+        safeCall(() => current.worker.removeEventListener("error", current.onWorkerError))
+        postFrame(current, { _tag: "Detach" })
+        safeCall(() => current.controlPort.close())
+        safeCall(() => current.provisioning?.worker.terminate())
         current.provisioning = undefined
-        current.databaseWorker?.terminate()
+        safeCall(() => current.databaseWorker?.terminate())
         current.databaseWorker = undefined
-        for (const port of current.rpcPorts.values()) port.close()
+        for (const port of current.rpcPorts.values()) safeCall(() => port.close())
         current.rpcPorts.clear()
       }
 
@@ -1076,18 +1125,20 @@ const layerTabImpl = (
         switch (frame._tag) {
           case "Attached": {
             let info: unknown
-            try {
-              info = options.infoSchema !== undefined
-                ? Schema.decodeUnknownSync(options.infoSchema)(frame.info)
-                : frame.info
-            } catch (cause) {
-              options.onOwnerError?.(`undecodable ownership info: ${String(cause)}`.slice(0, 512))
-              return
+            if (options.infoSchema === undefined) {
+              info = frame.info
+            } else {
+              const decoded = Schema.decodeUnknownExit(options.infoSchema)(frame.info)
+              if (Exit.isFailure(decoded)) {
+                options.onOwnerError?.(`undecodable ownership info: ${String(decoded.cause)}`.slice(0, 512))
+                return
+              }
+              info = decoded.value
             }
             if (!frame.provider && current.provisioning === undefined && current.databaseWorker !== undefined) {
               // The current engine is provided by another tab, so any database worker this tab
               // still runs belongs to a dead engine epoch.
-              current.databaseWorker.terminate()
+              safeCall(() => current.databaseWorker?.terminate())
               current.databaseWorker = undefined
             }
             options.onAttached?.({ ownerId: frame.ownerId, provider: frame.provider, info })
@@ -1098,23 +1149,35 @@ const layerTabImpl = (
             // A new provision request means the coordinator reset the owner: the previous epoch's
             // database worker must go before its replacement starts, or both race the same OPFS
             // handle.
-            current.databaseWorker?.terminate()
+            safeCall(() => current.databaseWorker?.terminate())
             current.databaseWorker = undefined
-            let database: globalThis.Worker
-            try {
-              database = options.databaseWorker()
-            } catch (cause) {
-              options.onOwnerError?.(`replica database worker failed to start: ${String(cause)}`.slice(0, 512))
+            const databaseExit = Effect.runSyncExit(Effect.try({
+              try: options.databaseWorker,
+              catch: (cause) => cause
+            }))
+            if (Exit.isFailure(databaseExit)) {
+              options.onOwnerError?.(
+                `replica database worker failed to start: ${String(databaseExit.cause)}`.slice(0, 512)
+              )
               return
             }
+            const database = databaseExit.value
             const channel = new MessageChannel()
-            database.postMessage(
-              Schema.encodeSync(OwnershipProtocol.DatabaseWorkerStart)({
+            const posted = runSyncSafe(() => {
+              const encoded = Schema.encodeSync(OwnershipProtocol.DatabaseWorkerStart)({
                 _tag: "DatabaseWorkerStart",
                 databasePort: channel.port1
-              }),
-              [channel.port1]
-            )
+              })
+              database.postMessage(encoded, [channel.port1])
+              return true
+            }, false)
+            if (!posted) {
+              safeCall(() => channel.port1.close())
+              safeCall(() => channel.port2.close())
+              safeCall(() => database.terminate())
+              options.onOwnerError?.("replica database worker failed to receive its start frame")
+              return
+            }
             current.provisioning = { nonce: frame.nonce, worker: database }
             current.databaseWorker = database
             postFrame(current, { _tag: "Provision", nonce: frame.nonce, databasePort: channel.port2 })
@@ -1129,7 +1192,7 @@ const layerTabImpl = (
               const worker = current.provisioning.worker
               current.provisioning = undefined
               current.databaseWorker = undefined
-              worker.terminate()
+              safeCall(() => worker.terminate())
               failRpcPorts(current, "replica provisioning was rejected")
             }
             return
@@ -1162,18 +1225,17 @@ const layerTabImpl = (
           provisioning: undefined,
           databaseWorker: undefined,
           onMessage: (event: MessageEvent<unknown>) => {
-            let frame: OwnershipProtocol.OwnerToPageFrame
-            try {
-              frame = Schema.decodeUnknownSync(OwnershipProtocol.OwnerToPageFrame)(event.data)
-            } catch (cause) {
-              options.onOwnerError?.(`undecodable ownership frame: ${String(cause)}`.slice(0, 512))
+            const decoded = Schema.decodeUnknownExit(OwnershipProtocol.OwnerToPageFrame)(event.data)
+            if (Exit.isFailure(decoded)) {
+              options.onOwnerError?.(`undecodable ownership frame: ${String(decoded.cause)}`.slice(0, 512))
               return
             }
-            handleFrame(current, frame)
+            handleFrame(current, decoded.value)
           },
           onWorkerError: (event: Event) => {
             if (connection !== current) return
-            const message = event instanceof ErrorEvent ? event.message : "replica owner worker failed"
+            let message = "replica owner worker failed"
+            if (event instanceof ErrorEvent) message = event.message
             options.onOwnerError?.(message)
             teardown(current, message)
           }
@@ -1206,9 +1268,9 @@ const layerTabImpl = (
       )
 
       return (id: number): MessagePort => {
-        if (closed) throw new Error("the ownership tab connection is closed")
+        if (closed) return Effect.runSync(Effect.die(new Error("the ownership tab connection is closed")))
         const current = connection ?? establish()
-        current.rpcPorts.get(id)?.close()
+        safeCall(() => current.rpcPorts.get(id)?.close())
         const channel = new MessageChannel()
         current.rpcPorts.set(id, channel.port2)
         postFrame(current, {
@@ -1230,12 +1292,12 @@ const withDatabaseLock = <E,>(
   if (typeof navigator !== "undefined" && "locks" in navigator) {
     return Effect.callback<void, E>((resume, signal) => {
       navigator.locks.request(name, { signal }, () =>
-        new Promise<void>((resolve) => {
-          resume(Effect.onExit(effect, () => {
-            resolve()
+        Effect.runPromise(
+          Effect.onExit(effect, () => {
+            resume(Effect.void)
             return Effect.void
-          }))
-        })).catch((defect) => resume(Effect.die(defect)))
+          })
+        )).catch((defect) => resume(Effect.die(defect)))
     })
   }
   return effect
@@ -1264,14 +1326,13 @@ export const runDatabaseWorker = (
   const dbName = options.dbName ?? `${options.name}.sqlite`
   const lockName = options.lockName ?? `${options.name}-opfs`
   const start = (event: MessageEvent<unknown>) => {
-    let frame: OwnershipProtocol.DatabaseWorkerStart
-    try {
-      frame = Schema.decodeUnknownSync(OwnershipProtocol.DatabaseWorkerStart)(event.data)
-    } catch (cause) {
-      for (const port of event.ports) port.close()
-      globalThis.reportError(cause)
+    const decoded = Schema.decodeUnknownExit(OwnershipProtocol.DatabaseWorkerStart)(event.data)
+    if (Exit.isFailure(decoded)) {
+      for (const port of event.ports) safeCall(() => port.close())
+      globalThis.reportError(decoded.cause)
       return
     }
+    const frame = decoded.value
     frame.databasePort.start()
     Effect.runFork(
       withDatabaseLock(lockName, OpfsWorker.run({ port: frame.databasePort, dbName })).pipe(

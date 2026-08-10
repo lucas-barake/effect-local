@@ -30,8 +30,8 @@ const lookup = <A,>(
   name: string
 ): Effect.Effect<A, ReplicaError.ReplicaError> => {
   const value = values.get(name)
-  return value === undefined
-    ? Effect.fail(
+  if (value === undefined) {
+    return Effect.fail(
       new ReplicaError.ReplicaError({
         reason: new ReplicaError.ProtocolMismatch({
           expected: `known ${kind}`,
@@ -39,10 +39,11 @@ const lookup = <A,>(
         })
       })
     )
-    : Effect.succeed(value)
+  }
+  return Effect.succeed(value)
 }
 
-export const layerHandlers = (definition: ReplicaDefinition.Any) =>
+export const layerHandlers = (replicaDefinition: ReplicaDefinition.Any) =>
   ReplicaRpc.group.toLayer(Effect.gen(function*() {
     const replica = yield* Replica.Replica
     const sessions = yield* SessionManager.SessionManager
@@ -63,36 +64,38 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
       )
     )
     const documents = new Map<string, Document.Any>(
-      definition.documents.documents.map((document: Document.Any) => [document.name, document])
+      replicaDefinition.documents.documents.map((document: Document.Any) => [document.name, document])
     )
     const mutations = new Map<string, Mutation.Any>(
-      definition.mutations.map((mutation: Mutation.Any) => [mutation.name, mutation])
+      replicaDefinition.mutations.map((mutation: Mutation.Any) => [mutation.name, mutation])
     )
     const queries = new Map<string, Query.Any>(
-      definition.queries.map((query: Query.Any) => [query.name, query])
+      replicaDefinition.queries.map((query: Query.Any) => [query.name, query])
     )
-    const allInvalidationKeys = ReplicaDefinition.invalidationKeys(definition)
+    const allInvalidationKeys = ReplicaDefinition.invalidationKeys(replicaDefinition)
     return ReplicaRpc.group.of({
-      OpenSession: ({ definitionHash, protocolVersion, sessionId }, { client }) =>
-        protocolVersion === ReplicaRpc.protocolVersion && definitionHash === definition.hash
-          ? sessions.open(sessionId, client.id).pipe(Effect.as({
+      OpenSession: ({ definitionHash, protocolVersion, sessionId }, { client }) => {
+        if (protocolVersion === ReplicaRpc.protocolVersion && definitionHash === replicaDefinition.hash) {
+          return sessions.open(sessionId, client.id).pipe(Effect.as({
             leaseMillis: SessionManager.leaseDurationMillis,
             protocolVersion: ReplicaRpc.protocolVersion,
-            definitionHash: definition.hash,
+            definitionHash: replicaDefinition.hash,
             ownerEpoch,
             conflictLimits: sessions.conflictLimits,
             maxChunkBytes: sessions.maxChunkBytes,
             maxRestoreCoalesceMillis: sessions.maxRestoreCoalesceMillis,
             maxRestoreErrorBytes: sessions.maxRestoreErrorBytes
           }))
-          : Effect.fail(
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.ProtocolMismatch({
-                expected: `${ReplicaRpc.protocolVersion}:${definition.hash}`,
-                observed: `${protocolVersion ?? "missing"}:${definitionHash}`
-              })
+        }
+        return Effect.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: `${ReplicaRpc.protocolVersion}:${replicaDefinition.hash}`,
+              observed: `${protocolVersion ?? "missing"}:${definitionHash}`
             })
-          ),
+          })
+        )
+      },
       RenewSession: ({ sessionId }, { client }) =>
         sessions.renew(sessionId, client.id).pipe(Effect.as({ leaseMillis: SessionManager.leaseDurationMillis })),
       CloseSession: ({ sessionId }, { client }) => sessions.close(sessionId, client.id),
@@ -239,12 +242,12 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
                 Effect.flatMap((decoded) => replica.query(definition, decoded)),
                 Effect.matchEffect({
                   onSuccess: (result) => Wire.encode(definition.successSchema, result),
-                  onFailure: (error) =>
-                    Schema.is(ReplicaError.ReplicaError)(error)
-                      ? Effect.fail(error)
-                      : Wire.encode(definition.errorSchema, error).pipe(
-                        Effect.flatMap((encoded) => Effect.fail(new ReplicaRpc.ReplicaQueryError({ error: encoded })))
-                      )
+                  onFailure: (error) => {
+                    if (Schema.is(ReplicaError.ReplicaError)(error)) return Effect.fail(error)
+                    return Wire.encode(definition.errorSchema, error).pipe(
+                      Effect.flatMap((encoded) => Effect.fail(new ReplicaRpc.ReplicaQueryError({ error: encoded })))
+                    )
+                  }
                 })
               )
             )
@@ -338,9 +341,9 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
           replica.commandDeliveryChanges(commandId)
         ),
       Flush: ({ sessionId }, { client }) => sessions.run(sessionId, client.id, replica.flush),
-      Invalidations: ({ ownerEpoch: requestedEpoch, sessionId }, { client }) =>
-        requestedEpoch === ownerEpoch
-          ? sessions.stream(
+      Invalidations: ({ ownerEpoch: requestedEpoch, sessionId }, { client }) => {
+        if (requestedEpoch === ownerEpoch) {
+          return sessions.stream(
             sessionId,
             client.id,
             Effect.all([commits.subscribe, deliveries.subscribe]).pipe(
@@ -356,32 +359,34 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
                   Stream.concat(
                     Stream.merge(
                       commitSubscription.events.pipe(
-                        Stream.map((event): ReplicaRpc.InvalidationMessage =>
-                          event._tag === "Commit"
-                            ? {
+                        Stream.map((event): ReplicaRpc.InvalidationMessage => {
+                          if (event._tag === "Commit") {
+                            return {
                               _tag: "Invalidation",
                               ownerEpoch,
                               sequence: event.commitSequence,
                               keys: event.keys
                             }
-                            : { _tag: "FullRefreshRequired", ownerEpoch, keys: allInvalidationKeys }
-                        )
+                          }
+                          return { _tag: "FullRefreshRequired", ownerEpoch, keys: allInvalidationKeys }
+                        })
                       ),
                       deliverySubscription.events.pipe(
-                        Stream.map((event): ReplicaRpc.InvalidationMessage =>
-                          event._tag === "Delivery"
-                            ? {
+                        Stream.map((event): ReplicaRpc.InvalidationMessage => {
+                          if (event._tag === "Delivery") {
+                            return {
                               _tag: "DeliveryInvalidation",
                               ownerEpoch,
                               sequence: event.sequence,
                               keys: [ReplicaRpc.commandDeliveryInvalidationKey]
                             }
-                            : {
-                              _tag: "DeliveryFullRefreshRequired",
-                              ownerEpoch,
-                              keys: [ReplicaRpc.commandDeliveryInvalidationKey]
-                            }
-                        )
+                          }
+                          return {
+                            _tag: "DeliveryFullRefreshRequired",
+                            ownerEpoch,
+                            keys: [ReplicaRpc.commandDeliveryInvalidationKey]
+                          }
+                        })
                       )
                     )
                   )
@@ -391,14 +396,16 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
               Stream.scoped
             )
           )
-          : Stream.fail(
-            new ReplicaError.ReplicaError({
-              reason: new ReplicaError.ProtocolMismatch({
-                expected: ownerEpoch,
-                observed: requestedEpoch
-              })
+        }
+        return Stream.fail(
+          new ReplicaError.ReplicaError({
+            reason: new ReplicaError.ProtocolMismatch({
+              expected: ownerEpoch,
+              observed: requestedEpoch
             })
-          ),
+          })
+        )
+      },
       Status: ({ sessionId }, { client }) => sessions.stream(sessionId, client.id, replica.status),
       PeerConnectionStatus: ({ peerId, sessionId }, { client }) =>
         sessions.stream(
@@ -476,9 +483,9 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
         { client }
       ) =>
         Backup.validateMaxBytes(options.maxBytes).pipe(
-          Effect.flatMap((validatedMaxBytes) =>
-            options.mode === "document"
-              ? lookup(documents, "document", options.document).pipe(
+          Effect.flatMap((validatedMaxBytes) => {
+            if (options.mode === "document") {
+              return lookup(documents, "document", options.document).pipe(
                 Effect.flatMap((document) =>
                   restoreTransport.begin({
                     sessionId: options.sessionId,
@@ -492,15 +499,16 @@ export const layerHandlers = (definition: ReplicaDefinition.Any) =>
                   })
                 )
               )
-              : restoreTransport.begin({
-                sessionId: options.sessionId,
-                clientId: client.id,
-                mode: options.mode,
-                maxBytes: validatedMaxBytes,
-                expectedDefinitionHash: options.expectedDefinitionHash,
-                installationId: options.installationId
-              })
-          )
+            }
+            return restoreTransport.begin({
+              sessionId: options.sessionId,
+              clientId: client.id,
+              mode: options.mode,
+              maxBytes: validatedMaxBytes,
+              expectedDefinitionHash: options.expectedDefinitionHash,
+              installationId: options.installationId
+            })
+          })
         ),
       FinishRestoreBackup: ({ nonce, sessionId }, { client }) =>
         restoreTransport.finish({

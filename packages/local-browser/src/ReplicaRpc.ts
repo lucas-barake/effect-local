@@ -6,6 +6,8 @@ import * as Conflict from "@lucas-barake/effect-local/Conflict"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Schema from "effect/Schema"
 import { Rpc, RpcGroup } from "effect/unstable/rpc"
 import * as Transferable from "effect/unstable/workers/Transferable"
@@ -84,17 +86,21 @@ export type SessionHandshake = typeof SessionHandshake.Type
 
 export const isMessagePort = (input: unknown): input is MessagePort => {
   if (typeof input !== "object" || input === null) return false
-  try {
-    return (
-      typeof Reflect.get(input, "postMessage") === "function" &&
-      typeof Reflect.get(input, "addEventListener") === "function" &&
-      typeof Reflect.get(input, "removeEventListener") === "function" &&
-      typeof Reflect.get(input, "start") === "function" &&
-      typeof Reflect.get(input, "close") === "function"
-    )
-  } catch {
-    return false
-  }
+  const checked = Effect.runSyncExit(Effect.try({
+    try: () => {
+      const method = (name: string): unknown => Reflect.get(input, name)
+      return (
+        typeof method("postMessage") === "function" &&
+        typeof method("addEventListener") === "function" &&
+        typeof method("removeEventListener") === "function" &&
+        typeof method("start") === "function" &&
+        typeof method("close") === "function"
+      )
+    },
+    catch: () => false
+  }))
+  if (Exit.isSuccess(checked)) return checked.value
+  return false
 }
 
 export const MessagePortSchema = Transferable.schema(

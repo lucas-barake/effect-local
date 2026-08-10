@@ -89,10 +89,18 @@ export const make = <A,>(schema: Schema.Decoder<A>, options: { readonly timeToLi
           )
           const expiresAtMillis = (yield* Clock.currentTimeMillis) + timeToLiveMillis
           const supersededBy = yield* Ref.modify(entries, (current) => {
-            if (claimed.admitted > token) return [claimed.admitted, current] as const
+            if (claimed.admitted > token) {
+              return [claimed.admitted, current] satisfies readonly [
+                number,
+                Map<Identity.PeerId, Entry<A> & { readonly token: number }>
+              ]
+            }
             current.set(peerId, { peerId, value: decoded, expiresAtMillis, identity: "transport-peer", token })
             claimed.admitted = token
-            return [undefined, current] as const
+            return [undefined, current] satisfies readonly [
+              undefined,
+              Map<Identity.PeerId, Entry<A> & { readonly token: number }>
+            ]
           })
           if (supersededBy !== undefined) {
             yield* Effect.logDebug("presence write superseded by a newer publication").pipe(

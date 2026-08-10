@@ -1,5 +1,7 @@
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Schema from "effect/Schema"
 import * as SchemaGetter from "effect/SchemaGetter"
 
@@ -20,6 +22,12 @@ export const BoundedErrorDescription = Schema.Struct({
 export type BoundedErrorDescription = typeof BoundedErrorDescription.Type
 
 export const maxPageStagingBytes = 64 * 1024
+
+const runSyncSafe = <A,>(thunk: () => A, fallback: A): A => {
+  const exit = Effect.runSyncExit(Effect.try({ try: thunk, catch: () => fallback }))
+  if (Exit.isSuccess(exit)) return exit.value
+  return fallback
+}
 
 // The single source of truth for the wire error union. `Schema.TaggedUnion` builds one
 // `Schema.TaggedStruct` per key, in key order, so this is exactly the union that used to be spelled
@@ -278,11 +286,11 @@ export const encodeDefect = (defect: unknown, maxBytes: number): BoundedErrorDes
     Math.max(0, maxBytes - payloadStringBytes(emptyErrorDescription))
   )
 
-export const decodeDefect = (description: BoundedErrorDescription): Error => {
-  const error = new Error(description.message)
-  error.name = description.name
-  return error
-}
+export const decodeDefect = (description: BoundedErrorDescription) => ({
+  _tag: "RestoreDefect",
+  name: description.name,
+  message: description.message
+})
 
 const bounded = (value: string, maxBytes: number) => truncateUtf8(value, maxBytes)
 
@@ -297,11 +305,11 @@ const encodeWithinBudget = (
   encode: (budget: ErrorBudget) => RestoreWireError
 ): RestoreWireError => {
   if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
-    throw new RangeError("maxBytes must be a positive safe integer")
+    return empty
   }
   const fixedBytes = payloadStringBytes(empty)
   if (fixedBytes > maxBytes) {
-    throw new RangeError("maxBytes cannot preserve the restore error shape")
+    return empty
   }
   let remaining = maxBytes - fixedBytes
   const text = (value: string): string => {
@@ -316,7 +324,7 @@ const encodeWithinBudget = (
   }
   const encoded = encode({ text, defect })
   if (!preflight(encoded, maxBytes)) {
-    throw new RangeError("encoded restore error exceeds maxBytes")
+    return empty
   }
   return encoded
 }
@@ -552,11 +560,17 @@ export const encodeReplicaError = (
           const local = text(reason.localLineage)
           const remote = text(reason.remoteLineage)
           const preserved = local === reason.localLineage && remote === reason.remoteLineage
+          let localLineage = Identity.genesisLineage
+          let remoteLineage = Identity.genesisLineage
+          if (preserved) {
+            localLineage = reason.localLineage
+            remoteLineage = reason.remoteLineage
+          }
           return {
             _tag: reason._tag,
             documentId: reason.documentId,
-            localLineage: preserved ? reason.localLineage : Identity.genesisLineage,
-            remoteLineage: preserved ? reason.remoteLineage : Identity.genesisLineage
+            localLineage,
+            remoteLineage
           }
         }
       )
@@ -569,6 +583,12 @@ export const encodeReplicaError = (
           documentId: reason.documentId,
           reason: text(reason.reason)
         })
+      )
+    default:
+      return encodeWithinBudget(
+        maxBytes,
+        { _tag: "ProtocolMismatch", expected: "", observed: "" },
+        () => ({ _tag: "ProtocolMismatch", expected: "", observed: "" })
       )
   }
 }
@@ -735,29 +755,32 @@ const RedactedRestoreDefect = Schema.Struct({
 
 export const RestoreResultDefect = Schema.Unknown.pipe(
   Schema.encodeTo(RedactedRestoreDefect, {
-    decode: SchemaGetter.transform(() => new Error("Restore failure details redacted")),
-    encode: SchemaGetter.transform(() => ({ _tag: "RestoreDefect" as const }))
+    decode: SchemaGetter.transform(() => ({
+      _tag: "RestoreDefect",
+      name: "RestoreDefect",
+      message: "Restore failure details redacted"
+    })),
+    encode: SchemaGetter.transform(() => ({ _tag: "RestoreDefect" }))
   })
 )
 
 const ownExactProperties = (
   input: unknown,
-  fields: ReadonlySet<string>
+  fieldNames: ReadonlySet<string>
 ): ReadonlyMap<string, unknown> | undefined => {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) return undefined
-  try {
+  return runSyncSafe(() => {
+    if (typeof input !== "object" || input === null || Array.isArray(input)) return undefined
     const properties = new Map<string, unknown>()
     for (const key in input) {
       if (!Object.prototype.hasOwnProperty.call(input, key)) continue
-      if (properties.size >= fields.size || !fields.has(key)) return undefined
+      if (properties.size >= fieldNames.size || !fieldNames.has(key)) return undefined
       const descriptor = Object.getOwnPropertyDescriptor(input, key)
       if (descriptor === undefined || !("value" in descriptor)) return undefined
       properties.set(key, descriptor.value)
     }
-    return properties.size === fields.size ? properties : undefined
-  } catch {
-    return undefined
-  }
+    if (properties.size !== fieldNames.size) return undefined
+    return properties
+  }, undefined)
 }
 
 const preflightBoundedErrorDescription = (
@@ -773,22 +796,19 @@ export const preflightReplicaError = (
   input: unknown,
   maxStringBytes: number
 ): boolean => {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) return false
-  let tag: unknown
-  try {
-    tag = Reflect.get(input, "_tag")
-  } catch {
-    return false
-  }
-  if (typeof tag !== "string") return false
-  const fields = restoreWireErrorFields[tag]
-  if (fields === undefined) return false
-  const properties = ownExactProperties(input, fields)
-  if (properties === undefined) return false
-  if (properties.has("cause") && !preflightBoundedErrorDescription(properties.get("cause"))) {
-    return false
-  }
-  return preflightPayload(input, maxStringBytes)
+  return runSyncSafe(() => {
+    if (typeof input !== "object" || input === null || Array.isArray(input)) return false
+    const tag = Reflect.get(input, "_tag")
+    if (typeof tag !== "string") return false
+    const errorFields = restoreWireErrorFields[tag]
+    if (errorFields === undefined) return false
+    const properties = ownExactProperties(input, errorFields)
+    if (properties === undefined) return false
+    if (properties.has("cause") && !preflightBoundedErrorDescription(properties.get("cause"))) {
+      return false
+    }
+    return preflightPayload(input, maxStringBytes)
+  }, false)
 }
 
 const preflightPayload = (
@@ -797,79 +817,72 @@ const preflightPayload = (
 ): boolean => {
   const pending: Array<readonly [unknown, number]> = [[input, 0]]
   const seen = new Set<object>()
-  const encoder = new TextEncoder()
+  const textEncoder = new TextEncoder()
   let nodes = 0
   let stringBytes = 0
-  try {
-    while (pending.length > 0) {
-      const [value, depth] = pending.pop()!
-      nodes += 1
-      if (nodes > 64 || depth > 8) return false
-      if (typeof value === "string") {
-        const remaining = maxStringBytes - stringBytes
-        if (value.length > remaining) return false
-        stringBytes += encoder.encode(value).byteLength
-        if (stringBytes > maxStringBytes) return false
-      } else if (
-        value === null ||
-        value === undefined ||
-        typeof value === "boolean" ||
-        typeof value === "number" ||
-        typeof value === "bigint"
-      ) {
-        continue
-      } else if (
-        value instanceof ArrayBuffer ||
-        (typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer) ||
-        ArrayBuffer.isView(value)
-      ) {
-        continue
-      } else if (typeof value !== "object" || seen.has(value)) {
-        return false
+  while (pending.length > 0) {
+    const [value, depth] = pending.pop()!
+    nodes += 1
+    if (nodes > 64 || depth > 8) return false
+    if (typeof value === "string") {
+      const remaining = maxStringBytes - stringBytes
+      if (value.length > remaining) return false
+      stringBytes += textEncoder.encode(value).byteLength
+      if (stringBytes > maxStringBytes) return false
+    } else if (
+      value === null ||
+      value === undefined ||
+      typeof value === "boolean" ||
+      typeof value === "number" ||
+      typeof value === "bigint"
+    ) {
+      continue
+    } else if (
+      value instanceof ArrayBuffer ||
+      (typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer) ||
+      ArrayBuffer.isView(value)
+    ) {
+      continue
+    } else if (typeof value !== "object" || seen.has(value)) {
+      return false
+    } else {
+      seen.add(value)
+      if (Array.isArray(value)) {
+        if (value.length > 32) return false
+        for (let index = 0; index < value.length; index++) {
+          pending.push([Reflect.get(value, index), depth + 1])
+        }
       } else {
-        seen.add(value)
-        if (Array.isArray(value)) {
-          if (value.length > 32) return false
-          for (let index = 0; index < value.length; index++) {
-            pending.push([Reflect.get(value, index), depth + 1])
-          }
-        } else {
-          let propertyCount = 0
-          for (const key in value) {
-            if (!Object.prototype.hasOwnProperty.call(value, key)) continue
-            propertyCount += 1
-            if (propertyCount > 16) return false
-            const remaining = maxStringBytes - stringBytes
-            if (key.length > remaining) return false
-            stringBytes += encoder.encode(key).byteLength
-            if (stringBytes > maxStringBytes) return false
-            const descriptor = Object.getOwnPropertyDescriptor(value, key)
-            if (descriptor === undefined || !("value" in descriptor)) return false
-            pending.push([descriptor.value, depth + 1])
-          }
+        let propertyCount = 0
+        for (const key in value) {
+          if (!Object.prototype.hasOwnProperty.call(value, key)) continue
+          propertyCount += 1
+          if (propertyCount > 16) return false
+          const remaining = maxStringBytes - stringBytes
+          if (key.length > remaining) return false
+          stringBytes += textEncoder.encode(key).byteLength
+          if (stringBytes > maxStringBytes) return false
+          const descriptor = Object.getOwnPropertyDescriptor(value, key)
+          if (descriptor === undefined || !("value" in descriptor)) return false
+          pending.push([descriptor.value, depth + 1])
         }
       }
     }
-    return true
-  } catch {
-    return false
   }
+  return true
 }
 
 export const preflight = (
   input: unknown,
   maxStringBytes: number
 ): boolean => {
-  if (typeof input === "object" && input !== null && !Array.isArray(input)) {
-    let tag: unknown
-    try {
-      tag = Reflect.get(input, "_tag")
-    } catch {
-      return false
+  return runSyncSafe(() => {
+    if (typeof input === "object" && input !== null && !Array.isArray(input)) {
+      const tag = Reflect.get(input, "_tag")
+      if (typeof tag === "string" && restoreWireErrorFields[tag] !== undefined) {
+        return preflightReplicaError(input, maxStringBytes)
+      }
     }
-    if (typeof tag === "string" && restoreWireErrorFields[tag] !== undefined) {
-      return preflightReplicaError(input, maxStringBytes)
-    }
-  }
-  return preflightPayload(input, maxStringBytes)
+    return preflightPayload(input, maxStringBytes)
+  }, false)
 }

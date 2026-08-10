@@ -91,5 +91,8 @@ export type DatabaseWorkerStart = typeof DatabaseWorkerStart.Type
  * Frames that carry a transferred port are posted with the port in the transfer list. Every other
  * frame travels as a plain structured clone.
  */
-export const transferOf = (frame: PageToOwnerFrame): ReadonlyArray<Transferable> =>
-  frame._tag === "Attach" ? [frame.rpcPort] : frame._tag === "Provision" ? [frame.databasePort] : []
+export const transferOf = (frame: PageToOwnerFrame): ReadonlyArray<Transferable> => {
+  if (frame._tag === "Attach") return [frame.rpcPort]
+  if (frame._tag === "Provision") return [frame.databasePort]
+  return []
+}

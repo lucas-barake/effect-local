@@ -25,6 +25,7 @@ import * as Option from "effect/Option"
 import * as PubSub from "effect/PubSub"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
+import * as Result from "effect/Result"
 import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
@@ -69,10 +70,22 @@ export interface Options {
 export const defaultSessionTimeout: Duration.Duration = Duration.seconds(10)
 export const defaultOperationTimeout: Duration.Duration = Duration.seconds(30)
 
+const runSyncSafe = <A,>(thunk: () => A, fallback: A): A => {
+  const exit = Effect.runSyncExit(Effect.try({ try: thunk, catch: () => fallback }))
+  if (Exit.isSuccess(exit)) return exit.value
+  return fallback
+}
+
 class RestoreBackupError extends Schema.TaggedErrorClass<RestoreBackupError>(
   "@lucas-barake/effect-local-browser/ReplicaClient/RestoreBackupError"
 )("RestoreBackupError", {
   error: ReplicaError.ReplicaError
+}) {}
+
+class RestoreChannelError extends Schema.TaggedErrorClass<RestoreChannelError>(
+  "@lucas-barake/effect-local-browser/ReplicaClient/RestoreChannelError"
+)("RestoreChannelError", {
+  message: Schema.String
 }) {}
 
 const isAuthoritativeRestoreResult = (
@@ -93,10 +106,11 @@ const acceptedProtocolMismatch = (
   const reason = exit.cause.reasons[0]
   if (reason === undefined || !Cause.isFailReason(reason)) return undefined
   if (reason.error._tag === "RestoreBackupError") return undefined
-  return reason.error.reason._tag === "ProtocolMismatch" &&
-      reason.error.reason.expected === "active session"
-    ? reason.error
-    : undefined
+  if (
+    reason.error.reason._tag === "ProtocolMismatch" &&
+    reason.error.reason.expected === "active session"
+  ) return reason.error
+  return undefined
 }
 
 const protocolFailure = (observed: string) =>
@@ -130,12 +144,12 @@ const isValidConflictLimits = (
 
 const isNativeErrorNamed = (value: unknown, name: string): boolean => {
   if (typeof value !== "object" || value === null) return false
-  try {
-    return Object.prototype.toString.call(value) === "[object DOMException]" &&
-      Reflect.get(value, "name") === name
-  } catch {
-    return false
-  }
+  return runSyncSafe(
+    () =>
+      Object.prototype.toString.call(value) === "[object DOMException]" &&
+      Reflect.get(value, "name") === name,
+    false
+  )
 }
 
 const isDataCloneError = (value: unknown): boolean => isNativeErrorNamed(value, "DataCloneError")
@@ -144,8 +158,8 @@ const ownDataProperties = (
   value: object,
   maxProperties: number
 ): ReadonlyMap<string, unknown> | undefined => {
-  const properties = new Map<string, unknown>()
-  try {
+  return runSyncSafe(() => {
+    const properties = new Map<string, unknown>()
     for (const key in value) {
       if (!Object.prototype.hasOwnProperty.call(value, key)) continue
       if (properties.size >= maxProperties) return undefined
@@ -154,9 +168,7 @@ const ownDataProperties = (
       properties.set(key, descriptor.value)
     }
     return properties
-  } catch {
-    return undefined
-  }
+  }, undefined)
 }
 
 const preflightOwnerFrame = (value: unknown): boolean => {
@@ -171,8 +183,9 @@ const preflightOwnerFrame = (value: unknown): boolean => {
     tag.length > 32 ||
     typeof nonce !== "string" ||
     nonce.length > 64 ||
+    typeof sequence !== "number" ||
     !Number.isSafeInteger(sequence) ||
-    (sequence as number) < 0
+    sequence < 0
   ) return false
   const expectedFields = RestoreProtocol.ownerToPageFrameFields[tag]
   if (
@@ -199,6 +212,8 @@ const isTransientRpcClientError = (error: RpcClientError.RpcClientError) => {
     case "HttpError":
       return error.reason.kind === "TransportError"
     case "RpcClientDefect":
+      return false
+    default:
       return false
   }
 }
@@ -234,18 +249,17 @@ export const fromRpcClient = (
           (fiber) =>
             Fiber.join(fiber).pipe(
               Effect.timeoutOption(duration),
-              Effect.flatMap((result) =>
-                Option.isSome(result)
-                  ? Effect.succeed(result.value)
-                  : Effect.fail(
-                    new ReplicaError.ReplicaError({
-                      reason: new ReplicaError.OperationTimeout({
-                        operation,
-                        timeoutMillis: reportedMillis
-                      })
+              Effect.flatMap((result) => {
+                if (Option.isSome(result)) return Effect.succeed(result.value)
+                return Effect.fail(
+                  new ReplicaError.ReplicaError({
+                    reason: new ReplicaError.OperationTimeout({
+                      operation,
+                      timeoutMillis: reportedMillis
                     })
-                  )
-              )
+                  })
+                )
+              })
             ),
           Fiber.interrupt
         )
@@ -276,50 +290,60 @@ export const fromRpcClient = (
         // `cause` is the dispatch failure that sent us here, not the lookup's own. A lookup that
         // simply finds no receipt is the same ambiguity, and the useful half of the story is why the
         // first answer went missing.
-        const lookupOrFail = (cause: unknown) =>
+        const preserveCause = (
+          cause: Cause.Cause<ReplicaError.ReplicaError | RpcClientError.RpcClientError>
+        ): Effect.Effect<never, ReplicaError.ReplicaError> =>
+          Function.prototype.call.bind(Effect.failCause)(undefined, cause)
+        const lookupOrFail = (cause: unknown): Effect.Effect<A, ReplicaError.ReplicaError> =>
           restore(lookup.pipe(boundOperation(lookupOperation))).pipe(
             Effect.catchCause((lookupCause) => {
               if (Cause.hasInterrupts(lookupCause) || Cause.hasDies(lookupCause)) {
-                return Effect.failCause(lookupCause as Cause.Cause<never>)
+                return preserveCause(lookupCause)
               }
-              const reason = lookupCause.reasons.length === 1 ? lookupCause.reasons[0] : undefined
-              if (reason === undefined || !Cause.isFailReason(reason)) {
-                return Effect.failCause(lookupCause as Cause.Cause<never>)
+              if (lookupCause.reasons.length !== 1) {
+                return preserveCause(lookupCause)
               }
+              const failure = Cause.findFail(lookupCause)
+              if (Result.isFailure(failure)) return preserveCause(lookupCause)
+              const reason = failure.success
               if (Schema.is(RpcClientError.RpcClientError)(reason.error)) return ambiguous(cause)
               if (ReplicaError.isReplicaError(reason.error)) {
-                return reason.error.reason._tag === "OperationTimeout"
-                  ? ambiguous(cause)
-                  : Effect.fail(reason.error)
+                if (reason.error.reason._tag === "OperationTimeout") return ambiguous(cause)
+                return Effect.fail(reason.error)
               }
-              return Effect.failCause(lookupCause as Cause.Cause<never>)
+              return preserveCause(lookupCause)
             }),
-            Effect.flatMap((outcome) => outcome._tag === "OutcomeUnknown" ? ambiguous(cause) : Effect.succeed(outcome))
+            Effect.flatMap((outcome) => {
+              if (outcome._tag === "OutcomeUnknown") return ambiguous(cause)
+              return Effect.succeed(outcome)
+            })
           )
         return restore(dispatch.pipe(boundOperation(dispatchOperation))).pipe(
           Effect.catchCause((dispatchCause) => {
             if (Cause.hasInterrupts(dispatchCause) || Cause.hasDies(dispatchCause)) {
-              return Effect.failCause(dispatchCause as Cause.Cause<never>)
+              return preserveCause(dispatchCause)
             }
-            const reason = dispatchCause.reasons.length === 1 ? dispatchCause.reasons[0] : undefined
-            if (reason === undefined || !Cause.isFailReason(reason)) {
-              return Effect.failCause(dispatchCause as Cause.Cause<never>)
+            if (dispatchCause.reasons.length !== 1) {
+              return preserveCause(dispatchCause)
             }
+            const failure = Cause.findFail(dispatchCause)
+            if (Result.isFailure(failure)) return preserveCause(dispatchCause)
+            const reason = failure.success
             if (Schema.is(RpcClientError.RpcClientError)(reason.error)) {
               return lookupOrFail(reason.error)
             }
             if (ReplicaError.isReplicaError(reason.error)) {
-              return reason.error.reason._tag === "OperationTimeout"
-                ? lookupOrFail(reason.error)
-                : Effect.fail(reason.error)
+              if (reason.error.reason._tag === "OperationTimeout") return lookupOrFail(reason.error)
+              return Effect.fail(reason.error)
             }
-            return Effect.failCause(dispatchCause as Cause.Cause<never>)
+            return preserveCause(dispatchCause)
           }),
           // A postcommit publication failure can make the owner report ambiguity even though the
           // durable receipt is already visible. Look it up before reporting the outcome as unknown.
-          Effect.flatMap((outcome) =>
-            outcome._tag === "OutcomeUnknown" ? lookupOrFail(undefined) : Effect.succeed(outcome)
-          )
+          Effect.flatMap((outcome) => {
+            if (outcome._tag === "OutcomeUnknown") return lookupOrFail(undefined)
+            return Effect.succeed(outcome)
+          })
         )
       })
     }
@@ -396,8 +420,8 @@ export const fromRpcClient = (
     const newSession = makeSessionId.pipe(Effect.flatMap(openSession))
     const sessions = yield* Effect.acquireRelease(
       newSession.pipe(Effect.flatMap(SubscriptionRef.make)),
-      (sessions) =>
-        SubscriptionRef.get(sessions).pipe(
+      (sessionRef) =>
+        SubscriptionRef.get(sessionRef).pipe(
           Effect.flatMap((session) => Effect.ignore(closeSession(session.sessionId)))
         )
     )
@@ -462,36 +486,40 @@ export const fromRpcClient = (
       reopenAttempt(
         stale,
         Ref.get(replacementCandidate).pipe(
-          Effect.flatMap((candidate) =>
-            Option.isSome(candidate) && candidate.value.staleSessionId === stale.sessionId
-              ? Effect.succeed(candidate.value.candidateSessionId)
-              : makeSessionId.pipe(
-                Effect.tap((candidateSessionId) =>
-                  Ref.set(
-                    replacementCandidate,
-                    Option.some({
-                      staleSessionId: stale.sessionId,
-                      candidateSessionId
-                    })
-                  )
+          Effect.flatMap((candidate) => {
+            if (Option.isSome(candidate) && candidate.value.staleSessionId === stale.sessionId) {
+              return Effect.succeed(candidate.value.candidateSessionId)
+            }
+            return makeSessionId.pipe(
+              Effect.tap((candidateSessionId) =>
+                Ref.set(
+                  replacementCandidate,
+                  Option.some({
+                    staleSessionId: stale.sessionId,
+                    candidateSessionId
+                  })
                 )
               )
-          ),
+            )
+          }),
           Effect.flatMap((sessionId) => {
             const attempt = openSession(sessionId)
-            return retryTransient
-              ? attempt.pipe(Effect.retry({ schedule: Schedule.spaced("1 second"), while: isTransient }))
-              : attempt
+            if (retryTransient) {
+              return attempt.pipe(Effect.retry({ schedule: Schedule.spaced("1 second"), while: isTransient }))
+            }
+            return attempt
           })
         )
       ).pipe(
         Effect.tap(() =>
           Ref.update(
             replacementCandidate,
-            (candidate) =>
-              Option.isSome(candidate) && candidate.value.staleSessionId === stale.sessionId
-                ? Option.none()
-                : candidate
+            (candidate) => {
+              if (Option.isSome(candidate) && candidate.value.staleSessionId === stale.sessionId) {
+                return Option.none()
+              }
+              return candidate
+            }
           )
         )
       )
@@ -502,7 +530,7 @@ export const fromRpcClient = (
       use: (
         session: Session
       ) => Effect.Effect<A, E | ReplicaError.ReplicaError, R>,
-      options?: {
+      sessionOptions?: {
         readonly boundOperation?: boolean
         readonly replayAfterReopen?: boolean
         readonly replaceSession?: (
@@ -510,13 +538,16 @@ export const fromRpcClient = (
         ) => Effect.Effect<Session, ReplicaError.ReplicaError>
       }
     ) => {
-      const bounded = (session: Session) =>
-        options?.boundOperation === false ? use(session) : use(session).pipe(boundOperation(operation))
+      const bounded = (session: Session) => {
+        if (sessionOptions?.boundOperation === false) return use(session)
+        return use(session).pipe(boundOperation(operation))
+      }
       return SubscriptionRef.get(sessions).pipe(
         Effect.flatMap((session) =>
           bounded(session).pipe(
             Effect.catchCause((cause) => {
-              const reason = cause.reasons.length === 1 ? cause.reasons[0] : undefined
+              let reason: Cause.Cause<unknown>["reasons"][number] | undefined
+              if (cause.reasons.length === 1) reason = cause.reasons[0]
               if (
                 reason === undefined ||
                 !Cause.isFailReason(reason) ||
@@ -525,10 +556,11 @@ export const fromRpcClient = (
               ) {
                 return Effect.failCause(cause)
               }
-              const replaceSession = options?.replaceSession ?? reopen
-              return options?.replayAfterReopen === false
-                ? replaceSession(session).pipe(Effect.andThen(Effect.fail(reason.error)))
-                : replaceSession(session).pipe(Effect.flatMap(bounded))
+              const replaceSession = sessionOptions?.replaceSession ?? reopen
+              if (sessionOptions?.replayAfterReopen === false) {
+                return replaceSession(session).pipe(Effect.andThen(Effect.fail(reason.error)))
+              }
+              return replaceSession(session).pipe(Effect.flatMap(bounded))
             })
           )
         )
@@ -538,34 +570,36 @@ export const fromRpcClient = (
       use: (
         session: Session
       ) => Stream.Stream<A, E | ReplicaError.ReplicaError, R>,
-      replace: (stale: Session) => Effect.Effect<Session, ReplicaError.ReplicaError> = reopen,
+      replaceSession: (stale: Session) => Effect.Effect<Session, ReplicaError.ReplicaError> = reopen,
       emittedRef?: Ref.Ref<boolean>,
       pendingMismatchRef?: Ref.Ref<Option.Option<PendingStreamMismatch>>
     ) =>
       Stream.unwrap(Effect.gen(function*() {
-        const session = yield* SubscriptionRef.get(sessions)
-        const emitted = emittedRef === undefined ? yield* Ref.make(false) : emittedRef
+        const currentSession = yield* SubscriptionRef.get(sessions)
+        let emitted: Ref.Ref<boolean>
+        if (emittedRef === undefined) emitted = yield* Ref.make(false)
+        else emitted = emittedRef
         if (pendingMismatchRef !== undefined) {
           const pending = yield* Ref.get(pendingMismatchRef)
           if (Option.isSome(pending)) {
             return Stream.unwrap(
-              replace(pending.value.stale).pipe(
+              replaceSession(pending.value.stale).pipe(
                 Effect.andThen(Ref.set(pendingMismatchRef, Option.none())),
                 Effect.as(Stream.fail(pending.value.error))
               )
             )
           }
         }
-        const tracked = (session: Session) => use(session).pipe(Stream.tap(() => Ref.set(emitted, true)))
-        return tracked(session).pipe(
-          Stream.catchTag("ReplicaError", (error) =>
-            Schema.is(ReplicaError.ReplicaError)(error) && isActiveSessionMismatch(error)
-              ? Stream.unwrap(Effect.gen(function*() {
+        const tracked = (trackedSession: Session) => use(trackedSession).pipe(Stream.tap(() => Ref.set(emitted, true)))
+        return tracked(currentSession).pipe(
+          Stream.catchTag("ReplicaError", (error) => {
+            if (Schema.is(ReplicaError.ReplicaError)(error) && isActiveSessionMismatch(error)) {
+              return Stream.unwrap(Effect.gen(function*() {
                 const hasEmitted = yield* Ref.get(emitted)
                 if (hasEmitted && pendingMismatchRef !== undefined) {
-                  yield* Ref.set(pendingMismatchRef, Option.some({ stale: session, error }))
+                  yield* Ref.set(pendingMismatchRef, Option.some({ stale: currentSession, error }))
                 }
-                const next = yield* replace(session)
+                const next = yield* replaceSession(currentSession)
                 if (!hasEmitted) {
                   return tracked(next)
                 }
@@ -574,7 +608,9 @@ export const fromRpcClient = (
                 }
                 return Stream.fail(error)
               }))
-              : Stream.fail(error))
+            }
+            return Stream.fail(error)
+          })
         )
       })).pipe(Stream.interruptWhen(Deferred.await(pageHidden)))
     const retrySchedule = Schedule.spaced("1 second")
@@ -601,19 +637,21 @@ export const fromRpcClient = (
           Effect.catchReason(
             "ReplicaError",
             "ProtocolMismatch",
-            (reason, error) =>
-              reason.expected === "active session"
-                ? reopen(session).pipe(Effect.as(undefined))
-                : Effect.fail(error)
+            (reason, error) => {
+              if (reason.expected === "active session") return reopen(session).pipe(Effect.as(undefined))
+              return Effect.fail(error)
+            }
           )
         )
         if (renewed !== undefined && renewed.leaseMillis !== session.lease.leaseMillis) {
           yield* SubscriptionRef.updateSome(
             sessions,
-            (current) =>
-              current.sessionId === session.sessionId
-                ? Option.some({ ...session, lease: { ...session.lease, ...renewed } })
-                : Option.none()
+            (latestSession) => {
+              if (latestSession.sessionId === session.sessionId) {
+                return Option.some({ ...session, lease: { ...session.lease, ...renewed } })
+              }
+              return Option.none()
+            }
           )
         }
       }).pipe(Effect.forever),
@@ -656,21 +694,24 @@ export const fromRpcClient = (
         Stream.catchReason(
           "ReplicaError",
           "ProtocolMismatch",
-          (reason, error) =>
-            isActiveSessionMismatch(error) || reason.observed === session.lease.ownerEpoch
-              ? Stream.unwrap(reopen(session).pipe(Effect.map(invalidationsFor)))
-              : Stream.fail(error)
+          (reason, error) => {
+            if (isActiveSessionMismatch(error) || reason.observed === session.lease.ownerEpoch) {
+              return Stream.unwrap(reopen(session).pipe(Effect.map(invalidationsFor)))
+            }
+            return Stream.fail(error)
+          }
         )
       )
     const advanceWatermark = (
       observed: number | undefined,
       sequence: number
-    ): { readonly next: number; readonly emit: "skip" | "event" | "refresh" } =>
-      observed === undefined || sequence > observed + 1
-        ? { next: sequence, emit: "refresh" }
-        : sequence === observed + 1
-        ? { next: sequence, emit: "event" }
-        : { next: observed, emit: "skip" }
+    ): { readonly next: number; readonly emit: "skip" | "event" | "refresh" } => {
+      if (observed === undefined || sequence > observed + 1) {
+        return { next: sequence, emit: "refresh" }
+      }
+      if (sequence === observed + 1) return { next: sequence, emit: "event" }
+      return { next: observed, emit: "skip" }
+    }
     const invalidationMessages: Stream.Stream<
       ReplicaRpc.InvalidationMessage,
       ReplicaError.ReplicaError
@@ -728,13 +769,17 @@ export const fromRpcClient = (
             ]
           }
           if (event._tag === "InvalidationsReady") {
-            const commitRefresh = state.watermark === undefined
-              ? event.watermark > 0 || event.refreshGeneration > 0
-              : event.watermark !== state.watermark || event.refreshGeneration !== state.refreshGeneration
-            const deliveryRefresh = state.deliveryWatermark === undefined
-              ? event.deliveryWatermark > 0 || event.deliveryRefreshEpoch > 0
-              : event.deliveryWatermark !== state.deliveryWatermark ||
+            let commitRefresh = event.watermark > 0 || event.refreshGeneration > 0
+            if (state.watermark !== undefined) {
+              commitRefresh = event.watermark !== state.watermark || event.refreshGeneration !== state.refreshGeneration
+            }
+            let deliveryRefresh = event.deliveryWatermark > 0 || event.deliveryRefreshEpoch > 0
+            if (state.deliveryWatermark !== undefined) {
+              deliveryRefresh = event.deliveryWatermark !== state.deliveryWatermark ||
                 event.deliveryRefreshEpoch !== state.deliveryRefreshEpoch
+            }
+            const refreshKeys: Array<ReplicaRpc.Invalidation> = []
+            if (commitRefresh || deliveryRefresh) refreshKeys.push(fullRefresh(event.ownerEpoch))
             return [
               {
                 ...state,
@@ -743,7 +788,7 @@ export const fromRpcClient = (
                 deliveryWatermark: event.deliveryWatermark,
                 deliveryRefreshEpoch: event.deliveryRefreshEpoch
               },
-              commitRefresh || deliveryRefresh ? [fullRefresh(event.ownerEpoch)] : []
+              refreshKeys
             ]
           }
           if (event._tag === "FullRefreshRequired") {
@@ -758,16 +803,21 @@ export const fromRpcClient = (
           }
           if (event._tag === "Invalidation") {
             const advanced = advanceWatermark(state.watermark, event.sequence)
+            let emitted: ReadonlyArray<ReplicaRpc.Invalidation>
+            if (advanced.emit === "skip") emitted = []
+            else if (advanced.emit === "event") emitted = [event]
+            else emitted = [fullRefresh(event.ownerEpoch)]
             return [
               { ...state, watermark: Identity.CommitSequence.make(advanced.next) },
-              advanced.emit === "skip" ? [] : advanced.emit === "event" ? [event] : [fullRefresh(event.ownerEpoch)]
+              emitted
             ]
           }
           const advanced = advanceWatermark(state.deliveryWatermark, event.sequence)
-          return [
-            { ...state, deliveryWatermark: advanced.next },
-            advanced.emit === "skip" ? [] : advanced.emit === "event" ? [event] : [fullRefresh(event.ownerEpoch)]
-          ]
+          let emitted: ReadonlyArray<ReplicaRpc.Invalidation>
+          if (advanced.emit === "skip") emitted = []
+          else if (advanced.emit === "event") emitted = [event]
+          else emitted = [fullRefresh(event.ownerEpoch)]
+          return [{ ...state, deliveryWatermark: advanced.next }, emitted]
         }
       ),
       Stream.interruptWhen(Deferred.await(sessionFailure)),
@@ -809,12 +859,12 @@ export const fromRpcClient = (
           let expectedOwnerSequence = 1
           let pullOutstanding = false
           let sourceComplete = false
-          let sourceWorker: Fiber.Fiber<void, ReplicaError.ReplicaError> | undefined
+          let sourceWorker: Fiber.Fiber<void, ReplicaError.ReplicaError | Cause.Done> | undefined
 
           const removeListeners = () => {
-            port.removeEventListener("message", onMessage)
-            port.removeEventListener("messageerror", onMessageError)
-            port.removeEventListener("close", onClose)
+            runSyncSafe(() => port.removeEventListener("message", onMessage), undefined)
+            runSyncSafe(() => port.removeEventListener("messageerror", onMessageError), undefined)
+            runSyncSafe(() => port.removeEventListener("close", onClose), undefined)
           }
           const stopIngress = () => {
             if (!logicalOpen) return
@@ -848,36 +898,40 @@ export const fromRpcClient = (
             )(value)
           }
           const postFrame = <A, I,>(
-            schema: Schema.Codec<A, I, never>,
+            schema: Schema.Codec<A, I>,
             frame: A,
             transfer?: ReadonlyArray<Transferable>
           ): Effect.Effect<void, ReplicaError.ReplicaError> =>
-            Effect.suspend(() => {
-              let encoded: I
-              try {
-                encoded = Schema.encodeSync(schema)(frame)
-              } catch (cause) {
-                return Effect.die(cause)
-              }
-              return Effect.try({
-                try: () => port.postMessage(encoded, transfer === undefined ? [] : [...transfer]),
-                catch: (cause) =>
-                  new ReplicaError.ReplicaError({
-                    reason: new ReplicaError.StorageUnavailable({ cause })
-                  })
+            Schema.encodeUnknownEffect(schema)(frame).pipe(
+              Effect.flatMap((encoded) => {
+                const transfers: Array<Transferable> = []
+                if (transfer !== undefined) transfers.push(...transfer)
+                return Effect.try({
+                  try: () => port.postMessage(encoded, transfers),
+                  catch: (cause) =>
+                    new ReplicaError.ReplicaError({
+                      reason: new ReplicaError.StorageUnavailable({ cause })
+                    })
+                })
+              }),
+              Effect.mapError((cause) => {
+                if (ReplicaError.isReplicaError(cause)) return cause
+                return new ReplicaError.ReplicaError({
+                  reason: new ReplicaError.StorageUnavailable({ cause })
+                })
               })
-            })
+            )
           const postReleasedAck = (frame: RestoreProtocol.Released) => {
-            try {
-              const encoded = Schema.encodeSync(RestoreProtocol.ReleasedAck)({
-                _tag: "ReleasedAck",
-                nonce,
-                sequence: frame.sequence
-              })
-              port.postMessage(encoded)
-            } catch {
-              // The terminal result is already authoritative.
-            }
+            const encoded = Schema.encodeUnknownExit(RestoreProtocol.ReleasedAck)({
+              _tag: "ReleasedAck",
+              nonce,
+              sequence: frame.sequence
+            })
+            if (Exit.isFailure(encoded)) return
+            Effect.runSyncExit(Effect.try({
+              try: () => port.postMessage(encoded.value),
+              catch: () => undefined
+            }))
           }
           const acceptOwnerFrame = (frame: RestoreProtocol.OwnerToPageFrame) => {
             if (frame.nonce !== nonce || frame.sequence !== expectedOwnerSequence) {
@@ -916,13 +970,7 @@ export const fromRpcClient = (
           }
           function onMessage(event: MessageEvent<unknown>) {
             if (!logicalOpen) return
-            let decoded: Exit.Exit<RestoreProtocol.OwnerToPageFrame, unknown>
-            try {
-              decoded = decodeOwnerFrame(event.data)
-            } catch {
-              failClosed(protocolFailure("invalid restore owner frame"))
-              return
-            }
+            const decoded = decodeOwnerFrame(event.data)
             if (Exit.isFailure(decoded)) {
               failClosed(protocolFailure("invalid restore owner frame"))
               return
@@ -933,7 +981,7 @@ export const fromRpcClient = (
             failClosed(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
-                  cause: new Error("restore channel message decoding failed")
+                  cause: new RestoreChannelError({ message: "restore channel message decoding failed" })
                 })
               })
             )
@@ -942,7 +990,7 @@ export const fromRpcClient = (
             failClosed(
               new ReplicaError.ReplicaError({
                 reason: new ReplicaError.StorageUnavailable({
-                  cause: new Error("restore channel peer closed")
+                  cause: new RestoreChannelError({ message: "restore channel peer closed" })
                 })
               })
             )
@@ -971,7 +1019,7 @@ export const fromRpcClient = (
                 | { readonly _tag: "End" }
                 | { readonly _tag: "Failure"; readonly error: ReplicaError.ReplicaError }
               const classifySourceCause = (
-                cause: Cause.Cause<ReplicaError.ReplicaError | Cause.Done<void>>
+                cause: Cause.Cause<ReplicaError.ReplicaError | Cause.Done>
               ): SourceResult | undefined => {
                 if (cause.reasons.length !== 1) return undefined
                 const reason = cause.reasons[0]
@@ -985,7 +1033,7 @@ export const fromRpcClient = (
               let pendingPull:
                 | Fiber.Fiber<
                   ReadonlyArray<Uint8Array>,
-                  ReplicaError.ReplicaError | Cause.Done<void>
+                  ReplicaError.ReplicaError | Cause.Done
                 >
                 | undefined
               let pendingPullObserved = false
@@ -1019,54 +1067,72 @@ export const fromRpcClient = (
                   }
                   if (classifySourceCause(exit.cause) !== undefined) return
                   stopIngress()
-                  Deferred.doneUnsafe(localFailure, Effect.failCause(exit.cause as Cause.Cause<never>))
+                  Deferred.doneUnsafe(
+                    localFailure,
+                    Effect.failCause(
+                      Cause.map(exit.cause, (error) => {
+                        if (Schema.is(ReplicaError.ReplicaError)(error)) {
+                          return new RestoreBackupError({ error })
+                        }
+                        return new RestoreBackupError({
+                          error: new ReplicaError.ReplicaError({
+                            reason: new ReplicaError.StorageUnavailable({ cause: error })
+                          })
+                        })
+                      })
+                    )
+                  )
                   sourceWorker?.interruptUnsafe()
                 })
               }
-              const takeSource: Effect.Effect<SourceResult> = Effect.gen(function*() {
-                if (pendingChunks !== undefined) {
-                  const chunk = pendingChunks[pendingChunkIndex++]
-                  if (pendingChunkIndex === pendingChunks.length) {
-                    pendingChunks = undefined
-                    pendingChunkIndex = 0
+              const takeSource: Effect.Effect<SourceResult, ReplicaError.ReplicaError | Cause.Done> = Effect.gen(
+                function*() {
+                  if (pendingChunks !== undefined) {
+                    const chunk = pendingChunks[pendingChunkIndex++]
+                    if (pendingChunkIndex === pendingChunks.length) {
+                      pendingChunks = undefined
+                      pendingChunkIndex = 0
+                    }
+                    if (chunk === undefined) {
+                      return yield* Effect.die(new Error("restore source emitted an empty batch"))
+                    }
+                    return { _tag: "Chunk", chunk }
                   }
-                  if (chunk === undefined) {
-                    return yield* Effect.die(new Error("restore source emitted an empty batch"))
+                  const next = yield* startPull
+                  const exit = yield* Fiber.await(next)
+                  pendingPull = undefined
+                  pendingPullObserved = false
+                  if (Exit.isSuccess(exit)) {
+                    const chunk = exit.value[0]
+                    if (chunk === undefined) {
+                      return yield* Effect.die(new Error("restore source emitted an empty batch"))
+                    }
+                    if (exit.value.length > 1) {
+                      pendingChunks = exit.value
+                      pendingChunkIndex = 1
+                    }
+                    return { _tag: "Chunk", chunk }
                   }
-                  return { _tag: "Chunk", chunk }
+                  const classified = classifySourceCause(exit.cause)
+                  if (classified !== undefined) return classified
+                  return yield* Effect.failCause(exit.cause)
                 }
-                const next = yield* startPull
-                const exit = yield* Fiber.await(next)
-                pendingPull = undefined
-                pendingPullObserved = false
-                if (Exit.isSuccess(exit)) {
-                  const chunk = exit.value[0]
-                  if (chunk === undefined) return yield* Effect.die(new Error("restore source emitted an empty batch"))
-                  if (exit.value.length > 1) {
-                    pendingChunks = exit.value
-                    pendingChunkIndex = 1
-                  }
-                  return { _tag: "Chunk", chunk }
-                }
-                const classified = classifySourceCause(exit.cause)
-                if (classified !== undefined) return classified
-                return yield* Effect.failCause(exit.cause as Cause.Cause<never>)
-              })
+              )
               const postResponse = <A, I,>(
-                schema: Schema.Codec<A, I, never>,
+                schema: Schema.Codec<A, I>,
                 frame: A,
                 transfer?: ReadonlyArray<Transferable>
-              ) =>
-                terminalAccepted
-                  ? Effect.succeed(false)
-                  : postFrame(schema, frame, transfer).pipe(
-                    Effect.tap(() =>
-                      Effect.sync(() => {
-                        pullOutstanding = false
-                      })
-                    ),
-                    Effect.as(true)
-                  )
+              ) => {
+                if (terminalAccepted) return Effect.succeed(false)
+                return postFrame(schema, frame, transfer).pipe(
+                  Effect.tap(() =>
+                    Effect.sync(() => {
+                      pullOutstanding = false
+                    })
+                  ),
+                  Effect.as(true)
+                )
+              }
 
               while (true) {
                 const credit = yield* Queue.take(credits)
@@ -1112,10 +1178,15 @@ export const fromRpcClient = (
                       if (remaining <= 0) break
                       const next = yield* Effect.raceFirst(
                         Fiber.await(nextFiber).pipe(
-                          Effect.map((exit) => ({ _tag: "Source" as const, exit }))
+                          Effect.map((
+                            exit
+                          ) => ({ _tag: "Source", exit } satisfies {
+                            readonly _tag: "Source"
+                            readonly exit: typeof exit
+                          }))
                         ),
                         Effect.sleep(remaining).pipe(
-                          Effect.as({ _tag: "Coalesce" as const })
+                          Effect.as({ _tag: "Coalesce" } satisfies { readonly _tag: "Coalesce" })
                         )
                       )
                       if (next._tag === "Coalesce") {
@@ -1192,10 +1263,16 @@ export const fromRpcClient = (
                 }
                 return Effect.sync(() => {
                   stopIngress()
-                  const cause = Cause.map(
-                    exit.cause,
-                    (error) => new RestoreBackupError({ error })
-                  )
+                  const cause = Cause.map(exit.cause, (error) => {
+                    if (Schema.is(ReplicaError.ReplicaError)(error)) {
+                      return new RestoreBackupError({ error })
+                    }
+                    return new RestoreBackupError({
+                      error: new ReplicaError.ReplicaError({
+                        reason: new ReplicaError.StorageUnavailable({ cause: error })
+                      })
+                    })
+                  })
                   Deferred.doneUnsafe(localFailure, Effect.failCause(cause))
                 })
               }),
@@ -1213,14 +1290,21 @@ export const fromRpcClient = (
             )
             const first = yield* Effect.raceFirst(
               awaitTerminal.pipe(
-                Effect.map((frame) => ({ _tag: "Terminal" as const, frame }))
+                Effect.map((
+                  terminalFrame
+                ) => ({ _tag: "Terminal", frame: terminalFrame } satisfies {
+                  readonly _tag: "Terminal"
+                  readonly frame: typeof terminalFrame
+                }))
               ),
               Effect.exit(awaitResult).pipe(
                 Effect.filterOrElse(
                   isAuthoritativeRestoreResult,
                   () => Effect.never
                 ),
-                Effect.map((exit) => ({ _tag: "Result" as const, exit }))
+                Effect.map((
+                  exit
+                ) => ({ _tag: "Result", exit } satisfies { readonly _tag: "Result"; readonly exit: typeof exit }))
               )
             )
             let frame: RestoreProtocol.TerminalReady
@@ -1230,10 +1314,15 @@ export const fromRpcClient = (
               yield* acceptResult(first.exit)
               const next = yield* Effect.raceFirst(
                 awaitTerminal.pipe(
-                  Effect.map((frame) => ({ _tag: "Terminal" as const, frame }))
+                  Effect.map((
+                    terminalFrame
+                  ) => ({ _tag: "Terminal", frame: terminalFrame } satisfies {
+                    readonly _tag: "Terminal"
+                    readonly frame: typeof terminalFrame
+                  }))
                 ),
                 Deferred.await(acceptedResultDisconnect).pipe(
-                  Effect.as({ _tag: "Disconnected" as const })
+                  Effect.as({ _tag: "Disconnected" } satisfies { readonly _tag: "Disconnected" })
                 )
               )
               if (next._tag === "Disconnected") return yield* first.exit
@@ -1372,24 +1461,24 @@ export const fromRpcClient = (
         Stream.interruptWhen(Deferred.await(pageHidden))
       ),
       invalidations,
-      create: (document, options) =>
-        Wire.encode(document.schema, options.value).pipe(
+      create: (document, createOptions) =>
+        Wire.encode(document.schema, createOptions.value).pipe(
           Effect.flatMap((value) =>
             withSession("Create", (session) =>
               recoverCommand(
-                options.commandId,
+                createOptions.commandId,
                 "Create",
                 rpc.Create({
                   sessionId: session.sessionId,
                   document: document.name,
-                  commandId: options.commandId,
+                  commandId: createOptions.commandId,
                   value
                 }),
                 "LookupCreate",
                 rpc.LookupCreate({
                   sessionId: session.sessionId,
                   document: document.name,
-                  commandId: options.commandId
+                  commandId: createOptions.commandId
                 })
               ), { boundOperation: false }).pipe(Effect.flatMap(CommandOutcome.committedOrFail))
           )
@@ -1450,26 +1539,26 @@ export const fromRpcClient = (
             attributes: { "document.type": document.name }
           })
         ),
-      resolveConflict: (document, options) =>
+      resolveConflict: (document, conflictOptions) =>
         withSession(
           "ResolveConflict",
           (session) => {
             const outcomeSchema = CommandOutcome.schema(Schema.Void, Conflict.ResolutionError)
             return Wire.encodeConflict(
               Conflict.Resolution,
-              options.resolution,
+              conflictOptions.resolution,
               session.lease.conflictLimits,
               Conflict.preflightResolution
             ).pipe(
               Effect.flatMap((resolution) =>
                 recoverCommand(
-                  options.commandId,
+                  conflictOptions.commandId,
                   "ResolveConflict",
                   rpc.ResolveConflict({
                     sessionId: session.sessionId,
                     document: document.name,
-                    commandId: options.commandId,
-                    documentId: options.documentId,
+                    commandId: conflictOptions.commandId,
+                    documentId: conflictOptions.documentId,
                     resolution
                   }).pipe(
                     Effect.flatMap((encoded) =>
@@ -1480,8 +1569,8 @@ export const fromRpcClient = (
                   rpc.LookupConflictResolution({
                     sessionId: session.sessionId,
                     document: document.name,
-                    commandId: options.commandId,
-                    documentId: options.documentId,
+                    commandId: conflictOptions.commandId,
+                    documentId: conflictOptions.documentId,
                     resolution
                   }).pipe(
                     Effect.flatMap((encoded) =>
@@ -1498,44 +1587,52 @@ export const fromRpcClient = (
           Effect.withSpan("ReplicaClient.resolveConflict", {
             attributes: {
               "document.type": document.name,
-              "conflict.choice": options.resolution.choice._tag,
-              "conflict.path_depth": options.resolution.path.parents.length + 1
+              "conflict.choice": conflictOptions.resolution.choice._tag,
+              "conflict.path_depth": conflictOptions.resolution.path.parents.length + 1
             }
           })
         ),
-      mutate: (mutation, options) =>
-        Wire.encode(mutation.payloadSchema, "payload" in options ? options.payload : undefined).pipe(
-          Effect.flatMap((payload) =>
+      mutate: (mutation, mutationOptions) => {
+        let payload: unknown
+        if ("payload" in mutationOptions) payload = mutationOptions.payload
+        else payload = undefined
+        return Wire.encode(mutation.payloadSchema, payload).pipe(
+          Effect.flatMap((encodedPayload) =>
             withSession("Mutate", (session) =>
               recoverCommand(
-                options.commandId,
+                mutationOptions.commandId,
                 "Mutate",
                 rpc.Mutate({
                   sessionId: session.sessionId,
                   mutation: mutation.name,
-                  commandId: options.commandId,
-                  documentId: options.documentId,
-                  payload
+                  commandId: mutationOptions.commandId,
+                  documentId: mutationOptions.documentId,
+                  payload: encodedPayload
                 }),
                 "LookupMutation",
                 rpc.LookupMutation({
                   sessionId: session.sessionId,
                   mutation: mutation.name,
-                  commandId: options.commandId
+                  commandId: mutationOptions.commandId
                 })
               ), { boundOperation: false })
           ),
           Effect.flatMap((outcome) => Wire.decodeOutcome(mutation.successSchema, mutation.errorSchema, outcome)),
           Effect.flatMap(CommandOutcome.committedOrFail)
-        ),
-      delete: (document, options) =>
+        )
+      },
+      delete: (document, deleteOptions) =>
         withSession("Delete", (session) =>
           recoverCommand(
-            options.commandId,
+            deleteOptions.commandId,
             "Delete",
-            rpc.Delete({ sessionId: session.sessionId, document: document.name, ...options }),
+            rpc.Delete({ sessionId: session.sessionId, document: document.name, ...deleteOptions }),
             "LookupDelete",
-            rpc.LookupDelete({ sessionId: session.sessionId, document: document.name, commandId: options.commandId })
+            rpc.LookupDelete({
+              sessionId: session.sessionId,
+              document: document.name,
+              commandId: deleteOptions.commandId
+            })
           ), { boundOperation: false }).pipe(
             Effect.flatMap((outcome) => Wire.decodeOutcome(Schema.Void, Schema.Never, outcome)),
             Effect.flatMap(CommandOutcome.committedOrFail)
@@ -1606,14 +1703,14 @@ export const fromRpcClient = (
               )),
             Effect.flatMap((outcome) => Wire.decodeOutcome(Schema.Void, Schema.Never, outcome))
           ),
-      lookupConflictResolution: (document, options) =>
+      lookupConflictResolution: (document, conflictOptions) =>
         withSession(
           "LookupConflictResolution",
           (session) => {
             const outcomeSchema = CommandOutcome.schema(Schema.Void, Conflict.ResolutionError)
             return Wire.encodeConflict(
               Conflict.Resolution,
-              options.resolution,
+              conflictOptions.resolution,
               session.lease.conflictLimits,
               Conflict.preflightResolution
             ).pipe(
@@ -1621,8 +1718,8 @@ export const fromRpcClient = (
                 rpc.LookupConflictResolution({
                   sessionId: session.sessionId,
                   document: document.name,
-                  commandId: options.commandId,
-                  documentId: options.documentId,
+                  commandId: conflictOptions.commandId,
+                  documentId: conflictOptions.documentId,
                   resolution
                 })
               ),
@@ -1641,8 +1738,8 @@ export const fromRpcClient = (
           Effect.withSpan("ReplicaClient.lookupConflictResolution", {
             attributes: {
               "document.type": document.name,
-              "conflict.choice": options.resolution.choice._tag,
-              "conflict.path_depth": options.resolution.path.parents.length + 1
+              "conflict.choice": conflictOptions.resolution.choice._tag,
+              "conflict.path_depth": conflictOptions.resolution.path.parents.length + 1
             }
           })
         ),
@@ -1730,14 +1827,14 @@ export const fromRpcClient = (
               })
             ))
         ),
-      restoreBackup: <R,>(options: ArchiveTransferOptions<R>) =>
+      restoreBackup: <RestoreRequirements,>(restoreOptions: ArchiveTransferOptions<RestoreRequirements>) =>
         Effect.gen(function*() {
           const startedAt = yield* Clock.currentTimeMillis
           const deadline = Math.min(
             Number.MAX_SAFE_INTEGER,
             startedAt + operationReportedTimeoutMillis
           )
-          const maxBytes = yield* Backup.validateMaxBytes(options.maxBytes)
+          const maxBytes = yield* Backup.validateMaxBytes(restoreOptions.maxBytes)
           let acceptedTerminal:
             | Exit.Exit<void, ReplicaError.ReplicaError | RestoreBackupError>
             | undefined
@@ -1751,12 +1848,12 @@ export const fromRpcClient = (
                 timeoutMillis: operationReportedTimeoutMillis
               })
             })
-          const withinDeadline = <E, R,>(
-            operation: Effect.Effect<void, E, R>
+          const withinDeadline = <DeadlineError, DeadlineRequirements,>(
+            operation: Effect.Effect<void, DeadlineError, DeadlineRequirements>
           ): Effect.Effect<
             void,
-            E | ReplicaError.ReplicaError | RestoreBackupError,
-            R
+            DeadlineError | ReplicaError.ReplicaError | RestoreBackupError,
+            DeadlineRequirements
           > =>
             Clock.currentTimeMillis.pipe(
               Effect.flatMap((now) =>
@@ -1776,48 +1873,50 @@ export const fromRpcClient = (
                 if (replacement !== undefined) {
                   const completed = replacement.pollUnsafe()
                   if (completed !== undefined) {
-                    return Exit.isFailure(completed) &&
-                        completed.cause.reasons.every(Cause.isInterruptReason)
-                      ? Effect.fail(timeoutError())
-                      : completed
+                    if (
+                      Exit.isFailure(completed) &&
+                      completed.cause.reasons.every(Cause.isInterruptReason)
+                    ) {
+                      return Effect.fail(timeoutError())
+                    }
+                    return completed
                   }
-                  return remaining === 0
-                    ? Effect.fail(timeoutError())
-                    : Effect.timeoutOrElse(Fiber.join(replacement), {
-                      duration: remaining,
-                      orElse: () => Effect.fail(timeoutError())
-                    })
-                }
-                return remaining === 0
-                  ? Effect.fail(timeoutError())
-                  : Effect.timeoutOrElse(reopen(session), {
+                  if (remaining === 0) return Effect.fail(timeoutError())
+                  return Effect.timeoutOrElse(Fiber.join(replacement), {
                     duration: remaining,
                     orElse: () => Effect.fail(timeoutError())
                   })
+                }
+                if (remaining === 0) return Effect.fail(timeoutError())
+                return Effect.timeoutOrElse(reopen(session), {
+                  duration: remaining,
+                  orElse: () => Effect.fail(timeoutError())
+                })
               })
             )
           const operation = withSession(
             "RestoreBackup",
             (session) =>
-              rpc.BeginRestoreBackup(
-                options.mode === "document"
-                  ? {
+              (() => {
+                if (restoreOptions.mode === "document") {
+                  return rpc.BeginRestoreBackup({
                     sessionId: session.sessionId,
-                    mode: options.mode,
-                    document: options.document.name,
-                    documentId: options.documentId,
+                    mode: restoreOptions.mode,
+                    document: restoreOptions.document.name,
+                    documentId: restoreOptions.documentId,
                     maxBytes,
-                    expectedDefinitionHash: options.expectedDefinitionHash,
-                    installationId: options.installationId
-                  }
-                  : {
-                    sessionId: session.sessionId,
-                    mode: options.mode,
-                    maxBytes,
-                    expectedDefinitionHash: options.expectedDefinitionHash,
-                    installationId: options.installationId
-                  }
-              ).pipe(
+                    expectedDefinitionHash: restoreOptions.expectedDefinitionHash,
+                    installationId: restoreOptions.installationId
+                  })
+                }
+                return rpc.BeginRestoreBackup({
+                  sessionId: session.sessionId,
+                  mode: restoreOptions.mode,
+                  maxBytes,
+                  expectedDefinitionHash: restoreOptions.expectedDefinitionHash,
+                  installationId: restoreOptions.installationId
+                })
+              })().pipe(
                 Effect.catchCause((cause) => {
                   if (
                     cause.reasons.length === 1 &&
@@ -1840,26 +1939,26 @@ export const fromRpcClient = (
                       })
                     })
                   )),
-                Effect.flatMap(({ nonce, port }) =>
+                Effect.flatMap(({ nonce: rpcNonce, port: rpcPort }) =>
                   Effect.acquireUseRelease(
                     Effect.sync(() => {
-                      const nativeClose = port.close.bind(port)
+                      const nativeClose = rpcPort.close.bind(rpcPort)
                       let open = true
                       return {
-                        nonce,
-                        port,
+                        nonce: rpcNonce,
+                        port: rpcPort,
                         close: () => {
                           if (!open) return
                           open = false
-                          nativeClose()
+                          runSyncSafe(nativeClose, undefined)
                         }
                       }
                     }),
-                    ({ close, nonce, port }) =>
+                    ({ close, nonce: finishNonce, port: finishPort }) =>
                       Effect.gen(function*() {
                         const result = rpc.FinishRestoreBackup({
                           sessionId: session.sessionId,
-                          nonce
+                          nonce: finishNonce
                         }).pipe(
                           Effect.catchCause((cause) =>
                             Effect.failCause(
@@ -1885,9 +1984,9 @@ export const fromRpcClient = (
                           Effect.forkChild({ startImmediately: true })
                         )
                         yield* serveRestoreSource(
-                          options.source,
-                          port,
-                          nonce,
+                          restoreOptions.source,
+                          finishPort,
+                          finishNonce,
                           maxBytes,
                           session.lease.maxChunkBytes,
                           session.lease.maxRestoreCoalesceMillis,
@@ -1913,7 +2012,7 @@ export const fromRpcClient = (
                 ),
                 Effect.withSpan("ReplicaClient.restoreBackup", {
                   attributes: {
-                    "restore.mode": options.mode,
+                    "restore.mode": restoreOptions.mode,
                     "restore.max_bytes": maxBytes,
                     "restore.max_chunk_bytes": session.lease.maxChunkBytes,
                     "restore.max_coalesce_millis": session.lease.maxRestoreCoalesceMillis,
@@ -1934,14 +2033,17 @@ export const fromRpcClient = (
             Effect.failCause(
               Cause.map(
                 cause,
-                (error) => error._tag === "RestoreBackupError" ? error.error : error
+                (error) => {
+                  if (error._tag === "RestoreBackupError") return error.error
+                  return error
+                }
               )
             )
           )
-        ) as Effect.Effect<void, ReplicaError.ReplicaError, R>,
-      installBackupDocument: (document, options) =>
+        ),
+      installBackupDocument: (document, installOptions) =>
         client.restoreBackup({
-          ...options,
+          ...installOptions,
           mode: "document",
           document
         }),
@@ -1964,8 +2066,8 @@ export const fromRpcClient = (
             )
           )
         ),
-      importDocument: (document, options) =>
-        Wire.encode(Schema.toEncoded(document.schema), options.value.value).pipe(
+      importDocument: (document, importOptions) =>
+        Wire.encode(Schema.toEncoded(document.schema), importOptions.value.value).pipe(
           Effect.flatMap((value) =>
             withSession(
               "ImportDocument",
@@ -1973,8 +2075,8 @@ export const fromRpcClient = (
                 rpc.ImportDocument({
                   sessionId: session.sessionId,
                   document: document.name,
-                  commandId: options.commandId,
-                  value: { ...options.value, value }
+                  commandId: importOptions.commandId,
+                  value: { ...importOptions.value, value }
                 }),
               { replayAfterReopen: false }
             ).pipe(
