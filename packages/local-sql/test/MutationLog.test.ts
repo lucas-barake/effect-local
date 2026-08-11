@@ -85,6 +85,7 @@ const clientHistory = {
   migration
 }
 const serverHistory = {
+  readAuthorizationRefreshInterval: "1 second" as const,
   retainedHistoryEntries: 256,
   maximumHistoryEntries: 10_000,
   retainedReceipts: 256,
@@ -1902,7 +1903,14 @@ describe("server reconciled mutation log", () => {
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("1"))
       yield* server.submit(pending.envelope)
 
-      const wake = yield* server.watch(spaceId).pipe(Stream.runHead)
+      const wake = yield* server.watch({
+        spaceId,
+        clientId,
+        schema: Domain.definition.schemaIdentity,
+        scope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
+        scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
+        cursor: null
+      }).pipe(Stream.runHead)
       assert.strictEqual(Option.getOrThrow(wake).sequence, 1)
     })))
 
@@ -1920,7 +1928,14 @@ describe("server reconciled mutation log", () => {
         const ready = yield* Deferred.make<void>()
         const release = yield* Deferred.make<void>()
         let initial = true
-        const wake = yield* server.watch(otherSpaceId).pipe(
+        const wake = yield* server.watch({
+          spaceId: otherSpaceId,
+          clientId,
+          schema: Domain.definition.schemaIdentity,
+          scope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
+          scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
+          cursor: null
+        }).pipe(
           Stream.tap(() => {
             if (!initial) return Effect.void
             initial = false

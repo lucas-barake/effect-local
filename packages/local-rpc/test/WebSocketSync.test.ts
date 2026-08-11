@@ -98,6 +98,7 @@ const migration = {
   maximumAttempts: 8
 } satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
 const serverHistory = {
+  readAuthorizationRefreshInterval: "1 second" as const,
   retainedHistoryEntries: 0,
   maximumHistoryEntries: 10_000,
   retainedReceipts: 0,

@@ -116,6 +116,15 @@ export const ServerCountRow = Schema.Struct({
   receipt_count: NonNegativeInt
 })
 
+export const ReplicationSpaceRow = Schema.Struct({
+  definition_hash: Schema.String,
+  schema_version: Identity.SchemaVersion,
+  schema_hash: Identity.SchemaHash,
+  active_schema_generation: NonNegativeInt,
+  next_server_sequence: PositiveInt,
+  next_terminal_sequence: PositiveInt
+})
+
 export const ServerReceiptRow = Schema.Struct({
   space_id: Identity.SpaceId,
   client_id: Identity.ClientId,

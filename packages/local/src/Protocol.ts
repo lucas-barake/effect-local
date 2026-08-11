@@ -248,6 +248,16 @@ export const SnapshotEntry = Schema.Struct({
 })
 export type SnapshotEntry = typeof SnapshotEntry.Type
 
+export const SnapshotEntity = Schema.Struct({
+  ordinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  model: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  modelVersion: Identity.SchemaVersion,
+  key: Schema.Json,
+  value: Schema.Json,
+  entityBytes: Schema.Int.check(Schema.isGreaterThan(0))
+})
+export type SnapshotEntity = typeof SnapshotEntity.Type
+
 export const BootstrapRequired = Schema.TaggedStruct("BootstrapRequired", {
   manifest: SnapshotManifest
 })
