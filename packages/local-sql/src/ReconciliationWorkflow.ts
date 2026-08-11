@@ -222,7 +222,10 @@ const handler = (
           }).pipe(Effect.result)
           if (Result.isSuccess(result)) return
           yield* reconciliation.failed(result.failure)
-          if (attempt >= configuration.maximumAttempts) return yield* result.failure
+          if (result.failure._tag === "StaleSchema" || attempt >= configuration.maximumAttempts) {
+            yield* result.failure
+            return
+          }
           yield* DurableClock.sleep({
             name: `${name}-retry/${attempt}`,
             duration: retryMillis(configuration, attempt),
@@ -394,12 +397,16 @@ const layerSchedulerWithConfiguration = (
         Effect.forever(
           remote.watch({ spaceId: options.spaceId, schema: options.definition.schemaIdentity }).pipe(
             Stream.runForEach(() => requestAndNotify),
-            Effect.andThen(requestAndNotify),
-            Effect.catch((error) => Effect.logWarning("Sync watch ended", error)),
-            Effect.ensuring(notify),
+            Effect.matchEffect({
+              onFailure: (error) => {
+                if (error._tag === "StaleSchema") return Effect.fail(error)
+                return Effect.logWarning("Sync watch ended", error).pipe(Effect.andThen(notify))
+              },
+              onSuccess: () => requestAndNotify
+            }),
             Effect.andThen(Effect.sleep(configuration.retryDelayMillis))
           )
-        )
+        ).pipe(Effect.catchTag("StaleSchema", reconciliation.failed))
       )
       yield* requestAndNotify
       yield* Effect.addFinalizer(() =>

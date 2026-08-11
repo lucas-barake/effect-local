@@ -1787,6 +1787,51 @@ describe("server reconciled mutation log", () => {
       assert.strictEqual(yield* Ref.get(subscriptions), 2)
     })))
 
+  it.effect("does not retry a permanently stale reconciliation runtime", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const subscriptions = yield* Ref.make(0)
+      const pulls = yield* Ref.make(0)
+      const subscribed = yield* Deferred.make<void>()
+      const stale = new ReplicaError.StaleSchema({
+        expectedVersion: 2,
+        expectedHash: "expected",
+        actualVersion: 1,
+        actualHash: "actual"
+      })
+      const remote = Layer.succeed(
+        SyncEngine.SyncEngine,
+        SyncEngine.SyncEngine.of({
+          submit: () => Effect.die("unexpected submit"),
+          pull: () => Ref.update(pulls, (count) => count + 1).pipe(Effect.andThen(Effect.fail(stale))),
+          bootstrap: () => Effect.fail(stale),
+          watch: () =>
+            Stream.unwrap(
+              Ref.update(subscriptions, (count) => count + 1).pipe(
+                Effect.andThen(Deferred.succeed(subscribed, undefined)),
+                Effect.as(Stream.fail(stale))
+              )
+            )
+        })
+      )
+      const reconciler = Reconciler.layer({
+        definition: Domain.definition,
+        spaceId,
+        retryDelay: "1 second"
+      }).pipe(
+        Layer.provide(localLayer()),
+        Layer.provide(remote)
+      )
+      const scheduler = yield* service(Reconciler.Reconciler, reconciler)
+      yield* Deferred.await(subscribed)
+      yield* Effect.yieldNow
+      yield* TestClock.adjust("5 seconds")
+      yield* Effect.yieldNow
+
+      assert.strictEqual(yield* Ref.get(subscriptions), 1)
+      assert.strictEqual(yield* Ref.get(pulls), 1)
+      assert.strictEqual((yield* scheduler.status)._tag, "Failed")
+    })))
+
   it.effect("retries pending mutations after an interrupted submit", () =>
     Effect.scoped(Effect.gen(function*() {
       const firstAttempt = yield* Deferred.make<void>()

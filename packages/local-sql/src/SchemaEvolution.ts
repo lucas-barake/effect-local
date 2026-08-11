@@ -547,6 +547,7 @@ export const client = (options: ClientOptions) =>
       const meta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
       const source = yield* resolveInitialSource(meta, options.evolution)
       if (!source.legacy && sameIdentity(source.identity, options.definition.schemaIdentity)) {
+        if (meta.definition_hash === options.definition.hash) return meta.schema_generation
         return yield* sql.withTransaction(Effect.gen(function*() {
           yield* sql`UPDATE effect_local_client_meta SET definition_hash = ${options.definition.hash}
             WHERE singleton = 1 AND schema_generation = ${meta.schema_generation}
@@ -1112,6 +1113,7 @@ export const server = (options: ServerOptions) =>
       const meta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
       const source = yield* resolveInitialSource(meta, options.evolution)
       if (!source.legacy && sameIdentity(source.identity, options.definition.schemaIdentity)) {
+        if (meta.definition_hash === options.definition.hash) return meta.schema_generation
         return yield* sql.withTransaction(Effect.gen(function*() {
           yield* sql`UPDATE effect_local_server_spaces SET definition_hash = ${options.definition.hash}
             WHERE space_id = ${options.spaceId} AND schema_generation = ${meta.schema_generation}

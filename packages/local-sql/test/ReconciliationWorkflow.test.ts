@@ -14,6 +14,7 @@ import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Ref from "effect/Ref"
 import * as Stream from "effect/Stream"
+import * as TestClock from "effect/testing/TestClock"
 import * as ClusterWorkflowEngine from "effect/unstable/cluster/ClusterWorkflowEngine"
 import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
@@ -486,5 +487,75 @@ describe("reconciliation workflow", () => {
         requested: generations.requested,
         completed: 0
       })
+    }))
+
+  it.effect("does not retry a stale schema workflow activity", () =>
+    Effect.gen(function*() {
+      const attempts = yield* Ref.make(0)
+      const attempted = yield* Deferred.make<void>()
+      const localContext = yield* Layer.build(
+        LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(database())
+        )
+      )
+      const local = Context.get(localContext, LocalStore.Store)
+      const stale = new ReplicaError.StaleSchema({
+        expectedVersion: 2,
+        expectedHash: "expected",
+        actualVersion: 1,
+        actualHash: "actual"
+      })
+      const remote = SyncEngine.SyncEngine.of({
+        submit: () => Effect.die("unexpected submit"),
+        pull: () =>
+          Ref.update(attempts, (count) => count + 1).pipe(
+            Effect.andThen(Deferred.succeed(attempted, undefined)),
+            Effect.andThen(Effect.fail(stale))
+          ),
+        bootstrap: () => Effect.fail(stale),
+        watch: () => Stream.never
+      })
+      const reconciliationContext = yield* Layer.build(
+        Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+          Layer.provide(Layer.succeed(LocalStore.Store, local)),
+          Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote))
+        )
+      )
+      const reconciliation = Context.get(reconciliationContext, Reconciler.Reconciliation)
+      const engineContext = yield* Layer.build(WorkflowEngine.layerMemory)
+      const engine = Context.get(engineContext, WorkflowEngine.WorkflowEngine)
+      yield* Layer.build(
+        ReconciliationWorkflow.layerRegistration({
+          definition: Domain.definition,
+          spaceId,
+          clientId,
+          retryDelay: "1 millis",
+          maximumRetryDelay: "1 millis",
+          maximumAttempts: 3
+        }).pipe(
+          Layer.provide(Layer.succeed(LocalStore.Store, local)),
+          Layer.provide(Layer.succeed(Reconciler.Reconciliation, reconciliation)),
+          Layer.provide(Layer.succeed(WorkflowEngine.WorkflowEngine, engine))
+        )
+      )
+      const generation = yield* local.requestReconciliation
+      const payload = ReconciliationWorkflow.Payload.make({
+        schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
+        spaceId,
+        clientId,
+        generation
+      })
+      const fiber = yield* ReconciliationWorkflow.make(payload).execute(payload).pipe(
+        Effect.flip,
+        Effect.provideService(WorkflowEngine.WorkflowEngine, engine),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Deferred.await(attempted)
+      yield* TestClock.adjust("5 millis")
+      const error = yield* Fiber.join(fiber)
+
+      assert.strictEqual(error._tag, "StaleSchema")
+      assert.strictEqual(yield* Ref.get(attempts), 1)
     }))
 })

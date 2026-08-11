@@ -812,4 +812,37 @@ describe("client schema evolution", () => {
       assert.strictEqual((yield* server.pullAuthorized(stale, "allowed").pipe(Effect.flip))._tag, "StaleSchema")
       assert.strictEqual((yield* countSpaces(undefined)).count, 0)
     })).pipe(Effect.provide(database)))
+
+  it.effect("does not rewrite unchanged server schema metadata during preparation", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const runtime = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(handlersV2))
+      const server = yield* Layer.build(
+        ServerStore.layerTrusted({ ...serverHistory, definition: definitionV2, evolution }).pipe(
+          Layer.provide(runtime)
+        )
+      ).pipe(Effect.map((context) => Context.get(context, ServerStore.ServerStore)))
+      yield* sql`CREATE TABLE space_update_probe (count INTEGER NOT NULL)`
+      yield* sql`CREATE TRIGGER count_space_updates AFTER UPDATE ON effect_local_server_spaces
+        BEGIN INSERT INTO space_update_probe (count) VALUES (1); END`
+      const CountRow = Schema.Struct({ count: Schema.Number })
+      const countUpdates = SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: CountRow,
+        execute: () => sql`SELECT COUNT(*) AS count FROM space_update_probe`
+      })
+      const request = {
+        spaceId,
+        schema: definitionV2.schemaIdentity,
+        after: Identity.ServerSequence.make(0),
+        limit: 10
+      }
+
+      yield* server.pull(request)
+      const afterFirst = (yield* countUpdates(undefined)).count
+      yield* server.pull(request)
+      const afterSecond = (yield* countUpdates(undefined)).count
+
+      assert.strictEqual(afterSecond - afterFirst, 0)
+    })).pipe(Effect.provide(database)))
 })

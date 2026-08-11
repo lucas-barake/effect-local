@@ -245,12 +245,13 @@ export const layerInMemoryScheduler = (
                 Effect.andThen(reconciliation.succeeded)
               )
           ),
-          Effect.catch((error) =>
-            Effect.logWarning("Reconciliation failed", error).pipe(
+          Effect.catch((error) => {
+            if (error._tag === "StaleSchema") return reconciliation.failed(error)
+            return Effect.logWarning("Reconciliation failed", error).pipe(
               Effect.andThen(Effect.sleep(retryDelayMillis)),
               Effect.andThen(notify)
             )
-          )
+          })
         )
       )
       const workerFiber = yield* Effect.forkScoped(worker)
@@ -258,19 +259,23 @@ export const layerInMemoryScheduler = (
         Effect.forever(
           remote.watch({ spaceId: options.spaceId, schema: options.definition.schemaIdentity }).pipe(
             Stream.runForEach(() => requestAndNotify),
-            Effect.catch((error) => Effect.logWarning("Sync watch ended", error)),
-            Effect.ensuring(
-              requestAndNotify.pipe(
-                Effect.catch((error) =>
-                  Effect.logWarning("Could not persist a reconciliation wake", error).pipe(
-                    Effect.andThen(notify)
+            Effect.matchEffect({
+              onFailure: (error) => {
+                if (error._tag === "StaleSchema") return Effect.fail(error)
+                return Effect.logWarning("Sync watch ended", error).pipe(
+                  Effect.andThen(requestAndNotify),
+                  Effect.catch((wakeError) =>
+                    Effect.logWarning("Could not persist a reconciliation wake", wakeError).pipe(
+                      Effect.andThen(notify)
+                    )
                   )
                 )
-              )
-            ),
+              },
+              onSuccess: () => requestAndNotify
+            }),
             Effect.andThen(Effect.sleep(retryDelayMillis))
           )
-        )
+        ).pipe(Effect.catchTag("StaleSchema", reconciliation.failed))
       )
       yield* requestAndNotify
       yield* Effect.addFinalizer(() =>
