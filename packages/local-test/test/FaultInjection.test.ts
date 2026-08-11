@@ -85,7 +85,8 @@ const makeServices = Effect.gen(function*() {
     SyncEngine.SyncEngine,
     TestServer.layer.pipe(
       Layer.provide(Layer.succeed(ServerStore.ServerStore, server)),
-      Layer.provide(Layer.succeed(FaultInjection.FaultInjection, faults))
+      Layer.provide(Layer.succeed(FaultInjection.FaultInjection, faults)),
+      Layer.provide(NodeCrypto.layer)
     )
   )
   const local = yield* service(
@@ -98,10 +99,52 @@ const makeServices = Effect.gen(function*() {
   return { faults, local, sync }
 })
 
+const pullRequest = (state: LocalStore.ReplicationState) =>
+  Protocol.PullRequest.make({
+    spaceId,
+    clientId: state.clientId,
+    schema: definition.schemaIdentity,
+    scope: state.scope,
+    scopeGeneration: state.scopeGeneration,
+    cursor: state.cursor,
+    limit: 10
+  })
+
+const synchronize = (local: LocalStore.Service, sync: SyncEngine.Service) =>
+  Effect.gen(function*() {
+    const state = yield* local.replicationState
+    const result = yield* sync.pull(pullRequest(state))
+    if (!("_tag" in result)) {
+      yield* local.applyViewPage(result)
+      return result
+    }
+    yield* local.prepareBootstrap(result.manifest)
+    let afterOrdinal = -1
+    while (true) {
+      const page = yield* sync.bootstrap({
+        spaceId,
+        clientId: state.clientId,
+        schema: definition.schemaIdentity,
+        scope: state.scope,
+        scopeGeneration: state.scopeGeneration,
+        cursor: result.manifest.cursor,
+        snapshotId: result.manifest.snapshotId,
+        afterOrdinal,
+        limit: 10
+      })
+      if (yield* local.stageBootstrapPage(page)) {
+        yield* local.installBootstrap(page.manifest)
+        return page
+      }
+      afterOrdinal += page.entries.length
+    }
+  })
+
 describe("test synchronization faults", () => {
   it.effect("keeps optimistic state while partitioned and reconciles after healing", () =>
     Effect.gen(function*() {
       const { faults, local, sync } = yield* makeServices
+      yield* synchronize(local, sync)
       const pending = yield* local.mutate(PutTodo, { id: "1", title: "offline" })
       const request = Protocol.SubmitRequest.make({ envelope: pending.envelope, schema: definition.schemaIdentity })
       yield* faults.partition
@@ -113,14 +156,10 @@ describe("test synchronization faults", () => {
       yield* faults.heal
       const receipt = yield* sync.submit(request)
       yield* local.applyReceipt(receipt)
-      const page = yield* sync.pull({
-        spaceId,
-        schema: definition.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      })
+      const page = yield* sync.pull(pullRequest(yield* local.replicationState))
       if ("_tag" in page) assert.fail("unexpected bootstrap")
-      yield* local.applyEntries(page.entries)
+      yield* local.applyViewPage(page)
+      yield* local.settleReceipts
       assert.strictEqual(yield* local.pendingCount, 0)
       assert.strictEqual(yield* local.cursor, 1)
     }))
@@ -128,6 +167,7 @@ describe("test synchronization faults", () => {
   it.effect("resolves a dropped receipt through an exact retry", () =>
     Effect.gen(function*() {
       const { faults, local, sync } = yield* makeServices
+      yield* synchronize(local, sync)
       const pending = yield* local.mutate(PutTodo, { id: "1", title: "ambiguous" })
       const request = Protocol.SubmitRequest.make({ envelope: pending.envelope, schema: definition.schemaIdentity })
       yield* faults.dropNextReceipt
@@ -136,32 +176,24 @@ describe("test synchronization faults", () => {
       const receipt = yield* sync.submit(request)
       assert.strictEqual(receipt._tag, "Accepted")
       if (receipt._tag === "Accepted") assert.strictEqual(receipt.serverSequence, 1)
-      const page = yield* sync.pull({
-        spaceId,
-        schema: definition.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      })
+      const page = yield* sync.pull(pullRequest(yield* local.replicationState))
       if ("_tag" in page) assert.fail("unexpected bootstrap")
-      assert.strictEqual(page.entries.length, 1)
+      assert.strictEqual(page.changes.length, 1)
     }))
 
   it.effect("duplicates a catch up entry without corrupting local order", () =>
     Effect.gen(function*() {
       const { faults, local, sync } = yield* makeServices
+      yield* synchronize(local, sync)
       const pending = yield* local.mutate(PutTodo, { id: "1", title: "duplicate" })
       const receipt = yield* sync.submit({ envelope: pending.envelope, schema: definition.schemaIdentity })
       yield* local.applyReceipt(receipt)
       yield* faults.duplicateNextPage
-      const page = yield* sync.pull({
-        spaceId,
-        schema: definition.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      })
+      const page = yield* sync.pull(pullRequest(yield* local.replicationState))
       if ("_tag" in page) assert.fail("unexpected bootstrap")
-      assert.deepStrictEqual(page.entries.map((entry) => entry.sequence), [1, 1])
-      yield* local.applyEntries(page.entries)
+      assert.deepStrictEqual(page.changes.map((change) => change._tag), ["Upsert", "Upsert"])
+      yield* local.applyViewPage(page)
+      yield* local.settleReceipts
       assert.strictEqual(yield* local.cursor, 1)
       assert.strictEqual(yield* local.pendingCount, 0)
     }))

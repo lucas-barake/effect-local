@@ -72,12 +72,18 @@ describe("domain contracts", () => {
 
   it("canonicalizes object order and enforces protocol page limits", () => {
     assert.strictEqual(Canonical.stringify({ b: 2, a: 1 }), Canonical.stringify({ a: 1, b: 2 }))
-    assert.throws(() =>
-      Schema.decodeUnknownSync(Protocol.PullRequest)({
-        spaceId: "spc_00000000-0000-4000-8000-000000000001",
-        after: 0,
-        limit: Protocol.maximumBatchEntries + 1
-      })
+    assert.throws(
+      () =>
+        Schema.decodeUnknownSync(Protocol.PullRequest)({
+          spaceId: "spc_00000000-0000-4000-8000-000000000001",
+          clientId: "cli_00000000-0000-4000-8000-000000000001",
+          schema: { version: 1, hash: "0123456789abcdef" },
+          scope: { models: ["Todo"] },
+          scopeGeneration: 1,
+          cursor: null,
+          limit: Protocol.maximumBatchEntries + 1
+        }),
+      /less than or equal to 1000/
     )
   })
 
