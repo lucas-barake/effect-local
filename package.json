@@ -19,6 +19,8 @@
     "check:pre-commit": "pnpm lint && pnpm dead-code && pnpm check && pnpm test --run",
     "lint": "oxlint && dprint check",
     "lint-fix": "oxlint --fix && dprint fmt",
+    "precommit": "node scripts/pre-commit.mjs",
+    "prepare": "git config core.hooksPath .githooks",
     "test": "vitest",
     "coverage": "vitest --coverage",
     "codegen": "node scripts/codegen.mjs",

@@ -47,6 +47,18 @@
   },
   "overrides": [
     {
+      "files": ["scripts/**"],
+      "rules": {
+        "effect/noAsyncFunction": "off",
+        "effect/noGlobals": "off",
+        "effect/noNewError": "off",
+        "effect/noNewPromise": "off",
+        "effect/noNodeBuiltinImport": "off",
+        "effect/noThrowStatement": "off",
+        "effect/noTryCatch": "off"
+      }
+    },
+    {
       "files": ["**/test/**", "**/tests/**", "**/test-browser/**"],
       "rules": { "eslint/no-console": "off" }
     },
