@@ -50,6 +50,10 @@ export class SchemaEvolutionFailed extends Schema.TaggedErrorClass<SchemaEvoluti
   cause: Schema.Defect()
 }) {}
 
+export class StorageMigrationMismatch extends Schema.TaggedErrorClass<StorageMigrationMismatch>(
+  "@lucas-barake/effect-local/StorageMigrationMismatch"
+)("StorageMigrationMismatch", { catalog: Schema.String, message: Schema.String }) {}
+
 export class ReplicaIdentityMismatch extends Schema.TaggedErrorClass<ReplicaIdentityMismatch>(
   "@lucas-barake/effect-local/ReplicaIdentityMismatch"
 )("ReplicaIdentityMismatch", {
@@ -107,6 +111,7 @@ export const ReplicaError = Schema.Union([
   SchemaGenerationConflict,
   SchemaEvolutionUnsupported,
   SchemaEvolutionFailed,
+  StorageMigrationMismatch,
   ReplicaIdentityMismatch,
   MutationIdentityConflict,
   OutOfOrderMutation,
