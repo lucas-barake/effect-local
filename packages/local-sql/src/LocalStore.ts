@@ -328,11 +328,13 @@ export const layer = (
         Result: Rows.CountRow,
         execute: ({ snapshotId, identitiesJson }) =>
           sql`SELECT EXISTS(
-            SELECT 1 FROM effect_local_client_scoped_bootstrap_entries AS staged
-            INNER JOIN json_each(${identitiesJson}) AS incoming
-              ON staged.model = json_extract(incoming.value, '$.model')
-              AND staged.entity_key = json_extract(incoming.value, '$.key')
-            WHERE staged.snapshot_id = ${snapshotId}
+            SELECT 1 FROM json_each(${identitiesJson}) AS incoming
+            WHERE EXISTS(
+              SELECT 1 FROM effect_local_client_scoped_bootstrap_entries AS staged
+              WHERE staged.snapshot_id = ${snapshotId}
+                AND staged.model = json_extract(incoming.value, '$.model')
+                AND staged.entity_key = json_extract(incoming.value, '$.key')
+            )
           ) AS count`
       })
       const findEntityIdentities = SqlSchema.findAll({

@@ -1382,12 +1382,14 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         Result: Rows.CountRow,
         execute: ({ spaceId, clientId, entitiesJson }) =>
           sql`SELECT EXISTS(
-            SELECT 1 FROM effect_local_server_replication_view_entities AS acknowledged
-            INNER JOIN json_each(${entitiesJson}) AS requested
-              ON acknowledged.model = json_extract(requested.value, '$.model')
-              AND acknowledged.entity_key = json_extract(requested.value, '$.key')
-            WHERE acknowledged.space_id = ${spaceId} AND acknowledged.client_id = ${clientId}
-              AND acknowledged.disposition = 'Upsert'
+            SELECT 1 FROM json_each(${entitiesJson}) AS requested
+            WHERE EXISTS(
+              SELECT 1 FROM effect_local_server_replication_view_entities AS acknowledged
+              WHERE acknowledged.space_id = ${spaceId} AND acknowledged.client_id = ${clientId}
+                AND acknowledged.model = json_extract(requested.value, '$.model')
+                AND acknowledged.entity_key = json_extract(requested.value, '$.key')
+                AND acknowledged.disposition = 'Upsert'
+            )
           ) AS count`
       })
       const mutationWakeVisible = (
