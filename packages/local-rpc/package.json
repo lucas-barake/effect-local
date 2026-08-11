@@ -48,9 +48,9 @@
     "dist/**/*.d.ts.map"
   ],
   "scripts": {
-    "build": "tsc -b tsconfig.json",
-    "build:tsgo": "tsgo -b tsconfig.json",
-    "check": "tsc -b tsconfig.json",
+    "build": "tsgo -b tsconfig.json",
+    "build:tsc": "tsc -b tsconfig.json",
+    "check": "tsgo -b tsconfig.json",
     "test": "vitest --config vitest.config.ts"
   },
   "dependencies": {
@@ -58,11 +58,11 @@
     "@lucas-barake/effect-local-sql": "workspace:^"
   },
   "peerDependencies": {
-    "effect": ">=4.0.0-beta.101 <4.0.1"
+    "effect": ">=4.0.0-beta.103 <4.0.1"
   },
   "devDependencies": {
-    "@effect/platform-node": "4.0.0-beta.101",
-    "@effect/sql-sqlite-node": "4.0.0-beta.101",
-    "effect": "4.0.0-beta.101"
+    "@effect/platform-node": "4.0.0-beta.103",
+    "@effect/sql-sqlite-node": "4.0.0-beta.103",
+    "effect": "4.0.0-beta.103"
   }
 }
