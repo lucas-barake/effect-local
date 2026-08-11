@@ -658,7 +658,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           if (options.schemaEvolutionBatchBytes !== undefined) {
             evolutionOptions = { ...evolutionOptions, batchBytes: options.schemaEvolutionBatchBytes }
           }
-          yield* SchemaEvolution.server(evolutionOptions).pipe(Effect.provideService(SqlClient.SqlClient, sql))
+          return yield* SchemaEvolution.server(evolutionOptions).pipe(Effect.provideService(SqlClient.SqlClient, sql))
         }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const bootstrapEntityFits = (spaceId: Identity.SpaceId, entity: Protocol.SnapshotEntity) =>
@@ -1476,24 +1476,24 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         pull: (input) => {
           const request = trustedPullRequest(input)
           return prepareSpace(request.spaceId, request.schema).pipe(
-            Effect.andThen(scopedReplication.pull(request, null))
+            Effect.flatMap((generation) => scopedReplication.pull(request, null, generation))
           )
         },
         pullAuthorized: (request, principal) =>
           authorizeReadScope(request, principal).pipe(
             Effect.andThen(prepareSpace(request.spaceId, request.schema)),
-            Effect.andThen(scopedReplication.pull(request, principal))
+            Effect.flatMap((generation) => scopedReplication.pull(request, principal, generation))
           ),
         bootstrap: (input) => {
           const request = trustedBootstrapRequest(input)
           return prepareSpace(request.spaceId, request.schema).pipe(
-            Effect.andThen(scopedReplication.bootstrap(request, null))
+            Effect.flatMap((generation) => scopedReplication.bootstrap(request, null, generation))
           )
         },
         bootstrapAuthorized: (request, principal) =>
           authorizeReadScope(request, principal).pipe(
             Effect.andThen(prepareSpace(request.spaceId, request.schema)),
-            Effect.andThen(scopedReplication.bootstrap(request, principal))
+            Effect.flatMap((generation) => scopedReplication.bootstrap(request, principal, generation))
           ),
         maintain,
         maintainAll,

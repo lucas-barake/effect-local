@@ -131,7 +131,11 @@ export const ReplicationSpaceRow = Schema.Struct({
   definition_hash: Schema.String,
   schema_version: Identity.SchemaVersion,
   schema_hash: Identity.SchemaHash,
+  schema_generation: NonNegativeInt,
   active_schema_generation: NonNegativeInt,
+  target_schema_version: Schema.NullOr(Identity.SchemaVersion),
+  target_schema_hash: Schema.NullOr(Identity.SchemaHash),
+  migration_hash: Schema.NullOr(Identity.SchemaHash),
   next_server_sequence: PositiveInt,
   next_terminal_sequence: PositiveInt
 })

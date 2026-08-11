@@ -1,4 +1,4 @@
-import { NodeCrypto } from "@effect/platform-node"
+import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Definition from "@lucas-barake/effect-local/Definition"
@@ -11,6 +11,7 @@ import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
+import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Ref from "effect/Ref"
@@ -1180,6 +1181,73 @@ describe("client schema evolution", () => {
       if (!("_tag" in result)) assert.fail("expected a replacement bootstrap")
       assert.notStrictEqual(result.manifest.cursor.viewId, outstanding.cursor.viewId)
     })).pipe(Effect.provide(database)))
+
+  it.effect("fences scoped writes after the prepared schema generation changes", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const fs = yield* FileSystem.FileSystem
+      const directory = yield* fs.makeTempDirectoryScoped()
+      const filename = `${directory}/schema-fence.sqlite`
+      const persistentDatabase = () =>
+        Layer.mergeAll(SqliteClient.layer({ filename }), NodeCrypto.layer, Reactivity.layer)
+      const prepared = yield* Deferred.make<void>()
+      const resume = yield* Deferred.make<void>()
+      const scopeAuthorizations = yield* Ref.make(0)
+      const runtimeV1 = MutationRuntime.layer(definitionV1).pipe(Layer.provide(handlersV1))
+      const serverV1 = yield* Layer.build(
+        ServerStore.layer({
+          ...serverHistory,
+          definition: definitionV1,
+          schemaEvolutionBatchSize: 1,
+          authorizeAccess: () => Effect.void,
+          authorizeMutation: () => Effect.void,
+          authorizeRead: (input) => {
+            if (input._tag === "Entity") return Effect.void
+            return Ref.updateAndGet(scopeAuthorizations, (count) => count + 1).pipe(
+              Effect.flatMap((count) => {
+                if (count !== 2) return Effect.void
+                return Deferred.succeed(prepared, undefined).pipe(Effect.andThen(Deferred.await(resume)))
+              })
+            )
+          }
+        }).pipe(Layer.provide(runtimeV1), Layer.provide(persistentDatabase()))
+      ).pipe(
+        Effect.map((context) => Context.get(context, ServerStore.ServerStore))
+      )
+      const stale = yield* serverV1.pullAuthorized(
+        Protocol.PullRequest.make({
+          spaceId,
+          clientId,
+          schema: definitionV1.schemaIdentity,
+          scope: Protocol.ReplicationScope.make({ models: [TodoV1.name] }),
+          scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
+          cursor: null,
+          limit: 10
+        }),
+        null
+      ).pipe(Effect.result, Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.await(prepared)
+      yield* SchemaEvolution.server({ definition: definitionV2, evolution, spaceId, batchSize: 1 }).pipe(
+        Effect.provide(SqliteClient.layer({ filename }))
+      )
+      yield* Deferred.succeed(resume, undefined)
+      const result = yield* Fiber.join(stale)
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) assert.strictEqual(result.failure._tag, "SchemaGenerationConflict")
+      const CountRow = Schema.Struct({ count: Schema.Number })
+      const staleCount = yield* Effect.gen(function*() {
+        const sql = yield* SqlClient.SqlClient
+        return yield* SqlSchema.findOne({
+          Request: Schema.Void,
+          Result: CountRow,
+          execute: () =>
+            sql`SELECT
+              (SELECT COUNT(*) FROM effect_local_server_replication_views WHERE space_id = ${spaceId}) +
+              (SELECT COUNT(*) FROM effect_local_server_scoped_snapshots WHERE space_id = ${spaceId}) AS count`
+        })(undefined)
+      })
+        .pipe(Effect.provide(SqliteClient.layer({ filename })))
+      assert.strictEqual(staleCount.count, 0)
+    })).pipe(Effect.provide(NodeFileSystem.layer)))
 
   it.effect("migrates every server receipt when client sequences overlap", () =>
     Effect.scoped(Effect.gen(function*() {

@@ -53,8 +53,8 @@ export const make = (options: Options) => {
     Request: Identity.SpaceId,
     Result: Rows.ReplicationSpaceRow,
     execute: (spaceId) =>
-      sql`SELECT definition_hash, schema_version, schema_hash, active_schema_generation,
-        next_server_sequence, next_terminal_sequence
+      sql`SELECT definition_hash, schema_version, schema_hash, schema_generation, active_schema_generation,
+        target_schema_version, target_schema_hash, migration_hash, next_server_sequence, next_terminal_sequence
       FROM effect_local_server_spaces WHERE space_id = ${spaceId}`
   })
   const findEntities = SqlSchema.findAll({
@@ -121,6 +121,50 @@ export const make = (options: Options) => {
 
   const scopeDigest = (scope: Protocol.ReplicationScope) =>
     Protocol.replicationScopeDigest(scope).pipe(Effect.provideService(Crypto.Crypto, options.crypto))
+
+  const lockSpace = (spaceId: Identity.SpaceId) =>
+    sql`INSERT INTO effect_local_server_space_counts (space_id, history_count, receipt_count)
+      VALUES (${spaceId}, 0, 0) ON CONFLICT (space_id) DO NOTHING`.pipe(
+      Effect.andThen(findSpace(spaceId)),
+      Effect.mapError(StorageUnavailable.make)
+    )
+
+  const validatePreparedSpace = (
+    request: Protocol.PullRequest | Protocol.BootstrapRequest,
+    expectedGeneration: number,
+    space: typeof Rows.ReplicationSpaceRow.Type
+  ) => {
+    if (
+      space.schema_generation !== expectedGeneration || space.active_schema_generation !== expectedGeneration ||
+      space.target_schema_version !== null || space.target_schema_hash !== null || space.migration_hash !== null
+    ) {
+      let actual = space.schema_generation
+      if (actual === expectedGeneration) actual = space.active_schema_generation
+      return Effect.fail(
+        new ReplicaError.SchemaGenerationConflict({
+          expected: expectedGeneration,
+          actual
+        })
+      )
+    }
+    if (space.schema_version !== request.schema.version || space.schema_hash !== request.schema.hash) {
+      return Effect.fail(
+        new ReplicaError.StaleSchema({
+          expectedVersion: request.schema.version,
+          expectedHash: request.schema.hash,
+          actualVersion: space.schema_version,
+          actualHash: space.schema_hash
+        })
+      )
+    }
+    if (space.definition_hash === options.definition.hash) return Effect.void
+    return Effect.fail(
+      new ReplicaError.DefinitionMismatch({
+        expected: options.definition.hash,
+        actual: space.definition_hash
+      })
+    )
+  }
 
   const decodeAuthoritative = (
     spaceId: Identity.SpaceId,
@@ -607,9 +651,15 @@ export const make = (options: Options) => {
       return page
     })
 
-  const pull = (request: Protocol.PullRequest, principal: typeof Schema.Json.Type) =>
+  const pull = (
+    request: Protocol.PullRequest,
+    principal: typeof Schema.Json.Type,
+    expectedGeneration: number
+  ) =>
     sql.withTransaction(Effect.gen(function*() {
       yield* options.authorization.scope(request, principal)
+      const space = yield* lockSpace(request.spaceId)
+      yield* validatePreparedSpace(request, expectedGeneration, space)
       const normalized = yield* Protocol.validateReplicationScope(options.definition, request.scope)
       const normalizedDigest = yield* scopeDigest(normalized)
       const principalHash = yield* principalDigest(principal)
@@ -677,7 +727,6 @@ export const make = (options: Options) => {
       }).pipe(Effect.mapError(StorageUnavailable.make))
       const target = yield* visible({ ...request, scope: normalized }, principal, all)
       const changes = yield* diff({ ...request, scope: normalized }, acknowledged, all, target)
-      const space = yield* findSpace(request.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
       return yield* persistNextPage(
         request,
         principalHash,
@@ -689,9 +738,15 @@ export const make = (options: Options) => {
       )
     })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
-  const bootstrap = (request: Protocol.BootstrapRequest, principal: typeof Schema.Json.Type) =>
+  const bootstrap = (
+    request: Protocol.BootstrapRequest,
+    principal: typeof Schema.Json.Type,
+    expectedGeneration: number
+  ) =>
     sql.withTransaction(Effect.gen(function*() {
       yield* options.authorization.scope(request, principal)
+      const space = yield* lockSpace(request.spaceId)
+      yield* validatePreparedSpace(request, expectedGeneration, space)
       const normalized = yield* Protocol.validateReplicationScope(options.definition, request.scope)
       const normalizedDigest = yield* scopeDigest(normalized)
       const principalHash = yield* principalDigest(principal)
