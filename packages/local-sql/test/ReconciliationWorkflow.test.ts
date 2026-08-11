@@ -3,6 +3,7 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
@@ -30,6 +31,7 @@ import * as Domain from "./Domain.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const scopeGeneration = Identity.ReplicationScopeGeneration.make(1)
 
 const database = () =>
   Layer.mergeAll(
@@ -52,6 +54,7 @@ const migration = {
   maximumAttempts: 8
 } satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
 const clientHistory = {
+  scope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
   retainedReceipts: 256,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,
@@ -118,6 +121,8 @@ describe("reconciliation workflow", () => {
       const second = yield* replica.mutate(Domain.PutTodo, Domain.todo("2"))
       const requested = (yield* local.reconciliationGenerations).requested
       const payload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
@@ -131,6 +136,8 @@ describe("reconciliation workflow", () => {
       let completed = yield* local.reconciliationGenerations
       while (completed.completed < completed.requested) {
         const nextPayload = ReconciliationWorkflow.Payload.make({
+          scope: clientHistory.scope,
+          scopeGeneration,
           schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
           spaceId,
           clientId,
@@ -171,6 +178,8 @@ describe("reconciliation workflow", () => {
       )
       const context = yield* Layer.build(replicaLayer)
       const payload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId: Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002"),
         clientId,
@@ -215,6 +224,8 @@ describe("reconciliation workflow", () => {
       const mutation = yield* replica.mutate(Domain.PutTodo, Domain.todo("cluster"))
       const requested = (yield* local.reconciliationGenerations).requested
       const payload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
@@ -225,6 +236,8 @@ describe("reconciliation workflow", () => {
       let generations = yield* local.reconciliationGenerations
       while (generations.completed < generations.requested) {
         const nextPayload = ReconciliationWorkflow.Payload.make({
+          scope: clientHistory.scope,
+          scopeGeneration,
           schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
           spaceId,
           clientId,
@@ -299,6 +312,8 @@ describe("reconciliation workflow", () => {
 
       const retainedGeneration = yield* legacy.requestReconciliation
       const retainedPayload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
@@ -315,6 +330,8 @@ describe("reconciliation workflow", () => {
       const current = yield* register(definitionV2)
       const generation = yield* current.requestReconciliation
       const payload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${definitionV2.schemaIdentity.version}:${definitionV2.schemaIdentity.hash}`,
         spaceId,
         clientId,
@@ -331,6 +348,8 @@ describe("reconciliation workflow", () => {
 
       const legacyGeneration = yield* legacy.requestReconciliation
       const legacyPayload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
@@ -403,12 +422,16 @@ describe("reconciliation workflow", () => {
       yield* register(clientId, firstPulls, firstPulled)
       yield* register(secondClientId, secondPulls, secondPulled)
       const firstPayload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
         generation: 1
       })
       const secondPayload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId: secondClientId,
@@ -473,6 +496,8 @@ describe("reconciliation workflow", () => {
       yield* local.mutate(Domain.PutTodo, Domain.todo("permanent-failure"))
       const generations = yield* local.reconciliationGenerations
       const payload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
@@ -544,6 +569,8 @@ describe("reconciliation workflow", () => {
       )
       const generation = yield* local.requestReconciliation
       const payload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,

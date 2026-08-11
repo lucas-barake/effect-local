@@ -30,6 +30,7 @@ const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001"
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 const clientHistory = {
+  scope: Protocol.ReplicationScope.make({ models: ["Todo"] }),
   retainedReceipts: 256,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,

@@ -1,6 +1,7 @@
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Evolution from "@lucas-barake/effect-local/Evolution"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Duration from "effect/Duration"
@@ -29,6 +30,8 @@ const PayloadFields = {
   schemaIdentity: Schema.String,
   spaceId: Identity.SpaceId,
   clientId: Identity.ClientId,
+  scope: Protocol.ReplicationScope,
+  scopeGeneration: Identity.ReplicationScopeGeneration,
   generation: ReconciliationGeneration
 } as const
 
@@ -78,7 +81,14 @@ export const make = ({ clientId, schemaIdentity: workflowSchemaIdentity, spaceId
     success: Schema.Void,
     error: ReplicaError.ReplicaError,
     idempotencyKey: (payload) =>
-      encodeJson([payload.schemaIdentity, payload.spaceId, payload.clientId, payload.generation])
+      encodeJson([
+        payload.schemaIdentity,
+        payload.spaceId,
+        payload.clientId,
+        payload.scope,
+        payload.scopeGeneration,
+        payload.generation
+      ])
   })
 
 export const Execution = Schema.Struct({
@@ -212,6 +222,24 @@ const handler = (
     }
     const local = yield* LocalStore.Store
     const reconciliation = yield* Reconciler.Reconciliation
+    const validateScope = Effect.gen(function*() {
+      const state = yield* local.replicationState
+      if (state.scopeGeneration !== payload.scopeGeneration) {
+        return yield* new ReplicaError.StaleReplicationScope({
+          expected: state.scopeGeneration,
+          actual: payload.scopeGeneration
+        })
+      }
+      if (
+        state.scope.models.length !== payload.scope.models.length ||
+        state.scope.models.some((model, index) => model !== payload.scope.models[index])
+      ) {
+        return yield* new ReplicaError.ProtocolInvalid({
+          message: "Reconciliation workflow scope does not match its durable generation"
+        })
+      }
+      return yield* Effect.void
+    })
     const runActivity = (name: string, execute: Effect.Effect<void, ReplicaError.ReplicaError>) =>
       Effect.gen(function*() {
         let attempt = 1
@@ -223,7 +251,10 @@ const handler = (
           }).pipe(Effect.result)
           if (Result.isSuccess(result)) return
           yield* reconciliation.failed(result.failure)
-          if (result.failure._tag === "StaleSchema" || attempt >= configuration.maximumAttempts) {
+          if (
+            result.failure._tag === "StaleSchema" || result.failure._tag === "StaleReplicationScope" ||
+            attempt >= configuration.maximumAttempts
+          ) {
             yield* result.failure
             return
           }
@@ -236,8 +267,11 @@ const handler = (
         }
       })
 
-    yield* runActivity("sync", reconciliation.sync)
-    yield* runActivity("complete", local.completeReconciliation(payload.generation))
+    yield* runActivity("sync", validateScope.pipe(Effect.andThen(reconciliation.sync), Effect.andThen(validateScope)))
+    yield* runActivity(
+      "complete",
+      validateScope.pipe(Effect.andThen(local.completeReconciliation(payload.generation)))
+    )
     yield* reconciliation.succeeded
     return undefined
   })
@@ -376,10 +410,13 @@ const layerSchedulerWithConfiguration = (
               while (true) {
                 const generations = yield* local.reconciliationGenerations
                 if (generations.completed >= generations.requested) return
+                const state = yield* local.replicationState
                 const payload = Payload.make({
                   schemaIdentity: schemaIdentityKey(options.definition),
                   spaceId: options.spaceId,
                   clientId: options.clientId,
+                  scope: state.scope,
+                  scopeGeneration: state.scopeGeneration,
                   generation: generations.requested
                 })
                 yield* make(payload).execute(payload)
@@ -397,7 +434,17 @@ const layerSchedulerWithConfiguration = (
       const supervisorFiber = yield* Effect.forkScoped(supervise)
       const watchFiber = yield* Effect.forkScoped(
         Effect.forever(
-          remote.watch({ spaceId: options.spaceId, schema: options.definition.schemaIdentity }).pipe(
+          local.replicationState.pipe(
+            Effect.map((state) => ({
+              spaceId: options.spaceId,
+              clientId: options.clientId,
+              schema: options.definition.schemaIdentity,
+              scope: state.scope,
+              scopeGeneration: state.scopeGeneration,
+              cursor: state.cursor
+            })),
+            Effect.map(remote.watch),
+            Stream.unwrap,
             Stream.runForEach(() => requestAndNotify),
             Effect.matchEffect({
               onFailure: (error) => {

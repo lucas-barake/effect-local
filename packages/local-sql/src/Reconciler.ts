@@ -78,9 +78,14 @@ export const layerOnePass = (
         Effect.gen(function*() {
           let afterOrdinal = yield* local.prepareBootstrap(manifest)
           while (true) {
+            const state = yield* local.replicationState
             const page = yield* remote.bootstrap({
               spaceId: options.spaceId,
+              clientId: state.clientId,
               schema: options.definition.schemaIdentity,
+              scope: state.scope,
+              scopeGeneration: state.scopeGeneration,
+              cursor: manifest.cursor,
               snapshotId: manifest.snapshotId,
               afterOrdinal,
               limit: pageSize
@@ -94,15 +99,25 @@ export const layerOnePass = (
               yield* local.installBootstrap(page.manifest)
               return yield* Effect.void
             }
-            afterOrdinal += page.entities.length
+            afterOrdinal += page.entries.length
           }
         })
 
       const bootstrapExpired = (receipt: Protocol.ExpiredReceipt) =>
         Effect.gen(function*() {
+          const state = yield* local.replicationState
+          if (state.cursor === null) {
+            return yield* new ReplicaError.ProtocolInvalid({
+              message: "Expired receipt recovery requires an installed replication view"
+            })
+          }
           const firstPage = yield* remote.bootstrap({
             spaceId: options.spaceId,
+            clientId: state.clientId,
             schema: options.definition.schemaIdentity,
+            scope: state.scope,
+            scopeGeneration: state.scopeGeneration,
+            cursor: state.cursor,
             snapshotId: receipt.snapshotId,
             afterOrdinal: -1,
             limit: pageSize
@@ -122,12 +137,17 @@ export const layerOnePass = (
               yield* local.installBootstrap(firstPage.manifest)
               return yield* Effect.void
             }
-            afterOrdinal = firstPage.entities.length - 1
+            afterOrdinal = firstPage.entries.length - 1
           }
           while (true) {
+            const current = yield* local.replicationState
             const page = yield* remote.bootstrap({
               spaceId: options.spaceId,
+              clientId: current.clientId,
               schema: options.definition.schemaIdentity,
+              scope: current.scope,
+              scopeGeneration: current.scopeGeneration,
+              cursor: firstPage.manifest.cursor,
               snapshotId: firstPage.manifest.snapshotId,
               afterOrdinal,
               limit: pageSize
@@ -141,24 +161,27 @@ export const layerOnePass = (
               yield* local.installBootstrap(page.manifest)
               return yield* Effect.void
             }
-            afterOrdinal += page.entities.length
+            afterOrdinal += page.entries.length
           }
         })
 
       const catchUp = Effect.gen(function*() {
         while (true) {
-          const cursor = yield* local.cursor
+          const state = yield* local.replicationState
           const result = yield* remote.pull({
             spaceId: options.spaceId,
+            clientId: state.clientId,
             schema: options.definition.schemaIdentity,
-            after: cursor,
+            scope: state.scope,
+            scopeGeneration: state.scopeGeneration,
+            cursor: state.cursor,
             limit: pageSize
           })
           if ("_tag" in result) {
             yield* bootstrap(result.manifest)
             continue
           }
-          yield* local.applyEntries(result.entries)
+          yield* local.applyViewPage(result)
           if (!result.hasMore) return
         }
       })
@@ -197,8 +220,13 @@ export const layerOnePass = (
         yield* catchUp
         yield* submitPending
         yield* catchUp
+        yield* local.settleReceipts
         yield* succeeded
       })).pipe(
+        Effect.tapError((error) => {
+          if (error._tag === "AuthorizationDenied") return local.revokeReplication
+          return Effect.void
+        }),
         Effect.tapError(failed),
         Effect.withSpan("Reconciliation.sync")
       )
@@ -257,7 +285,17 @@ export const layerInMemoryScheduler = (
       const workerFiber = yield* Effect.forkScoped(worker)
       const watchFiber = yield* Effect.forkScoped(
         Effect.forever(
-          remote.watch({ spaceId: options.spaceId, schema: options.definition.schemaIdentity }).pipe(
+          local.replicationState.pipe(
+            Effect.map((state) => ({
+              spaceId: options.spaceId,
+              clientId: state.clientId,
+              schema: options.definition.schemaIdentity,
+              scope: state.scope,
+              scopeGeneration: state.scopeGeneration,
+              cursor: state.cursor
+            })),
+            Effect.map(remote.watch),
+            Stream.unwrap,
             Stream.runForEach(() => requestAndNotify),
             Effect.matchEffect({
               onFailure: (error) => {

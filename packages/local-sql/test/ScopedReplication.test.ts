@@ -8,12 +8,19 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
+import * as Ref from "effect/Ref"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
+import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
+import * as LocalStore from "../src/LocalStore.js"
 import type * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
+import * as Reconciler from "../src/Reconciler.js"
+import * as ReconciliationWorkflow from "../src/ReconciliationWorkflow.js"
 import * as ServerStore from "../src/ServerStore.js"
+import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
@@ -33,6 +40,15 @@ const history = {
   retainedSnapshots: 2,
   maintenanceConcurrency: 1,
   maintenanceSpaceBatchSize: 128,
+  migration
+}
+const clientHistory = {
+  retainedReceipts: 256,
+  maximumReceipts: 10_000,
+  retainedHistoryEntries: 256,
+  maximumBootstrapEntities: 10_000,
+  maximumBootstrapBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: Protocol.maximumBatchBytes,
   migration
 }
 
@@ -142,6 +158,23 @@ describe("scoped replication", () => {
         assert.notStrictEqual(reader.manifest.snapshotId, owner.manifest.snapshotId)
         assert.strictEqual(reader.manifest.entityCount, 0)
         assert.strictEqual(owner.manifest.entityCount, 1)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("retracts the prior principal view when a client changes principals", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        yield* server.submit(yield* envelope("private", 1))
+        const owner = yield* server.pullAuthorized(pullRequest(), "owner")
+        if (!("_tag" in owner)) assert.fail("expected owner bootstrap")
+        yield* server.bootstrapAuthorized(bootstrapRequest(owner.manifest), "owner")
+
+        const reader = yield* server.pullAuthorized(pullRequest(owner.manifest.cursor), "reader")
+        if (!("_tag" in reader)) assert.fail("expected principal rotation bootstrap")
+        const page = yield* server.bootstrapAuthorized(bootstrapRequest(reader.manifest), "reader")
+        assert.deepStrictEqual(page.entries.map((entry) => entry.change._tag), ["Retract"])
+        assert.deepStrictEqual(page.entries.map((entry) => entry.change.entity.key), ["private"])
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
@@ -284,6 +317,155 @@ describe("scoped replication", () => {
 
         const stale = yield* server.pullAuthorized(pullRequest(empty.cursor, scope, 0), "reader").pipe(Effect.flip)
         assert.strictEqual(stale._tag, "StaleReplicationScope")
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("evicts a retracted entity without letting pending replay restore it", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        let visible = true
+        const server = yield* service(
+          ServerStore.ServerStore,
+          makeServer((input) => {
+            if (input._tag === "Entity" && !visible) return Effect.fail("revoked")
+            return Effect.void
+          })
+        )
+        const local = yield* service(
+          LocalStore.Store,
+          LocalStore.layer({
+            ...clientHistory,
+            definition: Domain.definition,
+            spaceId,
+            clientId: readerId,
+            scope
+          }).pipe(Layer.provide(runtime), Layer.provide(database))
+        )
+        yield* server.submit(yield* envelope("public", 1))
+        const required = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        const bootstrap = yield* server.bootstrapAuthorized(bootstrapRequest(required.manifest), "reader")
+        yield* local.prepareBootstrap(required.manifest)
+        assert.isTrue(yield* local.stageBootstrapPage(bootstrap))
+        yield* local.installBootstrap(required.manifest)
+        assert.isTrue(Option.isSome(yield* local.get(Domain.Todo, "public")))
+
+        yield* local.mutate(Domain.RenameTodo, { id: "public", title: "optimistic" })
+        visible = false
+        const revoked = yield* server.pullAuthorized(pullRequest(required.manifest.cursor), "reader")
+        if ("_tag" in revoked) assert.fail("expected retraction page")
+        yield* local.applyViewPage(revoked)
+        assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "public")))
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("reconciles scope changes incrementally through the durable client view", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        yield* server.submit(yield* envelope("public", 1))
+        const bootstrapCalls = yield* Ref.make(0)
+        const remote = Layer.succeed(
+          SyncEngine.SyncEngine,
+          SyncEngine.SyncEngine.of({
+            submit: server.submit,
+            pull: (request) => server.pullAuthorized(request, "reader"),
+            bootstrap: (request) =>
+              Ref.update(bootstrapCalls, (count) => count + 1).pipe(
+                Effect.andThen(server.bootstrapAuthorized(request, "reader"))
+              ),
+            watch: (request) => Stream.unwrap(server.watchAuthorized(request, "reader"))
+          })
+        )
+        const clientDatabase = database
+        const localLayer = LocalStore.layer({
+          ...clientHistory,
+          definition: Domain.definition,
+          spaceId,
+          clientId: readerId,
+          scope
+        }).pipe(Layer.provide(runtime), Layer.provide(clientDatabase))
+        const reconcilerLayer = Reconciler.layerOnePass({
+          definition: Domain.definition,
+          spaceId
+        }).pipe(Layer.provide(localLayer), Layer.provide(remote))
+        const context = yield* Layer.build(Layer.mergeAll(localLayer, reconcilerLayer, clientDatabase))
+        const local = Context.get(context, LocalStore.Store)
+        const reconciler = Context.get(context, Reconciler.Reconciliation)
+
+        yield* reconciler.sync
+        assert.isTrue(Option.isSome(yield* local.get(Domain.Todo, "public")))
+        assert.strictEqual(yield* Ref.get(bootstrapCalls), 1)
+
+        yield* local.mutate(Domain.PutTodo, Domain.todo("client"))
+        yield* reconciler.sync
+        assert.strictEqual(yield* local.pendingCount, 0)
+        assert.isTrue(Option.isSome(yield* local.get(Domain.Todo, "client")))
+
+        yield* local.setScope(Protocol.ReplicationScope.make({ models: [] }))
+        yield* reconciler.sync
+        assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "public")))
+        assert.strictEqual(yield* Ref.get(bootstrapCalls), 1)
+
+        yield* local.setScope(scope)
+        yield* reconciler.sync
+        assert.isTrue(Option.isSome(yield* local.get(Domain.Todo, "public")))
+        assert.strictEqual(yield* Ref.get(bootstrapCalls), 1)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("fences a durable workflow created for an older scope generation", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const local = yield* service(
+          LocalStore.Store,
+          LocalStore.layer({
+            ...clientHistory,
+            definition: Domain.definition,
+            spaceId,
+            clientId: readerId,
+            scope
+          }).pipe(Layer.provide(runtime), Layer.provide(database))
+        )
+        const syncCalls = yield* Ref.make(0)
+        const reconciliation = Reconciler.Reconciliation.of({
+          sync: Ref.update(syncCalls, (count) => count + 1),
+          failed: () => Effect.void,
+          succeeded: Effect.void,
+          status: Effect.succeed({ _tag: "Offline", pending: 0 })
+        })
+        const engine = yield* service(WorkflowEngine.WorkflowEngine, WorkflowEngine.layerMemory)
+        yield* Layer.build(
+          ReconciliationWorkflow.layerRegistration({
+            definition: Domain.definition,
+            spaceId,
+            clientId: readerId,
+            retryDelay: "1 millis",
+            maximumRetryDelay: "1 millis",
+            maximumAttempts: 3
+          }).pipe(
+            Layer.provide(Layer.succeed(LocalStore.Store, local)),
+            Layer.provide(Layer.succeed(Reconciler.Reconciliation, reconciliation)),
+            Layer.provide(Layer.succeed(WorkflowEngine.WorkflowEngine, engine))
+          )
+        )
+        const generation = yield* local.requestReconciliation
+        const initial = yield* local.replicationState
+        const payload = ReconciliationWorkflow.Payload.make({
+          schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
+          spaceId,
+          clientId: readerId,
+          scope: initial.scope,
+          scopeGeneration: initial.scopeGeneration,
+          generation
+        })
+        yield* local.setScope(Protocol.ReplicationScope.make({ models: [] }))
+        const error = yield* ReconciliationWorkflow.make(payload).execute(payload).pipe(
+          Effect.provideService(WorkflowEngine.WorkflowEngine, engine),
+          Effect.flip
+        )
+        assert.strictEqual(error._tag, "StaleReplicationScope")
+        assert.strictEqual(yield* Ref.get(syncCalls), 0)
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 })

@@ -292,7 +292,7 @@ export const make = (options: Options) => {
       const all = yield* authoritative(request.spaceId)
       const target = yield* visible({ ...request, scope: normalized }, principal, all)
       let priorRows: ReadonlyArray<typeof Rows.ReplicationViewEntityRow.Type> = []
-      if (Option.isSome(previous) && previous.value.principal_digest === principalHash) {
+      if (Option.isSome(previous)) {
         priorRows = yield* findViewEntities({
           spaceId: request.spaceId,
           clientId: request.clientId,

@@ -76,6 +76,7 @@ const runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Doma
 
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 const clientHistory = {
+  scope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
   retainedReceipts: 256,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,

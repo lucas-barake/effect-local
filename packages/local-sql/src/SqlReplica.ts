@@ -1,6 +1,7 @@
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import type * as Evolution from "@lucas-barake/effect-local/Evolution"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
+import type * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
@@ -16,6 +17,7 @@ export interface Options<D extends Definition.Any,> {
   readonly definition: D
   readonly spaceId: Identity.SpaceId
   readonly clientId: Identity.ClientId
+  readonly scope: Protocol.ReplicationScope
   readonly maximumPendingMutations?: number
   readonly evolution?: Evolution.Evolution
   readonly schemaEvolutionBatchSize?: number
