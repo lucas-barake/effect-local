@@ -64,14 +64,20 @@ describe("storage migration catalogs", () => {
         clientId
       })
 
-      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2])
+      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4])
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
         "effect_local_client_evolution",
         "effect_local_client_key_lineage",
+        "effect_local_client_key_lineage_groups",
+        "effect_local_client_key_lineage_targets",
         "effect_local_client_shadow_entities",
+        "effect_local_client_shadow_pending",
+        "effect_local_client_shadow_visible_entities",
         "effect_local_server_evolution",
         "effect_local_server_key_lineage",
+        "effect_local_server_key_lineage_groups",
+        "effect_local_server_key_lineage_targets",
         "effect_local_server_shadow_entities"
       ])
     }).pipe(Effect.provide(database)))

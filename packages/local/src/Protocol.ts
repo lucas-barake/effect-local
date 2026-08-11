@@ -24,20 +24,50 @@ export type MutationDigest = typeof MutationDigest.Type
 export const MutationDigestVersion = Schema.Literals([1, 2])
 export type MutationDigestVersion = typeof MutationDigestVersion.Type
 
-export const MutationEnvelope = Schema.Struct({
+const MutationIdentity = {
   spaceId: Identity.SpaceId,
   clientId: Identity.ClientId,
   mutationId: Identity.MutationId,
   localSequence: Identity.LocalSequence,
   basis: Identity.ServerSequence,
   name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
-  payload: Schema.Json,
+  payload: Schema.Json
+}
+
+export const MutationEnvelope = Schema.Struct({
+  ...MutationIdentity,
+  digestVersion: MutationDigestVersion,
+  sourceSchema: Identity.SchemaIdentity,
+  mutationVersion: Identity.SchemaVersion,
   digest: MutationDigest
 })
 export type MutationEnvelope = typeof MutationEnvelope.Type
 
+export const mutationDigestInput = (envelope: Omit<MutationEnvelope, "digest">): unknown => {
+  const identity = {
+    spaceId: envelope.spaceId,
+    clientId: envelope.clientId,
+    mutationId: envelope.mutationId,
+    localSequence: envelope.localSequence,
+    basis: envelope.basis,
+    name: envelope.name,
+    payload: envelope.payload
+  }
+  if (envelope.digestVersion === 1) return identity
+  return {
+    ...identity,
+    digestVersion: envelope.digestVersion,
+    sourceSchema: envelope.sourceSchema,
+    mutationVersion: envelope.mutationVersion
+  }
+}
+
+export const mutationDigest = (envelope: Omit<MutationEnvelope, "digest">) =>
+  Canonical.digest(mutationDigestInput(envelope))
+
 export const EntityKey = Schema.Struct({
   model: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  modelVersion: Identity.SchemaVersion,
   key: Schema.Json
 })
 export type EntityKey = typeof EntityKey.Type
@@ -59,18 +89,37 @@ const ReceiptIdentity = {
 
 export const AcceptedReceipt = Schema.TaggedStruct("Accepted", {
   ...ReceiptIdentity,
+  name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  sourceSchema: Identity.SchemaIdentity,
+  mutationVersion: Identity.SchemaVersion,
   serverSequence: Identity.ServerSequence,
   result: Schema.Json
 })
 export type AcceptedReceipt = typeof AcceptedReceipt.Type
 
+export const RejectionOrigin = Schema.Literals(["Mutation", "Authorization", "Capacity", "Legacy"])
+export type RejectionOrigin = typeof RejectionOrigin.Type
+
 export const RejectedReceipt = Schema.TaggedStruct("Rejected", {
   ...ReceiptIdentity,
+  name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  sourceSchema: Identity.SchemaIdentity,
+  mutationVersion: Identity.SchemaVersion,
+  origin: RejectionOrigin,
   rejection: Schema.Json
 })
 export type RejectedReceipt = typeof RejectedReceipt.Type
 
-export const Receipt = Schema.Union([AcceptedReceipt, RejectedReceipt])
+export const LegacyReceipt = Schema.TaggedStruct("Legacy", {
+  ...ReceiptIdentity,
+  sourceSchema: Identity.SchemaIdentity,
+  outcome: Schema.Literals(["Accepted", "Rejected"]),
+  serverSequence: Schema.NullOr(Identity.ServerSequence),
+  body: Schema.Json
+})
+export type LegacyReceipt = typeof LegacyReceipt.Type
+
+export const Receipt = Schema.Union([AcceptedReceipt, RejectedReceipt, LegacyReceipt])
 export type Receipt = typeof Receipt.Type
 
 export const AcceptedMutation = Schema.Struct({
@@ -79,6 +128,7 @@ export const AcceptedMutation = Schema.Struct({
   clientId: Identity.ClientId,
   mutationId: Identity.MutationId,
   localSequence: Identity.LocalSequence,
+  sourceSchema: Identity.SchemaIdentity,
   digest: MutationDigest,
   changes: Schema.Array(EntityChange)
 })

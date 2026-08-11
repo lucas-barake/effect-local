@@ -103,21 +103,24 @@ export const layer = (
         Request: Schema.Void,
         Result: Rows.PendingRow,
         execute: () =>
-          sql`SELECT mutation_id, local_sequence, basis, name, payload_json, digest,
+          sql`SELECT mutation_id, local_sequence, basis, name, payload_json, digest, digest_version,
+        source_schema_version, source_schema_hash, mutation_version,
         optimistic_result_json, changes_json FROM effect_local_pending ORDER BY local_sequence`
       })
       const findPendingByMutation = SqlSchema.findOneOption({
         Request: Identity.MutationId,
         Result: Rows.PendingRow,
         execute: (mutationId) =>
-          sql`SELECT mutation_id, local_sequence, basis, name, payload_json, digest,
+          sql`SELECT mutation_id, local_sequence, basis, name, payload_json, digest, digest_version,
+        source_schema_version, source_schema_hash, mutation_version,
         optimistic_result_json, changes_json FROM effect_local_pending WHERE mutation_id = ${mutationId}`
       })
       const findReplayPending = SqlSchema.findAll({
         Request: Schema.Void,
         Result: Rows.PendingRow,
         execute: () =>
-          sql`SELECT p.mutation_id, p.local_sequence, p.basis, p.name, p.payload_json, p.digest,
+          sql`SELECT p.mutation_id, p.local_sequence, p.basis, p.name, p.payload_json, p.digest, p.digest_version,
+        p.source_schema_version, p.source_schema_hash, p.mutation_version,
         p.optimistic_result_json, p.changes_json FROM effect_local_pending AS p
         WHERE NOT EXISTS (
           SELECT 1 FROM effect_local_server_log AS l WHERE l.mutation_id = p.mutation_id
@@ -133,7 +136,8 @@ export const layer = (
         Request: Schema.Struct({ after: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) }),
         Result: Rows.PendingReceiptRow,
         execute: ({ after }) =>
-          sql`SELECT p.mutation_id, p.local_sequence, p.basis, p.name, p.payload_json, p.digest,
+          sql`SELECT p.mutation_id, p.local_sequence, p.basis, p.name, p.payload_json, p.digest, p.digest_version,
+          p.source_schema_version, p.source_schema_hash, p.mutation_version,
           p.optimistic_result_json, p.changes_json, r.receipt_json,
           l.server_sequence, l.mutation_id AS entry_mutation_id, l.entry_json
         FROM effect_local_pending AS p
@@ -174,7 +178,9 @@ export const layer = (
 
       const decodePendingRow = (row: typeof Rows.PendingRow.Type) =>
         Effect.gen(function*() {
-          const payload = yield* Codec.parse(row.payload_json)
+          const payload = yield* Codec.parse(row.payload_json).pipe(
+            Effect.flatMap((value) => Codec.decode(Schema.Json, value))
+          )
           const optimisticResult = yield* Codec.parse(row.optimistic_result_json)
           const changes = yield* Codec.parse(row.changes_json)
           const identity = {
@@ -184,9 +190,17 @@ export const layer = (
             localSequence: row.local_sequence,
             basis: row.basis,
             name: row.name,
-            payload
+            payload,
+            digestVersion: row.digest_version,
+            sourceSchema: Identity.SchemaIdentity.make({
+              version: row.source_schema_version,
+              hash: row.source_schema_hash
+            }),
+            mutationVersion: row.mutation_version
           }
-          const expectedDigest = yield* Canonical.digest(identity).pipe(Effect.provideService(Crypto.Crypto, crypto))
+          const expectedDigest = yield* Protocol.mutationDigest(identity).pipe(
+            Effect.provideService(Crypto.Crypto, crypto)
+          )
           if (row.digest !== expectedDigest) {
             return yield* new ReplicaError.StorageCorrupt({
               message: `Pending mutation ${row.mutation_id} digest does not match its durable identity`
@@ -233,7 +247,10 @@ export const layer = (
               ).pipe(
                 Effect.flatMap((result) =>
                   Result.isFailure(result)
-                    ? Effect.fail(new TerminalRejection.TerminalRejection({ rejection: result.failure }))
+                    ? Effect.fail(new TerminalRejection.TerminalRejection({
+                      origin: "Mutation",
+                      rejection: result.failure
+                    }))
                     : Effect.succeed(result.success)
                 )
               )
@@ -484,9 +501,14 @@ export const layer = (
                 localSequence: storedMeta.next_local_sequence,
                 basis: storedMeta.server_cursor,
                 name: mutation.name,
-                payload: payloadJsonValue
+                payload: payloadJsonValue,
+                digestVersion: 2 as const,
+                sourceSchema: options.definition.schemaIdentity,
+                mutationVersion: mutation.version
               }
-              const digest = yield* Canonical.digest(identity).pipe(Effect.provideService(Crypto.Crypto, crypto))
+              const digest = yield* Protocol.mutationDigest(identity).pipe(
+                Effect.provideService(Crypto.Crypto, crypto)
+              )
               const envelope = yield* Codec.decode(Protocol.MutationEnvelope, { ...identity, digest })
               if ((yield* Protocol.encodedBytesEffect(envelope)) > Protocol.maximumMutationBytes) {
                 return yield* new ReplicaError.CapacityExceeded({
@@ -511,9 +533,11 @@ export const layer = (
                 changes
               }
               yield* sql`INSERT INTO effect_local_pending
-            (mutation_id, local_sequence, basis, name, payload_json, digest, optimistic_result_json, changes_json)
+            (mutation_id, local_sequence, basis, name, payload_json, digest, digest_version,
+              source_schema_version, source_schema_hash, mutation_version, optimistic_result_json, changes_json)
             VALUES (${mutationId}, ${envelope.localSequence}, ${envelope.basis}, ${envelope.name},
-              ${yield* Codec.stringify(envelope.payload)}, ${digest}, ${yield* Codec.stringify(
+              ${yield* Codec.stringify(envelope.payload)}, ${digest}, ${envelope.digestVersion},
+              ${envelope.sourceSchema.version}, ${envelope.sourceSchema.hash}, ${envelope.mutationVersion}, ${yield* Codec.stringify(
                 executed.success.result
               )},
               ${yield* Codec.stringify(changes)})`

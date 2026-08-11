@@ -5,6 +5,10 @@ import { bench } from "vitest"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const sourceSchema = Identity.SchemaIdentity.make({
+  version: Identity.SchemaVersion.make(1),
+  hash: Identity.SchemaHash.make("0123456789abcdef")
+})
 const page: Protocol.PullPage = {
   entries: Array.from({ length: 256 }, (_, index) => ({
     sequence: Identity.ServerSequence.make(index + 1),
@@ -12,10 +16,12 @@ const page: Protocol.PullPage = {
     clientId,
     mutationId: Identity.MutationId.make(`mut_00000000-0000-4000-8000-${String(index).padStart(12, "0")}`),
     localSequence: Identity.LocalSequence.make(index + 1),
+    sourceSchema,
+    mutationVersion: Identity.SchemaVersion.make(1),
     digest: "a".repeat(64),
     changes: [{
       _tag: "Upsert" as const,
-      entity: { model: "Todo", key: String(index) },
+      entity: { model: "Todo", modelVersion: Identity.SchemaVersion.make(1), key: String(index) },
       value: { id: String(index), title: "x".repeat(512) }
     }]
   })),

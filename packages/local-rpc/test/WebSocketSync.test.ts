@@ -4,7 +4,6 @@ import { assert, describe, it } from "@effect/vitest"
 import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime"
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
-import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
@@ -137,11 +136,14 @@ describe("WebSocket synchronization", () => {
         localSequence: Identity.LocalSequence.make(1),
         basis: Identity.ServerSequence.make(0),
         name: PutTodo.name,
-        payload: { id: "1", title: "socket" }
+        payload: { id: "1", title: "socket" },
+        digestVersion: 2 as const,
+        sourceSchema: definition.schemaIdentity,
+        mutationVersion: PutTodo.version
       }
       const envelope: Protocol.MutationEnvelope = {
         ...identity,
-        digest: yield* Canonical.digest(identity)
+        digest: yield* Protocol.mutationDigest(identity)
       }
       const receipt = yield* remote.submit(envelope)
       assert.strictEqual(receipt._tag, "Accepted")
@@ -168,7 +170,7 @@ describe("WebSocket synchronization", () => {
       const forbiddenIdentity = { ...identity, spaceId: forbiddenSpaceId }
       const forbidden = yield* remote.submit({
         ...forbiddenIdentity,
-        digest: yield* Canonical.digest(forbiddenIdentity)
+        digest: yield* Protocol.mutationDigest(forbiddenIdentity)
       }).pipe(Effect.flip)
       assert.strictEqual(forbidden._tag, "AuthorizationDenied")
     }).pipe(
@@ -204,11 +206,14 @@ describe("WebSocket synchronization", () => {
         localSequence: Identity.LocalSequence.make(1),
         basis: Identity.ServerSequence.make(0),
         name: ReturnHugeResult.name,
-        payload: null
+        payload: null,
+        digestVersion: 2 as const,
+        sourceSchema: definition.schemaIdentity,
+        mutationVersion: ReturnHugeResult.version
       }
       const submitted: Protocol.MutationEnvelope = {
         ...identity,
-        digest: yield* Canonical.digest(identity)
+        digest: yield* Protocol.mutationDigest(identity)
       }
       const first = yield* remote.submit(submitted)
       const retry = yield* remote.submit(submitted)

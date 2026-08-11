@@ -1,4 +1,3 @@
-import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
@@ -97,7 +96,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         Result: Rows.ServerReceiptRow,
         execute: ({ spaceId, mutationId }) =>
           sql`SELECT r.space_id, r.client_id, r.local_sequence, r.digest, r.mutation_id, r.receipt_json,
-          l.server_sequence
+          r.digest_version, r.source_schema_version, r.source_schema_hash, r.mutation_version,
+          r.mutation_name, r.rejection_origin, l.server_sequence
         FROM effect_local_server_receipts AS r
         LEFT JOIN effect_local_authoritative_log AS l
           ON l.space_id = r.space_id AND l.mutation_id = r.mutation_id
@@ -108,7 +108,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         Result: Rows.ServerReceiptRow,
         execute: ({ spaceId, clientId, localSequence }) =>
           sql`SELECT r.space_id, r.client_id, r.local_sequence, r.digest, r.mutation_id, r.receipt_json,
-          l.server_sequence
+          r.digest_version, r.source_schema_version, r.source_schema_hash, r.mutation_version,
+          r.mutation_name, r.rejection_origin, l.server_sequence
         FROM effect_local_server_receipts AS r
         LEFT JOIN effect_local_authoritative_log AS l
           ON l.space_id = r.space_id AND l.mutation_id = r.mutation_id
@@ -153,7 +154,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         Result: Rows.ServerLogRow,
         execute: ({ spaceId, after, through }) =>
           sql`SELECT l.space_id, l.server_sequence, l.mutation_id, l.entry_bytes, l.entry_json,
-          r.client_id AS receipt_client_id, r.local_sequence AS receipt_local_sequence, r.digest
+          r.client_id AS receipt_client_id, r.local_sequence AS receipt_local_sequence, r.digest,
+          l.source_schema_version, l.source_schema_hash
         FROM effect_local_authoritative_log AS l
         INNER JOIN effect_local_server_receipts AS r
           ON r.space_id = l.space_id AND r.mutation_id = l.mutation_id
@@ -184,9 +186,16 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             receipt.clientId !== row.client_id ||
             receipt.localSequence !== row.local_sequence ||
             receipt.mutationId !== row.mutation_id ||
+            receipt.sourceSchema.version !== row.source_schema_version ||
+            receipt.sourceSchema.hash !== row.source_schema_hash ||
+            (receipt._tag !== "Legacy" && (
+              receipt.mutationVersion !== row.mutation_version || receipt.name !== row.mutation_name
+            )) ||
             (receipt._tag === "Accepted"
               ? row.server_sequence === null || receipt.serverSequence !== row.server_sequence
-              : row.server_sequence !== null)
+              : receipt._tag === "Rejected"
+              ? row.server_sequence !== null
+              : receipt.serverSequence !== row.server_sequence)
           ) {
             return yield* new ReplicaError.StorageCorrupt({
               message: `Durable receipt ${envelope.mutationId} conflicts with its SQL identity`
@@ -199,13 +208,21 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         resource: "receipt bytes",
         limit: Protocol.maximumReceiptBytes
       }
-      const rejectedReceipt = (envelope: Protocol.MutationEnvelope, rejection: Schema.Json) =>
+      const rejectedReceipt = (
+        envelope: Protocol.MutationEnvelope,
+        rejection: Schema.Json,
+        origin: Protocol.RejectionOrigin
+      ) =>
         Effect.gen(function*() {
           const receipt = Protocol.RejectedReceipt.make({
             spaceId: envelope.spaceId,
             clientId: envelope.clientId,
             mutationId: envelope.mutationId,
             localSequence: envelope.localSequence,
+            name: envelope.name,
+            sourceSchema: envelope.sourceSchema,
+            mutationVersion: envelope.mutationVersion,
+            origin,
             rejection
           })
           return (yield* Protocol.encodedBytesEffect(receipt)) <= Protocol.maximumReceiptBytes
@@ -215,6 +232,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               clientId: envelope.clientId,
               mutationId: envelope.mutationId,
               localSequence: envelope.localSequence,
+              name: envelope.name,
+              sourceSchema: envelope.sourceSchema,
+              mutationVersion: envelope.mutationVersion,
+              origin: "Capacity",
               rejection: receiptCapacityRejection
             })
         })
@@ -243,7 +264,9 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             })
           }
           const { digest, ...identity } = envelope
-          const expectedDigest = yield* Canonical.digest(identity).pipe(Effect.provideService(Crypto.Crypto, crypto))
+          const expectedDigest = yield* Protocol.mutationDigest(identity).pipe(
+            Effect.provideService(Crypto.Crypto, crypto)
+          )
           if (digest !== expectedDigest) {
             return yield* new ReplicaError.MutationIdentityConflict({ mutationId: envelope.mutationId })
           }
@@ -313,7 +336,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             )
             let receipt: Protocol.Receipt
             if (Result.isFailure(authorization)) {
-              receipt = yield* rejectedReceipt(envelope, authorization.failure)
+              receipt = yield* rejectedReceipt(envelope, authorization.failure, "Authorization")
             } else {
               const changes: Array<Protocol.EntityChange> = []
               const executed = yield* sql.withTransaction(
@@ -326,7 +349,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                   Effect.flatMap((result) =>
                     Effect.gen(function*() {
                       if (Result.isFailure(result)) {
-                        return yield* new TerminalRejection.TerminalRejection({ rejection: result.failure })
+                        return yield* new TerminalRejection.TerminalRejection({
+                          origin: "Mutation",
+                          rejection: result.failure
+                        })
                       }
                       const sequence = Identity.ServerSequence.make(storedSpace.next_server_sequence)
                       const entry = Protocol.AcceptedMutation.make({
@@ -335,6 +361,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                         clientId: envelope.clientId,
                         mutationId: envelope.mutationId,
                         localSequence: envelope.localSequence,
+                        sourceSchema: envelope.sourceSchema,
                         digest: envelope.digest,
                         changes: result.success.changes
                       })
@@ -342,6 +369,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                       const pageBytes = yield* Protocol.encodedBytesEffect({ entries: [entry], hasMore: false })
                       if (pageBytes > Protocol.maximumBatchBytes) {
                         return yield* new TerminalRejection.TerminalRejection({
+                          origin: "Capacity",
                           rejection: {
                             _tag: "CapacityExceeded",
                             resource: "accepted mutation bytes",
@@ -354,11 +382,15 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                         clientId: envelope.clientId,
                         mutationId: envelope.mutationId,
                         localSequence: envelope.localSequence,
+                        name: envelope.name,
+                        sourceSchema: envelope.sourceSchema,
+                        mutationVersion: envelope.mutationVersion,
                         serverSequence: sequence,
                         result: result.success.result
                       })
                       if ((yield* Protocol.encodedBytesEffect(receipt)) > Protocol.maximumReceiptBytes) {
                         return yield* new TerminalRejection.TerminalRejection({
+                          origin: "Capacity",
                           rejection: receiptCapacityRejection
                         })
                       }
@@ -373,25 +405,30 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 )
               ).pipe(
                 Effect.map(Result.succeed),
-                Effect.catchTag("TerminalRejection", ({ rejection }) => Effect.succeed(Result.fail(rejection)))
+                Effect.catchTag("TerminalRejection", (terminal) => Effect.succeed(Result.fail(terminal)))
               )
               if (Result.isFailure(executed)) {
-                receipt = yield* rejectedReceipt(envelope, executed.failure)
+                receipt = yield* rejectedReceipt(envelope, executed.failure.rejection, executed.failure.origin)
               } else {
                 const { entry, entryBytes, entryJson } = executed.success
                 const sequence = entry.sequence
                 yield* sql`UPDATE effect_local_server_spaces
               SET next_server_sequence = next_server_sequence + 1 WHERE space_id = ${envelope.spaceId}`
                 yield* sql`INSERT INTO effect_local_authoritative_log
-              (space_id, server_sequence, mutation_id, entry_bytes, entry_json)
-              VALUES (${envelope.spaceId}, ${sequence}, ${envelope.mutationId}, ${entryBytes}, ${entryJson})`
+              (space_id, server_sequence, mutation_id, entry_bytes, entry_json,
+                source_schema_version, source_schema_hash, mutation_version)
+              VALUES (${envelope.spaceId}, ${sequence}, ${envelope.mutationId}, ${entryBytes}, ${entryJson},
+                ${envelope.sourceSchema.version}, ${envelope.sourceSchema.hash}, ${envelope.mutationVersion})`
                 receipt = executed.success.receipt
               }
             }
             yield* sql`INSERT INTO effect_local_server_receipts
-          (space_id, client_id, local_sequence, mutation_id, digest, receipt_json)
+          (space_id, client_id, local_sequence, mutation_id, digest, receipt_json, digest_version,
+            source_schema_version, source_schema_hash, mutation_version, mutation_name, rejection_origin)
           VALUES (${envelope.spaceId}, ${envelope.clientId}, ${envelope.localSequence}, ${envelope.mutationId},
-            ${envelope.digest}, ${yield* Codec.stringify(receipt)})`
+            ${envelope.digest}, ${yield* Codec.stringify(receipt)}, ${envelope.digestVersion},
+            ${envelope.sourceSchema.version}, ${envelope.sourceSchema.hash}, ${envelope.mutationVersion},
+            ${envelope.name}, ${receipt._tag === "Rejected" ? receipt.origin : null})`
             yield* sql`UPDATE effect_local_server_clients SET last_local_sequence = ${envelope.localSequence}
           WHERE space_id = ${envelope.spaceId} AND client_id = ${envelope.clientId}`
             return receipt
@@ -485,6 +522,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               row.receipt_client_id !== entry.clientId ||
               row.receipt_local_sequence !== entry.localSequence ||
               row.digest !== entry.digest ||
+              row.source_schema_version !== entry.sourceSchema.version ||
+              row.source_schema_hash !== entry.sourceSchema.hash ||
               entry.spaceId !== request.spaceId
             ) {
               return yield* new ReplicaError.StorageCorrupt({

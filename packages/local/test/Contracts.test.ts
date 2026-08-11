@@ -4,6 +4,7 @@ import * as Schema from "effect/Schema"
 import * as Canonical from "../src/Canonical.js"
 import * as Definition from "../src/Definition.js"
 import * as Field from "../src/Field.js"
+import * as Identity from "../src/Identity.js"
 import * as Model from "../src/Model.js"
 import * as Mutation from "../src/Mutation.js"
 import * as Protocol from "../src/Protocol.js"
@@ -72,5 +73,33 @@ describe("domain contracts", () => {
         limit: Protocol.maximumBatchEntries + 1
       })
     )
+  })
+
+  it("preserves the legacy mutation digest preimage and binds provenance in version 2", () => {
+    const legacyIdentity = {
+      spaceId: Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001"),
+      clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001"),
+      mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001"),
+      localSequence: Identity.LocalSequence.make(1),
+      basis: Identity.ServerSequence.make(0),
+      name: "PutTodo",
+      payload: { id: "1", title: "legacy" }
+    }
+    const sourceSchema = Identity.SchemaIdentity.make({
+      version: Identity.SchemaVersion.make(1),
+      hash: Identity.SchemaHash.make("0123456789abcdef")
+    })
+    assert.deepStrictEqual(Protocol.mutationDigestInput({
+      ...legacyIdentity,
+      digestVersion: 1,
+      sourceSchema,
+      mutationVersion: Identity.SchemaVersion.make(1)
+    }), legacyIdentity)
+    assert.deepInclude(Protocol.mutationDigestInput({
+      ...legacyIdentity,
+      digestVersion: 2,
+      sourceSchema,
+      mutationVersion: Identity.SchemaVersion.make(1)
+    }), { digestVersion: 2, sourceSchema, mutationVersion: 1 })
   })
 })

@@ -34,6 +34,11 @@ import * as Domain from "./Domain.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const putTodoProvenance = {
+  name: Domain.PutTodo.name,
+  sourceSchema: Domain.definition.schemaIdentity,
+  mutationVersion: Domain.PutTodo.version
+}
 
 const envelope = (
   name: string,
@@ -49,9 +54,12 @@ const envelope = (
       localSequence: Identity.LocalSequence.make(localSequence),
       basis: Identity.ServerSequence.make(0),
       name,
-      payload
+      payload,
+      digestVersion: 2 as const,
+      sourceSchema: Domain.definition.schemaIdentity,
+      mutationVersion: Domain.definition.mutationByName.get(name)?.version ?? Identity.SchemaVersion.make(1)
     }
-    return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Canonical.digest(identity) })
+    return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
   })
 
 const database = () =>
@@ -539,10 +547,12 @@ describe("server reconciled mutation log", () => {
               assert.isTrue(Option.isSome(yield* local.receipt(first.envelope.mutationId)))
             }
             return Protocol.RejectedReceipt.make({
+              ...putTodoProvenance,
               spaceId,
               clientId,
               mutationId: submitted.mutationId,
               localSequence: submitted.localSequence,
+              origin: "Authorization",
               rejection: "denied"
             })
           }),
@@ -583,10 +593,12 @@ describe("server reconciled mutation log", () => {
       yield* Effect.addFinalizer(() => Effect.sync(cancel))
       yield* store.applyReceipt({
         _tag: "Rejected",
+        ...putTodoProvenance,
         spaceId,
         clientId,
         mutationId: pending.envelope.mutationId,
         localSequence: pending.envelope.localSequence,
+        origin: "Authorization",
         rejection: "denied"
       })
       assert.strictEqual(invalidations, 1)
@@ -610,7 +622,7 @@ describe("server reconciled mutation log", () => {
         const local = yield* service(LocalStore.Store, localLayer())
         const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("1"))
         const { digest, ...identity } = pending.envelope
-        assert.strictEqual(yield* Canonical.digest(identity), digest)
+        assert.strictEqual(yield* Protocol.mutationDigest(identity), digest)
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
@@ -819,10 +831,12 @@ describe("server reconciled mutation log", () => {
               }
               return Deferred.succeed(secondAttempt, undefined).pipe(
                 Effect.as(Protocol.RejectedReceipt.make({
+                  ...putTodoProvenance,
                   spaceId,
                   clientId,
                   mutationId: submitted.mutationId,
                   localSequence: submitted.localSequence,
+                  origin: "Authorization",
                   rejection: "denied"
                 }))
               )
@@ -901,10 +915,11 @@ describe("server reconciled mutation log", () => {
               mutationId,
               localSequence: Identity.LocalSequence.make(localSequence),
               basis: Identity.ServerSequence.make(0),
-              name: Domain.PutTodo.name,
-              payload: Domain.todo(`${targetSpaceId}:${localSequence}`)
+              payload: Domain.todo(`${targetSpaceId}:${localSequence}`),
+              digestVersion: 2 as const,
+              ...putTodoProvenance
             }
-            return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Canonical.digest(identity) })
+            return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
           })
         yield* server.submit(
           yield* makeForSpace(
@@ -1015,10 +1030,12 @@ describe("server reconciled mutation log", () => {
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("1"))
       const error = yield* local.applyReceipt({
         _tag: "Rejected",
+        ...putTodoProvenance,
         spaceId: Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002"),
         clientId,
         mutationId: pending.envelope.mutationId,
         localSequence: pending.envelope.localSequence,
+        origin: "Authorization",
         rejection: { reason: "wrong space" }
       }).pipe(Effect.flip)
 
@@ -1032,6 +1049,7 @@ describe("server reconciled mutation log", () => {
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("1"))
       const receipt: Protocol.AcceptedReceipt = {
         _tag: "Accepted",
+        ...putTodoProvenance,
         spaceId,
         clientId,
         mutationId: pending.envelope.mutationId,

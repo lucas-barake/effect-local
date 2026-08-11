@@ -66,7 +66,7 @@ export const local = (options: {
         }
         options.changes?.push({
           _tag: "Upsert",
-          entity: { model: model.name, key: encoded.encodedKey as any },
+          entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey as any },
           value: encoded.encodedValue as any
         })
       }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
@@ -80,7 +80,10 @@ export const local = (options: {
           yield* options
             .sql`DELETE FROM effect_local_canonical_entities WHERE model = ${model.name} AND entity_key = ${encoded.keyJson}`
         }
-        options.changes?.push({ _tag: "Delete", entity: { model: model.name, key: encoded.encodedKey as any } })
+        options.changes?.push({
+          _tag: "Delete",
+          entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey as any }
+        })
       }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     applyField: (semantics, current, operation) => semantics.apply(current, operation)
   }
@@ -120,7 +123,7 @@ export const server = (options: {
         ON CONFLICT (space_id, model, entity_key) DO UPDATE SET value_json = excluded.value_json`
         options.changes.push({
           _tag: "Upsert",
-          entity: { model: model.name, key: encoded.encodedKey as any },
+          entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey as any },
           value: encoded.encodedValue as any
         })
       }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
@@ -129,7 +132,10 @@ export const server = (options: {
         const encoded = yield* encodeEntity(model, key)
         yield* options.sql`DELETE FROM effect_local_server_entities
         WHERE space_id = ${options.spaceId} AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
-        options.changes.push({ _tag: "Delete", entity: { model: model.name, key: encoded.encodedKey as any } })
+        options.changes.push({
+          _tag: "Delete",
+          entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey as any }
+        })
       }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     applyField: (semantics, current, operation) => semantics.apply(current, operation)
   }

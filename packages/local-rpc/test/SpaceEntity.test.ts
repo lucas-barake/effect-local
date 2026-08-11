@@ -3,12 +3,11 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime"
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
-import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
-import type * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
@@ -63,9 +62,12 @@ const envelope = (spaceId: Identity.SpaceId) => {
     localSequence: Identity.LocalSequence.make(1),
     basis: Identity.ServerSequence.make(0),
     name: PutTodo.name,
-    payload: { id: "1", title: "cluster" }
+    payload: { id: "1", title: "cluster" },
+    digestVersion: 2 as const,
+    sourceSchema: definition.schemaIdentity,
+    mutationVersion: PutTodo.version
   }
-  return Canonical.digest(identity).pipe(Effect.map((digest) => ({ ...identity, digest })))
+  return Protocol.mutationDigest(identity).pipe(Effect.map((digest) => ({ ...identity, digest })))
 }
 
 describe("SpaceEntity", () => {

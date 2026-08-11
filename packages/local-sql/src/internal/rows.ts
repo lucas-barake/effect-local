@@ -25,6 +25,10 @@ const PendingRowFields = {
   name: Schema.String,
   payload_json: Schema.String,
   digest: Protocol.MutationDigest,
+  digest_version: Protocol.MutationDigestVersion,
+  source_schema_version: Identity.SchemaVersion,
+  source_schema_hash: Identity.SchemaHash,
+  mutation_version: Identity.SchemaVersion,
   optimistic_result_json: Schema.String,
   changes_json: Schema.String
 }
@@ -55,6 +59,12 @@ export const ServerReceiptRow = Schema.Struct({
   client_id: Identity.ClientId,
   local_sequence: Identity.LocalSequence,
   digest: Protocol.MutationDigest,
+  digest_version: Protocol.MutationDigestVersion,
+  source_schema_version: Identity.SchemaVersion,
+  source_schema_hash: Identity.SchemaHash,
+  mutation_version: Identity.SchemaVersion,
+  mutation_name: Schema.String,
+  rejection_origin: Schema.NullOr(Protocol.RejectionOrigin),
   mutation_id: Identity.MutationId,
   receipt_json: Schema.String,
   server_sequence: Schema.NullOr(Identity.ServerSequence)
@@ -79,7 +89,9 @@ export const ServerLogRow = Schema.Struct({
   entry_json: Schema.String,
   receipt_client_id: Identity.ClientId,
   receipt_local_sequence: Identity.LocalSequence,
-  digest: Protocol.MutationDigest
+  digest: Protocol.MutationDigest,
+  source_schema_version: Identity.SchemaVersion,
+  source_schema_hash: Identity.SchemaHash
 })
 
 export const ChangeRow = Schema.Struct({

@@ -273,6 +273,64 @@ const clientV2 = makeMigration({
   ]
 })
 
+const clientV3 = makeMigration({
+  id: 3,
+  name: "schema-key-lineage-groups",
+  statements: [
+    `CREATE TABLE effect_local_client_key_lineage_groups (
+      source_schema_version INTEGER NOT NULL,
+      source_schema_hash TEXT NOT NULL,
+      source_model TEXT NOT NULL,
+      source_model_version INTEGER NOT NULL,
+      source_key TEXT NOT NULL,
+      lineage_id TEXT NOT NULL,
+      PRIMARY KEY (source_schema_version, source_schema_hash, source_model, source_model_version, source_key)
+    )`,
+    `CREATE TABLE effect_local_client_key_lineage_targets (
+      target_model TEXT NOT NULL,
+      target_model_version INTEGER NOT NULL,
+      target_key TEXT NOT NULL,
+      lineage_id TEXT NOT NULL,
+      PRIMARY KEY (target_model, target_model_version, target_key)
+    )`
+  ]
+})
+
+const clientV4 = makeMigration({
+  id: 4,
+  name: "schema-evolution-staging",
+  statements: [
+    "ALTER TABLE effect_local_client_evolution ADD COLUMN cursor_sequence INTEGER",
+    "ALTER TABLE effect_local_receipts ADD COLUMN mutation_name TEXT",
+    "ALTER TABLE effect_local_client_shadow_receipts ADD COLUMN mutation_name TEXT",
+    `CREATE TABLE effect_local_client_shadow_visible_entities (
+      generation INTEGER NOT NULL,
+      model TEXT NOT NULL,
+      model_version INTEGER NOT NULL,
+      entity_key TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      PRIMARY KEY (generation, model, entity_key)
+    )`,
+    `CREATE TABLE effect_local_client_shadow_pending (
+      generation INTEGER NOT NULL,
+      mutation_id TEXT NOT NULL,
+      local_sequence INTEGER NOT NULL,
+      basis INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      digest TEXT NOT NULL,
+      digest_version INTEGER NOT NULL CHECK (digest_version IN (1, 2)),
+      source_schema_version INTEGER NOT NULL,
+      source_schema_hash TEXT NOT NULL,
+      mutation_version INTEGER NOT NULL,
+      optimistic_result_json TEXT NOT NULL,
+      changes_json TEXT NOT NULL,
+      PRIMARY KEY (generation, mutation_id),
+      UNIQUE (generation, local_sequence)
+    )`
+  ]
+})
+
 const serverV1 = makeMigration({
   id: 1,
   name: "mutation-log",
@@ -376,8 +434,44 @@ const serverV2 = makeMigration({
   ]
 })
 
-export const clientCatalog = Object.freeze([clientV1, clientV2])
-export const serverCatalog = Object.freeze([serverV1, serverV2])
+const serverV3 = makeMigration({
+  id: 3,
+  name: "schema-key-lineage-groups",
+  statements: [
+    `CREATE TABLE effect_local_server_key_lineage_groups (
+      space_id TEXT NOT NULL,
+      source_schema_version INTEGER NOT NULL,
+      source_schema_hash TEXT NOT NULL,
+      source_model TEXT NOT NULL,
+      source_model_version INTEGER NOT NULL,
+      source_key TEXT NOT NULL,
+      lineage_id TEXT NOT NULL,
+      PRIMARY KEY (
+        space_id, source_schema_version, source_schema_hash, source_model, source_model_version, source_key
+      )
+    )`,
+    `CREATE TABLE effect_local_server_key_lineage_targets (
+      space_id TEXT NOT NULL,
+      target_model TEXT NOT NULL,
+      target_model_version INTEGER NOT NULL,
+      target_key TEXT NOT NULL,
+      lineage_id TEXT NOT NULL,
+      PRIMARY KEY (space_id, target_model, target_model_version, target_key)
+    )`
+  ]
+})
+
+const serverV4 = makeMigration({
+  id: 4,
+  name: "schema-evolution-staging",
+  statements: [
+    "ALTER TABLE effect_local_server_evolution ADD COLUMN cursor_sequence INTEGER",
+    "ALTER TABLE effect_local_server_receipts ADD COLUMN mutation_name TEXT"
+  ]
+})
+
+export const clientCatalog = Object.freeze([clientV1, clientV2, clientV3, clientV4])
+export const serverCatalog = Object.freeze([serverV1, serverV2, serverV3, serverV4])
 
 export const client = (options: {
   readonly definition: Definition.Any
