@@ -84,6 +84,12 @@ const serverLayer = ServerStore.layerTrusted({ ...serverHistory, definition: Dom
   Layer.provide(database())
 )
 
+const serverLayerFor = (definition: Definition.Any) =>
+  ServerStore.layerTrusted({ ...serverHistory, definition }).pipe(
+    Layer.provide(MutationRuntime.layer(definition).pipe(Layer.provide(Domain.handlers))),
+    Layer.provide(database())
+  )
+
 const directSync = (server: ServerStore.Service) =>
   Layer.succeed(
     SyncEngine.SyncEngine,
@@ -157,6 +163,8 @@ describe("reconciliation workflow", () => {
         "clientId",
         "generation",
         "schemaIdentity",
+        "scope",
+        "scopeGeneration",
         "spaceId"
       ])
     }))
@@ -273,11 +281,13 @@ describe("reconciliation workflow", () => {
             )
           )
           const local = Context.get(localContext, LocalStore.Store)
+          const serverContext = yield* Layer.build(serverLayerFor(definition))
+          const server = Context.get(serverContext, ServerStore.ServerStore)
           const remote = SyncEngine.SyncEngine.of({
-            submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-            pull: () => Effect.succeed({ entries: [], hasMore: false }),
-            bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-            watch: () => Stream.never
+            submit: server.submit,
+            pull: server.pull,
+            bootstrap: server.bootstrap,
+            watch: server.watch
           })
           const reconciliationContext = yield* Layer.build(
             Reconciler.layerOnePass({ definition, spaceId }).pipe(
@@ -371,6 +381,8 @@ describe("reconciliation workflow", () => {
       const secondClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
       const engineContext = yield* Layer.build(WorkflowEngine.layerMemory)
       const engine = Context.get(engineContext, WorkflowEngine.WorkflowEngine)
+      const serverContext = yield* Layer.build(serverLayer)
+      const server = Context.get(serverContext, ServerStore.ServerStore)
       const register = (
         registeredClientId: Identity.ClientId,
         pulls: Ref.Ref<number>,
@@ -391,12 +403,12 @@ describe("reconciliation workflow", () => {
           const local = Context.get(localContext, LocalStore.Store)
           const remote = SyncEngine.SyncEngine.of({
             submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-            pull: () =>
+            pull: (request) =>
               Ref.update(pulls, (count) => count + 1).pipe(
                 Effect.andThen(Deferred.succeed(pulled, undefined)),
-                Effect.as({ entries: [], hasMore: false })
+                Effect.andThen(server.pull(request))
               ),
-            bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+            bootstrap: server.bootstrap,
             watch: () => Stream.never
           })
           const reconciliationContext = yield* Layer.build(
@@ -461,13 +473,15 @@ describe("reconciliation workflow", () => {
         )
       )
       const local = Context.get(localContext, LocalStore.Store)
+      const serverContext = yield* Layer.build(serverLayer)
+      const server = Context.get(serverContext, ServerStore.ServerStore)
       const remote = SyncEngine.SyncEngine.of({
         submit: () =>
           Ref.update(attempts, (count) => count + 1).pipe(
             Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable()))
           ),
-        pull: () => Effect.succeed({ entries: [], hasMore: false }),
-        bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        pull: server.pull,
+        bootstrap: server.bootstrap,
         watch: () => Stream.never
       })
       const reconciliationContext = yield* Layer.build(

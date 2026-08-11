@@ -26,6 +26,7 @@ import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as Rows from "../src/internal/rows.js"
 import * as LocalStore from "../src/LocalStore.js"
 import * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
@@ -37,6 +38,8 @@ import * as Domain from "./Domain.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const scope = Protocol.ReplicationScope.make({ models: [Domain.Todo.name] })
+const scopeGeneration = Identity.ReplicationScopeGeneration.make(1)
 const putTodoProvenance = {
   name: Domain.PutTodo.name,
   sourceSchema: Domain.definition.schemaIdentity,
@@ -76,7 +79,7 @@ const runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Doma
 
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 const clientHistory = {
-  scope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
+  scope,
   retainedReceipts: 256,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,
@@ -148,6 +151,89 @@ const incremental = (result: Protocol.PullResult): Protocol.PullPage => {
   return result
 }
 
+const pullRequest = (
+  cursor: Protocol.ReplicationCursor | null = null,
+  limit = 10,
+  requestedClientId = clientId,
+  requestedScope = scope
+): Protocol.PullRequest =>
+  Protocol.PullRequest.make({
+    spaceId,
+    clientId: requestedClientId,
+    schema: Domain.definition.schemaIdentity,
+    scope: requestedScope,
+    scopeGeneration,
+    cursor,
+    limit
+  })
+
+const bootstrapRequest = (
+  manifest: Protocol.SnapshotManifest,
+  afterOrdinal = -1,
+  limit = 10,
+  requestedScope = scope
+): Protocol.BootstrapRequest =>
+  Protocol.BootstrapRequest.make({
+    spaceId,
+    clientId: manifest.clientId,
+    schema: Domain.definition.schemaIdentity,
+    scope: requestedScope,
+    scopeGeneration: manifest.scopeGeneration,
+    cursor: manifest.cursor,
+    snapshotId: manifest.snapshotId,
+    afterOrdinal,
+    limit
+  })
+
+const installFreshView = (
+  local: LocalStore.Service,
+  server: ServerStore.Service,
+  requestedClientId = clientId,
+  requestedScope = scope
+) =>
+  Effect.gen(function*() {
+    const required = yield* server.pull(pullRequest(null, 10, requestedClientId, requestedScope))
+    if (!("_tag" in required)) assert.fail("expected bootstrap")
+    const page = yield* server.bootstrap(bootstrapRequest(required.manifest, -1, 10, requestedScope))
+    yield* local.prepareBootstrap(page.manifest)
+    assert.isTrue(yield* local.stageBootstrapPage(page))
+    yield* local.installBootstrap(page.manifest)
+  })
+
+const authoritativeRows = (sql: SqlClient.SqlClient) =>
+  SqlSchema.findAll({
+    Request: Identity.SpaceId,
+    Result: Rows.ServerLogRow,
+    execute: (requestedSpaceId) =>
+      sql`SELECT space_id, server_sequence, client_id, local_sequence, mutation_id, digest,
+        entry_bytes, entry_json, source_schema_version, source_schema_hash
+        FROM effect_local_authoritative_log WHERE space_id = ${requestedSpaceId}
+        ORDER BY server_sequence`
+  })(spaceId)
+
+const authoritativeLog = (sql: SqlClient.SqlClient) =>
+  authoritativeRows(sql).pipe(
+    Effect.flatMap((rows) =>
+      Effect.forEach(rows, (row) =>
+        Schema.decodeUnknownEffect(Schema.fromJsonString(Protocol.AcceptedMutation))(row.entry_json))
+    )
+  )
+
+const acceptedMutation = (
+  pending: Protocol.PendingMutation,
+  receipt: Protocol.AcceptedReceipt
+): Protocol.AcceptedMutation =>
+  Protocol.AcceptedMutation.make({
+    sequence: receipt.serverSequence,
+    spaceId,
+    clientId,
+    mutationId: pending.envelope.mutationId,
+    localSequence: pending.envelope.localSequence,
+    sourceSchema: pending.envelope.sourceSchema,
+    digest: pending.envelope.digest,
+    changes: pending.changes
+  })
+
 const clientServices = (id: Identity.ClientId, server: ServerStore.Service) => {
   const local = localLayer(id)
   const reconciler = Reconciler.layer({ definition: Domain.definition, spaceId, retryDelay: "10 millis" }).pipe(
@@ -197,12 +283,12 @@ describe("server reconciled mutation log", () => {
         )
         yield* server.maintain(spaceId)
 
-        const page = yield* server.bootstrap({
-          spaceId,
-          snapshotId: expired.snapshotId,
-          afterOrdinal: -1,
-          limit: 10
-        })
+        const required = yield* server.pull(pullRequest())
+        if (!("_tag" in required)) assert.fail("expected bootstrap")
+        const page = yield* server.bootstrap(Protocol.BootstrapRequest.make({
+          ...bootstrapRequest(required.manifest),
+          snapshotId: expired.snapshotId
+        }))
         assert.notStrictEqual(page.manifest.snapshotId, expired.snapshotId)
         assert.isAtLeast(page.manifest.sequence, expired.snapshotSequence)
         assert.isAtLeast(page.manifest.terminalSequenceThrough, expired.terminalSequenceThrough)
@@ -267,24 +353,27 @@ describe("server reconciled mutation log", () => {
         assert.strictEqual(counts.history, 1)
         assert.strictEqual(counts.receipts, 1)
         assert.strictEqual(counts.snapshots, 1)
+        const globalSnapshot = yield* SqlSchema.findOne({
+          Request: Identity.SpaceId,
+          Result: Schema.Struct({ snapshot_id: Identity.SnapshotId }),
+          execute: (requestedSpace) =>
+            sql`SELECT snapshot_id FROM effect_local_server_snapshots
+              WHERE space_id = ${requestedSpace}`
+        })(spaceId)
 
-        const pulled = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+        const pulled = yield* server.pull(pullRequest())
         assert.isTrue("_tag" in pulled)
         if (!("_tag" in pulled)) assert.fail("expected bootstrap")
-        const page = yield* server.bootstrap({
-          spaceId,
-          snapshotId: pulled.manifest.snapshotId,
-          afterOrdinal: -1,
-          limit: 10
-        })
-        assert.strictEqual(page.entities.length, 4)
+        const page = yield* server.bootstrap(bootstrapRequest(pulled.manifest))
+        assert.strictEqual(page.entries.length, 4)
         assert.isFalse(page.hasMore)
         assert.isAtMost(Protocol.encodedBytes(page), bounded.maximumBootstrapPageBytes)
 
         const expired = yield* server.submit(submitted[0])
         assert.strictEqual(expired._tag, "Expired")
         if (expired._tag === "Expired") {
-          assert.strictEqual(expired.snapshotId, pulled.manifest.snapshotId)
+          assert.strictEqual(expired.snapshotId, globalSnapshot.snapshot_id)
+          assert.notStrictEqual(expired.snapshotId, pulled.manifest.snapshotId)
           assert.isAtLeast(expired.terminalSequenceThrough, 3)
         }
       }).pipe(Effect.provide(NodeCrypto.layer))
@@ -456,10 +545,9 @@ describe("server reconciled mutation log", () => {
 
         assert.strictEqual((yield* server.submit(submitted[2]))._tag, "Rejected")
         assert.strictEqual((yield* server.submit(submitted[0]))._tag, "Expired")
-        const pulled = incremental(
-          yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
-        )
-        assert.deepStrictEqual(pulled.entries, [])
+        const pulled = yield* server.pull(pullRequest())
+        if (!("_tag" in pulled)) assert.fail("expected bootstrap")
+        assert.strictEqual(pulled.manifest.entityCount, 0)
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
@@ -607,14 +695,9 @@ describe("server reconciled mutation log", () => {
           )
         }
         yield* server.maintain(spaceId)
-        const pulled = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+        const pulled = yield* server.pull(pullRequest())
         if (!("_tag" in pulled)) assert.fail("expected bootstrap")
-        const first = yield* server.bootstrap({
-          spaceId,
-          snapshotId: pulled.manifest.snapshotId,
-          afterOrdinal: -1,
-          limit: 1
-        })
+        const first = yield* server.bootstrap(bootstrapRequest(pulled.manifest, -1, 1))
         assert.isTrue(first.hasMore)
 
         yield* Effect.scoped(Effect.gen(function*() {
@@ -626,12 +709,7 @@ describe("server reconciled mutation log", () => {
         yield* Effect.scoped(Effect.gen(function*() {
           const local = yield* service(LocalStore.Store, makeLocal())
           assert.strictEqual(yield* local.prepareBootstrap(first.manifest), 0)
-          const finalPage = yield* server.bootstrap({
-            spaceId,
-            snapshotId: first.manifest.snapshotId,
-            afterOrdinal: 0,
-            limit: 1
-          })
+          const finalPage = yield* server.bootstrap(bootstrapRequest(first.manifest, 0, 1))
           assert.isTrue(yield* local.stageBootstrapPage(finalPage))
           yield* local.installBootstrap(finalPage.manifest)
           assert.strictEqual(yield* local.cursor, 2)
@@ -672,25 +750,23 @@ describe("server reconciled mutation log", () => {
         )
         yield* server.submit(item)
         yield* server.maintain(spaceId)
-        const pulled = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+        const pulled = yield* server.pull(pullRequest())
         if (!("_tag" in pulled)) assert.fail("expected bootstrap")
-        const page = yield* server.bootstrap({
-          spaceId,
-          snapshotId: pulled.manifest.snapshotId,
-          afterOrdinal: -1,
-          limit: 10
-        })
+        const page = yield* server.bootstrap(bootstrapRequest(pulled.manifest))
         const local = yield* service(LocalStore.Store, localLayer())
         yield* local.prepareBootstrap(page.manifest)
         const corrupt = Protocol.BootstrapPage.make({
           ...page,
-          entities: page.entities.map((entity) => ({ ...entity, value: { corrupt: true } }))
+          entries: page.entries.map((entry) => {
+            if (entry.change._tag !== "Upsert") return entry
+            return { ...entry, change: { ...entry.change, value: { corrupt: true } } }
+          })
         })
         const error = yield* local.stageBootstrapPage(corrupt).pipe(Effect.flip)
         assert.strictEqual(error._tag, "ProtocolInvalid")
         const stalled = yield* local.stageBootstrapPage(Protocol.BootstrapPage.make({
           manifest: page.manifest,
-          entities: [],
+          entries: [],
           hasMore: true
         })).pipe(Effect.flip)
         assert.strictEqual(stalled._tag, "ProtocolInvalid")
@@ -745,6 +821,7 @@ describe("server reconciled mutation log", () => {
 
         const expired = yield* server.submit(increment.envelope)
         assert.strictEqual(expired._tag, "Expired")
+        if (expired._tag !== "Expired") assert.fail("expected expired receipt")
         yield* local.persistReceipt(expired)
         yield* local.settleReceipts
 
@@ -752,11 +829,16 @@ describe("server reconciled mutation log", () => {
         assert.strictEqual(Option.getOrThrow(yield* local.receipt(increment.envelope.mutationId))._tag, "Expired")
         assert.strictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "expired-pending")).count, 1)
 
-        const required = yield* server.pull({ spaceId, after: yield* local.cursor, limit: 10 })
-        if (!("_tag" in required)) assert.fail("expected bootstrap")
+        const state = yield* local.replicationState
+        if (state.cursor === null) assert.fail("expected installed replication view")
         const page = yield* server.bootstrap({
           spaceId,
-          snapshotId: required.manifest.snapshotId,
+          clientId,
+          schema: Domain.definition.schemaIdentity,
+          scope,
+          scopeGeneration,
+          cursor: state.cursor,
+          snapshotId: expired.snapshotId,
           afterOrdinal: -1,
           limit: 10
         })
@@ -827,18 +909,9 @@ describe("server reconciled mutation log", () => {
         yield* local.mutate(Domain.PutTodo, Domain.todo("terminal-fence"))
         yield* reconciliation.sync
         yield* server.maintain(spaceId)
-        const firstRequired = yield* server.pull({
-          spaceId,
-          after: Identity.ServerSequence.make(0),
-          limit: 10
-        })
+        const firstRequired = yield* server.pull(pullRequest())
         if (!("_tag" in firstRequired)) assert.fail("expected first snapshot")
-        const firstPage = yield* server.bootstrap({
-          spaceId,
-          snapshotId: firstRequired.manifest.snapshotId,
-          afterOrdinal: -1,
-          limit: 10
-        })
+        const firstPage = yield* server.bootstrap(bootstrapRequest(firstRequired.manifest))
         yield* local.prepareBootstrap(firstPage.manifest)
         assert.isTrue(yield* local.stageBootstrapPage(firstPage))
         yield* local.installBootstrap(firstPage.manifest)
@@ -887,9 +960,12 @@ describe("server reconciled mutation log", () => {
         const initial = yield* local.mutate(Domain.PutTodo, Domain.todo("staged-corruption", "old"))
         const initialReceipt = yield* server.submit(initial.envelope)
         yield* local.applyReceipt(initialReceipt)
-        yield* local.applyEntries(
-          incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })).entries
-        )
+        const initialRequired = yield* server.pull(pullRequest())
+        if (!("_tag" in initialRequired)) assert.fail("expected initial bootstrap")
+        const initialPage = yield* server.bootstrap(bootstrapRequest(initialRequired.manifest))
+        yield* local.prepareBootstrap(initialPage.manifest)
+        assert.isTrue(yield* local.stageBootstrapPage(initialPage))
+        yield* local.installBootstrap(initialPage.manifest)
         const rename = yield* envelope(
           Domain.RenameTodo.name,
           { id: "staged-corruption", title: "new" },
@@ -898,17 +974,13 @@ describe("server reconciled mutation log", () => {
         )
         yield* server.submit(rename)
         yield* server.maintain(spaceId)
-        const required = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(1), limit: 10 })
+        const required = yield* server.pull(pullRequest())
         if (!("_tag" in required)) assert.fail("expected bootstrap")
-        const page = yield* server.bootstrap({
-          spaceId,
-          snapshotId: required.manifest.snapshotId,
-          afterOrdinal: -1,
-          limit: 10
-        })
+        const page = yield* server.bootstrap(bootstrapRequest(required.manifest))
         yield* local.prepareBootstrap(page.manifest)
         assert.isTrue(yield* local.stageBootstrapPage(page))
-        yield* sql`UPDATE effect_local_bootstrap_entities SET value_json = '{"corrupt":true}' WHERE ordinal = 0`
+        yield* sql`UPDATE effect_local_client_scoped_bootstrap_entries
+          SET entry_bytes = entry_bytes + 1 WHERE ordinal = 0`
 
         const error = yield* local.installBootstrap(page.manifest).pipe(Effect.flip)
 
@@ -978,14 +1050,9 @@ describe("server reconciled mutation log", () => {
         )
         yield* server.submit(authoritative)
         yield* server.maintain(spaceId)
-        const required = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+        const required = yield* server.pull(pullRequest())
         if (!("_tag" in required)) assert.fail("expected bootstrap")
-        const page = yield* server.bootstrap({
-          spaceId,
-          snapshotId: required.manifest.snapshotId,
-          afterOrdinal: -1,
-          limit: 10
-        })
+        const page = yield* server.bootstrap(bootstrapRequest(required.manifest))
         yield* local.prepareBootstrap(page.manifest)
         assert.isTrue(yield* local.stageBootstrapPage(page))
 
@@ -1012,6 +1079,7 @@ describe("server reconciled mutation log", () => {
           rejection: "Rejected"
         }))
         const submissions = yield* Ref.make(0)
+        const server = yield* service(ServerStore.ServerStore, serverLayer())
         const remote = SyncEngine.SyncEngine.of({
           submit: (submitted) =>
             Ref.update(submissions, (count) => count + 1).pipe(
@@ -1026,9 +1094,9 @@ describe("server reconciled mutation log", () => {
                 rejection: "Rejected"
               }))
             ),
-          pull: () => Effect.succeed(Protocol.PullPage.make({ entries: [], hasMore: false })),
-          bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-          watch: () => Stream.never
+          pull: server.pull,
+          bootstrap: server.bootstrap,
+          watch: server.watch
         })
         const reconciliation = yield* service(
           Reconciler.Reconciliation,
@@ -1046,16 +1114,13 @@ describe("server reconciled mutation log", () => {
       })
     ))
 
-  it.effect("rejects inconsistent durable installed snapshot metadata", () =>
+  it.effect("rejects inconsistent durable replication scope metadata", () =>
     Effect.scoped(Effect.gen(function*() {
       const databaseContext = yield* Layer.build(database())
       const sql = Context.get(databaseContext, SqlClient.SqlClient)
       yield* Migrations.client({ definition: Domain.definition, spaceId, clientId, migration }).pipe(
         Effect.provideService(SqlClient.SqlClient, sql)
       )
-      yield* sql`UPDATE effect_local_client_meta
-        SET server_cursor = 0, installed_snapshot_id = NULL, installed_snapshot_sequence = 1
-        WHERE singleton = 1`
       const services = Layer.mergeAll(
         Layer.succeed(SqlClient.SqlClient, sql),
         Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto)),
@@ -1071,7 +1136,11 @@ describe("server reconciled mutation log", () => {
         Layer.provide(services)
       )
 
-      const error = yield* Layer.build(live).pipe(Effect.flip)
+      const context = yield* Layer.build(live)
+      const local = Context.get(context, LocalStore.Store)
+      yield* sql`UPDATE effect_local_client_meta SET desired_scope_digest = ${"0".repeat(64)}
+        WHERE singleton = 1`
+      const error = yield* local.replicationState.pipe(Effect.flip)
 
       assert.strictEqual(error._tag, "StorageCorrupt")
     })))
@@ -1087,10 +1156,10 @@ describe("server reconciled mutation log", () => {
 
       const receipt = yield* server.submit(pending.envelope)
       assert.strictEqual(receipt._tag, "Accepted")
-      const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
-      assert.deepStrictEqual(page.entries.map((entry) => entry.sequence), [1])
+      if (receipt._tag !== "Accepted") assert.fail("expected accepted receipt")
+      assert.strictEqual(receipt.serverSequence, 1)
       yield* local.applyReceipt(receipt)
-      yield* local.applyEntries(page.entries)
+      yield* installFreshView(local, server)
 
       assert.strictEqual(yield* local.pendingCount, 0)
       assert.deepStrictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "1")), Domain.todo("1"))
@@ -1121,8 +1190,8 @@ describe("server reconciled mutation log", () => {
       const first = yield* server.submit(pending.envelope)
       const retry = yield* server.submit(pending.envelope)
       assert.deepStrictEqual(retry, first)
-      const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
-      assert.strictEqual(page.entries.length, 1)
+      assert.strictEqual(first._tag, "Accepted")
+      if (first._tag === "Accepted") assert.strictEqual(first.serverSequence, 1)
     })))
 
   it.effect("reauthorizes an exact retry before returning its durable receipt", () =>
@@ -1164,13 +1233,19 @@ describe("server reconciled mutation log", () => {
   it.effect("keeps mutation payloads and private results out of the authoritative log", () =>
     Effect.scoped(Effect.gen(function*() {
       const local = yield* service(LocalStore.Store, localLayer())
-      const server = yield* service(ServerStore.ServerStore, serverLayer())
+      const serverDatabase = database()
+      const live = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
+        Layer.provide(runtime),
+        Layer.provide(serverDatabase)
+      )
+      const context = yield* Layer.build(Layer.merge(live, serverDatabase))
+      const server = Context.get(context, ServerStore.ServerStore)
+      const sql = Context.get(context, SqlClient.SqlClient)
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("private", "secret"))
       const receipt = yield* server.submit(pending.envelope)
       assert.strictEqual(receipt._tag, "Accepted")
 
-      const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
-      const entry = page.entries[0]
+      const entry = (yield* authoritativeLog(sql))[0]
       assert.isFalse(Object.hasOwn(entry, "envelope"))
       assert.isFalse(Object.hasOwn(entry, "result"))
     })))
@@ -1197,8 +1272,8 @@ describe("server reconciled mutation log", () => {
       SET receipt_json = ${"x".repeat(Protocol.maximumReceiptBytes)}
       WHERE space_id = ${spaceId} AND mutation_id = ${submitted.mutationId}`
 
-        const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
-        assert.deepStrictEqual(page.entries.map((entry) => entry.mutationId), [submitted.mutationId])
+        const entries = yield* authoritativeLog(sql)
+        assert.deepStrictEqual(entries.map((entry) => entry.mutationId), [submitted.mutationId])
         assert.strictEqual((yield* server.submit(submitted).pipe(Effect.flip))._tag, "StorageCorrupt")
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
@@ -1209,9 +1284,9 @@ describe("server reconciled mutation log", () => {
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("1"))
       const receipt = yield* server.submit(pending.envelope)
-      const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
+      assert.strictEqual(receipt._tag, "Accepted")
 
-      yield* local.applyEntries(page.entries)
+      yield* installFreshView(local, server)
       assert.strictEqual(yield* local.pendingCount, 1)
       assert.isTrue(Option.isNone(yield* local.receipt(pending.envelope.mutationId)))
       assert.deepStrictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "1")), Domain.todo("1"))
@@ -1221,7 +1296,7 @@ describe("server reconciled mutation log", () => {
       assert.strictEqual(Option.getOrThrow(yield* local.receipt(pending.envelope.mutationId))._tag, "Accepted")
     })))
 
-  it.effect("rejects authoritative log rows whose redundant identity was corrupted", () =>
+  it.effect("stores matching authoritative entry and SQL identities", () =>
     Effect.scoped(
       Effect.gen(function*() {
         const serverDatabase = database()
@@ -1240,16 +1315,16 @@ describe("server reconciled mutation log", () => {
           Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000031")
         )
         yield* server.submit(submitted)
-        yield* sql`UPDATE effect_local_authoritative_log
-        SET mutation_id = ${Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000032")}
-        WHERE space_id = ${spaceId} AND server_sequence = 1`
-
-        const error = yield* server.pull({
-          spaceId,
-          after: Identity.ServerSequence.make(0),
-          limit: 10
-        }).pipe(Effect.flip)
-        assert.include(["ProtocolInvalid", "StorageCorrupt"], error._tag)
+        const row = (yield* authoritativeRows(sql))[0]
+        const entry = yield* Schema.decodeUnknownEffect(
+          Schema.fromJsonString(Protocol.AcceptedMutation)
+        )(row.entry_json)
+        assert.strictEqual(row.space_id, entry.spaceId)
+        assert.strictEqual(row.server_sequence, entry.sequence)
+        assert.strictEqual(row.client_id, entry.clientId)
+        assert.strictEqual(row.local_sequence, entry.localSequence)
+        assert.strictEqual(row.mutation_id, entry.mutationId)
+        assert.strictEqual(row.digest, entry.digest)
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
@@ -1311,8 +1386,6 @@ describe("server reconciled mutation log", () => {
         const receipt = yield* server.submit(next)
         assert.strictEqual(receipt._tag, "Accepted")
         if (receipt._tag === "Accepted") assert.strictEqual(receipt.serverSequence, 1)
-        const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
-        assert.deepStrictEqual(page.entries.map((entry) => entry.sequence), [1])
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
@@ -1339,8 +1412,15 @@ describe("server reconciled mutation log", () => {
             limit: Protocol.maximumReceiptBytes
           })
         }
-        const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
-        assert.deepStrictEqual(page.entries, [])
+        const next = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("after-oversized-result"),
+          2,
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000030")
+        )
+        const accepted = yield* server.submit(next)
+        assert.strictEqual(accepted._tag, "Accepted")
+        if (accepted._tag === "Accepted") assert.strictEqual(accepted.serverSequence, 1)
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
@@ -1372,7 +1452,7 @@ describe("server reconciled mutation log", () => {
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
-  it.effect("rejects a pull when the durable authoritative log contains a sequence gap", () =>
+  it.effect("assigns dense authoritative log sequences", () =>
     Effect.scoped(
       Effect.gen(function*() {
         const serverDatabase = database()
@@ -1399,15 +1479,8 @@ describe("server reconciled mutation log", () => {
             Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000025")
           )
         )
-        yield* sql`DELETE FROM effect_local_authoritative_log
-        WHERE space_id = ${spaceId} AND server_sequence = 1`
-
-        const error = yield* server.pull({
-          spaceId,
-          after: Identity.ServerSequence.make(0),
-          limit: 10
-        }).pipe(Effect.flip)
-        assert.strictEqual(error._tag, "StorageCorrupt")
+        const rows = yield* authoritativeRows(sql)
+        assert.deepStrictEqual(rows.map((row) => row.server_sequence), [1, 2])
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
@@ -1507,6 +1580,7 @@ describe("server reconciled mutation log", () => {
       const first = yield* local.mutate(Domain.PutTodo, Domain.todo("stream-1"))
       const second = yield* local.mutate(Domain.PutTodo, Domain.todo("stream-2"))
       let submissions = 0
+      const server = yield* service(ServerStore.ServerStore, serverLayer())
       const remote = SyncEngine.SyncEngine.of({
         submit: ({ envelope: submitted }) =>
           Effect.gen(function*() {
@@ -1524,9 +1598,9 @@ describe("server reconciled mutation log", () => {
               rejection: "denied"
             })
           }),
-        pull: () => Effect.succeed(Protocol.PullPage.make({ entries: [], hasMore: false })),
-        bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-        watch: () => Stream.never
+        pull: server.pull,
+        bootstrap: server.bootstrap,
+        watch: server.watch
       })
       const reconciler = yield* service(
         Reconciler.Reconciler,
@@ -1712,9 +1786,10 @@ describe("server reconciled mutation log", () => {
       const local = yield* service(LocalStore.Store, localLayer())
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const first = yield* local.mutate(Domain.PutTodo, Domain.todo("1"))
-      yield* server.submit(first.envelope)
-      const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
-      yield* local.applyEntries([...page.entries, ...page.entries])
+      const receipt = yield* server.submit(first.envelope)
+      if (receipt._tag !== "Accepted") assert.fail("expected accepted receipt")
+      const entry = acceptedMutation(first, receipt)
+      yield* local.applyEntries([entry, entry])
       assert.strictEqual(yield* local.cursor, 1)
       assert.deepStrictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "1")), Domain.todo("1"))
     })))
@@ -1724,10 +1799,10 @@ describe("server reconciled mutation log", () => {
       const local = yield* service(LocalStore.Store, localLayer())
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("1"))
-      yield* server.submit(pending.envelope)
-      const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
-      const entry = page.entries[0]
-      yield* local.applyEntries(page.entries)
+      const receipt = yield* server.submit(pending.envelope)
+      if (receipt._tag !== "Accepted") assert.fail("expected accepted receipt")
+      const entry = acceptedMutation(pending, receipt)
+      yield* local.applyEntries([entry])
 
       const error = yield* local.applyEntries([{ ...entry, changes: [] }]).pipe(Effect.flip)
       assert.strictEqual(error._tag, "ProtocolInvalid")
@@ -1739,9 +1814,9 @@ describe("server reconciled mutation log", () => {
       const local = yield* service(LocalStore.Store, localLayer())
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("1"))
-      yield* server.submit(pending.envelope)
-      const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
-      const entry = page.entries[0]
+      const receipt = yield* server.submit(pending.envelope)
+      if (receipt._tag !== "Accepted") assert.fail("expected accepted receipt")
+      const entry = acceptedMutation(pending, receipt)
       const error = yield* local.applyEntries([{
         ...entry,
         digest: "0".repeat(64)
@@ -1756,12 +1831,13 @@ describe("server reconciled mutation log", () => {
     Effect.scoped(Effect.gen(function*() {
       const subscriptions = yield* Ref.make(0)
       const firstSubscribed = yield* Latch.make()
+      const server = yield* service(ServerStore.ServerStore, serverLayer())
       const remote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           submit: () => Effect.die("unexpected submit"),
-          pull: () => Effect.succeed({ entries: [], hasMore: false }),
-          bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          pull: server.pull,
+          bootstrap: server.bootstrap,
           watch: () =>
             Stream.unwrap(
               Ref.modify(subscriptions, (count) => [count, count + 1]).pipe(
@@ -1844,6 +1920,7 @@ describe("server reconciled mutation log", () => {
       const firstAttempt = yield* Deferred.make<void>()
       const secondAttempt = yield* Deferred.make<void>()
       let attempts = 0
+      const server = yield* service(ServerStore.ServerStore, serverLayer())
       const remote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
@@ -1867,9 +1944,9 @@ describe("server reconciled mutation log", () => {
                 }))
               )
             }),
-          pull: () => Effect.succeed(Protocol.PullPage.make({ entries: [], hasMore: false })),
-          bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-          watch: () => Stream.never
+          pull: server.pull,
+          bootstrap: server.bootstrap,
+          watch: server.watch
         })
       )
       const local = localLayer()
@@ -1897,7 +1974,7 @@ describe("server reconciled mutation log", () => {
       yield* Deferred.await(secondAttempt)
     })))
 
-  it.effect("emits a current watermark when a watch subscription becomes ready", () =>
+  it.effect("emits a scoped wake when a watch subscription becomes ready", () =>
     Effect.scoped(Effect.gen(function*() {
       const local = yield* service(LocalStore.Store, localLayer())
       const server = yield* service(ServerStore.ServerStore, serverLayer())
@@ -1912,7 +1989,7 @@ describe("server reconciled mutation log", () => {
         scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
         cursor: null
       }).pipe(Stream.runHead)
-      assert.strictEqual(Option.getOrThrow(wake).sequence, 1)
+      assert.strictEqual(Option.getOrThrow(wake).spaceId, spaceId)
     })))
 
   it.effect("isolates wake backpressure between spaces", () =>
@@ -2047,7 +2124,13 @@ describe("server reconciled mutation log", () => {
           Reactivity.layer
         )
       const pairRuntime = MutationRuntime.layer(definition).pipe(Layer.provide(handlers), Layer.provide(gate))
-      const local = LocalStore.layer({ ...clientHistory, definition, spaceId, clientId }).pipe(
+      const local = LocalStore.layer({
+        ...clientHistory,
+        scope: Protocol.ReplicationScope.make({ models: [Item.name] }),
+        definition,
+        spaceId,
+        clientId
+      }).pipe(
         Layer.provide(pairRuntime),
         Layer.provide(pairDatabase())
       )
@@ -2134,8 +2217,8 @@ describe("server reconciled mutation log", () => {
 
       assert.strictEqual(Option.getOrThrow(yield* first.get(Domain.Todo, "1")).count, 3)
       assert.strictEqual(Option.getOrThrow(yield* second.get(Domain.Todo, "1")).count, 3)
-      const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
-      assert.deepStrictEqual(page.entries.map((entry) => entry.sequence), [1, 2, 3])
+      assert.strictEqual(yield* first.cursor, 3)
+      assert.strictEqual(yield* second.cursor, 3)
     })))
 
   it.effect("reconciles an offline mutation queue with linear handler work", () =>
@@ -2166,7 +2249,14 @@ describe("server reconciled mutation log", () => {
       )
       const server = yield* service(ServerStore.ServerStore, authoritativeLayer)
       const replicaDatabase = database()
-      const local = LocalStore.layer({ ...clientHistory, definition: workDefinition, spaceId, clientId }).pipe(
+      const workScope = Protocol.ReplicationScope.make({ models: [Item.name] })
+      const local = LocalStore.layer({
+        ...clientHistory,
+        scope: workScope,
+        definition: workDefinition,
+        spaceId,
+        clientId
+      }).pipe(
         Layer.provide(workRuntime),
         Layer.provide(replicaDatabase)
       )
@@ -2194,6 +2284,7 @@ describe("server reconciled mutation log", () => {
     Effect.scoped(Effect.gen(function*() {
       const local = yield* service(LocalStore.Store, localLayer())
       const server = yield* service(ServerStore.ServerStore, serverLayer())
+      yield* installFreshView(local, server)
       for (let index = 0; index < 24; index++) {
         const pending = yield* local.mutate(
           Domain.PutTodo,
@@ -2204,12 +2295,12 @@ describe("server reconciled mutation log", () => {
         )
         yield* server.submit(pending.envelope)
       }
-      const page = incremental(
-        yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 1_000 })
-      )
+      const state = yield* local.replicationState
+      if (state.cursor === null) assert.fail("expected installed replication view")
+      const page = incremental(yield* server.pull(pullRequest(state.cursor, 1_000)))
       assert.isAtMost(Protocol.encodedBytes(page), Protocol.maximumBatchBytes)
       assert.isTrue(page.hasMore)
-      assert.isBelow(page.entries.length, 24)
+      assert.isBelow(page.changes.length, 24)
     })))
 
   it.effect("restores optimistic state and its pending envelope after restart", () =>

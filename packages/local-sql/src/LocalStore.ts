@@ -674,12 +674,11 @@ export const layer = (
           attributes: { "mutation.id": receipt.mutationId }
         }))
 
-      const settleReceipts = Effect.gen(function*() {
-        const touched = new Map<string, Protocol.EntityKey>()
-        let prunedReceiptIds: ReadonlyArray<Identity.MutationId> = []
-        yield* sql.withTransaction(Effect.gen(function*() {
-          const installed = yield* meta
-          yield* validateFence(installed)
+      const settleCoveredReceipts = (
+        installed: typeof Rows.ClientMetaRow.Type,
+        touched: Map<string, Protocol.EntityKey>
+      ) =>
+        Effect.gen(function*() {
           let after = 0
           while (true) {
             const found = yield* findPendingReceipt({ after }).pipe(Effect.mapError(StorageUnavailable.make))
@@ -738,6 +737,16 @@ export const layer = (
             }
             yield* sql`DELETE FROM effect_local_pending WHERE mutation_id = ${receipt.mutationId}`
           }
+          return yield* Effect.void
+        })
+
+      const settleReceipts = Effect.gen(function*() {
+        const touched = new Map<string, Protocol.EntityKey>()
+        let prunedReceiptIds: ReadonlyArray<Identity.MutationId> = []
+        yield* sql.withTransaction(Effect.gen(function*() {
+          const installed = yield* meta
+          yield* validateFence(installed)
+          yield* settleCoveredReceipts(installed, touched)
           if (touched.size > 0) {
             yield* restoreAndReplay(Array.from(touched.values()))
             yield* sql`UPDATE effect_local_client_meta
@@ -1245,7 +1254,7 @@ export const layer = (
 
       const applyViewPage = (page: Protocol.PullPage) =>
         Effect.gen(function*() {
-          const touched: Array<Protocol.EntityKey> = []
+          const touched = new Map<string, Protocol.EntityKey>()
           yield* sql.withTransaction(Effect.gen(function*() {
             const current = yield* meta
             yield* validateFence(current)
@@ -1278,9 +1287,8 @@ export const layer = (
             for (const change of page.changes) {
               const validated = yield* validateViewChange(change, "Replication page")
               yield* applyViewChange(change, validated.keyJson, validated.valueJson)
-              touched.push(change.entity)
+              touched.set(SqlTransaction.entityKey(change.entity), change.entity)
             }
-            yield* restoreAndReplay(touched)
             if (page.hasMore) {
               yield* sql`UPDATE effect_local_client_meta SET
                 replication_view_revision = ${page.cursor.revision},
@@ -1291,9 +1299,11 @@ export const layer = (
                 server_cursor = ${page.serverSequence}, visible_revision = visible_revision + 1
                 WHERE singleton = 1`
             }
+            if (!page.hasMore) yield* settleCoveredReceipts(yield* meta, touched)
+            if (touched.size > 0) yield* restoreAndReplay(Array.from(touched.values()))
             return yield* Effect.void
           }))
-          yield* invalidate(touched)
+          yield* invalidate(Array.from(touched.values()))
         }).pipe(
           Effect.uninterruptible,
           Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
