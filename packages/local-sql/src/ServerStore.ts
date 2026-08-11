@@ -1373,18 +1373,17 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           entity: authorizeReadEntity
         }
       })
-      const countAcknowledgedEntity = SqlSchema.findOne({
+      const countAcknowledgedEntities = SqlSchema.findOne({
         Request: Schema.Struct({
           spaceId: Identity.SpaceId,
           clientId: Identity.ClientId,
-          model: Schema.String,
-          entityKey: Schema.String
+          entities: Schema.Array(Schema.Struct({ model: Schema.String, key: Schema.String }))
         }),
         Result: Rows.CountRow,
-        execute: ({ spaceId, clientId, model, entityKey }) =>
+        execute: ({ spaceId, clientId, entities }) =>
           sql`SELECT COUNT(*) AS count FROM effect_local_server_replication_view_entities
-          WHERE space_id = ${spaceId} AND client_id = ${clientId} AND model = ${model}
-            AND entity_key = ${entityKey} AND disposition = 'Upsert'`
+          WHERE space_id = ${spaceId} AND client_id = ${clientId} AND disposition = 'Upsert'
+            AND ${sql.or(entities.map((entity) => sql`(model = ${entity.model} AND entity_key = ${entity.key})`))}`
       })
       const mutationWakeVisible = (
         request: Protocol.WatchRequest,
@@ -1392,16 +1391,19 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         wake: InternalWake
       ) =>
         Effect.gen(function*() {
-          for (const change of wake.changes) {
-            if (!request.scope.models.includes(change.entity.model)) continue
-            const entityKey = yield* Codec.stringify(change.entity.key)
-            const acknowledged = yield* countAcknowledgedEntity({
-              spaceId: request.spaceId,
-              clientId: request.clientId,
-              model: change.entity.model,
-              entityKey
-            }).pipe(Effect.mapError(StorageUnavailable.make))
-            if (acknowledged.count > 0) return true
+          const scoped = wake.changes.filter((change) => request.scope.models.includes(change.entity.model))
+          if (scoped.length === 0) return false
+          const identities = yield* Effect.forEach(scoped, (change) =>
+            Codec.stringify(change.entity.key).pipe(
+              Effect.map((key) => ({ model: change.entity.model, key }))
+            ))
+          const acknowledged = yield* countAcknowledgedEntities({
+            spaceId: request.spaceId,
+            clientId: request.clientId,
+            entities: identities
+          }).pipe(Effect.mapError(StorageUnavailable.make))
+          if (acknowledged.count > 0) return true
+          for (const change of scoped) {
             if (
               change._tag === "Upsert" &&
               (yield* authorizeReadEntity(request, principal, change.entity, change.value))
