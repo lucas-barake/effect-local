@@ -977,9 +977,12 @@ const clientV8 = makeMigration({
     `CREATE TABLE effect_local_client_scoped_bootstrap_entries (
       snapshot_id TEXT NOT NULL,
       ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+      model TEXT NOT NULL,
+      entity_key TEXT NOT NULL,
       change_json TEXT NOT NULL CHECK (json_valid(change_json)),
       entry_bytes INTEGER NOT NULL CHECK (entry_bytes > 0),
-      PRIMARY KEY (snapshot_id, ordinal)
+      PRIMARY KEY (snapshot_id, ordinal),
+      UNIQUE (snapshot_id, model, entity_key)
     )`
   ]
 })

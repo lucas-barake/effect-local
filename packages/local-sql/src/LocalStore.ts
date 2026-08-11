@@ -323,6 +323,13 @@ export const layer = (
           sql`SELECT ordinal, change_json, entry_bytes
           FROM effect_local_client_scoped_bootstrap_entries ORDER BY ordinal`
       })
+      const countScopedBootstrapIdentity = SqlSchema.findOne({
+        Request: Schema.Struct({ snapshotId: Identity.SnapshotId, model: Schema.String, entityKey: Schema.String }),
+        Result: Rows.CountRow,
+        execute: ({ snapshotId, model, entityKey }) =>
+          sql`SELECT COUNT(*) AS count FROM effect_local_client_scoped_bootstrap_entries
+          WHERE snapshot_id = ${snapshotId} AND model = ${model} AND entity_key = ${entityKey}`
+      })
       const findEntityIdentities = SqlSchema.findAll({
         Request: Schema.Void,
         Result: Rows.EntityIdentityRow,
@@ -330,14 +337,17 @@ export const layer = (
           sql`SELECT model, model_version, entity_key FROM effect_local_canonical_entities
           UNION SELECT model, model_version, entity_key FROM effect_local_visible_entities`
       })
+      const findCanonicalEntityIdentities = SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: Rows.EntityIdentityRow,
+        execute: () => sql`SELECT model, model_version, entity_key FROM effect_local_canonical_entities`
+      })
 
       const meta = findMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
       const normalizedScope = yield* Protocol.validateReplicationScope(options.definition, options.scope)
       const desiredScopeJson = yield* Codec.stringify(normalizedScope)
-      const desiredScopeDigest = Protocol.MutationDigest.make(
-        yield* Canonical.digest({ format: 1, scope: normalizedScope }).pipe(
-          Effect.provideService(Crypto.Crypto, crypto)
-        )
+      const desiredScopeDigest = yield* Protocol.replicationScopeDigest(normalizedScope).pipe(
+        Effect.provideService(Crypto.Crypto, crypto)
       )
       let initializedMeta = yield* meta
       if (initializedMeta.definition_hash !== options.definition.hash) {
@@ -782,8 +792,8 @@ export const layer = (
           Effect.flatMap((value) => Protocol.validateReplicationScope(options.definition, value))
         )
         const scopeJson = yield* Codec.stringify(scope)
-        const scopeDigest = Protocol.MutationDigest.make(
-          yield* Canonical.digest({ format: 1, scope }).pipe(Effect.provideService(Crypto.Crypto, crypto))
+        const scopeDigest = yield* Protocol.replicationScopeDigest(scope).pipe(
+          Effect.provideService(Crypto.Crypto, crypto)
         )
         if (scopeJson !== current.desired_scope_json || scopeDigest !== current.desired_scope_digest) {
           return yield* new ReplicaError.StorageCorrupt({
@@ -809,10 +819,8 @@ export const layer = (
         Effect.gen(function*() {
           const normalized = yield* Protocol.validateReplicationScope(options.definition, scope)
           const scopeJson = yield* Codec.stringify(normalized)
-          const scopeDigest = Protocol.MutationDigest.make(
-            yield* Canonical.digest({ format: 1, scope: normalized }).pipe(
-              Effect.provideService(Crypto.Crypto, crypto)
-            )
+          const scopeDigest = yield* Protocol.replicationScopeDigest(normalized).pipe(
+            Effect.provideService(Crypto.Crypto, crypto)
           )
           yield* sql.withTransaction(Effect.gen(function*() {
             const current = yield* meta
@@ -996,15 +1004,8 @@ export const layer = (
             let nextOrdinal = stage.next_ordinal
             let receivedBytes = stage.received_bytes
             let rollingDigest = stage.rolling_digest
-            const staged = yield* findScopedBootstrapEntries(undefined).pipe(Effect.mapError(StorageUnavailable.make))
             const identities = new Set<string>()
-            for (const row of staged) {
-              const entry = yield* Codec.parse(row.change_json).pipe(
-                Effect.flatMap((value) => Codec.decode(Protocol.SnapshotEntry, value))
-              )
-              const { keyJson } = yield* validateViewChange(entry.change, `Snapshot ${page.manifest.snapshotId}`)
-              identities.add(`${entry.change.entity.model}\\u0000${keyJson}`)
-            }
+            const stagedRows: Array<Record<string, unknown>> = []
             for (const entry of page.entries) {
               if (entry.ordinal !== nextOrdinal) {
                 return yield* new ReplicaError.ProtocolInvalid({
@@ -1020,7 +1021,12 @@ export const layer = (
                 })
               }
               const identity = `${entry.change.entity.model}\\u0000${validated.keyJson}`
-              if (identities.has(identity)) {
+              const staged = yield* countScopedBootstrapIdentity({
+                snapshotId: page.manifest.snapshotId,
+                model: entry.change.entity.model,
+                entityKey: validated.keyJson
+              }).pipe(Effect.mapError(StorageUnavailable.make))
+              if (identities.has(identity) || staged.count > 0) {
                 return yield* new ReplicaError.ProtocolInvalid({
                   message: `Snapshot ${page.manifest.snapshotId} contains a duplicate entity`
                 })
@@ -1032,16 +1038,22 @@ export const layer = (
                   message: `Snapshot ${page.manifest.snapshotId} exceeds its declared bytes`
                 })
               }
-              rollingDigest = Protocol.SnapshotDigest.make(
-                yield* Canonical.digest({ previous: rollingDigest, entry }).pipe(
-                  Effect.provideService(Crypto.Crypto, crypto)
-                )
+              rollingDigest = yield* Protocol.snapshotEntryDigest(rollingDigest, entry).pipe(
+                Effect.provideService(Crypto.Crypto, crypto)
               )
-              yield* sql`INSERT INTO effect_local_client_scoped_bootstrap_entries
-                (snapshot_id, ordinal, change_json, entry_bytes)
-                VALUES (${page.manifest.snapshotId}, ${entry.ordinal},
-                  ${yield* Codec.stringify(entry)}, ${entry.entryBytes})`
+              stagedRows.push({
+                snapshot_id: page.manifest.snapshotId,
+                ordinal: entry.ordinal,
+                model: entry.change.entity.model,
+                entity_key: validated.keyJson,
+                change_json: yield* Codec.stringify(entry),
+                entry_bytes: entry.entryBytes
+              })
               nextOrdinal += 1
+            }
+            for (let offset = 0; offset < stagedRows.length; offset += 100) {
+              yield* sql`INSERT INTO effect_local_client_scoped_bootstrap_entries
+                ${sql.insert(stagedRows.slice(offset, offset + 100))}`
             }
             if (nextOrdinal > page.manifest.entityCount) {
               return yield* new ReplicaError.ProtocolInvalid({
@@ -1140,10 +1152,8 @@ export const layer = (
               }
               stagedIdentities.add(identity)
               receivedBytes += entryBytes
-              rollingDigest = Protocol.SnapshotDigest.make(
-                yield* Canonical.digest({ previous: rollingDigest, entry }).pipe(
-                  Effect.provideService(Crypto.Crypto, crypto)
-                )
+              rollingDigest = yield* Protocol.snapshotEntryDigest(rollingDigest, entry).pipe(
+                Effect.provideService(Crypto.Crypto, crypto)
               )
               entries.push({ entry, ...validated })
             }
@@ -1166,6 +1176,11 @@ export const layer = (
                 key: yield* Codec.parse(row.entity_key)
               })
               dirty.set(SqlTransaction.entityKey(entity), entity)
+            }
+            const priorCanonical = yield* findCanonicalEntityIdentities(undefined).pipe(
+              Effect.mapError(StorageUnavailable.make)
+            )
+            for (const row of priorCanonical) {
               const identity = `${row.model}\\u0000${row.entity_key}`
               if (!stagedIdentities.has(identity)) {
                 yield* sql`INSERT INTO effect_local_client_retractions
@@ -1274,10 +1289,8 @@ export const layer = (
               })
             }
             const contentBytes = yield* Protocol.encodedBytesEffect(page.changes)
-            const pageDigest = Protocol.MutationDigest.make(
-              yield* Canonical.digest({ format: 1, changes: page.changes }).pipe(
-                Effect.provideService(Crypto.Crypto, crypto)
-              )
+            const pageDigest = yield* Protocol.viewChangesDigest(page.changes).pipe(
+              Effect.provideService(Crypto.Crypto, crypto)
             )
             if (contentBytes !== page.contentBytes || pageDigest !== page.digest) {
               return yield* new ReplicaError.ProtocolInvalid({

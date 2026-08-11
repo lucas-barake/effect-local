@@ -120,7 +120,7 @@ export const make = (options: Options) => {
     digest({ format: 1, principal }).pipe(Effect.map((value) => Protocol.MutationDigest.make(value)))
 
   const scopeDigest = (scope: Protocol.ReplicationScope) =>
-    digest({ format: 1, scope }).pipe(Effect.map((value) => Protocol.MutationDigest.make(value)))
+    Protocol.replicationScopeDigest(scope).pipe(Effect.provideService(Crypto.Crypto, options.crypto))
 
   const decodeAuthoritative = (
     spaceId: Identity.SpaceId,
@@ -259,15 +259,24 @@ export const make = (options: Options) => {
     Effect.gen(function*() {
       yield* sql`DELETE FROM effect_local_server_replication_view_entities
         WHERE space_id = ${request.spaceId} AND client_id = ${request.clientId}`
-      for (const change of changes) {
-        const key = yield* Codec.stringify(change.entity.key)
-        let valueJson: string | null = null
-        if (change._tag === "Upsert") valueJson = yield* Codec.stringify(change.value)
+      const rows = yield* Effect.forEach(changes, (change) =>
+        Effect.gen(function*() {
+          if (change._tag !== "Upsert") return undefined
+          return {
+            space_id: request.spaceId,
+            client_id: request.clientId,
+            principal_digest: principal,
+            view_id: cursor.viewId,
+            model: change.entity.model,
+            model_version: change.entity.modelVersion,
+            entity_key: yield* Codec.stringify(change.entity.key),
+            disposition: change._tag,
+            value_json: yield* Codec.stringify(change.value)
+          }
+        })).pipe(Effect.map((values) => values.filter((value) => value !== undefined)))
+      for (let offset = 0; offset < rows.length; offset += 100) {
         yield* sql`INSERT INTO effect_local_server_replication_view_entities
-          (space_id, client_id, principal_digest, view_id, model, model_version, entity_key,
-            disposition, value_json)
-          VALUES (${request.spaceId}, ${request.clientId}, ${principal}, ${cursor.viewId},
-            ${change.entity.model}, ${change.entity.modelVersion}, ${key}, ${change._tag}, ${valueJson})`
+          ${sql.insert(rows.slice(offset, offset + 100))}`
       }
     })
 
@@ -291,29 +300,9 @@ export const make = (options: Options) => {
       }
       const all = yield* authoritative(request.spaceId)
       const target = yield* visible({ ...request, scope: normalized }, principal, all)
-      let priorRows: ReadonlyArray<typeof Rows.ReplicationViewEntityRow.Type> = []
-      if (Option.isSome(previous)) {
-        priorRows = yield* findViewEntities({
-          spaceId: request.spaceId,
-          clientId: request.clientId,
-          viewId: previous.value.view_id
-        }).pipe(Effect.mapError(StorageUnavailable.make))
-      }
       const changes: Array<Protocol.ViewChange> = []
       for (const entity of target.values()) {
         changes.push(Protocol.Upsert.make({ entity: entity.entity, value: entity.value }))
-      }
-      for (const prior of priorRows) {
-        const identity = identityOf(prior.model, prior.entity_key)
-        if (target.has(identity)) continue
-        const current = all.get(identity)
-        const entity = Protocol.EntityKey.make({
-          model: prior.model,
-          modelVersion: prior.model_version,
-          key: yield* Codec.parse(prior.entity_key)
-        })
-        if (current === undefined) changes.push(Protocol.Delete.make({ entity }))
-        else changes.push(Protocol.Retract.make({ entity }))
       }
       const orderedChanges = changes.toSorted((left, right) => {
         const leftKey = identityOf(left.entity.model, Canonical.stringify(left.entity.key))
@@ -350,7 +339,9 @@ export const make = (options: Options) => {
             limit: options.maximumSnapshotBytes
           })
         }
-        rolling = Protocol.SnapshotDigest.make(yield* digest({ previous: rolling, entry }))
+        rolling = yield* Protocol.snapshotEntryDigest(rolling, entry).pipe(
+          Effect.provideService(Crypto.Crypto, options.crypto)
+        )
         entries.push(entry)
       }
       yield* deleteSnapshot(request.spaceId, request.clientId)
@@ -379,10 +370,16 @@ export const make = (options: Options) => {
           ${yield* Codec.stringify(normalized)}, ${normalizedDigest}, ${request.scopeGeneration},
           ${viewId}, 0, ${space.next_server_sequence - 1}, ${space.next_terminal_sequence - 1},
           ${entries.length}, ${bytes}, ${rolling})`
-      for (const entry of entries) {
+      const entryRows = yield* Effect.forEach(entries, (entry) =>
+        Codec.stringify(entry).pipe(Effect.map((changeJson) => ({
+          snapshot_id: snapshotId,
+          ordinal: entry.ordinal,
+          change_json: changeJson,
+          entry_bytes: entry.entryBytes
+        }))))
+      for (let offset = 0; offset < entryRows.length; offset += 100) {
         yield* sql`INSERT INTO effect_local_server_scoped_snapshot_entries
-          (snapshot_id, ordinal, change_json, entry_bytes)
-          VALUES (${snapshotId}, ${entry.ordinal}, ${yield* Codec.stringify(entry)}, ${entry.entryBytes})`
+          ${sql.insert(entryRows.slice(offset, offset + 100))}`
       }
       return Protocol.SnapshotManifest.make({
         spaceId: request.spaceId,
@@ -439,14 +436,19 @@ export const make = (options: Options) => {
         if (change._tag === "Upsert") {
           if (
             current === undefined || !request.scope.models.includes(current.entity.model) ||
-            !(yield* options.authorization.entity(request, principal, current.entity, current.value))
+            change.entity.modelVersion !== current.entity.modelVersion ||
+            (yield* Codec.stringify(change.value)) !== current.valueJson ||
+            !(yield* options.authorization.entity(request, principal, change.entity, change.value))
           ) return false
         }
-        if (
-          change._tag === "Delete" && current !== undefined &&
-          (!request.scope.models.includes(current.entity.model) ||
-            !(yield* options.authorization.entity(request, principal, current.entity, current.value)))
-        ) return false
+        if (change._tag === "Delete" && current !== undefined) return false
+        if (change._tag === "Retract") {
+          if (current === undefined) return false
+          if (
+            request.scope.models.includes(current.entity.model) &&
+            (yield* options.authorization.entity(request, principal, current.entity, current.value))
+          ) return false
+        }
       }
       return true
     })
@@ -459,18 +461,39 @@ export const make = (options: Options) => {
     scopeHash: Protocol.MutationDigest
   ) =>
     Effect.gen(function*() {
+      const upserts: Array<Record<string, unknown>> = []
+      const removals: Array<{ readonly model: string; readonly key: string }> = []
       for (const change of page.changes) {
         const key = yield* Codec.stringify(change.entity.key)
-        let valueJson: string | null = null
-        if (change._tag === "Upsert") valueJson = yield* Codec.stringify(change.value)
+        if (change._tag === "Upsert") {
+          upserts.push({
+            space_id: request.spaceId,
+            client_id: request.clientId,
+            principal_digest: principalHash,
+            view_id: page.cursor.viewId,
+            model: change.entity.model,
+            model_version: change.entity.modelVersion,
+            entity_key: key,
+            disposition: change._tag,
+            value_json: yield* Codec.stringify(change.value)
+          })
+        } else {
+          removals.push({ model: change.entity.model, key })
+        }
+      }
+      for (let offset = 0; offset < upserts.length; offset += 100) {
         yield* sql`INSERT INTO effect_local_server_replication_view_entities
-          (space_id, client_id, principal_digest, view_id, model, model_version, entity_key,
-            disposition, value_json)
-          VALUES (${request.spaceId}, ${request.clientId}, ${principalHash}, ${page.cursor.viewId},
-            ${change.entity.model}, ${change.entity.modelVersion}, ${key}, ${change._tag}, ${valueJson})
+          ${sql.insert(upserts.slice(offset, offset + 100))}
           ON CONFLICT (space_id, client_id, view_id, model, entity_key) DO UPDATE SET
             principal_digest = excluded.principal_digest, model_version = excluded.model_version,
             disposition = excluded.disposition, value_json = excluded.value_json`
+      }
+      for (let offset = 0; offset < removals.length; offset += 100) {
+        const batch = removals.slice(offset, offset + 100)
+        yield* sql`DELETE FROM effect_local_server_replication_view_entities
+          WHERE space_id = ${request.spaceId} AND client_id = ${request.clientId}
+            AND view_id = ${page.cursor.viewId}
+            AND ${sql.or(batch.map((entity) => sql`(model = ${entity.model} AND entity_key = ${entity.key})`))}`
       }
       yield* sql`UPDATE effect_local_server_replication_views SET
         view_revision = ${page.cursor.revision}, scope_generation = ${page.scopeGeneration},
@@ -530,10 +553,11 @@ export const make = (options: Options) => {
         viewId: view.view_id,
         revision: Identity.ReplicationViewRevision.make(view.view_revision + 1)
       })
-      const selected: Array<Protocol.ViewChange> = []
-      for (const change of changes) {
-        if (selected.length >= request.limit) break
-        const candidate = [...selected, change]
+      let lower = 0
+      let upper = Math.min(request.limit, changes.length)
+      while (lower < upper) {
+        const length = Math.ceil((lower + upper) / 2)
+        const candidate = changes.slice(0, length)
         const candidatePage = Protocol.PullPage.make({
           scopeGeneration: request.scopeGeneration,
           cursor,
@@ -543,9 +567,10 @@ export const make = (options: Options) => {
           digest: Protocol.MutationDigest.make("0".repeat(64)),
           hasMore: candidate.length < changes.length
         })
-        if (Protocol.encodedBytes(candidatePage) > Protocol.maximumBatchBytes) break
-        selected.push(change)
+        if (Protocol.encodedBytes(candidatePage) <= Protocol.maximumBatchBytes) lower = length
+        else upper = length - 1
       }
+      const selected = changes.slice(0, lower)
       if (changes.length > 0 && selected.length === 0) {
         return yield* new ReplicaError.CapacityExceeded({
           resource: "replication page bytes",
@@ -559,7 +584,9 @@ export const make = (options: Options) => {
         serverSequence,
         changes: selected,
         contentBytes,
-        digest: Protocol.MutationDigest.make(yield* digest({ format: 1, changes: selected })),
+        digest: yield* Protocol.viewChangesDigest(selected).pipe(
+          Effect.provideService(Crypto.Crypto, options.crypto)
+        ),
         hasMore: selected.length < changes.length
       })
       const scopeJson = yield* Codec.stringify(normalized)
@@ -597,6 +624,8 @@ export const make = (options: Options) => {
       }
       if (
         request.cursor === null || Option.isNone(stored) || stored.value.principal_digest !== principalHash ||
+        stored.value.definition_hash !== options.definition.hash ||
+        stored.value.schema_version !== request.schema.version || stored.value.schema_hash !== request.schema.hash ||
         request.cursor.viewId !== stored.value.view_id || request.scopeGeneration < stored.value.scope_generation
       ) return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
       const view = stored.value
@@ -670,6 +699,8 @@ export const make = (options: Options) => {
       if (
         Option.isNone(stored) || stored.value.space_id !== request.spaceId ||
         stored.value.client_id !== request.clientId || stored.value.principal_digest !== principalHash ||
+        stored.value.definition_hash !== options.definition.hash ||
+        stored.value.schema_version !== request.schema.version || stored.value.schema_hash !== request.schema.hash ||
         stored.value.scope_digest !== normalizedDigest || stored.value.scope_generation !== request.scopeGeneration ||
         stored.value.view_id !== request.cursor.viewId || stored.value.view_revision !== request.cursor.revision
       ) {
@@ -687,12 +718,12 @@ export const make = (options: Options) => {
       for (const entry of entries) {
         const key = yield* Codec.stringify(entry.change.entity.key)
         const current = all.get(identityOf(entry.change.entity.model, key))
-        const authorized = current !== undefined && normalized.models.includes(current.entity.model) &&
-          (yield* options.authorization.entity(request, principal, current.entity, current.value))
         if (
-          (entry.change._tag === "Upsert" && !authorized) ||
-          (entry.change._tag === "Delete" && current !== undefined) ||
-          (entry.change._tag === "Retract" && (current === undefined || authorized))
+          entry.change._tag !== "Upsert" || current === undefined ||
+          !normalized.models.includes(current.entity.model) ||
+          entry.change.entity.modelVersion !== current.entity.modelVersion ||
+          (yield* Codec.stringify(entry.change.value)) !== current.valueJson ||
+          !(yield* options.authorization.entity(request, principal, entry.change.entity, entry.change.value))
         ) {
           valid = false
           break
@@ -717,17 +748,19 @@ export const make = (options: Options) => {
         })
       }
       const remaining = entries.slice(afterOrdinal + 1)
-      const selected: Array<Protocol.SnapshotEntry> = []
-      for (const entry of remaining) {
-        if (selected.length >= request.limit) break
+      let lower = 0
+      let upper = Math.min(request.limit, remaining.length)
+      while (lower < upper) {
+        const length = Math.ceil((lower + upper) / 2)
         const candidate = Protocol.BootstrapPage.make({
           manifest: manifestFromRow(row),
-          entries: [...selected, entry],
-          hasMore: selected.length + 1 < remaining.length
+          entries: remaining.slice(0, length),
+          hasMore: length < remaining.length
         })
-        if (Protocol.encodedBytes(candidate) > options.maximumBootstrapPageBytes) break
-        selected.push(entry)
+        if (Protocol.encodedBytes(candidate) <= options.maximumBootstrapPageBytes) lower = length
+        else upper = length - 1
       }
+      const selected = remaining.slice(0, lower)
       if (remaining.length > 0 && selected.length === 0) {
         return yield* new ReplicaError.CapacityExceeded({
           resource: "bootstrap page bytes",

@@ -99,6 +99,9 @@ export const ReplicationScope = Schema.Struct({
 })
 export type ReplicationScope = typeof ReplicationScope.Type
 
+export const replicationScopeDigest = (scope: ReplicationScope) =>
+  Canonical.digest({ format: 1, scope }).pipe(Effect.map((value) => MutationDigest.make(value)))
+
 export const normalizeReplicationScope = (scope: ReplicationScope): ReplicationScope =>
   ReplicationScope.make({ models: scope.models.toSorted() })
 
@@ -220,6 +223,9 @@ export const PullPage = Schema.Struct({
 })
 export type PullPage = typeof PullPage.Type
 
+export const viewChangesDigest = (changes: ReadonlyArray<ViewChange>) =>
+  Canonical.digest({ format: 1, changes }).pipe(Effect.map((value) => MutationDigest.make(value)))
+
 export const SnapshotDigest = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
 export type SnapshotDigest = typeof SnapshotDigest.Type
 export const initialSnapshotDigest = SnapshotDigest.make("0".repeat(64))
@@ -247,6 +253,9 @@ export const SnapshotEntry = Schema.Struct({
   entryBytes: Schema.Int.check(Schema.isGreaterThan(0))
 })
 export type SnapshotEntry = typeof SnapshotEntry.Type
+
+export const snapshotEntryDigest = (previous: SnapshotDigest, entry: SnapshotEntry) =>
+  Canonical.digest({ previous, entry }).pipe(Effect.map((value) => SnapshotDigest.make(value)))
 
 export const SnapshotEntity = Schema.Struct({
   ordinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),

@@ -66,9 +66,13 @@ const defaultAuthorizeRead: ServerStore.Options["authorizeRead"] = (input) => {
   return Effect.void
 }
 
-const makeServer = (authorizeRead: ServerStore.Options["authorizeRead"] = defaultAuthorizeRead) =>
+const makeServer = (
+  authorizeRead: ServerStore.Options["authorizeRead"] = defaultAuthorizeRead,
+  overrides: Partial<typeof history> = {}
+) =>
   ServerStore.layer({
     ...history,
+    ...overrides,
     definition: Domain.definition,
     readAuthorizationRefreshInterval: "1 second",
     authorizeAccess: () => Effect.void,
@@ -79,7 +83,12 @@ const makeServer = (authorizeRead: ServerStore.Options["authorizeRead"] = defaul
 const service = <I, S, E, R,>(tag: Context.Service<I, S>, layer: Layer.Layer<I, E, R>) =>
   Layer.build(layer).pipe(Effect.map((context) => Context.get(context, tag)))
 
-const envelope = (id: string, sequence: number) =>
+const titleOf = (value: unknown): unknown => {
+  if (value === null || typeof value !== "object" || Array.isArray(value) || !("title" in value)) return undefined
+  return value.title
+}
+
+const envelope = (id: string, sequence: number, title = "first") =>
   Effect.gen(function*() {
     const identity = {
       spaceId,
@@ -90,10 +99,29 @@ const envelope = (id: string, sequence: number) =>
       localSequence: Identity.LocalSequence.make(sequence),
       basis: Identity.ServerSequence.make(0),
       name: Domain.PutTodo.name,
-      payload: Domain.todo(id),
+      payload: Domain.todo(id, title),
       digestVersion: 2 as const,
       sourceSchema: Domain.definition.schemaIdentity,
       mutationVersion: Domain.PutTodo.version
+    }
+    return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
+  })
+
+const deleteEnvelope = (id: string, sequence: number) =>
+  Effect.gen(function*() {
+    const identity = {
+      spaceId,
+      clientId: writerId,
+      mutationId: Identity.MutationId.make(
+        `mut_00000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`
+      ),
+      localSequence: Identity.LocalSequence.make(sequence),
+      basis: Identity.ServerSequence.make(0),
+      name: Domain.DeleteTodo.name,
+      payload: { id },
+      digestVersion: 2 as const,
+      sourceSchema: Domain.definition.schemaIdentity,
+      mutationVersion: Domain.DeleteTodo.version
     }
     return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
   })
@@ -161,7 +189,7 @@ describe("scoped replication", () => {
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
-  it.effect("retracts the prior principal view when a client changes principals", () =>
+  it.effect("does not disclose prior principal keys when a client changes principals", () =>
     Effect.scoped(
       Effect.gen(function*() {
         const server = yield* service(ServerStore.ServerStore, makeServer())
@@ -173,8 +201,7 @@ describe("scoped replication", () => {
         const reader = yield* server.pullAuthorized(pullRequest(owner.manifest.cursor), "reader")
         if (!("_tag" in reader)) assert.fail("expected principal rotation bootstrap")
         const page = yield* server.bootstrapAuthorized(bootstrapRequest(reader.manifest), "reader")
-        assert.deepStrictEqual(page.entries.map((entry) => entry.change._tag), ["Retract"])
-        assert.deepStrictEqual(page.entries.map((entry) => entry.change.entity.key), ["private"])
+        assert.deepStrictEqual(page.entries, [])
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
@@ -232,17 +259,23 @@ describe("scoped replication", () => {
         assert.isTrue("_tag" in rotated)
         if (!("_tag" in rotated)) assert.fail("unsafe outstanding page must rotate")
         const revokedBootstrap = yield* server.bootstrapAuthorized(bootstrapRequest(rotated.manifest), "reader")
-        assert.deepStrictEqual(
-          revokedBootstrap.entries.map((entry) => entry.change._tag),
-          ["Retract"]
-        )
+        assert.deepStrictEqual(revokedBootstrap.entries, [])
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
   it.effect("does not wake for hidden mutations and emits a periodic revocation hint", () =>
     Effect.scoped(
       Effect.gen(function*() {
-        const server = yield* service(ServerStore.ServerStore, makeServer())
+        const hiddenChecked = yield* Deferred.make<void>()
+        const server = yield* service(
+          ServerStore.ServerStore,
+          makeServer((input) => {
+            if (input._tag === "Entity" && input.entity.key === "private") {
+              return Deferred.succeed(hiddenChecked, undefined).pipe(Effect.andThen(Effect.fail("private")))
+            }
+            return Effect.void
+          })
+        )
         const initial = yield* server.pullAuthorized(pullRequest(), "reader")
         if (!("_tag" in initial)) assert.fail("expected scoped bootstrap")
         yield* server.bootstrapAuthorized(bootstrapRequest(initial.manifest), "reader")
@@ -269,6 +302,7 @@ describe("scoped replication", () => {
         )
         yield* Deferred.await(firstWake)
         yield* server.submit(yield* envelope("private", 1))
+        yield* Deferred.await(hiddenChecked)
         yield* Effect.yieldNow
         assert.isUndefined(watcher.pollUnsafe())
 
@@ -356,6 +390,120 @@ describe("scoped replication", () => {
         if ("_tag" in revoked) assert.fail("expected retraction page")
         yield* local.applyViewPage(revoked)
         assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "public")))
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("keeps a pending-only optimistic entity visible across bootstrap replacement", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        const local = yield* service(
+          LocalStore.Store,
+          LocalStore.layer({
+            ...clientHistory,
+            definition: Domain.definition,
+            spaceId,
+            clientId: readerId,
+            scope
+          }).pipe(Layer.provide(runtime), Layer.provide(database))
+        )
+        yield* local.mutate(Domain.PutTodo, Domain.todo("pending"))
+
+        const required = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        const page = yield* server.bootstrapAuthorized(bootstrapRequest(required.manifest), "reader")
+        yield* local.prepareBootstrap(required.manifest)
+        assert.isTrue(yield* local.stageBootstrapPage(page))
+        yield* local.installBootstrap(required.manifest)
+
+        assert.strictEqual(yield* local.pendingCount, 1)
+        assert.deepStrictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "pending")), Domain.todo("pending"))
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("bounds replacement snapshots by the current visible entity set", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(
+          ServerStore.ServerStore,
+          makeServer(defaultAuthorizeRead, { maximumSnapshotEntities: 1 })
+        )
+        const initial = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in initial)) assert.fail("expected scoped bootstrap")
+        yield* server.bootstrapAuthorized(bootstrapRequest(initial.manifest), "reader")
+
+        yield* server.submit(yield* envelope("first", 1))
+        const upsert = yield* server.pullAuthorized(pullRequest(initial.manifest.cursor), "reader")
+        if ("_tag" in upsert) assert.fail("expected upsert page")
+        yield* server.submit(yield* deleteEnvelope("first", 2))
+        const deleted = yield* server.pullAuthorized(pullRequest(upsert.cursor), "reader")
+        if ("_tag" in deleted) assert.fail("expected delete page")
+        yield* server.submit(yield* envelope("second", 3))
+        const current = yield* server.pullAuthorized(pullRequest(deleted.cursor), "reader")
+        if ("_tag" in current) assert.fail("expected current page")
+
+        const rotated = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in rotated)) assert.fail("expected replacement bootstrap")
+        const page = yield* server.bootstrapAuthorized(bootstrapRequest(rotated.manifest), "reader")
+        assert.strictEqual(page.manifest.entityCount, 1)
+        assert.deepStrictEqual(page.entries.map((entry) => entry.change.entity.key), ["second"])
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("rotates an outstanding page when its persisted value is no longer current", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        let allowedTitle = "base"
+        const server = yield* service(
+          ServerStore.ServerStore,
+          makeServer((input) => {
+            if (input._tag === "Entity" && titleOf(input.value) !== allowedTitle) {
+              return Effect.fail("not current")
+            }
+            return Effect.void
+          })
+        )
+        yield* server.submit(yield* envelope("public", 1, "base"))
+        const initial = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in initial)) assert.fail("expected scoped bootstrap")
+        yield* server.bootstrapAuthorized(bootstrapRequest(initial.manifest), "reader")
+
+        allowedTitle = "secret-page"
+        yield* server.submit(yield* envelope("public", 2, "secret-page"))
+        const secret = yield* server.pullAuthorized(pullRequest(initial.manifest.cursor), "reader")
+        if ("_tag" in secret) assert.fail("expected outstanding page")
+
+        allowedTitle = "public-current"
+        yield* server.submit(yield* envelope("public", 3, "public-current"))
+        const retried = yield* server.pullAuthorized(pullRequest(initial.manifest.cursor), "reader")
+        assert.isTrue("_tag" in retried)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("rotates a snapshot when its persisted value is no longer current", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        let allowedTitle = "secret-snapshot"
+        const server = yield* service(
+          ServerStore.ServerStore,
+          makeServer((input) => {
+            if (input._tag === "Entity" && titleOf(input.value) !== allowedTitle) {
+              return Effect.fail("not current")
+            }
+            return Effect.void
+          })
+        )
+        yield* server.submit(yield* envelope("public", 1, "secret-snapshot"))
+        const initial = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in initial)) assert.fail("expected scoped bootstrap")
+
+        allowedTitle = "public-current"
+        yield* server.submit(yield* envelope("public", 2, "public-current"))
+        const page = yield* server.bootstrapAuthorized(bootstrapRequest(initial.manifest), "reader")
+        assert.notStrictEqual(page.manifest.snapshotId, initial.manifest.snapshotId)
+        const change = page.entries[0]?.change
+        if (change?._tag !== "Upsert") assert.fail("expected current upsert")
+        assert.strictEqual(titleOf(change.value), "public-current")
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 

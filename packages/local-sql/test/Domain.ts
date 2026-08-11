@@ -32,6 +32,11 @@ export const RenameTodo = Mutation.make("RenameTodo", {
   rejection: Schema.Literal("TodoNotFound")
 })
 
+export const DeleteTodo = Mutation.make("DeleteTodo", {
+  version: 1,
+  payload: { id: Schema.String }
+})
+
 export const IncrementTodo = Mutation.make("IncrementTodo", {
   version: 1,
   payload: { id: Schema.String, delta: Schema.Number },
@@ -73,7 +78,16 @@ const ListTodos = Query.make("ListTodos", {
 export const definition = Definition.make({
   version: 1,
   models: [Todo],
-  mutations: [PutTodo, RenameTodo, IncrementTodo, AddLabel, RejectAfterWrite, PutHugeTodo, ReturnHugeResult],
+  mutations: [
+    PutTodo,
+    RenameTodo,
+    DeleteTodo,
+    IncrementTodo,
+    AddLabel,
+    RejectAfterWrite,
+    PutHugeTodo,
+    ReturnHugeResult
+  ],
   queries: [ListTodos]
 })
 
@@ -93,6 +107,7 @@ export const handlers = Layer.mergeAll(
       yield* transaction.set(Todo, payload.id, { ...current, title: payload.title })
     })
   ),
+  DeleteTodo.toLayer(({ payload, transaction }) => transaction.delete(Todo, payload.id)),
   IncrementTodo.toLayer(({ payload, transaction }) =>
     Effect.gen(function*() {
       const current = yield* getTodo(transaction, payload.id)
