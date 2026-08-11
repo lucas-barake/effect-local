@@ -60,8 +60,7 @@ const MigrationRow = Schema.Struct({
   checksum: Identity.SchemaHash
 })
 
-const mismatch = (catalog: Catalog, message: string) =>
-  new ReplicaError.StorageMigrationMismatch({ catalog, message })
+const mismatch = (catalog: Catalog, message: string) => new ReplicaError.StorageMigrationMismatch({ catalog, message })
 
 const validateCatalog = (
   catalog: Catalog,
@@ -71,7 +70,10 @@ const validateCatalog = (
   for (let index = 0; index < migrations.length; index++) {
     const migration = migrations[index]!
     if (migration.id !== index + 1) {
-      return mismatch(catalog, `${catalog} migration ids must be contiguous from 1. Expected ${index + 1}, got ${migration.id}`)
+      return mismatch(
+        catalog,
+        `${catalog} migration ids must be contiguous from 1. Expected ${index + 1}, got ${migration.id}`
+      )
     }
     if (names.has(migration.name)) return mismatch(catalog, `Duplicate migration name: ${migration.name}`)
     names.add(migration.name)
@@ -118,12 +120,17 @@ export const runCatalog = (
     })
     yield* sql.withTransaction(Effect.gen(function*() {
       const applied = yield* (catalog === "Client" ? readClient(undefined) : readServer(undefined)).pipe(
-        Effect.mapError((cause) => SqlError.isSqlError(cause)
-          ? StorageUnavailable.make(cause)
-          : new ReplicaError.StorageCorrupt({ message: `${catalog} migration ledger is corrupt`, cause }))
+        Effect.mapError((cause) =>
+          SqlError.isSqlError(cause)
+            ? StorageUnavailable.make(cause)
+            : new ReplicaError.StorageCorrupt({ message: `${catalog} migration ledger is corrupt`, cause })
+        )
       )
       if (applied.length > migrations.length) {
-        return yield* mismatch(catalog, `${catalog} catalog deleted ${applied.length - migrations.length} applied migration(s)`)
+        return yield* mismatch(
+          catalog,
+          `${catalog} catalog deleted ${applied.length - migrations.length} applied migration(s)`
+        )
       }
       for (let index = 0; index < applied.length; index++) {
         const stored = applied[index]!
@@ -331,6 +338,26 @@ const clientV4 = makeMigration({
   ]
 })
 
+const clientV5 = makeMigration({
+  id: 5,
+  name: "opaque-legacy-receipts",
+  statements: [
+    `CREATE TABLE effect_local_client_shadow_receipts_v2 (
+      generation INTEGER NOT NULL,
+      mutation_id TEXT NOT NULL,
+      local_sequence INTEGER NOT NULL,
+      receipt_json TEXT NOT NULL,
+      source_schema_version INTEGER NOT NULL,
+      source_schema_hash TEXT NOT NULL,
+      mutation_version INTEGER,
+      mutation_name TEXT,
+      rejection_origin TEXT,
+      PRIMARY KEY (generation, mutation_id),
+      UNIQUE (generation, local_sequence)
+    )`
+  ]
+})
+
 const serverV1 = makeMigration({
   id: 1,
   name: "mutation-log",
@@ -470,7 +497,7 @@ const serverV4 = makeMigration({
   ]
 })
 
-export const clientCatalog = Object.freeze([clientV1, clientV2, clientV3, clientV4])
+export const clientCatalog = Object.freeze([clientV1, clientV2, clientV3, clientV4, clientV5])
 export const serverCatalog = Object.freeze([serverV1, serverV2, serverV3, serverV4])
 
 export const client = (options: {

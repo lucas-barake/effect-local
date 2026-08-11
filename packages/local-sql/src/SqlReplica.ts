@@ -1,4 +1,5 @@
 import type * as Definition from "@lucas-barake/effect-local/Definition"
+import type * as Evolution from "@lucas-barake/effect-local/Evolution"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import type * as Duration from "effect/Duration"
@@ -15,6 +16,8 @@ export interface Options<D extends Definition.Any,> {
   readonly spaceId: Identity.SpaceId
   readonly clientId: Identity.ClientId
   readonly maximumPendingMutations?: number
+  readonly evolution?: Evolution.Evolution
+  readonly schemaEvolutionBatchSize?: number
   readonly pageSize?: number
   readonly retryDelay?: Duration.Input
   readonly maximumRetryDelay?: Duration.Input
@@ -45,7 +48,7 @@ const makeLayer = <D extends Definition.Any, E, R,>(
   options: Options<D>,
   reconcilerLayer: Layer.Layer<Reconciler.Reconciler, E, LocalStore.Store | R>
 ) => {
-  const mutationRuntime = MutationRuntime.layer(options.definition)
+  const mutationRuntime = MutationRuntime.layer(options.definition, options.evolution)
   const local = LocalStore.layer(options).pipe(Layer.provide(mutationRuntime))
   const queries = QueryExecutor.layer(options.definition)
   const reconciler = reconcilerLayer.pipe(Layer.provide(local))

@@ -3,13 +3,13 @@ import * as Schema from "effect/Schema"
 import * as Canonical from "./Canonical.js"
 import type * as Definition from "./Definition.js"
 import * as Identity from "./Identity.js"
+import type * as SchemaInput from "./internal/schemaInput.js"
 import type * as Model from "./Model.js"
 import type * as Mutation from "./Mutation.js"
 import * as ReplicaError from "./ReplicaError.js"
 import * as SchemaDescriptor from "./SchemaDescriptor.js"
-import type * as SchemaInput from "./internal/schemaInput.js"
 
-export interface ModelMigration<From extends Model.Any, To extends Model.Any> {
+export interface ModelMigration<From extends Model.Any, To extends Model.Any,> {
   readonly id: string
   readonly from: From
   readonly to: To
@@ -21,7 +21,7 @@ export interface ModelMigration<From extends Model.Any, To extends Model.Any> {
   }): Model.Value<To>
 }
 
-export interface MutationMigration<From extends Mutation.Any, To extends Mutation.Any> {
+export interface MutationMigration<From extends Mutation.Any, To extends Mutation.Any,> {
   readonly id: string
   readonly from: From
   readonly to: To
@@ -88,7 +88,9 @@ const byId = <A extends { readonly id: string },>(left: A, right: A): number =>
 
 const assertStableId = (kind: string, id: string): void => {
   if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/.test(id)) {
-    throw new TypeError(`${kind} id must be stable, nonempty, and contain only letters, numbers, dot, slash, underscore, or dash: ${id}`)
+    throw new TypeError(
+      `${kind} id must be stable, nonempty, and contain only letters, numbers, dot, slash, underscore, or dash: ${id}`
+    )
   }
 }
 
@@ -115,16 +117,18 @@ const indexedMigrations = <A extends { readonly id: string; readonly from: { rea
   return byName
 }
 
-export const model = <From extends Model.Any, To extends Model.Any>(options: {
+export const model = <From extends Model.Any, To extends Model.Any,>(options: {
   readonly id: string
   readonly from: From
   readonly to: To
   readonly key?: ((key: Model.Key<From>) => Model.Key<To>) | undefined
-  readonly value?: ((input: {
-    readonly key: Model.Key<From>
-    readonly targetKey: Model.Key<To>
-    readonly value: Model.Value<From>
-  }) => Model.Value<To>) | undefined
+  readonly value?:
+    | ((input: {
+      readonly key: Model.Key<From>
+      readonly targetKey: Model.Key<To>
+      readonly value: Model.Value<From>
+    }) => Model.Value<To>)
+    | undefined
 }): ModelMigration<From, To> => {
   assertStableId("model", options.id)
   if (options.from.name !== options.to.name) {
@@ -150,7 +154,7 @@ export const model = <From extends Model.Any, To extends Model.Any>(options: {
   })
 }
 
-export const mutation = <From extends Mutation.Any, To extends Mutation.Any>(options: {
+export const mutation = <From extends Mutation.Any, To extends Mutation.Any,>(options: {
   readonly id: string
   readonly from: From
   readonly to: To
@@ -174,8 +178,10 @@ export const mutation = <From extends Mutation.Any, To extends Mutation.Any>(opt
   if (rejectionChanged && options.rejection === undefined) {
     throw new TypeError(`Mutation migration ${options.id} requires a rejection transform`)
   }
-  if (!payloadChanged && !successChanged && !rejectionChanged &&
-    options.payload === undefined && options.success === undefined && options.rejection === undefined) {
+  if (
+    !payloadChanged && !successChanged && !rejectionChanged &&
+    options.payload === undefined && options.success === undefined && options.rejection === undefined
+  ) {
     throw new TypeError(`Mutation migration ${options.id} must declare at least one semantic transform`)
   }
   return Object.freeze({
@@ -216,8 +222,10 @@ const validateModelChanges = (
     }
   }
   for (const migration of migrations.values()) {
-    if (from.modelByName.get(migration.from.name) !== migration.from ||
-      to.modelByName.get(migration.to.name) !== migration.to) {
+    if (
+      from.modelByName.get(migration.from.name) !== migration.from ||
+      to.modelByName.get(migration.to.name) !== migration.to
+    ) {
       throw new TypeError(`Model migration ${migration.id} does not belong to its step definitions`)
     }
   }
@@ -237,7 +245,9 @@ const validateMutationChanges = (
       !sameSchema(source.rejectionSchema, target.rejectionSchema)
     const migration = migrations.get(source.name)
     if (!changed) {
-      if (migration !== undefined) throw new TypeError(`Unchanged mutation must not declare a migration: ${source.name}`)
+      if (migration !== undefined) {
+        throw new TypeError(`Unchanged mutation must not declare a migration: ${source.name}`)
+      }
       continue
     }
     if (target.version !== source.version + 1) {
@@ -253,8 +263,10 @@ const validateMutationChanges = (
     }
   }
   for (const migration of migrations.values()) {
-    if (from.mutationByName.get(migration.from.name) !== migration.from ||
-      to.mutationByName.get(migration.to.name) !== migration.to) {
+    if (
+      from.mutationByName.get(migration.from.name) !== migration.from ||
+      to.mutationByName.get(migration.to.name) !== migration.to
+    ) {
       throw new TypeError(`Mutation migration ${migration.id} does not belong to its step definitions`)
     }
   }
@@ -430,15 +442,16 @@ const failed = (
   fromVersion: number,
   toVersion: number,
   cause: unknown
-) => new ReplicaError.SchemaEvolutionFailed({
-  stepId: step.id,
-  componentKind,
-  componentName,
-  part,
-  fromVersion,
-  toVersion,
-  cause
-})
+) =>
+  new ReplicaError.SchemaEvolutionFailed({
+    stepId: step.id,
+    componentKind,
+    componentName,
+    part,
+    fromVersion,
+    toVersion,
+    cause
+  })
 
 const decode = (
   schema: PureSchema,
@@ -463,7 +476,10 @@ const transform = (
   input: typeof Schema.Json.Type,
   migrate: (value: unknown) => unknown,
   error: (cause: unknown) => ReplicaError.SchemaEvolutionFailed
-): Effect.Effect<{ readonly encoded: typeof Schema.Json.Type; readonly value: unknown }, ReplicaError.SchemaEvolutionFailed> =>
+): Effect.Effect<
+  { readonly encoded: typeof Schema.Json.Type; readonly value: unknown },
+  ReplicaError.SchemaEvolutionFailed
+> =>
   Effect.gen(function*() {
     const source = yield* decode(from, input, error)
     const migrated = yield* Effect.sync(() => migrate(source))
@@ -482,6 +498,11 @@ export const migrateModel = (options: {
 }): Effect.Effect<MigratedModel, ReplicaError.SchemaEvolutionUnsupported | ReplicaError.SchemaEvolutionFailed> =>
   Effect.gen(function*() {
     const path = yield* pathFrom(options.evolution, options.source)
+    const sourceDefinition = options.evolution.definitionByIdentity.get(identityKey(options.source))
+    const sourceModel = sourceDefinition?.modelByName.get(options.model)
+    if (sourceModel === undefined || sourceModel.version !== options.modelVersion) {
+      return yield* Effect.fail(unsupported(options.evolution, options.source))
+    }
     let key = options.key
     let value = options.value
     let version = options.modelVersion
@@ -494,18 +515,25 @@ export const migrateModel = (options: {
         return yield* Effect.fail(unsupported(options.evolution, options.source))
       }
       const migration = entry.models.get(options.model)
-      const keyError = (cause: unknown) => failed(entry, "Model", options.model, "Key", source.version, target.version, cause)
+      const keyError = (cause: unknown) =>
+        failed(entry, "Model", options.model, "Key", source.version, target.version, cause)
       const sourceKey = yield* decode(source.key, key, keyError)
-      const migratedKey = yield* Effect.sync(() => migration?.migrateKey === undefined ?
-        sourceKey : migration.migrateKey(sourceKey))
+      const migratedKey = yield* Effect.sync(() =>
+        migration?.migrateKey === undefined ?
+          sourceKey :
+          migration.migrateKey(sourceKey)
+      )
       const targetKey = yield* decode(Schema.toType(target.key), migratedKey, keyError)
       key = yield* encode(target.key, targetKey, keyError)
       if (value !== undefined) {
         const valueError = (cause: unknown) =>
           failed(entry, "Model", options.model, "Value", source.version, target.version, cause)
         const sourceValue = yield* decode(source.schema, value, valueError)
-        const migratedValue = yield* Effect.sync(() => migration?.migrateValue === undefined ?
-          sourceValue : migration.migrateValue({ key: sourceKey, targetKey, value: sourceValue }))
+        const migratedValue = yield* Effect.sync(() =>
+          migration?.migrateValue === undefined ?
+            sourceValue :
+            migration.migrateValue({ key: sourceKey, targetKey, value: sourceValue })
+        )
         const targetValue = yield* decode(Schema.toType(target.schema), migratedValue, valueError)
         value = yield* encode(target.schema, targetValue, valueError)
       }
@@ -529,9 +557,17 @@ const migrateMutationPart = (options: {
   readonly mutationVersion: Identity.SchemaVersion
   readonly value: typeof Schema.Json.Type
   readonly part: "Payload" | "Success" | "Rejection"
-}): Effect.Effect<MigratedMutationValue, ReplicaError.SchemaEvolutionUnsupported | ReplicaError.SchemaEvolutionFailed> =>
+}): Effect.Effect<
+  MigratedMutationValue,
+  ReplicaError.SchemaEvolutionUnsupported | ReplicaError.SchemaEvolutionFailed
+> =>
   Effect.gen(function*() {
     const path = yield* pathFrom(options.evolution, options.source)
+    const sourceDefinition = options.evolution.definitionByIdentity.get(identityKey(options.source))
+    const sourceMutation = sourceDefinition?.mutationByName.get(options.mutation)
+    if (sourceMutation === undefined || sourceMutation.version !== options.mutationVersion) {
+      return yield* Effect.fail(unsupported(options.evolution, options.source))
+    }
     let value = options.value
     let version = options.mutationVersion
     for (const entry of path) {

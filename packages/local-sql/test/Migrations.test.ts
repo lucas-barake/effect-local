@@ -30,23 +30,26 @@ const LegacyServerRow = Schema.Struct({
   model_version: Schema.NullOr(Schema.Number)
 })
 
-const clientLedger = (sql: SqlClient.SqlClient) => SqlSchema.findAll({
-  Request: Schema.Void,
-  Result: LedgerRow,
-  execute: () => sql`SELECT id, name, checksum FROM effect_local_client_migrations ORDER BY id`
-})(undefined)
+const clientLedger = (sql: SqlClient.SqlClient) =>
+  SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: LedgerRow,
+    execute: () => sql`SELECT id, name, checksum FROM effect_local_client_migrations ORDER BY id`
+  })(undefined)
 
-const tableNames = (sql: SqlClient.SqlClient) => SqlSchema.findAll({
-  Request: Schema.Void,
-  Result: NameRow,
-  execute: () => sql`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`
-})(undefined)
+const tableNames = (sql: SqlClient.SqlClient) =>
+  SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: NameRow,
+    execute: () => sql`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`
+  })(undefined)
 
-const probeCount = (sql: SqlClient.SqlClient) => SqlSchema.findOne({
-  Request: Schema.Void,
-  Result: CountRow,
-  execute: () => sql`SELECT COUNT(*) AS count FROM migration_probe`
-})(undefined)
+const probeCount = (sql: SqlClient.SqlClient) =>
+  SqlSchema.findOne({
+    Request: Schema.Void,
+    Result: CountRow,
+    execute: () => sql`SELECT COUNT(*) AS count FROM migration_probe`
+  })(undefined)
 
 describe("storage migration catalogs", () => {
   it.effect("applies the complete client and server catalogs once", () =>
@@ -64,7 +67,7 @@ describe("storage migration catalogs", () => {
         clientId
       })
 
-      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4])
+      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5])
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
         "effect_local_client_evolution",
@@ -73,6 +76,7 @@ describe("storage migration catalogs", () => {
         "effect_local_client_key_lineage_targets",
         "effect_local_client_shadow_entities",
         "effect_local_client_shadow_pending",
+        "effect_local_client_shadow_receipts_v2",
         "effect_local_client_shadow_visible_entities",
         "effect_local_server_evolution",
         "effect_local_server_key_lineage",
@@ -96,8 +100,14 @@ describe("storage migration catalogs", () => {
         name: "first",
         statements: ["CREATE TABLE catalog_probe (value TEXT NOT NULL)"]
       })
-      assert.strictEqual((yield* Migrations.runCatalog("Client", [changed]).pipe(Effect.flip))._tag, "StorageMigrationMismatch")
-      assert.strictEqual((yield* Migrations.runCatalog("Client", []).pipe(Effect.flip))._tag, "StorageMigrationMismatch")
+      assert.strictEqual(
+        (yield* Migrations.runCatalog("Client", [changed]).pipe(Effect.flip))._tag,
+        "StorageMigrationMismatch"
+      )
+      assert.strictEqual(
+        (yield* Migrations.runCatalog("Client", []).pipe(Effect.flip))._tag,
+        "StorageMigrationMismatch"
+      )
 
       const second = Migrations.makeMigration({
         id: 2,
@@ -109,8 +119,14 @@ describe("storage migration catalogs", () => {
         name: "first",
         statements: ["CREATE TABLE duplicate_probe (value INTEGER NOT NULL)"]
       })
-      assert.strictEqual((yield* Migrations.runCatalog("Server", [second]).pipe(Effect.flip))._tag, "StorageMigrationMismatch")
-      assert.strictEqual((yield* Migrations.runCatalog("Server", [first, duplicate]).pipe(Effect.flip))._tag, "StorageMigrationMismatch")
+      assert.strictEqual(
+        (yield* Migrations.runCatalog("Server", [second]).pipe(Effect.flip))._tag,
+        "StorageMigrationMismatch"
+      )
+      assert.strictEqual(
+        (yield* Migrations.runCatalog("Server", [first, duplicate]).pipe(Effect.flip))._tag,
+        "StorageMigrationMismatch"
+      )
 
       const duplicateId = Migrations.makeMigration({
         id: 1,
@@ -149,7 +165,8 @@ describe("storage migration catalogs", () => {
       const clientRow = yield* SqlSchema.findOne({
         Request: Schema.Void,
         Result: LegacyClientRow,
-        execute: () => sql`SELECT m.definition_hash, m.schema_version, e.value_json AS entity_value,
+        execute: () =>
+          sql`SELECT m.definition_hash, m.schema_version, e.value_json AS entity_value,
           e.model_version
         FROM effect_local_client_meta AS m
         INNER JOIN effect_local_canonical_entities AS e ON e.model = 'Todo' AND e.entity_key = '"1"'
@@ -165,7 +182,8 @@ describe("storage migration catalogs", () => {
       const serverRow = yield* SqlSchema.findOne({
         Request: Schema.Void,
         Result: LegacyServerRow,
-        execute: () => sql`SELECT s.definition_hash, s.schema_version, e.value_json AS entity_value,
+        execute: () =>
+          sql`SELECT s.definition_hash, s.schema_version, e.value_json AS entity_value,
           e.model_version
         FROM effect_local_server_spaces AS s
         INNER JOIN effect_local_server_entities AS e
@@ -192,7 +210,10 @@ describe("storage migration catalogs", () => {
           "INSERT INTO table_that_does_not_exist (value) VALUES (1)"
         ]
       })
-      assert.strictEqual((yield* Migrations.runCatalog("Client", [broken]).pipe(Effect.flip))._tag, "StorageUnavailable")
+      assert.strictEqual(
+        (yield* Migrations.runCatalog("Client", [broken]).pipe(Effect.flip))._tag,
+        "StorageUnavailable"
+      )
       assert.notInclude((yield* tableNames(sql)).map((row) => row.name), "migration_probe")
       assert.deepStrictEqual(yield* clientLedger(sql), [])
 

@@ -54,6 +54,14 @@ export class StorageMigrationMismatch extends Schema.TaggedErrorClass<StorageMig
   "@lucas-barake/effect-local/StorageMigrationMismatch"
 )("StorageMigrationMismatch", { catalog: Schema.String, message: Schema.String }) {}
 
+export class SchemaKeyCollision extends Schema.TaggedErrorClass<SchemaKeyCollision>(
+  "@lucas-barake/effect-local/SchemaKeyCollision"
+)("SchemaKeyCollision", { model: Schema.String, key: Schema.String }) {}
+
+export class PendingMutationEvolutionRejected extends Schema.TaggedErrorClass<PendingMutationEvolutionRejected>(
+  "@lucas-barake/effect-local/PendingMutationEvolutionRejected"
+)("PendingMutationEvolutionRejected", { mutationId: Schema.String, rejection: Schema.Json }) {}
+
 export class ReplicaIdentityMismatch extends Schema.TaggedErrorClass<ReplicaIdentityMismatch>(
   "@lucas-barake/effect-local/ReplicaIdentityMismatch"
 )("ReplicaIdentityMismatch", {
@@ -112,6 +120,8 @@ export const ReplicaError = Schema.Union([
   SchemaEvolutionUnsupported,
   SchemaEvolutionFailed,
   StorageMigrationMismatch,
+  SchemaKeyCollision,
+  PendingMutationEvolutionRejected,
   ReplicaIdentityMismatch,
   MutationIdentityConflict,
   OutOfOrderMutation,
