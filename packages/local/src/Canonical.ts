@@ -18,11 +18,13 @@ const isUint8Array = (value: object): value is Uint8Array =>
 const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   switch (typeof value) {
     case "string":
-      return value.startsWith(sentinel) ? sentinel + value : value
+      if (value.startsWith(sentinel)) return sentinel + value
+      return value
     case "bigint":
       return `${sentinel}bigint:${value}`
     case "number":
-      return Number.isFinite(value) ? value : `${sentinel}number:${value}`
+      if (Number.isFinite(value)) return value
+      return `${sentinel}number:${value}`
     case "undefined":
       return `${sentinel}undefined`
     case "function":
@@ -39,17 +41,26 @@ const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   }
   if (ancestors.has(value)) return `${sentinel}circular`
   ancestors.add(value)
-  const result = Array.isArray(value)
-    ? value.map((item) => normalize(item, ancestors))
-    : Object.fromEntries(
+  let result: unknown
+  if (Array.isArray(value)) {
+    result = value.map((item) => normalize(item, ancestors))
+  } else {
+    result = Object.fromEntries(
       Object.keys(value).toSorted().map((key) => [key, normalize(Reflect.get(value, key), ancestors)])
     )
+  }
   ancestors.delete(value)
   return result
 }
 
 export const stringify = (value: unknown): string =>
-  Schema.encodeSync(Schema.UnknownFromJsonString)(normalize(value, new WeakSet()))
+  Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(normalize(value, new WeakSet()))
+
+export const stringifyEffect = (value: unknown): Effect.Effect<string, ReplicaError.CanonicalEncodeError> =>
+  Effect.try({
+    try: () => stringify(value),
+    catch: (cause) => new ReplicaError.CanonicalEncodeError({ cause })
+  })
 
 export const hash = (value: unknown): string => {
   const input = stringify(value)
@@ -62,21 +73,11 @@ export const hash = (value: unknown): string => {
 }
 
 export const digest = (value: unknown) =>
-  Effect.try({
-    try: () => stringify(value),
-    catch: (cause) =>
-      new ReplicaError.ReplicaError({
-        reason: new ReplicaError.CanonicalEncodeError({ cause })
-      })
-  }).pipe(
+  stringifyEffect(value).pipe(
     Effect.flatMap((input) =>
       Crypto.Crypto.use((crypto) => crypto.digest("SHA-256", new TextEncoder().encode(input))).pipe(
         Effect.map(Encoding.encodeHex),
-        Effect.mapError((cause) =>
-          new ReplicaError.ReplicaError({
-            reason: new ReplicaError.StorageUnavailable({ cause })
-          })
-        )
+        Effect.mapError((cause) => new ReplicaError.StorageUnavailable({ cause }))
       )
     )
   )

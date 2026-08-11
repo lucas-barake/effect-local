@@ -10,5 +10,7 @@ await Promise.all(["local", "local-sql", "local-browser", "local-rpc", "local-te
     const name = file.slice(0, -3)
     return `export * as ${name} from "./${name}.js"`
   }).join("\n")
-  await writeFile(join(source, "index.ts"), output.length === 0 ? "export {}\n" : `${output}\n`)
+  let contents = `${output}\n`
+  if (output.length === 0) contents = "export {}\n"
+  await writeFile(join(source, "index.ts"), contents)
 }))

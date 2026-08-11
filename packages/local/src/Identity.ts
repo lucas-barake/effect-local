@@ -4,83 +4,56 @@ import * as Schema from "effect/Schema"
 
 const identifier = <const Name extends string,>(name: Name, prefix: string) =>
   Schema.String.check(
-    Schema.isPattern(
-      new RegExp(`^${prefix}_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
-    )
+    Schema.isPattern(new RegExp(`^${prefix}_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`))
   ).pipe(Schema.brand(`@lucas-barake/effect-local/${name}`))
 
-const sequence = <const Name extends string,>(name: Name) =>
-  Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).pipe(Schema.brand(`@lucas-barake/effect-local/${name}`))
-
-export const ReplicaId = identifier("ReplicaId", "rep")
-export type ReplicaId = typeof ReplicaId.Type
-
-export const ReplicaIncarnation = sequence("ReplicaIncarnation")
-export type ReplicaIncarnation = typeof ReplicaIncarnation.Type
-
-export const SessionId = identifier("SessionId", "ses")
-export type SessionId = typeof SessionId.Type
-
-export const DocumentId = identifier("DocumentId", "doc")
-export type DocumentId = typeof DocumentId.Type
-
-export const CommandId = identifier("CommandId", "cmd")
-export type CommandId = typeof CommandId.Type
-
-export const WriterGeneration = sequence("WriterGeneration")
-export type WriterGeneration = typeof WriterGeneration.Type
-
-export const CommitSequence = sequence("CommitSequence")
-export type CommitSequence = typeof CommitSequence.Type
-
-export const PeerId = identifier("PeerId", "peer")
-export type PeerId = typeof PeerId.Type
-
-export const BackupInstallationId = identifier("BackupInstallationId", "bak")
-export type BackupInstallationId = typeof BackupInstallationId.Type
-
-export const RelayMessageId = identifier("RelayMessageId", "rly")
-export type RelayMessageId = typeof RelayMessageId.Type
-
-export const ProjectionVersion = Schema.Int.check(Schema.isGreaterThan(0)).pipe(
-  Schema.brand("@lucas-barake/effect-local/ProjectionVersion")
-)
-export type ProjectionVersion = typeof ProjectionVersion.Type
-
-export const DocumentLineage = Schema.String.check(
-  Schema.isPattern(
-    /^$|^lin_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+const sequence = <const Name extends string,>(name: Name, minimum: number) =>
+  Schema.Int.check(Schema.isGreaterThanOrEqualTo(minimum)).pipe(
+    Schema.brand(`@lucas-barake/effect-local/${name}`)
   )
-).pipe(Schema.brand("@lucas-barake/effect-local/DocumentLineage"))
-export type DocumentLineage = typeof DocumentLineage.Type
 
-export const genesisLineage: DocumentLineage = DocumentLineage.make("")
+export const SpaceId = identifier("SpaceId", "spc")
+export type SpaceId = typeof SpaceId.Type
 
-export const makeReplicaId = Crypto.Crypto.use((crypto) =>
-  crypto.randomUUIDv4.pipe(Effect.map((uuid) => ReplicaId.make(`rep_${uuid}`)))
-)
-export const makeSessionId = Crypto.Crypto.use((crypto) =>
-  crypto.randomUUIDv4.pipe(Effect.map((uuid) => SessionId.make(`ses_${uuid}`)))
-)
-export const makeDocumentId = Crypto.Crypto.use((crypto) =>
-  crypto.randomUUIDv4.pipe(Effect.map((uuid) => DocumentId.make(`doc_${uuid}`)))
-)
-export const makeCommandId = Crypto.Crypto.use((crypto) =>
-  crypto.randomUUIDv4.pipe(Effect.map((uuid) => CommandId.make(`cmd_${uuid}`)))
-)
-export const makePeerId = Crypto.Crypto.use((crypto) =>
-  crypto.randomUUIDv4.pipe(Effect.map((uuid) => PeerId.make(`peer_${uuid}`)))
-)
-export const makeBackupInstallationId = Crypto.Crypto.use((crypto) =>
-  crypto.randomUUIDv4.pipe(Effect.map((uuid) => BackupInstallationId.make(`bak_${uuid}`)))
-)
-export const makeRelayMessageId = Crypto.Crypto.use((crypto) =>
-  crypto.randomUUIDv4.pipe(Effect.map((uuid) => RelayMessageId.make(`rly_${uuid}`)))
-)
+export const ClientId = identifier("ClientId", "cli")
+export type ClientId = typeof ClientId.Type
 
-export const makeDocumentLineage = Crypto.Crypto.use((crypto) =>
-  crypto.randomUUIDv4.pipe(Effect.map((uuid) => DocumentLineage.make(`lin_${uuid}`)))
-)
+export const MutationId = identifier("MutationId", "mut")
+export type MutationId = typeof MutationId.Type
 
-export const documentIdFromCommandId = (commandId: CommandId): DocumentId =>
-  DocumentId.make(`doc_${commandId.slice(4)}`)
+export const SnapshotId = identifier("SnapshotId", "snp")
+export type SnapshotId = typeof SnapshotId.Type
+
+export const LocalSequence = sequence("LocalSequence", 1)
+export type LocalSequence = typeof LocalSequence.Type
+
+export const ServerSequence = sequence("ServerSequence", 0)
+export type ServerSequence = typeof ServerSequence.Type
+
+export const TerminalSequence = sequence("TerminalSequence", 0)
+export type TerminalSequence = typeof TerminalSequence.Type
+
+export const VisibleRevision = sequence("VisibleRevision", 0)
+export type VisibleRevision = typeof VisibleRevision.Type
+
+export const SchemaVersion = sequence("SchemaVersion", 1)
+export type SchemaVersion = typeof SchemaVersion.Type
+
+export const SchemaHash = Schema.String.check(Schema.isPattern(/^[0-9a-f]{16}$/)).pipe(
+  Schema.brand("@lucas-barake/effect-local/SchemaHash")
+)
+export type SchemaHash = typeof SchemaHash.Type
+
+export const SchemaIdentity = Schema.Struct({
+  version: SchemaVersion,
+  hash: SchemaHash
+})
+export type SchemaIdentity = typeof SchemaIdentity.Type
+
+const makeIdentifier = <A,>(schema: { readonly make: (value: string) => A }, prefix: string) =>
+  Crypto.Crypto.use((crypto) => crypto.randomUUIDv4.pipe(Effect.map((uuid) => schema.make(`${prefix}_${uuid}`))))
+
+export const makeSpaceId = makeIdentifier(SpaceId, "spc")
+export const makeClientId = makeIdentifier(ClientId, "cli")
+export const makeMutationId = makeIdentifier(MutationId, "mut")
+export const makeSnapshotId = makeIdentifier(SnapshotId, "snp")

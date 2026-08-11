@@ -1,171 +1,148 @@
+import type * as Definition from "@lucas-barake/effect-local/Definition"
+import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Query from "@lucas-barake/effect-local/Query"
-import type * as ReplicaDefinition from "@lucas-barake/effect-local/ReplicaDefinition"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
-import type * as Stream from "effect/Stream"
-import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as Codec from "./internal/codec.js"
+import * as Rows from "./internal/rows.js"
+import * as StorageUnavailable from "./internal/storageUnavailable.js"
+import * as SqlTransaction from "./internal/transaction.js"
 
-export class QueryExecutor extends Context.Service<QueryExecutor, {
+export interface Service {
   readonly execute: <Q extends Query.Any,>(
     query: Q,
     payload: Q["payloadSchema"]["Type"]
-  ) => Effect.Effect<Q["successSchema"]["Type"], Q["errorSchema"]["Type"] | ReplicaError.ReplicaError>
-  readonly reactive: <Q extends Query.Any,>(
-    query: Q,
-    payload: Q["payloadSchema"]["Type"]
-  ) => Stream.Stream<Q["successSchema"]["Type"], Q["errorSchema"]["Type"] | ReplicaError.ReplicaError>
-}>()("@lucas-barake/effect-local-sql/QueryExecutor") {}
+  ) => Effect.Effect<Q["successSchema"]["Type"], ReplicaError.ReplicaError | Q["errorSchema"]["Type"]>
+}
 
-export type QueryHandlers<D extends ReplicaDefinition.Any,> = D["queries"][number] extends infer Q
-  ? Q extends Query.Query<infer Name, infer Payload, infer Success, infer Error, infer Dependencies>
-    ? Query.HandlerService<Name, Payload, Success, Error, Dependencies>
-  : never
+export class QueryExecutor extends Context.Service<QueryExecutor, Service>()(
+  "@lucas-barake/effect-local-sql/QueryExecutor"
+) {}
+
+export type Handlers<D extends Definition.Any,> = D["queries"][number] extends infer Q
+  ? Q extends Query.Query<infer Name, infer P, infer A, infer E> ? Query.HandlerService<Name, P, A, E> : never
   : never
 
-export const layer = <D extends ReplicaDefinition.Any,>(
+type Handler<Q extends Query.Any,> = Query.HandlerService<
+  Q["name"],
+  Q["payloadSchema"],
+  Q["successSchema"],
+  Q["errorSchema"]
+>
+
+const SchemaFenceRow = Schema.Struct({
+  definition_hash: Schema.String,
+  schema_version: Identity.SchemaVersion,
+  schema_hash: Identity.SchemaHash,
+  active_schema_generation: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  target_schema_version: Schema.NullOr(Identity.SchemaVersion),
+  target_schema_hash: Schema.NullOr(Identity.SchemaHash),
+  migration_hash: Schema.NullOr(Identity.SchemaHash)
+})
+
+export const layer = <D extends Definition.Any,>(
   definition: D
-): Layer.Layer<QueryExecutor, never, Reactivity.Reactivity | SqlClient.SqlClient | QueryHandlers<D>> =>
+): Layer.Layer<QueryExecutor, never, SqlClient.SqlClient | Handlers<D>> =>
   Layer.effect(
     QueryExecutor,
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
-      const reactivity = yield* Reactivity.Reactivity
-      const context = yield* Effect.context<QueryHandlers<D>>()
-      const handlers = new Map<string, Query.Handler<any, any, any, never>>()
+      const context = yield* Effect.context<Handlers<D>>()
       for (const query of definition.queries) {
-        handlers.set(query.name, Context.get(context, query.handler))
+        Context.getUnsafe<Query.HandlerService<any, any, any, any>, any>(query.handler)(context)
       }
-      const findProjectionStatus = SqlSchema.findOneOption({
-        Request: Schema.String,
-        Result: Schema.Struct({ status: Schema.String }),
-        execute: (projectionName) =>
-          sql`SELECT status FROM effect_local_projection_registry
-            WHERE projection_name = ${projectionName}`
+
+      const allRows = SqlSchema.findAll({
+        Request: Schema.Struct({ model: Schema.String, generation: Schema.Int }),
+        Result: Rows.EntityRow,
+        execute: ({ model, generation }) =>
+          sql`SELECT value_json FROM effect_local_client_visible_entities_data
+          WHERE generation = ${generation} AND model = ${model} ORDER BY entity_key`
       })
-      const findBlockedDocumentCount = SqlSchema.findOneOption({
-        Request: Schema.String,
-        Result: Schema.Struct({ count: Schema.Number }),
-        execute: (documentType) =>
-          sql`SELECT COUNT(*) AS count FROM effect_local_documents
-            WHERE document_type = ${documentType} AND projection_status != 'Ready'`
+      const findFence = SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: SchemaFenceRow,
+        execute: () =>
+          sql`SELECT definition_hash, schema_version, schema_hash, active_schema_generation,
+          target_schema_version, target_schema_hash, migration_hash
+          FROM effect_local_client_meta WHERE singleton = 1`
       })
-      const findBlockedProjectionCount = SqlSchema.findOneOption({
-        Request: Schema.String,
-        Result: Schema.Struct({ count: Schema.Number }),
-        execute: (projectionName) =>
-          sql`SELECT COUNT(*) AS count FROM effect_local_document_projections
-            WHERE projection_name = ${projectionName} AND status != 'Ready'`
+      const queryCapability = (generation: number): Transaction.Query => ({
+        get: SqlTransaction.local({ sql, definition, table: "visible", generation }).get,
+        all: (model) =>
+          allRows({ model: model.name, generation }).pipe(
+            Effect.mapError(StorageUnavailable.make),
+            Effect.flatMap((rows) =>
+              Effect.forEach(
+                rows,
+                (row) => Codec.parse(row.value_json).pipe(Effect.flatMap((value) => Codec.decode(model.schema, value)))
+              )
+            )
+          )
       })
-      const execute = <Q extends Query.Any,>(query: Q, payload: Q["payloadSchema"]["Type"]) =>
+      const execute = <Q extends Query.Any,>(
+        query: Q,
+        payload: Q["payloadSchema"]["Type"]
+      ): Effect.Effect<Q["successSchema"]["Type"], ReplicaError.ReplicaError | Q["errorSchema"]["Type"]> =>
         sql.withTransaction(Effect.gen(function*() {
-          for (const projection of query.dependsOn) {
-            const registry = yield* findProjectionStatus(projection.name).pipe(
-              Effect.mapError((cause) =>
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.ProjectionBlocked({
-                    projection: projection.name,
-                    cause
-                  })
-                })
-              )
-            )
-            if (registry._tag === "None" || registry.value.status !== "Ready") {
-              return yield* new ReplicaError.ReplicaError({
-                reason: new ReplicaError.ProjectionBlocked({
-                  projection: projection.name,
-                  cause: new Error("Projection is not ready")
-                })
-              })
-            }
-            const blockedDocuments = yield* findBlockedDocumentCount(projection.document.name).pipe(
-              Effect.mapError((cause) =>
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.ProjectionBlocked({
-                    projection: projection.name,
-                    cause
-                  })
-                })
-              )
-            )
-            if ((blockedDocuments._tag === "Some" ? blockedDocuments.value.count : 0) > 0) {
-              return yield* new ReplicaError.ReplicaError({
-                reason: new ReplicaError.ProjectionBlocked({
-                  projection: projection.name,
-                  cause: new Error("A source document projection is not ready")
-                })
-              })
-            }
-            const blocked = yield* findBlockedProjectionCount(projection.name).pipe(
-              Effect.mapError((cause) =>
-                new ReplicaError.ReplicaError({
-                  reason: new ReplicaError.ProjectionBlocked({
-                    projection: projection.name,
-                    cause
-                  })
-                })
-              )
-            )
-            if ((blocked._tag === "Some" ? blocked.value.count : 0) > 0) {
-              return yield* new ReplicaError.ReplicaError({
-                reason: new ReplicaError.ProjectionBlocked({
-                  projection: projection.name,
-                  cause: new Error("A document projection is not ready")
-                })
-              })
-            }
+          const fence = yield* findFence(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          if (
+            fence.schema_version !== definition.schemaIdentity.version ||
+            fence.schema_hash !== definition.schemaIdentity.hash ||
+            fence.target_schema_version !== null || fence.target_schema_hash !== null ||
+            fence.migration_hash !== null
+          ) {
+            return yield* new ReplicaError.StaleSchema({
+              expectedVersion: definition.schemaIdentity.version,
+              expectedHash: definition.schemaIdentity.hash,
+              actualVersion: fence.schema_version,
+              actualHash: fence.schema_hash
+            })
           }
-          const encoded = yield* Schema.encodeEffect(query.payloadSchema)(payload).pipe(
-            Effect.mapError((cause) =>
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.StorageCorrupt({
-                  cause
-                })
-              })
-            )
-          )
-          const decoded = yield* Schema.decodeEffect(query.payloadSchema)(encoded).pipe(
-            Effect.mapError((cause) =>
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.StorageCorrupt({
-                  cause
-                })
-              })
-            )
-          )
-          const handler = handlers.get(query.name)
-          if (handler === undefined) return yield* Effect.die(new Error(`Missing query handler: ${query.name}`))
-          const result = yield* handler(decoded)
-          return yield* Schema.decodeUnknownEffect(Schema.toType(query.successSchema))(result).pipe(
-            Effect.mapError((cause) =>
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.StorageCorrupt({
-                  cause
-                })
-              })
-            )
-          )
+          if (fence.definition_hash !== definition.hash) {
+            return yield* new ReplicaError.DefinitionMismatch({
+              expected: definition.hash,
+              actual: fence.definition_hash
+            })
+          }
+          const registered = definition.queryByName.get(query.name)
+          if (registered === undefined || registered !== query) {
+            return yield* new ReplicaError.ProtocolInvalid({ message: `Unknown query: ${query.name}` })
+          }
+          const handler = Context.getUnsafe<Handler<Q>, any>(registered.handler)(context)
+          const payloadSchema = Schema.make<
+            Schema.Codec<
+              Q["payloadSchema"]["Type"],
+              Q["payloadSchema"]["Encoded"]
+            >
+          >(query.payloadSchema.ast)
+          const successSchema = Schema.make<
+            Schema.Codec<
+              Q["successSchema"]["Type"],
+              Q["successSchema"]["Encoded"]
+            >
+          >(query.successSchema.ast)
+          const encodedPayload = yield* Codec.encode(payloadSchema, payload)
+          const decodedPayload = yield* Codec.decode(payloadSchema, encodedPayload)
+          const result = yield* handler.execute({
+            query: queryCapability(fence.active_schema_generation),
+            payload: decodedPayload
+          })
+          const encoded = yield* Codec.encode(successSchema, result)
+          return yield* Codec.decode(successSchema, encoded)
         })).pipe(
-          Effect.catchIf(SqlError.isSqlError, (cause) =>
-            Effect.fail(
-              new ReplicaError.ReplicaError({
-                reason: new ReplicaError.StorageUnavailable({
-                  cause
-                })
-              })
-            ))
-        ) as Effect.Effect<Q["successSchema"]["Type"], Q["errorSchema"]["Type"] | ReplicaError.ReplicaError>
-      const reactivityKeys = (
-        query: Query.Any
-      ) => [...new Set(query.dependsOn.flatMap((projection) => [projection.name, projection.document.name]))]
-      return QueryExecutor.of({
-        execute,
-        reactive: (query, payload) => reactivity.stream(reactivityKeys(query), execute(query, payload))
-      })
+          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
+          Effect.withSpan("QueryExecutor.execute", {
+            attributes: { "query.name": query.name }
+          })
+        )
+      return QueryExecutor.of({ execute })
     })
   )

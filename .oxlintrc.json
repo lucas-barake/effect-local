@@ -1,6 +1,10 @@
 {
   "$schema": "https://raw.githubusercontent.com/oxc-project/oxc/main/npm/oxlint/configuration_schema.json",
   "plugins": ["typescript", "import", "oxc", "eslint", "unicorn", "node"],
+  "jsPlugins": ["oxlint-plugin-effect/plugin"],
+  "options": {
+    "typeAware": true
+  },
   "categories": {
     "correctness": "error",
     "suspicious": "error",
@@ -23,11 +27,37 @@
     "typescript/no-non-null-assertion": "off",
     "eslint/no-unused-vars": "off",
     "eslint/require-yield": "off",
+    "eslint/no-underscore-dangle": "off",
     "unicorn/consistent-function-scoping": "off",
     "unicorn/require-post-message-target-origin": "off",
-    "unicorn/no-empty-file": "off"
+    "unicorn/no-empty-file": "off",
+    "effect/noAs": "error",
+    "effect/noAsyncFunction": "error",
+    "effect/noDynamicImports": "error",
+    "effect/noEffectBind": "error",
+    "effect/noEffectDo": "error",
+    "effect/noGlobals": "error",
+    "effect/noNewError": "error",
+    "effect/noNewPromise": "error",
+    "effect/noNodeBuiltinImport": "error",
+    "effect/noTernary": "error",
+    "effect/noTestLifecycleHooks": "error",
+    "effect/noThrowStatement": "error",
+    "effect/noTryCatch": "error"
   },
   "overrides": [
+    {
+      "files": ["scripts/**"],
+      "rules": {
+        "effect/noAsyncFunction": "off",
+        "effect/noGlobals": "off",
+        "effect/noNewError": "off",
+        "effect/noNewPromise": "off",
+        "effect/noNodeBuiltinImport": "off",
+        "effect/noThrowStatement": "off",
+        "effect/noTryCatch": "off"
+      }
+    },
     {
       "files": ["**/test/**", "**/tests/**", "**/test-browser/**"],
       "rules": { "eslint/no-console": "off" }

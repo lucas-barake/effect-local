@@ -1,35 +1,46 @@
-import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Context from "effect/Context"
-import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Ref from "effect/Ref"
 
-export interface Packet {
-  readonly sequence: number
-  readonly from: Identity.PeerId
-  readonly to: Identity.PeerId
-  readonly payload: Uint8Array
+export interface State {
+  readonly online: boolean
+  readonly dropNextReceipt: boolean
+  readonly duplicateNextPage: boolean
 }
 
-export interface Decision {
-  readonly drop: boolean
-  readonly copies: number
-  readonly delay: Duration.Input
-  readonly reorder: boolean
+export interface Service {
+  readonly state: Effect.Effect<State>
+  readonly partition: Effect.Effect<void>
+  readonly heal: Effect.Effect<void>
+  readonly dropNextReceipt: Effect.Effect<void>
+  readonly duplicateNextPage: Effect.Effect<void>
+  readonly takeDroppedReceipt: Effect.Effect<boolean>
+  readonly takeDuplicatePage: Effect.Effect<boolean>
 }
 
-export class FaultInjection extends Context.Service<FaultInjection, {
-  readonly decide: (packet: Packet) => Effect.Effect<Decision>
-}>()(
+export class FaultInjection extends Context.Service<FaultInjection, Service>()(
   "@lucas-barake/effect-local-test/FaultInjection"
 ) {}
 
-export const layer = (decide: FaultInjection["Service"]["decide"]) => Layer.succeed(FaultInjection, { decide })
-
-export const none = layer(() => Effect.succeed({ drop: false, copies: 1, delay: 0, reorder: false }))
-
-export const layerSequence = (decisions: readonly [Decision, ...ReadonlyArray<Decision>]) =>
-  layer((packet) => {
-    const index = Math.max(0, Math.min(Math.trunc(packet.sequence), decisions.length - 1))
-    return Effect.succeed(decisions[index] ?? decisions[0])
+export const layer: Layer.Layer<FaultInjection> = Layer.effect(
+  FaultInjection,
+  Effect.gen(function*() {
+    const state = yield* Ref.make<State>({ online: true, dropNextReceipt: false, duplicateNextPage: false })
+    const set = (patch: Partial<State>) => Ref.update(state, (current) => ({ ...current, ...patch }))
+    const take = (key: "dropNextReceipt" | "duplicateNextPage") =>
+      Ref.modify(state, (current) => [
+        current[key],
+        { ...current, [key]: false }
+      ])
+    return FaultInjection.of({
+      state: Ref.get(state),
+      partition: set({ online: false }),
+      heal: set({ online: true }),
+      dropNextReceipt: set({ dropNextReceipt: true }),
+      duplicateNextPage: set({ duplicateNextPage: true }),
+      takeDroppedReceipt: take("dropNextReceipt"),
+      takeDuplicatePage: take("duplicateNextPage")
+    })
   })
+)

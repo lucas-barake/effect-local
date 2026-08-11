@@ -1,40 +1,13 @@
 import * as Schema from "effect/Schema"
+import * as Identity from "./Identity.js"
 
-export const Starting = Schema.TaggedStruct("Starting", { phase: Schema.String })
-export type Starting = typeof Starting.Type
-
-export const Ready = Schema.TaggedStruct("Ready", {
-  pendingCommands: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+export const Offline = Schema.TaggedStruct("Offline", { pending: Schema.Int })
+export const Connecting = Schema.TaggedStruct("Connecting", { pending: Schema.Int })
+export const Online = Schema.TaggedStruct("Online", {
+  pending: Schema.Int,
+  cursor: Identity.ServerSequence
 })
-export type Ready = typeof Ready.Type
-
-export const ReadOnly = Schema.TaggedStruct("ReadOnly", { reason: Schema.String })
-export type ReadOnly = typeof ReadOnly.Type
-
-export const Degraded = Schema.TaggedStruct("Degraded", { reason: Schema.String })
-export type Degraded = typeof Degraded.Type
-
-export const ProjectionBlocked = Schema.TaggedStruct("ProjectionBlocked", {
-  projection: Schema.String,
-  reason: Schema.String
-})
-export type ProjectionBlocked = typeof ProjectionBlocked.Type
-
-export const Restoring = Schema.TaggedStruct("Restoring", {
-  processedBytes: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
-})
-export type Restoring = typeof Restoring.Type
-
-export const Failed = Schema.TaggedStruct("Failed", { message: Schema.String })
-export type Failed = typeof Failed.Type
-
-export const ReplicaStatus = Schema.Union([
-  Starting,
-  Ready,
-  ReadOnly,
-  Degraded,
-  ProjectionBlocked,
-  Restoring,
-  Failed
-])
+export const NeedsAuthentication = Schema.TaggedStruct("NeedsAuthentication", { pending: Schema.Int })
+export const Failed = Schema.TaggedStruct("Failed", { pending: Schema.Int, message: Schema.String })
+export const ReplicaStatus = Schema.Union([Offline, Connecting, Online, NeedsAuthentication, Failed])
 export type ReplicaStatus = typeof ReplicaStatus.Type

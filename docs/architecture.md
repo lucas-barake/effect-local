@@ -1,118 +1,126 @@
 # Architecture
 
-## Boundaries
+Effect Local has two authority domains.
 
-Effect Local has one durable authority per origin within a browser profile. The application SharedWorker owns it.
-Tabs are scoped clients. The OPFS SQLite worker is a separate protocol process and never owns application behavior.
+The client owns local availability. It assigns `(spaceId, clientId, localSequence)`, generates an immutable
+`mutationId`, computes a digest over the canonical envelope, executes the mutation optimistically, and commits the
+pending mutation plus visible writes to SQLite. None of those steps require the server.
 
-```mermaid
-flowchart LR
-  TabA["Tab A"] --> Shared["Application SharedWorker"]
-  TabB["Tab B"] --> Shared
-  Shared --> Rpc["Effect RPC"]
-  Rpc --> Replica["Replica service"]
-  Replica --> Entity["Effect Cluster document entity"]
-  Entity --> Commands["Command executor"]
-  Commands --> Store["Automerge canonical store"]
-  Commands --> Projections["SQLite projections"]
-  Shared --> Workflow["Effect Workflow"]
-  Store --> Port["Transferred database port"]
-  Projections --> Port
-  Workflow --> Port
-  Port --> Opfs["Dedicated OPFS worker"]
-```
+The server owns shared order. It verifies the digest, authenticates the principal, serializes admission per space,
+deduplicates the mutation identity, checks the next client sequence, authorizes and executes the handler, and stores a
+terminal receipt. Accepted mutations alone receive the next dense server sequence and enter the authoritative log.
 
-The worker services stay injectable. The page provides `Worker.WorkerPlatform` and `Worker.Spawner`. The owner
-requires a `DatabasePort`. Tests replace those layers without changing domain code.
+## State model
 
-Each tab session is bound to its Effect RPC transport client. Commit invalidations use one bounded subscription per
-tab with an owner epoch, sequence watermark, and sticky refresh generation. Gaps and restore rewinds force a full
-refresh. The fixed RPC client retries renewal and invalidation transport failures with a bounded policy. Exhausting
-that policy requires recreating the enclosing runtime because Effect beta.99 exposes no transport replacement hook
-for reconstructing the session in place.
+Client SQLite contains:
 
-## State ownership
+- replica identity, definition hash, next local sequence, server cursor, visible revision, and requested and completed
+  reconciliation generations
+- canonical entities from accepted server entries
+- visible entities after optimistic pending mutations
+- pending envelopes, results, and write sets ordered by local sequence
+- a bounded accepted server suffix ordered by server sequence
+- bounded terminal accepted, rejected, and expired receipts
+- one resumable bootstrap stage and its verified entities
+- the installed snapshot identity, accepted sequence, and terminal fence
 
-1. Automerge changes and verified checkpoints are canonical replicated state.
-2. SQLite projection tables are disposable indexes over canonical state.
-3. Cluster mailbox rows and replies are durable execution records.
-4. Workflow journals are durable orchestration records.
-5. Atom values are reactive caches.
-6. Presence and tab sessions are ephemeral.
-7. Sender relay outbox rows are temporary durable transfer state in frontend SQLite.
-8. Relay custody rows are temporary durable delivery state in the configured backend SQL database.
+Server SQL contains:
 
-Cluster and Workflow do not replace Automerge. They serialize local effects, resolve retry ambiguity, and resume
-operations after process loss. Automerge remains responsible for causal history, conflicts, and convergence.
+- a definition hash, accepted and terminal sequence heads, retained floors, exact row counters, and snapshot pointer per
+  space
+- a last processed and expired local sequence per `(spaceId, clientId)`
+- retained immutable receipts keyed by both mutation identity and client sequence
+- a retained dense accepted suffix keyed by server sequence
+- authoritative materialized entities with exact snapshot byte accounting
+- immutable snapshot manifests and deterministically ordered snapshot entities
 
-## Relay topology
+Workflow storage contains reconciliation execution control only. It does not contain mutation payloads, receipts, log
+entries, or canonical state. Cluster messages and publications are routed wake and presence signals. They are never
+application data authority.
 
-Effect RPC uses one durable protocol. Version `1` uses `PeerRpc.Rpcs` over a standard Effect RPC socket with
-`RpcSerialization`, `RelayServer.layerHandlers` for the front door, and `RelayServer.layer` to compose the front door
-with the entity behaviour and its retention singleton.
+## Mutation lifecycle
 
-```mermaid
-flowchart LR
-  Sender["Sender SQL replica"] --> Outbox["Stable sender relay outbox"]
-  Outbox --> FrontDoor["RelayServer front door (any node)"]
-  FrontDoor --> Entity["RelayInbox entity (single owner per device)"]
-  Entity --> Custody["Injected backend SQL custody"]
-  Entity --> RecipientSession["Recipient delivery session"]
-  RecipientSession --> Receipt["Recipient SQL sync and receipt"]
-  Receipt --> Ack["Relay acknowledgement"]
-  Ack --> Entity
-```
+1. The client reads its durable cursor as the mutation basis.
+2. One SQLite transaction allocates the next local sequence, runs the handler, stores the pending envelope and write
+   set, and changes visible entities.
+3. The same transaction increments the requested reconciliation generation. A finite Workflow coalesces durable
+   generations and runs an idempotent reconciliation pass. Retry always uses the same envelope bytes and identity.
+4. The server locks the space order row inside its transaction. It returns an existing exact receipt or processes the
+   next client sequence.
+5. A rejection is stored without advancing the accepted sequence. An acceptance appends public mutation identity and
+   its exact write set at the next sequence. The success result remains only in the submitter's receipt.
+6. The client pulls from its durable cursor. It installs only contiguous entries into canonical state. A cursor below
+   the retained floor receives `BootstrapRequired` instead of a false gap or an unbounded replay.
+7. Bootstrap pages repeat the immutable manifest and are count and byte bounded. The client durably verifies identity,
+   order, Schema values, entity bytes, and the chained digest. Completion replaces canonical state and advances the
+   cursor in one transaction.
+8. The client removes settled pending mutations, restores touched visible entities from canonical state, and replays
+   remaining pending mutations in local order.
+9. Successful reconciliation advances the completed generation idempotently. A newer requested generation starts a
+   new finite Workflow.
+10. Effect `Reactivity` invalidates affected models, receipts, and status after the SQL transaction commits.
 
-Endpoint ownership, routing, and cross node wakeups come from cluster sharding rather than from process local state,
-so several relay nodes may serve one database as active active. The entity that owns a device is the sole writer for
-that device's inbox, which is what makes custody need no distributed protocol of its own. The supplied `SqlClient` may
-target SQLite, PostgreSQL, or MySQL. The relay requires a `Sharding` and never builds one: single process in memory,
-one runner over SQL, and many sharded runners are all the application's choice.
+## Handler contract
 
-Relay ordering is FIFO within one exact directed peer channel, where a channel includes the sender's connection
-epoch. Distinct channels progress concurrently, so one stalled sender cannot block another. Delivery is stop and wait
-within a channel: nothing is offered behind an unsettled message. See
-[Store and forward](store-and-forward.md) for delivery, capacity, security, and lifecycle details.
+Mutation handlers receive only their decoded payload and a constrained `Transaction`. Query handlers receive their
+decoded payload and a read only `Query` capability. `Mutation.toLayer` and `Query.toLayer` capture ordinary Effect
+dependencies when their Layer is built.
 
-Relay infrastructure treats the Automerge message as opaque. It validates the envelope Schema, endpoint and document
-routing, hashes, outer digest, and writer provenance shape. Relay enabled `PeerSync` performs the one semantic
-Automerge decode.
+Handlers must be deterministic across client and server execution. Time, randomness, server generated values, and
+environment dependent decisions belong in the payload or admission policy. A handler may use explicit
+`Field.Semantics` when a field needs operation semantics. The normal model value remains plain Schema encoded JSON.
 
-That boundary is explicit because Automerge `3.3.2` has no allocation bounded decode API. Ordinary authentication and
-document authorization do not imply resource trust. `PeerRelayAuthorization` requires a second exact
-`UnsafeUnboundedAutomerge3DecodeGrant` for relay admission and delivery. Its principal, remote, direction, documents,
-finite lease, and revocation Effect are all scoped and validated. Default deny is
-`denyUnsafeUnboundedAutomerge3Decode`.
+## Ordering and identity
 
-Fresh ordinary and unsafe grants feed a local operation gate. Revocation that reaches the gate first prevents SQL
-mutation or payload emission. An operation admitted first may finish and returns its real result. Revocation drains
-that bounded in flight work and blocks later work. This is a local ordering boundary, not an atomic transaction
-between SQLite and an external policy authority.
+Mutation identity and accepted order are separate.
 
-## Domain API
+- `(spaceId, clientId, localSequence)` provides a monotonic client session order.
+- `mutationId` provides a stable random retry identity.
+- `digest` rejects reuse of either identity with different bytes.
+- `basis` records the accepted cursor observed when the mutation was created.
+- `serverSequence` is dense per space and exists only for accepted mutations.
 
-Applications define schema coded `Document`, `Mutation`, `Projection`, and `Query` values, then collect them in one
-`ReplicaDefinition`. Mutation handlers and SQL bindings are Effect services. This keeps domain definitions portable
-while making every runtime dependency visible through Layer requirements.
+A terminal rejection advances the server's client sequence watermark but does not create a hole in the accepted log.
+Receipt reclamation advances an expired local sequence watermark atomically with deletion. A retry at or below that
+watermark returns `Expired` bound to a published snapshot fence and never executes again.
 
-One ordinary mutation targets one document. The engine does not claim replicated transactions across documents.
-Applications that need an invariant across multiple documents must model one aggregate document or use a workflow
-whose intermediate states are explicit.
+## Effect runtime
 
-## Browser lifecycle
+Public capabilities are `Context.Service` values. Implementations are scoped Layers. SQL transactions and errors stay
+in Effects. Callers select either the lightweight in memory reconciliation Layer or the finite Workflow Layer. The
+Workflow payload contains only definition, space, client, and generation identity. Activities call the same
+idempotent reconciliation operation as the in memory scheduler.
 
-The first page creates a dedicated OPFS worker and transfers its `MessagePort` with an RPC port to the SharedWorker.
-The owner claims a new writer generation before accepting commands. Every write validates that generation. A stale
-owner can no longer commit after another owner takes over.
+The server front door is an authenticated WebSocket RPC facade. It routes submit, pull, watch, presence publish, and
+presence watch through one Effect Cluster entity keyed by space. The sequential entity command lane gives a space one
+live mutation owner while forked reads and streams stay concurrent. The owner holds per-space wake and presence
+recipients, so a client connected to one runner observes work admitted through another.
 
-The provisioning contract requires a live page to create the OPFS worker. Provision requests carry an expiring
-nonce so an unresponsive candidate cannot stall later tabs, and a candidate that cannot answer or cannot produce a
-healthy engine is dropped until it attaches again. Every attach and every live engine is verified with a round trip
-through the database worker itself, never through the provisioning page, so a dead database behind a live page is
-still detected. On takeover the coordinator tells every served tab to re-attach and provisions the next engine among
-all attached tabs, so a secondary tab is handed off to the new owner instead of being stranded. The dedicated
-database worker holds a Web Lock for the database lifetime, so a replacement waits instead of opening OPFS
-concurrently with a slow prior owner.
+Entity operations are volatile. Client SQLite owns a mutation until admission returns its exact receipt. Server SQL then
+owns the authoritative mutation log, terminal receipt, canonical changes, and total sequence. A runner failure before
+the SQL commit leaves the client mutation pending. A lost reply after commit is repaired by exact idempotent
+resubmission. Cluster provides ownership and routing without retaining a second permanent copy of every mutation payload
+and private reply.
 
-OPFS starts as best effort origin storage. The engine does not turn that bucket persistent by itself. Applications
-must request `navigator.storage.persist()`, show whether the grant was accepted, and keep user controlled exports.
+Applications provide Effect's Cluster runner, storage, and transport Layers. A single process can use
+`SingleRunner`. Sharded deployments can use shared runner storage and the Node runner transport. The authoritative
+server SQL database must remain reachable after shard reassignment. Pod-local SQLite is valid only when deployment
+placement keeps that database with its space owner.
+
+The browser graph defaults to Effect's shared `Atom.runtime`. The replica Layer and `factory.withReactivity` therefore
+share one application memo map and memoized `Reactivity` service. Entity keys invalidate exact records. Query
+dependencies invalidate once per model.
+
+## Capacity
+
+Protocol limits bound a mutation, a pull page, a bootstrap page, and a presence update by count and encoded bytes.
+Server options set hard history, receipt, entity, snapshot byte, and bootstrap byte limits. Admission cross checks
+space counters against trigger maintained shadow counters under the lock before executing a handler and checks resulting snapshot capacity inside the handler
+savepoint. The client bounds pending mutations, retained receipts, accepted evidence, staged entities, staged bytes,
+and incoming page bytes. Server wake publication, presence publication, and in memory reconciler wakeup are bounded or
+sliding. Workflow generations coalesce durable requests. Streams and publications carry only notifications.
+
+History maintenance is an explicit service lifecycle. It reads one consistent bounded materialized state, builds an
+immutable manifest in memory, then locks the space and compares both sequence heads. Only an unchanged candidate is
+inserted and published. The same transaction advances logical floors before deleting bounded prefixes. A crash can
+leave surplus rows, but it cannot publish a floor without a complete recovery snapshot.

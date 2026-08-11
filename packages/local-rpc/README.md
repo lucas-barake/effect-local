@@ -1,33 +1,40 @@
 # @lucas-barake/effect-local-rpc
 
-Platform neutral Effect RPC building blocks for authenticated peer synchronization with an Effect Local SQL replica.
-Protocol version `1` uses one bounded relay topology for both durable custody with reconnect delivery and fenced
-acknowledgements, and best effort transient delivery over the same live session.
+Authenticated Effect RPC synchronization for Effect Local.
 
-The relay is a cluster of `RelayInbox` entities, one per recipient device, so more than one relay node can serve one
-database. `RelayServer` is the stateless front door; each entity is the sole writer for its device's inbox. Backend
-custody is injected through `RelayInboxStore`, and `SqlRelayInboxStore.layer` implements it against a supplied
-`SqlClient` for SQLite, PostgreSQL, or MySQL. The relay requires a `Sharding` but never builds one, so the deployment
-shape stays the application's choice. Frontend replica state, sender outbox, and recipient receipts remain SQLite.
+One `SyncRpc.Rpcs` group carries mutation submission, ordered pulls, snapshot bootstrap pages, wake streams, presence
+publication, and presence watch streams over one WebSocket. `SyncServer.layer` keeps that public authenticated facade
+and routes each operation through `SpaceEntity.Client`. `SyncClient.layer` adapts the generated typed client to
+`SyncEngine`.
 
-Automerge `3.3.2` has no allocation bounded semantic decode API, so safe relay composition explicitly passes
-`denyUnsafeUnboundedAutomerge3Decode`. A separate exact unsafe resource trust grant is required to proceed. Ordinary
-authentication and document authorization do not provide that grant.
+`SpaceEntity` gives every space one Cluster routing key. All operations are explicitly volatile. The entity command lane
+is sequential. Read and stream handlers use `Rpc.fork`, so long lived watches do not block mutation commands. Options
+expose mailbox, idle time, defect, and span controls without allowing callers to break the single writer invariant.
+`SpaceEntity.layerClient` provides the domain client used by the public facade. `SpaceEntity.layer()` composes both.
 
-Delivery attempts are durable and bounded. `RelayInbox.Options.maxDeliveries` is required per deployment; a message
-that exhausts it is dead lettered so it stops blocking its channel. An attempt is charged only once the message has
-reached the transport, so a delivery prepared and then abandoned on a flaky connection costs nothing.
+For one process, provide `SingleRunner.layer` with the selected runner storage. A Node multi runner deployment provides
+`SocketRunner.layer` with `NodeClusterSocket.layerSocketServer` and `NodeClusterSocket.layerClientProtocol`, then supplies
+its chosen `RunnerStorage`, `MessageStorage`, `RunnerHealth`, `RpcSerialization`, and `ShardingConfig` Layers. The package
+does not select those deployment policies.
 
-Authorization is re-checked on every operation rather than once at the handshake, because a grant can be narrowed or
-revoked while a session is live. A session whose credential or grants lapse is ended by the relay, which is the only
-party that observes them.
+The client pending row retains custody until Submit returns. `ServerStore` then retains the authoritative application
+event and receipt. A runner failure before admission makes the volatile entity call fail, so reconciliation resubmits the
+same identity. A lost reply after SQL commit is recovered from the stored receipt. Cluster mailbox persistence is not
+used because Effect `4.0.0-beta.103` retains completed payloads and replies without per-request retention control. A custom
+`ServerStore` service can route by `spaceId` to database shards. The provided SQL layer uses the supplied `SqlClient` as
+one partition. Pulls return either a bounded dense suffix or `BootstrapRequired`. Bootstrap pages repeat an immutable
+manifest and stay under the configured frame bound. Wake and presence streams are live hints routed through the
+current owner of the space.
 
-Transient payloads are limited to 4 KiB. The relay derives sender and document routing from the authenticated session,
-checks directional authorization, applies a per session token bucket, and offers to a bounded nonblocking recipient
-queue. Offline and slow recipients lose values. Transient values never enter relay custody, sender outbox, recipient
-receipts, settlement, backup, or Automerge history.
+Authentication follows Effect RPC middleware conventions. The client reads redacted `Credentials` and writes a
+bearer header. The server uses `Authenticator` to provide a JSON `Principal`. `ServerStore.layer` requires explicit
+access, mutation admission, and read callbacks. `PresenceHub.layer` requires a tagged publish or watch callback and
+includes the claimed client ID for publish policy. Use the named `layerTrusted` constructors only where allow all is
+intentional. The principal is inserted into the internal entity payload by `SyncServer`. Browser payloads never carry
+or choose it.
 
-See the [Effect Local documentation](https://github.com/lucas-barake/effect-local#readme) for synchronization
-architecture, deployment boundaries, and API reference. The relay contract, composition, limits, security,
-and failure model are documented in
-[Store and forward](https://github.com/lucas-barake/effect-local/blob/main/docs/store-and-forward.md).
+Use `SyncRpc.layerJson` for the WebSocket serialization Layer. It bounds each complete UTF-8 JSON frame and makes
+remote defects opaque. The high level Effect Node server does not expose the underlying `ws` `maxPayload` option, so
+production ingress must also enforce `SyncRpc.maximumFrameBytes` with a reverse proxy or a lower level upgrade handler.
+
+See the [repository guide](https://github.com/lucas-barake/effect-local#readme).

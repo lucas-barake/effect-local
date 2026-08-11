@@ -1,0 +1,2 @@
+#!/bin/sh
+exec node scripts/pre-commit.mjs

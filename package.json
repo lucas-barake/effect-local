@@ -8,23 +8,23 @@
   "scripts": {
     "clean": "node scripts/clean.mjs",
     "bench": "vitest bench --run",
-    "build": "tsc -b tsconfig.packages.json",
-    "build:tsgo": "tsgo -b tsconfig.packages.json",
+    "build": "tsgo -b tsconfig.packages.json",
+    "build:tsc": "tsc -b tsconfig.packages.json",
     "circular": "madge --extensions ts --circular --no-color --no-spinner packages/*/src",
     "dead-code": "knip --no-config-hints",
     "check": "pnpm check:types",
-    "check:examples": "pnpm --filter './examples/*' exec pnpm check",
-    "check:types": "tsc -b tsconfig.json && pnpm check:examples",
-    "check:tsgo": "tsgo -b tsconfig.json",
-    "check:all": "pnpm check:tsgo && pnpm check:pre-commit",
+    "check:types": "tsgo -b tsconfig.json",
+    "check:tsc": "tsc -b tsconfig.json",
+    "check:all": "pnpm check:tsc && pnpm check:pre-commit",
     "check:pre-commit": "pnpm lint && pnpm dead-code && pnpm check && pnpm test --run",
     "lint": "oxlint && dprint check",
     "lint-fix": "oxlint --fix && dprint fmt",
+    "precommit": "node scripts/pre-commit.mjs",
+    "prepare": "git config core.hooksPath .githooks",
     "test": "vitest",
-    "test:browser": "pnpm --filter @lucas-barake/effect-local-browser test:browser",
     "coverage": "vitest --coverage",
     "codegen": "node scripts/codegen.mjs",
-    "docgen": "tsc -b tsconfig.json",
+    "docgen": "tsgo -b tsconfig.json",
     "changeset-version": "changeset version",
     "changeset-publish": "pnpm build && changeset publish"
   },
@@ -34,24 +34,28 @@
       "esbuild"
     ],
     "overrides": {
-      "@effect/platform-node-shared": "4.0.0-beta.101"
+      "@effect/platform-node-shared": "4.0.0-beta.103"
+    },
+    "patchedDependencies": {
+      "oxlint-plugin-effect@0.6.0": "patches/oxlint-plugin-effect@0.6.0.patch"
     }
   },
   "devDependencies": {
-    "@automerge/automerge": "3.3.2",
     "@changesets/changelog-github": "^0.7.0",
     "@changesets/cli": "^2.31.0",
-    "@effect/language-service": "^0.85.1",
-    "@effect/vitest": "4.0.0-beta.101",
+    "@effect/language-service": "^0.87.2",
+    "@effect/vitest": "4.0.0-beta.103",
     "@types/node": "^25.7.0",
-    "@typescript/native-preview": "7.0.0-dev.20260420.1",
+    "@typescript/native-preview": "7.0.0-dev.20260707.2",
     "@vitest/coverage-v8": "4.1.10",
-    "dprint": "^0.55.1",
-    "effect": "4.0.0-beta.101",
+    "dprint": "^0.55.2",
+    "effect": "4.0.0-beta.103",
     "glob": "^13.0.6",
-    "knip": "6.27.0",
+    "knip": "6.32.0",
     "madge": "^8.0.0",
-    "oxlint": "1.42.0",
+    "oxlint": "1.77.0",
+    "oxlint-plugin-effect": "0.6.0",
+    "oxlint-tsgolint": "7.0.2001",
     "typescript": "^6.0.3",
     "vitest": "4.1.10"
   }

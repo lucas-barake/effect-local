@@ -1,14 +1,19 @@
 # @lucas-barake/effect-local-browser
 
-Worker and RPC composition, OPFS database ports, peer sessions, presence, and Effect Atom integration for Effect Local.
+Browser SQLite, Effect Atom, and best effort presence for Effect Local.
 
-`BrowserReplica` provides `ReplicaClient` through normal Layer composition. The client exposes
-`transient(peerId, documentId, payload)` and a reconnecting `transients` stream over the page to owner session.
-Transient sends are never replayed after session replacement, and the stream can only observe future values.
-`BrowserReplica.layer*` also provides registered typed transient contracts. Applications should use each contract's
-document scoped `client`, `publish`, and `messages` API. The raw `ReplicaClient` operations are an advanced transport
-escape hatch.
+`BrowserSqlite.layerMessagePort` adapts an application owned SQLite WASM worker port. `BrowserReplica.make` creates one
+Atom runtime with entity families, query families, concurrent mutation functions, receipt families, and replica
+status. It uses Effect `Reactivity`, so committed local writes and installed server entries refresh only matching model
+dependencies.
 
-Import transport neutral peer sessions from `@lucas-barake/effect-local-sql/PeerSession`. The existing `@lucas-barake/effect-local-browser/PeerSession` subpath remains as a compatibility reexport.
+Pass either `SqlReplica.layer` or `SqlReplica.layerWorkflow` to the graph. The Workflow composition can run in an
+application owned dedicated Worker or SharedWorker with SQL backed `SingleRunner` and `ClusterWorkflowEngine`.
+`BrowserReplica` deliberately does not create a Worker or choose its URL, database name, credentials, runner storage,
+or lifecycle policy. A SharedWorker must build one replica runtime per database and share it across page ports.
+`Atom.runtime` stays on the page side when an application adds an RPC bridge to a worker owned replica.
 
-See the [Effect Local documentation](https://github.com/lucas-barake/effect-local#readme) for browser setup, reactive atoms, sessions, presence, and API reference.
+`Presence.make` Schema decodes ephemeral values, expires them by TTL, and prevents slow stale decodes or scope
+finalizers from replacing newer client state. Presence never enters SQLite or the mutation log.
+
+See the [repository guide](https://github.com/lucas-barake/effect-local#readme).

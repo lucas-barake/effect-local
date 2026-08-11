@@ -1,8 +1,10 @@
 # @lucas-barake/effect-local-test
 
-Production shaped SQLite test layers, peer transports, and deterministic fault injection for Effect Local.
+Production shaped test Layers for Effect Local.
 
-`TestPeer` exercises both durable packets and current connection transient delivery. Its transient route is bounded,
-nonblocking, and no replay so tests can prove offline loss and slow subscriber dropping without durable custody.
+`TestServer.layer` adapts the real `ServerStore` to `SyncEngine`. `TestReplica.layer` uses the real `SqlReplica`
+composition. `FaultInjection.layer` can partition and heal the link, drop the next receipt after authoritative commit,
+and duplicate the next pull page so applications can test offline writes, ambiguous acknowledgements, reconnect, and
+deduplication without replacing the persistence engine.
 
-See the [Effect Local documentation](https://github.com/lucas-barake/effect-local#readme) for testing recipes, convergence examples, and API reference.
+See the [repository guide](https://github.com/lucas-barake/effect-local#readme).

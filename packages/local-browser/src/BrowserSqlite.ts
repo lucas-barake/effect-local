@@ -20,9 +20,11 @@ const normalizeQueryParameters = (message: unknown): unknown => {
   const parameters = message[2].map((value) => {
     if (typeof value !== "boolean") return value
     changed = true
-    return value ? 1 : 0
+    if (value) return 1
+    return 0
   })
-  return changed ? [message[0], message[1], parameters] : message
+  if (changed) return [message[0], message[1], parameters]
+  return message
 }
 
 // wa-sqlite 0.1.2 satisfies the driver's peer range but cannot bind booleans.
@@ -45,7 +47,8 @@ const compatiblePort = (port: MessagePort): MessagePort =>
         }
       }
       const value = Reflect.get(target, property, target)
-      return typeof value === "function" ? value.bind(target) : value
+      if (typeof value === "function") return value.bind(target)
+      return value
     }
   })
 

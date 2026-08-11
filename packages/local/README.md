@@ -1,13 +1,13 @@
 # @lucas-barake/effect-local
 
-Local first domain primitives for Effect v4.
+Schema defined domain and protocol primitives for Effect Local.
 
-`PeerTransport.Connection` carries tagged durable and transient inbound values. Durable sends have settlement and
-replay semantics supplied by the adapter. Transient sends are document scoped, best effort, and have no settlement or
-replay contract.
+Define models with `Model.make`, mutations with `Mutation.make`, queries with `Query.make`, and collect them with
+`Definition.make`. Mutation and query handlers use Effect Layers and a constrained transaction capability. The package
+also exports stable identities, accepted, rejected, and expired terminal receipts, immutable snapshot and bootstrap
+contracts, tagged `ReplicaError` failures, replica status, canonical encoding, and opt in `Field.Semantics`.
 
-Application code should define `Transient.make(name, { document, payload })`, register it in `ReplicaDefinition`,
-and use its document scoped `client`. The client owns schema encoding and decoding and exposes `publish` plus a typed
-`messages` Stream. `Transient.Transport` remains the advanced raw adapter boundary for custom runtimes.
+This package does not persist or transport data. Use `@lucas-barake/effect-local-sql` for the local and authoritative
+logs, `@lucas-barake/effect-local-rpc` for WebSockets, and `@lucas-barake/effect-local-browser` for Effect Atom.
 
-See the [Effect Local documentation](https://github.com/lucas-barake/effect-local#readme) for installation, domain modeling, replica operations, sync, backup, and API reference.
+See the [repository guide](https://github.com/lucas-barake/effect-local#readme).

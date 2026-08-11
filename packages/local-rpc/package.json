@@ -1,7 +1,7 @@
 {
   "name": "@lucas-barake/effect-local-rpc",
   "version": "0.0.0",
-  "description": "Effect RPC peer synchronization for Effect Local",
+  "description": "Effect RPC WebSocket synchronization for Effect Local",
   "homepage": "https://github.com/lucas-barake/effect-local#readme",
   "bugs": "https://github.com/lucas-barake/effect-local/issues",
   "keywords": [
@@ -9,7 +9,7 @@
     "local-first",
     "rpc",
     "websocket",
-    "automerge"
+    "mutation-log"
   ],
   "engines": {
     "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
@@ -48,9 +48,9 @@
     "dist/**/*.d.ts.map"
   ],
   "scripts": {
-    "build": "tsc -b tsconfig.json",
-    "build:tsgo": "tsgo -b tsconfig.json",
-    "check": "tsc -b tsconfig.json",
+    "build": "tsgo -b tsconfig.json",
+    "build:tsc": "tsc -b tsconfig.json",
+    "check": "tsgo -b tsconfig.json",
     "test": "vitest --config vitest.config.ts"
   },
   "dependencies": {
@@ -58,16 +58,11 @@
     "@lucas-barake/effect-local-sql": "workspace:^"
   },
   "peerDependencies": {
-    "effect": ">=4.0.0-beta.101 <4.0.1"
+    "effect": ">=4.0.0-beta.103 <4.0.1"
   },
   "devDependencies": {
-    "@effect/platform-node": "4.0.0-beta.101",
-    "@effect/sql-mysql2": "4.0.0-beta.101",
-    "@effect/sql-pg": "4.0.0-beta.101",
-    "@effect/sql-sqlite-node": "4.0.0-beta.101",
-    "@lucas-barake/effect-local-test": "workspace:^",
-    "@testcontainers/mysql": "11.14.0",
-    "@testcontainers/postgresql": "11.14.0",
-    "effect": "4.0.0-beta.101"
+    "@effect/platform-node": "4.0.0-beta.103",
+    "@effect/sql-sqlite-node": "4.0.0-beta.103",
+    "effect": "4.0.0-beta.103"
   }
 }
