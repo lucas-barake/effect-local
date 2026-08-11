@@ -342,6 +342,7 @@ const currentOrLegacyEntry = (
       clientId: legacy.clientId,
       mutationId: legacy.mutationId,
       localSequence: legacy.localSequence,
+      membershipIncarnation: Identity.legacyMembershipIncarnation,
       sourceSchema: source,
       digest: legacy.digest,
       changes

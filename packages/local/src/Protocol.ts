@@ -22,7 +22,7 @@ export const encodedBytesEffect = (
 export const MutationDigest = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
 export type MutationDigest = typeof MutationDigest.Type
 
-export const MutationDigestVersion = Schema.Literals([1, 2])
+export const MutationDigestVersion = Schema.Literals([1, 2, 3])
 export type MutationDigestVersion = typeof MutationDigestVersion.Type
 
 const MutationIdentity = {
@@ -35,14 +35,31 @@ const MutationIdentity = {
   payload: Schema.Json
 }
 
+const LegacyMembershipIncarnation = Identity.MembershipIncarnation.pipe(
+  Schema.withDecodingDefaultKey(Effect.succeed(Identity.legacyMembershipIncarnation)),
+  Schema.withConstructorDefault(Effect.succeed(Identity.legacyMembershipIncarnation))
+)
+
 export const MutationEnvelope = Schema.Struct({
   ...MutationIdentity,
   digestVersion: MutationDigestVersion,
   sourceSchema: Identity.SchemaIdentity,
   mutationVersion: Identity.SchemaVersion,
+  membershipIncarnation: LegacyMembershipIncarnation,
   digest: MutationDigest
 })
 export type MutationEnvelope = typeof MutationEnvelope.Type
+
+export type MutationDigestIdentity = Omit<MutationEnvelope, "digest" | "membershipIncarnation"> & {
+  readonly membershipIncarnation?: Identity.MembershipIncarnation
+}
+
+export const membershipIncarnationForEnvelope = (
+  envelope: Pick<MutationEnvelope, "digestVersion" | "membershipIncarnation">
+): Identity.MembershipIncarnation => {
+  if (envelope.digestVersion === 3) return envelope.membershipIncarnation
+  return Identity.legacyMembershipIncarnation
+}
 
 export const SubmitRequest = Schema.Struct({
   envelope: MutationEnvelope,
@@ -50,7 +67,7 @@ export const SubmitRequest = Schema.Struct({
 })
 export type SubmitRequest = typeof SubmitRequest.Type
 
-export const mutationDigestInput = (envelope: Omit<MutationEnvelope, "digest">): unknown => {
+export const mutationDigestInput = (envelope: MutationDigestIdentity): unknown => {
   const identity = {
     spaceId: envelope.spaceId,
     clientId: envelope.clientId,
@@ -61,16 +78,17 @@ export const mutationDigestInput = (envelope: Omit<MutationEnvelope, "digest">):
     payload: envelope.payload
   }
   if (envelope.digestVersion === 1) return identity
-  return {
+  const versioned = {
     ...identity,
     digestVersion: envelope.digestVersion,
     sourceSchema: envelope.sourceSchema,
     mutationVersion: envelope.mutationVersion
   }
+  if (envelope.digestVersion === 2) return versioned
+  return { ...versioned, membershipIncarnation: envelope.membershipIncarnation }
 }
 
-export const mutationDigest = (envelope: Omit<MutationEnvelope, "digest">) =>
-  Canonical.digest(mutationDigestInput(envelope))
+export const mutationDigest = (envelope: MutationDigestIdentity) => Canonical.digest(mutationDigestInput(envelope))
 
 export const EntityKey = Schema.Struct({
   model: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
@@ -91,7 +109,8 @@ const ReceiptIdentity = {
   spaceId: Identity.SpaceId,
   clientId: Identity.ClientId,
   mutationId: Identity.MutationId,
-  localSequence: Identity.LocalSequence
+  localSequence: Identity.LocalSequence,
+  membershipIncarnation: LegacyMembershipIncarnation
 }
 
 export const AcceptedReceipt = Schema.TaggedStruct("Accepted", {
@@ -148,6 +167,7 @@ export const AcceptedMutation = Schema.Struct({
   clientId: Identity.ClientId,
   mutationId: Identity.MutationId,
   localSequence: Identity.LocalSequence,
+  membershipIncarnation: LegacyMembershipIncarnation,
   sourceSchema: Identity.SchemaIdentity,
   digest: MutationDigest,
   changes: Schema.Array(EntityChange)

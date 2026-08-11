@@ -18,6 +18,13 @@ export type SpaceId = typeof SpaceId.Type
 export const ClientId = identifier("ClientId", "cli")
 export type ClientId = typeof ClientId.Type
 
+export const MembershipIncarnation = identifier("MembershipIncarnation", "inc")
+export type MembershipIncarnation = typeof MembershipIncarnation.Type
+
+export const legacyMembershipIncarnation = MembershipIncarnation.make(
+  "inc_00000000-0000-4000-8000-000000000000"
+)
+
 export const MutationId = identifier("MutationId", "mut")
 export type MutationId = typeof MutationId.Type
 
@@ -55,5 +62,6 @@ const makeIdentifier = <A,>(schema: { readonly make: (value: string) => A }, pre
 
 export const makeSpaceId = makeIdentifier(SpaceId, "spc")
 export const makeClientId = makeIdentifier(ClientId, "cli")
+export const makeMembershipIncarnation = makeIdentifier(MembershipIncarnation, "inc")
 export const makeMutationId = makeIdentifier(MutationId, "mut")
 export const makeSnapshotId = makeIdentifier(SnapshotId, "snp")

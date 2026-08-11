@@ -261,6 +261,70 @@ const legacyV1Envelope = (
   })
 
 describe("mutation digest evolution", () => {
+  it.effect("normalizes legacy protocol identity and binds membership incarnation in version 3", () =>
+    Effect.gen(function*() {
+      const common = {
+        spaceId,
+        clientId,
+        mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000211"),
+        localSequence: Identity.LocalSequence.make(1),
+        basis: Identity.ServerSequence.make(0),
+        name: PutTodoV1.name,
+        payload: { id: "1", title: "incarnation" },
+        sourceSchema: definitionV1.schemaIdentity,
+        mutationVersion: PutTodoV1.version
+      }
+      const legacyIdentity = { ...common, digestVersion: 2 as const }
+      const legacyWire = {
+        ...legacyIdentity,
+        digest: yield* Protocol.mutationDigest(legacyIdentity)
+      }
+      const decodedLegacy = Schema.decodeUnknownSync(Protocol.MutationEnvelope)(legacyWire)
+      assert.strictEqual(decodedLegacy.membershipIncarnation, Identity.legacyMembershipIncarnation)
+
+      const firstIncarnation = Identity.MembershipIncarnation.make(
+        "inc_00000000-0000-4000-8000-000000000001"
+      )
+      const secondIncarnation = Identity.MembershipIncarnation.make(
+        "inc_00000000-0000-4000-8000-000000000002"
+      )
+      const firstV3 = { ...common, digestVersion: 3 as const, membershipIncarnation: firstIncarnation }
+      const secondV3 = { ...common, digestVersion: 3 as const, membershipIncarnation: secondIncarnation }
+      const firstDigest = yield* Protocol.mutationDigest(firstV3)
+      const secondDigest = yield* Protocol.mutationDigest(secondV3)
+      assert.notStrictEqual(firstDigest, secondDigest)
+
+      const decodedReceipt = Schema.decodeUnknownSync(Protocol.Receipt)({
+        _tag: "Accepted",
+        spaceId,
+        clientId,
+        mutationId: common.mutationId,
+        localSequence: common.localSequence,
+        name: common.name,
+        sourceSchema: common.sourceSchema,
+        mutationVersion: common.mutationVersion,
+        serverSequence: 1,
+        result: null
+      })
+      assert.strictEqual(decodedReceipt.membershipIncarnation, Identity.legacyMembershipIncarnation)
+      assert.strictEqual(
+        Schema.encodeSync(Protocol.Receipt)(decodedReceipt).membershipIncarnation,
+        Identity.legacyMembershipIncarnation
+      )
+
+      const decodedEntry = Schema.decodeUnknownSync(Protocol.AcceptedMutation)({
+        sequence: 1,
+        spaceId,
+        clientId,
+        mutationId: common.mutationId,
+        localSequence: common.localSequence,
+        sourceSchema: common.sourceSchema,
+        digest: legacyWire.digest,
+        changes: []
+      })
+      assert.strictEqual(decodedEntry.membershipIncarnation, Identity.legacyMembershipIncarnation)
+    }).pipe(Effect.provide(NodeCrypto.layer)))
+
   it.effect("preserves legacy digests and binds schema provenance in version 2", () =>
     Effect.gen(function*() {
       const common = {
