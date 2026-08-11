@@ -425,16 +425,6 @@ const fromAST = (
               parameter: fromAST(signature.parameter, state, trustedBehavior),
               type: fromAST(signature.type, state, trustedBehavior)
             }
-            if (signature.merge !== undefined) {
-              if (!identifiedBehavior) {
-                throw new TypeError("Opaque index combiners require an identifier or meta annotation")
-              }
-              descriptor.merge = {
-                decode: signature.merge.decode !== undefined,
-                encode: signature.merge.encode !== undefined,
-                identity: "Annotated"
-              }
-            }
             return descriptor
           })
         }

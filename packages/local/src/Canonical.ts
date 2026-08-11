@@ -49,7 +49,7 @@ const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
 }
 
 export const stringify = (value: unknown): string =>
-  Schema.encodeSync(Schema.UnknownFromJsonString)(normalize(value, new WeakSet()))
+  Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(normalize(value, new WeakSet()))
 
 export const stringifyEffect = (value: unknown): Effect.Effect<string, ReplicaError.CanonicalEncodeError> =>
   Effect.try({
