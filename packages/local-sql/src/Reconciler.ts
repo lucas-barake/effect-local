@@ -2,6 +2,7 @@ import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
@@ -130,6 +131,13 @@ export const layerInMemoryScheduler = (
             generations.completed >= generations.requested
               ? Effect.void
               : reconciliation.sync.pipe(
+                Effect.forkChild({ startImmediately: true }),
+                Effect.flatMap(Fiber.await),
+                Effect.flatMap((exit) =>
+                  exit._tag === "Failure" && Cause.hasInterruptsOnly(exit.cause)
+                    ? Effect.fail(new ReplicaError.ServerUnavailable())
+                    : exit
+                ),
                 Effect.andThen(local.completeReconciliation(generations.requested)),
                 Effect.andThen(reconciliation.succeeded)
               )

@@ -801,6 +801,57 @@ describe("server reconciled mutation log", () => {
       assert.strictEqual(yield* Ref.get(subscriptions), 2)
     })))
 
+  it.effect("retries pending mutations after an interrupted submit", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const firstAttempt = yield* Deferred.make<void>()
+      const secondAttempt = yield* Deferred.make<void>()
+      let attempts = 0
+      const remote = Layer.succeed(
+        SyncEngine.SyncEngine,
+        SyncEngine.SyncEngine.of({
+          submit: (submitted) =>
+            Effect.suspend(() => {
+              attempts++
+              if (attempts === 1) {
+                return Deferred.succeed(firstAttempt, undefined).pipe(
+                  Effect.andThen(Effect.interrupt)
+                )
+              }
+              return Deferred.succeed(secondAttempt, undefined).pipe(
+                Effect.as(Protocol.RejectedReceipt.make({
+                  spaceId,
+                  clientId,
+                  mutationId: submitted.mutationId,
+                  localSequence: submitted.localSequence,
+                  rejection: "denied"
+                }))
+              )
+            }),
+          pull: () => Effect.succeed(Protocol.PullPage.make({ entries: [], hasMore: false })),
+          watch: () => Stream.never
+        })
+      )
+      const local = localLayer()
+      const reconciler = Reconciler.layer({ spaceId, retryDelay: "1 second" }).pipe(
+        Layer.provide(local),
+        Layer.provide(remote)
+      )
+      const services = yield* Layer.build(Layer.merge(local, reconciler))
+      const store = Context.get(services, LocalStore.Store)
+      const scheduler = Context.get(services, Reconciler.Reconciler)
+      yield* store.mutate(Domain.PutTodo, Domain.todo("interrupted"))
+
+      yield* scheduler.notify
+      yield* Deferred.await(firstAttempt)
+      yield* Effect.yieldNow
+      yield* scheduler.notify
+      yield* TestClock.adjust("1 second")
+      yield* Effect.yieldNow
+
+      assert.strictEqual(attempts, 2)
+      yield* Deferred.await(secondAttempt)
+    })))
+
   it.effect("emits a current watermark when a watch subscription becomes ready", () =>
     Effect.scoped(Effect.gen(function*() {
       const local = yield* service(LocalStore.Store, localLayer())
