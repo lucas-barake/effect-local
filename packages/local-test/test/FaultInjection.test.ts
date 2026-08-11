@@ -3,6 +3,7 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as LocalStore from "@lucas-barake/effect-local-sql/LocalStore"
 import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime"
+import * as QueryReactivity from "@lucas-barake/effect-local-sql/QueryReactivity"
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
@@ -22,6 +23,15 @@ import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as FaultInjection from "../src/FaultInjection.js"
 import * as TestServer from "../src/TestServer.js"
+
+type EffectQueryReactivity = {
+  readonly retain: (key: string) => Effect.Effect<Effect.Effect<void>>
+  readonly record: (key: string, reads: ReadonlyArray<QueryReactivity.Read>) => Effect.Effect<void>
+  readonly affected: (changes: QueryReactivity.Changes) => Effect.Effect<ReadonlyArray<string>>
+}
+type QueryReactivityMethodsReturnEffects = QueryReactivity.Service extends EffectQueryReactivity ? true : false
+const queryReactivityMethodsReturnEffects: QueryReactivityMethodsReturnEffects = true
+void queryReactivityMethodsReturnEffects
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
@@ -68,7 +78,8 @@ const database = () =>
   Layer.mergeAll(
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
     NodeCrypto.layer,
-    Reactivity.layer
+    Reactivity.layer,
+    QueryReactivity.layer
   )
 
 const service = <I, S, E, R,>(tag: Context.Service<I, S>, layer: Layer.Layer<I, E, R>) =>

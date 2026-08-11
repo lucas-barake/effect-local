@@ -1,4 +1,6 @@
-import type * as Reactivity from "effect/unstable/reactivity/Reactivity"
+import * as Context from "effect/Context"
+import * as Effect from "effect/Effect"
+import * as Layer from "effect/Layer"
 import type * as IndexStore from "./IndexStore.js"
 
 export type Read =
@@ -13,18 +15,15 @@ export interface Changes {
   readonly broadModels: ReadonlySet<string>
 }
 
-export interface Registry {
-  readonly record: (key: string, reads: ReadonlyArray<Read>) => void
-  readonly affected: (changes: Changes) => ReadonlyArray<string>
+export interface Service {
+  readonly retain: (key: string) => Effect.Effect<Effect.Effect<void>>
+  readonly record: (key: string, reads: ReadonlyArray<Read>) => Effect.Effect<void>
+  readonly affected: (changes: Changes) => Effect.Effect<ReadonlyArray<string>>
 }
 
-interface InternalRegistry extends Registry {
-  readonly delete: (key: string) => void
-}
-
-const registries = new WeakMap<Reactivity.Reactivity["Service"], InternalRegistry>()
-const liveRegistries = new Set<WeakRef<InternalRegistry>>()
-const retained = new Map<string, number>()
+export class QueryReactivity extends Context.Service<QueryReactivity, Service>()(
+  "@lucas-barake/effect-local-sql/QueryReactivity"
+) {}
 
 const compareValue = (left: string | number, right: string | number): number => {
   if (typeof left === "number" && typeof right === "number") return left - right
@@ -53,7 +52,7 @@ const sameTuple = (
 ): boolean => compareTuple(left, right) === 0
 
 const pointMatches = (footprint: IndexStore.Footprint, point: IndexStore.Point): boolean => {
-  if (point.descriptor !== footprint.descriptor || !sameTuple(point.partition, footprint.partition)) return false
+  if (!sameTuple(point.partition, footprint.partition)) return false
   const ranged = point.sort[0]
   if (ranged !== undefined) {
     if (footprint.lower !== undefined) {
@@ -79,59 +78,56 @@ const pointMatches = (footprint: IndexStore.Footprint, point: IndexStore.Point):
   return true
 }
 
-const readMatches = (read: Read, changes: Changes): boolean => {
-  if (read._tag === "Entity") return changes.entityKeys.has(read.key)
-  if (read._tag === "Model") return changes.models.has(read.model)
-  if (changes.broadModels.has(read.footprint.model)) return true
-  return changes.points.some((point) => pointMatches(read.footprint, point))
-}
-
-const make = (): InternalRegistry => {
+const make = (): Service => {
+  const retained = new Map<string, number>()
   const readsByKey = new Map<string, ReadonlyArray<Read>>()
   return {
-    record: (key, reads) => {
-      if (!retained.has(key)) return
-      readsByKey.set(key, reads)
-    },
-    delete: (key) => {
-      readsByKey.delete(key)
-    },
-    affected: (changes) => {
-      if (
-        changes.entityKeys.size === 0 && changes.models.size === 0 && changes.points.length === 0 &&
-        changes.broadModels.size === 0
-      ) return []
-      const affected: Array<string> = []
-      for (const [key, reads] of readsByKey) {
-        if (reads.some((read) => readMatches(read, changes))) affected.push(key)
-      }
-      return affected
-    }
+    retain: (key) =>
+      Effect.sync(() => {
+        retained.set(key, (retained.get(key) ?? 0) + 1)
+        return Effect.sync(() => {
+          const remaining = (retained.get(key) ?? 1) - 1
+          if (remaining > 0) {
+            retained.set(key, remaining)
+            return
+          }
+          retained.delete(key)
+          readsByKey.delete(key)
+        })
+      }),
+    record: (key, reads) =>
+      Effect.sync(() => {
+        if (retained.has(key)) readsByKey.set(key, reads)
+      }),
+    affected: (changes) =>
+      Effect.sync(() => {
+        if (
+          changes.entityKeys.size === 0 && changes.models.size === 0 && changes.points.length === 0 &&
+          changes.broadModels.size === 0
+        ) return []
+        const pointsByDescriptor = new Map<string, Array<IndexStore.Point>>()
+        for (const point of changes.points) {
+          const points = pointsByDescriptor.get(point.descriptor)
+          if (points === undefined) pointsByDescriptor.set(point.descriptor, [point])
+          else points.push(point)
+        }
+        const affected: Array<string> = []
+        for (const [key, reads] of readsByKey) {
+          const matches = reads.some((read) => {
+            if (read._tag === "Entity") return changes.entityKeys.has(read.key)
+            if (read._tag === "Model") return changes.models.has(read.model)
+            if (changes.broadModels.has(read.footprint.model)) return true
+            return pointsByDescriptor.get(read.footprint.descriptor)?.some((point) =>
+              pointMatches(read.footprint, point)
+            ) ?? false
+          })
+          if (matches) affected.push(key)
+        }
+        return affected
+      })
   }
 }
 
-export const get = (reactivity: Reactivity.Reactivity["Service"]): Registry => {
-  const existing = registries.get(reactivity)
-  if (existing !== undefined) return existing
-  const created = make()
-  registries.set(reactivity, created)
-  liveRegistries.add(new WeakRef(created))
-  return created
-}
+export const makeLayer = (): Layer.Layer<QueryReactivity> => Layer.sync(QueryReactivity, make)
 
-export const retain = (key: string): () => void => {
-  retained.set(key, (retained.get(key) ?? 0) + 1)
-  return () => {
-    const remaining = (retained.get(key) ?? 1) - 1
-    if (remaining > 0) {
-      retained.set(key, remaining)
-      return
-    }
-    retained.delete(key)
-    for (const reference of liveRegistries) {
-      const registry = reference.deref()
-      if (registry === undefined) liveRegistries.delete(reference)
-      else registry.delete(key)
-    }
-  }
-}
+export const layer: Layer.Layer<QueryReactivity> = makeLayer()

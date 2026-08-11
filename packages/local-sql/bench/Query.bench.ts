@@ -15,11 +15,12 @@ import { afterAll, assert, beforeAll, bench } from "vitest"
 import * as IndexStore from "../src/IndexStore.js"
 import * as Migrations from "../src/Migrations.js"
 import * as QueryExecutor from "../src/QueryExecutor.js"
+import * as QueryReactivity from "../src/QueryReactivity.js"
 
 /* oxlint-disable effect/noTestLifecycleHooks, effect/noAsyncFunction -- Vitest owns benchmark fixture setup, timing callbacks, and teardown. */
 
 let decodedRows = 0
-const StoredItem = Schema.Struct({ id: Schema.String, score: Schema.Number })
+const StoredItem = Schema.Struct({ id: Schema.String, bucket: Schema.Number, score: Schema.Number })
 const ItemSchema = StoredItem.pipe(Schema.decodeTo(StoredItem, {
   decode: SchemaGetter.transform((item) => {
     decodedRows++
@@ -41,6 +42,21 @@ const Item = Model.make("BenchItem", {
         schema: Schema.Number,
         extract: (item: typeof ItemSchema.Type) => item.score
       }]
+    },
+    byBucketScore: {
+      version: 1,
+      partition: [],
+      sort: [{
+        name: "bucket",
+        affinity: "integer",
+        schema: Schema.Number,
+        extract: (item: typeof ItemSchema.Type) => item.bucket
+      }, {
+        name: "score",
+        affinity: "real",
+        schema: Schema.Number,
+        extract: (item: typeof ItemSchema.Type) => item.score
+      }]
     }
   }
 })
@@ -49,20 +65,34 @@ const Indexed = Query.make("BenchIndexed", {
   success: Schema.Array(Item.schema)
 })
 const Full = Query.make("BenchFull", { success: Schema.Array(Item.schema) })
-const definition = Definition.make({ version: 1, models: [Item], mutations: [], queries: [Indexed, Full] })
-const handlers = Layer.merge(
+const MultiColumn = Query.make("BenchMultiColumn", { success: Schema.Array(Item.schema) })
+const definition = Definition.make({
+  version: 1,
+  models: [Item],
+  mutations: [],
+  queries: [Indexed, Full, MultiColumn]
+})
+const handlers = Layer.mergeAll(
   Indexed.toLayer(({ payload, query }) =>
     query.from(Item, "byScore").where({ score: { gte: payload.minimum } }).limit(25).page().pipe(
       Effect.map((page) => page.items)
     )
   ),
-  Full.toLayer(({ query }) => query.all(Item))
+  Full.toLayer(({ query }) => query.all(Item)),
+  MultiColumn.toLayer(({ query }) =>
+    Effect.gen(function*() {
+      const builder = query.from(Item, "byBucketScore").limit(25)
+      const first = yield* builder.page()
+      if (first.next === undefined) return []
+      return (yield* builder.after(first.next).page()).items
+    })
+  )
 )
 const database = Layer.merge(
   SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
   Reactivity.layer
 )
-const dependencies = Layer.merge(database, handlers)
+const dependencies = Layer.mergeAll(database, handlers, QueryReactivity.layer)
 const executor = QueryExecutor.layer(definition).pipe(Layer.provide(dependencies))
 const runtime = ManagedRuntime.make(Layer.merge(executor, dependencies))
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
@@ -77,13 +107,15 @@ beforeAll(async () => {
       clientId,
       migration: { retryDelay: "1 millis", maximumAttempts: 8 }
     })
+    yield* sql`UPDATE effect_local_client_meta SET schema_version = ${definition.schemaIdentity.version},
+      schema_hash = ${definition.schemaIdentity.hash} WHERE singleton = 1`
     const rows = Array.from({ length: 10_000 }, (_, score) => {
       const id = `item-${score.toString().padStart(5, "0")}`
       return {
         generation: 0,
         model: Item.name,
         entity_key: Canonical.stringify(id),
-        value_json: Canonical.stringify({ id, score }),
+        value_json: Canonical.stringify({ id, bucket: score % 4, score }),
         model_version: Item.version
       }
     })
@@ -100,20 +132,29 @@ afterAll(async () => {
   await runtime.dispose()
 })
 
-bench("indexed selective page decodes only its 25 returned rows", async () => {
+bench("indexed selective page avoids decoding the complete model", async () => {
   decodedRows = 0
   const result = await runtime.runPromise(
     QueryExecutor.QueryExecutor.use((service) => service.execute(Indexed, { minimum: 9_900 }))
   )
   assert.strictEqual(result.length, 25)
-  assert.strictEqual(decodedRows, 25)
-}, { iterations: 20, time: 100, warmupIterations: 3, warmupTime: 25 })
+  assert.strictEqual(decodedRows, 50)
+}, { iterations: 20, time: 0, warmupIterations: 3, warmupTime: 0, throws: true })
 
-bench("compatibility all decodes the complete 10000 row model", async () => {
+bench("low cardinality multicolumn cursor returns a stable second page", async () => {
+  decodedRows = 0
+  const result = await runtime.runPromise(
+    QueryExecutor.QueryExecutor.use((service) => service.execute(MultiColumn, undefined))
+  )
+  assert.strictEqual(result.length, 25)
+  assert.strictEqual(decodedRows, 75)
+}, { iterations: 20, time: 0, warmupIterations: 3, warmupTime: 0, throws: true })
+
+bench("compatibility all decodes the complete model", async () => {
   decodedRows = 0
   const result = await runtime.runPromise(
     QueryExecutor.QueryExecutor.use((service) => service.execute(Full, undefined))
   )
   assert.strictEqual(result.length, 10_000)
-  assert.strictEqual(decodedRows, 10_000)
-}, { iterations: 5, time: 100, warmupIterations: 1, warmupTime: 25 })
+  assert.strictEqual(decodedRows, 20_000)
+}, { iterations: 5, time: 0, warmupIterations: 1, warmupTime: 0, throws: true })

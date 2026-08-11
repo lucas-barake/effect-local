@@ -30,6 +30,7 @@ import * as LocalStore from "../src/LocalStore.js"
 import * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as QueryExecutor from "../src/QueryExecutor.js"
+import * as QueryReactivity from "../src/QueryReactivity.js"
 import * as Reconciler from "../src/Reconciler.js"
 import * as ServerStore from "../src/ServerStore.js"
 import * as SyncEngine from "../src/SyncEngine.js"
@@ -74,7 +75,8 @@ const database = () =>
   Layer.mergeAll(
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
     NodeCrypto.layer,
-    Reactivity.layer
+    Reactivity.layer,
+    QueryReactivity.layer
   )
 
 const runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.handlers))
@@ -162,6 +164,56 @@ const clientServices = (id: Identity.ClientId, server: ServerStore.Service) => {
 }
 
 describe("server reconciled mutation log", () => {
+  it.effect("classifies malformed visible rows during index maintenance as storage corruption", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const clientDatabase = database()
+      const live = LocalStore.layer({
+        ...clientHistory,
+        definition: Domain.definition,
+        spaceId,
+        clientId
+      }).pipe(
+        Layer.provide(runtime),
+        Layer.provide(clientDatabase)
+      )
+      const context = yield* Layer.build(Layer.merge(live, clientDatabase))
+      const local = Context.get(context, LocalStore.Store)
+      const sql = Context.get(context, SqlClient.SqlClient)
+      const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("corrupt-index-refresh"))
+      const meta = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: Schema.Struct({ active_schema_generation: Schema.Int }),
+        execute: () => sql`SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1`
+      })(undefined)
+
+      yield* sql`INSERT INTO effect_local_client_canonical_entities_data
+        (generation, model, model_version, entity_key, value_json)
+        VALUES (${meta.active_schema_generation}, ${Domain.Todo.name}, ${Domain.Todo.version},
+          ${Canonical.stringify("corrupt-index-refresh")}, x'00')`
+      const malformed = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: Schema.Struct({ value_json: Schema.Unknown }),
+        execute: () =>
+          sql`SELECT value_json FROM effect_local_client_canonical_entities_data
+          WHERE generation = ${meta.active_schema_generation} AND model = ${Domain.Todo.name}
+          AND entity_key = ${Canonical.stringify("corrupt-index-refresh")}`
+      })(undefined)
+      assert.instanceOf(malformed.value_json, Uint8Array)
+      yield* local.persistReceipt(Protocol.RejectedReceipt.make({
+        spaceId,
+        clientId,
+        mutationId: pending.envelope.mutationId,
+        localSequence: pending.envelope.localSequence,
+        ...putTodoProvenance,
+        origin: "Mutation",
+        terminalSequence: Identity.TerminalSequence.make(1),
+        rejection: "denied"
+      }))
+
+      const error = yield* local.settleReceipts.pipe(Effect.flip)
+      assert.strictEqual(error._tag, "StorageCorrupt")
+    })))
+
   it.effect("filters, orders, paginates, and streams through a declared secondary index", () =>
     Effect.scoped(Effect.gen(function*() {
       const sharedDatabase = database()
@@ -655,7 +707,8 @@ describe("server reconciled mutation log", () => {
           Layer.mergeAll(
             SqliteClient.layer({ filename, disableWAL: true }),
             NodeCrypto.layer,
-            Reactivity.layer
+            Reactivity.layer,
+            QueryReactivity.layer
           )
         const makeLocal = () =>
           LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
@@ -1151,7 +1204,11 @@ describe("server reconciled mutation log", () => {
       const services = Layer.mergeAll(
         Layer.succeed(SqlClient.SqlClient, sql),
         Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto)),
-        Layer.succeed(Reactivity.Reactivity, Context.get(databaseContext, Reactivity.Reactivity))
+        Layer.succeed(Reactivity.Reactivity, Context.get(databaseContext, Reactivity.Reactivity)),
+        Layer.succeed(
+          QueryReactivity.QueryReactivity,
+          Context.get(databaseContext, QueryReactivity.QueryReactivity)
+        )
       )
       const live = LocalStore.layer({
         ...clientHistory,
@@ -2241,7 +2298,8 @@ describe("server reconciled mutation log", () => {
         Layer.mergeAll(
           SqliteClient.layer({ filename }),
           NodeCrypto.layer,
-          Reactivity.layer
+          Reactivity.layer,
+          QueryReactivity.layer
         )
       const pairRuntime = MutationRuntime.layer(definition).pipe(Layer.provide(handlers), Layer.provide(gate))
       const local = LocalStore.layer({ ...clientHistory, definition, spaceId, clientId }).pipe(
@@ -2421,7 +2479,8 @@ describe("server reconciled mutation log", () => {
           Layer.mergeAll(
             SqliteClient.layer({ filename, disableWAL: true }),
             NodeCrypto.layer,
-            Reactivity.layer
+            Reactivity.layer,
+            QueryReactivity.layer
           )
 
         const mutationId = yield* Effect.scoped(Effect.gen(function*() {

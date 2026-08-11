@@ -26,6 +26,7 @@ import * as Codec from "../src/internal/codec.js"
 import * as LocalStore from "../src/LocalStore.js"
 import type * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
+import * as QueryReactivity from "../src/QueryReactivity.js"
 import * as SchemaEvolution from "../src/SchemaEvolution.js"
 import * as ServerStore from "../src/ServerStore.js"
 import * as SqlReplica from "../src/SqlReplica.js"
@@ -296,7 +297,8 @@ const evolutionV3 = Evolution.make({
 const database = Layer.mergeAll(
   SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
   NodeCrypto.layer,
-  Reactivity.layer
+  Reactivity.layer,
+  QueryReactivity.layer
 )
 
 const buildStore = <D extends Definition.Any,>(

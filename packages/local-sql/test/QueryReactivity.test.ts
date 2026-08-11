@@ -1,6 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
-import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import type * as IndexStore from "../src/IndexStore.js"
 import * as QueryReactivity from "../src/QueryReactivity.js"
 
@@ -44,38 +43,64 @@ const changes = (points: ReadonlyArray<IndexStore.Point>): QueryReactivity.Chang
 describe("query range reactivity", () => {
   it.effect("intersects old and new index points with only the result ranges they can change", () =>
     Effect.gen(function*() {
-      const service = yield* Reactivity.make
-      const registry = QueryReactivity.get(service)
-      const releaseRelated = QueryReactivity.retain("related")
-      const releaseUnrelated = QueryReactivity.retain("unrelated")
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          releaseUnrelated()
-          releaseRelated()
-        })
-      )
-      registry.record("related", [{ _tag: "Index", footprint: footprint({ lower: "a", upper: "m" }) }])
-      registry.record("unrelated", [{ _tag: "Index", footprint: footprint({ lower: "n", upper: "z" }) }])
+      const registry = yield* QueryReactivity.QueryReactivity
+      const effectService: {
+        readonly retain: (key: string) => Effect.Effect<Effect.Effect<void>>
+        readonly record: (key: string, reads: ReadonlyArray<QueryReactivity.Read>) => Effect.Effect<void>
+        readonly affected: (changes: QueryReactivity.Changes) => Effect.Effect<ReadonlyArray<string>>
+      } = registry
+      void effectService
+      const releaseRelated = yield* registry.retain("related")
+      const releaseUnrelated = yield* registry.retain("unrelated")
+      yield* Effect.addFinalizer(() => releaseUnrelated.pipe(Effect.andThen(releaseRelated)))
+      yield* registry.record("related", [{ _tag: "Index", footprint: footprint({ lower: "a", upper: "m" }) }])
+      yield* registry.record("unrelated", [{ _tag: "Index", footprint: footprint({ lower: "n", upper: "z" }) }])
 
-      assert.deepStrictEqual(registry.affected(changes([point("beta", "\"1\"")])), ["related"])
+      assert.deepStrictEqual(yield* registry.affected(changes([point("beta", "\"1\"")])), ["related"])
       assert.deepStrictEqual(
-        registry.affected(changes([point("beta", "\"1\""), point("omega", "\"1\"")])),
+        yield* registry.affected(changes([point("beta", "\"1\""), point("omega", "\"1\"")])),
         ["related", "unrelated"]
       )
-    }))
+    }).pipe(Effect.provide(QueryReactivity.layer)))
 
   it.effect("does not invalidate a full limited page for a point beyond its result boundary", () =>
     Effect.gen(function*() {
-      const service = yield* Reactivity.make
-      const registry = QueryReactivity.get(service)
-      const release = QueryReactivity.retain("page")
-      yield* Effect.addFinalizer(() => Effect.sync(release))
-      registry.record("page", [{
+      const registry = yield* QueryReactivity.QueryReactivity
+      const release = yield* registry.retain("page")
+      yield* Effect.addFinalizer(() => release)
+      yield* registry.record("page", [{
         _tag: "Index",
         footprint: footprint({ lower: "a", upper: "z", boundary: ["middle", "\"2\""], full: true })
       }])
 
-      assert.deepStrictEqual(registry.affected(changes([point("omega", "\"3\"")])), [])
-      assert.deepStrictEqual(registry.affected(changes([point("beta", "\"1\"")])), ["page"])
-    }))
+      assert.deepStrictEqual(yield* registry.affected(changes([point("omega", "\"3\"")])), [])
+      assert.deepStrictEqual(yield* registry.affected(changes([point("beta", "\"1\"")])), ["page"])
+    }).pipe(Effect.provide(QueryReactivity.layer)))
+
+  it.effect("indexes changed points by descriptor before range intersection", () =>
+    Effect.gen(function*() {
+      const registry = yield* QueryReactivity.QueryReactivity
+      const releases: Array<Effect.Effect<void>> = []
+      for (let index = 0; index < 1_000; index++) {
+        const key = `query-${index}`
+        releases.push(yield* registry.retain(key))
+        yield* registry.record(key, [{ _tag: "Index", footprint: footprint({ lower: "a", upper: "z" }) }])
+      }
+      yield* Effect.addFinalizer(() => Effect.all(releases, { discard: true }))
+      let comparisons = 0
+      const unrelated = Array.from({ length: 1_000 }, (_, index): IndexStore.Point => ({
+        get descriptor() {
+          comparisons++
+          return "another-index"
+        },
+        model: "Todo",
+        index: "byTitle",
+        partition: [],
+        sort: [index],
+        entityKey: `"${index}"`
+      }))
+
+      assert.deepStrictEqual(yield* registry.affected(changes(unrelated)), [])
+      assert.isAtMost(comparisons, 2_000)
+    }).pipe(Effect.provide(QueryReactivity.layer)))
 })
