@@ -14,6 +14,13 @@ receipts, a bounded accepted suffix, per space cursors, resumable snapshot stagi
 reconciliation generations. Optimistic writes, incremental reconciliation, and snapshot installation are
 transactional. Workflow storage contains execution control only.
 
+Declared model indexes are materialized as owner qualified SQLite shadow tables with typed component columns and
+covering scan indexes. A checksum catalog verifies exact DDL and resumes bounded active generation backfills. Query
+handlers use SQLite bounds, ordering, limits, and keyset continuation, then decode every selected row through
+`SqlSchema` and the model Schema. Portable streams paginate because the pinned Node and worker SQLite drivers do not
+provide a schema decoded statement stream. Local writes and sync replay update shadow rows in the same transaction.
+Post commit range intersection refreshes only mounted query atoms whose current results can change.
+
 The caller chooses the Workflow engine and runner. A durable single runner composition is:
 
 ```ts

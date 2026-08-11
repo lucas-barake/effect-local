@@ -24,10 +24,23 @@ const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001"
 const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
 const thirdSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000003")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const TodoSchema = Schema.Struct({ id: Schema.String, title: Schema.String })
 const Todo = Model.make("Todo", {
   version: 1,
   key: Schema.String,
-  schema: Schema.Struct({ id: Schema.String, title: Schema.String })
+  schema: TodoSchema,
+  indexes: {
+    byTitle: {
+      version: 1,
+      partition: [],
+      sort: [{
+        name: "title",
+        affinity: "text",
+        schema: Schema.String,
+        extract: (todo: typeof TodoSchema.Type) => todo.title
+      }]
+    }
+  }
 })
 const PutTodo = Mutation.make("PutTodo", { version: 1, payload: Todo.schema, success: Todo.schema })
 const Numbered = Model.make("Numbered", {
@@ -41,21 +54,34 @@ const PutNumbered = Mutation.make("PutNumbered", {
   success: Numbered.schema
 })
 const ListTodos = Query.make("ListTodos", {
-  success: Schema.Array(Todo.schema),
-  dependsOn: [Todo]
+  success: Schema.Array(Todo.schema)
 })
+const RangeTodos = Query.make("RangeTodos", {
+  payload: { lower: Schema.String, upper: Schema.String },
+  success: Schema.Array(Todo.schema)
+})
+const rangeReads = new Map<string, number>()
 const definition = Definition.make({
   version: 1,
   models: [Todo, Numbered],
   mutations: [PutTodo, PutNumbered],
-  queries: [ListTodos]
+  queries: [ListTodos, RangeTodos]
 })
 const handlers = Layer.mergeAll(
   PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))),
   PutNumbered.toLayer(({ payload, transaction }) =>
     transaction.set(Numbered, payload.id, payload).pipe(Effect.as(payload))
   ),
-  ListTodos.toLayer(({ query }) => query.all(Todo))
+  ListTodos.toLayer(({ query }) => query.all(Todo)),
+  RangeTodos.toLayer(({ payload, query }) => {
+    const key = `${payload.lower}:${payload.upper}`
+    rangeReads.set(key, (rangeReads.get(key) ?? 0) + 1)
+    return query.from(Todo, "byTitle")
+      .where({ title: { gte: payload.lower, lt: payload.upper } })
+      .limit(20)
+      .page()
+      .pipe(Effect.map((page) => page.items))
+  })
 )
 const database = Layer.mergeAll(
   SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
@@ -120,6 +146,38 @@ const replica = SqlReplica.layer({
 )
 
 describe("Replica Atom graph", () => {
+  it.live("reruns only an indexed query whose result range can change", () =>
+    Effect.gen(function*() {
+      rangeReads.clear()
+      const graph = BrowserReplica.make(replica)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const related = graph.query(RangeTodos)({ lower: "a", upper: "m" })
+      const unrelated = graph.query(RangeTodos)({ lower: "n", upper: "z" })
+      const mutation = graph.mutation(PutTodo)
+      const unmountRelated = registry.mount(related)
+      const unmountUnrelated = registry.mount(unrelated)
+      const unmountMutation = registry.mount(mutation)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          unmountMutation()
+          unmountUnrelated()
+          unmountRelated()
+        })
+      )
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, related), [])
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, unrelated), [])
+      assert.strictEqual(rangeReads.get("a:m"), 1)
+      assert.strictEqual(rangeReads.get("n:z"), 1)
+
+      registry.set(mutation, { id: "range", title: "beta" })
+      yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, related), [{ id: "range", title: "beta" }])
+      yield* Effect.sleep("20 millis")
+      assert.isAtLeast(rangeReads.get("a:m") ?? 0, 2)
+      assert.strictEqual(rangeReads.get("n:z"), 1)
+    }))
+
   it.live("refreshes an entity atom when its key has a different encoded representation", () =>
     Effect.gen(function*() {
       const graph = BrowserReplica.make(replica)

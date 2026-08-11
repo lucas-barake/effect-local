@@ -2,6 +2,13 @@
 
 SQLite is the client commit boundary. The server SQL transaction is the shared authority boundary.
 
+Client secondary indexes are derived durable state. A static migration installs their checksum catalog. Each declared
+owner qualified layout creates one shadow table and covering scan index whose normalized `sqlite_schema` statements
+must match the catalog checksums. Catalog rows store a backfill generation, durable entity key cursor, and ready
+generation. Startup after schema evolution resumes bounded pages and exposes the replica only after every declared
+index is ready for the active generation. Local mutation, receipt replay, accepted entry installation, and bootstrap
+replacement update or rebuild index rows inside the same SQLite transaction as visible state.
+
 ## Client transactions
 
 A local mutation transaction contains sequence allocation, handler writes, the pending envelope, its optimistic
