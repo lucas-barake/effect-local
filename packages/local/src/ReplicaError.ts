@@ -16,6 +16,40 @@ export class DefinitionMismatch extends Schema.TaggedErrorClass<DefinitionMismat
   "@lucas-barake/effect-local/DefinitionMismatch"
 )("DefinitionMismatch", { expected: Schema.String, actual: Schema.String }) {}
 
+export class StaleSchema extends Schema.TaggedErrorClass<StaleSchema>(
+  "@lucas-barake/effect-local/StaleSchema"
+)("StaleSchema", {
+  expectedVersion: Schema.Number,
+  expectedHash: Schema.String,
+  actualVersion: Schema.Number,
+  actualHash: Schema.String
+}) {}
+
+export class SchemaGenerationConflict extends Schema.TaggedErrorClass<SchemaGenerationConflict>(
+  "@lucas-barake/effect-local/SchemaGenerationConflict"
+)("SchemaGenerationConflict", { expected: Schema.Number, actual: Schema.Number }) {}
+
+export class SchemaEvolutionUnsupported extends Schema.TaggedErrorClass<SchemaEvolutionUnsupported>(
+  "@lucas-barake/effect-local/SchemaEvolutionUnsupported"
+)("SchemaEvolutionUnsupported", {
+  sourceVersion: Schema.Number,
+  sourceHash: Schema.String,
+  targetVersion: Schema.Number,
+  targetHash: Schema.String
+}) {}
+
+export class SchemaEvolutionFailed extends Schema.TaggedErrorClass<SchemaEvolutionFailed>(
+  "@lucas-barake/effect-local/SchemaEvolutionFailed"
+)("SchemaEvolutionFailed", {
+  stepId: Schema.String,
+  componentKind: Schema.Literals(["Model", "Mutation"]),
+  componentName: Schema.String,
+  part: Schema.Literals(["Key", "Value", "Payload", "Success", "Rejection"]),
+  fromVersion: Schema.Number,
+  toVersion: Schema.Number,
+  cause: Schema.Defect()
+}) {}
+
 export class ReplicaIdentityMismatch extends Schema.TaggedErrorClass<ReplicaIdentityMismatch>(
   "@lucas-barake/effect-local/ReplicaIdentityMismatch"
 )("ReplicaIdentityMismatch", {
@@ -69,6 +103,10 @@ export const ReplicaError = Schema.Union([
   StorageCorrupt,
   CanonicalEncodeError,
   DefinitionMismatch,
+  StaleSchema,
+  SchemaGenerationConflict,
+  SchemaEvolutionUnsupported,
+  SchemaEvolutionFailed,
   ReplicaIdentityMismatch,
   MutationIdentityConflict,
   OutOfOrderMutation,

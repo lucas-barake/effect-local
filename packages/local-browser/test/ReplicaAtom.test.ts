@@ -22,15 +22,16 @@ import * as BrowserReplica from "../src/BrowserReplica.js"
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
 const Todo = Model.make("Todo", {
+  version: 1,
   key: Schema.String,
   schema: Schema.Struct({ id: Schema.String, title: Schema.String })
 })
-const PutTodo = Mutation.make("PutTodo", { payload: Todo.schema, success: Todo.schema })
+const PutTodo = Mutation.make("PutTodo", { version: 1, payload: Todo.schema, success: Todo.schema })
 const ListTodos = Query.make("ListTodos", {
   success: Schema.Array(Todo.schema),
   dependsOn: [Todo]
 })
-const definition = Definition.make({ models: [Todo], mutations: [PutTodo], queries: [ListTodos] })
+const definition = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo], queries: [ListTodos] })
 const handlers = Layer.merge(
   PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))),
   ListTodos.toLayer(({ query }) => query.all(Todo))

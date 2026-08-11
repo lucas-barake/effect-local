@@ -934,10 +934,12 @@ describe("server reconciled mutation log", () => {
       const directory = yield* fs.makeTempDirectoryScoped()
       const filename = `${directory}/snapshot.sqlite`
       const Item = Model.make("SnapshotItem", {
+        version: 1,
         key: Schema.String,
         schema: Schema.Struct({ id: Schema.String, value: Schema.Number })
       })
       const PutPair = Mutation.make("PutSnapshotPair", {
+        version: 1,
         payload: { left: Schema.Number, right: Schema.Number }
       })
       const ReadPair = Query.make("ReadSnapshotPair", {
@@ -947,7 +949,7 @@ describe("server reconciled mutation log", () => {
       class QueryGate extends Context.Service<QueryGate, {
         readonly betweenReads: Effect.Effect<void>
       }>()("test/QueryGate") {}
-      const definition = Definition.make({ models: [Item], mutations: [PutPair], queries: [ReadPair] })
+      const definition = Definition.make({ version: 1, models: [Item], mutations: [PutPair], queries: [ReadPair] })
       const reached = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
       const writerStarted = yield* Deferred.make<void>()
@@ -1072,14 +1074,16 @@ describe("server reconciled mutation log", () => {
   it.effect("reconciles an offline mutation queue with linear handler work", () =>
     Effect.scoped(Effect.gen(function*() {
       const Item = Model.make("ReconciliationWorkItem", {
+        version: 1,
         key: Schema.String,
         schema: Schema.Struct({ id: Schema.String, value: Schema.Number })
       })
       const PutItem = Mutation.make("PutReconciliationWorkItem", {
+        version: 1,
         payload: Item.schema,
         success: Item.schema
       })
-      const workDefinition = Definition.make({ models: [Item], mutations: [PutItem] })
+      const workDefinition = Definition.make({ version: 1, models: [Item], mutations: [PutItem] })
       const executions = yield* Ref.make(0)
       const workHandlers = PutItem.toLayer(({ payload, transaction }) =>
         Ref.update(executions, (count) => count + 1).pipe(

@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
+import * as Identity from "./Identity.js"
 import * as SchemaInput from "./internal/schemaInput.js"
 import type * as ReplicaError from "./ReplicaError.js"
 import type * as Transaction from "./Transaction.js"
@@ -24,6 +25,7 @@ export interface HandlerService<
 
 export interface Mutation<Name extends string, P extends Schema.Top, A extends Schema.Top, E extends Schema.Top,> {
   readonly name: Name
+  readonly version: Identity.SchemaVersion
   readonly payloadSchema: P
   readonly successSchema: A
   readonly rejectionSchema: E
@@ -40,9 +42,10 @@ export interface Mutation<Name extends string, P extends Schema.Top, A extends S
 
 export interface Any {
   readonly name: string
-  readonly payloadSchema: Schema.Top
-  readonly successSchema: Schema.Top
-  readonly rejectionSchema: Schema.Top
+  readonly version: Identity.SchemaVersion
+  readonly payloadSchema: SchemaInput.WireSchema
+  readonly successSchema: SchemaInput.WireSchema
+  readonly rejectionSchema: SchemaInput.WireSchema
   readonly handler: Context.Service.Any
 }
 
@@ -53,18 +56,19 @@ export const make = <
   P extends SchemaInput.Input = typeof SchemaInput.Void,
   A extends SchemaInput.WireSchema = typeof SchemaInput.Void,
   E extends SchemaInput.WireSchema = typeof Schema.Never,
->(name: Name, options?: {
+>(name: Name, options: {
+  readonly version: number
   readonly payload?: SchemaInput.Valid<P>
   readonly success?: A
   readonly rejection?: E
 }): Mutation<Name, SchemaInput.Wire<P>, A, E> => {
   if (name.length === 0) throw new TypeError("Mutation name must be nonempty")
   if (name.startsWith("$")) throw new TypeError(`Mutation name must not start with $: ${name}`)
-  const payloadSchema = options?.payload === undefined ?
+  const payloadSchema = options.payload === undefined ?
     SchemaInput.Void as unknown as SchemaInput.Wire<P> :
     SchemaInput.normalize(options.payload)
-  const successSchema = (options?.success ?? SchemaInput.Void) as A
-  const rejectionSchema = (options?.rejection ?? Schema.Never) as E
+  const successSchema = (options.success ?? SchemaInput.Void) as A
+  const rejectionSchema = (options.rejection ?? Schema.Never) as E
   const handler = Context.Service<
     HandlerService<Name, SchemaInput.Wire<P>, A, E>,
     HandlerService<Name, SchemaInput.Wire<P>, A, E>
@@ -90,6 +94,7 @@ export const make = <
     )
   const mutation: Mutation<Name, SchemaInput.Wire<P>, A, E> = {
     name,
+    version: Identity.SchemaVersion.make(options.version),
     payloadSchema,
     successSchema,
     rejectionSchema,

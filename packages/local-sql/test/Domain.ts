@@ -10,6 +10,7 @@ import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 
 export const Todo = Model.make("Todo", {
+  version: 1,
   key: Schema.String,
   schema: Schema.Struct({
     id: Schema.String,
@@ -20,38 +21,45 @@ export const Todo = Model.make("Todo", {
 })
 
 export const PutTodo = Mutation.make("PutTodo", {
+  version: 1,
   payload: Todo.schema,
   success: Todo.schema
 })
 
 export const RenameTodo = Mutation.make("RenameTodo", {
+  version: 1,
   payload: { id: Schema.String, title: Schema.String },
   rejection: Schema.Literal("TodoNotFound")
 })
 
 export const IncrementTodo = Mutation.make("IncrementTodo", {
+  version: 1,
   payload: { id: Schema.String, delta: Schema.Number },
   rejection: Schema.Literal("TodoNotFound"),
   success: Schema.Number
 })
 
 export const AddLabel = Mutation.make("AddLabel", {
+  version: 1,
   payload: { id: Schema.String, label: Schema.String },
   rejection: Schema.Literal("TodoNotFound"),
   success: Schema.Array(Schema.String)
 })
 
 export const RejectAfterWrite = Mutation.make("RejectAfterWrite", {
+  version: 1,
   payload: Todo.schema,
   rejection: Schema.Literal("Rejected")
 })
 
 export const PutHugeTodo = Mutation.make("PutHugeTodo", {
+  version: 1,
   payload: { id: Schema.String },
   success: Todo.schema
 })
 
 export const ReturnHugeResult = Mutation.make("ReturnHugeResult", {
+  version: 1,
   success: Schema.String
 })
 
@@ -63,6 +71,7 @@ const ListTodos = Query.make("ListTodos", {
 })
 
 export const definition = Definition.make({
+  version: 1,
   models: [Todo],
   mutations: [PutTodo, RenameTodo, IncrementTodo, AddLabel, RejectAfterWrite, PutHugeTodo, ReturnHugeResult],
   queries: [ListTodos]

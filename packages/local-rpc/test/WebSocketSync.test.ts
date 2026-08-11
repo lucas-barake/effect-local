@@ -36,12 +36,13 @@ const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-00000000000
 const mutationId = Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")
 
 const Todo = Model.make("Todo", {
+  version: 1,
   key: Schema.String,
   schema: Schema.Struct({ id: Schema.String, title: Schema.String })
 })
-const PutTodo = Mutation.make("PutTodo", { payload: Todo.schema, success: Todo.schema })
-const ReturnHugeResult = Mutation.make("ReturnHugeResult", { success: Schema.String })
-const definition = Definition.make({ models: [Todo], mutations: [PutTodo, ReturnHugeResult] })
+const PutTodo = Mutation.make("PutTodo", { version: 1, payload: Todo.schema, success: Todo.schema })
+const ReturnHugeResult = Mutation.make("ReturnHugeResult", { version: 1, success: Schema.String })
+const definition = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo, ReturnHugeResult] })
 const handlers = Layer.merge(
   PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))),
   ReturnHugeResult.toLayer(() => Effect.succeed("x".repeat(SyncRpc.maximumFrameBytes)))

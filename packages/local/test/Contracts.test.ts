@@ -10,15 +10,16 @@ import * as Protocol from "../src/Protocol.js"
 import * as Query from "../src/Query.js"
 
 const Todo = Model.make("Todo", {
+  version: 1,
   key: Schema.String,
   schema: Schema.Struct({ id: Schema.String, title: Schema.String })
 })
-const PutTodo = Mutation.make("PutTodo", { payload: Todo.schema, success: Todo.schema })
+const PutTodo = Mutation.make("PutTodo", { version: 1, payload: Todo.schema, success: Todo.schema })
 const ListTodos = Query.make("ListTodos", { success: Schema.Array(Todo.schema), dependsOn: [Todo] })
 
 describe("domain contracts", () => {
   it("uses JSON null as the wire representation for void payloads and results", () => {
-    const mutation = Mutation.make("Touch")
+    const mutation = Mutation.make("Touch", { version: 1 })
     const query = Query.make("Count", { dependsOn: [] })
     assert.strictEqual(Schema.encodeSync(mutation.payloadSchema)(undefined), null)
     assert.strictEqual(Schema.decodeUnknownSync(mutation.successSchema)(null), undefined)
@@ -26,25 +27,25 @@ describe("domain contracts", () => {
   })
 
   it("builds a stable definition hash from Schema contracts", () => {
-    const first = Definition.make({ models: [Todo], mutations: [PutTodo], queries: [ListTodos] })
-    const second = Definition.make({ models: [Todo], mutations: [PutTodo], queries: [ListTodos] })
+    const first = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo], queries: [ListTodos] })
+    const second = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo], queries: [ListTodos] })
     assert.strictEqual(first.hash, second.hash)
     assert.strictEqual(first.modelByName.get("Todo"), Todo)
   })
 
   it("rejects duplicate names and unregistered query dependencies", () => {
-    assert.throws(() => Definition.make({ models: [Todo, Todo], mutations: [PutTodo] }), /Duplicate model name/)
-    const Other = Model.make("Other", { key: Schema.String, schema: Schema.Struct({ id: Schema.String }) })
+    assert.throws(() => Definition.make({ version: 1, models: [Todo, Todo], mutations: [PutTodo] }), /Duplicate model name/)
+    const Other = Model.make("Other", { version: 1, key: Schema.String, schema: Schema.Struct({ id: Schema.String }) })
     const InvalidQuery = Query.make("Invalid", { dependsOn: [Other] })
     assert.throws(
-      () => Definition.make({ models: [Todo], mutations: [PutTodo], queries: [InvalidQuery] }),
+      () => Definition.make({ version: 1, models: [Todo], mutations: [PutTodo], queries: [InvalidQuery] }),
       /unregistered model/
     )
   })
 
   it("reserves protocol names", () => {
-    assert.throws(() => Model.make("$Model", { key: Schema.String, schema: Schema.String }), /must not start/)
-    assert.throws(() => Mutation.make("$Mutation"), /must not start/)
+    assert.throws(() => Model.make("$Model", { version: 1, key: Schema.String, schema: Schema.String }), /must not start/)
+    assert.throws(() => Mutation.make("$Mutation", { version: 1 }), /must not start/)
     assert.throws(() => Query.make("$Query", { dependsOn: [] }), /must not start/)
   })
 

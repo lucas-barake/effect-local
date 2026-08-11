@@ -30,6 +30,20 @@ export type ServerSequence = typeof ServerSequence.Type
 export const VisibleRevision = sequence("VisibleRevision", 0)
 export type VisibleRevision = typeof VisibleRevision.Type
 
+export const SchemaVersion = sequence("SchemaVersion", 1)
+export type SchemaVersion = typeof SchemaVersion.Type
+
+export const SchemaHash = Schema.String.check(Schema.isPattern(/^[0-9a-f]{16}$/)).pipe(
+  Schema.brand("@lucas-barake/effect-local/SchemaHash")
+)
+export type SchemaHash = typeof SchemaHash.Type
+
+export const SchemaIdentity = Schema.Struct({
+  version: SchemaVersion,
+  hash: SchemaHash
+})
+export type SchemaIdentity = typeof SchemaIdentity.Type
+
 const makeIdentifier = <A,>(schema: { readonly make: (value: string) => A }, prefix: string) =>
   Crypto.Crypto.use((crypto) => crypto.randomUUIDv4.pipe(Effect.map((uuid) => schema.make(`${prefix}_${uuid}`))))
 

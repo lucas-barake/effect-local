@@ -21,6 +21,9 @@ export const encodedBytesEffect = (
 export const MutationDigest = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
 export type MutationDigest = typeof MutationDigest.Type
 
+export const MutationDigestVersion = Schema.Literals([1, 2])
+export type MutationDigestVersion = typeof MutationDigestVersion.Type
+
 export const MutationEnvelope = Schema.Struct({
   spaceId: Identity.SpaceId,
   clientId: Identity.ClientId,
