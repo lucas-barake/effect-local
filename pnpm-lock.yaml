@@ -7,6 +7,11 @@ settings:
 overrides:
   '@effect/platform-node-shared': 4.0.0-beta.103
 
+patchedDependencies:
+  oxlint-plugin-effect@0.6.0:
+    hash: 55c4f51bf62afe6d847c6efc5831643232c37d8231111f23ce967e8ad084ced5
+    path: patches/oxlint-plugin-effect@0.6.0.patch
+
 importers:
 
   .:
@@ -52,7 +57,7 @@ importers:
         version: 1.77.0(oxlint-tsgolint@7.0.2001)
       oxlint-plugin-effect:
         specifier: 0.6.0
-        version: 0.6.0(effect@4.0.0-beta.103)
+        version: 0.6.0(patch_hash=55c4f51bf62afe6d847c6efc5831643232c37d8231111f23ce967e8ad084ced5)(effect@4.0.0-beta.103)
       oxlint-tsgolint:
         specifier: 7.0.2001
         version: 7.0.2001
@@ -4272,7 +4277,7 @@ snapshots:
       '@oxc-resolver/binding-win32-arm64-msvc': 11.24.2
       '@oxc-resolver/binding-win32-x64-msvc': 11.24.2
 
-  oxlint-plugin-effect@0.6.0(effect@4.0.0-beta.103):
+  oxlint-plugin-effect@0.6.0(patch_hash=55c4f51bf62afe6d847c6efc5831643232c37d8231111f23ce967e8ad084ced5)(effect@4.0.0-beta.103):
     dependencies:
       '@oxlint/plugins': 1.78.0
       effect: 4.0.0-beta.103

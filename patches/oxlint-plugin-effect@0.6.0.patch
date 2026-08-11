@@ -1,0 +1,44 @@
+diff --git a/dist/rules/no-as.js b/dist/rules/no-as.js
+index aa6f83ac0275699dd9a0191d03ddbb98fedda043..a174eb81fc9b20e73f13733571b11540ac8f46fa 100644
+--- a/dist/rules/no-as.js
++++ b/dist/rules/no-as.js
+@@ -1,22 +1,27 @@
+ import { make } from "../vendor/effect-oxlint/Diagnostic.js";
+ import { RuleContext } from "../vendor/effect-oxlint/RuleContext.js";
+ import { define, meta } from "../vendor/effect-oxlint/Rule.js";
++import * as Effect from "effect/Effect";
+ import "../vendor/effect-oxlint/index.js";
+ //#region src/rules/no-as.ts
+ /** Ban TypeScript `as` assertions. */
+ const noAs = define({
+-	name: "no-as",
+-	meta: meta({
+-		type: "problem",
+-		description: "Use satisfies instead of an as assertion."
+-	}),
+-	create: function* () {
+-		const ctx = yield* RuleContext;
+-		return { TSAsExpression: (node) => ctx.report(make({
+-			node,
+-			message: "Avoid as assertions. Use satisfies instead."
+-		})) };
+-	}
++  name: "no-as",
++  meta: meta({
++    type: "problem",
++    description: "Use satisfies instead of an as assertion."
++  }),
++  create: function* () {
++    const ctx = yield* RuleContext;
++    return { TSAsExpression: (node) => {
++      const type = node.typeAnnotation;
++      if (type.type === "TSTypeReference" && type.typeName.type === "Identifier" && type.typeName.name === "const" && type.typeArguments === null) return Effect.void;
++      return ctx.report(make({
++        node,
++        message: "Avoid as assertions. Use satisfies instead."
++      }));
++    } };
++  }
+ });
+ //#endregion
+ export { noAs };
