@@ -59,6 +59,7 @@ Read this file before any work. Treat these rules as required for every package.
 - Prefer Effect returning combinators over throwing synchronous variants inside Effect code, for example `Schema.decodeUnknownEffect` over `Schema.decodeUnknownSync`. Contain unavoidable throwing variants at the non Effect boundary that requires them.
 - Give queues, latches, subscriptions, and scopes a documented owner and cleanup path.
 - Attach cleanup immediately after acquiring a native resource so every later failure and interruption path releases it.
+- Never wrap `Effect.sync` in `Semaphore.withPermit`. Synchronous JavaScript cannot interleave. Use a semaphore only when one invariant spans an effectful suspension.
 - Recheck mutable admission, quota, and idempotency state inside the same lock or transaction that performs the write.
 
 ## Persistence And Validation
