@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
+import * as Defect from "./internal/defect.js"
 import * as SchemaInput from "./internal/schemaInput.js"
 import type * as Model from "./Model.js"
 import type * as ReplicaError from "./ReplicaError.js"
@@ -48,7 +49,7 @@ export interface Any {
 
 let handlerId = 0
 
-export const make = <
+export function make<
   const Name extends string,
   P extends SchemaInput.Input = typeof SchemaInput.Void,
   A extends SchemaInput.WireSchema = typeof SchemaInput.Void,
@@ -61,38 +62,58 @@ export const make = <
     readonly error?: E
     readonly dependsOn: ReadonlyArray<Model.Any>
   }
-): Query<Name, SchemaInput.Wire<P>, A, E> => {
-  if (name.length === 0) throw new TypeError("Query name must be nonempty")
-  if (name.startsWith("$")) throw new TypeError(`Query name must not start with $: ${name}`)
-  const payloadSchema = options.payload === undefined ?
-    SchemaInput.Void as unknown as SchemaInput.Wire<P> :
-    SchemaInput.normalize(options.payload)
-  const successSchema = (options.success ?? SchemaInput.Void) as A
-  const errorSchema = (options.error ?? Schema.Never) as E
+): Query<Name, SchemaInput.Wire<P>, A, E>
+export function make(name: string, options: {
+  readonly payload?: SchemaInput.Input
+  readonly success?: SchemaInput.WireSchema
+  readonly error?: SchemaInput.WireSchema
+  readonly dependsOn: ReadonlyArray<Model.Any>
+}): Query<string, SchemaInput.WireSchema, SchemaInput.WireSchema, SchemaInput.WireSchema> {
+  if (name.length === 0) return Defect.invalid("Query name must be nonempty")
+  if (name.startsWith("$")) return Defect.invalid(`Query name must not start with $: ${name}`)
+  let payloadSchema: SchemaInput.WireSchema = SchemaInput.Void
+  if (options.payload !== undefined) payloadSchema = SchemaInput.normalize(options.payload)
+  const successSchema = options.success ?? SchemaInput.Void
+  const errorSchema = options.error ?? Schema.Never
   const handler = Context.Service<
-    HandlerService<Name, SchemaInput.Wire<P>, A, E>,
-    HandlerService<Name, SchemaInput.Wire<P>, A, E>
+    HandlerService<string, SchemaInput.WireSchema, SchemaInput.WireSchema, SchemaInput.WireSchema>,
+    HandlerService<string, SchemaInput.WireSchema, SchemaInput.WireSchema, SchemaInput.WireSchema>
   >(
     `@lucas-barake/effect-local/Query/${name}/${handlerId++}`
   )
   const toLayer = <R, EX = never, RX = never,>(
     build:
-      | Handler<SchemaInput.Wire<P>["Type"], A["Type"], E["Type"], R>
-      | Effect.Effect<Handler<SchemaInput.Wire<P>["Type"], A["Type"], E["Type"], R>, EX, RX>
-  ): Layer.Layer<HandlerService<Name, SchemaInput.Wire<P>, A, E>, EX, Exclude<R | RX, Scope.Scope>> =>
+      | Handler<SchemaInput.WireSchema["Type"], SchemaInput.WireSchema["Type"], SchemaInput.WireSchema["Type"], R>
+      | Effect.Effect<
+        Handler<SchemaInput.WireSchema["Type"], SchemaInput.WireSchema["Type"], SchemaInput.WireSchema["Type"], R>,
+        EX,
+        RX
+      >
+  ): Layer.Layer<
+    HandlerService<string, SchemaInput.WireSchema, SchemaInput.WireSchema, SchemaInput.WireSchema>,
+    EX,
+    Exclude<R | RX, Scope.Scope>
+  > =>
     Layer.effect(
       handler,
       Effect.gen(function*() {
-        const context = (yield* Effect.context<R | Scope.Scope>()).pipe(Context.omit(Scope.Scope)) as Context.Context<R>
-        const implementation = Effect.isEffect(build) ? yield* build : build
+        const context = (yield* Effect.context<R | Scope.Scope>()).pipe(Context.omit(Scope.Scope))
+        let implementation: Handler<
+          SchemaInput.WireSchema["Type"],
+          SchemaInput.WireSchema["Type"],
+          SchemaInput.WireSchema["Type"],
+          R
+        >
+        if (Effect.isEffect(build)) implementation = yield* build
+        else implementation = build
         return {
           query,
           execute: (input: Parameters<typeof implementation>[0]) =>
-            implementation(input).pipe(Effect.provide(context), Effect.scoped)
+            implementation(input).pipe(Effect.scoped, Effect.provide(context))
         }
       })
     )
-  const query: Query<Name, SchemaInput.Wire<P>, A, E> = {
+  const query: Query<string, SchemaInput.WireSchema, SchemaInput.WireSchema, SchemaInput.WireSchema> = {
     name,
     payloadSchema,
     successSchema,

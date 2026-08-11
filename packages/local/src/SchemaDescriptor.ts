@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema"
 import * as SchemaAST from "effect/SchemaAST"
 import * as Canonical from "./Canonical.js"
+import * as Defect from "./internal/defect.js"
 
 export type Descriptor =
   | string
@@ -32,7 +33,8 @@ interface State {
 const wellKnownSymbols = new Map<symbol, string>(
   Object.getOwnPropertyNames(Symbol).flatMap((name) => {
     const value = Reflect.get(Symbol, name)
-    return typeof value === "symbol" ? [[value, name] as const] : []
+    if (typeof value === "symbol") return [[value, name] as const]
+    return []
   })
 )
 
@@ -43,18 +45,20 @@ const fromSymbol = (value: symbol): Descriptor => {
   if (globalKey !== undefined) return { _tag: "GlobalSymbol", key: globalKey }
   const wellKnown = wellKnownSymbols.get(value)
   if (wellKnown !== undefined) return { _tag: "WellKnownSymbol", name: wellKnown }
-  throw new TypeError("Schema descriptors cannot represent local symbols")
+  return Defect.invalid("Schema descriptors cannot represent local symbols")
 }
 
-const fromPropertyKey = (value: PropertyKey): Descriptor =>
-  typeof value === "symbol"
-    ? fromSymbol(value)
-    : { _tag: "StringKey", value: String(value) }
+const fromPropertyKey = (value: PropertyKey): Descriptor => {
+  if (typeof value === "symbol") return fromSymbol(value)
+  return { _tag: "StringKey", value: String(value) }
+}
 
 const compareDescriptor = (left: Descriptor, right: Descriptor): number => {
   const a = Canonical.stringify(left)
   const b = Canonical.stringify(right)
-  return a < b ? -1 : a > b ? 1 : 0
+  if (a < b) return -1
+  if (a > b) return 1
+  return 0
 }
 
 const fromUnknown = (value: unknown, state: State): Descriptor => {
@@ -67,18 +71,19 @@ const fromUnknown = (value: unknown, state: State): Descriptor => {
       return value
     case "number":
       if (Object.is(value, -0)) return { _tag: "Number", value: "-0" }
-      return Number.isFinite(value) ? value : { _tag: "Number", value: String(value) }
+      if (Number.isFinite(value)) return value
+      return { _tag: "Number", value: String(value) }
     case "bigint":
       return { _tag: "BigInt", value: value.toString() }
     case "symbol":
       return fromSymbol(value)
     case "function":
-      throw new TypeError("Schema descriptors cannot represent functions")
+      return Defect.invalid("Schema descriptors cannot represent functions")
   }
   if (SchemaAST.isAST(value)) return fromAST(value, state, false)
   if (value instanceof RegExp) {
     if (value.global || value.sticky) {
-      throw new TypeError("Schema descriptors cannot represent stateful regular expressions")
+      return Defect.invalid("Schema descriptors cannot represent stateful regular expressions")
     }
     return { _tag: "RegExp", source: value.source, flags: value.flags }
   }
@@ -86,7 +91,7 @@ const fromUnknown = (value: unknown, state: State): Descriptor => {
   const ancestor = state.unknownAncestors.get(value)
   if (ancestor !== undefined) {
     for (let index = ancestor; index < state.unknownStack.length; index++) {
-      state.unknownCyclic.add(state.unknownStack[index]!)
+      state.unknownCyclic.add(state.unknownStack[index])
     }
     return { _tag: "Circular", back: state.unknownStack.length - ancestor }
   }
@@ -95,29 +100,26 @@ const fromUnknown = (value: unknown, state: State): Descriptor => {
   state.unknownAncestors.set(value, state.unknownStack.length)
   state.unknownStack.push(value)
   let descriptor: Descriptor
-  try {
-    if (Array.isArray(value)) {
-      descriptor = { _tag: "Array", items: value.map((item) => fromUnknown(item, state)) }
-    } else {
-      const prototype = Object.getPrototypeOf(value)
-      if (prototype !== null && prototype !== Object.prototype) {
-        throw new TypeError("Schema descriptors cannot represent non-plain objects")
-      }
-      const properties = Reflect.ownKeys(value).flatMap((key) => {
-        const property = Object.getOwnPropertyDescriptor(value, key)
-        if (property === undefined || property.enumerable !== true) return []
-        if (!("value" in property)) {
-          throw new TypeError("Schema descriptors cannot represent accessor properties")
-        }
-        return [[fromPropertyKey(key), property.value] as const]
-      }).toSorted(([left], [right]) => compareDescriptor(left, right))
-      const entries = properties.map(([key, propertyValue]) => [key, fromUnknown(propertyValue, state)] as const)
-      descriptor = { _tag: "Object", entries }
+  if (Array.isArray(value)) {
+    descriptor = { _tag: "Array", items: value.map((item) => fromUnknown(item, state)) }
+  } else {
+    const prototype = Object.getPrototypeOf(value)
+    if (prototype !== null && prototype !== Object.prototype) {
+      return Defect.invalid("Schema descriptors cannot represent non-plain objects")
     }
-  } finally {
-    state.unknownStack.pop()
-    state.unknownAncestors.delete(value)
+    const properties = Reflect.ownKeys(value).flatMap((key) => {
+      const property = Object.getOwnPropertyDescriptor(value, key)
+      if (property === undefined || property.enumerable !== true) return []
+      if (!("value" in property)) {
+        return Defect.invalid("Schema descriptors cannot represent accessor properties")
+      }
+      return [[fromPropertyKey(key), property.value] as const]
+    }).toSorted(([left], [right]) => compareDescriptor(left, right))
+    const entries = properties.map(([key, propertyValue]) => [key, fromUnknown(propertyValue, state)] as const)
+    descriptor = { _tag: "Object", entries }
   }
+  state.unknownStack.pop()
+  state.unknownAncestors.delete(value)
   const reference = intern(descriptor, state)
   if (!state.unknownCyclic.has(value)) state.unknownCompleted.set(value, reference)
   return reference
@@ -180,7 +182,8 @@ const fromAnnotations = (
   }
   const structural = Reflect.get(annotations, structuralAnnotationKey)
   if (typeof structural === "boolean") result.structural = structural
-  return Object.keys(result).length === 0 ? undefined : result
+  if (Object.keys(result).length === 0) return undefined
+  return result
 }
 
 const fromCheck = (
@@ -193,7 +196,7 @@ const fromCheck = (
   if (annotations !== undefined) result.annotations = annotations
   if (check._tag === "Filter") {
     if (!trustedBehavior && !hasStableMetadata(check.annotations)) {
-      throw new TypeError("Opaque schema checks require an identifier or meta annotation")
+      return Defect.invalid("Opaque schema checks require an identifier or meta annotation")
     }
     result.aborted = check.aborted
   } else {
@@ -206,8 +209,10 @@ const fromChecks = (
   checks: SchemaAST.Checks | undefined,
   state: State,
   trustedBehavior: boolean
-): Descriptor | undefined =>
-  checks === undefined ? undefined : checks.map((check) => fromCheck(check, state, trustedBehavior))
+): Descriptor | undefined => {
+  if (checks === undefined) return undefined
+  return checks.map((check) => fromCheck(check, state, trustedBehavior))
+}
 
 interface BuiltInTransformation {
   readonly transformation: SchemaAST.Link["transformation"]
@@ -251,9 +256,11 @@ const getBuiltInTransformations = (): ReadonlyArray<BuiltInTransformation> => {
     }
   }
   for (
-    const [name, value] of Object.entries(Schema).toSorted(([left], [right]) =>
-      left < right ? -1 : left > right ? 1 : 0
-    )
+    const [name, value] of Object.entries(Schema).toSorted(([left], [right]) => {
+      if (left < right) return -1
+      if (left > right) return 1
+      return 0
+    })
   ) {
     if (
       value !== null &&
@@ -290,14 +297,15 @@ const fromEncoding = (
     )?.identity
     const identified = trustedBehavior || explicitBehavior(owner)
     if (builtIn === undefined && !identified) {
-      throw new TypeError("Opaque schema transformations require an identifier or meta annotation")
+      return Defect.invalid("Opaque schema transformations require an identifier or meta annotation")
     }
-    return {
-      to: fromAST(link.to, state, identified),
-      transformation: builtIn === undefined
-        ? { _tag: link.transformation._tag, identity: "Annotated" }
-        : { _tag: link.transformation._tag, identity: builtIn }
+    const transformation: Record<string, Descriptor> = { _tag: link.transformation._tag }
+    if (builtIn === undefined) {
+      transformation.identity = "Annotated"
+    } else {
+      transformation.identity = builtIn
     }
+    return { to: fromAST(link.to, state, identified), transformation }
   })
 
 const intern = (descriptor: Descriptor, state: State): Descriptor => {
@@ -305,7 +313,7 @@ const intern = (descriptor: Descriptor, state: State): Descriptor => {
   const id = Canonical.hash(descriptor)
   const existing = state.nodes.get(id)
   if (existing !== undefined && existing.canonical !== canonical) {
-    throw new TypeError(`Schema descriptor node hash collision: ${id}`)
+    return Defect.invalid(`Schema descriptor node hash collision: ${id}`)
   }
   if (existing === undefined) state.nodes.set(id, { canonical, descriptor })
   return { _tag: "Reference", id }
@@ -331,11 +339,9 @@ const fromAST = (
       return { _tag: "Cycle", back: Math.max(1, state.stack.size - ancestor) }
     }
     state.suspends.set(ast, state.stack.size)
-    try {
-      return fromAST(ast.thunk(), state, trustedBehavior)
-    } finally {
-      state.suspends.delete(ast)
-    }
+    const result = fromAST(ast.thunk(), state, trustedBehavior)
+    state.suspends.delete(ast)
+    return result
   }
   const ancestor = state.stack.get(ast)
   if (ancestor !== undefined) {
@@ -344,113 +350,115 @@ const fromAST = (
     }
     return { _tag: "Cycle", back: state.stack.size - ancestor }
   }
-  const completed = (trustedBehavior ? state.trustedCompleted : state.completed).get(ast)
+  let completedNodes = state.completed
+  if (trustedBehavior) completedNodes = state.trustedCompleted
+  const completed = completedNodes.get(ast)
   if (completed !== undefined) return completed
   state.stack.set(ast, state.stack.size)
-  try {
-    const identifiedBehavior = trustedBehavior || hasStableMetadata(ast.annotations)
-    const node: Record<string, Descriptor> = { _tag: ast._tag }
-    const annotations = fromAnnotations(ast.annotations, state)
-    if (annotations !== undefined) node.annotations = annotations
-    const checks = fromChecks(ast.checks, state, identifiedBehavior)
-    if (checks !== undefined) node.checks = checks
-    if (ast.encoding !== undefined) {
-      node.encoding = fromEncoding(ast, ast.encoding, state, identifiedBehavior)
-    }
-    if (ast.context !== undefined) {
-      const context: Record<string, Descriptor> = {}
-      if (ast.context.isOptional) context.isOptional = true
-      if (ast.context.isMutable) context.isMutable = true
-      const contextAnnotations = fromAnnotations(ast.context.annotations, state)
-      if (contextAnnotations !== undefined) context.annotations = contextAnnotations
-      if (ast.context.defaultValue !== undefined && state.includeConstructorDefaults) {
-        if (ast._tag === "Literal") {
-          context.defaultValue = { _tag: "LiteralDefault", value: fromUnknown(ast.literal, state) }
-        } else {
-          if (!hasStableMetadata(ast.annotations) && !hasStableMetadata(ast.context.annotations)) {
-            throw new TypeError("Opaque constructor defaults require an identifier or meta annotation")
-          }
-          context.defaultValue = fromEncoding(
-            ast,
-            ast.context.defaultValue,
-            state,
-            identifiedBehavior
-          )
-        }
-      }
-      if (Object.keys(context).length > 0) node.context = context
-    }
-    switch (ast._tag) {
-      case "Declaration": {
-        if (!identifiedBehavior) {
-          throw new TypeError("Opaque schema declarations require an identifier or meta annotation")
-        }
-        node.typeParameters = ast.typeParameters.map((parameter) => fromAST(parameter, state, trustedBehavior))
-        const encodingChecks = fromChecks(ast.encodingChecks, state, identifiedBehavior)
-        if (encodingChecks !== undefined) node.encodingChecks = encodingChecks
-        break
-      }
-      case "Literal":
-        node.literal = fromUnknown(ast.literal, state)
-        break
-      case "UniqueSymbol":
-        node.symbol = fromSymbol(ast.symbol)
-        break
-      case "Enum":
-        node.enums = ast.enums.map(([name, value]) => [name, value] as Descriptor)
-          .toSorted(compareDescriptor)
-        break
-      case "TemplateLiteral":
-        node.parts = ast.parts.map((part) => fromAST(part, state, trustedBehavior))
-        break
-      case "Arrays": {
-        node.isMutable = ast.isMutable
-        node.elements = ast.elements.map((element) => fromAST(element, state, trustedBehavior))
-        node.rest = ast.rest.map((element) => fromAST(element, state, trustedBehavior))
-        const encodingChecks = fromChecks(ast.encodingChecks, state, identifiedBehavior)
-        if (encodingChecks !== undefined) node.encodingChecks = encodingChecks
-        break
-      }
-      case "Objects": {
-        node.propertySignatures = ast.propertySignatures.map((property) => [
-          fromPropertyKey(property.name),
-          fromAST(property.type, state, trustedBehavior)
-        ]).toSorted(([leftName, leftType], [rightName, rightType]) => {
-          const byName = compareDescriptor(leftName, rightName)
-          return byName === 0 ? compareDescriptor(leftType, rightType) : byName
-        })
-        if (ast.indexSignatures.length > 0) {
-          node.indexSignatures = ast.indexSignatures.map((signature) => {
-            const descriptor: Record<string, Descriptor> = {
-              parameter: fromAST(signature.parameter, state, trustedBehavior),
-              type: fromAST(signature.type, state, trustedBehavior)
-            }
-            return descriptor
-          })
-        }
-        const encodingChecks = fromChecks(ast.encodingChecks, state, identifiedBehavior)
-        if (encodingChecks !== undefined) node.encodingChecks = encodingChecks
-        break
-      }
-      case "Union": {
-        node.mode = ast.mode
-        node.types = ast.types.map((member) => fromAST(member, state, trustedBehavior))
-        const encodingChecks = fromChecks(ast.encodingChecks, state, identifiedBehavior)
-        if (encodingChecks !== undefined) node.encodingChecks = encodingChecks
-        break
-      }
-      case "Suspend":
-        node.suspended = fromAST(ast.thunk(), state, trustedBehavior)
-        break
-    }
-    const reference = intern(node, state)
-    if (!state.cyclic.has(ast)) {
-      ;(trustedBehavior ? state.trustedCompleted : state.completed).set(ast, reference)
-    }
-    return reference
-  } finally {
-    state.stack.delete(ast)
+  const identifiedBehavior = trustedBehavior || hasStableMetadata(ast.annotations)
+  const node: Record<string, Descriptor> = { _tag: ast._tag }
+  const annotations = fromAnnotations(ast.annotations, state)
+  if (annotations !== undefined) node.annotations = annotations
+  const checks = fromChecks(ast.checks, state, identifiedBehavior)
+  if (checks !== undefined) node.checks = checks
+  if (ast.encoding !== undefined) {
+    node.encoding = fromEncoding(ast, ast.encoding, state, identifiedBehavior)
   }
+  if (ast.context !== undefined) {
+    const context: Record<string, Descriptor> = {}
+    if (ast.context.isOptional) context.isOptional = true
+    if (ast.context.isMutable) context.isMutable = true
+    const contextAnnotations = fromAnnotations(ast.context.annotations, state)
+    if (contextAnnotations !== undefined) context.annotations = contextAnnotations
+    if (ast.context.defaultValue !== undefined && state.includeConstructorDefaults) {
+      if (ast._tag === "Literal") {
+        context.defaultValue = { _tag: "LiteralDefault", value: fromUnknown(ast.literal, state) }
+      } else {
+        if (!hasStableMetadata(ast.annotations) && !hasStableMetadata(ast.context.annotations)) {
+          return Defect.invalid("Opaque constructor defaults require an identifier or meta annotation")
+        }
+        context.defaultValue = fromEncoding(
+          ast,
+          ast.context.defaultValue,
+          state,
+          identifiedBehavior
+        )
+      }
+    }
+    if (Object.keys(context).length > 0) node.context = context
+  }
+  switch (ast._tag) {
+    case "Declaration": {
+      if (!identifiedBehavior) {
+        return Defect.invalid("Opaque schema declarations require an identifier or meta annotation")
+      }
+      node.typeParameters = ast.typeParameters.map((parameter) => fromAST(parameter, state, trustedBehavior))
+      const encodingChecks = fromChecks(ast.encodingChecks, state, identifiedBehavior)
+      if (encodingChecks !== undefined) node.encodingChecks = encodingChecks
+      break
+    }
+    case "Literal":
+      node.literal = fromUnknown(ast.literal, state)
+      break
+    case "UniqueSymbol":
+      node.symbol = fromSymbol(ast.symbol)
+      break
+    case "Enum":
+      node.enums = ast.enums.map(([name, value]) => [name, value] as const)
+        .toSorted(compareDescriptor)
+      break
+    case "TemplateLiteral":
+      node.parts = ast.parts.map((part) => fromAST(part, state, trustedBehavior))
+      break
+    case "Arrays": {
+      node.isMutable = ast.isMutable
+      node.elements = ast.elements.map((element) => fromAST(element, state, trustedBehavior))
+      node.rest = ast.rest.map((element) => fromAST(element, state, trustedBehavior))
+      const encodingChecks = fromChecks(ast.encodingChecks, state, identifiedBehavior)
+      if (encodingChecks !== undefined) node.encodingChecks = encodingChecks
+      break
+    }
+    case "Objects": {
+      node.propertySignatures = ast.propertySignatures.map((property) => [
+        fromPropertyKey(property.name),
+        fromAST(property.type, state, trustedBehavior)
+      ]).toSorted(([leftName, leftType], [rightName, rightType]) => {
+        const nameOrder = compareDescriptor(leftName, rightName)
+        if (nameOrder === 0) return compareDescriptor(leftType, rightType)
+        return nameOrder
+      })
+      if (ast.indexSignatures.length > 0) {
+        node.indexSignatures = ast.indexSignatures.map((signature) => {
+          const descriptor: Record<string, Descriptor> = {
+            parameter: fromAST(signature.parameter, state, trustedBehavior),
+            type: fromAST(signature.type, state, trustedBehavior)
+          }
+          return descriptor
+        })
+      }
+      const encodingChecks = fromChecks(ast.encodingChecks, state, identifiedBehavior)
+      if (encodingChecks !== undefined) node.encodingChecks = encodingChecks
+      break
+    }
+    case "Union": {
+      node.mode = ast.mode
+      node.types = ast.types.map((member) => fromAST(member, state, trustedBehavior))
+      const encodingChecks = fromChecks(ast.encodingChecks, state, identifiedBehavior)
+      if (encodingChecks !== undefined) node.encodingChecks = encodingChecks
+      break
+    }
+    case "Suspend":
+      node.suspended = fromAST(ast.thunk(), state, trustedBehavior)
+      break
+  }
+  const reference = intern(node, state)
+  if (!state.cyclic.has(ast)) {
+    let targetCompletedNodes = state.completed
+    if (trustedBehavior) targetCompletedNodes = state.trustedCompleted
+    targetCompletedNodes.set(ast, reference)
+  }
+  state.stack.delete(ast)
+  return reference
 }
 
 export interface MakeOptions {
@@ -483,7 +491,11 @@ export const make = (schema: Schema.Constraint, options?: MakeOptions): Descript
     root,
     nodes: Object.fromEntries(
       Array.from(state.nodes)
-        .toSorted(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+        .toSorted(([left], [right]) => {
+          if (left < right) return -1
+          if (left > right) return 1
+          return 0
+        })
         .map(([id, node]) => [id, node.descriptor])
     )
   }

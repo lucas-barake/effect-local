@@ -31,14 +31,13 @@ export const layer: Layer.Layer<
       PresenceClient.of({
         publish: (update) =>
           client.PublishPresence(update).pipe(
-            Effect.mapError((cause) =>
-              Schema.is(ReplicaError.ReplicaError)(cause)
-                ? cause
-                : new ReplicaError.ProtocolInvalid({
-                  message: "The presence transport failed",
-                  cause
-                })
-            ),
+            Effect.mapError((cause) => {
+              if (Schema.is(ReplicaError.ReplicaError)(cause)) return cause
+              return new ReplicaError.ProtocolInvalid({
+                message: "The presence transport failed",
+                cause
+              })
+            }),
             Effect.asVoid,
             Effect.withSpan("PresenceClient.publish", {
               attributes: { "space.id": update.spaceId, "client.id": update.clientId }
@@ -46,14 +45,13 @@ export const layer: Layer.Layer<
           ),
         watch: (spaceId) =>
           client.WatchPresence({ spaceId }).pipe(
-            Stream.mapError((cause) =>
-              Schema.is(ReplicaError.ReplicaError)(cause)
-                ? cause
-                : new ReplicaError.ProtocolInvalid({
-                  message: "The presence transport failed",
-                  cause
-                })
-            ),
+            Stream.mapError((cause) => {
+              if (Schema.is(ReplicaError.ReplicaError)(cause)) return cause
+              return new ReplicaError.ProtocolInvalid({
+                message: "The presence transport failed",
+                cause
+              })
+            }),
             Stream.withSpan("PresenceClient.watch", {
               attributes: { "space.id": spaceId }
             })

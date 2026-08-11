@@ -2,12 +2,16 @@ import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Predicate from "effect/Predicate"
 import * as Schema from "effect/Schema"
 import * as SchemaGetter from "effect/SchemaGetter"
 import type * as Scope from "effect/Scope"
 import * as Rpc from "effect/unstable/rpc/Rpc"
-import { make as makeClient } from "effect/unstable/rpc/RpcClient"
-import type * as RpcClient from "effect/unstable/rpc/RpcClient"
+import {
+  type FromGroup as RpcClientFromGroup,
+  make as makeClient,
+  type Protocol as RpcClientProtocol
+} from "effect/unstable/rpc/RpcClient"
 import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
@@ -25,30 +29,34 @@ const RemoteDefect = Schema.Struct({
 
 const opaqueDefect = { _tag: "RemoteDefect" } as const
 const opaqueCause = { name: "Error", message: "Remote internal error" } as const
+const JsonString = Schema.fromJsonString(Schema.Unknown)
+const decodeJsonString = Schema.decodeUnknownSync(JsonString)
+const encodeJsonString = Schema.encodeSync(JsonString)
 
 const sanitizeReason = (reason: unknown): unknown => {
   if (reason === null || typeof reason !== "object" || Array.isArray(reason)) return reason
-  const record = reason as Record<string, unknown>
-  if (record._tag === "Die") return { ...record, defect: opaqueDefect }
-  if (record._tag !== "Fail") return reason
-  const error = record.error
-  if (error === null || typeof error !== "object" || Array.isArray(error) || !("cause" in error)) return reason
-  return { ...record, error: { ...(error as Record<string, unknown>), cause: opaqueCause } }
+  if (!Predicate.hasProperty(reason, "_tag")) return reason
+  if (reason._tag === "Die") return { ...reason, defect: opaqueDefect }
+  if (reason._tag !== "Fail" || !Predicate.hasProperty(reason, "error")) return reason
+  const error = reason.error
+  if (error === null || typeof error !== "object" || Array.isArray(error)) return reason
+  if (!Predicate.hasProperty(error, "cause")) return reason
+  return { ...reason, error: { ...error, cause: opaqueCause } }
 }
 
 const sanitizeResponse = (response: unknown): unknown => {
   if (Array.isArray(response)) return response.map(sanitizeResponse)
   if (response === null || typeof response !== "object") return response
-  const record = response as Record<string, unknown>
-  if (record._tag === "Defect") return { ...record, defect: opaqueDefect }
-  if (record._tag !== "Exit") return response
-  const exit = record.exit
+  if (!Predicate.hasProperty(response, "_tag")) return response
+  if (response._tag === "Defect") return { ...response, defect: opaqueDefect }
+  if (response._tag !== "Exit" || !Predicate.hasProperty(response, "exit")) return response
+  const exit = response.exit
   if (exit === null || typeof exit !== "object" || Array.isArray(exit)) return response
-  const encodedExit = exit as Record<string, unknown>
-  if (encodedExit._tag !== "Failure" || !Array.isArray(encodedExit.cause)) return response
+  if (!Predicate.hasProperty(exit, "_tag") || exit._tag !== "Failure") return response
+  if (!Predicate.hasProperty(exit, "cause") || !Array.isArray(exit.cause)) return response
   return {
-    ...record,
-    exit: { ...encodedExit, cause: encodedExit.cause.map(sanitizeReason) }
+    ...response,
+    exit: { ...exit, cause: exit.cause.map(sanitizeReason) }
   }
 }
 
@@ -73,14 +81,27 @@ export const layerJson = (options?: {
           const encoder = new TextEncoder()
           return {
             decode: (data) => {
-              const bytes = typeof data === "string" ? encoder.encode(data).byteLength : data.byteLength
-              if (bytes > limit) throw new RangeError(`RPC frame exceeds ${limit} bytes`)
-              const decoded = JSON.parse(typeof data === "string" ? data : decoder.decode(data))
-              return Array.isArray(decoded) ? decoded : [decoded]
+              let encoded: string
+              let bytes: number
+              if (typeof data === "string") {
+                encoded = data
+                bytes = encoder.encode(data).byteLength
+              } else {
+                encoded = decoder.decode(data)
+                bytes = data.byteLength
+              }
+              if (bytes > limit) {
+                // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError -- RpcSerialization.Parser is synchronous and signals parsing failures by throwing.
+                throw new RangeError(`RPC frame exceeds ${limit} bytes`)
+              }
+              const decoded = decodeJsonString(encoded)
+              if (Array.isArray(decoded)) return decoded
+              return [decoded]
             },
             encode: (response) => {
-              const encoded = JSON.stringify(sanitizeResponse(response))
+              const encoded = encodeJsonString(sanitizeResponse(response))
               if (encoder.encode(encoded).byteLength > limit) {
+                // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError -- RpcSerialization.Parser is synchronous and signals encoding failures by throwing.
                 throw new RangeError(`RPC frame exceeds ${limit} bytes`)
               }
               return encoded
@@ -139,10 +160,10 @@ export const Rpcs = RpcGroup.make(Submit, Pull, Bootstrap, Watch, PublishPresenc
   Authentication.Authentication
 )
 
-export interface Client extends RpcClient.FromGroup<typeof Rpcs, RpcClientError> {}
+export interface Client extends RpcClientFromGroup<typeof Rpcs, RpcClientError> {}
 
 export const makeRpcClient: Effect.Effect<
   Client,
   never,
-  RpcClient.Protocol | RpcMiddleware.ForClient<Authentication.Authentication> | Scope.Scope
+  RpcClientProtocol | RpcMiddleware.ForClient<Authentication.Authentication> | Scope.Scope
 > = makeClient(Rpcs)

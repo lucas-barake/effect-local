@@ -285,10 +285,12 @@ describe("reconciliation workflow", () => {
       const legacy = yield* register(Domain.definition)
       const registrationEntered = yield* Deferred.make<void>()
       const interruptedEngine = new Proxy(engine, {
-        get: (target, property, receiver) =>
-          property === "register"
-            ? () => Deferred.succeed(registrationEntered, undefined).pipe(Effect.andThen(Effect.never))
-            : Reflect.get(target, property, receiver)
+        get: (target, property, receiver) => {
+          if (property === "register") {
+            return () => Deferred.succeed(registrationEntered, undefined).pipe(Effect.andThen(Effect.never))
+          }
+          return Reflect.get(target, property, receiver)
+        }
       })
       const interruptedRegistration = yield* Effect.forkChild(register(definitionV2, interruptedEngine))
       yield* Deferred.await(registrationEntered)

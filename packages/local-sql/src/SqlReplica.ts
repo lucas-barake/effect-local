@@ -19,6 +19,7 @@ export interface Options<D extends Definition.Any,> {
   readonly maximumPendingMutations?: number
   readonly evolution?: Evolution.Evolution
   readonly schemaEvolutionBatchSize?: number
+  readonly schemaEvolutionBatchBytes?: number
   readonly retainedReceipts: number
   readonly maximumReceipts: number
   readonly retainedHistoryEntries: number

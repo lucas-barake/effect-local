@@ -15,13 +15,15 @@ export const positiveFiniteDurationMillis = (
           message: `${option} must be a valid positive finite duration`
         })
       ),
-    onSome: (duration) =>
-      Duration.isPositive(duration) && Duration.isFinite(duration)
-        ? Effect.succeed(Duration.toMillis(duration))
-        : Effect.fail(
-          new ReplicaError.InvalidConfiguration({
-            option,
-            message: `${option} must be a valid positive finite duration`
-          })
-        )
+    onSome: (duration) => {
+      if (Duration.isPositive(duration) && Duration.isFinite(duration)) {
+        return Effect.succeed(Duration.toMillis(duration))
+      }
+      return Effect.fail(
+        new ReplicaError.InvalidConfiguration({
+          option,
+          message: `${option} must be a valid positive finite duration`
+        })
+      )
+    }
   })

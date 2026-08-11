@@ -52,21 +52,20 @@ export const local = (options: {
   readonly sql: SqlClient.SqlClient
   readonly definition: Definition.Any
   readonly table: "visible" | "canonical" | "shadow-visible"
-  readonly generation?: number | undefined
+  readonly generation: number
   readonly changes?: Array<Protocol.EntityChange>
 }): Transaction.Transaction => {
   const find = SqlSchema.findOneOption({
     Request: Schema.Struct({ model: Schema.String, key: Schema.String }),
     Result: Rows.EntityRow,
-    execute: ({ model, key }) =>
-      options.table === "visible"
-        ? options
-          .sql`SELECT value_json FROM effect_local_visible_entities WHERE model = ${model} AND entity_key = ${key}`
-        : options.table === "shadow-visible"
-        ? options.sql`SELECT value_json FROM effect_local_client_shadow_visible_entities
+    execute: ({ model, key }) => {
+      if (options.table === "visible" || options.table === "shadow-visible") {
+        return options.sql`SELECT value_json FROM effect_local_client_visible_entities_data
           WHERE generation = ${options.generation} AND model = ${model} AND entity_key = ${key}`
-        : options
-          .sql`SELECT value_json FROM effect_local_canonical_entities WHERE model = ${model} AND entity_key = ${key}`
+      }
+      return options.sql`SELECT value_json FROM effect_local_client_canonical_entities_data
+          WHERE generation = ${options.generation} AND model = ${model} AND entity_key = ${key}`
+    }
   })
   return {
     get: (model, key) =>
@@ -84,21 +83,17 @@ export const local = (options: {
     set: (model, key, value) =>
       Effect.gen(function*() {
         const encoded = yield* encodeEntity(model, key, value)
-        if (options.table === "visible") {
-          yield* options.sql`INSERT INTO effect_local_visible_entities (model, entity_key, value_json, model_version)
-          VALUES (${model.name}, ${encoded.keyJson}, ${encoded.valueJson}, ${model.version})
-          ON CONFLICT (model, entity_key) DO UPDATE SET
-            value_json = excluded.value_json, model_version = excluded.model_version`
-        } else if (options.table === "shadow-visible") {
-          yield* options.sql`INSERT INTO effect_local_client_shadow_visible_entities
+        if (options.table === "visible" || options.table === "shadow-visible") {
+          yield* options.sql`INSERT INTO effect_local_client_visible_entities_data
           (generation, model, entity_key, value_json, model_version)
           VALUES (${options.generation}, ${model.name}, ${encoded.keyJson}, ${encoded.valueJson}, ${model.version})
           ON CONFLICT (generation, model, entity_key) DO UPDATE SET
             value_json = excluded.value_json, model_version = excluded.model_version`
         } else {
-          yield* options.sql`INSERT INTO effect_local_canonical_entities (model, entity_key, value_json, model_version)
-          VALUES (${model.name}, ${encoded.keyJson}, ${encoded.valueJson}, ${model.version})
-          ON CONFLICT (model, entity_key) DO UPDATE SET
+          yield* options.sql`INSERT INTO effect_local_client_canonical_entities_data
+          (generation, model, entity_key, value_json, model_version)
+          VALUES (${options.generation}, ${model.name}, ${encoded.keyJson}, ${encoded.valueJson}, ${model.version})
+          ON CONFLICT (generation, model, entity_key) DO UPDATE SET
             value_json = excluded.value_json, model_version = excluded.model_version`
         }
         options.changes?.push({
@@ -110,15 +105,12 @@ export const local = (options: {
     delete: (model, key) =>
       Effect.gen(function*() {
         const encoded = yield* encodeEntity(model, key)
-        if (options.table === "visible") {
-          yield* options
-            .sql`DELETE FROM effect_local_visible_entities WHERE model = ${model.name} AND entity_key = ${encoded.keyJson}`
-        } else if (options.table === "shadow-visible") {
-          yield* options.sql`DELETE FROM effect_local_client_shadow_visible_entities
+        if (options.table === "visible" || options.table === "shadow-visible") {
+          yield* options.sql`DELETE FROM effect_local_client_visible_entities_data
           WHERE generation = ${options.generation} AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
         } else {
-          yield* options
-            .sql`DELETE FROM effect_local_canonical_entities WHERE model = ${model.name} AND entity_key = ${encoded.keyJson}`
+          yield* options.sql`DELETE FROM effect_local_client_canonical_entities_data
+          WHERE generation = ${options.generation} AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
         }
         options.changes?.push({
           _tag: "Delete",
@@ -133,21 +125,16 @@ export const server = (options: {
   readonly sql: SqlClient.SqlClient
   readonly definition: Definition.Any
   readonly spaceId: Identity.SpaceId
+  readonly generation: number
   readonly changes: Array<Protocol.EntityChange>
 }): Transaction.Transaction => {
   const find = SqlSchema.findOneOption({
     Request: Schema.Struct({ spaceId: Schema.String, model: Schema.String, key: Schema.String }),
     Result: Rows.EntityRow,
     execute: ({ spaceId, model, key }) =>
-      options.sql`SELECT value_json FROM effect_local_server_entities
-      WHERE space_id = ${spaceId} AND model = ${model} AND entity_key = ${key}`
-  })
-  const findSized = SqlSchema.findOneOption({
-    Request: Schema.Struct({ spaceId: Schema.String, model: Schema.String, key: Schema.String }),
-    Result: Rows.SizedEntityRow,
-    execute: ({ spaceId, model, key }) =>
-      options.sql`SELECT value_json, entity_bytes FROM effect_local_server_entities
-      WHERE space_id = ${spaceId} AND model = ${model} AND entity_key = ${key}`
+      options.sql`SELECT value_json FROM effect_local_server_entities_data
+      WHERE space_id = ${spaceId} AND generation = ${options.generation}
+        AND model = ${model} AND entity_key = ${key}`
   })
   return {
     get: (model, key) =>
@@ -165,34 +152,19 @@ export const server = (options: {
     set: (model, key, value) =>
       Effect.gen(function*() {
         const encoded = yield* encodeEntity(model, key, value)
-        const previous = yield* findSized({
-          spaceId: options.spaceId,
-          model: model.name,
-          key: encoded.keyJson
-        }).pipe(Effect.mapError(StorageUnavailable.make))
         const entityBytes = yield* Protocol.encodedBytesEffect({
           model: model.name,
           modelVersion: model.version,
           key: encoded.encodedKey,
           value: encoded.encodedValue
         })
-        yield* options.sql`INSERT INTO effect_local_server_entities
-          (space_id, model, model_version, entity_key, value_json, entity_bytes)
-        VALUES (${options.spaceId}, ${model.name}, ${model.version}, ${encoded.keyJson}, ${encoded.valueJson}, ${entityBytes})
-        ON CONFLICT (space_id, model, entity_key) DO UPDATE
+        yield* options.sql`INSERT INTO effect_local_server_entities_data
+          (space_id, generation, model, model_version, entity_key, value_json, entity_bytes)
+        VALUES (${options.spaceId}, ${options.generation}, ${model.name}, ${model.version},
+          ${encoded.keyJson}, ${encoded.valueJson}, ${entityBytes})
+        ON CONFLICT (space_id, generation, model, entity_key) DO UPDATE
           SET model_version = excluded.model_version, value_json = excluded.value_json,
             entity_bytes = excluded.entity_bytes`
-        let entityCountDelta = 0
-        let previousEntityBytes = 0
-        if (Option.isNone(previous)) {
-          entityCountDelta = 1
-        } else {
-          previousEntityBytes = previous.value.entity_bytes
-        }
-        yield* options.sql`UPDATE effect_local_server_spaces SET
-          entity_count = entity_count + ${entityCountDelta},
-          entity_bytes = entity_bytes + ${entityBytes - previousEntityBytes}
-        WHERE space_id = ${options.spaceId}`
         options.changes.push({
           _tag: "Upsert",
           entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey },
@@ -202,19 +174,9 @@ export const server = (options: {
     delete: (model, key) =>
       Effect.gen(function*() {
         const encoded = yield* encodeEntity(model, key)
-        const previous = yield* findSized({
-          spaceId: options.spaceId,
-          model: model.name,
-          key: encoded.keyJson
-        }).pipe(Effect.mapError(StorageUnavailable.make))
-        yield* options.sql`DELETE FROM effect_local_server_entities
-        WHERE space_id = ${options.spaceId} AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
-        if (Option.isSome(previous)) {
-          yield* options.sql`UPDATE effect_local_server_spaces SET
-            entity_count = entity_count - 1,
-            entity_bytes = entity_bytes - ${previous.value.entity_bytes}
-          WHERE space_id = ${options.spaceId}`
-        }
+        yield* options.sql`DELETE FROM effect_local_server_entities_data
+        WHERE space_id = ${options.spaceId} AND generation = ${options.generation}
+          AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
         options.changes.push({
           _tag: "Delete",
           entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey }
@@ -227,6 +189,7 @@ export const server = (options: {
 export const applyLocalChange = (
   sql: SqlClient.SqlClient,
   table: "visible" | "canonical",
+  generation: number,
   change: Protocol.EntityChange
 ) =>
   Effect.gen(function*() {
@@ -235,20 +198,24 @@ export const applyLocalChange = (
       if (
         table === "visible"
       ) {
-        yield* sql`DELETE FROM effect_local_visible_entities WHERE model = ${change.entity.model} AND entity_key = ${keyJson}`
-      } else {yield* sql`DELETE FROM effect_local_canonical_entities WHERE model = ${change.entity.model} AND entity_key = ${keyJson}`}
+        yield* sql`DELETE FROM effect_local_client_visible_entities_data WHERE generation = ${generation}
+          AND model = ${change.entity.model} AND entity_key = ${keyJson}`
+      } else {yield* sql`DELETE FROM effect_local_client_canonical_entities_data WHERE generation = ${generation}
+        AND model = ${change.entity.model} AND entity_key = ${keyJson}`}
       return
     }
     const valueJson = yield* Codec.stringify(change.value)
     if (table === "visible") {
-      yield* sql`INSERT INTO effect_local_visible_entities (model, entity_key, value_json, model_version)
-        VALUES (${change.entity.model}, ${keyJson}, ${valueJson}, ${change.entity.modelVersion})
-        ON CONFLICT (model, entity_key) DO UPDATE SET
+      yield* sql`INSERT INTO effect_local_client_visible_entities_data
+        (generation, model, entity_key, value_json, model_version)
+        VALUES (${generation}, ${change.entity.model}, ${keyJson}, ${valueJson}, ${change.entity.modelVersion})
+        ON CONFLICT (generation, model, entity_key) DO UPDATE SET
           value_json = excluded.value_json, model_version = excluded.model_version`
     } else {
-      yield* sql`INSERT INTO effect_local_canonical_entities (model, entity_key, value_json, model_version)
-        VALUES (${change.entity.model}, ${keyJson}, ${valueJson}, ${change.entity.modelVersion})
-        ON CONFLICT (model, entity_key) DO UPDATE SET
+      yield* sql`INSERT INTO effect_local_client_canonical_entities_data
+        (generation, model, entity_key, value_json, model_version)
+        VALUES (${generation}, ${change.entity.model}, ${keyJson}, ${valueJson}, ${change.entity.modelVersion})
+        ON CONFLICT (generation, model, entity_key) DO UPDATE SET
           value_json = excluded.value_json, model_version = excluded.model_version`
     }
   }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))

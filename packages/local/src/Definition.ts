@@ -1,5 +1,6 @@
 import * as Canonical from "./Canonical.js"
 import * as Identity from "./Identity.js"
+import * as Defect from "./internal/defect.js"
 import type * as Model from "./Model.js"
 import type * as Mutation from "./Mutation.js"
 import type * as Query from "./Query.js"
@@ -24,16 +25,19 @@ export interface Definition<
 const indexed = <A extends { readonly name: string },>(kind: string, values: ReadonlyArray<A>) => {
   const result = new Map<string, A>()
   for (const value of values) {
-    if (result.has(value.name)) throw new TypeError(`Duplicate ${kind} name: ${value.name}`)
+    if (result.has(value.name)) return Defect.invalid(`Duplicate ${kind} name: ${value.name}`)
     result.set(value.name, value)
   }
   return result
 }
 
-const byName = <A extends { readonly name: string },>(left: A, right: A): number =>
-  left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+const byName = <A extends { readonly name: string },>(left: A, right: A): number => {
+  if (left.name < right.name) return -1
+  if (left.name > right.name) return 1
+  return 0
+}
 
-export const make = <
+export function make<
   const Models extends ReadonlyArray<Model.Any>,
   const Mutations extends ReadonlyArray<Mutation.Any>,
   const Queries extends ReadonlyArray<Query.Any> = readonly [],
@@ -42,8 +46,14 @@ export const make = <
   readonly models: Models
   readonly mutations: Mutations
   readonly queries?: Queries
-}): Definition<Models, Mutations, Queries> => {
-  const queries = (options.queries ?? []) as unknown as Queries
+}): Definition<Models, Mutations, Queries>
+export function make(options: {
+  readonly version: number
+  readonly models: ReadonlyArray<Model.Any>
+  readonly mutations: ReadonlyArray<Mutation.Any>
+  readonly queries?: ReadonlyArray<Query.Any>
+}): Definition<ReadonlyArray<Model.Any>, ReadonlyArray<Mutation.Any>, ReadonlyArray<Query.Any>> {
+  const queries = options.queries ?? []
   const modelByName = indexed("model", options.models)
   const mutationByName = indexed("mutation", options.mutations)
   const queryByName = indexed("query", queries)
@@ -51,23 +61,23 @@ export const make = <
   for (const query of queries) {
     for (const dependency of query.dependsOn) {
       if (modelByName.get(dependency.name) !== dependency) {
-        throw new TypeError(`Query ${query.name} depends on an unregistered model: ${dependency.name}`)
+        return Defect.invalid(`Query ${query.name} depends on an unregistered model: ${dependency.name}`)
       }
     }
   }
   const models = options.models.map((model) => ({
-      name: model.name,
-      version: model.version,
-      key: SchemaDescriptor.make(model.key),
-      schema: SchemaDescriptor.make(model.schema)
-    })).toSorted(byName)
+    name: model.name,
+    version: model.version,
+    key: SchemaDescriptor.make(model.key),
+    schema: SchemaDescriptor.make(model.schema)
+  })).toSorted(byName)
   const mutations = options.mutations.map((mutation) => ({
-      name: mutation.name,
-      version: mutation.version,
-      payload: SchemaDescriptor.make(mutation.payloadSchema),
-      success: SchemaDescriptor.make(mutation.successSchema),
-      rejection: SchemaDescriptor.make(mutation.rejectionSchema)
-    })).toSorted(byName)
+    name: mutation.name,
+    version: mutation.version,
+    payload: SchemaDescriptor.make(mutation.payloadSchema),
+    success: SchemaDescriptor.make(mutation.successSchema),
+    rejection: SchemaDescriptor.make(mutation.rejectionSchema)
+  })).toSorted(byName)
   const schemaIdentity = Identity.SchemaIdentity.make({
     version,
     hash: Identity.SchemaHash.make(Canonical.hash({ format: 1, models, mutations }))
@@ -84,9 +94,9 @@ export const make = <
     })).toSorted(byName)
   })
   return Object.freeze({
-    models: Object.freeze([...options.models]) as unknown as Models,
-    mutations: Object.freeze([...options.mutations]) as unknown as Mutations,
-    queries: Object.freeze([...queries]) as unknown as Queries,
+    models: Object.freeze([...options.models]),
+    mutations: Object.freeze([...options.mutations]),
+    queries: Object.freeze([...queries]),
     modelByName,
     mutationByName,
     queryByName,

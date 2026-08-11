@@ -4,6 +4,7 @@ import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Stream from "effect/Stream"
 import * as PresenceHub from "../src/PresenceHub.js"
 
@@ -71,10 +72,12 @@ describe("PresenceHub", () => {
 
   it.effect("lets policy reject a spoofed publishing client identity", () => {
     const live = PresenceHub.layer({
-      authorize: (input) =>
-        input._tag === "Publish" && input.clientId !== clientId
-          ? Effect.fail("client identity mismatch")
-          : Effect.void
+      authorize: (input) => {
+        if (input._tag === "Publish" && input.clientId !== clientId) {
+          return Effect.fail("client identity mismatch")
+        }
+        return Effect.void
+      }
     })
 
     return Effect.gen(function*() {
@@ -110,7 +113,7 @@ describe("PresenceHub", () => {
       yield* hub.publish({ ...update(spaceA), value: { cursor: 2 } }, null)
 
       const received = yield* Fiber.join(watchers[0])
-      assert.deepStrictEqual(received._tag === "Some" ? received.value.value : undefined, { cursor: 2 })
+      assert.deepStrictEqual(Option.getOrUndefined(received)?.value, { cursor: 2 })
       yield* Effect.forEach(
         [spaceB, spaceC, spaceD],
         (spaceId, index) => hub.publish({ ...update(spaceId), value: { cursor: index + 3 } }, null),
@@ -118,7 +121,7 @@ describe("PresenceHub", () => {
       )
       const isolated = yield* Fiber.joinAll(watchers.slice(1))
       assert.deepStrictEqual(
-        isolated.map((entry) => entry._tag === "Some" ? entry.value.value : undefined),
+        isolated.map((entry) => Option.getOrUndefined(entry)?.value),
         [{ cursor: 3 }, { cursor: 4 }, { cursor: 5 }]
       )
     }).pipe(Effect.provide(live))

@@ -82,13 +82,13 @@ export const layer = <R = never,>(options: {
                   limit: Protocol.maximumPresenceBytes
                 })
               }
-              if (!(yield* RcMap.has(updates, spaceId))) {
-                return
+              if (yield* RcMap.has(updates, spaceId)) {
+                yield* RcMap.get(updates, spaceId).pipe(
+                  Effect.flatMap((channel) => PubSub.publish(channel, update)),
+                  Effect.scoped
+                )
               }
-              yield* RcMap.get(updates, spaceId).pipe(
-                Effect.flatMap((channel) => PubSub.publish(channel, update)),
-                Effect.scoped
-              )
+              return yield* Effect.void
             }).pipe(
               Effect.asVoid,
               Effect.withSpan("PresenceHub.publish", {

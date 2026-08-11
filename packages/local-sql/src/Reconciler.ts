@@ -230,21 +230,21 @@ export const layerInMemoryScheduler = (
       const worker = Effect.forever(
         Queue.take(wake).pipe(
           Effect.andThen(local.reconciliationGenerations),
-          Effect.flatMap((generations) =>
-            generations.completed >= generations.requested
-              ? Effect.void
-              : reconciliation.sync.pipe(
-                Effect.forkChild({ startImmediately: true }),
-                Effect.flatMap(Fiber.await),
-                Effect.flatMap((exit) =>
-                  exit._tag === "Failure" && Cause.hasInterruptsOnly(exit.cause)
-                    ? Effect.fail(new ReplicaError.ServerUnavailable())
-                    : exit
-                ),
-                Effect.andThen(local.completeReconciliation(generations.requested)),
-                Effect.andThen(reconciliation.succeeded)
-              )
-          ),
+          Effect.flatMap((generations) => {
+            if (generations.completed >= generations.requested) return Effect.void
+            return reconciliation.sync.pipe(
+              Effect.forkChild({ startImmediately: true }),
+              Effect.flatMap(Fiber.await),
+              Effect.flatMap((exit) => {
+                if (exit._tag === "Failure" && Cause.hasInterruptsOnly(exit.cause)) {
+                  return Effect.fail(new ReplicaError.ServerUnavailable())
+                }
+                return exit
+              }),
+              Effect.andThen(local.completeReconciliation(generations.requested)),
+              Effect.andThen(reconciliation.succeeded)
+            )
+          }),
           Effect.catch((error) => {
             if (error._tag === "StaleSchema") return reconciliation.failed(error)
             return Effect.logWarning("Reconciliation failed", error).pipe(

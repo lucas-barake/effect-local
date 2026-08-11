@@ -2,7 +2,7 @@ import type * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Evolution from "@lucas-barake/effect-local/Evolution"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
-import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import type * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import * as Context from "effect/Context"
@@ -61,7 +61,10 @@ export const layer = <D extends Definition.Any,>(
       const context = yield* Effect.context<Handlers<D>>()
       const handlers = new Map<string, Mutation.HandlerService<any, any, any, any>>()
       for (const mutation of definition.mutations) {
-        handlers.set(mutation.name, Context.get(context, mutation.handler as any) as any)
+        handlers.set(
+          mutation.name,
+          Context.getUnsafe<Mutation.HandlerService<any, any, any, any>, any>(mutation.handler)(context)
+        )
       }
       const execute = (
         name: string,
@@ -88,7 +91,8 @@ export const layer = <D extends Definition.Any,>(
               )
               return Result_.fail(json)
             }
-            return yield* Effect.fail(failure as ReplicaError.ReplicaError)
+            if (Schema.is(ReplicaError.ReplicaError)(failure)) return yield* Effect.fail(failure)
+            return yield* Effect.die(failure)
           }
           const encoded = yield* Codec.encode(mutation.successSchema, result.success)
           const json = yield* Schema.decodeUnknownEffect(Schema.Json)(encoded).pipe(

@@ -19,7 +19,8 @@ export const register = <Value extends Schema.Top,>(schema: Value) => {
   return make({
     schema,
     operation,
-    apply: (_current, update) => Effect.succeed((update as { readonly value: Value["Type"] }).value)
+    apply: (_current, update) =>
+      Schema.decodeUnknownEffect(Schema.toType(schema))(Reflect.get(update, "value")).pipe(Effect.orDie)
   })
 }
 
@@ -39,12 +40,14 @@ export const growOnlySet = <Item extends Schema.Top,>(item: Item) => {
   return make({
     schema: Schema.Array(item),
     operation,
-    apply: (current, update) => {
-      const value = (update as { readonly value: Item["Type"] }).value
-      const encoded = Canonical.stringify(value)
-      return Effect.succeed(
-        current.some((currentValue) => Canonical.stringify(currentValue) === encoded) ? current : [...current, value]
-      )
-    }
+    apply: (current, update) =>
+      Effect.gen(function*() {
+        const value = yield* Schema.decodeUnknownEffect(Schema.toType(item))(Reflect.get(update, "value")).pipe(
+          Effect.orDie
+        )
+        const encoded = Canonical.stringify(value)
+        if (current.some((currentValue) => Canonical.stringify(currentValue) === encoded)) return current
+        return [...current, value]
+      })
   })
 }

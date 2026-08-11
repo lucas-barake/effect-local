@@ -18,11 +18,13 @@ const isUint8Array = (value: object): value is Uint8Array =>
 const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   switch (typeof value) {
     case "string":
-      return value.startsWith(sentinel) ? sentinel + value : value
+      if (value.startsWith(sentinel)) return sentinel + value
+      return value
     case "bigint":
       return `${sentinel}bigint:${value}`
     case "number":
-      return Number.isFinite(value) ? value : `${sentinel}number:${value}`
+      if (Number.isFinite(value)) return value
+      return `${sentinel}number:${value}`
     case "undefined":
       return `${sentinel}undefined`
     case "function":
@@ -39,11 +41,14 @@ const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   }
   if (ancestors.has(value)) return `${sentinel}circular`
   ancestors.add(value)
-  const result = Array.isArray(value)
-    ? value.map((item) => normalize(item, ancestors))
-    : Object.fromEntries(
+  let result: unknown
+  if (Array.isArray(value)) {
+    result = value.map((item) => normalize(item, ancestors))
+  } else {
+    result = Object.fromEntries(
       Object.keys(value).toSorted().map((key) => [key, normalize(Reflect.get(value, key), ancestors)])
     )
+  }
   ancestors.delete(value)
   return result
 }

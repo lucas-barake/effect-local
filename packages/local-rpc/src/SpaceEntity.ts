@@ -169,7 +169,7 @@ export interface HandlerOptions {
   readonly maxIdleTime?: Duration.Input
   readonly mailboxCapacity?: number | "unbounded"
   readonly disableFatalDefects?: boolean
-  readonly defectRetryPolicy?: Schedule.Schedule<any, unknown>
+  readonly defectRetryPolicy?: Schedule.Schedule<any>
   readonly spanAttributes?: Record<string, string>
 }
 
@@ -179,7 +179,8 @@ export const layerHandlers = (options: HandlerOptions = {}) =>
       const address = yield* Entity.CurrentAddress
       const store = yield* ServerStore.ServerStore
       const presence = yield* PresenceHub.PresenceHub
-      const spaceId = Schema.is(Identity.SpaceId)(address.entityId) ? address.entityId : undefined
+      let spaceId: Identity.SpaceId | undefined
+      if (Schema.is(Identity.SpaceId)(address.entityId)) spaceId = address.entityId
 
       return SpaceEntity.of({
         Submit: ({ payload }) => {
@@ -208,12 +209,14 @@ export const layerHandlers = (options: HandlerOptions = {}) =>
             }
             return store.bootstrapAuthorized(payload.request, payload.principal)
           }),
-        Watch: ({ payload }) =>
-          Rpc.fork(
-            spaceId === undefined || payload.request.spaceId !== spaceId
-              ? Stream.fail(new ReplicaError.ProtocolInvalid({ message: "The routed space is invalid" }))
-              : Stream.unwrap(store.watchAuthorized(payload.request, payload.principal))
-          ),
+        Watch: ({ payload }) => {
+          if (spaceId === undefined || payload.request.spaceId !== spaceId) {
+            return Rpc.fork(
+              Stream.fail(new ReplicaError.ProtocolInvalid({ message: "The routed space is invalid" }))
+            )
+          }
+          return Rpc.fork(Stream.unwrap(store.watchAuthorized(payload.request, payload.principal)))
+        },
         PublishPresence: ({ payload }) =>
           Rpc.fork(Effect.suspend(() => {
             if (spaceId === undefined || payload.update.spaceId !== spaceId) {
@@ -223,12 +226,14 @@ export const layerHandlers = (options: HandlerOptions = {}) =>
             }
             return presence.publish(payload.update, payload.principal)
           })),
-        WatchPresence: ({ payload }) =>
-          Rpc.fork(
-            spaceId === undefined
-              ? Stream.fail(new ReplicaError.ProtocolInvalid({ message: "The routed space is invalid" }))
-              : presence.watch(spaceId, payload.principal)
-          )
+        WatchPresence: ({ payload }) => {
+          if (spaceId === undefined) {
+            return Rpc.fork(
+              Stream.fail(new ReplicaError.ProtocolInvalid({ message: "The routed space is invalid" }))
+            )
+          }
+          return Rpc.fork(presence.watch(spaceId, payload.principal))
+        }
       })
     }),
     { ...options, concurrency: 1 }

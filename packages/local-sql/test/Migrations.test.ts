@@ -89,16 +89,35 @@ describe("storage migration catalogs", () => {
         const lockClient = yield* SqliteClient.make({ filename })
         const migratorClient = yield* SqliteClient.make({ filename })
         yield* migratorClient`PRAGMA busy_timeout = 1`
-        yield* Migrations.server().pipe(Effect.provideService(SqlClient.SqlClient, migratorClient))
+        yield* Migrations.runCatalog("Server", Migrations.serverCatalog.slice(0, -1)).pipe(
+          Effect.provideService(SqlClient.SqlClient, migratorClient)
+        )
+        const firstFailure = yield* Deferred.make<void>()
+        const observedClient = new Proxy(migratorClient, {
+          get: (target, property, receiver) => {
+            if (property === "unsafe") {
+              return <A extends object,>(statement: string, parameters?: ReadonlyArray<unknown>) =>
+                target.unsafe<A>(statement, parameters).pipe(
+                  Effect.tapError(() => Deferred.succeed(firstFailure, undefined))
+                )
+            }
+            if (property !== "withTransaction") return Reflect.get(target, property, receiver)
+            return <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
+              target.withTransaction(effect).pipe(
+                Effect.tapError(() => Deferred.succeed(firstFailure, undefined))
+              )
+          }
+        })
 
         yield* lockClient`BEGIN IMMEDIATE`
         const migrationFiber = yield* Migrations.server({
           retryDelay: "1 second",
           maximumAttempts: 2
         }).pipe(
-          Effect.provideService(SqlClient.SqlClient, migratorClient),
+          Effect.provideService(SqlClient.SqlClient, observedClient),
           Effect.forkChild({ startImmediately: true })
         )
+        yield* Deferred.await(firstFailure)
         yield* lockClient`ROLLBACK`
         yield* TestClock.adjust("1 second")
         yield* Fiber.join(migrationFiber)
@@ -121,8 +140,8 @@ describe("storage migration catalogs", () => {
       })
       yield* Migrations.server()
 
-      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6])
-      assert.deepStrictEqual((yield* serverMigrationLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6])
+      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7])
+      assert.deepStrictEqual((yield* serverMigrationLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7])
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
         "effect_local_client_evolution",
@@ -135,11 +154,16 @@ describe("storage migration catalogs", () => {
         "effect_local_client_shadow_visible_entities",
         "effect_local_bootstrap",
         "effect_local_bootstrap_entities",
+        "effect_local_client_canonical_entities_data",
+        "effect_local_client_pending_data",
+        "effect_local_client_receipts_data",
+        "effect_local_client_visible_entities_data",
         "effect_local_server_evolution",
         "effect_local_server_key_lineage",
         "effect_local_server_key_lineage_groups",
         "effect_local_server_key_lineage_targets",
-        "effect_local_server_shadow_entities"
+        "effect_local_server_shadow_entities",
+        "effect_local_server_entities_data"
       ])
     }).pipe(Effect.provide(database)))
 
@@ -280,6 +304,96 @@ describe("storage migration catalogs", () => {
         schema_version: null,
         entity_value: "{\"id\":\"1\",\"title\":\"legacy\"}",
         model_version: null
+      })
+    }).pipe(Effect.provide(database)))
+
+  it.effect("restarts pre-generation promotions from preserved source rows", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrations.runCatalog("Client", Migrations.clientCatalog.slice(0, 6))
+      yield* Migrations.runCatalog("Server", Migrations.serverCatalog.slice(0, 6))
+      yield* sql`INSERT INTO effect_local_client_meta
+        (singleton, space_id, client_id, definition_hash, next_local_sequence, server_cursor, visible_revision,
+          requested_generation, completed_generation, schema_version, schema_hash, schema_generation,
+          target_schema_version, target_schema_hash, migration_hash)
+        VALUES (1, ${spaceId}, ${clientId}, 'source-definition', 1, 0, 0, 0, 0,
+          1, 'source-hash', 4, 2, 'target-hash', 'migration-hash')`
+      yield* sql`INSERT INTO effect_local_canonical_entities (model, model_version, entity_key, value_json)
+        VALUES ('Todo', 1, '"source"', '{"id":"source"}')`
+      yield* sql`INSERT INTO effect_local_client_evolution
+        (singleton, source_schema_version, source_schema_hash, target_schema_version, target_schema_hash,
+          migration_hash, generation, phase, cursor_model, cursor_key, cursor_sequence)
+        VALUES (1, 1, 'source-hash', 2, 'target-hash', 'migration-hash', 4,
+          'Entities', 'Todo', '"source"', NULL)`
+      yield* sql`INSERT INTO effect_local_client_shadow_entities
+        (generation, model, model_version, entity_key, value_json)
+        VALUES (4, 'Todo', 2, '"partial"', '{"id":"partial"}')`
+
+      yield* sql`INSERT INTO effect_local_server_spaces
+        (space_id, definition_hash, next_server_sequence, schema_version, schema_hash, schema_generation,
+          target_schema_version, target_schema_hash, migration_hash, next_terminal_sequence, history_floor,
+          receipt_floor, retained_history_count, retained_receipt_count, entity_count, entity_bytes,
+          snapshot_sequence, snapshot_terminal_sequence, metadata_verified)
+        VALUES (${spaceId}, 'source-definition', 1, 1, 'source-hash', 4, 2, 'target-hash',
+          'migration-hash', 1, 0, 0, 0, 0, 1, 10, 0, 0, 1)`
+      yield* sql`INSERT INTO effect_local_server_entities
+        (space_id, model, model_version, entity_key, value_json, entity_bytes)
+        VALUES (${spaceId}, 'Todo', 1, '"source"', '{"id":"source"}', 10)`
+      yield* sql`INSERT INTO effect_local_server_evolution
+        (space_id, source_schema_version, source_schema_hash, target_schema_version, target_schema_hash,
+          migration_hash, generation, phase, cursor_model, cursor_key, cursor_sequence)
+        VALUES (${spaceId}, 1, 'source-hash', 2, 'target-hash', 'migration-hash', 4,
+          'Entities', 'Todo', '"source"', NULL)`
+      yield* sql`INSERT INTO effect_local_server_shadow_entities
+        (space_id, generation, model, model_version, entity_key, value_json)
+        VALUES (${spaceId}, 4, 'Todo', 2, '"partial"', '{"id":"partial"}')`
+
+      yield* Migrations.runCatalog("Client", Migrations.clientCatalog)
+      yield* Migrations.runCatalog("Server", Migrations.serverCatalog)
+
+      const client = (yield* sql<{
+        readonly active_schema_generation: number
+        readonly phase: string
+        readonly source_generation: number
+        readonly source_count: number
+        readonly target_count: number
+      }>`SELECT m.active_schema_generation, e.phase, e.source_generation,
+        (SELECT COUNT(*) FROM effect_local_client_canonical_entities_data WHERE generation = 3) AS source_count,
+        (SELECT COUNT(*) FROM effect_local_client_canonical_entities_data WHERE generation = 4) AS target_count
+        FROM effect_local_client_meta AS m INNER JOIN effect_local_client_evolution AS e ON e.singleton = m.singleton`)[
+        0
+      ]
+      assert.deepStrictEqual(client, {
+        active_schema_generation: 3,
+        phase: "Log",
+        source_generation: 3,
+        source_count: 1,
+        target_count: 0
+      })
+      const server = (yield* sql<{
+        readonly active_schema_generation: number
+        readonly phase: string
+        readonly source_generation: number
+        readonly source_count: number
+        readonly target_count: number
+        readonly target_entity_count: number
+        readonly target_entity_bytes: number
+      }>`SELECT s.active_schema_generation, e.phase, e.source_generation,
+        e.target_entity_count, e.target_entity_bytes,
+        (SELECT COUNT(*) FROM effect_local_server_entities_data
+          WHERE space_id = ${spaceId} AND generation = 3) AS source_count,
+        (SELECT COUNT(*) FROM effect_local_server_entities_data
+          WHERE space_id = ${spaceId} AND generation = 4) AS target_count
+        FROM effect_local_server_spaces AS s INNER JOIN effect_local_server_evolution AS e
+          ON e.space_id = s.space_id WHERE s.space_id = ${spaceId}`)[0]
+      assert.deepStrictEqual(server, {
+        active_schema_generation: 3,
+        phase: "Log",
+        source_generation: 3,
+        source_count: 1,
+        target_count: 0,
+        target_entity_count: 0,
+        target_entity_bytes: 0
       })
     }).pipe(Effect.provide(database)))
 

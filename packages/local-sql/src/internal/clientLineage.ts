@@ -44,7 +44,8 @@ export const make = (sql: SqlClient.SqlClient) => {
         (alias) => Codec.stringify(alias.key).pipe(Effect.map((key) => ({ ...alias, key })))
       )
       const groups = new Set<string>()
-      const sourceAliases = aliases.length === 1 ? aliases : aliases.slice(0, -1)
+      let sourceAliases = aliases
+      if (aliases.length !== 1) sourceAliases = aliases.slice(0, -1)
       for (const alias of sourceAliases) {
         const found = yield* readGroup({
           schemaVersion: alias.schemaIdentity.version,
@@ -58,7 +59,7 @@ export const make = (sql: SqlClient.SqlClient) => {
       if (groups.size > 1) {
         return yield* new ReplicaError.SchemaKeyCollision({ model, key: yield* Codec.stringify(migrated.key) })
       }
-      const root = aliases[0]!
+      const root = aliases[0]
       const lineageId = groups.values().next().value ?? Canonical.stringify({
         schemaIdentity: root.schemaIdentity,
         model,
@@ -100,5 +101,6 @@ export const make = (sql: SqlClient.SqlClient) => {
       if (Option.isNone(storedTarget) || storedTarget.value.lineage_id !== lineageId) {
         return yield* new ReplicaError.SchemaKeyCollision({ model, key: targetKey })
       }
+      return undefined
     })
 }

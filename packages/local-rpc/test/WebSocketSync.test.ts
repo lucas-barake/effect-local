@@ -17,6 +17,7 @@ import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as MutableRef from "effect/MutableRef"
+import * as Option from "effect/Option"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
@@ -115,34 +116,41 @@ const store = ServerStore.layer({
   ...serverHistory,
   definition,
   evolution,
-  authorizeAccess: ({ principal, spaceId: requestedSpaceId }) =>
-    principal !== null && typeof principal === "object" && !Array.isArray(principal) &&
+  authorizeAccess: ({ principal, spaceId: requestedSpaceId }) => {
+    if (
+      principal !== null && typeof principal === "object" && !Array.isArray(principal) &&
       "subject" in principal && principal.subject === "test" && requestedSpaceId === spaceId
-      ? Effect.void
-      : Effect.fail({ reason: "forbidden" }),
+    ) {
+      return Effect.void
+    }
+    return Effect.fail({ reason: "forbidden" })
+  },
   authorizeMutation: ({ mutation }) => {
     if (Schema.is(AssignRoleV2.payloadSchema)(mutation.payload) && mutation.payload.role === "admin") {
       return Effect.fail({ reason: "admin role requires elevated access" })
     }
     return Effect.void
   },
-  authorizeRead: ({ principal, spaceId: requestedSpaceId }) =>
-    MutableRef.get(readAuthorized) && principal !== null && typeof principal === "object" &&
+  authorizeRead: ({ principal, spaceId: requestedSpaceId }) => {
+    if (
+      MutableRef.get(readAuthorized) && principal !== null && typeof principal === "object" &&
       !Array.isArray(principal) &&
       "subject" in principal && principal.subject === "test" && requestedSpaceId === spaceId
-      ? Effect.void
-      : Effect.fail({ reason: "forbidden" })
+    ) {
+      return Effect.void
+    }
+    return Effect.fail({ reason: "forbidden" })
+  }
 }).pipe(Layer.provide(runtime), Layer.provide(database))
 
 const authenticator = Layer.succeed(
   Authentication.Authenticator,
   Authentication.Authenticator.of({
-    authenticate: (credential) =>
-      Redacted.value(credential) === "secret"
-        ? Effect.succeed({ subject: "test" })
-        : Redacted.value(credential) === "revoked"
-        ? Effect.succeed({ subject: "revoked" })
-        : Effect.fail(new Authentication.AuthenticationFailure())
+    authenticate: (credential) => {
+      if (Redacted.value(credential) === "secret") return Effect.succeed({ subject: "test" })
+      if (Redacted.value(credential) === "revoked") return Effect.succeed({ subject: "revoked" })
+      return Effect.fail(new Authentication.AuthenticationFailure())
+    }
   })
 )
 const authenticationServer = Authentication.layerServer.pipe(Layer.provide(authenticator))
@@ -170,7 +178,8 @@ const websocketServer = SyncServer.layer.pipe(
 )
 const socket = Effect.gen(function*() {
   const server = yield* HttpServer.HttpServer
-  const address = server.address as HttpServer.TcpAddress
+  const address = server.address
+  if (address._tag === "UnixAddress") return yield* Effect.die("Expected the test HTTP server to use a TCP address")
   return NodeSocket.layerWebSocket(`http://127.0.0.1:${address.port}/sync`)
 }).pipe(Layer.unwrap)
 const clientProtocol = SyncClient.layerProtocolSocket().pipe(Layer.provide(socket))
@@ -289,7 +298,7 @@ describe("WebSocket synchronization", () => {
       const sql = yield* SqlClient.SqlClient
       const messageRows = yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM cluster_messages`
       const replyRows = yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM cluster_replies`
-      assert.deepStrictEqual([messageRows[0]!.count, replyRows[0]!.count], [0, 0])
+      assert.deepStrictEqual([messageRows[0]?.count, replyRows[0]?.count], [0, 0])
 
       const page = yield* remote.pull({
         spaceId,
@@ -329,7 +338,10 @@ describe("WebSocket synchronization", () => {
       const remote = yield* SyncEngine.SyncEngine
       const initialWake = yield* Deferred.make<void>()
       const watching = yield* remote.watch({ spaceId, schema: definition.schemaIdentity }).pipe(
-        Stream.tap((wake) => wake.sequence === 0 ? Deferred.succeed(initialWake, undefined) : Effect.void),
+        Stream.tap((wake) => {
+          if (wake.sequence === 0) return Deferred.succeed(initialWake, undefined)
+          return Effect.void
+        }),
         Stream.take(2),
         Stream.runCollect,
         Effect.forkChild({ startImmediately: true })
@@ -410,7 +422,7 @@ describe("WebSocket synchronization", () => {
       }
       yield* presence.publish(update)
       const value = yield* Fiber.join(received)
-      assert.deepStrictEqual(value._tag === "Some" ? value.value : undefined, update)
+      assert.deepStrictEqual(Option.getOrUndefined(value), update)
     }).pipe(Effect.provide(live)))
 
   it.effect("returns and replays a bounded terminal rejection for an oversized private result", () =>

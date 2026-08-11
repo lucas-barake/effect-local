@@ -32,6 +32,7 @@ const defaultOptions: Options = { retryDelay: "5 millis", maximumAttempts: 8 }
 
 const stableName = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/
 
+/* oxlint-disable effect/noThrowStatement, effect/noNewError -- Migration descriptors are synchronous schema values and must reject invalid catalogs before any Effect is constructed. */
 export const makeMigration = (options: {
   readonly id: number
   readonly name: string
@@ -50,7 +51,7 @@ export const makeMigration = (options: {
     throw new TypeError(`Storage migration effect id is not stable: ${options.effect.id}`)
   }
   const statements = Object.freeze([...options.statements])
-  return Object.freeze({
+  const migration = {
     id: options.id,
     name: options.name,
     checksum: Identity.SchemaHash.make(Canonical.hash({
@@ -60,10 +61,12 @@ export const makeMigration = (options: {
       statements,
       effect: options.effect?.id ?? null
     })),
-    statements,
-    ...(options.effect === undefined ? {} : { effect: options.effect.run })
-  })
+    statements
+  }
+  if (options.effect === undefined) return Object.freeze(migration)
+  return Object.freeze({ ...migration, effect: options.effect.run })
 }
+/* oxlint-enable effect/noThrowStatement, effect/noNewError */
 
 const MigrationRow = Schema.Struct({
   id: Schema.Int.check(Schema.isGreaterThan(0)),
@@ -83,7 +86,7 @@ const validateCatalog = (
 ): ReplicaError.StorageMigrationMismatch | undefined => {
   const names = new Set<string>()
   for (let index = 0; index < migrations.length; index++) {
-    const migration = migrations[index]!
+    const migration = migrations[index]
     if (migration.id !== index + 1) {
       return new ReplicaError.StorageMigrationMismatch({
         catalog,
@@ -779,7 +782,159 @@ const serverV5 = makeMigration({
   }
 })
 
-export const clientCatalog = Object.freeze([clientV1, clientV2, clientV3, clientV4, clientV5, clientV6])
+const clientV7 = makeMigration({
+  id: 7,
+  name: "generation-owned-storage",
+  statements: [
+    "ALTER TABLE effect_local_client_meta ADD COLUMN active_schema_generation INTEGER NOT NULL DEFAULT 0 CHECK (active_schema_generation >= 0)",
+    "ALTER TABLE effect_local_client_evolution ADD COLUMN source_generation INTEGER NOT NULL DEFAULT 0 CHECK (source_generation >= 0)",
+    `UPDATE effect_local_client_meta SET active_schema_generation = CASE
+      WHEN EXISTS (SELECT 1 FROM effect_local_client_evolution WHERE singleton = 1)
+      THEN MAX(schema_generation - 1, 0) ELSE schema_generation END`,
+    `UPDATE effect_local_client_evolution SET source_generation =
+      (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1),
+      phase = 'Log', cursor_model = NULL, cursor_key = NULL, cursor_sequence = 0`,
+    `CREATE TABLE effect_local_client_pending_data (
+      generation INTEGER NOT NULL,
+      mutation_id TEXT NOT NULL,
+      local_sequence INTEGER NOT NULL,
+      basis INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      digest TEXT NOT NULL,
+      digest_version INTEGER NOT NULL CHECK (digest_version IN (1, 2)),
+      source_schema_version INTEGER,
+      source_schema_hash TEXT,
+      mutation_version INTEGER,
+      optimistic_result_json TEXT NOT NULL,
+      changes_json TEXT NOT NULL,
+      PRIMARY KEY (generation, mutation_id),
+      UNIQUE (generation, local_sequence)
+    )`,
+    `INSERT INTO effect_local_client_pending_data
+      SELECT (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1),
+        mutation_id, local_sequence, basis, name, payload_json, digest, digest_version,
+        source_schema_version, source_schema_hash, mutation_version, optimistic_result_json, changes_json
+      FROM effect_local_pending`,
+    `CREATE TABLE effect_local_client_receipts_data (
+      generation INTEGER NOT NULL,
+      mutation_id TEXT NOT NULL,
+      local_sequence INTEGER NOT NULL,
+      receipt_json TEXT NOT NULL,
+      source_schema_version INTEGER,
+      source_schema_hash TEXT,
+      mutation_version INTEGER,
+      rejection_origin TEXT,
+      mutation_name TEXT,
+      PRIMARY KEY (generation, mutation_id),
+      UNIQUE (generation, local_sequence)
+    )`,
+    `INSERT INTO effect_local_client_receipts_data
+      SELECT (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1),
+        mutation_id, local_sequence, receipt_json, source_schema_version, source_schema_hash,
+        mutation_version, rejection_origin, mutation_name FROM effect_local_receipts`,
+    `CREATE TABLE effect_local_client_canonical_entities_data (
+      generation INTEGER NOT NULL,
+      model TEXT NOT NULL,
+      entity_key TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      model_version INTEGER,
+      PRIMARY KEY (generation, model, entity_key)
+    )`,
+    `INSERT INTO effect_local_client_canonical_entities_data
+      SELECT (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1),
+        model, entity_key, value_json, model_version FROM effect_local_canonical_entities`,
+    `CREATE TABLE effect_local_client_visible_entities_data (
+      generation INTEGER NOT NULL,
+      model TEXT NOT NULL,
+      entity_key TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      model_version INTEGER,
+      PRIMARY KEY (generation, model, entity_key)
+    )`,
+    `INSERT INTO effect_local_client_visible_entities_data
+      SELECT (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1),
+        model, entity_key, value_json, model_version FROM effect_local_visible_entities`,
+    "DROP TABLE effect_local_pending",
+    "DROP TABLE effect_local_receipts",
+    "DROP TABLE effect_local_canonical_entities",
+    "DROP TABLE effect_local_visible_entities",
+    "DELETE FROM effect_local_client_shadow_entities",
+    "DELETE FROM effect_local_client_shadow_visible_entities",
+    "DELETE FROM effect_local_client_shadow_receipts_v2",
+    "DELETE FROM effect_local_client_shadow_pending",
+    `CREATE VIEW effect_local_pending AS SELECT mutation_id, local_sequence, basis, name, payload_json,
+      digest, digest_version, source_schema_version, source_schema_hash, mutation_version,
+      optimistic_result_json, changes_json FROM effect_local_client_pending_data
+      WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)`,
+    `CREATE VIEW effect_local_receipts AS SELECT mutation_id, local_sequence, receipt_json,
+      source_schema_version, source_schema_hash, mutation_version, rejection_origin, mutation_name
+      FROM effect_local_client_receipts_data
+      WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)`,
+    `CREATE VIEW effect_local_canonical_entities AS SELECT model, entity_key, value_json, model_version
+      FROM effect_local_client_canonical_entities_data
+      WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)`,
+    `CREATE VIEW effect_local_visible_entities AS SELECT model, entity_key, value_json, model_version
+      FROM effect_local_client_visible_entities_data
+      WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)`,
+    `CREATE TRIGGER effect_local_pending_insert INSTEAD OF INSERT ON effect_local_pending BEGIN
+      INSERT INTO effect_local_client_pending_data
+        (generation, mutation_id, local_sequence, basis, name, payload_json, digest, digest_version,
+          source_schema_version, source_schema_hash, mutation_version, optimistic_result_json, changes_json)
+      VALUES ((SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1),
+        NEW.mutation_id, NEW.local_sequence, NEW.basis, NEW.name, NEW.payload_json, NEW.digest,
+        NEW.digest_version, NEW.source_schema_version, NEW.source_schema_hash, NEW.mutation_version,
+        NEW.optimistic_result_json, NEW.changes_json); END`,
+    `CREATE TRIGGER effect_local_pending_update INSTEAD OF UPDATE ON effect_local_pending BEGIN
+      UPDATE effect_local_client_pending_data SET mutation_id = NEW.mutation_id, local_sequence = NEW.local_sequence,
+        basis = NEW.basis, name = NEW.name, payload_json = NEW.payload_json, digest = NEW.digest,
+        digest_version = NEW.digest_version, source_schema_version = NEW.source_schema_version,
+        source_schema_hash = NEW.source_schema_hash, mutation_version = NEW.mutation_version,
+        optimistic_result_json = NEW.optimistic_result_json, changes_json = NEW.changes_json
+      WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)
+        AND mutation_id = OLD.mutation_id; END`,
+    `CREATE TRIGGER effect_local_pending_delete INSTEAD OF DELETE ON effect_local_pending BEGIN
+      DELETE FROM effect_local_client_pending_data
+      WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)
+        AND mutation_id = OLD.mutation_id; END`,
+    `CREATE TRIGGER effect_local_receipts_insert INSTEAD OF INSERT ON effect_local_receipts BEGIN
+      INSERT INTO effect_local_client_receipts_data
+        (generation, mutation_id, local_sequence, receipt_json, source_schema_version, source_schema_hash,
+          mutation_version, rejection_origin, mutation_name)
+      VALUES ((SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1),
+        NEW.mutation_id, NEW.local_sequence, NEW.receipt_json, NEW.source_schema_version, NEW.source_schema_hash,
+        NEW.mutation_version, NEW.rejection_origin, NEW.mutation_name); END`,
+    `CREATE TRIGGER effect_local_receipts_update INSTEAD OF UPDATE ON effect_local_receipts BEGIN
+      UPDATE effect_local_client_receipts_data SET mutation_id = NEW.mutation_id, local_sequence = NEW.local_sequence,
+        receipt_json = NEW.receipt_json, source_schema_version = NEW.source_schema_version,
+        source_schema_hash = NEW.source_schema_hash, mutation_version = NEW.mutation_version,
+        rejection_origin = NEW.rejection_origin, mutation_name = NEW.mutation_name
+      WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)
+        AND mutation_id = OLD.mutation_id; END`,
+    `CREATE TRIGGER effect_local_receipts_delete INSTEAD OF DELETE ON effect_local_receipts BEGIN
+      DELETE FROM effect_local_client_receipts_data
+      WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)
+        AND mutation_id = OLD.mutation_id; END`,
+    ...["canonical", "visible"].flatMap((kind) => [
+      `CREATE TRIGGER effect_local_${kind}_entities_insert INSTEAD OF INSERT ON effect_local_${kind}_entities BEGIN
+        INSERT INTO effect_local_client_${kind}_entities_data
+          (generation, model, entity_key, value_json, model_version)
+        VALUES ((SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1),
+          NEW.model, NEW.entity_key, NEW.value_json, NEW.model_version); END`,
+      `CREATE TRIGGER effect_local_${kind}_entities_update INSTEAD OF UPDATE ON effect_local_${kind}_entities BEGIN
+        UPDATE effect_local_client_${kind}_entities_data SET model = NEW.model, entity_key = NEW.entity_key,
+          value_json = NEW.value_json, model_version = NEW.model_version
+        WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)
+          AND model = OLD.model AND entity_key = OLD.entity_key; END`,
+      `CREATE TRIGGER effect_local_${kind}_entities_delete INSTEAD OF DELETE ON effect_local_${kind}_entities BEGIN
+        DELETE FROM effect_local_client_${kind}_entities_data
+        WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)
+          AND model = OLD.model AND entity_key = OLD.entity_key; END`
+    ])
+  ]
+})
+
+export const clientCatalog = Object.freeze([clientV1, clientV2, clientV3, clientV4, clientV5, clientV6, clientV7])
 
 const serverV6 = makeMigration({
   id: 6,
@@ -790,7 +945,84 @@ const serverV6 = makeMigration({
   ]
 })
 
-export const serverCatalog = Object.freeze([serverV1, serverV2, serverV3, serverV4, serverV5, serverV6])
+const serverV7 = makeMigration({
+  id: 7,
+  name: "generation-owned-storage",
+  statements: [
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN active_schema_generation INTEGER NOT NULL DEFAULT 0 CHECK (active_schema_generation >= 0)",
+    "ALTER TABLE effect_local_server_evolution ADD COLUMN source_generation INTEGER NOT NULL DEFAULT 0 CHECK (source_generation >= 0)",
+    "ALTER TABLE effect_local_server_evolution ADD COLUMN target_entity_count INTEGER NOT NULL DEFAULT 0 CHECK (target_entity_count >= 0)",
+    "ALTER TABLE effect_local_server_evolution ADD COLUMN target_entity_bytes INTEGER NOT NULL DEFAULT 0 CHECK (target_entity_bytes >= 0)",
+    `UPDATE effect_local_server_spaces SET active_schema_generation = CASE
+      WHEN EXISTS (SELECT 1 FROM effect_local_server_evolution AS e
+        WHERE e.space_id = effect_local_server_spaces.space_id)
+      THEN MAX(schema_generation - 1, 0) ELSE schema_generation END`,
+    `UPDATE effect_local_server_evolution SET source_generation =
+      (SELECT active_schema_generation FROM effect_local_server_spaces AS s
+        WHERE s.space_id = effect_local_server_evolution.space_id),
+      target_entity_count = 0, target_entity_bytes = 0,
+      phase = 'Log', cursor_model = NULL, cursor_key = NULL, cursor_sequence = 0`,
+    `CREATE TABLE effect_local_server_entities_data (
+      space_id TEXT NOT NULL,
+      generation INTEGER NOT NULL,
+      model TEXT NOT NULL,
+      entity_key TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      model_version INTEGER,
+      entity_bytes INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (space_id, generation, model, entity_key)
+    )`,
+    `INSERT INTO effect_local_server_entities_data
+      SELECT e.space_id, s.active_schema_generation, e.model, e.entity_key, e.value_json,
+        e.model_version, e.entity_bytes FROM effect_local_server_entities AS e
+      INNER JOIN effect_local_server_spaces AS s ON s.space_id = e.space_id`,
+    "DROP TABLE effect_local_server_entities",
+    "DELETE FROM effect_local_server_shadow_entities",
+    `CREATE INDEX effect_local_server_entities_largest
+      ON effect_local_server_entities_data (space_id, generation, entity_bytes DESC, model, entity_key)`,
+    `CREATE VIEW effect_local_server_entities AS
+      SELECT d.space_id, d.model, d.entity_key, d.value_json, d.model_version, d.entity_bytes
+      FROM effect_local_server_entities_data AS d
+      INNER JOIN effect_local_server_spaces AS s ON s.space_id = d.space_id
+        AND s.active_schema_generation = d.generation`,
+    `CREATE TRIGGER effect_local_server_entities_insert INSTEAD OF INSERT ON effect_local_server_entities BEGIN
+      INSERT INTO effect_local_server_entities_data
+        (space_id, generation, model, entity_key, value_json, model_version, entity_bytes)
+      VALUES (NEW.space_id, (SELECT active_schema_generation FROM effect_local_server_spaces
+        WHERE space_id = NEW.space_id), NEW.model, NEW.entity_key, NEW.value_json, NEW.model_version,
+        NEW.entity_bytes); END`,
+    `CREATE TRIGGER effect_local_server_entities_update INSTEAD OF UPDATE ON effect_local_server_entities BEGIN
+      UPDATE effect_local_server_entities_data SET space_id = NEW.space_id, model = NEW.model,
+        entity_key = NEW.entity_key, value_json = NEW.value_json, model_version = NEW.model_version,
+        entity_bytes = NEW.entity_bytes
+      WHERE space_id = OLD.space_id AND generation = (SELECT active_schema_generation
+        FROM effect_local_server_spaces WHERE space_id = OLD.space_id)
+        AND model = OLD.model AND entity_key = OLD.entity_key; END`,
+    `CREATE TRIGGER effect_local_server_entities_delete INSTEAD OF DELETE ON effect_local_server_entities BEGIN
+      DELETE FROM effect_local_server_entities_data WHERE space_id = OLD.space_id
+        AND generation = (SELECT active_schema_generation FROM effect_local_server_spaces
+          WHERE space_id = OLD.space_id) AND model = OLD.model AND entity_key = OLD.entity_key; END`,
+    `CREATE TRIGGER effect_local_server_entity_count_insert AFTER INSERT ON effect_local_server_entities_data
+      WHEN NEW.generation = (SELECT active_schema_generation FROM effect_local_server_spaces
+        WHERE space_id = NEW.space_id) BEGIN
+      UPDATE effect_local_server_spaces SET entity_count = entity_count + 1,
+        entity_bytes = entity_bytes + NEW.entity_bytes WHERE space_id = NEW.space_id; END`,
+    `CREATE TRIGGER effect_local_server_entity_count_delete AFTER DELETE ON effect_local_server_entities_data
+      WHEN OLD.generation = (SELECT active_schema_generation FROM effect_local_server_spaces
+        WHERE space_id = OLD.space_id) BEGIN
+      UPDATE effect_local_server_spaces SET entity_count = entity_count - 1,
+        entity_bytes = entity_bytes - OLD.entity_bytes WHERE space_id = OLD.space_id; END`,
+    `CREATE TRIGGER effect_local_server_entity_count_update AFTER UPDATE OF entity_bytes
+      ON effect_local_server_entities_data
+      WHEN NEW.generation = OLD.generation AND NEW.space_id = OLD.space_id AND
+        NEW.generation = (SELECT active_schema_generation FROM effect_local_server_spaces
+          WHERE space_id = NEW.space_id) BEGIN
+      UPDATE effect_local_server_spaces SET entity_bytes = entity_bytes + NEW.entity_bytes - OLD.entity_bytes
+        WHERE space_id = NEW.space_id; END`
+  ]
+})
+
+export const serverCatalog = Object.freeze([serverV1, serverV2, serverV3, serverV4, serverV5, serverV6, serverV7])
 
 export const client = (options: {
   readonly definition: Definition.Any
@@ -807,11 +1039,10 @@ export const client = (options: {
       execute: () => sql`SELECT space_id, client_id FROM effect_local_client_meta WHERE singleton = 1`
     })
     const existing = yield* readIdentity(undefined).pipe(
-      Effect.mapError((cause) =>
-        SqlError.isSqlError(cause)
-          ? StorageUnavailable.make(cause)
-          : new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause })
-      )
+      Effect.mapError((cause) => {
+        if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
+        return new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause })
+      })
     )
     if (
       Option.isSome(existing) &&
@@ -829,6 +1060,7 @@ export const client = (options: {
       requested_generation, completed_generation)
     VALUES (1, ${options.spaceId}, ${options.clientId}, ${options.definition.hash}, 1, 0, 0, 0, 0)
     ON CONFLICT (singleton) DO NOTHING`
+    return undefined
   }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
 export const server = (options: Options = defaultOptions) => runCatalog("Server", serverCatalog, options)

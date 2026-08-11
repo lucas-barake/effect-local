@@ -53,12 +53,14 @@ const workflowRegistrationStateSymbol = Symbol.for(
   "@lucas-barake/effect-local-sql/ReconciliationWorkflow/WorkflowRegistrationState"
 )
 
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))
+
 type EngineWithRegistrationState = WorkflowEngine.WorkflowEngine["Service"] & {
   [workflowRegistrationStateSymbol]?: WorkflowRegistrationState
 }
 
 const replicaIdentityKey = (options: Pick<Options, "spaceId" | "clientId">) =>
-  JSON.stringify([options.spaceId, options.clientId])
+  encodeJson([options.spaceId, options.clientId])
 
 const workflowRegistrationState = (
   engine: WorkflowEngine.WorkflowEngine["Service"]
@@ -71,12 +73,12 @@ const workflowRegistrationState = (
 }
 
 export const make = ({ clientId, schemaIdentity: workflowSchemaIdentity, spaceId }: ReplicaIdentity) =>
-  Workflow.make(`effect-local/ReconcileReplica/v2/${JSON.stringify([workflowSchemaIdentity, spaceId, clientId])}`, {
+  Workflow.make(`effect-local/ReconcileReplica/v2/${encodeJson([workflowSchemaIdentity, spaceId, clientId])}`, {
     payload: PayloadFields,
     success: Schema.Void,
     error: ReplicaError.ReplicaError,
     idempotencyKey: (payload) =>
-      JSON.stringify([payload.schemaIdentity, payload.spaceId, payload.clientId, payload.generation])
+      encodeJson([payload.schemaIdentity, payload.spaceId, payload.clientId, payload.generation])
   })
 
 export const Execution = Schema.Struct({
@@ -99,19 +101,18 @@ export const start = (
   payload: Payload
 ): Effect.Effect<Execution, never, WorkflowEngine.WorkflowEngine> =>
   Effect.gen(function*() {
-    const executionId = yield* make(payload).execute(payload, { discard: true })
-    return Execution.make({ ...payload, executionId })
+    const workflowExecutionId = yield* make(payload).execute(payload, { discard: true })
+    return Execution.make({ ...payload, executionId: workflowExecutionId })
   })
 
 export const validateExecution = (execution: Execution): Effect.Effect<Payload, ReplicaError.ProtocolInvalid> =>
   make(execution).executionId(execution).pipe(
-    Effect.flatMap((expected) =>
-      expected === execution.executionId
-        ? Effect.succeed(Payload.make(execution))
-        : Effect.fail(
-          new ReplicaError.ProtocolInvalid({ message: "Reconciliation execution ID does not match payload" })
-        )
-    )
+    Effect.flatMap((expected) => {
+      if (expected === execution.executionId) return Effect.succeed(Payload.make(execution))
+      return Effect.fail(
+        new ReplicaError.ProtocolInvalid({ message: "Reconciliation execution ID does not match payload" })
+      )
+    })
   )
 
 export const poll = (execution: Execution) =>
@@ -238,6 +239,7 @@ const handler = (
     yield* runActivity("sync", reconciliation.sync)
     yield* runActivity("complete", local.completeReconciliation(payload.generation))
     yield* reconciliation.succeeded
+    return undefined
   })
 
 const layerRegistrationWithConfiguration = (
@@ -312,7 +314,7 @@ const layerRegistrationWithConfiguration = (
       legacyDefinitions.delete(options.definition.hash)
       for (const [definitionHash, definition] of legacyDefinitions) {
         const legacy = Workflow.make(
-          `effect-local/ReconcileReplica/${JSON.stringify([definitionHash, options.spaceId, options.clientId])}`,
+          `effect-local/ReconcileReplica/${encodeJson([definitionHash, options.spaceId, options.clientId])}`,
           {
             payload: {
               definitionHash: Schema.String,

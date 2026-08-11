@@ -16,14 +16,13 @@ const gatedPayload = Effect.gen(function*() {
   const started = yield* Deferred.make<void>()
   const release = yield* Deferred.make<void>()
   const schema = Payload.pipe(Schema.decode({
-    decode: SchemaGetter.transformOrFail((value: typeof Payload.Type) =>
-      value.cursor !== 1
-        ? Effect.succeed(value)
-        : Deferred.succeed(started, undefined).pipe(
-          Effect.andThen(Deferred.await(release)),
-          Effect.as(value)
-        )
-    ),
+    decode: SchemaGetter.transformOrFail((value: typeof Payload.Type) => {
+      if (value.cursor !== 1) return Effect.succeed(value)
+      return Deferred.succeed(started, undefined).pipe(
+        Effect.andThen(Deferred.await(release)),
+        Effect.as(value)
+      )
+    }),
     encode: SchemaGetter.passthrough()
   }))
   return { schema, started, release }

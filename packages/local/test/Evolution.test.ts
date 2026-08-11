@@ -97,10 +97,11 @@ describe("schema evolution", () => {
     )
     const definitionV3 = Definition.make({ version: 3, models: [TodoV2], mutations: [PutTodoV2] })
     assert.throws(
-      () => Evolution.make({
-        current: definitionV3,
-        steps: [oneToTwo]
-      }),
+      () =>
+        Evolution.make({
+          current: definitionV3,
+          steps: [oneToTwo]
+        }),
       /does not terminate/
     )
     assert.strictEqual(evolution.legacyBaselineByHash.get("0123456789abcdef")?.definition, definitionV1)
@@ -180,7 +181,7 @@ describe("schema evolution", () => {
   })
 
   it.effect("preserves thrown migration failures as defects", () => {
-    const defect = new Error("migration implementation defect")
+    const defect = Error("migration implementation defect")
     const broken = Evolution.step({
       id: "definition/defect",
       from: definitionV1,
@@ -190,7 +191,7 @@ describe("schema evolution", () => {
         from: TodoV1,
         to: TodoV2,
         key: () => {
-          throw defect
+          return Effect.runSync(Effect.die(defect))
         },
         value: ({ value }) => ({ ...value, done: false })
       })],

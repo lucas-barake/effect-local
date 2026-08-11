@@ -14,13 +14,13 @@ export class Principal extends Context.Service<Principal, typeof Schema.Json.Typ
   "@lucas-barake/effect-local-rpc/Principal"
 ) {}
 
-export class Credentials extends Context.Service<Credentials, Redacted.Redacted<string>>()(
+export class Credentials extends Context.Service<Credentials, Redacted.Redacted>()(
   "@lucas-barake/effect-local-rpc/Credentials"
 ) {}
 
 export class Authenticator extends Context.Service<Authenticator, {
   readonly authenticate: (
-    credential: Redacted.Redacted<string>
+    credential: Redacted.Redacted
   ) => Effect.Effect<typeof Schema.Json.Type, AuthenticationFailure>
 }>()("@lucas-barake/effect-local-rpc/Authenticator") {}
 
@@ -52,11 +52,9 @@ export const layerServer: Layer.Layer<Authentication, never, Authenticator> = La
 export const layerClient = RpcMiddleware.layerClient(
   Authentication,
   Credentials.pipe(Effect.map((credential) => ({ next, request }) =>
-    next(
-      {
-        ...request,
-        headers: Headers.set(request.headers, "authorization", `Bearer ${Redacted.value(credential)}`)
-      } as typeof request
-    )
+    next({
+      ...request,
+      headers: Headers.set(request.headers, "authorization", `Bearer ${Redacted.value(credential)}`)
+    })
   ))
 )

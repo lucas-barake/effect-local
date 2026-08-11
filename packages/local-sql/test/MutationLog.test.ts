@@ -1132,7 +1132,10 @@ describe("server reconciled mutation log", () => {
           definition: Domain.definition,
           authorizeAccess: () =>
             Ref.get(access).pipe(
-              Effect.flatMap((allowed) => allowed ? Effect.void : Effect.fail({ reason: "revoked" }))
+              Effect.flatMap((allowed) => {
+                if (allowed) return Effect.void
+                return Effect.fail({ reason: "revoked" })
+              })
             ),
           authorizeMutation: () => Effect.void,
           authorizeRead: () => Effect.void
@@ -1662,9 +1665,10 @@ describe("server reconciled mutation log", () => {
     Effect.scoped(Effect.gen(function*() {
       const server = yield* service(
         ServerStore.ServerStore,
-        serverLayer(({ mutation }) =>
-          mutation.name === Domain.RenameTodo.name ? Effect.fail({ reason: "denied" }) : Effect.void
-        )
+        serverLayer(({ mutation }) => {
+          if (mutation.name === Domain.RenameTodo.name) return Effect.fail({ reason: "denied" })
+          return Effect.void
+        })
       )
       const services = yield* Layer.build(clientServices(clientId, server))
       const local = Context.get(services, LocalStore.Store)
@@ -1759,15 +1763,16 @@ describe("server reconciled mutation log", () => {
           watch: () =>
             Stream.unwrap(
               Ref.modify(subscriptions, (count) => [count, count + 1]).pipe(
-                Effect.flatMap((count) =>
-                  count === 0
-                    ? firstSubscribed.open.pipe(Effect.as(Stream.fail(
+                Effect.flatMap((count) => {
+                  if (count === 0) {
+                    return firstSubscribed.open.pipe(Effect.as(Stream.fail(
                       new ReplicaError.ProtocolInvalid({
                         message: "disconnected"
                       })
                     )))
-                    : Effect.succeed(Stream.never)
-                )
+                  }
+                  return Effect.succeed(Stream.never)
+                })
               )
             )
         })
@@ -2046,6 +2051,10 @@ describe("server reconciled mutation log", () => {
       yield* Fiber.join(mutation)
       yield* Deferred.succeed(release, undefined)
       assert.deepStrictEqual(yield* Fiber.join(query), [0, 0])
+
+      const counterfeit = Query.make("ReadSnapshotPair", { success: Schema.String, dependsOn: [Item] })
+      const error = yield* queryExecutor.execute(counterfeit, undefined).pipe(Effect.flip)
+      assert.strictEqual(error._tag, "ProtocolInvalid")
     })).pipe(Effect.provide(NodeFileSystem.layer)))
 
   it.effect("rejects a receipt for another replica without settling pending work", () =>

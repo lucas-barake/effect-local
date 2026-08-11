@@ -34,6 +34,7 @@ export interface Options {
   readonly maximumPendingMutations?: number
   readonly evolution?: Evolution.Evolution
   readonly schemaEvolutionBatchSize?: number
+  readonly schemaEvolutionBatchBytes?: number
   readonly retainedReceipts: number
   readonly maximumReceipts: number
   readonly retainedHistoryEntries: number
@@ -161,51 +162,58 @@ export const layer = (
       }
       yield* Migrations.client(options)
       const evolution = options.evolution ?? Evolution.make({ current: options.definition })
-      yield* SchemaEvolution.client({
+      let evolutionOptions: SchemaEvolution.ClientOptions = {
         definition: options.definition,
         evolution,
         spaceId: options.spaceId,
-        clientId: options.clientId,
-        ...(options.schemaEvolutionBatchSize === undefined
-          ? {}
-          : { batchSize: options.schemaEvolutionBatchSize })
-      })
+        clientId: options.clientId
+      }
+      if (options.schemaEvolutionBatchSize !== undefined) {
+        evolutionOptions = { ...evolutionOptions, batchSize: options.schemaEvolutionBatchSize }
+      }
+      if (options.schemaEvolutionBatchBytes !== undefined) {
+        evolutionOptions = { ...evolutionOptions, batchBytes: options.schemaEvolutionBatchBytes }
+      }
+      yield* SchemaEvolution.client(evolutionOptions)
       const registerLineage = ClientLineage.make(sql)
 
       const migrateEntryChanges = (entry: Protocol.AcceptedMutation) =>
-        Effect.forEach(entry.changes, (change) =>
-          Evolution.migrateModel({
+        Effect.forEach(entry.changes, (change) => {
+          const migration = {
             evolution,
             source: entry.sourceSchema,
             model: change.entity.model,
             modelVersion: change.entity.modelVersion,
-            key: change.entity.key,
-            ...(change._tag === "Upsert" ? { value: change.value } : {})
-          }).pipe(
-            Effect.flatMap((migrated) =>
-              Effect.gen(function*() {
-                yield* registerLineage(change.entity.model, migrated)
-                const entity = {
-                  model: change.entity.model,
-                  modelVersion: migrated.modelVersion,
-                  key: migrated.key
-                }
-                if (change._tag === "Delete") return Protocol.Delete.make({ entity })
-                if (migrated.value === undefined) {
-                  return yield* new ReplicaError.StorageCorrupt({
-                    message: `Migrated upsert for ${change.entity.model} has no value`
-                  })
-                }
-                return Protocol.Upsert.make({ entity, value: migrated.value })
-              })
-            )
-          ))
+            key: change.entity.key
+          }
+          const finish = (migrated: Evolution.MigratedModel) =>
+            Effect.gen(function*() {
+              yield* registerLineage(change.entity.model, migrated)
+              const entity = {
+                model: change.entity.model,
+                modelVersion: migrated.modelVersion,
+                key: migrated.key
+              }
+              if (change._tag === "Delete") return Protocol.Delete.make({ entity })
+              if (migrated.value === undefined) {
+                return yield* new ReplicaError.StorageCorrupt({
+                  message: `Migrated upsert for ${change.entity.model} has no value`
+                })
+              }
+              return Protocol.Upsert.make({ entity, value: migrated.value })
+            })
+          if (change._tag === "Upsert") {
+            return Evolution.migrateModel({ ...migration, value: change.value }).pipe(Effect.flatMap(finish))
+          }
+          return Evolution.migrateModel(migration).pipe(Effect.flatMap(finish))
+        })
 
       const findMeta = SqlSchema.findOne({
         Request: Schema.Void,
         Result: Rows.ClientMetaRow,
         execute: () =>
           sql`SELECT space_id, client_id, definition_hash, schema_version, schema_hash, schema_generation,
+          active_schema_generation,
           target_schema_version, target_schema_hash, migration_hash,
           next_local_sequence, server_cursor, visible_revision,
           requested_generation, completed_generation, installed_snapshot_id, installed_snapshot_sequence,
@@ -343,6 +351,7 @@ export const layer = (
         })
       }
       const schemaGeneration = initializedMeta.schema_generation
+      const activeGeneration = initializedMeta.active_schema_generation
       const validateFence = (current: typeof Rows.ClientMetaRow.Type) => {
         if (current.schema_generation !== schemaGeneration) {
           return Effect.fail(
@@ -447,16 +456,24 @@ export const layer = (
           for (const entity of dirty.values()) {
             const keyJson = yield* Codec.stringify(entity.key)
             yield* sql`DELETE FROM effect_local_visible_entities WHERE model = ${entity.model} AND entity_key = ${keyJson}`
-            yield* sql`INSERT INTO effect_local_visible_entities (model, entity_key, value_json, model_version)
-          SELECT model, entity_key, value_json, model_version FROM effect_local_canonical_entities
-          WHERE model = ${entity.model} AND entity_key = ${keyJson}`
+            yield* sql`INSERT INTO effect_local_client_visible_entities_data
+              (generation, model, entity_key, value_json, model_version)
+            SELECT ${activeGeneration}, model, entity_key, value_json, model_version
+            FROM effect_local_client_canonical_entities_data
+            WHERE generation = ${activeGeneration} AND model = ${entity.model} AND entity_key = ${keyJson}`
           }
           for (const item of replayPending) {
             const changes: Array<Protocol.EntityChange> = []
             const result = yield* sql.withTransaction(
               runtime.executeEnvelope(
                 item.envelope,
-                SqlTransaction.local({ sql, definition: options.definition, table: "visible", changes }),
+                SqlTransaction.local({
+                  sql,
+                  definition: options.definition,
+                  table: "visible",
+                  generation: activeGeneration,
+                  changes
+                }),
                 changes
               ).pipe(
                 Effect.flatMap((executionResult) => {
@@ -605,12 +622,16 @@ export const layer = (
             } else if (receipt._tag === "Expired") {
               receiptName = pendingMutation.envelope.name
             }
-            yield* sql`INSERT INTO effect_local_receipts
-          (mutation_id, local_sequence, receipt_json, source_schema_version, source_schema_hash,
-            mutation_version, mutation_name, rejection_origin)
-          VALUES (${receipt.mutationId}, ${receipt.localSequence}, ${yield* Codec.stringify(receipt)},
+            let rejectionOrigin: string | null = null
+            if (receipt._tag === "Rejected") rejectionOrigin = receipt.origin
+            else if (receipt._tag === "Legacy") rejectionOrigin = "Legacy"
+            yield* sql`INSERT INTO effect_local_client_receipts_data
+              (generation, mutation_id, local_sequence, receipt_json, source_schema_version, source_schema_hash,
+                mutation_version, mutation_name, rejection_origin)
+              VALUES (${activeGeneration}, ${receipt.mutationId}, ${receipt.localSequence},
+                ${yield* Codec.stringify(receipt)},
             ${receiptSchema.version}, ${receiptSchema.hash}, ${receiptMutationVersion}, ${receiptName},
-            ${receipt._tag === "Rejected" ? receipt.origin : receipt._tag === "Legacy" ? "Legacy" : null})`
+            ${rejectionOrigin})`
             inserted = true
             return yield* Effect.void
           })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
@@ -1114,13 +1135,16 @@ export const layer = (
             }
 
             yield* sql`DELETE FROM effect_local_canonical_entities`
-            yield* sql`INSERT INTO effect_local_canonical_entities (model, model_version, entity_key, value_json)
-              SELECT model, model_version, entity_key, value_json
+            yield* sql`INSERT INTO effect_local_client_canonical_entities_data
+              (generation, model, model_version, entity_key, value_json)
+              SELECT ${activeGeneration}, model, model_version, entity_key, value_json
               FROM effect_local_bootstrap_entities ORDER BY ordinal`
             yield* sql`DELETE FROM effect_local_server_log WHERE server_sequence <= ${manifest.sequence}`
             yield* sql`DELETE FROM effect_local_visible_entities`
-            yield* sql`INSERT INTO effect_local_visible_entities (model, model_version, entity_key, value_json)
-              SELECT model, model_version, entity_key, value_json FROM effect_local_canonical_entities`
+            yield* sql`INSERT INTO effect_local_client_visible_entities_data
+              (generation, model, model_version, entity_key, value_json)
+              SELECT ${activeGeneration}, model, model_version, entity_key, value_json
+              FROM effect_local_client_canonical_entities_data WHERE generation = ${activeGeneration}`
             yield* restoreAndReplay([])
             yield* sql`UPDATE effect_local_client_meta SET
               server_cursor = ${manifest.sequence},
@@ -1252,7 +1276,13 @@ export const layer = (
               const executed = yield* runtime.execute(
                 mutation.name,
                 payloadJsonValue,
-                SqlTransaction.local({ sql, definition: options.definition, table: "visible", changes }),
+                SqlTransaction.local({
+                  sql,
+                  definition: options.definition,
+                  table: "visible",
+                  generation: activeGeneration,
+                  changes
+                }),
                 changes
               )
               if (Result.isFailure(executed)) {
@@ -1264,10 +1294,10 @@ export const layer = (
                 optimisticResult: executed.success.result,
                 changes
               }
-              yield* sql`INSERT INTO effect_local_pending
-            (mutation_id, local_sequence, basis, name, payload_json, digest, digest_version,
+              yield* sql`INSERT INTO effect_local_client_pending_data
+            (generation, mutation_id, local_sequence, basis, name, payload_json, digest, digest_version,
               source_schema_version, source_schema_hash, mutation_version, optimistic_result_json, changes_json)
-            VALUES (${mutationId}, ${envelope.localSequence}, ${envelope.basis}, ${envelope.name},
+            VALUES (${activeGeneration}, ${mutationId}, ${envelope.localSequence}, ${envelope.basis}, ${envelope.name},
               ${yield* Codec.stringify(envelope.payload)}, ${digest}, ${envelope.digestVersion},
               ${envelope.sourceSchema.version}, ${envelope.sourceSchema.hash}, ${envelope.mutationVersion}, ${yield* Codec
                 .stringify(
@@ -1293,7 +1323,12 @@ export const layer = (
         get: (model, key) =>
           sql.withTransaction(Effect.gen(function*() {
             yield* validateFence(yield* meta)
-            return yield* SqlTransaction.local({ sql, definition: options.definition, table: "visible" }).get(
+            return yield* SqlTransaction.local({
+              sql,
+              definition: options.definition,
+              table: "visible",
+              generation: activeGeneration
+            }).get(
               model,
               key
             )
@@ -1303,13 +1338,12 @@ export const layer = (
           sql.withTransaction(Effect.gen(function*() {
             yield* validateFence(yield* meta)
             const row = yield* findReceipt(mutationId).pipe(Effect.mapError(StorageUnavailable.make))
-            return Option.isNone(row)
-              ? Option.none()
-              : Option.some(
-                yield* Codec.parse(row.value.receipt_json).pipe(
-                  Effect.flatMap((value) => Codec.decode(Protocol.Receipt, value))
-                )
+            if (Option.isNone(row)) return Option.none()
+            return Option.some(
+              yield* Codec.parse(row.value.receipt_json).pipe(
+                Effect.flatMap((value) => Codec.decode(Protocol.Receipt, value))
               )
+            )
           })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
         cursor: sql.withTransaction(Effect.gen(function*() {
           const row = yield* meta
@@ -1371,7 +1405,7 @@ export const layer = (
                 const currentChanges = yield* migrateEntryChanges(entry)
                 for (const change of currentChanges) {
                   touched.push(change.entity)
-                  yield* SqlTransaction.applyLocalChange(sql, "canonical", change)
+                  yield* SqlTransaction.applyLocalChange(sql, "canonical", activeGeneration, change)
                 }
                 if (entry.clientId === options.clientId) {
                   const storedPending = yield* findPendingByMutation(entry.mutationId).pipe(
@@ -1437,6 +1471,7 @@ export const layer = (
               touched,
               [...settledReceiptIds, ...prunedReceiptIds]
             )
+            return undefined
           }).pipe(Effect.withSpan("LocalStore.applyEntries", {
             attributes: { "entry.count": entries.length, "space.id": options.spaceId }
           })),

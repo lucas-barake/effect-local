@@ -97,7 +97,8 @@ export const make = <A,>(schema: Schema.Decoder<A>, options: { readonly timeToLi
           yield* Ref.update(state, (current) =>
             updateClient(current, clientId, (client) => {
               const settled = removeInFlight(client, token)
-              return token < settled.barrier ? settled : {
+              if (token < settled.barrier) return settled
+              return {
                 ...settled,
                 barrier: token,
                 entry: { clientId, value: decoded, expiresAtMillis, token }
@@ -110,8 +111,10 @@ export const make = <A,>(schema: Schema.Decoder<A>, options: { readonly timeToLi
       Ref.update(
         state,
         (current) =>
-          updateClient(current, clientId, (client) =>
-            client.entry?.token === token ? { ...client, entry: undefined } : client)
+          updateClient(current, clientId, (client) => {
+            if (client.entry?.token === token) return { ...client, entry: undefined }
+            return client
+          })
       )
     return {
       receive: (clientId, value) => set(clientId, value).pipe(Effect.asVoid),

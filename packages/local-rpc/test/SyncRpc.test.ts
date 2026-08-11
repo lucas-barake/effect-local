@@ -28,7 +28,7 @@ describe("SyncRpc serialization", () => {
       const parser = service.makeUnsafe()
       const protocolDefect = parser.encode({
         _tag: "Defect",
-        defect: new Error("protocol secret")
+        defect: "protocol secret"
       })
       const typedFailure = parser.encode({
         _tag: "Exit",
