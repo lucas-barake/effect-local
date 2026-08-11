@@ -22,6 +22,13 @@ const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-00000000000
 const LedgerRow = Schema.Struct({ id: Schema.Number, name: Schema.String, checksum: Schema.String })
 const NameRow = Schema.Struct({ name: Schema.String })
 const CountRow = Schema.Struct({ count: Schema.Number })
+const ClientReplicationMetaRow = Schema.Struct({
+  replication_view_id: Schema.NullOr(Schema.String),
+  replication_view_revision: Schema.Number,
+  desired_scope_json: Schema.String,
+  desired_scope_digest: Schema.String,
+  scope_generation: Schema.Number
+})
 const LegacyClientRow = Schema.Struct({
   definition_hash: Schema.String,
   schema_version: Schema.NullOr(Schema.Number),
@@ -140,8 +147,8 @@ describe("storage migration catalogs", () => {
       })
       yield* Migrations.server()
 
-      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7])
-      assert.deepStrictEqual((yield* serverMigrationLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7])
+      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7, 8])
+      assert.deepStrictEqual((yield* serverMigrationLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7, 8])
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
         "effect_local_client_evolution",
@@ -158,13 +165,72 @@ describe("storage migration catalogs", () => {
         "effect_local_client_pending_data",
         "effect_local_client_receipts_data",
         "effect_local_client_visible_entities_data",
+        "effect_local_client_retractions",
+        "effect_local_client_scoped_bootstrap",
+        "effect_local_client_scoped_bootstrap_entries",
         "effect_local_server_evolution",
         "effect_local_server_key_lineage",
         "effect_local_server_key_lineage_groups",
         "effect_local_server_key_lineage_targets",
         "effect_local_server_shadow_entities",
-        "effect_local_server_entities_data"
+        "effect_local_server_entities_data",
+        "effect_local_server_replication_views",
+        "effect_local_server_replication_view_entities",
+        "effect_local_server_replication_pages",
+        "effect_local_server_scoped_snapshots",
+        "effect_local_server_scoped_snapshot_entries"
       ])
+    }).pipe(Effect.provide(database)))
+
+  it.effect("upgrades V7 storage without fabricating a client view", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrations.runCatalog("Client", Migrations.clientCatalog.slice(0, 7))
+      yield* Migrations.runCatalog("Server", Migrations.serverCatalog.slice(0, 7))
+      yield* sql`INSERT INTO effect_local_client_meta
+        (singleton, space_id, client_id, definition_hash, next_local_sequence, server_cursor,
+          visible_revision, requested_generation, completed_generation, schema_version, schema_hash,
+          schema_generation, active_schema_generation)
+        VALUES (1, ${spaceId}, ${clientId}, ${Domain.definition.hash}, 1, 0, 0, 0, 0,
+          ${Domain.definition.schemaIdentity.version}, ${Domain.definition.schemaIdentity.hash}, 0, 0)`
+      yield* sql`INSERT INTO effect_local_server_spaces
+        (space_id, definition_hash, next_server_sequence, schema_version, schema_hash, schema_generation,
+          next_terminal_sequence, history_floor, receipt_floor, retained_history_count,
+          retained_receipt_count, entity_count, entity_bytes, snapshot_sequence,
+          snapshot_terminal_sequence, metadata_verified, active_schema_generation)
+        VALUES (${spaceId}, ${Domain.definition.hash}, 1, ${Domain.definition.schemaIdentity.version},
+          ${Domain.definition.schemaIdentity.hash}, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0)`
+
+      yield* Migrations.client({ definition: Domain.definition, spaceId, clientId })
+      yield* Migrations.server()
+
+      const meta = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: ClientReplicationMetaRow,
+        execute: () =>
+          sql`SELECT replication_view_id, replication_view_revision, desired_scope_json,
+            desired_scope_digest, scope_generation
+          FROM effect_local_client_meta WHERE singleton = 1`
+      })(undefined)
+      assert.deepStrictEqual(meta, {
+        replication_view_id: null,
+        replication_view_revision: 0,
+        desired_scope_json: "{\"models\":[]}",
+        desired_scope_digest: "0".repeat(64),
+        scope_generation: 0
+      })
+      const clientRetractions = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: CountRow,
+        execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_client_retractions`
+      })(undefined)
+      const serverViews = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: CountRow,
+        execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_server_replication_views`
+      })(undefined)
+      assert.strictEqual(clientRetractions.count, 0)
+      assert.strictEqual(serverViews.count, 0)
     }).pipe(Effect.provide(database)))
 
   it.effect("claims pending migrations before executing their effects", () =>

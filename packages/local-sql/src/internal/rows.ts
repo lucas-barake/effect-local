@@ -26,6 +26,21 @@ export const ClientMetaRow = Schema.Struct({
   installed_snapshot_terminal_sequence: Identity.TerminalSequence
 })
 
+export const ClientReplicationMetaRow = Schema.Struct({
+  replication_view_id: Schema.NullOr(Identity.ReplicationViewId),
+  replication_view_revision: Identity.ReplicationViewRevision,
+  desired_scope_json: Schema.String,
+  desired_scope_digest: Protocol.MutationDigest,
+  scope_generation: Identity.ReplicationScopeGeneration
+})
+
+export const ClientRetractionRow = Schema.Struct({
+  generation: NonNegativeInt,
+  model: Schema.String,
+  model_version: Identity.SchemaVersion,
+  entity_key: Schema.String
+})
+
 export const EntityRow = Schema.Struct({ value_json: Schema.String })
 export const SizedEntityRow = Schema.Struct({
   value_json: Schema.String,
@@ -181,6 +196,70 @@ export const SnapshotEntityWireRow = Schema.Struct({
   ordinal: NonNegativeInt,
   wire_json: Schema.String,
   wire_bytes: PositiveInt
+})
+
+export const ReplicationViewRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  client_id: Identity.ClientId,
+  principal_digest: Protocol.MutationDigest,
+  view_id: Identity.ReplicationViewId,
+  view_revision: Identity.ReplicationViewRevision,
+  scope_generation: Identity.ReplicationScopeGeneration,
+  scope_json: Schema.String,
+  scope_digest: Protocol.MutationDigest,
+  definition_hash: Schema.String,
+  schema_version: Identity.SchemaVersion,
+  schema_hash: Identity.SchemaHash,
+  server_sequence: Identity.ServerSequence
+})
+
+export const ReplicationViewEntityRow = Schema.Struct({
+  model: Schema.String,
+  model_version: Identity.SchemaVersion,
+  entity_key: Schema.String,
+  disposition: Schema.Literals(["Upsert", "Delete", "Retract"]),
+  value_json: Schema.NullOr(Schema.String)
+})
+
+export const ReplicationPageRow = Schema.Struct({
+  principal_digest: Protocol.MutationDigest,
+  view_id: Identity.ReplicationViewId,
+  base_revision: Identity.ReplicationViewRevision,
+  target_revision: Identity.ReplicationViewRevision,
+  scope_generation: Identity.ReplicationScopeGeneration,
+  scope_json: Schema.String,
+  scope_digest: Protocol.MutationDigest,
+  server_sequence: Identity.ServerSequence,
+  changes_json: Schema.String,
+  content_bytes: NonNegativeInt,
+  digest: Protocol.MutationDigest,
+  has_more: Schema.Literals([0, 1])
+})
+
+export const ScopedSnapshotManifestRow = Schema.Struct({
+  snapshot_id: Identity.SnapshotId,
+  space_id: Identity.SpaceId,
+  client_id: Identity.ClientId,
+  principal_digest: Protocol.MutationDigest,
+  definition_hash: Schema.String,
+  schema_version: Identity.SchemaVersion,
+  schema_hash: Identity.SchemaHash,
+  scope_json: Schema.String,
+  scope_digest: Protocol.MutationDigest,
+  scope_generation: Identity.ReplicationScopeGeneration,
+  view_id: Identity.ReplicationViewId,
+  view_revision: Identity.ReplicationViewRevision,
+  server_sequence: Identity.ServerSequence,
+  terminal_sequence: Identity.TerminalSequence,
+  entry_count: NonNegativeInt,
+  content_bytes: NonNegativeInt,
+  digest: Protocol.SnapshotDigest
+})
+
+export const ScopedSnapshotEntryRow = Schema.Struct({
+  ordinal: NonNegativeInt,
+  change_json: Schema.String,
+  entry_bytes: PositiveInt
 })
 
 export const BootstrapRow = Schema.Struct({

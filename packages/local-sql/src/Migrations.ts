@@ -934,7 +934,66 @@ const clientV7 = makeMigration({
   ]
 })
 
-export const clientCatalog = Object.freeze([clientV1, clientV2, clientV3, clientV4, clientV5, clientV6, clientV7])
+const clientV8 = makeMigration({
+  id: 8,
+  name: "scoped-replication",
+  statements: [
+    "ALTER TABLE effect_local_client_meta ADD COLUMN replication_view_id TEXT",
+    "ALTER TABLE effect_local_client_meta ADD COLUMN replication_view_revision INTEGER NOT NULL DEFAULT 0 CHECK (replication_view_revision >= 0)",
+    `ALTER TABLE effect_local_client_meta ADD COLUMN desired_scope_json TEXT NOT NULL DEFAULT '{"models":[]}'
+      CHECK (json_valid(desired_scope_json))`,
+    `ALTER TABLE effect_local_client_meta ADD COLUMN desired_scope_digest TEXT NOT NULL
+      DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'
+      CHECK (length(desired_scope_digest) = 64)`,
+    "ALTER TABLE effect_local_client_meta ADD COLUMN scope_generation INTEGER NOT NULL DEFAULT 0 CHECK (scope_generation >= 0)",
+    `CREATE TABLE effect_local_client_retractions (
+      generation INTEGER NOT NULL CHECK (generation >= 0),
+      model TEXT NOT NULL,
+      model_version INTEGER NOT NULL CHECK (model_version > 0),
+      entity_key TEXT NOT NULL,
+      PRIMARY KEY (generation, model, entity_key)
+    )`,
+    `CREATE TABLE effect_local_client_scoped_bootstrap (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      snapshot_id TEXT NOT NULL,
+      space_id TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      definition_hash TEXT NOT NULL,
+      schema_version INTEGER NOT NULL,
+      schema_hash TEXT NOT NULL,
+      scope_digest TEXT NOT NULL CHECK (length(scope_digest) = 64),
+      scope_generation INTEGER NOT NULL CHECK (scope_generation >= 0),
+      view_id TEXT NOT NULL,
+      view_revision INTEGER NOT NULL CHECK (view_revision >= 0),
+      server_sequence INTEGER NOT NULL CHECK (server_sequence >= 0),
+      terminal_sequence INTEGER NOT NULL CHECK (terminal_sequence >= 0),
+      entry_count INTEGER NOT NULL CHECK (entry_count >= 0),
+      content_bytes INTEGER NOT NULL CHECK (content_bytes >= 0),
+      digest TEXT NOT NULL CHECK (length(digest) = 64),
+      next_ordinal INTEGER NOT NULL CHECK (next_ordinal >= 0),
+      received_bytes INTEGER NOT NULL CHECK (received_bytes >= 0),
+      rolling_digest TEXT NOT NULL CHECK (length(rolling_digest) = 64)
+    )`,
+    `CREATE TABLE effect_local_client_scoped_bootstrap_entries (
+      snapshot_id TEXT NOT NULL,
+      ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+      change_json TEXT NOT NULL CHECK (json_valid(change_json)),
+      entry_bytes INTEGER NOT NULL CHECK (entry_bytes > 0),
+      PRIMARY KEY (snapshot_id, ordinal)
+    )`
+  ]
+})
+
+export const clientCatalog = Object.freeze([
+  clientV1,
+  clientV2,
+  clientV3,
+  clientV4,
+  clientV5,
+  clientV6,
+  clientV7,
+  clientV8
+])
 
 const serverV6 = makeMigration({
   id: 6,
@@ -1022,7 +1081,98 @@ const serverV7 = makeMigration({
   ]
 })
 
-export const serverCatalog = Object.freeze([serverV1, serverV2, serverV3, serverV4, serverV5, serverV6, serverV7])
+const serverV8 = makeMigration({
+  id: 8,
+  name: "scoped-replication",
+  statements: [
+    `CREATE TABLE effect_local_server_replication_views (
+      space_id TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      principal_digest TEXT NOT NULL CHECK (length(principal_digest) = 64),
+      view_id TEXT NOT NULL,
+      view_revision INTEGER NOT NULL CHECK (view_revision >= 0),
+      scope_generation INTEGER NOT NULL CHECK (scope_generation >= 0),
+      scope_json TEXT NOT NULL CHECK (json_valid(scope_json)),
+      scope_digest TEXT NOT NULL CHECK (length(scope_digest) = 64),
+      definition_hash TEXT NOT NULL,
+      schema_version INTEGER NOT NULL,
+      schema_hash TEXT NOT NULL,
+      server_sequence INTEGER NOT NULL CHECK (server_sequence >= 0),
+      PRIMARY KEY (space_id, client_id)
+    )`,
+    `CREATE TABLE effect_local_server_replication_view_entities (
+      space_id TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      principal_digest TEXT NOT NULL CHECK (length(principal_digest) = 64),
+      view_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      model_version INTEGER NOT NULL CHECK (model_version > 0),
+      entity_key TEXT NOT NULL,
+      disposition TEXT NOT NULL CHECK (disposition IN ('Upsert', 'Delete', 'Retract')),
+      value_json TEXT CHECK (value_json IS NULL OR json_valid(value_json)),
+      PRIMARY KEY (space_id, client_id, view_id, model, entity_key)
+    )`,
+    `CREATE TABLE effect_local_server_replication_pages (
+      space_id TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      principal_digest TEXT NOT NULL CHECK (length(principal_digest) = 64),
+      view_id TEXT NOT NULL,
+      base_revision INTEGER NOT NULL CHECK (base_revision >= 0),
+      target_revision INTEGER NOT NULL CHECK (target_revision = base_revision + 1),
+      scope_generation INTEGER NOT NULL CHECK (scope_generation >= 0),
+      scope_json TEXT NOT NULL CHECK (json_valid(scope_json)),
+      scope_digest TEXT NOT NULL CHECK (length(scope_digest) = 64),
+      server_sequence INTEGER NOT NULL CHECK (server_sequence >= 0),
+      changes_json TEXT NOT NULL CHECK (json_valid(changes_json)),
+      content_bytes INTEGER NOT NULL CHECK (content_bytes >= 0),
+      digest TEXT NOT NULL CHECK (length(digest) = 64),
+      has_more INTEGER NOT NULL CHECK (has_more IN (0, 1)),
+      PRIMARY KEY (space_id, client_id)
+    )`,
+    `CREATE TABLE effect_local_server_scoped_snapshots (
+      snapshot_id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      principal_digest TEXT NOT NULL CHECK (length(principal_digest) = 64),
+      definition_hash TEXT NOT NULL,
+      schema_version INTEGER NOT NULL,
+      schema_hash TEXT NOT NULL,
+      scope_json TEXT NOT NULL CHECK (json_valid(scope_json)),
+      scope_digest TEXT NOT NULL CHECK (length(scope_digest) = 64),
+      scope_generation INTEGER NOT NULL CHECK (scope_generation >= 0),
+      view_id TEXT NOT NULL,
+      view_revision INTEGER NOT NULL CHECK (view_revision >= 0),
+      server_sequence INTEGER NOT NULL CHECK (server_sequence >= 0),
+      terminal_sequence INTEGER NOT NULL CHECK (terminal_sequence >= 0),
+      entry_count INTEGER NOT NULL CHECK (entry_count >= 0),
+      content_bytes INTEGER NOT NULL CHECK (content_bytes >= 0),
+      digest TEXT NOT NULL CHECK (length(digest) = 64),
+      UNIQUE (space_id, client_id)
+    )`,
+    `CREATE TABLE effect_local_server_scoped_snapshot_entries (
+      snapshot_id TEXT NOT NULL,
+      ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+      change_json TEXT NOT NULL CHECK (json_valid(change_json)),
+      entry_bytes INTEGER NOT NULL CHECK (entry_bytes > 0),
+      PRIMARY KEY (snapshot_id, ordinal)
+    )`,
+    `CREATE INDEX effect_local_server_replication_view_entities_identity
+      ON effect_local_server_replication_view_entities (space_id, client_id, model, entity_key)`,
+    `CREATE INDEX effect_local_server_scoped_snapshot_entries_page
+      ON effect_local_server_scoped_snapshot_entries (snapshot_id, ordinal)`
+  ]
+})
+
+export const serverCatalog = Object.freeze([
+  serverV1,
+  serverV2,
+  serverV3,
+  serverV4,
+  serverV5,
+  serverV6,
+  serverV7,
+  serverV8
+])
 
 export const client = (options: {
   readonly definition: Definition.Any
