@@ -5,36 +5,44 @@ import type * as HttpRouter from "effect/unstable/http/HttpRouter"
 import type * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
 import * as Authentication from "./Authentication.js"
+import * as PrincipalAssertion from "./PrincipalAssertion.js"
 import * as SpaceEntity from "./SpaceEntity.js"
 import * as SyncRpc from "./SyncRpc.js"
 
 export const layerHandlers = SyncRpc.Rpcs.toLayer(Effect.gen(function*() {
   const client = yield* SpaceEntity.Client
+  const issuer = yield* PrincipalAssertion.Issuer
   return SyncRpc.Rpcs.of({
     Submit: (request) =>
       Authentication.Principal.pipe(
-        Effect.flatMap((principal) => client.submit(request.envelope.spaceId, request, principal))
+        Effect.flatMap(issuer.issue),
+        Effect.flatMap((assertion) => client.submit(request.envelope.spaceId, request, assertion))
       ),
     Pull: (request) =>
       Authentication.Principal.pipe(
-        Effect.flatMap((principal) => client.pull(request.spaceId, request, principal))
+        Effect.flatMap(issuer.issue),
+        Effect.flatMap((assertion) => client.pull(request.spaceId, request, assertion))
       ),
     Bootstrap: (request) =>
       Authentication.Principal.pipe(
-        Effect.flatMap((principal) => client.bootstrap(request.spaceId, request, principal))
+        Effect.flatMap(issuer.issue),
+        Effect.flatMap((assertion) => client.bootstrap(request.spaceId, request, assertion))
       ),
     Watch: (request) =>
       Stream.unwrap(Authentication.Principal.pipe(
-        Effect.map((principal) => client.watch(request.spaceId, request, principal))
+        Effect.flatMap(issuer.issue),
+        Effect.map((assertion) => client.watch(request.spaceId, request, assertion))
       )),
     PublishPresence: (update) =>
       Authentication.Principal.pipe(
-        Effect.flatMap((principal) => client.publishPresence(update.spaceId, update, principal)),
+        Effect.flatMap(issuer.issue),
+        Effect.flatMap((assertion) => client.publishPresence(update.spaceId, update, assertion)),
         Effect.as(null)
       ),
     WatchPresence: ({ spaceId }) =>
       Stream.unwrap(Authentication.Principal.pipe(
-        Effect.map((principal) => client.watchPresence(spaceId, principal))
+        Effect.flatMap(issuer.issue),
+        Effect.map((assertion) => client.watchPresence(spaceId, assertion))
       ))
   })
 }))

@@ -8,6 +8,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
@@ -21,6 +22,7 @@ import * as Entity from "effect/unstable/cluster/Entity"
 import * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as PresenceHub from "../src/PresenceHub.js"
+import * as PrincipalAssertion from "../src/PrincipalAssertion.js"
 import * as SpaceEntity from "../src/SpaceEntity.js"
 
 const spaceA = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
@@ -35,6 +37,8 @@ const Todo = Model.make("Todo", {
 })
 const PutTodo = Mutation.make("PutTodo", { version: 1, payload: Todo.schema, success: Todo.schema })
 const definition = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo] })
+const scope = Protocol.ReplicationScope.make({ models: [Todo.name] })
+const scopeGeneration = Identity.ReplicationScopeGeneration.make(1)
 const handlers = PutTodo.toLayer(({ payload, transaction }) =>
   transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))
 )
@@ -63,6 +67,15 @@ const store = ServerStore.layerTrusted({
   Layer.provide(runtime),
   Layer.provide(database)
 )
+const assertionCodec = Schema.fromJsonString(Schema.Json)
+const assertionOf = (principal: typeof Schema.Json.Type) =>
+  PrincipalAssertion.PrincipalAssertion.make(Schema.encodeUnknownSync(assertionCodec)(principal))
+const assertionVerifier = PrincipalAssertion.layerVerifier((assertion) =>
+  Schema.decodeUnknownEffect(assertionCodec)(assertion).pipe(
+    Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "invalid principal assertion" }))
+  )
+)
+
 const shardingConfig = ShardingConfig.layer({
   shardsPerGroup: 32,
   entityMailboxCapacity: 32,
@@ -98,6 +111,7 @@ describe("SpaceEntity", () => {
         }
       })
       const entityHandlers = SpaceEntity.layerHandlers().pipe(
+        Layer.provide(assertionVerifier),
         Layer.provide(store),
         Layer.provide(presence)
       )
@@ -105,42 +119,64 @@ describe("SpaceEntity", () => {
       const client = yield* makeClient(spaceA)
       const wakes = yield* Queue.unbounded<Protocol.Wake>()
       const watch = yield* client.Watch({
-        request: { spaceId: spaceA, schema: definition.schemaIdentity },
-        principal: { subject: "reader" }
+        request: {
+          spaceId: spaceA,
+          clientId,
+          schema: definition.schemaIdentity,
+          scope,
+          scopeGeneration,
+          cursor: null
+        },
+        assertion: assertionOf({ subject: "reader" })
       }).pipe(
         Stream.runForEach((wake) => Queue.offer(wakes, wake)),
         Effect.forkChild({ startImmediately: true })
       )
 
       assert.deepStrictEqual(yield* Queue.take(wakes), {
-        spaceId: spaceA,
-        sequence: Identity.ServerSequence.make(0)
+        spaceId: spaceA
       })
 
       const submitted = yield* envelope(spaceA)
       const receipt = yield* client.Submit({
         request: { envelope: submitted, schema: definition.schemaIdentity },
-        principal: { subject: "writer" }
+        assertion: assertionOf({ subject: "writer" })
       })
       assert.strictEqual(receipt._tag, "Accepted")
       assert.deepStrictEqual(yield* Queue.take(wakes), {
-        spaceId: spaceA,
-        sequence: Identity.ServerSequence.make(1)
+        spaceId: spaceA
       })
 
       const page = yield* client.Pull({
         request: {
           spaceId: spaceA,
+          clientId,
           schema: definition.schemaIdentity,
-          after: Identity.ServerSequence.make(0),
+          scope,
+          scopeGeneration,
+          cursor: null,
           limit: 10
         },
-        principal: { subject: "reader" }
+        assertion: assertionOf({ subject: "reader" })
       })
-      if ("_tag" in page) assert.fail("unexpected bootstrap")
-      assert.deepStrictEqual(page.entries.map((entry) => entry.mutationId), [mutationId])
+      if (!("_tag" in page)) assert.fail("expected bootstrap")
+      const bootstrap = yield* client.Bootstrap({
+        request: {
+          spaceId: spaceA,
+          clientId,
+          schema: definition.schemaIdentity,
+          scope,
+          scopeGeneration,
+          cursor: page.manifest.cursor,
+          snapshotId: page.manifest.snapshotId,
+          afterOrdinal: -1,
+          limit: 10
+        },
+        assertion: assertionOf({ subject: "reader" })
+      })
+      assert.deepStrictEqual(bootstrap.entries.map((entry) => entry.change._tag), ["Upsert"])
 
-      const watchedPresence = yield* client.WatchPresence({ principal: { subject: "reader" } }).pipe(
+      const watchedPresence = yield* client.WatchPresence({ assertion: assertionOf({ subject: "reader" }) }).pipe(
         Stream.runHead,
         Effect.forkChild({ startImmediately: true })
       )
@@ -151,7 +187,7 @@ describe("SpaceEntity", () => {
         value: { cursor: 4 },
         ttlMillis: 5_000
       }
-      yield* client.PublishPresence({ update, principal: { subject: "writer" } })
+      yield* client.PublishPresence({ update, assertion: assertionOf({ subject: "writer" }) })
       const received = yield* Fiber.join(watchedPresence)
       assert.deepStrictEqual(Option.getOrUndefined(received), update)
       yield* Fiber.interrupt(watch)
@@ -163,6 +199,7 @@ describe("SpaceEntity", () => {
   it.effect("rejects payloads addressed through a different space owner", () =>
     Effect.gen(function*() {
       const entityHandlers = SpaceEntity.layerHandlers().pipe(
+        Layer.provide(assertionVerifier),
         Layer.provide(store),
         Layer.provide(PresenceHub.layerTrusted())
       )
@@ -172,36 +209,46 @@ describe("SpaceEntity", () => {
 
       const submitError = yield* client.Submit({
         request: { envelope: submitted, schema: definition.schemaIdentity },
-        principal: null
+        assertion: assertionOf(null)
       }).pipe(Effect.flip)
       assert.strictEqual(submitError._tag, "ProtocolInvalid")
 
       const pullError = yield* client.Pull({
         request: {
           spaceId: spaceB,
+          clientId,
           schema: definition.schemaIdentity,
-          after: Identity.ServerSequence.make(0),
+          scope,
+          scopeGeneration,
+          cursor: null,
           limit: 10
         },
-        principal: null
+        assertion: assertionOf(null)
       }).pipe(Effect.flip)
       assert.strictEqual(pullError._tag, "ProtocolInvalid")
 
       const bootstrapError = yield* client.Bootstrap({
         request: {
           spaceId: spaceB,
+          clientId,
           schema: definition.schemaIdentity,
+          scope,
+          scopeGeneration,
+          cursor: {
+            viewId: Identity.ReplicationViewId.make("viw_00000000-0000-4000-8000-000000000001"),
+            revision: Identity.ReplicationViewRevision.make(0)
+          },
           snapshotId: Identity.SnapshotId.make("snp_00000000-0000-4000-8000-000000000001"),
           afterOrdinal: -1,
           limit: 10
         },
-        principal: null
+        assertion: assertionOf(null)
       }).pipe(Effect.flip)
       assert.strictEqual(bootstrapError._tag, "ProtocolInvalid")
 
       const presenceError = yield* client.PublishPresence({
         update: { spaceId: spaceB, clientId, value: null, ttlMillis: 5_000 },
-        principal: null
+        assertion: assertionOf(null)
       }).pipe(Effect.flip)
       assert.strictEqual(presenceError._tag, "ProtocolInvalid")
     }).pipe(
@@ -220,8 +267,15 @@ describe("SpaceEntity", () => {
       const page = Protocol.BootstrapPage.make({
         manifest: {
           spaceId: spaceA,
+          clientId,
           definitionHash: definition.hash,
           schema: definition.schemaIdentity,
+          scopeDigest: Protocol.MutationDigest.make("0".repeat(64)),
+          scopeGeneration,
+          cursor: {
+            viewId: Identity.ReplicationViewId.make("viw_00000000-0000-4000-8000-000000000001"),
+            revision: Identity.ReplicationViewRevision.make(0)
+          },
           snapshotId,
           sequence: Identity.ServerSequence.make(0),
           terminalSequenceThrough: Identity.TerminalSequence.make(0),
@@ -229,7 +283,7 @@ describe("SpaceEntity", () => {
           contentBytes: 0,
           digest: Protocol.initialSnapshotDigest
         },
-        entities: [],
+        entries: [],
         hasMore: false
       })
       const wrapped = ServerStore.ServerStore.of({
@@ -247,6 +301,7 @@ describe("SpaceEntity", () => {
           })
       })
       const entityHandlers = SpaceEntity.layerHandlers().pipe(
+        Layer.provide(assertionVerifier),
         Layer.provide(Layer.succeed(ServerStore.ServerStore, wrapped)),
         Layer.provide(PresenceHub.layerTrusted())
       )
@@ -254,16 +309,20 @@ describe("SpaceEntity", () => {
       const client = yield* makeClient(spaceA)
       const request: Protocol.BootstrapRequest = {
         spaceId: spaceA,
+        clientId,
         schema: definition.schemaIdentity,
+        scope,
+        scopeGeneration,
+        cursor: page.manifest.cursor,
         snapshotId,
         afterOrdinal: -1,
         limit: 10
       }
-      const first = yield* client.Bootstrap({ request, principal: null }).pipe(
+      const first = yield* client.Bootstrap({ request, assertion: assertionOf(null) }).pipe(
         Effect.forkChild({ startImmediately: true })
       )
       yield* Deferred.await(firstEntered)
-      const second = yield* client.Bootstrap({ request, principal: null }).pipe(
+      const second = yield* client.Bootstrap({ request, assertion: assertionOf(null) }).pipe(
         Effect.forkChild({ startImmediately: true })
       )
       yield* Effect.yieldNow
