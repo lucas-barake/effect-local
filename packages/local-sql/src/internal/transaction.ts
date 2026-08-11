@@ -52,7 +52,9 @@ export const local = (options: {
   readonly sql: SqlClient.SqlClient
   readonly definition: Definition.Any
   readonly table: "visible" | "canonical" | "shadow-visible"
-  readonly generation: number
+  readonly spaceId: Identity.SpaceId
+  readonly schemaGeneration: number
+  readonly projectionGeneration: number
   readonly changes?: Array<Protocol.EntityChange>
 }): Transaction.Transaction => {
   const find = SqlSchema.findOneOption({
@@ -61,10 +63,13 @@ export const local = (options: {
     execute: ({ model, key }) => {
       if (options.table === "visible" || options.table === "shadow-visible") {
         return options.sql`SELECT value_json FROM effect_local_client_visible_entities_data
-          WHERE generation = ${options.generation} AND model = ${model} AND entity_key = ${key}`
+          WHERE space_id = ${options.spaceId} AND schema_generation = ${options.schemaGeneration}
+            AND projection_generation = ${options.projectionGeneration}
+            AND model = ${model} AND entity_key = ${key}`
       }
       return options.sql`SELECT value_json FROM effect_local_client_canonical_entities_data
-          WHERE generation = ${options.generation} AND model = ${model} AND entity_key = ${key}`
+          WHERE space_id = ${options.spaceId} AND schema_generation = ${options.schemaGeneration}
+            AND model = ${model} AND entity_key = ${key}`
     }
   })
   return {
@@ -85,15 +90,17 @@ export const local = (options: {
         const encoded = yield* encodeEntity(model, key, value)
         if (options.table === "visible" || options.table === "shadow-visible") {
           yield* options.sql`INSERT INTO effect_local_client_visible_entities_data
-          (generation, model, entity_key, value_json, model_version)
-          VALUES (${options.generation}, ${model.name}, ${encoded.keyJson}, ${encoded.valueJson}, ${model.version})
-          ON CONFLICT (generation, model, entity_key) DO UPDATE SET
+          (space_id, schema_generation, projection_generation, model, entity_key, value_json, model_version)
+          VALUES (${options.spaceId}, ${options.schemaGeneration}, ${options.projectionGeneration},
+            ${model.name}, ${encoded.keyJson}, ${encoded.valueJson}, ${model.version})
+          ON CONFLICT (space_id, schema_generation, projection_generation, model, entity_key) DO UPDATE SET
             value_json = excluded.value_json, model_version = excluded.model_version`
         } else {
           yield* options.sql`INSERT INTO effect_local_client_canonical_entities_data
-          (generation, model, entity_key, value_json, model_version)
-          VALUES (${options.generation}, ${model.name}, ${encoded.keyJson}, ${encoded.valueJson}, ${model.version})
-          ON CONFLICT (generation, model, entity_key) DO UPDATE SET
+          (space_id, schema_generation, model, entity_key, value_json, model_version)
+          VALUES (${options.spaceId}, ${options.schemaGeneration}, ${model.name}, ${encoded.keyJson},
+            ${encoded.valueJson}, ${model.version})
+          ON CONFLICT (space_id, schema_generation, model, entity_key) DO UPDATE SET
             value_json = excluded.value_json, model_version = excluded.model_version`
         }
         options.changes?.push({
@@ -107,10 +114,13 @@ export const local = (options: {
         const encoded = yield* encodeEntity(model, key)
         if (options.table === "visible" || options.table === "shadow-visible") {
           yield* options.sql`DELETE FROM effect_local_client_visible_entities_data
-          WHERE generation = ${options.generation} AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
+          WHERE space_id = ${options.spaceId} AND schema_generation = ${options.schemaGeneration}
+            AND projection_generation = ${options.projectionGeneration}
+            AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
         } else {
           yield* options.sql`DELETE FROM effect_local_client_canonical_entities_data
-          WHERE generation = ${options.generation} AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
+          WHERE space_id = ${options.spaceId} AND schema_generation = ${options.schemaGeneration}
+            AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
         }
         options.changes?.push({
           _tag: "Delete",
@@ -189,7 +199,9 @@ export const server = (options: {
 export const applyLocalChange = (
   sql: SqlClient.SqlClient,
   table: "visible" | "canonical",
-  generation: number,
+  spaceId: Identity.SpaceId,
+  schemaGeneration: number,
+  projectionGeneration: number,
   change: Protocol.EntityChange
 ) =>
   Effect.gen(function*() {
@@ -198,24 +210,29 @@ export const applyLocalChange = (
       if (
         table === "visible"
       ) {
-        yield* sql`DELETE FROM effect_local_client_visible_entities_data WHERE generation = ${generation}
+        yield* sql`DELETE FROM effect_local_client_visible_entities_data
+          WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
+          AND projection_generation = ${projectionGeneration}
           AND model = ${change.entity.model} AND entity_key = ${keyJson}`
-      } else {yield* sql`DELETE FROM effect_local_client_canonical_entities_data WHERE generation = ${generation}
+      } else {yield* sql`DELETE FROM effect_local_client_canonical_entities_data
+        WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
         AND model = ${change.entity.model} AND entity_key = ${keyJson}`}
       return
     }
     const valueJson = yield* Codec.stringify(change.value)
     if (table === "visible") {
       yield* sql`INSERT INTO effect_local_client_visible_entities_data
-        (generation, model, entity_key, value_json, model_version)
-        VALUES (${generation}, ${change.entity.model}, ${keyJson}, ${valueJson}, ${change.entity.modelVersion})
-        ON CONFLICT (generation, model, entity_key) DO UPDATE SET
+        (space_id, schema_generation, projection_generation, model, entity_key, value_json, model_version)
+        VALUES (${spaceId}, ${schemaGeneration}, ${projectionGeneration}, ${change.entity.model},
+          ${keyJson}, ${valueJson}, ${change.entity.modelVersion})
+        ON CONFLICT (space_id, schema_generation, projection_generation, model, entity_key) DO UPDATE SET
           value_json = excluded.value_json, model_version = excluded.model_version`
     } else {
       yield* sql`INSERT INTO effect_local_client_canonical_entities_data
-        (generation, model, entity_key, value_json, model_version)
-        VALUES (${generation}, ${change.entity.model}, ${keyJson}, ${valueJson}, ${change.entity.modelVersion})
-        ON CONFLICT (generation, model, entity_key) DO UPDATE SET
+        (space_id, schema_generation, model, entity_key, value_json, model_version)
+        VALUES (${spaceId}, ${schemaGeneration}, ${change.entity.model}, ${keyJson}, ${valueJson},
+          ${change.entity.modelVersion})
+        ON CONFLICT (space_id, schema_generation, model, entity_key) DO UPDATE SET
           value_json = excluded.value_json, model_version = excluded.model_version`
     }
   }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))

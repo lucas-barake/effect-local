@@ -42,13 +42,15 @@ const SchemaFenceRow = Schema.Struct({
   schema_version: Identity.SchemaVersion,
   schema_hash: Identity.SchemaHash,
   active_schema_generation: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  active_projection_generation: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   target_schema_version: Schema.NullOr(Identity.SchemaVersion),
   target_schema_hash: Schema.NullOr(Identity.SchemaHash),
   migration_hash: Schema.NullOr(Identity.SchemaHash)
 })
 
 export const layer = <D extends Definition.Any,>(
-  definition: D
+  definition: D,
+  spaceId: Identity.SpaceId
 ): Layer.Layer<QueryExecutor, never, SqlClient.SqlClient | Handlers<D>> =>
   Layer.effect(
     QueryExecutor,
@@ -60,24 +62,37 @@ export const layer = <D extends Definition.Any,>(
       }
 
       const allRows = SqlSchema.findAll({
-        Request: Schema.Struct({ model: Schema.String, generation: Schema.Int }),
+        Request: Schema.Struct({
+          model: Schema.String,
+          schemaGeneration: Schema.Int,
+          projectionGeneration: Schema.Int
+        }),
         Result: Rows.EntityRow,
-        execute: ({ model, generation }) =>
+        execute: ({ model, projectionGeneration, schemaGeneration }) =>
           sql`SELECT value_json FROM effect_local_client_visible_entities_data
-          WHERE generation = ${generation} AND model = ${model} ORDER BY entity_key`
+          WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
+            AND projection_generation = ${projectionGeneration} AND model = ${model} ORDER BY entity_key`
       })
       const findFence = SqlSchema.findOne({
         Request: Schema.Void,
         Result: SchemaFenceRow,
         execute: () =>
           sql`SELECT definition_hash, schema_version, schema_hash, active_schema_generation,
+          active_projection_generation,
           target_schema_version, target_schema_hash, migration_hash
-          FROM effect_local_client_meta WHERE singleton = 1`
+          FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
       })
-      const queryCapability = (generation: number): Transaction.Query => ({
-        get: SqlTransaction.local({ sql, definition, table: "visible", generation }).get,
+      const queryCapability = (schemaGeneration: number, projectionGeneration: number): Transaction.Query => ({
+        get: SqlTransaction.local({
+          sql,
+          definition,
+          table: "visible",
+          spaceId,
+          schemaGeneration,
+          projectionGeneration
+        }).get,
         all: (model) =>
-          allRows({ model: model.name, generation }).pipe(
+          allRows({ model: model.name, schemaGeneration, projectionGeneration }).pipe(
             Effect.mapError(StorageUnavailable.make),
             Effect.flatMap((rows) =>
               Effect.forEach(
@@ -132,7 +147,7 @@ export const layer = <D extends Definition.Any,>(
           const encodedPayload = yield* Codec.encode(payloadSchema, payload)
           const decodedPayload = yield* Codec.decode(payloadSchema, encodedPayload)
           const result = yield* handler.execute({
-            query: queryCapability(fence.active_schema_generation),
+            query: queryCapability(fence.active_schema_generation, fence.active_projection_generation),
             payload: decodedPayload
           })
           const encoded = yield* Codec.encode(successSchema, result)

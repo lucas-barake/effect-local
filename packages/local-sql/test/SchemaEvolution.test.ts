@@ -375,6 +375,7 @@ describe("client schema evolution", () => {
       yield* v1.applyReceipt(Protocol.AcceptedReceipt.make({
         spaceId,
         clientId,
+        membershipIncarnation: accepted.envelope.membershipIncarnation,
         mutationId: accepted.envelope.mutationId,
         localSequence: accepted.envelope.localSequence,
         name: PutTodoV1.name,
@@ -387,6 +388,7 @@ describe("client schema evolution", () => {
         sequence: Identity.ServerSequence.make(1),
         spaceId,
         clientId,
+        membershipIncarnation: accepted.envelope.membershipIncarnation,
         mutationId: accepted.envelope.mutationId,
         localSequence: accepted.envelope.localSequence,
         sourceSchema: definitionV1.schemaIdentity,
@@ -535,6 +537,7 @@ describe("client schema evolution", () => {
       const receipt = Protocol.AcceptedReceipt.make({
         spaceId,
         clientId,
+        membershipIncarnation: pending.envelope.membershipIncarnation,
         mutationId: pending.envelope.mutationId,
         localSequence: pending.envelope.localSequence,
         name: PutTodoV1.name,
@@ -548,7 +551,9 @@ describe("client schema evolution", () => {
         ...receipt,
         mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000999")
       })
-      yield* sql`UPDATE effect_local_receipts SET receipt_json = ${yield* Codec.stringify(conflicting)}`
+      yield* sql`UPDATE effect_local_client_receipts_data
+        SET receipt_json = ${yield* Codec.stringify(conflicting)}
+        WHERE space_id = ${spaceId} AND mutation_id = ${pending.envelope.mutationId}`
 
       const result = yield* buildStore(definitionV2, handlersV2, evolution).pipe(Effect.result)
       assert.isTrue(Result.isFailure(result))
@@ -608,10 +613,12 @@ describe("client schema evolution", () => {
         const progress = (yield* sql<{
           readonly generation: number
           readonly cursor_model: string | null
-        }>`SELECT generation, cursor_model FROM effect_local_client_evolution WHERE singleton = 1`)[0]
+        }>`SELECT generation, cursor_model FROM effect_local_client_evolution
+          WHERE space_id = ${spaceId}`)[0]
         if (progress === undefined || progress.cursor_model === null) return
         const copied = (yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
-          FROM effect_local_client_canonical_entities_data WHERE generation = ${progress.generation}`)[0]
+          FROM effect_local_client_canonical_entities_data
+          WHERE space_id = ${spaceId} AND schema_generation = ${progress.generation}`)[0]
         if (copied.count !== 1) return
         yield* Deferred.succeed(reached, undefined)
         yield* Effect.never
@@ -632,11 +639,13 @@ describe("client schema evolution", () => {
         readonly generation: number
         readonly phase: string
         readonly cursor_model: string | null
-      }>`SELECT generation, phase, cursor_model FROM effect_local_client_evolution WHERE singleton = 1`)[0]
+      }>`SELECT generation, phase, cursor_model FROM effect_local_client_evolution
+        WHERE space_id = ${spaceId}`)[0]
       assert.strictEqual(progress.phase, "Entities")
       assert.strictEqual(progress.cursor_model, TodoV1.name)
       const copied = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
-        FROM effect_local_client_canonical_entities_data WHERE generation = ${progress.generation}`
+        FROM effect_local_client_canonical_entities_data
+        WHERE space_id = ${spaceId} AND schema_generation = ${progress.generation}`
       assert.strictEqual(copied[0].count, 1)
 
       const v2 = yield* buildStore(definitionV2, handlersV2, evolution)
@@ -652,15 +661,22 @@ describe("client schema evolution", () => {
     Effect.scoped(Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
       yield* buildStore(definitionV1, handlersV1)
-      const source = (yield* sql<{ readonly active_schema_generation: number }>`SELECT active_schema_generation
-        FROM effect_local_client_meta WHERE singleton = 1`)[0].active_schema_generation
+      const source = (yield* sql<{
+        readonly active_schema_generation: number
+        readonly active_projection_generation: number
+      }>`SELECT active_schema_generation, active_projection_generation
+        FROM effect_local_client_spaces WHERE space_id = ${spaceId}`)[0]
       for (let index = 1; index <= 3; index++) {
         const key = yield* Codec.stringify(String(index))
         const value = yield* Codec.stringify({ id: String(index), title: `todo-${index}` })
-        yield* sql`INSERT INTO effect_local_canonical_entities (model, model_version, entity_key, value_json)
-          VALUES (${TodoV1.name}, ${TodoV1.version}, ${key}, ${value})`
-        yield* sql`INSERT INTO effect_local_visible_entities (model, model_version, entity_key, value_json)
-          VALUES (${TodoV1.name}, ${TodoV1.version}, ${key}, ${value})`
+        yield* sql`INSERT INTO effect_local_client_canonical_entities_data
+          (space_id, schema_generation, model, model_version, entity_key, value_json)
+          VALUES (${spaceId}, ${source.active_schema_generation}, ${TodoV1.name},
+            ${TodoV1.version}, ${key}, ${value})`
+        yield* sql`INSERT INTO effect_local_client_visible_entities_data
+          (space_id, schema_generation, projection_generation, model, model_version, entity_key, value_json)
+          VALUES (${spaceId}, ${source.active_schema_generation}, ${source.active_projection_generation},
+            ${TodoV1.name}, ${TodoV1.version}, ${key}, ${value})`
       }
       yield* sql`CREATE TABLE evolution_write_probe (operation TEXT NOT NULL)`
       yield* sql`CREATE TRIGGER probe_canonical_insert AFTER INSERT ON effect_local_client_canonical_entities_data
@@ -679,7 +695,8 @@ describe("client schema evolution", () => {
         const count = (yield* sql<typeof ProbeRow.Type>`SELECT COUNT(*) AS count FROM evolution_write_probe`)[0].count
         yield* Ref.update(maximumWrites, (current) => Math.max(current, count))
         yield* sql`DELETE FROM evolution_write_probe`
-        const phase = (yield* sql<typeof PhaseRow.Type>`SELECT phase FROM effect_local_client_evolution`)[0]?.phase
+        const phase = (yield* sql<typeof PhaseRow.Type>`SELECT phase FROM effect_local_client_evolution
+          WHERE space_id = ${spaceId}`)[0]?.phase
         if (phase === "CleanupCanonical") {
           yield* Deferred.succeed(flipped, undefined)
           yield* Effect.never
@@ -698,8 +715,8 @@ describe("client schema evolution", () => {
       yield* Fiber.interrupt(fiber)
 
       const active = yield* sql<{ readonly active_schema_generation: number }>`SELECT active_schema_generation
-        FROM effect_local_client_meta WHERE singleton = 1`
-      assert.strictEqual(active[0].active_schema_generation, source + 1)
+        FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
+      assert.strictEqual(active[0].active_schema_generation, source.active_schema_generation + 1)
       assert.isAtMost(yield* Ref.get(maximumWrites), 2)
 
       yield* SchemaEvolution.client({
@@ -710,10 +727,14 @@ describe("client schema evolution", () => {
         batchSize: 1
       }).pipe(Effect.provide(runtimeV2))
       const remaining = yield* sql<{ readonly count: number }>`SELECT
-        (SELECT COUNT(*) FROM effect_local_client_canonical_entities_data WHERE generation = ${source}) +
-        (SELECT COUNT(*) FROM effect_local_client_visible_entities_data WHERE generation = ${source}) +
-        (SELECT COUNT(*) FROM effect_local_client_receipts_data WHERE generation = ${source}) +
-        (SELECT COUNT(*) FROM effect_local_client_pending_data WHERE generation = ${source}) AS count`
+        (SELECT COUNT(*) FROM effect_local_client_canonical_entities_data
+          WHERE space_id = ${spaceId} AND schema_generation = ${source.active_schema_generation}) +
+        (SELECT COUNT(*) FROM effect_local_client_visible_entities_data
+          WHERE space_id = ${spaceId} AND schema_generation = ${source.active_schema_generation}) +
+        (SELECT COUNT(*) FROM effect_local_client_receipts_data
+          WHERE space_id = ${spaceId} AND schema_generation = ${source.active_schema_generation}) +
+        (SELECT COUNT(*) FROM effect_local_client_pending_data
+          WHERE space_id = ${spaceId} AND schema_generation = ${source.active_schema_generation}) AS count`
       assert.strictEqual(remaining[0].count, 0)
     })).pipe(Effect.provide(database)))
 
@@ -750,14 +771,21 @@ describe("client schema evolution", () => {
       const source = yield* SqlSchema.findOne({
         Request: Schema.Void,
         Result: CountRow,
-        execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_pending`
+        execute: () =>
+          sql`SELECT COUNT(*) AS count FROM effect_local_client_pending_data AS p
+          INNER JOIN effect_local_client_spaces AS s ON s.space_id = p.space_id
+            AND s.active_schema_generation = p.schema_generation
+          WHERE p.space_id = ${spaceId}`
       })(undefined)
       const published = yield* SqlSchema.findOne({
         Request: Schema.Void,
         Result: CountRow,
         execute: () =>
-          sql`SELECT COUNT(*) AS count FROM effect_local_visible_entities
-          WHERE model_version = ${TodoV2.version}`
+          sql`SELECT COUNT(*) AS count FROM effect_local_client_visible_entities_data AS v
+          INNER JOIN effect_local_client_spaces AS s ON s.space_id = v.space_id
+            AND s.active_schema_generation = v.schema_generation
+            AND s.active_projection_generation = v.projection_generation
+          WHERE v.space_id = ${spaceId} AND v.model_version = ${TodoV2.version}`
       })(undefined)
       assert.strictEqual(source.count, 2)
       assert.strictEqual(published.count, 0)

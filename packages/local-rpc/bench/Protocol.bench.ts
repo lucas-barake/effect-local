@@ -16,6 +16,7 @@ const page: Protocol.PullPage = {
     clientId,
     mutationId: Identity.MutationId.make(`mut_00000000-0000-4000-8000-${String(index).padStart(12, "0")}`),
     localSequence: Identity.LocalSequence.make(index + 1),
+    membershipIncarnation: Identity.legacyMembershipIncarnation,
     sourceSchema,
     mutationVersion: Identity.SchemaVersion.make(1),
     digest: "a".repeat(64),

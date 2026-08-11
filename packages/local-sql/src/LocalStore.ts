@@ -13,6 +13,7 @@ import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
+import * as Semaphore from "effect/Semaphore"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
@@ -35,6 +36,7 @@ export interface Options {
   readonly evolution?: Evolution.Evolution
   readonly schemaEvolutionBatchSize?: number
   readonly schemaEvolutionBatchBytes?: number
+  readonly projectionReplayBatchSize?: number
   readonly retainedReceipts: number
   readonly maximumReceipts: number
   readonly retainedHistoryEntries: number
@@ -50,6 +52,7 @@ export interface ReconciliationGenerations {
 }
 
 export interface Service {
+  readonly membershipIncarnation: Identity.MembershipIncarnation
   readonly mutate: <M extends Mutation.Any,>(
     mutation: M,
     payload: Mutation.Payload<M>
@@ -160,6 +163,13 @@ export const layer = (
           message: `maximumBootstrapPageBytes must not exceed ${Protocol.maximumBatchBytes}`
         })
       }
+      const projectionReplayBatchSize = options.projectionReplayBatchSize ?? 256
+      if (!Number.isSafeInteger(projectionReplayBatchSize) || projectionReplayBatchSize <= 0) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "projectionReplayBatchSize",
+          message: "projectionReplayBatchSize must be a positive safe integer"
+        })
+      }
       yield* Migrations.client(options)
       const evolution = options.evolution ?? Evolution.make({ current: options.definition })
       let evolutionOptions: SchemaEvolution.ClientOptions = {
@@ -175,7 +185,8 @@ export const layer = (
         evolutionOptions = { ...evolutionOptions, batchBytes: options.schemaEvolutionBatchBytes }
       }
       yield* SchemaEvolution.client(evolutionOptions)
-      const registerLineage = ClientLineage.make(sql)
+      const projectionGate = yield* Semaphore.make(1)
+      const registerLineage = ClientLineage.make(sql, options.spaceId)
 
       const migrateEntryChanges = (entry: Protocol.AcceptedMutation) =>
         Effect.forEach(entry.changes, (change) => {
@@ -212,96 +223,164 @@ export const layer = (
         Request: Schema.Void,
         Result: Rows.ClientMetaRow,
         execute: () =>
-          sql`SELECT space_id, client_id, definition_hash, schema_version, schema_hash, schema_generation,
-          active_schema_generation,
+          sql`SELECT space_id, membership_incarnation, definition_hash, schema_version, schema_hash,
+          schema_generation, active_schema_generation, active_projection_generation,
+          projection_schema_generation,
           target_schema_version, target_schema_hash, migration_hash,
           next_local_sequence, server_cursor, visible_revision,
           requested_generation, completed_generation, installed_snapshot_id, installed_snapshot_sequence,
-          installed_snapshot_terminal_sequence
-        FROM effect_local_client_meta WHERE singleton = 1`
+          installed_snapshot_terminal_sequence, projection_replay_generation, projection_replay_cursor
+        FROM effect_local_client_spaces WHERE space_id = ${options.spaceId}`
       })
       const findPending = SqlSchema.findAll({
         Request: Schema.Void,
         Result: Rows.PendingRow,
         execute: () =>
-          sql`SELECT mutation_id, local_sequence, basis, name, payload_json, digest, digest_version,
+          sql`SELECT membership_incarnation, mutation_id, local_sequence, basis, name, payload_json, digest,
+        digest_version,
         source_schema_version, source_schema_hash, mutation_version,
-        optimistic_result_json, changes_json FROM effect_local_pending ORDER BY local_sequence`
+        optimistic_result_json, changes_json FROM effect_local_client_pending_data
+        WHERE space_id = ${options.spaceId} AND schema_generation = (
+          SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
+        ORDER BY local_sequence`
       })
       const findPendingByMutation = SqlSchema.findOneOption({
         Request: Identity.MutationId,
         Result: Rows.PendingRow,
         execute: (mutationId) =>
-          sql`SELECT mutation_id, local_sequence, basis, name, payload_json, digest, digest_version,
+          sql`SELECT membership_incarnation, mutation_id, local_sequence, basis, name, payload_json, digest,
+        digest_version,
         source_schema_version, source_schema_hash, mutation_version,
-        optimistic_result_json, changes_json FROM effect_local_pending WHERE mutation_id = ${mutationId}`
+        optimistic_result_json, changes_json FROM effect_local_client_pending_data
+        WHERE space_id = ${options.spaceId} AND schema_generation = (
+          SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
+          AND mutation_id = ${mutationId}`
       })
-      const findReplayPending = SqlSchema.findAll({
-        Request: Schema.Void,
+      const findReplayPendingBatch = SqlSchema.findAll({
+        Request: Schema.Struct({ after: Schema.Int, limit: Schema.Int }),
         Result: Rows.PendingRow,
-        execute: () =>
-          sql`SELECT p.mutation_id, p.local_sequence, p.basis, p.name, p.payload_json, p.digest, p.digest_version,
-        p.source_schema_version, p.source_schema_hash, p.mutation_version,
-        p.optimistic_result_json, p.changes_json FROM effect_local_pending AS p
-        WHERE NOT EXISTS (
-          SELECT 1 FROM effect_local_server_log AS l WHERE l.mutation_id = p.mutation_id
-        )
-        ORDER BY p.local_sequence`
+        execute: ({ after, limit }) =>
+          sql`SELECT p.membership_incarnation, p.mutation_id, p.local_sequence, p.basis, p.name, p.payload_json,
+          p.digest, p.digest_version, p.source_schema_version, p.source_schema_hash, p.mutation_version,
+          p.optimistic_result_json, p.changes_json FROM effect_local_client_pending_data AS p
+          WHERE p.space_id = ${options.spaceId} AND p.schema_generation = (
+            SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
+          AND p.local_sequence > ${after} AND NOT EXISTS (
+            SELECT 1 FROM effect_local_server_log AS l
+            WHERE l.space_id = ${options.spaceId} AND l.mutation_id = p.mutation_id
+          )
+          ORDER BY p.local_sequence LIMIT ${limit}`
+      })
+      const findProjectionRows = SqlSchema.findAll({
+        Request: Schema.Struct({ schemaGeneration: Schema.Int, projectionGeneration: Schema.Int, limit: Schema.Int }),
+        Result: Rows.ProjectionEntityRow,
+        execute: ({ schemaGeneration, projectionGeneration, limit }) =>
+          sql`SELECT c.model, c.model_version, c.entity_key, c.value_json
+          FROM effect_local_client_canonical_entities_data AS c
+          WHERE c.space_id = ${options.spaceId} AND c.schema_generation = ${schemaGeneration}
+            AND NOT EXISTS (
+              SELECT 1 FROM effect_local_client_visible_entities_data AS v
+              WHERE v.space_id = c.space_id AND v.schema_generation = c.schema_generation
+                AND v.projection_generation = ${projectionGeneration}
+                AND v.model = c.model AND v.entity_key = c.entity_key
+            )
+          ORDER BY c.model, c.entity_key LIMIT ${limit}`
+      })
+      const findProjectionRowIds = SqlSchema.findAll({
+        Request: Schema.Struct({
+          schemaGeneration: Schema.Int,
+          projectionGeneration: Schema.Int,
+          keep: Schema.Boolean,
+          limit: Schema.Int
+        }),
+        Result: Rows.RowIdRow,
+        execute: ({ schemaGeneration: requestedSchemaGeneration, projectionGeneration, keep, limit }) => {
+          if (keep) {
+            return sql`SELECT rowid AS row_id FROM effect_local_client_visible_entities_data
+              WHERE space_id = ${options.spaceId} AND schema_generation = ${requestedSchemaGeneration}
+                AND projection_generation <> ${projectionGeneration} ORDER BY rowid LIMIT ${limit}`
+          }
+          return sql`SELECT rowid AS row_id FROM effect_local_client_visible_entities_data
+              WHERE space_id = ${options.spaceId} AND schema_generation = ${requestedSchemaGeneration}
+                AND projection_generation = ${projectionGeneration} ORDER BY rowid LIMIT ${limit}`
+        }
       })
       const findReceipt = SqlSchema.findOneOption({
         Request: Identity.MutationId,
         Result: Rows.ReceiptRow,
-        execute: (mutationId) => sql`SELECT receipt_json FROM effect_local_receipts WHERE mutation_id = ${mutationId}`
+        execute: (mutationId) =>
+          sql`SELECT receipt_json FROM effect_local_client_receipts_data
+          WHERE space_id = ${options.spaceId} AND schema_generation = (
+            SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
+            AND mutation_id = ${mutationId}`
       })
       const findPendingReceipt = SqlSchema.findOneOption({
         Request: Schema.Struct({ after: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) }),
         Result: Rows.PendingReceiptRow,
         execute: ({ after }) =>
-          sql`SELECT p.mutation_id, p.local_sequence, p.basis, p.name, p.payload_json, p.digest, p.digest_version,
+          sql`SELECT p.membership_incarnation, p.mutation_id, p.local_sequence, p.basis, p.name, p.payload_json,
+          p.digest, p.digest_version,
           p.source_schema_version, p.source_schema_hash, p.mutation_version,
           p.optimistic_result_json, p.changes_json, r.receipt_json,
           l.server_sequence, l.mutation_id AS entry_mutation_id, l.entry_json
-        FROM effect_local_pending AS p
-        INNER JOIN effect_local_receipts AS r ON r.mutation_id = p.mutation_id
-        LEFT JOIN effect_local_server_log AS l ON l.mutation_id = p.mutation_id
-        WHERE p.local_sequence > ${after}
+        FROM effect_local_client_pending_data AS p
+        INNER JOIN effect_local_client_receipts_data AS r
+          ON r.space_id = p.space_id AND r.schema_generation = p.schema_generation
+          AND r.mutation_id = p.mutation_id
+        LEFT JOIN effect_local_server_log AS l ON l.space_id = p.space_id AND l.mutation_id = p.mutation_id
+        WHERE p.space_id = ${options.spaceId} AND p.schema_generation = (
+          SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
+          AND p.local_sequence > ${after}
         ORDER BY p.local_sequence LIMIT 1`
       })
       const findPendingLog = SqlSchema.findAll({
         Request: Schema.Void,
         Result: Rows.PendingLogRow,
         execute: () =>
-          sql`SELECT p.mutation_id, p.local_sequence, p.basis, p.name, p.payload_json, p.digest,
+          sql`SELECT p.membership_incarnation, p.mutation_id, p.local_sequence, p.basis, p.name, p.payload_json,
+            p.digest, p.digest_version, p.source_schema_version, p.source_schema_hash, p.mutation_version,
             p.optimistic_result_json, p.changes_json, l.server_sequence,
             l.mutation_id AS entry_mutation_id, l.entry_json
-          FROM effect_local_pending AS p
-          INNER JOIN effect_local_server_log AS l ON l.mutation_id = p.mutation_id
+          FROM effect_local_client_pending_data AS p
+          INNER JOIN effect_local_server_log AS l ON l.space_id = p.space_id AND l.mutation_id = p.mutation_id
+          WHERE p.space_id = ${options.spaceId} AND p.schema_generation = (
+            SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
           ORDER BY p.local_sequence`
       })
       const findLogEntry = SqlSchema.findOneOption({
         Request: Identity.ServerSequence,
         Result: Rows.ClientLogRow,
         execute: (sequence) =>
-          sql`SELECT server_sequence, mutation_id, entry_json FROM effect_local_server_log
-        WHERE server_sequence = ${sequence}`
+          sql`SELECT membership_incarnation, server_sequence, mutation_id, entry_json
+          FROM effect_local_server_log
+        WHERE space_id = ${options.spaceId} AND server_sequence = ${sequence}`
       })
       const countPending = SqlSchema.findOne({
         Request: Schema.Void,
         Result: Rows.CountRow,
-        execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_pending`
+        execute: () =>
+          sql`SELECT COUNT(*) AS count FROM effect_local_client_pending_data
+          WHERE space_id = ${options.spaceId} AND schema_generation = (
+            SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})`
       })
       const countReceipts = SqlSchema.findOne({
         Request: Schema.Void,
         Result: Rows.CountRow,
-        execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_receipts`
+        execute: () =>
+          sql`SELECT COUNT(*) AS count FROM effect_local_client_receipts_data
+          WHERE space_id = ${options.spaceId} AND schema_generation = (
+            SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})`
       })
       const findPrunableReceipts = SqlSchema.findAll({
         Request: Schema.Int,
         Result: Rows.MutationIdRow,
         execute: (limit) =>
-          sql`SELECT r.mutation_id FROM effect_local_receipts AS r
-          WHERE NOT EXISTS (
-            SELECT 1 FROM effect_local_pending AS p WHERE p.mutation_id = r.mutation_id
+          sql`SELECT r.mutation_id FROM effect_local_client_receipts_data AS r
+          WHERE r.space_id = ${options.spaceId} AND r.schema_generation = (
+            SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
+          AND NOT EXISTS (
+            SELECT 1 FROM effect_local_client_pending_data AS p WHERE p.space_id = r.space_id
+              AND p.schema_generation = r.schema_generation AND p.mutation_id = r.mutation_id
           )
           ORDER BY r.local_sequence LIMIT ${limit}`
       })
@@ -312,26 +391,33 @@ export const layer = (
           sql`SELECT snapshot_id, space_id, definition_hash, schema_version, schema_hash,
             server_sequence, terminal_sequence,
             entity_count, content_bytes, digest, next_ordinal, received_bytes, rolling_digest
-          FROM effect_local_bootstrap WHERE singleton = 1`
+          FROM effect_local_bootstrap WHERE space_id = ${options.spaceId}`
       })
       const findStagedEntities = SqlSchema.findAll({
         Request: Schema.Void,
         Result: Rows.SnapshotEntityRow,
         execute: () =>
           sql`SELECT ordinal, model, model_version, entity_key, value_json, entity_bytes
-          FROM effect_local_bootstrap_entities ORDER BY ordinal`
+          FROM effect_local_bootstrap_entities WHERE space_id = ${options.spaceId} ORDER BY ordinal`
       })
       const findStagedIdentities = SqlSchema.findAll({
         Request: Schema.Void,
         Result: Rows.EntityIdentityRow,
-        execute: () => sql`SELECT model, model_version, entity_key FROM effect_local_bootstrap_entities`
+        execute: () =>
+          sql`SELECT model, model_version, entity_key FROM effect_local_bootstrap_entities
+          WHERE space_id = ${options.spaceId}`
       })
       const findEntityIdentities = SqlSchema.findAll({
         Request: Schema.Void,
         Result: Rows.EntityIdentityRow,
         execute: () =>
-          sql`SELECT model, model_version, entity_key FROM effect_local_visible_entities
-          UNION SELECT model, model_version, entity_key FROM effect_local_bootstrap_entities`
+          sql`SELECT model, model_version, entity_key FROM effect_local_client_visible_entities_data
+          WHERE space_id = ${options.spaceId} AND schema_generation = (
+            SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
+            AND projection_generation = (
+              SELECT active_projection_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
+          UNION SELECT model, model_version, entity_key FROM effect_local_bootstrap_entities
+            WHERE space_id = ${options.spaceId}`
       })
 
       const meta = findMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
@@ -342,17 +428,12 @@ export const layer = (
           actual: initializedMeta.definition_hash
         })
       }
-      if (initializedMeta.space_id !== options.spaceId || initializedMeta.client_id !== options.clientId) {
-        return yield* new ReplicaError.ReplicaIdentityMismatch({
-          expectedSpaceId: options.spaceId,
-          actualSpaceId: initializedMeta.space_id,
-          expectedClientId: options.clientId,
-          actualClientId: initializedMeta.client_id
-        })
-      }
       const schemaGeneration = initializedMeta.schema_generation
       const activeGeneration = initializedMeta.active_schema_generation
       const validateFence = (current: typeof Rows.ClientMetaRow.Type) => {
+        if (current.membership_incarnation !== initializedMeta.membership_incarnation) {
+          return Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
+        }
         if (current.schema_generation !== schemaGeneration) {
           return Effect.fail(
             new ReplicaError.SchemaGenerationConflict({
@@ -413,6 +494,7 @@ export const layer = (
             name: row.name,
             payload,
             digestVersion: row.digest_version,
+            membershipIncarnation: row.membership_incarnation,
             sourceSchema: Identity.SchemaIdentity.make({
               version: row.source_schema_version,
               hash: row.source_schema_hash
@@ -442,27 +524,63 @@ export const layer = (
         )
       })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
-      const restoreAndReplay = (initialDirty: ReadonlyArray<Protocol.EntityKey>) =>
-        Effect.gen(function*() {
-          const dirty = new Map(initialDirty.map((entity) => [SqlTransaction.entityKey(entity), entity]))
-          const currentPending = yield* pending
-          const replayPending = yield* findReplayPending(undefined).pipe(
-            Effect.mapError(StorageUnavailable.make),
-            Effect.flatMap(Effect.forEach(decodePendingRow))
+      const invalidate = (
+        entities: ReadonlyArray<Protocol.EntityKey>,
+        receiptIds: ReadonlyArray<Identity.MutationId> = []
+      ) => {
+        const uniqueEntities = Array.from(
+          new Map(entities.map((entity) => [SqlTransaction.entityKey(entity), entity])).values()
+        )
+        const uniqueReceiptIds = Array.from(new Set(receiptIds))
+        let invalidateReceipts = Effect.void
+        const spaceKey = `effect-local:space:${options.spaceId}`
+        if (uniqueReceiptIds.length > 0) {
+          invalidateReceipts = reactivity.invalidate(
+            uniqueReceiptIds.map((mutationId) => `${spaceKey}:receipt:${mutationId}`)
           )
-          for (const item of currentPending) {
-            for (const change of item.changes) dirty.set(SqlTransaction.entityKey(change.entity), change.entity)
+        }
+        return reactivity.invalidate({
+          [spaceKey]: [],
+          [`${spaceKey}:entities`]: uniqueEntities.map((entity) => [entity.model, entity.key]),
+          [`${spaceKey}:status`]: [],
+          "effect-local:status": []
+        }).pipe(Effect.andThen(invalidateReceipts))
+      }
+
+      const nextProjectionGeneration = (current: number) => {
+        if (current >= Number.MAX_SAFE_INTEGER) {
+          return Effect.fail(
+            new ReplicaError.CapacityExceeded({
+              resource: "projection generation",
+              limit: Number.MAX_SAFE_INTEGER
+            })
+          )
+        }
+        return Effect.succeed(current + 1)
+      }
+
+      const requestProjectionReplay = (current: typeof Rows.ClientMetaRow.Type) =>
+        Effect.gen(function*() {
+          if (current.projection_replay_generation !== null) {
+            return yield* new ReplicaError.StorageCorrupt({
+              message: "Projection replay was not resumed before another replay was requested"
+            })
           }
-          for (const entity of dirty.values()) {
-            const keyJson = yield* Codec.stringify(entity.key)
-            yield* sql`DELETE FROM effect_local_visible_entities WHERE model = ${entity.model} AND entity_key = ${keyJson}`
-            yield* sql`INSERT INTO effect_local_client_visible_entities_data
-              (generation, model, entity_key, value_json, model_version)
-            SELECT ${activeGeneration}, model, entity_key, value_json, model_version
-            FROM effect_local_client_canonical_entities_data
-            WHERE generation = ${activeGeneration} AND model = ${entity.model} AND entity_key = ${keyJson}`
-          }
-          for (const item of replayPending) {
+          const target = yield* nextProjectionGeneration(current.active_projection_generation)
+          yield* sql`UPDATE effect_local_client_spaces
+            SET projection_replay_generation = ${target}, projection_replay_cursor = NULL
+            WHERE space_id = ${options.spaceId}`
+          return target
+        })
+
+      const replayPendingBatch = (
+        rows: ReadonlyArray<typeof Rows.PendingRow.Type>,
+        replaySchemaGeneration: number,
+        projectionGeneration: number
+      ) =>
+        Effect.gen(function*() {
+          for (const row of rows) {
+            const item = yield* decodePendingRow(row)
             const changes: Array<Protocol.EntityChange> = []
             const result = yield* sql.withTransaction(
               runtime.executeEnvelope(
@@ -471,7 +589,9 @@ export const layer = (
                   sql,
                   definition: options.definition,
                   table: "visible",
-                  generation: activeGeneration,
+                  spaceId: options.spaceId,
+                  schemaGeneration: replaySchemaGeneration,
+                  projectionGeneration,
                   changes
                 }),
                 changes
@@ -493,40 +613,172 @@ export const layer = (
               Effect.catchTag("TerminalRejection", ({ rejection }) => Effect.succeed(Result.fail(rejection)))
             )
             if (Result.isSuccess(result)) {
-              for (const change of changes) {
-                const id = SqlTransaction.entityKey(change.entity)
-                if (!dirty.has(id)) dirty.set(id, change.entity)
-              }
-              yield* sql`UPDATE effect_local_pending
-            SET optimistic_result_json = ${yield* Codec.stringify(result.success.result)},
-                changes_json = ${yield* Codec.stringify(changes)}
-            WHERE mutation_id = ${item.envelope.mutationId}`
+              yield* sql`UPDATE effect_local_client_pending_data
+                SET optimistic_result_json = ${yield* Codec.stringify(result.success.result)},
+                    changes_json = ${yield* Codec.stringify(changes)}
+                WHERE space_id = ${options.spaceId} AND schema_generation = ${replaySchemaGeneration}
+                  AND mutation_id = ${item.envelope.mutationId}`
             } else {
-              yield* sql`UPDATE effect_local_pending SET changes_json = '[]'
-            WHERE mutation_id = ${item.envelope.mutationId}`
+              yield* sql`UPDATE effect_local_client_pending_data SET changes_json = '[]'
+                WHERE space_id = ${options.spaceId} AND schema_generation = ${replaySchemaGeneration}
+                  AND mutation_id = ${item.envelope.mutationId}`
             }
           }
         })
 
-      const invalidate = (
-        entities: ReadonlyArray<Protocol.EntityKey>,
-        receiptIds: ReadonlyArray<Identity.MutationId> = []
-      ) => {
-        const uniqueEntities = Array.from(
-          new Map(entities.map((entity) => [SqlTransaction.entityKey(entity), entity])).values()
+      const rebuildProjection = Effect.gen(function*() {
+        let current = yield* sql.withTransaction(meta).pipe(
+          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
         )
-        const uniqueReceiptIds = Array.from(new Set(receiptIds))
-        let invalidateReceipts = Effect.void
-        if (uniqueReceiptIds.length > 0) {
-          invalidateReceipts = reactivity.invalidate(
-            uniqueReceiptIds.map((mutationId) => `effect-local:receipt:${mutationId}`)
+        if (current.projection_replay_generation === null) return yield* Effect.void
+        yield* validateFence(current)
+        let target = current.projection_replay_generation
+        if (target === current.active_projection_generation) {
+          target = yield* nextProjectionGeneration(current.active_projection_generation)
+          yield* sql.withTransaction(sql`UPDATE effect_local_client_spaces
+            SET projection_replay_generation = ${target}, projection_replay_cursor = NULL
+            WHERE space_id = ${options.spaceId}`).pipe(
+            Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
           )
+          current = { ...current, projection_replay_generation: target, projection_replay_cursor: null }
         }
-        return reactivity.invalidate({
-          "effect-local:entities": uniqueEntities.map((entity) => [entity.model, entity.key]),
-          "effect-local:status": []
-        }).pipe(Effect.andThen(invalidateReceipts))
-      }
+        const replaySchemaGeneration = current.active_schema_generation
+        let cursor = current.projection_replay_cursor
+
+        if (cursor === null) {
+          while (true) {
+            const deleted = yield* sql.withTransaction(Effect.gen(function*() {
+              const row = yield* meta
+              yield* validateFence(row)
+              if (row.projection_replay_generation !== target || row.projection_replay_cursor !== null) {
+                return yield* new ReplicaError.StorageCorrupt({ message: "Projection cleanup fence changed" })
+              }
+              const ids = yield* findProjectionRowIds({
+                schemaGeneration: replaySchemaGeneration,
+                projectionGeneration: target,
+                keep: false,
+                limit: projectionReplayBatchSize
+              }).pipe(Effect.mapError(StorageUnavailable.make))
+              if (ids.length === 0) {
+                yield* sql`UPDATE effect_local_client_spaces SET projection_replay_cursor = 'canonical'
+                  WHERE space_id = ${options.spaceId}`
+                return false
+              }
+              yield* sql`DELETE FROM effect_local_client_visible_entities_data
+                WHERE rowid IN ${sql.in(ids.map((id) => id.row_id))}`
+              return true
+            })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            if (!deleted) break
+            yield* Effect.yieldNow
+          }
+          cursor = "canonical"
+        }
+
+        if (cursor === "canonical") {
+          while (true) {
+            const copied = yield* sql.withTransaction(Effect.gen(function*() {
+              const row = yield* meta
+              yield* validateFence(row)
+              if (row.projection_replay_generation !== target || row.projection_replay_cursor !== "canonical") {
+                return yield* new ReplicaError.StorageCorrupt({ message: "Projection copy fence changed" })
+              }
+              const rows = yield* findProjectionRows({
+                schemaGeneration: replaySchemaGeneration,
+                projectionGeneration: target,
+                limit: projectionReplayBatchSize
+              }).pipe(Effect.mapError(StorageUnavailable.make))
+              if (rows.length === 0) {
+                yield* sql`UPDATE effect_local_client_spaces SET projection_replay_cursor = 'pending:0'
+                  WHERE space_id = ${options.spaceId}`
+                return false
+              }
+              for (const entity of rows) {
+                yield* sql`INSERT INTO effect_local_client_visible_entities_data
+                  (space_id, schema_generation, projection_generation, model, model_version, entity_key, value_json)
+                  VALUES (${options.spaceId}, ${replaySchemaGeneration}, ${target}, ${entity.model},
+                    ${entity.model_version}, ${entity.entity_key}, ${entity.value_json})`
+              }
+              return true
+            })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            if (!copied) break
+            yield* Effect.yieldNow
+          }
+          cursor = "pending:0"
+        }
+
+        if (!cursor.startsWith("pending:")) {
+          return yield* new ReplicaError.StorageCorrupt({ message: "Projection replay cursor is invalid" })
+        }
+        let after = Number(cursor.slice("pending:".length))
+        if (!Number.isSafeInteger(after) || after < 0) {
+          return yield* new ReplicaError.StorageCorrupt({ message: "Projection replay cursor is invalid" })
+        }
+        while (true) {
+          const replayed = yield* sql.withTransaction(Effect.gen(function*() {
+            const row = yield* meta
+            yield* validateFence(row)
+            if (
+              row.projection_replay_generation !== target ||
+              row.projection_replay_cursor !== `pending:${after}`
+            ) {
+              return yield* new ReplicaError.StorageCorrupt({ message: "Projection replay fence changed" })
+            }
+            const rows = yield* findReplayPendingBatch({ after, limit: projectionReplayBatchSize }).pipe(
+              Effect.mapError(StorageUnavailable.make)
+            )
+            if (rows.length === 0) return null
+            yield* replayPendingBatch(rows, replaySchemaGeneration, target)
+            const next = rows[rows.length - 1].local_sequence
+            yield* sql`UPDATE effect_local_client_spaces SET projection_replay_cursor = ${`pending:${next}`}
+              WHERE space_id = ${options.spaceId}`
+            return next
+          })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          if (replayed === null) break
+          after = replayed
+          yield* Effect.yieldNow
+        }
+
+        yield* sql.withTransaction(Effect.gen(function*() {
+          const row = yield* meta
+          yield* validateFence(row)
+          if (
+            row.projection_replay_generation !== target ||
+            row.projection_replay_cursor !== `pending:${after}`
+          ) {
+            return yield* new ReplicaError.StorageCorrupt({ message: "Projection promotion fence changed" })
+          }
+          yield* sql`UPDATE effect_local_client_spaces SET
+            active_projection_generation = ${target},
+            projection_schema_generation = ${replaySchemaGeneration},
+            projection_replay_generation = NULL,
+            projection_replay_cursor = NULL,
+            visible_revision = visible_revision + 1
+            WHERE space_id = ${options.spaceId}`
+          return yield* Effect.void
+        })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+
+        while (true) {
+          const deleted = yield* sql.withTransaction(Effect.gen(function*() {
+            const ids = yield* findProjectionRowIds({
+              schemaGeneration: replaySchemaGeneration,
+              projectionGeneration: target,
+              keep: true,
+              limit: projectionReplayBatchSize
+            }).pipe(Effect.mapError(StorageUnavailable.make))
+            if (ids.length === 0) return false
+            yield* sql`DELETE FROM effect_local_client_visible_entities_data
+              WHERE rowid IN ${sql.in(ids.map((id) => id.row_id))}`
+            return true
+          })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          if (!deleted) break
+          yield* Effect.yieldNow
+        }
+        yield* invalidate([])
+        return yield* Effect.void
+      })
+
+      const withProjectionGate = <A, E, R,>(effect: Effect.Effect<A, E, R>) =>
+        projectionGate.withPermit(rebuildProjection.pipe(Effect.andThen(effect)))
 
       const pruneReceipts = (target: number) =>
         Effect.gen(function*() {
@@ -536,7 +788,9 @@ export const layer = (
           const rows = yield* findPrunableReceipts(excess).pipe(Effect.mapError(StorageUnavailable.make))
           for (let offset = 0; offset < rows.length; offset += 500) {
             const mutationIds = rows.slice(offset, offset + 500).map((row) => row.mutation_id)
-            yield* sql`DELETE FROM effect_local_receipts WHERE mutation_id IN ${sql.in(mutationIds)}`
+            yield* sql`DELETE FROM effect_local_client_receipts_data
+              WHERE space_id = ${options.spaceId} AND schema_generation = ${activeGeneration}
+                AND mutation_id IN ${sql.in(mutationIds)}`
           }
           return rows.map((row) => row.mutation_id)
         })
@@ -570,6 +824,11 @@ export const layer = (
             if (receipt.spaceId !== options.spaceId || receipt.clientId !== options.clientId) {
               return yield* new ReplicaError.ProtocolInvalid({
                 message: "Receipt identity does not match this replica"
+              })
+            }
+            if (receipt.membershipIncarnation !== initializedMeta.membership_incarnation) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: "Receipt incarnation does not match this membership"
               })
             }
             const storedReceipt = yield* findReceipt(receipt.mutationId).pipe(
@@ -626,9 +885,10 @@ export const layer = (
             if (receipt._tag === "Rejected") rejectionOrigin = receipt.origin
             else if (receipt._tag === "Legacy") rejectionOrigin = "Legacy"
             yield* sql`INSERT INTO effect_local_client_receipts_data
-              (generation, mutation_id, local_sequence, receipt_json, source_schema_version, source_schema_hash,
-                mutation_version, mutation_name, rejection_origin)
-              VALUES (${activeGeneration}, ${receipt.mutationId}, ${receipt.localSequence},
+              (space_id, schema_generation, membership_incarnation, mutation_id, local_sequence, receipt_json,
+                source_schema_version, source_schema_hash, mutation_version, mutation_name, rejection_origin)
+              VALUES (${options.spaceId}, ${activeGeneration}, ${receipt.membershipIncarnation},
+                ${receipt.mutationId}, ${receipt.localSequence},
                 ${yield* Codec.stringify(receipt)},
             ${receiptSchema.version}, ${receiptSchema.hash}, ${receiptMutationVersion}, ${receiptName},
             ${rejectionOrigin})`
@@ -645,7 +905,7 @@ export const layer = (
           attributes: { "mutation.id": receipt.mutationId }
         }))
 
-      const settleReceipts = Effect.gen(function*() {
+      const settleReceipts = withProjectionGate(Effect.gen(function*() {
         const touched = new Map<string, Protocol.EntityKey>()
         let prunedReceiptIds: ReadonlyArray<Identity.MutationId> = []
         yield* sql.withTransaction(Effect.gen(function*() {
@@ -664,6 +924,7 @@ export const layer = (
             if (
               receipt.spaceId !== pendingMutation.envelope.spaceId ||
               receipt.clientId !== pendingMutation.envelope.clientId ||
+              receipt.membershipIncarnation !== pendingMutation.envelope.membershipIncarnation ||
               receipt.mutationId !== pendingMutation.envelope.mutationId ||
               receipt.localSequence !== pendingMutation.envelope.localSequence
             ) {
@@ -693,6 +954,7 @@ export const layer = (
                   row.entry_mutation_id !== entry.mutationId ||
                   entry.spaceId !== receipt.spaceId ||
                   entry.clientId !== receipt.clientId ||
+                  entry.membershipIncarnation !== receipt.membershipIncarnation ||
                   entry.mutationId !== receipt.mutationId ||
                   entry.localSequence !== receipt.localSequence ||
                   entry.sequence !== receipt.serverSequence ||
@@ -712,26 +974,28 @@ export const layer = (
             for (const change of pendingMutation.changes) {
               touched.set(SqlTransaction.entityKey(change.entity), change.entity)
             }
-            yield* sql`DELETE FROM effect_local_pending WHERE mutation_id = ${receipt.mutationId}`
+            yield* sql`DELETE FROM effect_local_client_pending_data
+              WHERE space_id = ${options.spaceId} AND schema_generation = ${activeGeneration}
+                AND mutation_id = ${receipt.mutationId}`
           }
           if (touched.size > 0) {
-            yield* restoreAndReplay(Array.from(touched.values()))
-            yield* sql`UPDATE effect_local_client_meta
-              SET visible_revision = visible_revision + 1 WHERE singleton = 1`
+            yield* requestProjectionReplay(yield* meta)
           }
           const current = yield* meta
           const logFloor = Math.max(0, current.server_cursor - options.retainedHistoryEntries)
           yield* sql`DELETE FROM effect_local_server_log
-            WHERE server_sequence <= ${logFloor} AND NOT EXISTS (
-              SELECT 1 FROM effect_local_pending AS p
-              WHERE p.mutation_id = effect_local_server_log.mutation_id
+            WHERE space_id = ${options.spaceId} AND server_sequence <= ${logFloor} AND NOT EXISTS (
+              SELECT 1 FROM effect_local_client_pending_data AS p
+              WHERE p.space_id = ${options.spaceId} AND p.schema_generation = ${activeGeneration}
+                AND p.mutation_id = effect_local_server_log.mutation_id
             )`
           prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
           return yield* Effect.void
         })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        if (touched.size > 0) yield* rebuildProjection
         if (touched.size > 0) yield* invalidate(Array.from(touched.values()))
         if (prunedReceiptIds.length > 0) yield* invalidate([], prunedReceiptIds)
-      }).pipe(Effect.withSpan("LocalStore.settleReceipts"))
+      })).pipe(Effect.withSpan("LocalStore.settleReceipts"))
 
       const applyReceipts = (receipts: ReadonlyArray<Protocol.Receipt>) =>
         Effect.gen(function*() {
@@ -787,13 +1051,13 @@ export const layer = (
             if (Option.isSome(current) && bootstrapMatches(current.value, manifest)) {
               return current.value.next_ordinal - 1
             }
-            yield* sql`DELETE FROM effect_local_bootstrap_entities`
-            yield* sql`DELETE FROM effect_local_bootstrap WHERE singleton = 1`
+            yield* sql`DELETE FROM effect_local_bootstrap_entities WHERE space_id = ${options.spaceId}`
+            yield* sql`DELETE FROM effect_local_bootstrap WHERE space_id = ${options.spaceId}`
             yield* sql`INSERT INTO effect_local_bootstrap
-              (singleton, snapshot_id, space_id, definition_hash, schema_version, schema_hash,
+              (snapshot_id, space_id, definition_hash, schema_version, schema_hash,
                 server_sequence, terminal_sequence,
                 entity_count, content_bytes, digest, next_ordinal, received_bytes, rolling_digest)
-              VALUES (1, ${manifest.snapshotId}, ${manifest.spaceId}, ${manifest.definitionHash},
+              VALUES (${manifest.snapshotId}, ${manifest.spaceId}, ${manifest.definitionHash},
                 ${manifest.schema.version}, ${manifest.schema.hash},
                 ${manifest.sequence}, ${manifest.terminalSequenceThrough}, ${manifest.entityCount},
                 ${manifest.contentBytes}, ${manifest.digest}, 0, 0, ${Protocol.initialSnapshotDigest})`
@@ -918,8 +1182,16 @@ export const layer = (
               nextOrdinal += 1
             }
             for (let offset = 0; offset < stagedRows.length; offset += 100) {
-              yield* sql`INSERT INTO effect_local_bootstrap_entities
-                ${sql.insert(stagedRows.slice(offset, offset + 100))}`
+              const batch = stagedRows.slice(offset, offset + 100).map((row) => ({
+                space_id: options.spaceId,
+                ordinal: row.ordinal,
+                model: row.model,
+                model_version: row.model_version,
+                entity_key: row.entity_key,
+                value_json: row.value_json,
+                entity_bytes: row.entity_bytes
+              }))
+              yield* sql`INSERT INTO effect_local_bootstrap_entities ${sql.insert(batch)}`
             }
             if (nextOrdinal > page.manifest.entityCount) {
               return yield* new ReplicaError.ProtocolInvalid({
@@ -947,7 +1219,7 @@ export const layer = (
             }
             yield* sql`UPDATE effect_local_bootstrap SET
               next_ordinal = ${nextOrdinal}, received_bytes = ${receivedBytes}, rolling_digest = ${rollingDigest}
-              WHERE singleton = 1`
+              WHERE space_id = ${options.spaceId}`
             return complete
           }))
         }).pipe(
@@ -958,7 +1230,7 @@ export const layer = (
         )
 
       const installBootstrap = (manifest: Protocol.SnapshotManifest) =>
-        Effect.gen(function*() {
+        withProjectionGate(Effect.gen(function*() {
           yield* validateManifest(manifest)
           const dirty = new Map<string, Protocol.EntityKey>()
           let prunedReceiptIds: ReadonlyArray<Identity.MutationId> = []
@@ -1087,6 +1359,7 @@ export const layer = (
               if (
                 receipt.spaceId !== pendingMutation.envelope.spaceId ||
                 receipt.clientId !== pendingMutation.envelope.clientId ||
+                receipt.membershipIncarnation !== pendingMutation.envelope.membershipIncarnation ||
                 receipt.mutationId !== pendingMutation.envelope.mutationId ||
                 receipt.localSequence !== pendingMutation.envelope.localSequence
               ) {
@@ -1108,7 +1381,11 @@ export const layer = (
               } else {
                 covered = true
               }
-              if (covered) yield* sql`DELETE FROM effect_local_pending WHERE mutation_id = ${row.mutation_id}`
+              if (covered) {
+                yield* sql`DELETE FROM effect_local_client_pending_data
+                  WHERE space_id = ${options.spaceId} AND schema_generation = ${activeGeneration}
+                    AND mutation_id = ${row.mutation_id}`
+              }
             }
 
             const pendingLogs = yield* findPendingLog(undefined).pipe(Effect.mapError(StorageUnavailable.make))
@@ -1122,6 +1399,7 @@ export const layer = (
                 row.entry_mutation_id !== entry.mutationId ||
                 entry.mutationId !== pendingMutation.envelope.mutationId ||
                 entry.clientId !== options.clientId ||
+                entry.membershipIncarnation !== initializedMeta.membership_incarnation ||
                 entry.localSequence !== pendingMutation.envelope.localSequence ||
                 entry.digest !== pendingMutation.envelope.digest
               ) {
@@ -1130,36 +1408,35 @@ export const layer = (
                 })
               }
               if (entry.sequence <= manifest.sequence) {
-                yield* sql`DELETE FROM effect_local_pending WHERE mutation_id = ${row.mutation_id}`
+                yield* sql`DELETE FROM effect_local_client_pending_data
+                  WHERE space_id = ${options.spaceId} AND schema_generation = ${activeGeneration}
+                    AND mutation_id = ${row.mutation_id}`
               }
             }
 
-            yield* sql`DELETE FROM effect_local_canonical_entities`
+            yield* sql`DELETE FROM effect_local_client_canonical_entities_data
+              WHERE space_id = ${options.spaceId} AND schema_generation = ${activeGeneration}`
             yield* sql`INSERT INTO effect_local_client_canonical_entities_data
-              (generation, model, model_version, entity_key, value_json)
-              SELECT ${activeGeneration}, model, model_version, entity_key, value_json
-              FROM effect_local_bootstrap_entities ORDER BY ordinal`
-            yield* sql`DELETE FROM effect_local_server_log WHERE server_sequence <= ${manifest.sequence}`
-            yield* sql`DELETE FROM effect_local_visible_entities`
-            yield* sql`INSERT INTO effect_local_client_visible_entities_data
-              (generation, model, model_version, entity_key, value_json)
-              SELECT ${activeGeneration}, model, model_version, entity_key, value_json
-              FROM effect_local_client_canonical_entities_data WHERE generation = ${activeGeneration}`
-            yield* restoreAndReplay([])
-            yield* sql`UPDATE effect_local_client_meta SET
+              (space_id, schema_generation, model, model_version, entity_key, value_json)
+              SELECT ${options.spaceId}, ${activeGeneration}, model, model_version, entity_key, value_json
+              FROM effect_local_bootstrap_entities WHERE space_id = ${options.spaceId} ORDER BY ordinal`
+            yield* sql`DELETE FROM effect_local_server_log
+              WHERE space_id = ${options.spaceId} AND server_sequence <= ${manifest.sequence}`
+            yield* sql`UPDATE effect_local_client_spaces SET
               server_cursor = ${manifest.sequence},
               installed_snapshot_id = ${manifest.snapshotId},
               installed_snapshot_sequence = ${manifest.sequence},
-              installed_snapshot_terminal_sequence = ${manifest.terminalSequenceThrough},
-              visible_revision = visible_revision + 1
-              WHERE singleton = 1`
-            yield* sql`DELETE FROM effect_local_bootstrap_entities`
-            yield* sql`DELETE FROM effect_local_bootstrap WHERE singleton = 1`
+              installed_snapshot_terminal_sequence = ${manifest.terminalSequenceThrough}
+              WHERE space_id = ${options.spaceId}`
+            yield* requestProjectionReplay(yield* meta)
+            yield* sql`DELETE FROM effect_local_bootstrap_entities WHERE space_id = ${options.spaceId}`
+            yield* sql`DELETE FROM effect_local_bootstrap WHERE space_id = ${options.spaceId}`
             prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
             return yield* Effect.void
           })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          yield* rebuildProjection
           yield* invalidate(Array.from(dirty.values()), prunedReceiptIds)
-        }).pipe(
+        })).pipe(
           Effect.uninterruptible,
           Effect.withSpan("LocalStore.installBootstrap", {
             attributes: { "snapshot.id": manifest.snapshotId, "server.sequence": manifest.sequence }
@@ -1188,9 +1465,9 @@ export const layer = (
           const current = yield* meta
           yield* validateFence(current)
           const requested = yield* nextReconciliationGeneration(current.requested_generation)
-          yield* sql`UPDATE effect_local_client_meta
+          yield* sql`UPDATE effect_local_client_spaces
           SET requested_generation = ${requested}
-          WHERE singleton = 1`
+          WHERE space_id = ${options.spaceId}`
           return requested
         })
       ).pipe(
@@ -1213,9 +1490,9 @@ export const layer = (
                 message: `Reconciliation generation ${generation} was not requested`
               })
             }
-            yield* sql`UPDATE effect_local_client_meta
+            yield* sql`UPDATE effect_local_client_spaces
             SET completed_generation = MAX(completed_generation, ${generation})
-            WHERE singleton = 1`
+            WHERE space_id = ${options.spaceId}`
             return yield* Effect.void
           })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
           return yield* Effect.void
@@ -1223,9 +1500,12 @@ export const layer = (
           attributes: { "reconciliation.generation": generation }
         }))
 
+      yield* projectionGate.withPermit(rebuildProjection)
+
       const service: Service = {
+        membershipIncarnation: initializedMeta.membership_incarnation,
         mutate: (mutation, payloadValue) =>
-          Effect.gen(function*() {
+          withProjectionGate(Effect.gen(function*() {
             const result = yield* sql.withTransaction(Effect.gen(function*() {
               const storedMeta = yield* meta
               yield* validateFence(storedMeta)
@@ -1258,7 +1538,8 @@ export const layer = (
                 basis: storedMeta.server_cursor,
                 name: mutation.name,
                 payload: payloadJsonValue,
-                digestVersion: 2 as const,
+                digestVersion: 3 as const,
+                membershipIncarnation: storedMeta.membership_incarnation,
                 sourceSchema: options.definition.schemaIdentity,
                 mutationVersion: mutation.version
               }
@@ -1280,7 +1561,9 @@ export const layer = (
                   sql,
                   definition: options.definition,
                   table: "visible",
-                  generation: activeGeneration,
+                  spaceId: options.spaceId,
+                  schemaGeneration: storedMeta.active_schema_generation,
+                  projectionGeneration: storedMeta.active_projection_generation,
                   changes
                 }),
                 changes
@@ -1295,25 +1578,27 @@ export const layer = (
                 changes
               }
               yield* sql`INSERT INTO effect_local_client_pending_data
-            (generation, mutation_id, local_sequence, basis, name, payload_json, digest, digest_version,
-              source_schema_version, source_schema_hash, mutation_version, optimistic_result_json, changes_json)
-            VALUES (${activeGeneration}, ${mutationId}, ${envelope.localSequence}, ${envelope.basis}, ${envelope.name},
+            (space_id, schema_generation, membership_incarnation, mutation_id, local_sequence, basis, name,
+              payload_json, digest, digest_version, source_schema_version, source_schema_hash, mutation_version,
+              optimistic_result_json, changes_json)
+            VALUES (${options.spaceId}, ${storedMeta.active_schema_generation}, ${envelope.membershipIncarnation}, ${mutationId},
+              ${envelope.localSequence}, ${envelope.basis}, ${envelope.name},
               ${yield* Codec.stringify(envelope.payload)}, ${digest}, ${envelope.digestVersion},
               ${envelope.sourceSchema.version}, ${envelope.sourceSchema.hash}, ${envelope.mutationVersion}, ${yield* Codec
                 .stringify(
                   executed.success.result
                 )},
               ${yield* Codec.stringify(changes)})`
-              yield* sql`UPDATE effect_local_client_meta
+              yield* sql`UPDATE effect_local_client_spaces
             SET next_local_sequence = next_local_sequence + 1,
                 visible_revision = visible_revision + 1,
                 requested_generation = requested_generation + 1
-            WHERE singleton = 1`
+            WHERE space_id = ${options.spaceId}`
               return pendingMutation
             })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
             yield* invalidate(result.changes.map((change) => change.entity))
             return result
-          }).pipe(Effect.withSpan("LocalStore.mutate", {
+          })).pipe(Effect.withSpan("LocalStore.mutate", {
             attributes: {
               "mutation.name": mutation.name,
               "space.id": options.spaceId,
@@ -1322,12 +1607,15 @@ export const layer = (
           })),
         get: (model, key) =>
           sql.withTransaction(Effect.gen(function*() {
-            yield* validateFence(yield* meta)
+            const current = yield* meta
+            yield* validateFence(current)
             return yield* SqlTransaction.local({
               sql,
               definition: options.definition,
               table: "visible",
-              generation: activeGeneration
+              spaceId: options.spaceId,
+              schemaGeneration: current.active_schema_generation,
+              projectionGeneration: current.active_projection_generation
             }).get(
               model,
               key
@@ -1358,7 +1646,7 @@ export const layer = (
         requestReconciliation,
         completeReconciliation,
         applyEntries: (entries) =>
-          Effect.gen(function*() {
+          withProjectionGate(Effect.gen(function*() {
             if (entries.length === 0) return yield* Effect.void
             const touched: Array<Protocol.EntityKey> = []
             const settledReceiptIds: Array<Identity.MutationId> = []
@@ -1399,13 +1687,22 @@ export const layer = (
                   return yield* new ReplicaError.CursorGap({ expected, actual: entry.sequence })
                 }
                 yield* sql`INSERT INTO effect_local_server_log
-              (server_sequence, mutation_id, entry_json, source_schema_version, source_schema_hash)
-              VALUES (${entry.sequence}, ${entry.mutationId}, ${yield* Codec.stringify(entry)},
+              (space_id, membership_incarnation, server_sequence, mutation_id, entry_json,
+                source_schema_version, source_schema_hash)
+              VALUES (${options.spaceId}, ${entry.membershipIncarnation}, ${entry.sequence}, ${entry.mutationId},
+                ${yield* Codec.stringify(entry)},
                 ${entry.sourceSchema.version}, ${entry.sourceSchema.hash})`
                 const currentChanges = yield* migrateEntryChanges(entry)
                 for (const change of currentChanges) {
                   touched.push(change.entity)
-                  yield* SqlTransaction.applyLocalChange(sql, "canonical", activeGeneration, change)
+                  yield* SqlTransaction.applyLocalChange(
+                    sql,
+                    "canonical",
+                    options.spaceId,
+                    currentMeta.active_schema_generation,
+                    currentMeta.active_projection_generation,
+                    change
+                  )
                 }
                 if (entry.clientId === options.clientId) {
                   const storedPending = yield* findPendingByMutation(entry.mutationId).pipe(
@@ -1416,6 +1713,7 @@ export const layer = (
                     if (
                       decodedPending.envelope.spaceId !== entry.spaceId ||
                       decodedPending.envelope.clientId !== entry.clientId ||
+                      decodedPending.envelope.membershipIncarnation !== entry.membershipIncarnation ||
                       decodedPending.envelope.mutationId !== entry.mutationId ||
                       decodedPending.envelope.localSequence !== entry.localSequence ||
                       decodedPending.envelope.digest !== entry.digest
@@ -1436,6 +1734,7 @@ export const layer = (
                       receipt._tag !== "Accepted" ||
                       receipt.spaceId !== entry.spaceId ||
                       receipt.clientId !== entry.clientId ||
+                      receipt.membershipIncarnation !== entry.membershipIncarnation ||
                       receipt.mutationId !== entry.mutationId ||
                       receipt.localSequence !== entry.localSequence ||
                       receipt.serverSequence !== entry.sequence
@@ -1448,31 +1747,36 @@ export const layer = (
                       touched.push(
                         ...(yield* decodePendingRow(storedPending.value)).changes.map((change) => change.entity)
                       )
-                      yield* sql`DELETE FROM effect_local_pending WHERE mutation_id = ${entry.mutationId}`
+                      yield* sql`DELETE FROM effect_local_client_pending_data
+                        WHERE space_id = ${options.spaceId} AND schema_generation = ${activeGeneration}
+                          AND mutation_id = ${entry.mutationId}`
                     }
                     settledReceiptIds.push(entry.mutationId)
                   }
                 }
                 cursor = entry.sequence
               }
-              yield* restoreAndReplay(touched)
-              yield* sql`UPDATE effect_local_client_meta
-            SET server_cursor = ${cursor}, visible_revision = visible_revision + 1 WHERE singleton = 1`
+              yield* sql`UPDATE effect_local_client_spaces
+            SET server_cursor = ${cursor}
+            WHERE space_id = ${options.spaceId}`
+              yield* requestProjectionReplay(yield* meta)
               const logFloor = Math.max(0, cursor - options.retainedHistoryEntries)
               yield* sql`DELETE FROM effect_local_server_log
-                WHERE server_sequence <= ${logFloor} AND NOT EXISTS (
-                  SELECT 1 FROM effect_local_pending AS p
-                  WHERE p.mutation_id = effect_local_server_log.mutation_id
+                WHERE space_id = ${options.spaceId} AND server_sequence <= ${logFloor} AND NOT EXISTS (
+                  SELECT 1 FROM effect_local_client_pending_data AS p
+                  WHERE p.space_id = ${options.spaceId} AND p.schema_generation = ${activeGeneration}
+                    AND p.mutation_id = effect_local_server_log.mutation_id
                 )`
               prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
               return yield* Effect.void
             })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            yield* rebuildProjection
             yield* invalidate(
               touched,
               [...settledReceiptIds, ...prunedReceiptIds]
             )
             return undefined
-          }).pipe(Effect.withSpan("LocalStore.applyEntries", {
+          })).pipe(Effect.withSpan("LocalStore.applyEntries", {
             attributes: { "entry.count": entries.length, "space.id": options.spaceId }
           })),
         applyReceipts,
@@ -1482,7 +1786,10 @@ export const layer = (
         prepareBootstrap,
         stageBootstrapPage,
         installBootstrap,
-        invalidateStatus: reactivity.invalidate(["effect-local:status"])
+        invalidateStatus: reactivity.invalidate([
+          `effect-local:space:${options.spaceId}:status`,
+          "effect-local:status"
+        ])
       }
       return Store.of(service)
     })

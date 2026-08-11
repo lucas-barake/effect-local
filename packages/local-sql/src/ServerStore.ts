@@ -202,7 +202,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         Request: Schema.Struct({ spaceId: Identity.SpaceId, mutationId: Identity.MutationId }),
         Result: Rows.ServerReceiptRow,
         execute: ({ spaceId, mutationId }) =>
-          sql`SELECT r.space_id, r.client_id, r.local_sequence, r.digest, r.mutation_id, r.receipt_json,
+          sql`SELECT r.space_id, r.client_id, r.membership_incarnation, r.local_sequence,
+          r.digest, r.mutation_id, r.receipt_json,
           r.digest_version, r.source_schema_version, r.source_schema_hash, r.mutation_version,
           r.mutation_name, r.rejection_origin, r.terminal_sequence, r.server_sequence
         FROM effect_local_server_receipts AS r
@@ -212,23 +213,31 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         Request: Schema.Struct({
           spaceId: Identity.SpaceId,
           clientId: Identity.ClientId,
+          membershipIncarnation: Identity.MembershipIncarnation,
           localSequence: Identity.LocalSequence
         }),
         Result: Rows.ServerReceiptRow,
-        execute: ({ spaceId, clientId, localSequence }) =>
-          sql`SELECT r.space_id, r.client_id, r.local_sequence, r.digest, r.mutation_id, r.receipt_json,
+        execute: ({ spaceId, clientId, membershipIncarnation, localSequence }) =>
+          sql`SELECT r.space_id, r.client_id, r.membership_incarnation, r.local_sequence,
+          r.digest, r.mutation_id, r.receipt_json,
           r.digest_version, r.source_schema_version, r.source_schema_hash, r.mutation_version,
           r.mutation_name, r.rejection_origin, r.terminal_sequence, r.server_sequence
         FROM effect_local_server_receipts AS r
-        WHERE r.space_id = ${spaceId} AND r.client_id = ${clientId} AND r.local_sequence = ${localSequence}`
+        WHERE r.space_id = ${spaceId} AND r.client_id = ${clientId}
+          AND r.membership_incarnation = ${membershipIncarnation} AND r.local_sequence = ${localSequence}`
       })
       const lockClient = SqlSchema.findOne({
-        Request: Schema.Struct({ spaceId: Identity.SpaceId, clientId: Identity.ClientId }),
+        Request: Schema.Struct({
+          spaceId: Identity.SpaceId,
+          clientId: Identity.ClientId,
+          membershipIncarnation: Identity.MembershipIncarnation
+        }),
         Result: Rows.ServerClientRow,
-        execute: ({ spaceId, clientId }) =>
+        execute: ({ spaceId, clientId, membershipIncarnation }) =>
           sql`UPDATE effect_local_server_clients
         SET last_local_sequence = last_local_sequence
         WHERE space_id = ${spaceId} AND client_id = ${clientId}
+          AND membership_incarnation = ${membershipIncarnation}
         RETURNING last_local_sequence, expired_local_sequence`
       })
       const lockSpace = SqlSchema.findOne({
@@ -313,7 +322,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         }),
         Result: Rows.ServerLogRow,
         execute: ({ spaceId, after, through }) =>
-          sql`SELECT space_id, server_sequence, client_id, local_sequence, mutation_id, digest,
+          sql`SELECT space_id, server_sequence, client_id, membership_incarnation,
+            local_sequence, mutation_id, digest,
             entry_bytes, entry_json, source_schema_version, source_schema_hash
           FROM effect_local_authoritative_log
           WHERE space_id = ${spaceId} AND server_sequence > ${after} AND server_sequence <= ${through}
@@ -496,10 +506,12 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           if (
             row.space_id !== envelope.spaceId ||
             row.client_id !== envelope.clientId ||
+            row.membership_incarnation !== Protocol.membershipIncarnationForEnvelope(envelope) ||
             row.local_sequence !== envelope.localSequence ||
             row.mutation_id !== envelope.mutationId ||
             receipt.spaceId !== row.space_id ||
             receipt.clientId !== row.client_id ||
+            receipt.membershipIncarnation !== row.membership_incarnation ||
             receipt.localSequence !== row.local_sequence ||
             receipt.mutationId !== row.mutation_id ||
             receipt.sourceSchema.version !== row.source_schema_version ||
@@ -536,6 +548,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           const receipt = Protocol.RejectedReceipt.make({
             spaceId: envelope.spaceId,
             clientId: envelope.clientId,
+            membershipIncarnation: Protocol.membershipIncarnationForEnvelope(envelope),
             mutationId: envelope.mutationId,
             localSequence: envelope.localSequence,
             name: mutation.name,
@@ -548,6 +561,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           return Protocol.RejectedReceipt.make({
             spaceId: envelope.spaceId,
             clientId: envelope.clientId,
+            membershipIncarnation: Protocol.membershipIncarnationForEnvelope(envelope),
             mutationId: envelope.mutationId,
             localSequence: envelope.localSequence,
             name: mutation.name,
@@ -798,6 +812,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             )
           }
           const envelope = yield* resolveLegacyEnvelope(submittedEnvelope)
+          const membershipIncarnation = Protocol.membershipIncarnationForEnvelope(envelope)
           yield* prepareSpace(envelope.spaceId, request.schema)
           if (envelope.digestVersion === 1) {
             yield* sql`UPDATE effect_local_server_spaces SET
@@ -834,9 +849,9 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           const mutation = yield* runtime.prepare(envelope)
           return yield* sql.withTransaction(Effect.gen(function*() {
             yield* sql`INSERT INTO effect_local_server_clients
-              (space_id, client_id, last_local_sequence, expired_local_sequence)
-              VALUES (${envelope.spaceId}, ${envelope.clientId}, 0, 0)
-              ON CONFLICT (space_id, client_id) DO NOTHING`
+              (space_id, client_id, membership_incarnation, last_local_sequence, expired_local_sequence)
+              VALUES (${envelope.spaceId}, ${envelope.clientId}, ${membershipIncarnation}, 0, 0)
+              ON CONFLICT (space_id, client_id, membership_incarnation) DO NOTHING`
             let storedSpace: typeof Rows.ServerMetaRow.Type = yield* lockSpace(envelope.spaceId).pipe(
               Effect.mapError(StorageUnavailable.make)
             )
@@ -854,7 +869,11 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 message: `Space ${envelope.spaceId} retained row counters are inconsistent`
               })
             }
-            const client = yield* lockClient({ spaceId: envelope.spaceId, clientId: envelope.clientId }).pipe(
+            const client = yield* lockClient({
+              spaceId: envelope.spaceId,
+              clientId: envelope.clientId,
+              membershipIncarnation
+            }).pipe(
               Effect.mapError(StorageUnavailable.make)
             )
             const committedByMutation = yield* findReceiptByMutation({
@@ -872,6 +891,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             const committedBySequence = yield* findReceiptBySequence({
               spaceId: envelope.spaceId,
               clientId: envelope.clientId,
+              membershipIncarnation,
               localSequence: envelope.localSequence
             }).pipe(Effect.mapError(StorageUnavailable.make))
             if (Option.isSome(committedBySequence)) {
@@ -883,6 +903,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               return Protocol.ExpiredReceipt.make({
                 spaceId: envelope.spaceId,
                 clientId: envelope.clientId,
+                membershipIncarnation,
                 mutationId: envelope.mutationId,
                 localSequence: envelope.localSequence,
                 name: mutation.name,
@@ -1010,6 +1031,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                         sequence,
                         spaceId: envelope.spaceId,
                         clientId: envelope.clientId,
+                        membershipIncarnation,
                         mutationId: envelope.mutationId,
                         localSequence: envelope.localSequence,
                         sourceSchema: options.definition.schemaIdentity,
@@ -1033,6 +1055,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                       const accepted = Protocol.AcceptedReceipt.make({
                         spaceId: envelope.spaceId,
                         clientId: envelope.clientId,
+                        membershipIncarnation,
                         mutationId: envelope.mutationId,
                         localSequence: envelope.localSequence,
                         name: mutation.name,
@@ -1077,9 +1100,11 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                   next_server_sequence = next_server_sequence + 1
                   WHERE space_id = ${envelope.spaceId}`
                 yield* sql`INSERT INTO effect_local_authoritative_log
-                  (space_id, server_sequence, client_id, local_sequence, mutation_id, digest, entry_bytes, entry_json,
-                    source_schema_version, source_schema_hash, mutation_version)
-                  VALUES (${envelope.spaceId}, ${entry.sequence}, ${envelope.clientId}, ${envelope.localSequence},
+                  (space_id, server_sequence, client_id, membership_incarnation, local_sequence,
+                    mutation_id, digest, entry_bytes, entry_json, source_schema_version,
+                    source_schema_hash, mutation_version)
+                  VALUES (${envelope.spaceId}, ${entry.sequence}, ${envelope.clientId},
+                    ${membershipIncarnation}, ${envelope.localSequence},
                     ${envelope.mutationId}, ${envelope.digest}, ${entryBytes}, ${entryJson},
                     ${options.definition.schemaIdentity.version}, ${options.definition.schemaIdentity.hash},
                     ${mutation.mutationVersion})`
@@ -1092,10 +1117,11 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             let rejectionOrigin: Protocol.RejectionOrigin | null = null
             if (receipt._tag === "Rejected") rejectionOrigin = receipt.origin
             yield* sql`INSERT INTO effect_local_server_receipts
-              (space_id, client_id, local_sequence, mutation_id, digest, terminal_sequence, server_sequence,
-                receipt_json, digest_version, source_schema_version, source_schema_hash, mutation_version,
-                mutation_name, rejection_origin)
-              VALUES (${envelope.spaceId}, ${envelope.clientId}, ${envelope.localSequence}, ${envelope.mutationId},
+              (space_id, client_id, membership_incarnation, local_sequence, mutation_id, digest,
+                terminal_sequence, server_sequence, receipt_json, digest_version, source_schema_version,
+                source_schema_hash, mutation_version, mutation_name, rejection_origin)
+              VALUES (${envelope.spaceId}, ${envelope.clientId}, ${membershipIncarnation},
+                ${envelope.localSequence}, ${envelope.mutationId},
                 ${envelope.digest}, ${terminalSequence}, ${receiptServerSequence},
                 ${yield* Codec.stringify(receipt)}, ${envelope.digestVersion},
                 ${receipt.sourceSchema.version}, ${receipt.sourceSchema.hash}, ${receipt.mutationVersion},
@@ -1104,7 +1130,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               next_terminal_sequence = next_terminal_sequence + 1
               WHERE space_id = ${envelope.spaceId}`
             yield* sql`UPDATE effect_local_server_clients SET last_local_sequence = ${envelope.localSequence}
-              WHERE space_id = ${envelope.spaceId} AND client_id = ${envelope.clientId}`
+              WHERE space_id = ${envelope.spaceId} AND client_id = ${envelope.clientId}
+                AND membership_incarnation = ${membershipIncarnation}`
             return receipt
           }))
         }).pipe(
@@ -1202,6 +1229,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               row.server_sequence !== metadataRow.server_sequence ||
               row.server_sequence !== entry.sequence ||
               row.client_id !== entry.clientId ||
+              row.membership_incarnation !== entry.membershipIncarnation ||
               row.local_sequence !== entry.localSequence ||
               row.mutation_id !== entry.mutationId ||
               row.digest !== entry.digest ||
@@ -1483,11 +1511,13 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                   expired_local_sequence = MAX(expired_local_sequence, COALESCE((
                     SELECT MAX(r.local_sequence) FROM effect_local_server_receipts AS r
                     WHERE r.space_id = c.space_id AND r.client_id = c.client_id
+                      AND r.membership_incarnation = c.membership_incarnation
                       AND r.terminal_sequence <= ${through}
                   ), expired_local_sequence))
                   WHERE c.space_id = ${candidate.manifest.spaceId} AND EXISTS (
                     SELECT 1 FROM effect_local_server_receipts AS r
                     WHERE r.space_id = c.space_id AND r.client_id = c.client_id
+                      AND r.membership_incarnation = c.membership_incarnation
                       AND r.terminal_sequence <= ${through}
                   )`
                 yield* sql`DELETE FROM effect_local_server_receipts

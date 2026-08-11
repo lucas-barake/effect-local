@@ -1,7 +1,9 @@
 import { NodeFileSystem } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
@@ -18,6 +20,7 @@ import * as Domain from "./Domain.js"
 const database = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const otherClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
 
 const LedgerRow = Schema.Struct({ id: Schema.Number, name: Schema.String, checksum: Schema.String })
 const NameRow = Schema.Struct({ name: Schema.String })
@@ -140,18 +143,15 @@ describe("storage migration catalogs", () => {
       })
       yield* Migrations.server()
 
-      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7])
-      assert.deepStrictEqual((yield* serverMigrationLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7])
+      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7, 8])
+      assert.deepStrictEqual((yield* serverMigrationLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7, 8])
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
         "effect_local_client_evolution",
         "effect_local_client_key_lineage",
         "effect_local_client_key_lineage_groups",
         "effect_local_client_key_lineage_targets",
-        "effect_local_client_shadow_entities",
-        "effect_local_client_shadow_pending",
-        "effect_local_client_shadow_receipts_v2",
-        "effect_local_client_shadow_visible_entities",
+        "effect_local_client_spaces",
         "effect_local_bootstrap",
         "effect_local_bootstrap_entities",
         "effect_local_client_canonical_entities_data",
@@ -165,6 +165,194 @@ describe("storage migration catalogs", () => {
         "effect_local_server_shadow_entities",
         "effect_local_server_entities_data"
       ])
+    }).pipe(Effect.provide(database)))
+
+  it.effect("promotes the singleton client catalog to partitioned space ownership without data loss", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrations.runCatalog("Client", Migrations.clientCatalog.slice(0, 7))
+      yield* sql`INSERT INTO effect_local_client_meta
+        (singleton, space_id, client_id, definition_hash, next_local_sequence, server_cursor, visible_revision,
+          requested_generation, completed_generation, schema_version, schema_hash, schema_generation,
+          active_schema_generation, installed_snapshot_sequence, installed_snapshot_terminal_sequence)
+        VALUES (1, ${spaceId}, ${clientId}, ${Domain.definition.hash}, 2, 4, 3, 5, 4,
+          ${Domain.definition.schemaIdentity.version}, ${Domain.definition.schemaIdentity.hash}, 2, 2, 0, 0)`
+      yield* sql`INSERT INTO effect_local_client_canonical_entities_data
+        (generation, model, entity_key, value_json, model_version)
+        VALUES (2, 'Todo', '"legacy"', '{"id":"legacy","title":"kept"}', 1)`
+      yield* sql`INSERT INTO effect_local_client_visible_entities_data
+        (generation, model, entity_key, value_json, model_version)
+        VALUES (2, 'Todo', '"legacy"', '{"id":"legacy","title":"kept"}', 1)`
+
+      yield* Migrations.client({ definition: Domain.definition, spaceId, clientId })
+
+      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7, 8])
+      const identities = yield* sql<{
+        readonly singleton: number
+        readonly client_id: string
+      }>`SELECT singleton, client_id FROM effect_local_client_meta`
+      assert.deepStrictEqual(identities, [{ singleton: 1, client_id: clientId }])
+      const memberships = yield* sql<{
+        readonly space_id: string
+        readonly membership_incarnation: string
+        readonly active_schema_generation: number
+        readonly active_projection_generation: number
+      }>`SELECT space_id, membership_incarnation, active_schema_generation, active_projection_generation
+        FROM effect_local_client_spaces`
+      assert.deepStrictEqual(memberships, [{
+        space_id: spaceId,
+        membership_incarnation: Identity.legacyMembershipIncarnation,
+        active_schema_generation: 2,
+        active_projection_generation: 0
+      }])
+      const visible = yield* sql<{
+        readonly space_id: string
+        readonly schema_generation: number
+        readonly projection_generation: number
+        readonly value_json: string
+      }>`SELECT space_id, schema_generation, projection_generation, value_json
+        FROM effect_local_client_visible_entities_data`
+      assert.deepStrictEqual(visible, [{
+        space_id: spaceId,
+        schema_generation: 2,
+        projection_generation: 0,
+        value_json: "{\"id\":\"legacy\",\"title\":\"kept\"}"
+      }])
+    }).pipe(Effect.provide(database)))
+
+  it.effect("rejects a wrong client before mutating a version 7 catalog", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrations.runCatalog("Client", Migrations.clientCatalog.slice(0, 7))
+      yield* sql`INSERT INTO effect_local_client_meta
+        (singleton, space_id, client_id, definition_hash, next_local_sequence, server_cursor, visible_revision,
+          requested_generation, completed_generation, schema_version, schema_hash, schema_generation,
+          active_schema_generation, installed_snapshot_sequence, installed_snapshot_terminal_sequence)
+        VALUES (1, ${spaceId}, ${clientId}, ${Domain.definition.hash}, 1, 0, 0, 0, 0,
+          ${Domain.definition.schemaIdentity.version}, ${Domain.definition.schemaIdentity.hash}, 0, 0, 0, 0)`
+
+      const error = yield* Migrations.client({
+        definition: Domain.definition,
+        spaceId,
+        clientId: otherClientId
+      }).pipe(Effect.flip)
+
+      assert.strictEqual(error._tag, "ReplicaIdentityMismatch")
+      if (error._tag === "ReplicaIdentityMismatch") {
+        assert.strictEqual(error.expectedClientId, otherClientId)
+        assert.strictEqual(error.actualClientId, clientId)
+      }
+      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7])
+      const metadata = yield* sql<{
+        readonly space_id: string
+        readonly client_id: string
+      }>`SELECT space_id, client_id FROM effect_local_client_meta`
+      assert.deepStrictEqual(metadata, [{ space_id: spaceId, client_id: clientId }])
+    }).pipe(Effect.provide(database)))
+
+  it.effect("rolls back version 8 when legacy bootstrap ownership is corrupt", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrations.runCatalog("Client", Migrations.clientCatalog.slice(0, 7))
+      yield* sql`INSERT INTO effect_local_client_meta
+        (singleton, space_id, client_id, definition_hash, next_local_sequence, server_cursor, visible_revision,
+          requested_generation, completed_generation, schema_version, schema_hash, schema_generation,
+          active_schema_generation, installed_snapshot_sequence, installed_snapshot_terminal_sequence)
+        VALUES (1, ${spaceId}, ${clientId}, ${Domain.definition.hash}, 1, 0, 0, 0, 0,
+          ${Domain.definition.schemaIdentity.version}, ${Domain.definition.schemaIdentity.hash}, 0, 0, 0, 0)`
+      yield* sql`INSERT INTO effect_local_bootstrap
+        (space_id, snapshot_id, definition_hash, schema_version, schema_hash, server_sequence,
+          terminal_sequence, entity_count, content_bytes, digest, next_ordinal, received_bytes, rolling_digest)
+        VALUES ('spc_00000000-0000-4000-8000-000000000099', 'snp_legacy', ${Domain.definition.hash},
+          ${Domain.definition.schemaIdentity.version}, ${Domain.definition.schemaIdentity.hash},
+          0, 0, 0, 0, ${"0".repeat(64)}, 0, 0, ${"0".repeat(64)})`
+
+      const error = yield* Migrations.client({ definition: Domain.definition, spaceId, clientId }).pipe(Effect.flip)
+
+      assert.strictEqual(error._tag, "StorageCorrupt")
+      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7])
+      const metadata = yield* sql<{ readonly space_id: string }>`SELECT space_id FROM effect_local_client_meta`
+      const bootstrap = yield* sql<{ readonly space_id: string }>`SELECT space_id FROM effect_local_bootstrap`
+      assert.deepStrictEqual(metadata, [{ space_id: spaceId }])
+      assert.deepStrictEqual(bootstrap, [{ space_id: "spc_00000000-0000-4000-8000-000000000099" }])
+    }).pipe(Effect.provide(database)))
+
+  it.effect("promotes server mutation lineage to membership incarnations with canonical durable JSON", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrations.runCatalog("Server", Migrations.serverCatalog.slice(0, 7))
+      const mutationId = Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")
+      const digest = Protocol.MutationDigest.make("1".repeat(64))
+      const schemaHash = Identity.SchemaHash.make("2".repeat(16))
+      const entry = {
+        sequence: 1,
+        spaceId,
+        clientId,
+        mutationId,
+        localSequence: 1,
+        sourceSchema: { version: 1, hash: schemaHash },
+        digest,
+        changes: []
+      }
+      const receipt = {
+        _tag: "Accepted",
+        spaceId,
+        clientId,
+        mutationId,
+        localSequence: 1,
+        name: "put",
+        sourceSchema: { version: 1, hash: schemaHash },
+        mutationVersion: 1,
+        serverSequence: 1,
+        terminalSequence: 1,
+        result: null
+      }
+      yield* sql`INSERT INTO effect_local_server_spaces
+        (space_id, definition_hash, next_server_sequence, schema_version, schema_hash,
+          schema_generation, active_schema_generation, next_terminal_sequence, metadata_verified)
+        VALUES (${spaceId}, 'definition', 2, 1, ${schemaHash}, 0, 0, 2, 1)`
+      yield* sql`INSERT INTO effect_local_server_space_counts (space_id, history_count, receipt_count)
+        VALUES (${spaceId}, 0, 0)`
+      yield* sql`INSERT INTO effect_local_server_clients
+        (space_id, client_id, last_local_sequence, expired_local_sequence)
+        VALUES (${spaceId}, ${clientId}, 1, 0)`
+      yield* sql`INSERT INTO effect_local_authoritative_log
+        (space_id, server_sequence, mutation_id, entry_bytes, entry_json, source_schema_version,
+          source_schema_hash, mutation_version, client_id, local_sequence, digest)
+        VALUES (${spaceId}, 1, ${mutationId}, 1, ${Canonical.stringify(entry)}, 1,
+          ${schemaHash}, 1, ${clientId}, 1, ${digest})`
+      yield* sql`INSERT INTO effect_local_server_receipts
+        (space_id, client_id, local_sequence, mutation_id, digest, receipt_json, digest_version,
+          source_schema_version, source_schema_hash, mutation_version, mutation_name,
+          terminal_sequence, server_sequence)
+        VALUES (${spaceId}, ${clientId}, 1, ${mutationId}, ${digest}, ${Canonical.stringify(receipt)}, 2,
+          1, ${schemaHash}, 1, 'put', 1, 1)`
+
+      yield* Migrations.server()
+
+      const clientRows = yield* sql<{ readonly membership_incarnation: string }>`
+        SELECT membership_incarnation FROM effect_local_server_clients`
+      const receiptRows = yield* sql<{
+        readonly membership_incarnation: string
+        readonly receipt_json: string
+      }>`SELECT membership_incarnation, receipt_json FROM effect_local_server_receipts`
+      const entryRows = yield* sql<{
+        readonly membership_incarnation: string
+        readonly entry_bytes: number
+        readonly entry_json: string
+      }>`SELECT membership_incarnation, entry_bytes, entry_json FROM effect_local_authoritative_log`
+      assert.strictEqual(clientRows[0].membership_incarnation, Identity.legacyMembershipIncarnation)
+      assert.strictEqual(receiptRows[0].membership_incarnation, Identity.legacyMembershipIncarnation)
+      assert.strictEqual(entryRows[0].membership_incarnation, Identity.legacyMembershipIncarnation)
+      const migratedReceipt = Schema.decodeUnknownSync(Schema.fromJsonString(Protocol.Receipt))(
+        receiptRows[0].receipt_json
+      )
+      const migratedEntry = Schema.decodeUnknownSync(Schema.fromJsonString(Protocol.AcceptedMutation))(
+        entryRows[0].entry_json
+      )
+      assert.strictEqual(migratedReceipt.membershipIncarnation, Identity.legacyMembershipIncarnation)
+      assert.strictEqual(migratedEntry.membershipIncarnation, Identity.legacyMembershipIncarnation)
+      assert.strictEqual(entryRows[0].entry_bytes, Protocol.encodedBytes(migratedEntry))
     }).pipe(Effect.provide(database)))
 
   it.effect("claims pending migrations before executing their effects", () =>
@@ -277,9 +465,11 @@ describe("storage migration catalogs", () => {
         execute: () =>
           sql`SELECT m.definition_hash, m.schema_version, e.value_json AS entity_value,
           e.model_version
-        FROM effect_local_client_meta AS m
-        INNER JOIN effect_local_canonical_entities AS e ON e.model = 'Todo' AND e.entity_key = '"1"'
-        WHERE m.singleton = 1`
+        FROM effect_local_client_spaces AS m
+        INNER JOIN effect_local_client_canonical_entities_data AS e
+          ON e.space_id = m.space_id AND e.schema_generation = m.active_schema_generation
+          AND e.model = 'Todo' AND e.entity_key = '"1"'
+        WHERE m.space_id = ${spaceId}`
       })(undefined)
       assert.deepStrictEqual(clientRow, {
         definition_hash: "legacy-client-hash",
@@ -358,9 +548,12 @@ describe("storage migration catalogs", () => {
         readonly source_count: number
         readonly target_count: number
       }>`SELECT m.active_schema_generation, e.phase, e.source_generation,
-        (SELECT COUNT(*) FROM effect_local_client_canonical_entities_data WHERE generation = 3) AS source_count,
-        (SELECT COUNT(*) FROM effect_local_client_canonical_entities_data WHERE generation = 4) AS target_count
-        FROM effect_local_client_meta AS m INNER JOIN effect_local_client_evolution AS e ON e.singleton = m.singleton`)[
+        (SELECT COUNT(*) FROM effect_local_client_canonical_entities_data
+          WHERE space_id = ${spaceId} AND schema_generation = 3) AS source_count,
+        (SELECT COUNT(*) FROM effect_local_client_canonical_entities_data
+          WHERE space_id = ${spaceId} AND schema_generation = 4) AS target_count
+        FROM effect_local_client_spaces AS m INNER JOIN effect_local_client_evolution AS e
+          ON e.space_id = m.space_id WHERE m.space_id = ${spaceId}`)[
         0
       ]
       assert.deepStrictEqual(client, {
