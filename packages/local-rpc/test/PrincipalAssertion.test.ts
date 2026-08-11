@@ -86,7 +86,8 @@ describe("principal assertions", () => {
         request,
         assertion: PrincipalAssertion.PrincipalAssertion.make("forged")
       }).pipe(Effect.flip)
-      assert.strictEqual(forged._tag, "AuthorizationDenied")
+      if (forged._tag !== "AuthorizationDenied") assert.fail("expected forged assertion denial")
+      assert.strictEqual(forged.reason, "forged assertion")
 
       const accepted = yield* client.Pull({
         request,

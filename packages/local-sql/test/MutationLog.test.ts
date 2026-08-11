@@ -1250,7 +1250,7 @@ describe("server reconciled mutation log", () => {
       assert.isFalse(Object.hasOwn(entry, "result"))
     })))
 
-  it.effect("pulls the public log without materializing private receipt payloads", () =>
+  it.effect("pulls authoritative entities without materializing private receipt payloads", () =>
     Effect.scoped(
       Effect.gen(function*() {
         const serverDatabase = database()
@@ -1274,6 +1274,10 @@ describe("server reconciled mutation log", () => {
 
         const entries = yield* authoritativeLog(sql)
         assert.deepStrictEqual(entries.map((entry) => entry.mutationId), [submitted.mutationId])
+        const required = yield* server.pull(pullRequest())
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        const page = yield* server.bootstrap(bootstrapRequest(required.manifest))
+        assert.deepStrictEqual(page.entries.map((entry) => entry.change.entity.key), ["public-with-private-receipt"])
         assert.strictEqual((yield* server.submit(submitted).pipe(Effect.flip))._tag, "StorageCorrupt")
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))

@@ -12,36 +12,31 @@ import * as SyncRpc from "./SyncRpc.js"
 export const layerHandlers = SyncRpc.Rpcs.toLayer(Effect.gen(function*() {
   const client = yield* SpaceEntity.Client
   const issuer = yield* PrincipalAssertion.Issuer
+  const issueAssertion = Authentication.Principal.pipe(Effect.flatMap(issuer.issue))
   return SyncRpc.Rpcs.of({
     Submit: (request) =>
-      Authentication.Principal.pipe(
-        Effect.flatMap(issuer.issue),
+      issueAssertion.pipe(
         Effect.flatMap((assertion) => client.submit(request.envelope.spaceId, request, assertion))
       ),
     Pull: (request) =>
-      Authentication.Principal.pipe(
-        Effect.flatMap(issuer.issue),
+      issueAssertion.pipe(
         Effect.flatMap((assertion) => client.pull(request.spaceId, request, assertion))
       ),
     Bootstrap: (request) =>
-      Authentication.Principal.pipe(
-        Effect.flatMap(issuer.issue),
+      issueAssertion.pipe(
         Effect.flatMap((assertion) => client.bootstrap(request.spaceId, request, assertion))
       ),
     Watch: (request) =>
-      Stream.unwrap(Authentication.Principal.pipe(
-        Effect.flatMap(issuer.issue),
+      Stream.unwrap(issueAssertion.pipe(
         Effect.map((assertion) => client.watch(request.spaceId, request, assertion))
       )),
     PublishPresence: (update) =>
-      Authentication.Principal.pipe(
-        Effect.flatMap(issuer.issue),
+      issueAssertion.pipe(
         Effect.flatMap((assertion) => client.publishPresence(update.spaceId, update, assertion)),
         Effect.as(null)
       ),
     WatchPresence: ({ spaceId }) =>
-      Stream.unwrap(Authentication.Principal.pipe(
-        Effect.flatMap(issuer.issue),
+      Stream.unwrap(issueAssertion.pipe(
         Effect.map((assertion) => client.watchPresence(spaceId, assertion))
       ))
   })

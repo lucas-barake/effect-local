@@ -1,6 +1,5 @@
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
-import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Crypto from "effect/Crypto"
@@ -47,10 +46,8 @@ export const layer: Layer.Layer<
             ...page,
             changes,
             contentBytes,
-            digest: Protocol.MutationDigest.make(
-              yield* Canonical.digest({ format: 1, changes }).pipe(
-                Effect.provideService(Crypto.Crypto, crypto)
-              )
+            digest: yield* Protocol.viewChangesDigest(changes).pipe(
+              Effect.provideService(Crypto.Crypto, crypto)
             )
           })
           if (Protocol.encodedBytes(duplicate) > Protocol.maximumBatchBytes) return page

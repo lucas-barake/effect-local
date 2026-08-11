@@ -31,21 +31,6 @@ export const ClientMetaRow = Schema.Struct({
   scope_generation: Identity.ReplicationScopeGeneration
 })
 
-export const ClientReplicationMetaRow = Schema.Struct({
-  replication_view_id: Schema.NullOr(Identity.ReplicationViewId),
-  replication_view_revision: Identity.ReplicationViewRevision,
-  desired_scope_json: Schema.String,
-  desired_scope_digest: Protocol.MutationDigest,
-  scope_generation: Identity.ReplicationScopeGeneration
-})
-
-export const ClientRetractionRow = Schema.Struct({
-  generation: NonNegativeInt,
-  model: Schema.String,
-  model_version: Identity.SchemaVersion,
-  entity_key: Schema.String
-})
-
 export const ClientScopedBootstrapRow = Schema.Struct({
   snapshot_id: Identity.SnapshotId,
   space_id: Identity.SpaceId,
@@ -295,22 +280,6 @@ export const ScopedSnapshotEntryRow = Schema.Struct({
   ordinal: NonNegativeInt,
   change_json: Schema.String,
   entry_bytes: PositiveInt
-})
-
-export const BootstrapRow = Schema.Struct({
-  snapshot_id: Identity.SnapshotId,
-  space_id: Identity.SpaceId,
-  definition_hash: Schema.String,
-  schema_version: Identity.SchemaVersion,
-  schema_hash: Identity.SchemaHash,
-  server_sequence: Identity.ServerSequence,
-  terminal_sequence: Identity.TerminalSequence,
-  entity_count: NonNegativeInt,
-  content_bytes: NonNegativeInt,
-  digest: Protocol.SnapshotDigest,
-  next_ordinal: NonNegativeInt,
-  received_bytes: NonNegativeInt,
-  rolling_digest: Protocol.SnapshotDigest
 })
 
 export const ChangeRow = Schema.Struct({
