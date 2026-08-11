@@ -28,6 +28,7 @@ export const layer: Layer.Layer<SyncEngine.SyncEngine, never, ServerStore.Server
             }
             return receipt
           }),
+        discard: (request) => online.pipe(Effect.andThen(server.discard(request, null))),
         pull: (request) =>
           Effect.gen(function*() {
             yield* online(request.spaceId)

@@ -5,6 +5,7 @@ import type * as Identity from "./Identity.js"
 import type * as Model from "./Model.js"
 import type * as Mutation from "./Mutation.js"
 import type * as Protocol from "./Protocol.js"
+import type * as Quarantine from "./Quarantine.js"
 import type * as Query from "./Query.js"
 import type * as ReplicaError from "./ReplicaError.js"
 import type * as ReplicaStatus from "./ReplicaStatus.js"
@@ -26,6 +27,15 @@ export interface Space {
   readonly receipt: (
     mutationId: Identity.MutationId
   ) => Effect.Effect<Option.Option<Protocol.Receipt>, ReplicaError.ReplicaError>
+  readonly quarantine: Effect.Effect<ReadonlyArray<Quarantine.QuarantinedMutation>, ReplicaError.ReplicaError>
+  readonly discardQuarantined: (
+    mutationId: Identity.MutationId
+  ) => Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError>
+  readonly resubmitQuarantined: <M extends Mutation.Any,>(
+    mutationId: Identity.MutationId,
+    mutation: M,
+    payload: Mutation.Payload<M>
+  ) => Effect.Effect<Quarantine.ResubmitResult, ReplicaError.ReplicaError | Mutation.Rejection<M>>
   readonly status: Effect.Effect<ReplicaStatus.SpaceStatus, ReplicaError.ReplicaError>
 }
 

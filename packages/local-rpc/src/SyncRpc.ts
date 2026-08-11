@@ -119,6 +119,20 @@ export class Submit extends Rpc.make("Submit", {
   defect: RemoteDefect
 }) {}
 
+export class Discard extends Rpc.make("Discard", {
+  payload: Protocol.DiscardRequest.fields,
+  success: Protocol.Receipt,
+  error: ReplicaError.ReplicaError,
+  defect: RemoteDefect
+}) {}
+
+export class Negotiate extends Rpc.make("Negotiate", {
+  payload: Protocol.NegotiateRequest.fields,
+  success: Protocol.NegotiatedProtocol,
+  error: ReplicaError.ReplicaError,
+  defect: RemoteDefect
+}) {}
+
 export class Pull extends Rpc.make("Pull", {
   payload: Protocol.PullRequest.fields,
   success: Protocol.PullResult,
@@ -149,14 +163,26 @@ export class PublishPresence extends Rpc.make("PublishPresence", {
 }) {}
 
 export class WatchPresence extends Rpc.make("WatchPresence", {
-  payload: { spaceId: Protocol.PullRequest.fields.spaceId },
+  payload: {
+    spaceId: Protocol.PullRequest.fields.spaceId,
+    protocolVersion: Schema.optionalKey(Protocol.ProtocolVersion)
+  },
   success: Protocol.PresenceUpdate,
   error: ReplicaError.ReplicaError,
   defect: RemoteDefect,
   stream: true
 }) {}
 
-export const Rpcs = RpcGroup.make(Submit, Pull, Bootstrap, Watch, PublishPresence, WatchPresence).middleware(
+export const Rpcs = RpcGroup.make(
+  Negotiate,
+  Submit,
+  Discard,
+  Pull,
+  Bootstrap,
+  Watch,
+  PublishPresence,
+  WatchPresence
+).middleware(
   Authentication.Authentication
 )
 

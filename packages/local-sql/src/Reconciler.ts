@@ -266,6 +266,7 @@ export const layerOnePass = (
       const remote = yield* SyncEngine.SyncEngine
       const gate = yield* Semaphore.make(1)
       const status = yield* Ref.make<ReplicaStatus.ReplicaStatus>({ _tag: "Offline", pending: 0 })
+      const updateAvailable = yield* Ref.make<Identity.SchemaIdentity | undefined>(undefined)
       const setStatus = (value: ReplicaStatus.ReplicaStatus) =>
         Ref.set(status, value).pipe(Effect.andThen(local.invalidateStatus))
       const failed = (error: ReplicaError.ReplicaError) =>
@@ -282,8 +283,21 @@ export const layerOnePass = (
       const succeeded = Effect.gen(function*() {
         const pending = yield* local.pendingCount
         const cursor = yield* local.cursor
-        yield* setStatus({ _tag: "Online", pending, cursor })
+        const serverSchema = yield* Ref.get(updateAvailable)
+        if (serverSchema !== undefined) {
+          yield* setStatus({ _tag: "SchemaUpdateAvailable", pending, cursor, serverSchema })
+        } else {
+          yield* setStatus({ _tag: "Online", pending, cursor })
+        }
       })
+      const observeServerSchema = (serverSchema: Identity.SchemaIdentity | undefined) => {
+        if (serverSchema === undefined) return Effect.void
+        if (
+          serverSchema.version === options.definition.schemaIdentity.version &&
+          serverSchema.hash === options.definition.schemaIdentity.hash
+        ) return Ref.set(updateAvailable, undefined)
+        return Ref.set(updateAvailable, serverSchema)
+      }
 
       const bootstrap = (
         manifest: Protocol.SnapshotManifest
@@ -298,6 +312,7 @@ export const layerOnePass = (
               afterOrdinal,
               limit: pageSize
             })
+            yield* observeServerSchema(page.serverSchema)
             if (page.manifest.snapshotId !== manifest.snapshotId) {
               yield* bootstrap(page.manifest)
               return yield* Effect.void
@@ -320,6 +335,7 @@ export const layerOnePass = (
             afterOrdinal: -1,
             limit: pageSize
           })
+          yield* observeServerSchema(firstPage.serverSchema)
           if (
             firstPage.manifest.sequence < receipt.snapshotSequence ||
             firstPage.manifest.terminalSequenceThrough < receipt.terminalSequenceThrough
@@ -345,6 +361,7 @@ export const layerOnePass = (
               afterOrdinal,
               limit: pageSize
             })
+            yield* observeServerSchema(page.serverSchema)
             if (page.manifest.snapshotId !== firstPage.manifest.snapshotId) {
               yield* bootstrap(page.manifest)
               return yield* Effect.void
@@ -367,6 +384,7 @@ export const layerOnePass = (
             after: cursor,
             limit: pageSize
           })
+          yield* observeServerSchema(result.serverSchema)
           if ("_tag" in result) {
             yield* bootstrap(result.manifest)
             continue
@@ -459,7 +477,9 @@ export const layerInMemoryScheduler = (
             )
           }),
           Effect.catch((error) => {
-            if (error._tag === "StaleSchema") return reconciliation.failed(error)
+            if (error._tag === "StaleSchema" || error._tag === "UpgradeRequired") {
+              return reconciliation.failed(error)
+            }
             return Effect.logWarning("Reconciliation failed", error).pipe(
               Effect.andThen(Effect.sleep(retryDelayMillis)),
               Effect.andThen(notify)
@@ -474,7 +494,7 @@ export const layerInMemoryScheduler = (
             Stream.runForEach(() => requestAndNotify),
             Effect.matchEffect({
               onFailure: (error) => {
-                if (error._tag === "StaleSchema") return Effect.fail(error)
+                if (error._tag === "StaleSchema" || error._tag === "UpgradeRequired") return Effect.fail(error)
                 return Effect.logWarning("Sync watch ended", error).pipe(
                   Effect.andThen(requestAndNotify),
                   Effect.catch((wakeError) =>
@@ -488,7 +508,10 @@ export const layerInMemoryScheduler = (
             }),
             Effect.andThen(Effect.sleep(retryDelayMillis))
           )
-        ).pipe(Effect.catchTag("StaleSchema", reconciliation.failed))
+        ).pipe(Effect.catchTags({
+          StaleSchema: reconciliation.failed,
+          UpgradeRequired: reconciliation.failed
+        }))
       )
       yield* requestAndNotify
       yield* Effect.addFinalizer(() =>

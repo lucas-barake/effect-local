@@ -304,8 +304,11 @@ pnpm bench
   a runner starts again.
 - The server is an authority, not a peer. Conflict behavior is arrival order unless a handler explicitly applies field
   semantics.
-- SQL schemas advance through an ordered checksum validated migration catalog. Stop all old server writers before the
-  lifecycle migration. The migrated schema rejects their legacy write shape so mixed writer versions cannot silently
-  violate retention metadata. There is no backward migration,
-  protocol version negotiation, multi writer browser ownership coordinator, encryption layer, or stable v1
-  compatibility promise yet.
+- Deploy the compatible server first. Configure `acceptedSchemaVersions` with the Evolution definitions and downgrade
+  transforms needed for the rolling client window. The server migrates old submissions forward and projects receipts,
+  pulls, and snapshots back. Compatible old replicas stay online with `SchemaUpdateAvailable`. Reduce the window only
+  after the deprecation horizon. Protocol negotiation returns terminal `UpgradeRequired` when no wire version overlaps.
+- SQL storage schemas advance through an ordered checksum validated migration catalog. A lifecycle migration still
+  requires old server writers to stop before they can issue a legacy SQL write shape. This is separate from the
+  supported mixed application schema and wire protocol window. There is no backward SQL migration, multi writer
+  browser ownership coordinator, encryption layer, or stable v1 compatibility promise yet.

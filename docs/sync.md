@@ -3,6 +3,7 @@
 `SyncEngine` is the transport neutral client contract:
 
 - `submit` sends one stable mutation envelope and returns its durable terminal receipt
+- `discard` resolves one quarantined envelope without executing its mutation handler
 - `pull` reads a bounded accepted suffix or returns the immutable snapshot manifest required for bootstrap
 - `bootstrap` reads one identity bound, ordered, count and byte bounded snapshot page
 - `watch` streams wake notifications for a space
@@ -45,7 +46,8 @@ full private result was reclaimed.
 
 ## WebSocket RPC
 
-`SyncRpc.Rpcs` uses one Effect RPC group for submit, pull, bootstrap, watch, presence publish, and presence watch. Effect's RPC
+`SyncRpc.Rpcs` uses one Effect RPC group for negotiation, submit, discard, pull, bootstrap, watch, presence publish,
+and presence watch. Effect's RPC
 Schema codecs define the external contract. `SyncServer.layer` is the authenticated facade. It routes each operation
 through the Effect Cluster entity named by the request's space. The entity validates that embedded space identity
 matches its Cluster address, then calls `ServerStore` or `PresenceHub`. `SyncClient.layer` maps the generated client
@@ -86,6 +88,12 @@ not replace an ingress payload limit.
 
 ## Reconnect and retry
 
+The first operation on a logical client session negotiates the highest shared protocol version. Every later sync and
+presence operation carries that selected version. An operation rejected after reconnect clears the cached selection,
+negotiates against the new peer, and retries once. No shared version returns typed `UpgradeRequired`. Reconciliation
+treats it as terminal. Transport loss and `ServerUnavailable` remain retryable. A malformed frame remains
+`ProtocolInvalid`; it is not used as a version signal.
+
 An interrupted socket may fail an active request even when the server committed it. The client retains the pending
 mutation and retries exactly. Retained server receipts deduplicate by mutation identity and client sequence. After a
 receipt expires, the durable watermark prevents reexecution and directs the client to its covering snapshot. The
@@ -93,6 +101,22 @@ accepted log or verified snapshot, not an acknowledgement, changes client canoni
 
 When a watch ends, its finalizer requests another reconciliation generation. The transport may reconnect
 independently. The durable cursor, pending queue, and generation counters contain everything required to resume.
+
+Servers accept their current application schema plus `acceptedSchemaVersions` immediately preceding definitions from
+the configured Evolution chain. Inbound old envelopes migrate forward. Receipts, pulls, and snapshots project back to
+the caller with explicit downgrade transforms. Responses also identify the server schema. A compatible old replica
+keeps syncing and reports `SchemaUpdateAvailable` so the application can prompt for reload. Removing a definition from
+the configured horizon is the explicit deprecation action. Requests outside the horizon receive terminal
+`StaleSchema`.
+
+Deploy a server that accepts both schema and protocol generations before deploying a new client bundle. Keep the
+window open through the client rollout, then reduce it only after the operator's deprecation horizon has passed.
+
+If a current handler rejects an old pending envelope during local schema promotion, its savepoint rolls back and the
+envelope moves to durable quarantine. Promotion still completes and the app starts. `Replica.quarantine` exposes the
+original envelope and typed rejection. `discardQuarantined` asks the server to consume its local sequence without
+handler execution. `resubmitQuarantined` first proves that nonexecution, then creates a corrected mutation at the tail.
+An already accepted or expired server receipt suppresses replacement.
 
 ## Presence
 

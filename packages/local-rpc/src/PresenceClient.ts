@@ -9,7 +9,7 @@ import * as Stream from "effect/Stream"
 import type * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import type * as Authentication from "./Authentication.js"
-import * as SyncRpc from "./SyncRpc.js"
+import * as ProtocolSession from "./ProtocolSession.js"
 
 export interface Service {
   readonly publish: (update: Protocol.PresenceUpdate) => Effect.Effect<void, ReplicaError.ReplicaError>
@@ -20,43 +20,79 @@ export class PresenceClient extends Context.Service<PresenceClient, Service>()(
   "@lucas-barake/effect-local-rpc/PresenceClient"
 ) {}
 
-export const layer: Layer.Layer<
+export interface Options extends ProtocolSession.Options {}
+
+export const layerFromSession: Layer.Layer<
   PresenceClient,
   never,
-  RpcClient.Protocol | RpcMiddleware.ForClient<Authentication.Authentication>
+  ProtocolSession.ProtocolSession
 > = Layer.effect(
   PresenceClient,
-  SyncRpc.makeRpcClient.pipe(
-    Effect.map((client) =>
-      PresenceClient.of({
-        publish: (update) =>
-          client.PublishPresence(update).pipe(
+  Effect.gen(function*() {
+    const session = yield* ProtocolSession.ProtocolSession
+    const client = session.client
+    const run = <A,>(execute: (version: number) => Effect.Effect<A, ReplicaError.ReplicaError>) =>
+      Effect.gen(function*() {
+        const version = yield* session.version
+        const first = yield* execute(version).pipe(Effect.result)
+        if (first._tag === "Success") return first.success
+        if (first.failure._tag !== "ProtocolVersionRejected") return yield* first.failure
+        return yield* execute(yield* session.rejected(version))
+      })
+    return PresenceClient.of({
+      publish: (update) =>
+        run((version) =>
+          client.PublishPresence({ ...update, protocolVersion: version }).pipe(
             Effect.mapError((cause) => {
               if (Schema.is(ReplicaError.ReplicaError)(cause)) return cause
-              return new ReplicaError.ProtocolInvalid({
-                message: "The presence transport failed",
-                cause
-              })
-            }),
-            Effect.asVoid,
-            Effect.withSpan("PresenceClient.publish", {
-              attributes: { "space.id": update.spaceId, "client.id": update.clientId }
-            })
-          ),
-        watch: (spaceId) =>
-          client.WatchPresence({ spaceId }).pipe(
-            Stream.mapError((cause) => {
-              if (Schema.is(ReplicaError.ReplicaError)(cause)) return cause
-              return new ReplicaError.ProtocolInvalid({
-                message: "The presence transport failed",
-                cause
-              })
-            }),
-            Stream.withSpan("PresenceClient.watch", {
-              attributes: { "space.id": spaceId }
+              return new ReplicaError.ProtocolInvalid({ message: "The presence transport failed", cause })
             })
           )
-      })
-    )
-  )
+        ).pipe(
+          Effect.asVoid,
+          Effect.withSpan("PresenceClient.publish", {
+            attributes: { "space.id": update.spaceId, "client.id": update.clientId }
+          })
+        ),
+      watch: (spaceId) =>
+        Stream.unwrap(session.version.pipe(
+          Effect.map((version) =>
+            client.WatchPresence({ spaceId, protocolVersion: version }).pipe(
+              Stream.mapError((cause) => {
+                if (Schema.is(ReplicaError.ReplicaError)(cause)) return cause
+                return new ReplicaError.ProtocolInvalid({ message: "The presence transport failed", cause })
+              }),
+              Stream.catchTag("ProtocolVersionRejected", () =>
+                Stream.unwrap(
+                  session.rejected(version).pipe(
+                    Effect.map((replacement) =>
+                      client.WatchPresence({ spaceId, protocolVersion: replacement }).pipe(
+                        Stream.mapError((cause) => {
+                          if (Schema.is(ReplicaError.ReplicaError)(cause)) return cause
+                          return new ReplicaError.ProtocolInvalid({
+                            message: "The presence transport failed",
+                            cause
+                          })
+                        })
+                      )
+                    )
+                  )
+                ))
+            )
+          )
+        )).pipe(
+          Stream.withSpan("PresenceClient.watch", {
+            attributes: { "space.id": spaceId }
+          })
+        )
+    })
+  })
 )
+
+export const layerWithOptions = (options?: Options): Layer.Layer<
+  PresenceClient,
+  ReplicaError.InvalidConfiguration,
+  RpcClient.Protocol | RpcMiddleware.ForClient<Authentication.Authentication>
+> => layerFromSession.pipe(Layer.provide(ProtocolSession.layerWithOptions(options)))
+
+export const layer = layerFromSession.pipe(Layer.provide(ProtocolSession.layer))

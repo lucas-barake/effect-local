@@ -12,6 +12,17 @@ export const maximumPresenceBytes = 16 * 1024
 export const maximumPresenceTtlMillis = 60_000
 export const maximumBootstrapEntries = 1_000
 
+export const ProtocolVersion = Schema.Int.check(Schema.isGreaterThan(0))
+export type ProtocolVersion = typeof ProtocolVersion.Type
+export const legacyProtocolVersion = ProtocolVersion.make(1)
+export const currentProtocolVersion = ProtocolVersion.make(1)
+export const NegotiateRequest = Schema.Struct({
+  supportedVersions: Schema.Array(ProtocolVersion).check(Schema.isMinLength(1))
+})
+export type NegotiateRequest = typeof NegotiateRequest.Type
+export const NegotiatedProtocol = Schema.Struct({ version: ProtocolVersion })
+export type NegotiatedProtocol = typeof NegotiatedProtocol.Type
+
 export const encodedBytes = (value: unknown): number => new TextEncoder().encode(Canonical.stringify(value)).byteLength
 
 export const encodedBytesEffect = (
@@ -49,9 +60,17 @@ export type MutationDigestIdentity = Omit<MutationEnvelope, "digest">
 
 export const SubmitRequest = Schema.Struct({
   envelope: MutationEnvelope,
-  schema: Identity.SchemaIdentity
+  schema: Identity.SchemaIdentity,
+  protocolVersion: Schema.optionalKey(ProtocolVersion)
 })
 export type SubmitRequest = typeof SubmitRequest.Type
+
+export const DiscardRequest = Schema.Struct({
+  envelope: MutationEnvelope,
+  schema: Identity.SchemaIdentity,
+  protocolVersion: Schema.optionalKey(ProtocolVersion)
+})
+export type DiscardRequest = typeof DiscardRequest.Type
 
 export const mutationDigestInput = (envelope: MutationDigestIdentity): unknown => {
   return {
@@ -105,7 +124,7 @@ export const AcceptedReceipt = Schema.TaggedStruct("Accepted", {
 })
 export type AcceptedReceipt = typeof AcceptedReceipt.Type
 
-export const RejectionOrigin = Schema.Literals(["Mutation", "Authorization", "Capacity", "Legacy"])
+export const RejectionOrigin = Schema.Literals(["Mutation", "Authorization", "Capacity", "Legacy", "Quarantine"])
 export type RejectionOrigin = typeof RejectionOrigin.Type
 
 export const RejectedReceipt = Schema.TaggedStruct("Rejected", {
@@ -159,19 +178,22 @@ export const PullRequest = Schema.Struct({
   spaceId: Identity.SpaceId,
   schema: Identity.SchemaIdentity,
   after: Identity.ServerSequence,
-  limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBatchEntries))
+  limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBatchEntries)),
+  protocolVersion: Schema.optionalKey(ProtocolVersion)
 })
 export type PullRequest = typeof PullRequest.Type
 
 export const WatchRequest = Schema.Struct({
   spaceId: Identity.SpaceId,
-  schema: Identity.SchemaIdentity
+  schema: Identity.SchemaIdentity,
+  protocolVersion: Schema.optionalKey(ProtocolVersion)
 })
 export type WatchRequest = typeof WatchRequest.Type
 
 export const PullPage = Schema.Struct({
   entries: Schema.Array(AcceptedMutation).check(Schema.isMaxLength(maximumBatchEntries)),
-  hasMore: Schema.Boolean
+  hasMore: Schema.Boolean,
+  serverSchema: Schema.optionalKey(Identity.SchemaIdentity)
 })
 export type PullPage = typeof PullPage.Type
 
@@ -203,7 +225,8 @@ export const SnapshotEntity = Schema.Struct({
 export type SnapshotEntity = typeof SnapshotEntity.Type
 
 export const BootstrapRequired = Schema.TaggedStruct("BootstrapRequired", {
-  manifest: SnapshotManifest
+  manifest: SnapshotManifest,
+  serverSchema: Schema.optionalKey(Identity.SchemaIdentity)
 })
 export type BootstrapRequired = typeof BootstrapRequired.Type
 
@@ -215,14 +238,16 @@ export const BootstrapRequest = Schema.Struct({
   schema: Identity.SchemaIdentity,
   snapshotId: Identity.SnapshotId,
   afterOrdinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(-1)),
-  limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBootstrapEntries))
+  limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBootstrapEntries)),
+  protocolVersion: Schema.optionalKey(ProtocolVersion)
 })
 export type BootstrapRequest = typeof BootstrapRequest.Type
 
 export const BootstrapPage = Schema.Struct({
   manifest: SnapshotManifest,
   entities: Schema.Array(SnapshotEntity).check(Schema.isMaxLength(maximumBootstrapEntries)),
-  hasMore: Schema.Boolean
+  hasMore: Schema.Boolean,
+  serverSchema: Schema.optionalKey(Identity.SchemaIdentity)
 })
 export type BootstrapPage = typeof BootstrapPage.Type
 
@@ -239,7 +264,8 @@ export const PresenceUpdate = Schema.Struct({
   ttlMillis: Schema.Int.check(
     Schema.isGreaterThan(0),
     Schema.isLessThanOrEqualTo(maximumPresenceTtlMillis)
-  )
+  ),
+  protocolVersion: Schema.optionalKey(ProtocolVersion)
 })
 export type PresenceUpdate = typeof PresenceUpdate.Type
 

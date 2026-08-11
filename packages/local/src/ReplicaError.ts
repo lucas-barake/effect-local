@@ -81,6 +81,10 @@ export class MutationIdentityConflict extends Schema.TaggedErrorClass<MutationId
   "@lucas-barake/effect-local/MutationIdentityConflict"
 )("MutationIdentityConflict", { mutationId: Schema.String }) {}
 
+export class QuarantineResubmissionConflict extends Schema.TaggedErrorClass<QuarantineResubmissionConflict>(
+  "@lucas-barake/effect-local/QuarantineResubmissionConflict"
+)("QuarantineResubmissionConflict", { mutationId: Schema.String }) {}
+
 export class OutOfOrderMutation extends Schema.TaggedErrorClass<OutOfOrderMutation>(
   "@lucas-barake/effect-local/OutOfOrderMutation"
 )("OutOfOrderMutation", { expected: Schema.Number, actual: Schema.Number }) {}
@@ -109,6 +113,20 @@ export class ProtocolInvalid extends Schema.TaggedErrorClass<ProtocolInvalid>(
   "@lucas-barake/effect-local/ProtocolInvalid"
 )("ProtocolInvalid", { message: Schema.String, cause: Schema.optionalKey(Schema.Defect()) }) {}
 
+export class UpgradeRequired extends Schema.TaggedErrorClass<UpgradeRequired>(
+  "@lucas-barake/effect-local/UpgradeRequired"
+)("UpgradeRequired", {
+  clientVersions: Schema.Array(Schema.Int),
+  serverVersions: Schema.Array(Schema.Int)
+}) {}
+
+export class ProtocolVersionRejected extends Schema.TaggedErrorClass<ProtocolVersionRejected>(
+  "@lucas-barake/effect-local/ProtocolVersionRejected"
+)("ProtocolVersionRejected", {
+  version: Schema.Int,
+  serverVersions: Schema.Array(Schema.Int)
+}) {}
+
 export class ServerUnavailable extends Schema.TaggedErrorClass<ServerUnavailable>(
   "@lucas-barake/effect-local/ServerUnavailable"
 )("ServerUnavailable", {}) {}
@@ -136,6 +154,7 @@ export const ReplicaError = Schema.Union([
   SpaceNotJoined,
   SpaceUnavailable,
   MutationIdentityConflict,
+  QuarantineResubmissionConflict,
   OutOfOrderMutation,
   CursorGap,
   SnapshotUnavailable,
@@ -143,6 +162,8 @@ export const ReplicaError = Schema.Union([
   InvalidConfiguration,
   UnknownCommitOutcome,
   ProtocolInvalid,
+  UpgradeRequired,
+  ProtocolVersionRejected,
   ServerUnavailable,
   AuthorizationDenied
 ])

@@ -1,6 +1,8 @@
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import type * as Evolution from "@lucas-barake/effect-local/Evolution"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import type * as Mutation from "@lucas-barake/effect-local/Mutation"
+import * as Quarantine from "@lucas-barake/effect-local/Quarantine"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
@@ -11,6 +13,7 @@ import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
@@ -27,7 +30,7 @@ import * as MutationRuntime from "./MutationRuntime.js"
 import * as QueryExecutor from "./QueryExecutor.js"
 import * as Reconciler from "./Reconciler.js"
 import * as ReconciliationWorkflow from "./ReconciliationWorkflow.js"
-import type * as SyncEngine from "./SyncEngine.js"
+import * as SyncEngine from "./SyncEngine.js"
 
 export interface Options<D extends Definition.Any,> {
   readonly definition: D
@@ -95,7 +98,7 @@ const aggregateStatus = (spaces: ReadonlyArray<ReplicaStatus.SpaceStatus>): Repl
   const counts = {
     offline: spaces.filter((status) => status._tag === "Offline").length,
     connecting: spaces.filter((status) => status._tag === "Connecting").length,
-    online: spaces.filter((status) => status._tag === "Online").length,
+    online: spaces.filter((status) => status._tag === "Online" || status._tag === "SchemaUpdateAvailable").length,
     needsAuthentication: spaces.filter((status) => status._tag === "NeedsAuthentication").length,
     failed: spaces.filter((status) => status._tag === "Failed").length
   }
@@ -123,6 +126,7 @@ const makeLayer = <D extends Definition.Any, R,>(
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
       const reactivity = yield* Reactivity.Reactivity
+      const remote = yield* SyncEngine.SyncEngine
       const parentScope = yield* Effect.scope
       const rootContext = yield* Effect.context<BaseRequirements<D> | R>()
       const entries = new Map<Identity.SpaceId, Entry>()
@@ -218,6 +222,49 @@ const makeLayer = <D extends Definition.Any, R,>(
             const operationGate = yield* Semaphore.make(1)
             const admit = <A, E,>(effect: Effect.Effect<A, E>) =>
               operationGate.withPermit(checkActive(spaceId, generation).pipe(Effect.andThen(effect)))
+            const findReceipt = (mutationId: Identity.MutationId) =>
+              local.receipt(mutationId).pipe(
+                Effect.flatMap((found) => {
+                  if (Option.isSome(found)) return Effect.succeed(found.value)
+                  return Effect.fail(
+                    new ReplicaError.ProtocolInvalid({
+                      message: `Quarantined mutation ${mutationId} was not found or previously resolved`
+                    })
+                  )
+                })
+              )
+            const continueCancellation = (initial: Option.Option<Quarantine.QuarantinedMutation>) =>
+              Effect.gen(function*() {
+                let canceled = initial
+                while (Option.isSome(canceled)) {
+                  yield* reconciler.sync
+                  const canceledReceipt = yield* remote.discard({
+                    envelope: canceled.value.envelope,
+                    schema: local.schema
+                  })
+                  canceled = yield* local.resolveQuarantine(canceledReceipt, "Discard")
+                }
+              })
+            const resolveDisposition = (
+              receipt: Parameters<LocalStore.Service["resolveQuarantine"]>[0],
+              disposition: LocalStore.QuarantineDisposition
+            ) =>
+              Effect.gen(function*() {
+                const canceled = yield* local.resolveQuarantine(receipt, disposition)
+                yield* continueCancellation(canceled)
+              })
+            const discardQuarantined = (mutationId: Identity.MutationId) =>
+              Effect.gen(function*() {
+                const found = yield* local.quarantineByMutation(mutationId)
+                if (Option.isNone(found)) {
+                  const continuation = yield* local.quarantineCancellation(mutationId)
+                  yield* continueCancellation(continuation)
+                  return yield* findReceipt(mutationId)
+                }
+                const receipt = yield* remote.discard({ envelope: found.value.envelope, schema: local.schema })
+                yield* resolveDisposition(receipt, "Discard")
+                return receipt
+              }).pipe(Effect.ensuring(reconciler.notify))
             const handle: Replica.Space = {
               spaceId,
               mutate: (mutation, payload) =>
@@ -225,6 +272,35 @@ const makeLayer = <D extends Definition.Any, R,>(
               get: (model, key) => admit(local.get(model, key)),
               query: (query, payload) => admit(queries.execute(query, payload)),
               receipt: (mutationId) => admit(local.receipt(mutationId)),
+              quarantine: admit(local.quarantine),
+              discardQuarantined: (mutationId) => admit(discardQuarantined(mutationId)),
+              resubmitQuarantined: <M extends Mutation.Any,>(
+                mutationId: Identity.MutationId,
+                mutation: M,
+                payload: Mutation.Payload<M>
+              ) =>
+                admit(Effect.gen(function*() {
+                  const found = yield* local.quarantineByMutation(mutationId)
+                  if (Option.isNone(found)) {
+                    const continuation = yield* local.quarantineCancellation(mutationId)
+                    yield* continueCancellation(continuation)
+                    return Quarantine.AlreadyResolved.make({ receipt: yield* findReceipt(mutationId) })
+                  }
+                  const item = found.value
+                  if (mutation.name !== item.envelope.name) {
+                    return yield* new ReplicaError.ProtocolInvalid({
+                      message: `Resubmission mutation ${mutation.name} does not match ${item.envelope.name}`
+                    })
+                  }
+                  const pending = yield* local.ensureQuarantineResubmission(mutationId, mutation, payload)
+                  const receipt = yield* remote.discard({ envelope: item.envelope, schema: local.schema })
+                  if (receipt._tag !== "Rejected" || receipt.origin !== "Quarantine") {
+                    yield* resolveDisposition(receipt, "Resubmit")
+                    return Quarantine.AlreadyResolved.make({ receipt })
+                  }
+                  yield* resolveDisposition(receipt, "Resubmit")
+                  return Quarantine.Resubmitted.make({ pending })
+                }).pipe(Effect.ensuring(reconciler.notify))),
               status: admit(
                 Effect.all([reconciler.status, local.pendingCount]).pipe(
                   Effect.map(([status, pending]) => addressedStatus(spaceId, { ...status, pending }))

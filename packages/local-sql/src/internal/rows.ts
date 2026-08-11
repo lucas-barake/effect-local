@@ -61,6 +61,36 @@ const PendingRowFields = {
 
 export const PendingRow = Schema.Struct(PendingRowFields)
 
+export const QuarantineRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  membership_incarnation: Identity.MembershipIncarnation,
+  mutation_id: Identity.MutationId,
+  local_sequence: Identity.LocalSequence,
+  basis: Identity.ServerSequence,
+  name: Schema.String,
+  payload_json: Schema.String,
+  digest: Protocol.MutationDigest,
+  digest_version: Protocol.MutationDigestVersion,
+  source_schema_version: Identity.SchemaVersion,
+  source_schema_hash: Identity.SchemaHash,
+  mutation_version: Identity.SchemaVersion,
+  rejection_json: Schema.String,
+  target_schema_version: Identity.SchemaVersion,
+  target_schema_hash: Identity.SchemaHash
+})
+
+export const QuarantineResubmissionRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  original_mutation_id: Identity.MutationId,
+  replacement_mutation_id: Identity.MutationId
+})
+
+export const QuarantineCancellationRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  root_mutation_id: Identity.MutationId,
+  current_mutation_id: Identity.MutationId
+})
+
 export const PendingReceiptRow = Schema.Struct({
   ...PendingRowFields,
   receipt_json: Schema.String,
@@ -196,6 +226,17 @@ export const SnapshotEntityWireRow = Schema.Struct({
   ordinal: NonNegativeInt,
   wire_json: Schema.String,
   wire_bytes: PositiveInt
+})
+
+export const SnapshotProjectionRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  snapshot_id: Identity.SnapshotId,
+  target_schema_version: Identity.SchemaVersion,
+  target_schema_hash: Identity.SchemaHash,
+  definition_hash: Schema.String,
+  entity_count: NonNegativeInt,
+  content_bytes: NonNegativeInt,
+  digest: Protocol.SnapshotDigest
 })
 
 export const BootstrapRow = Schema.Struct({

@@ -7,15 +7,28 @@ export const Online = Schema.TaggedStruct("Online", {
   pending: Schema.Int,
   cursor: Identity.ServerSequence
 })
+export const SchemaUpdateAvailable = Schema.TaggedStruct("SchemaUpdateAvailable", {
+  pending: Schema.Int,
+  cursor: Identity.ServerSequence,
+  serverSchema: Identity.SchemaIdentity
+})
 export const NeedsAuthentication = Schema.TaggedStruct("NeedsAuthentication", { pending: Schema.Int })
 export const Failed = Schema.TaggedStruct("Failed", { pending: Schema.Int, message: Schema.String })
-export const ReplicaStatus = Schema.Union([Offline, Connecting, Online, NeedsAuthentication, Failed])
+export const ReplicaStatus = Schema.Union([
+  Offline,
+  Connecting,
+  Online,
+  SchemaUpdateAvailable,
+  NeedsAuthentication,
+  Failed
+])
 export type ReplicaStatus = typeof ReplicaStatus.Type
 
 export const SpaceStatus = Schema.Union([
   Schema.Struct({ spaceId: Identity.SpaceId, ...Offline.fields }),
   Schema.Struct({ spaceId: Identity.SpaceId, ...Connecting.fields }),
   Schema.Struct({ spaceId: Identity.SpaceId, ...Online.fields }),
+  Schema.Struct({ spaceId: Identity.SpaceId, ...SchemaUpdateAvailable.fields }),
   Schema.Struct({ spaceId: Identity.SpaceId, ...NeedsAuthentication.fields }),
   Schema.Struct({ spaceId: Identity.SpaceId, ...Failed.fields })
 ])
