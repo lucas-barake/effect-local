@@ -1314,7 +1314,19 @@ const ServerProgressRow = Schema.Struct({
   source_generation: NonNegativeInt,
   target_entity_count: NonNegativeInt,
   target_entity_bytes: NonNegativeInt,
-  phase: Schema.Literals(["Log", "Entities", "Receipts", "Flip", "CleanupEntities", "Finalize"]),
+  phase: Schema.Literals([
+    "Log",
+    "Entities",
+    "Receipts",
+    "Flip",
+    "CleanupScopedSnapshotEntries",
+    "CleanupScopedSnapshots",
+    "CleanupReplicationPages",
+    "CleanupReplicationViewEntities",
+    "CleanupReplicationViews",
+    "CleanupEntities",
+    "Finalize"
+  ]),
   cursor_model: Schema.NullOr(Schema.String),
   cursor_key: Schema.NullOr(Schema.String),
   cursor_sequence: Schema.NullOr(NonNegativeInt)
@@ -1387,6 +1399,57 @@ export const server = (options: ServerOptions) =>
       execute: (generation) =>
         sql`SELECT COUNT(*) AS count FROM effect_local_server_entities_data
         WHERE space_id = ${options.spaceId} AND generation = ${generation}`
+    })
+    const countScopedSnapshotEntries = SqlSchema.findOne({
+      Request: Identity.SchemaIdentity,
+      Result: CountRow,
+      execute: (schema) =>
+        sql`SELECT EXISTS(SELECT 1 FROM effect_local_server_scoped_snapshot_entries
+        WHERE snapshot_id IN (
+          SELECT snapshot_id FROM effect_local_server_scoped_snapshots
+          WHERE space_id = ${options.spaceId} AND schema_version = ${schema.version}
+            AND schema_hash = ${schema.hash}
+        )) AS count`
+    })
+    const countScopedSnapshots = SqlSchema.findOne({
+      Request: Identity.SchemaIdentity,
+      Result: CountRow,
+      execute: (schema) =>
+        sql`SELECT EXISTS(SELECT 1 FROM effect_local_server_scoped_snapshots
+        WHERE space_id = ${options.spaceId} AND schema_version = ${schema.version}
+          AND schema_hash = ${schema.hash}) AS count`
+    })
+    const countReplicationPages = SqlSchema.findOne({
+      Request: Identity.SchemaIdentity,
+      Result: CountRow,
+      execute: (schema) =>
+        sql`SELECT EXISTS(SELECT 1 FROM effect_local_server_replication_pages AS page
+        WHERE page.space_id = ${options.spaceId} AND EXISTS (
+          SELECT 1 FROM effect_local_server_replication_views AS view
+          WHERE view.space_id = page.space_id AND view.client_id = page.client_id
+            AND view.schema_version = ${schema.version}
+            AND view.schema_hash = ${schema.hash}
+        )) AS count`
+    })
+    const countReplicationViewEntities = SqlSchema.findOne({
+      Request: Identity.SchemaIdentity,
+      Result: CountRow,
+      execute: (schema) =>
+        sql`SELECT EXISTS(SELECT 1 FROM effect_local_server_replication_view_entities AS entity
+        WHERE entity.space_id = ${options.spaceId} AND EXISTS (
+          SELECT 1 FROM effect_local_server_replication_views AS view
+          WHERE view.space_id = entity.space_id AND view.client_id = entity.client_id
+            AND view.schema_version = ${schema.version}
+            AND view.schema_hash = ${schema.hash}
+        )) AS count`
+    })
+    const countReplicationViews = SqlSchema.findOne({
+      Request: Identity.SchemaIdentity,
+      Result: CountRow,
+      execute: (schema) =>
+        sql`SELECT EXISTS(SELECT 1 FROM effect_local_server_replication_views
+        WHERE space_id = ${options.spaceId} AND schema_version = ${schema.version}
+          AND schema_hash = ${schema.hash}) AS count`
     })
     const beginPromotion = SqlSchema.findOneOption({
       Request: Schema.Struct({
@@ -1876,21 +1939,100 @@ export const server = (options: ServerOptions) =>
       } else if (state.phase === "Flip") {
         yield* sql.withTransaction(Effect.gen(function*() {
           yield* validateBatch(state)
-          yield* sql`DELETE FROM effect_local_server_scoped_snapshot_entries
-            WHERE snapshot_id IN (
-              SELECT snapshot_id FROM effect_local_server_scoped_snapshots WHERE space_id = ${options.spaceId}
-            )`
-          yield* sql`DELETE FROM effect_local_server_scoped_snapshots WHERE space_id = ${options.spaceId}`
-          yield* sql`DELETE FROM effect_local_server_replication_pages WHERE space_id = ${options.spaceId}`
-          yield* sql`DELETE FROM effect_local_server_replication_view_entities WHERE space_id = ${options.spaceId}`
-          yield* sql`DELETE FROM effect_local_server_replication_views WHERE space_id = ${options.spaceId}`
           yield* sql`UPDATE effect_local_server_spaces SET
             active_schema_generation = ${state.generation},
             entity_count = ${state.target_entity_count}, entity_bytes = ${state.target_entity_bytes}
             WHERE space_id = ${options.spaceId} AND schema_generation = ${state.generation}
               AND active_schema_generation = ${state.source_generation}`
-          yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupEntities'
+          yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupScopedSnapshotEntries'
             WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
+        }))
+      } else if (state.phase === "CleanupScopedSnapshotEntries") {
+        yield* sql.withTransaction(Effect.gen(function*() {
+          yield* validateBatch(state)
+          yield* sql`DELETE FROM effect_local_server_scoped_snapshot_entries WHERE rowid IN (
+            SELECT entry.rowid FROM effect_local_server_scoped_snapshot_entries AS entry
+            INNER JOIN effect_local_server_scoped_snapshots AS snapshot
+              ON snapshot.snapshot_id = entry.snapshot_id
+            WHERE snapshot.space_id = ${options.spaceId}
+              AND snapshot.schema_version = ${state.source_schema_version}
+              AND snapshot.schema_hash = ${state.source_schema_hash}
+            ORDER BY entry.snapshot_id, entry.ordinal LIMIT ${batchSize})`
+          const remaining = yield* countScopedSnapshotEntries(
+            identityFrom(state.source_schema_version, state.source_schema_hash)
+          ).pipe(Effect.mapError(StorageUnavailable.make))
+          if (remaining.count === 0) {
+            yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupScopedSnapshots'
+              WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
+          }
+        }))
+      } else if (state.phase === "CleanupScopedSnapshots") {
+        yield* sql.withTransaction(Effect.gen(function*() {
+          yield* validateBatch(state)
+          yield* sql`DELETE FROM effect_local_server_scoped_snapshots WHERE rowid IN (
+            SELECT rowid FROM effect_local_server_scoped_snapshots
+            WHERE space_id = ${options.spaceId} AND schema_version = ${state.source_schema_version}
+              AND schema_hash = ${state.source_schema_hash}
+            ORDER BY snapshot_id LIMIT ${batchSize})`
+          const remaining = yield* countScopedSnapshots(
+            identityFrom(state.source_schema_version, state.source_schema_hash)
+          ).pipe(Effect.mapError(StorageUnavailable.make))
+          if (remaining.count === 0) {
+            yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupReplicationPages'
+              WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
+          }
+        }))
+      } else if (state.phase === "CleanupReplicationPages") {
+        yield* sql.withTransaction(Effect.gen(function*() {
+          yield* validateBatch(state)
+          yield* sql`DELETE FROM effect_local_server_replication_pages WHERE rowid IN (
+            SELECT page.rowid FROM effect_local_server_replication_pages AS page
+            INNER JOIN effect_local_server_replication_views AS view
+              ON view.space_id = page.space_id AND view.client_id = page.client_id
+            WHERE view.space_id = ${options.spaceId} AND view.schema_version = ${state.source_schema_version}
+              AND view.schema_hash = ${state.source_schema_hash}
+            ORDER BY page.client_id LIMIT ${batchSize})`
+          const remaining = yield* countReplicationPages(
+            identityFrom(state.source_schema_version, state.source_schema_hash)
+          ).pipe(Effect.mapError(StorageUnavailable.make))
+          if (remaining.count === 0) {
+            yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupReplicationViewEntities'
+              WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
+          }
+        }))
+      } else if (state.phase === "CleanupReplicationViewEntities") {
+        yield* sql.withTransaction(Effect.gen(function*() {
+          yield* validateBatch(state)
+          yield* sql`DELETE FROM effect_local_server_replication_view_entities WHERE rowid IN (
+            SELECT entity.rowid FROM effect_local_server_replication_view_entities AS entity
+            INNER JOIN effect_local_server_replication_views AS view
+              ON view.space_id = entity.space_id AND view.client_id = entity.client_id
+            WHERE view.space_id = ${options.spaceId} AND view.schema_version = ${state.source_schema_version}
+              AND view.schema_hash = ${state.source_schema_hash}
+            ORDER BY entity.client_id, entity.model, entity.entity_key LIMIT ${batchSize})`
+          const remaining = yield* countReplicationViewEntities(
+            identityFrom(state.source_schema_version, state.source_schema_hash)
+          ).pipe(Effect.mapError(StorageUnavailable.make))
+          if (remaining.count === 0) {
+            yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupReplicationViews'
+              WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
+          }
+        }))
+      } else if (state.phase === "CleanupReplicationViews") {
+        yield* sql.withTransaction(Effect.gen(function*() {
+          yield* validateBatch(state)
+          yield* sql`DELETE FROM effect_local_server_replication_views WHERE rowid IN (
+            SELECT rowid FROM effect_local_server_replication_views
+            WHERE space_id = ${options.spaceId} AND schema_version = ${state.source_schema_version}
+              AND schema_hash = ${state.source_schema_hash}
+            ORDER BY client_id LIMIT ${batchSize})`
+          const remaining = yield* countReplicationViews(
+            identityFrom(state.source_schema_version, state.source_schema_hash)
+          ).pipe(Effect.mapError(StorageUnavailable.make))
+          if (remaining.count === 0) {
+            yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupEntities'
+              WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
+          }
         }))
       } else if (state.phase === "CleanupEntities") {
         yield* sql.withTransaction(Effect.gen(function*() {

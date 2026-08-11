@@ -628,8 +628,9 @@ describe("client schema evolution", () => {
           ${definitionV1.schemaIdentity.version}, ${definitionV1.schemaIdentity.hash}, ${"0".repeat(64)},
           1, ${viewId}, 4, 1, 1, 1, 1, ${"0".repeat(64)}, 1, 1, ${"0".repeat(64)})`
       yield* sql`INSERT INTO effect_local_client_scoped_bootstrap_entries
-        (snapshot_id, ordinal, change_json, entry_bytes)
-        VALUES (${snapshotId}, 0, ${yield* Codec.stringify(Protocol.Retract.make({
+        (snapshot_id, ordinal, model, entity_key, change_json, entry_bytes)
+        VALUES (${snapshotId}, 0, ${TodoV1.name}, ${yield* Codec.stringify("3")},
+          ${yield* Codec.stringify(Protocol.Retract.make({
         entity: { model: TodoV1.name, modelVersion: TodoV1.version, key: "3" }
       }))}, 1)`
 
@@ -1064,16 +1065,81 @@ describe("client schema evolution", () => {
         null
       )
       if ("_tag" in outstanding) assert.fail("expected incremental page")
+      for (const suffix of [2, 3]) {
+        const scopedClientId = Identity.ClientId.make(
+          `cli_00000000-0000-4000-8000-${String(suffix).padStart(12, "0")}`
+        )
+        const required = yield* serverV1.pullAuthorized(
+          Protocol.PullRequest.make({
+            spaceId,
+            clientId: scopedClientId,
+            schema: definitionV1.schemaIdentity,
+            scope,
+            scopeGeneration,
+            cursor: null,
+            limit: 10
+          }),
+          null
+        )
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        yield* serverV1.bootstrapAuthorized(
+          Protocol.BootstrapRequest.make({
+            spaceId,
+            clientId: scopedClientId,
+            schema: definitionV1.schemaIdentity,
+            scope,
+            scopeGeneration,
+            cursor: required.manifest.cursor,
+            snapshotId: required.manifest.snapshotId,
+            afterOrdinal: -1,
+            limit: 10
+          }),
+          null
+        )
+        yield* serverV1.pullAuthorized(
+          Protocol.PullRequest.make({
+            spaceId,
+            clientId: scopedClientId,
+            schema: definitionV1.schemaIdentity,
+            scope,
+            scopeGeneration,
+            cursor: required.manifest.cursor,
+            limit: 10
+          }),
+          null
+        )
+      }
 
       const flipped = yield* Deferred.make<void>()
+      const cleanupPhases = yield* Ref.make<ReadonlyArray<string>>([])
+      const cleanupCounts = yield* Ref.make<ReadonlyArray<number>>([])
       const Progress = Schema.Struct({ phase: Schema.String })
+      const CountRow = Schema.Struct({ count: Schema.Number })
       const readProgress = SqlSchema.findOne({
         Request: Schema.Void,
         Result: Progress,
         execute: () => sql`SELECT phase FROM effect_local_server_evolution WHERE space_id = ${spaceId}`
       })
+      const countScopedRows = SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: CountRow,
+        execute: () =>
+          sql`SELECT
+          (SELECT COUNT(*) FROM effect_local_server_replication_views WHERE space_id = ${spaceId}) +
+          (SELECT COUNT(*) FROM effect_local_server_replication_view_entities WHERE space_id = ${spaceId}) +
+          (SELECT COUNT(*) FROM effect_local_server_replication_pages WHERE space_id = ${spaceId}) +
+          (SELECT COUNT(*) FROM effect_local_server_scoped_snapshots WHERE space_id = ${spaceId}) +
+          (SELECT COUNT(*) FROM effect_local_server_scoped_snapshot_entries WHERE snapshot_id IN (
+            SELECT snapshot_id FROM effect_local_server_scoped_snapshots WHERE space_id = ${spaceId}
+          )) AS count`
+      })
       const afterBatch = Effect.gen(function*() {
         const progress = yield* readProgress(undefined)
+        const scopedRows = yield* countScopedRows(undefined)
+        yield* Ref.update(cleanupCounts, (counts) => [...counts, scopedRows.count])
+        if (progress.phase.startsWith("CleanupScoped")) {
+          yield* Ref.update(cleanupPhases, (phases) => [...phases, progress.phase])
+        }
         if (progress.phase !== "CleanupEntities") return
         yield* Deferred.succeed(flipped, undefined)
         yield* Effect.never
@@ -1087,21 +1153,14 @@ describe("client schema evolution", () => {
       }).pipe(Effect.forkChild({ startImmediately: true }))
       yield* Deferred.await(flipped)
       yield* Fiber.interrupt(fiber)
+      assert.include(yield* Ref.get(cleanupPhases), "CleanupScopedSnapshotEntries")
+      const counts = yield* Ref.get(cleanupCounts)
+      assert.isAtLeast(counts[0] ?? 0, 15)
+      for (let index = 1; index < counts.length; index++) {
+        assert.isAtMost(counts[index - 1] - counts[index], 1)
+      }
 
-      const CountRow = Schema.Struct({ count: Schema.Number })
-      const scopedRows = yield* SqlSchema.findOne({
-        Request: Schema.Void,
-        Result: CountRow,
-        execute: () =>
-          sql`SELECT
-          (SELECT COUNT(*) FROM effect_local_server_replication_views WHERE space_id = ${spaceId}) +
-          (SELECT COUNT(*) FROM effect_local_server_replication_view_entities WHERE space_id = ${spaceId}) +
-          (SELECT COUNT(*) FROM effect_local_server_replication_pages WHERE space_id = ${spaceId}) +
-          (SELECT COUNT(*) FROM effect_local_server_scoped_snapshots WHERE space_id = ${spaceId}) +
-          (SELECT COUNT(*) FROM effect_local_server_scoped_snapshot_entries WHERE snapshot_id IN (
-            SELECT snapshot_id FROM effect_local_server_scoped_snapshots WHERE space_id = ${spaceId}
-          )) AS count`
-      })(undefined)
+      const scopedRows = yield* countScopedRows(undefined)
       assert.strictEqual(scopedRows.count, 0)
 
       yield* SchemaEvolution.server({ definition: definitionV2, evolution, spaceId, batchSize: 1 })
