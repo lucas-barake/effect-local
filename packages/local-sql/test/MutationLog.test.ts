@@ -106,7 +106,7 @@ const directSync = (server: ServerStore.Service) =>
 
 const clientServices = (id: Identity.ClientId, server: ServerStore.Service) => {
   const local = localLayer(id)
-  const reconciler = Reconciler.layer({ spaceId, retryDelay: "10 millis" }).pipe(
+  const reconciler = Reconciler.layer({ definition: Domain.definition, spaceId, retryDelay: "10 millis" }).pipe(
     Layer.provide(local),
     Layer.provide(directSync(server))
   )
@@ -186,10 +186,11 @@ describe("server reconciled mutation log", () => {
           1,
           Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000041")
         )
-        assert.strictEqual((yield* server.admit(submitted, { subject: "test" }))._tag, "Accepted")
+        const request = Protocol.SubmitRequest.make({ envelope: submitted, schema: Domain.definition.schemaIdentity })
+        assert.strictEqual((yield* server.admit(request, { subject: "test" }))._tag, "Accepted")
         yield* Ref.set(access, false)
 
-        const error = yield* server.admit(submitted, { subject: "test" }).pipe(Effect.flip)
+        const error = yield* server.admit(request, { subject: "test" }).pipe(Effect.flip)
         assert.strictEqual(error._tag, "AuthorizationDenied")
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
@@ -540,7 +541,7 @@ describe("server reconciled mutation log", () => {
       const second = yield* local.mutate(Domain.PutTodo, Domain.todo("stream-2"))
       let submissions = 0
       const remote = SyncEngine.SyncEngine.of({
-        submit: (submitted) =>
+        submit: ({ envelope: submitted }) =>
           Effect.gen(function*() {
             submissions++
             if (submissions === 2) {
@@ -561,7 +562,7 @@ describe("server reconciled mutation log", () => {
       })
       const reconciler = yield* service(
         Reconciler.Reconciler,
-        Reconciler.layer({ spaceId }).pipe(
+        Reconciler.layer({ definition: Domain.definition, spaceId }).pipe(
           Layer.provide(Layer.succeed(LocalStore.Store, local)),
           Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote))
         )
@@ -672,7 +673,7 @@ describe("server reconciled mutation log", () => {
       }
 
       const server = yield* service(ServerStore.ServerStore, serverLayer())
-      const invalidPageSize = Reconciler.layer({ spaceId, pageSize: 0 }).pipe(
+      const invalidPageSize = Reconciler.layer({ definition: Domain.definition, spaceId, pageSize: 0 }).pipe(
         Layer.provide(localLayer()),
         Layer.provide(directSync(server))
       )
@@ -680,7 +681,11 @@ describe("server reconciled mutation log", () => {
       assert.strictEqual(pageSizeError._tag, "InvalidConfiguration")
       if (pageSizeError._tag === "InvalidConfiguration") assert.strictEqual(pageSizeError.option, "pageSize")
 
-      const invalidRetryDelay = Reconciler.layer({ spaceId, retryDelay: "0 millis" }).pipe(
+      const invalidRetryDelay = Reconciler.layer({
+        definition: Domain.definition,
+        spaceId,
+        retryDelay: "0 millis"
+      }).pipe(
         Layer.provide(localLayer()),
         Layer.provide(directSync(server))
       )
@@ -802,7 +807,11 @@ describe("server reconciled mutation log", () => {
             )
         })
       )
-      const reconciler = Reconciler.layer({ spaceId, retryDelay: "1 second" }).pipe(
+      const reconciler = Reconciler.layer({
+        definition: Domain.definition,
+        spaceId,
+        retryDelay: "1 second"
+      }).pipe(
         Layer.provide(localLayer()),
         Layer.provide(remote)
       )
@@ -821,7 +830,7 @@ describe("server reconciled mutation log", () => {
       const remote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
-          submit: (submitted) =>
+          submit: ({ envelope: submitted }) =>
             Effect.suspend(() => {
               attempts++
               if (attempts === 1) {
@@ -846,7 +855,11 @@ describe("server reconciled mutation log", () => {
         })
       )
       const local = localLayer()
-      const reconciler = Reconciler.layer({ spaceId, retryDelay: "1 second" }).pipe(
+      const reconciler = Reconciler.layer({
+        definition: Domain.definition,
+        spaceId,
+        retryDelay: "1 second"
+      }).pipe(
         Layer.provide(local),
         Layer.provide(remote)
       )
@@ -1121,7 +1134,7 @@ describe("server reconciled mutation log", () => {
         Layer.provide(workRuntime),
         Layer.provide(replicaDatabase)
       )
-      const reconciler = Reconciler.layer({ spaceId }).pipe(
+      const reconciler = Reconciler.layer({ definition: workDefinition, spaceId }).pipe(
         Layer.provide(local),
         Layer.provide(directSync(server))
       )

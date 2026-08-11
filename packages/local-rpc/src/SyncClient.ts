@@ -21,8 +21,8 @@ export const layer: Layer.Layer<
   Effect.gen(function*() {
     const client = yield* SyncRpc.makeRpcClient
     return SyncEngine.SyncEngine.of({
-      submit: (envelope) =>
-        client.Submit(envelope).pipe(
+      submit: (request) =>
+        client.Submit(request).pipe(
           Effect.mapError((cause) =>
             Schema.is(ReplicaError.ReplicaError)(cause)
               ? cause
@@ -32,7 +32,10 @@ export const layer: Layer.Layer<
               })
           ),
           Effect.withSpan("SyncClient.submit", {
-            attributes: { "space.id": envelope.spaceId, "mutation.id": envelope.mutationId }
+            attributes: {
+              "space.id": request.envelope.spaceId,
+              "mutation.id": request.envelope.mutationId
+            }
           })
         ),
       pull: (request) =>
@@ -49,8 +52,8 @@ export const layer: Layer.Layer<
             attributes: { "space.id": request.spaceId, "server.after": request.after }
           })
         ),
-      watch: (spaceId) =>
-        client.Watch({ spaceId }).pipe(
+      watch: (request) =>
+        client.Watch(request).pipe(
           Stream.mapError((cause) =>
             Schema.is(ReplicaError.ReplicaError)(cause)
               ? cause
@@ -60,7 +63,7 @@ export const layer: Layer.Layer<
               })
           ),
           Stream.withSpan("SyncClient.watch", {
-            attributes: { "space.id": spaceId }
+            attributes: { "space.id": request.spaceId }
           })
         )
     })

@@ -105,6 +105,33 @@ export const layer = (
           : { batchSize: options.schemaEvolutionBatchSize })
       })
 
+      const migrateEntryChanges = (entry: Protocol.AcceptedMutation) =>
+        Effect.forEach(entry.changes, (change) =>
+          Evolution.migrateModel({
+            evolution,
+            source: entry.sourceSchema,
+            model: change.entity.model,
+            modelVersion: change.entity.modelVersion,
+            key: change.entity.key,
+            ...(change._tag === "Upsert" ? { value: change.value } : {})
+          }).pipe(
+            Effect.flatMap((migrated): Effect.Effect<Protocol.EntityChange, ReplicaError.StorageCorrupt> => {
+              const entity = {
+                model: change.entity.model,
+                modelVersion: migrated.modelVersion,
+                key: migrated.key
+              }
+              if (change._tag === "Delete") return Effect.succeed(Protocol.Delete.make({ entity }))
+              return migrated.value === undefined
+                ? Effect.fail(
+                  new ReplicaError.StorageCorrupt({
+                    message: `Migrated upsert for ${change.entity.model} has no value`
+                  })
+                )
+                : Effect.succeed(Protocol.Upsert.make({ entity, value: migrated.value }))
+            })
+          ))
+
       const findMeta = SqlSchema.findOne({
         Request: Schema.Void,
         Result: Rows.ClientMetaRow,
@@ -654,7 +681,7 @@ export const layer = (
         applyEntries: (entries) =>
           Effect.gen(function*() {
             if (entries.length === 0) return
-            const touched = entries.flatMap((entry) => entry.changes.map((change) => change.entity))
+            const touched: Array<Protocol.EntityKey> = []
             const settledReceiptIds: Array<Identity.MutationId> = []
             yield* sql.withTransaction(Effect.gen(function*() {
               const currentMeta = yield* meta
@@ -695,7 +722,9 @@ export const layer = (
               (server_sequence, mutation_id, entry_json, source_schema_version, source_schema_hash)
               VALUES (${entry.sequence}, ${entry.mutationId}, ${yield* Codec.stringify(entry)},
                 ${entry.sourceSchema.version}, ${entry.sourceSchema.hash})`
-                for (const change of entry.changes) {
+                const currentChanges = yield* migrateEntryChanges(entry)
+                for (const change of currentChanges) {
+                  touched.push(change.entity)
                   yield* SqlTransaction.applyLocalChange(sql, "canonical", change)
                 }
                 if (entry.clientId === options.clientId) {

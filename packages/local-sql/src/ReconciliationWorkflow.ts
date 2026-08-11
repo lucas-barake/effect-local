@@ -1,4 +1,5 @@
 import type * as Definition from "@lucas-barake/effect-local/Definition"
+import * as Evolution from "@lucas-barake/effect-local/Evolution"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
@@ -25,7 +26,7 @@ export const ReconciliationGeneration = Schema.Int.check(
 )
 
 const PayloadFields = {
-  definitionHash: Schema.String,
+  schemaIdentity: Schema.String,
   spaceId: Identity.SpaceId,
   clientId: Identity.ClientId,
   generation: ReconciliationGeneration
@@ -34,14 +35,18 @@ const PayloadFields = {
 export const Payload = Schema.Struct(PayloadFields)
 export type Payload = typeof Payload.Type
 
-type ReplicaIdentity = Pick<Payload, "definitionHash" | "spaceId" | "clientId">
+const schemaIdentity = (definition: Definition.Any): string =>
+  `${definition.schemaIdentity.version}:${definition.schemaIdentity.hash}`
 
-export const make = ({ clientId, definitionHash, spaceId }: ReplicaIdentity) =>
-  Workflow.make(`effect-local/ReconcileReplica/${JSON.stringify([definitionHash, spaceId, clientId])}`, {
+type ReplicaIdentity = Pick<Payload, "spaceId" | "clientId">
+
+export const make = ({ clientId, spaceId }: ReplicaIdentity) =>
+  Workflow.make(`effect-local/ReconcileReplica/v2/${JSON.stringify([spaceId, clientId])}`, {
     payload: PayloadFields,
     success: Schema.Void,
     error: ReplicaError.ReplicaError,
-    idempotencyKey: ({ generation }) => String(generation)
+    idempotencyKey: ({ clientId, generation, schemaIdentity, spaceId }) =>
+      JSON.stringify([schemaIdentity, spaceId, clientId, generation])
   })
 
 export const Execution = Schema.Struct({
@@ -96,6 +101,7 @@ export const resume = (execution: Execution) =>
 
 export interface Options {
   readonly definition: Definition.Any
+  readonly evolution?: Evolution.Evolution
   readonly spaceId: Identity.SpaceId
   readonly clientId: Identity.ClientId
   readonly retryDelay?: Duration.Input
@@ -147,7 +153,7 @@ const retryMillis = (configuration: RetryConfigurationService, attempt: number) 
 const handler = (options: Options, configuration: RetryConfigurationService) => (payload: Payload) =>
   Effect.gen(function*() {
     if (
-      payload.definitionHash !== options.definition.hash ||
+      payload.schemaIdentity !== schemaIdentity(options.definition) ||
       payload.spaceId !== options.spaceId ||
       payload.clientId !== options.clientId
     ) {
@@ -194,14 +200,45 @@ const layerRegistrationWithConfiguration = (
     Effect.gen(function*() {
       const configuration = yield* RetryConfiguration
       const engine = yield* WorkflowEngine.WorkflowEngine
+      const evolution = options.evolution ?? Evolution.make({ current: options.definition })
       yield* engine.register(
         make({
-          definitionHash: options.definition.hash,
           spaceId: options.spaceId,
           clientId: options.clientId
         }),
         handler(options, configuration)
       )
+      const legacyDefinitions = new Map<string, Definition.Any>()
+      for (const step of evolution.steps) legacyDefinitions.set(step.from.hash, step.from)
+      for (const baseline of evolution.legacyBaselines) {
+        legacyDefinitions.set(baseline.hash, baseline.definition)
+      }
+      legacyDefinitions.delete(options.definition.hash)
+      for (const [definitionHash, definition] of legacyDefinitions) {
+        const legacy = Workflow.make(
+          `effect-local/ReconcileReplica/${JSON.stringify([definitionHash, options.spaceId, options.clientId])}`,
+          {
+            payload: {
+              definitionHash: Schema.String,
+              spaceId: Identity.SpaceId,
+              clientId: Identity.ClientId,
+              generation: ReconciliationGeneration
+            },
+            success: Schema.Void,
+            error: ReplicaError.ReplicaError,
+            idempotencyKey: ({ generation }) => String(generation)
+          }
+        )
+        yield* engine.register(legacy, () =>
+          Effect.fail(
+            new ReplicaError.StaleSchema({
+              expectedVersion: options.definition.schemaIdentity.version,
+              expectedHash: options.definition.schemaIdentity.hash,
+              actualVersion: definition.schemaIdentity.version,
+              actualHash: definition.schemaIdentity.hash
+            })
+          ))
+      }
       return Layer.succeed(Registration, Registration.of({ registered: true }))
     })
   )
@@ -241,7 +278,7 @@ const layerSchedulerWithConfiguration = (
                 const generations = yield* local.reconciliationGenerations
                 if (generations.completed >= generations.requested) return
                 const payload = Payload.make({
-                  definitionHash: options.definition.hash,
+                  schemaIdentity: schemaIdentity(options.definition),
                   spaceId: options.spaceId,
                   clientId: options.clientId,
                   generation: generations.requested
@@ -261,7 +298,7 @@ const layerSchedulerWithConfiguration = (
       const supervisorFiber = yield* Effect.forkScoped(supervise)
       const watchFiber = yield* Effect.forkScoped(
         Effect.forever(
-          remote.watch(options.spaceId).pipe(
+          remote.watch({ spaceId: options.spaceId, schema: options.definition.schemaIdentity }).pipe(
             Stream.runForEach(() => requestAndNotify),
             Effect.andThen(requestAndNotify),
             Effect.catch((error) => Effect.logWarning("Sync watch ended", error)),

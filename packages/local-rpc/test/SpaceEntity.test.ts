@@ -87,7 +87,10 @@ describe("SpaceEntity", () => {
       const makeClient = yield* Entity.makeTestClient(SpaceEntity.SpaceEntity, entityHandlers)
       const client = yield* makeClient(spaceA)
       const wakes = yield* Queue.unbounded<Protocol.Wake>()
-      const watch = yield* client.Watch({ principal: { subject: "reader" } }).pipe(
+      const watch = yield* client.Watch({
+        request: { spaceId: spaceA, schema: definition.schemaIdentity },
+        principal: { subject: "reader" }
+      }).pipe(
         Stream.runForEach((wake) => Queue.offer(wakes, wake)),
         Effect.forkChild({ startImmediately: true })
       )
@@ -98,7 +101,10 @@ describe("SpaceEntity", () => {
       })
 
       const submitted = yield* envelope(spaceA)
-      const receipt = yield* client.Submit({ envelope: submitted, principal: { subject: "writer" } })
+      const receipt = yield* client.Submit({
+        request: { envelope: submitted, schema: definition.schemaIdentity },
+        principal: { subject: "writer" }
+      })
       assert.strictEqual(receipt._tag, "Accepted")
       assert.deepStrictEqual(yield* Queue.take(wakes), {
         spaceId: spaceA,
@@ -106,7 +112,12 @@ describe("SpaceEntity", () => {
       })
 
       const page = yield* client.Pull({
-        request: { spaceId: spaceA, after: Identity.ServerSequence.make(0), limit: 10 },
+        request: {
+          spaceId: spaceA,
+          schema: definition.schemaIdentity,
+          after: Identity.ServerSequence.make(0),
+          limit: 10
+        },
         principal: { subject: "reader" }
       })
       assert.deepStrictEqual(page.entries.map((entry) => entry.mutationId), [mutationId])
@@ -141,11 +152,19 @@ describe("SpaceEntity", () => {
       const client = yield* makeClient(spaceA)
       const submitted = yield* envelope(spaceB)
 
-      const submitError = yield* client.Submit({ envelope: submitted, principal: null }).pipe(Effect.flip)
+      const submitError = yield* client.Submit({
+        request: { envelope: submitted, schema: definition.schemaIdentity },
+        principal: null
+      }).pipe(Effect.flip)
       assert.strictEqual(submitError._tag, "ProtocolInvalid")
 
       const pullError = yield* client.Pull({
-        request: { spaceId: spaceB, after: Identity.ServerSequence.make(0), limit: 10 },
+        request: {
+          spaceId: spaceB,
+          schema: definition.schemaIdentity,
+          after: Identity.ServerSequence.make(0),
+          limit: 10
+        },
         principal: null
       }).pipe(Effect.flip)
       assert.strictEqual(pullError._tag, "ProtocolInvalid")

@@ -72,7 +72,7 @@ describe("reconciliation workflow", () => {
       const second = yield* replica.mutate(Domain.PutTodo, Domain.todo("2"))
       const requested = (yield* local.reconciliationGenerations).requested
       const payload = ReconciliationWorkflow.Payload.make({
-        definitionHash: Domain.definition.hash,
+        schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
         generation: requested
@@ -86,7 +86,7 @@ describe("reconciliation workflow", () => {
         const generations = yield* local.reconciliationGenerations
         if (generations.completed >= generations.requested) break
         const nextPayload = ReconciliationWorkflow.Payload.make({
-          definitionHash: Domain.definition.hash,
+          schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
           spaceId,
           clientId,
           generation: generations.requested
@@ -101,7 +101,12 @@ describe("reconciliation workflow", () => {
       assert.strictEqual(Option.getOrThrow(yield* local.receipt(first.envelope.mutationId))._tag, "Accepted")
       assert.strictEqual(Option.getOrThrow(yield* local.receipt(second.envelope.mutationId))._tag, "Accepted")
       assert.deepStrictEqual(Option.getOrThrow(yield* replica.get(Domain.Todo, "2")), Domain.todo("2"))
-      assert.deepStrictEqual(Object.keys(payload).toSorted(), ["clientId", "definitionHash", "generation", "spaceId"])
+      assert.deepStrictEqual(Object.keys(payload).toSorted(), [
+        "clientId",
+        "generation",
+        "schemaIdentity",
+        "spaceId"
+      ])
     }))
 
   it.effect("rejects a workflow handle addressed to another replica", () =>
@@ -116,13 +121,12 @@ describe("reconciliation workflow", () => {
       )
       const context = yield* Layer.build(replicaLayer)
       const payload = ReconciliationWorkflow.Payload.make({
-        definitionHash: Domain.definition.hash,
+        schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId: Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002"),
         clientId,
         generation: 1
       })
       const error = yield* ReconciliationWorkflow.make({
-        definitionHash: Domain.definition.hash,
         spaceId,
         clientId
       }).execute(payload).pipe(Effect.flip, Effect.provide(context))
@@ -158,7 +162,7 @@ describe("reconciliation workflow", () => {
       const mutation = yield* replica.mutate(Domain.PutTodo, Domain.todo("cluster"))
       const generations = yield* local.reconciliationGenerations
       const payload = ReconciliationWorkflow.Payload.make({
-        definitionHash: Domain.definition.hash,
+        schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
         generation: generations.requested
@@ -205,7 +209,7 @@ describe("reconciliation workflow", () => {
             watch: () => Stream.never
           })
           const reconciliationContext = yield* Layer.build(
-            Reconciler.layerOnePass({ spaceId }).pipe(
+            Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
               Layer.provide(Layer.succeed(LocalStore.Store, local)),
               Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote))
             )
@@ -227,13 +231,13 @@ describe("reconciliation workflow", () => {
       yield* register(clientId, firstPulls, firstPulled)
       yield* register(secondClientId, secondPulls, secondPulled)
       const firstPayload = ReconciliationWorkflow.Payload.make({
-        definitionHash: Domain.definition.hash,
+        schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
         generation: 1
       })
       const secondPayload = ReconciliationWorkflow.Payload.make({
-        definitionHash: Domain.definition.hash,
+        schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId: secondClientId,
         generation: 1
@@ -271,7 +275,7 @@ describe("reconciliation workflow", () => {
         watch: () => Stream.never
       })
       const reconciliationContext = yield* Layer.build(
-        Reconciler.layerOnePass({ spaceId }).pipe(
+        Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
           Layer.provide(Layer.succeed(LocalStore.Store, local)),
           Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote))
         )
@@ -296,7 +300,7 @@ describe("reconciliation workflow", () => {
       yield* local.mutate(Domain.PutTodo, Domain.todo("permanent-failure"))
       const generations = yield* local.reconciliationGenerations
       const payload = ReconciliationWorkflow.Payload.make({
-        definitionHash: Domain.definition.hash,
+        schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
         generation: generations.requested

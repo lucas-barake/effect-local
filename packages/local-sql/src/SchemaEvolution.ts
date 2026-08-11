@@ -121,6 +121,31 @@ const LegacyReceipt = Schema.Union([LegacyAcceptedReceipt, LegacyRejectedReceipt
 const sameIdentity = (left: Identity.SchemaIdentity, right: Identity.SchemaIdentity): boolean =>
   left.version === right.version && left.hash === right.hash
 
+interface EvolutionProgress {
+  readonly source_schema_version: number
+  readonly source_schema_hash: string
+  readonly target_schema_version: number
+  readonly target_schema_hash: string
+  readonly migration_hash: string
+  readonly generation: number
+  readonly phase: string
+  readonly cursor_model: string | null
+  readonly cursor_key: string | null
+  readonly cursor_sequence: number | null
+}
+
+const sameProgress = (left: EvolutionProgress, right: EvolutionProgress): boolean =>
+  left.source_schema_version === right.source_schema_version &&
+  left.source_schema_hash === right.source_schema_hash &&
+  left.target_schema_version === right.target_schema_version &&
+  left.target_schema_hash === right.target_schema_hash &&
+  left.migration_hash === right.migration_hash &&
+  left.generation === right.generation &&
+  left.phase === right.phase &&
+  left.cursor_model === right.cursor_model &&
+  left.cursor_key === right.cursor_key &&
+  left.cursor_sequence === right.cursor_sequence
+
 const identityFrom = (version: Identity.SchemaVersion, hash: Identity.SchemaHash): Identity.SchemaIdentity => ({
   version,
   hash
@@ -233,7 +258,7 @@ const currentOrLegacyReceipt = (
     })
   })
 
-const migrateReceipt = (
+export const migrateReceipt = (
   receipt: Protocol.Receipt,
   evolution: Evolution.Evolution
 ): Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError> =>
@@ -387,6 +412,24 @@ export const client = (options: ClientOptions) =>
         target_schema_hash, migration_hash, generation, phase, cursor_model, cursor_key, cursor_sequence
         FROM effect_local_client_evolution WHERE singleton = 1`
     })
+    const beginPromotion = SqlSchema.findOneOption({
+      Request: Schema.Struct({
+        expectedGeneration: NonNegativeInt,
+        generation: Identity.SchemaVersion,
+        sourceVersion: Identity.SchemaVersion,
+        sourceHash: Identity.SchemaHash
+      }),
+      Result: Schema.Struct({ schema_generation: Identity.SchemaVersion }),
+      execute: ({ expectedGeneration, generation, sourceVersion, sourceHash }) =>
+        sql`UPDATE effect_local_client_meta SET
+          schema_version = ${sourceVersion}, schema_hash = ${sourceHash},
+          target_schema_version = ${options.definition.schemaIdentity.version},
+          target_schema_hash = ${options.definition.schemaIdentity.hash},
+          migration_hash = ${options.evolution.migrationHash}, schema_generation = ${generation}
+          WHERE singleton = 1 AND schema_generation = ${expectedGeneration}
+            AND target_schema_version IS NULL AND target_schema_hash IS NULL AND migration_hash IS NULL
+          RETURNING schema_generation`
+    })
     const entityBatch = SqlSchema.findAll({
       Request: Schema.Struct({
         model: Schema.NullOr(Schema.String),
@@ -519,16 +562,47 @@ export const client = (options: ClientOptions) =>
         }
       })
 
+    const validateBatch = (state: typeof ProgressRow.Type) =>
+      Effect.gen(function*() {
+        const meta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+        const progress = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+        if (
+          meta.schema_generation !== state.generation || meta.schema_version !== state.source_schema_version ||
+          meta.schema_hash !== state.source_schema_hash || meta.target_schema_version !== state.target_schema_version ||
+          meta.target_schema_hash !== state.target_schema_hash || meta.migration_hash !== state.migration_hash ||
+          Option.isNone(progress) || !sameProgress(progress.value, state)
+        ) {
+          return yield* new ReplicaError.SchemaGenerationConflict({
+            expected: state.generation,
+            actual: meta.schema_generation
+          })
+        }
+      })
+
     let progress = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
     if (Option.isNone(progress)) {
       const meta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
       const source = yield* resolveInitialSource(meta, options.evolution)
       if (!source.legacy && sameIdentity(source.identity, options.definition.schemaIdentity)) {
-        if (meta.definition_hash !== options.definition.hash) {
+        return yield* sql.withTransaction(Effect.gen(function*() {
           yield* sql`UPDATE effect_local_client_meta SET definition_hash = ${options.definition.hash}
-            WHERE singleton = 1`
-        }
-        return meta.schema_generation
+            WHERE singleton = 1 AND schema_generation = ${meta.schema_generation}
+              AND target_schema_version IS NULL AND target_schema_hash IS NULL AND migration_hash IS NULL`
+          const currentMeta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          if (
+            currentMeta.schema_generation !== meta.schema_generation ||
+            currentMeta.schema_version !== options.definition.schemaIdentity.version ||
+            currentMeta.schema_hash !== options.definition.schemaIdentity.hash ||
+            currentMeta.target_schema_version !== null || currentMeta.target_schema_hash !== null ||
+            currentMeta.migration_hash !== null
+          ) {
+            return yield* new ReplicaError.SchemaGenerationConflict({
+              expected: meta.schema_generation,
+              actual: currentMeta.schema_generation
+            })
+          }
+          return currentMeta.schema_generation
+        }))
       }
       if (meta.schema_generation >= Number.MAX_SAFE_INTEGER) {
         return yield* new ReplicaError.CapacityExceeded({
@@ -538,11 +612,13 @@ export const client = (options: ClientOptions) =>
       }
       const generation = Identity.SchemaVersion.make(meta.schema_generation + 1)
       yield* sql.withTransaction(Effect.gen(function*() {
-        yield* sql`UPDATE effect_local_client_meta SET
-          schema_version = ${source.identity.version}, schema_hash = ${source.identity.hash},
-          target_schema_version = ${options.definition.schemaIdentity.version},
-          target_schema_hash = ${options.definition.schemaIdentity.hash}, migration_hash = ${options.evolution.migrationHash},
-          schema_generation = ${generation} WHERE singleton = 1 AND schema_generation = ${meta.schema_generation}`
+        const promoted = yield* beginPromotion({
+          expectedGeneration: meta.schema_generation,
+          generation,
+          sourceVersion: source.identity.version,
+          sourceHash: source.identity.hash
+        }).pipe(Effect.mapError(StorageUnavailable.make))
+        if (Option.isNone(promoted)) return
         yield* sql`DELETE FROM effect_local_client_shadow_entities WHERE generation = ${generation}`
         yield* sql`DELETE FROM effect_local_client_shadow_visible_entities WHERE generation = ${generation}`
         yield* sql`DELETE FROM effect_local_client_shadow_receipts_v2 WHERE generation = ${generation}`
@@ -577,7 +653,19 @@ export const client = (options: ClientOptions) =>
 
     while (true) {
       const current = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
-      if (Option.isNone(current)) return expected.generation
+      if (Option.isNone(current)) {
+        const meta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+        if (
+          meta.schema_generation === expected.generation &&
+          meta.schema_version === options.definition.schemaIdentity.version &&
+          meta.schema_hash === options.definition.schemaIdentity.hash &&
+          meta.target_schema_version === null && meta.target_schema_hash === null && meta.migration_hash === null
+        ) return expected.generation
+        return yield* new ReplicaError.SchemaGenerationConflict({
+          expected: expected.generation,
+          actual: meta.schema_generation
+        })
+      }
       const state = current.value
       if (state.generation !== expected.generation || state.migration_hash !== expected.migration_hash) {
         return yield* new ReplicaError.SchemaGenerationConflict({
@@ -591,6 +679,7 @@ export const client = (options: ClientOptions) =>
           Effect.mapError(StorageUnavailable.make)
         )
         yield* sql.withTransaction(Effect.gen(function*() {
+          yield* validateBatch(state)
           for (const row of rows) {
             const entry = yield* currentOrLegacyEntry(row, source, definition)
             for (const change of entry.changes) {
@@ -625,6 +714,7 @@ export const client = (options: ClientOptions) =>
           Effect.mapError(StorageUnavailable.make)
         )
         yield* sql.withTransaction(Effect.gen(function*() {
+          yield* validateBatch(state)
           for (const row of rows) {
             const model = definition.modelByName.get(row.model)
             const modelVersion = row.model_version ?? model?.version
@@ -661,6 +751,7 @@ export const client = (options: ClientOptions) =>
           Effect.mapError(StorageUnavailable.make)
         )
         yield* sql.withTransaction(Effect.gen(function*() {
+          yield* validateBatch(state)
           for (const row of rows) {
             const decoded = yield* currentOrLegacyReceipt(row, source)
             const receipt = yield* migrateReceipt(decoded, options.evolution)
@@ -693,6 +784,7 @@ export const client = (options: ClientOptions) =>
           Effect.mapError(StorageUnavailable.make)
         )
         yield* sql.withTransaction(Effect.gen(function*() {
+          yield* validateBatch(state)
           for (const row of rows) {
             const envelope = yield* pendingEnvelope(row, options, source, definition)
             const decodedChanges = yield* decodeJson(
@@ -773,17 +865,7 @@ export const client = (options: ClientOptions) =>
         }))
       } else {
         yield* sql.withTransaction(Effect.gen(function*() {
-          const finalMeta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
-          if (
-            finalMeta.schema_generation !== state.generation || finalMeta.migration_hash !== state.migration_hash ||
-            finalMeta.target_schema_version !== state.target_schema_version ||
-            finalMeta.target_schema_hash !== state.target_schema_hash
-          ) {
-            return yield* new ReplicaError.SchemaGenerationConflict({
-              expected: state.generation,
-              actual: finalMeta.schema_generation
-            })
-          }
+          yield* validateBatch(state)
           yield* sql`DELETE FROM effect_local_canonical_entities`
           yield* sql`INSERT INTO effect_local_canonical_entities (model, model_version, entity_key, value_json)
             SELECT model, model_version, entity_key, value_json FROM effect_local_client_shadow_entities
@@ -826,4 +908,457 @@ export const client = (options: ClientOptions) =>
     Effect.withSpan("SchemaEvolution.client", {
       attributes: { "space.id": options.spaceId, "client.id": options.clientId }
     })
+  )
+
+const ServerMetaEvolutionRow = Schema.Struct({
+  definition_hash: Schema.String,
+  schema_version: NullableSchemaVersion,
+  schema_hash: NullableSchemaHash,
+  schema_generation: NonNegativeInt,
+  target_schema_version: NullableSchemaVersion,
+  target_schema_hash: NullableSchemaHash,
+  migration_hash: NullableSchemaHash
+})
+
+const ServerProgressRow = Schema.Struct({
+  source_schema_version: Identity.SchemaVersion,
+  source_schema_hash: Identity.SchemaHash,
+  target_schema_version: Identity.SchemaVersion,
+  target_schema_hash: Identity.SchemaHash,
+  migration_hash: Identity.SchemaHash,
+  generation: Identity.SchemaVersion,
+  phase: Schema.Literals(["Log", "Entities", "Receipts", "Finalize"]),
+  cursor_model: Schema.NullOr(Schema.String),
+  cursor_key: Schema.NullOr(Schema.String),
+  cursor_sequence: Schema.NullOr(NonNegativeInt)
+})
+
+const ServerReceiptBatchRow = Schema.Struct({
+  mutation_id: Identity.MutationId,
+  local_sequence: Identity.LocalSequence,
+  receipt_json: Schema.String,
+  source_schema_version: NullableSchemaVersion,
+  source_schema_hash: NullableSchemaHash,
+  mutation_version: NullableSchemaVersion,
+  mutation_name: Schema.NullOr(Schema.String),
+  rejection_origin: Schema.NullOr(Protocol.RejectionOrigin)
+})
+
+export interface ServerOptions {
+  readonly definition: Definition.Any
+  readonly evolution: Evolution.Evolution
+  readonly spaceId: Identity.SpaceId
+  readonly batchSize?: number | undefined
+  readonly afterBatch?: Effect.Effect<void> | undefined
+}
+
+export const server = (options: ServerOptions) =>
+  Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    if (!sameIdentity(options.definition.schemaIdentity, options.evolution.current.schemaIdentity)) {
+      return yield* new ReplicaError.InvalidConfiguration({
+        option: "evolution",
+        message: "The evolution target does not match the ServerStore definition"
+      })
+    }
+    const batchSize = options.batchSize ?? 256
+    if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 10_000) {
+      return yield* new ReplicaError.InvalidConfiguration({
+        option: "schemaEvolutionBatchSize",
+        message: "Schema evolution batch size must be a positive safe integer no greater than 10000"
+      })
+    }
+
+    const readMeta = SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: ServerMetaEvolutionRow,
+      execute: () =>
+        sql`SELECT definition_hash, schema_version, schema_hash, schema_generation,
+        target_schema_version, target_schema_hash, migration_hash FROM effect_local_server_spaces
+        WHERE space_id = ${options.spaceId}`
+    })
+    const readProgress = SqlSchema.findOneOption({
+      Request: Schema.Void,
+      Result: ServerProgressRow,
+      execute: () =>
+        sql`SELECT source_schema_version, source_schema_hash, target_schema_version,
+        target_schema_hash, migration_hash, generation, phase, cursor_model, cursor_key, cursor_sequence
+        FROM effect_local_server_evolution WHERE space_id = ${options.spaceId}`
+    })
+    const beginPromotion = SqlSchema.findOneOption({
+      Request: Schema.Struct({
+        expectedGeneration: NonNegativeInt,
+        generation: Identity.SchemaVersion,
+        sourceVersion: Identity.SchemaVersion,
+        sourceHash: Identity.SchemaHash
+      }),
+      Result: Schema.Struct({ schema_generation: Identity.SchemaVersion }),
+      execute: ({ expectedGeneration, generation, sourceVersion, sourceHash }) =>
+        sql`UPDATE effect_local_server_spaces SET
+          schema_version = ${sourceVersion}, schema_hash = ${sourceHash},
+          target_schema_version = ${options.definition.schemaIdentity.version},
+          target_schema_hash = ${options.definition.schemaIdentity.hash},
+          migration_hash = ${options.evolution.migrationHash}, schema_generation = ${generation}
+          WHERE space_id = ${options.spaceId} AND schema_generation = ${expectedGeneration}
+            AND target_schema_version IS NULL AND target_schema_hash IS NULL AND migration_hash IS NULL
+          RETURNING schema_generation`
+    })
+    const logBatch = SqlSchema.findAll({
+      Request: Schema.Struct({ after: NonNegativeInt, limit: Schema.Number }),
+      Result: LogBatchRow,
+      execute: ({ after, limit }) =>
+        sql`SELECT server_sequence, mutation_id, entry_json,
+        source_schema_version, source_schema_hash FROM effect_local_authoritative_log
+        WHERE space_id = ${options.spaceId} AND server_sequence > ${after}
+        ORDER BY server_sequence LIMIT ${limit}`
+    })
+    const entityBatch = SqlSchema.findAll({
+      Request: Schema.Struct({
+        model: Schema.NullOr(Schema.String),
+        key: Schema.NullOr(Schema.String),
+        limit: Schema.Number
+      }),
+      Result: EntityBatchRow,
+      execute: ({ model, key, limit }) =>
+        sql`SELECT model, model_version, entity_key, value_json
+        FROM effect_local_server_entities WHERE space_id = ${options.spaceId}
+          AND (${model} IS NULL OR model > ${model} OR (model = ${model} AND entity_key > ${key}))
+        ORDER BY model, entity_key LIMIT ${limit}`
+    })
+    const receiptBatch = SqlSchema.findAll({
+      Request: Schema.Struct({ after: Schema.NullOr(Schema.String), limit: Schema.Number }),
+      Result: ServerReceiptBatchRow,
+      execute: ({ after, limit }) =>
+        sql`SELECT mutation_id, local_sequence, receipt_json,
+        source_schema_version, source_schema_hash, mutation_version, mutation_name, rejection_origin
+        FROM effect_local_server_receipts WHERE space_id = ${options.spaceId}
+          AND (${after} IS NULL OR mutation_id > ${after}) ORDER BY mutation_id LIMIT ${limit}`
+    })
+    const readLineageGroup = SqlSchema.findOneOption({
+      Request: Schema.Struct({
+        schemaVersion: Identity.SchemaVersion,
+        schemaHash: Identity.SchemaHash,
+        model: Schema.String,
+        modelVersion: Identity.SchemaVersion,
+        key: Schema.String
+      }),
+      Result: LineageRow,
+      execute: (request) =>
+        sql`SELECT lineage_id FROM effect_local_server_key_lineage_groups
+        WHERE space_id = ${options.spaceId} AND source_schema_version = ${request.schemaVersion}
+          AND source_schema_hash = ${request.schemaHash} AND source_model = ${request.model}
+          AND source_model_version = ${request.modelVersion} AND source_key = ${request.key}`
+    })
+    const readLineageTarget = SqlSchema.findOneOption({
+      Request: Schema.Struct({ model: Schema.String, modelVersion: Identity.SchemaVersion, key: Schema.String }),
+      Result: LineageRow,
+      execute: (request) =>
+        sql`SELECT lineage_id FROM effect_local_server_key_lineage_targets
+        WHERE space_id = ${options.spaceId} AND target_model = ${request.model}
+          AND target_model_version = ${request.modelVersion} AND target_key = ${request.key}`
+    })
+
+    const registerLineage = (model: string, migrated: Evolution.MigratedModel) =>
+      Effect.gen(function*() {
+        const aliases = yield* Effect.forEach(
+          migrated.aliases,
+          (alias) => Codec.stringify(alias.key).pipe(Effect.map((key) => ({ ...alias, key })))
+        )
+        const sourceAliases = aliases.length === 1 ? aliases : aliases.slice(0, -1)
+        const groups = new Set<string>()
+        for (const alias of sourceAliases) {
+          const found = yield* readLineageGroup({
+            schemaVersion: alias.schemaIdentity.version,
+            schemaHash: alias.schemaIdentity.hash,
+            model,
+            modelVersion: alias.modelVersion,
+            key: alias.key
+          }).pipe(Effect.mapError(StorageUnavailable.make))
+          if (Option.isSome(found)) groups.add(found.value.lineage_id)
+        }
+        const targetKey = yield* Codec.stringify(migrated.key)
+        if (groups.size > 1) return yield* new ReplicaError.SchemaKeyCollision({ model, key: targetKey })
+        const root = aliases[0]!
+        const lineageId = groups.values().next().value ?? Canonical.stringify({
+          spaceId: options.spaceId,
+          schemaIdentity: root.schemaIdentity,
+          model,
+          modelVersion: root.modelVersion,
+          key: root.key
+        })
+        const target = yield* readLineageTarget({
+          model,
+          modelVersion: migrated.modelVersion,
+          key: targetKey
+        }).pipe(Effect.mapError(StorageUnavailable.make))
+        if (Option.isSome(target) && target.value.lineage_id !== lineageId) {
+          return yield* new ReplicaError.SchemaKeyCollision({ model, key: targetKey })
+        }
+        for (const alias of aliases) {
+          yield* sql`INSERT INTO effect_local_server_key_lineage_groups
+            (space_id, source_schema_version, source_schema_hash, source_model,
+              source_model_version, source_key, lineage_id)
+            VALUES (${options.spaceId}, ${alias.schemaIdentity.version}, ${alias.schemaIdentity.hash},
+              ${model}, ${alias.modelVersion}, ${alias.key}, ${lineageId})
+            ON CONFLICT (space_id, source_schema_version, source_schema_hash, source_model,
+              source_model_version, source_key) DO NOTHING`
+          yield* sql`INSERT INTO effect_local_server_key_lineage
+            (space_id, source_schema_version, source_schema_hash, source_model, source_model_version,
+              source_key, target_model, target_model_version, target_key)
+            VALUES (${options.spaceId}, ${alias.schemaIdentity.version}, ${alias.schemaIdentity.hash},
+              ${model}, ${alias.modelVersion}, ${alias.key}, ${model}, ${migrated.modelVersion}, ${targetKey})
+            ON CONFLICT (space_id, source_schema_version, source_schema_hash, source_model,
+              source_model_version, source_key) DO UPDATE SET target_model = excluded.target_model,
+              target_model_version = excluded.target_model_version, target_key = excluded.target_key`
+        }
+        yield* sql`INSERT INTO effect_local_server_key_lineage_targets
+          (space_id, target_model, target_model_version, target_key, lineage_id)
+          VALUES (${options.spaceId}, ${model}, ${migrated.modelVersion}, ${targetKey}, ${lineageId})
+          ON CONFLICT (space_id, target_model, target_model_version, target_key) DO NOTHING`
+        const stored = yield* readLineageTarget({
+          model,
+          modelVersion: migrated.modelVersion,
+          key: targetKey
+        }).pipe(Effect.mapError(StorageUnavailable.make))
+        if (Option.isNone(stored) || stored.value.lineage_id !== lineageId) {
+          return yield* new ReplicaError.SchemaKeyCollision({ model, key: targetKey })
+        }
+      })
+
+    const validateBatch = (state: typeof ServerProgressRow.Type) =>
+      Effect.gen(function*() {
+        const meta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+        const progress = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+        if (
+          meta.schema_generation !== state.generation || meta.schema_version !== state.source_schema_version ||
+          meta.schema_hash !== state.source_schema_hash || meta.target_schema_version !== state.target_schema_version ||
+          meta.target_schema_hash !== state.target_schema_hash || meta.migration_hash !== state.migration_hash ||
+          Option.isNone(progress) || !sameProgress(progress.value, state)
+        ) {
+          return yield* new ReplicaError.SchemaGenerationConflict({
+            expected: state.generation,
+            actual: meta.schema_generation
+          })
+        }
+      })
+
+    let progress = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+    if (Option.isNone(progress)) {
+      const meta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+      const source = yield* resolveInitialSource(meta, options.evolution)
+      if (!source.legacy && sameIdentity(source.identity, options.definition.schemaIdentity)) {
+        return yield* sql.withTransaction(Effect.gen(function*() {
+          yield* sql`UPDATE effect_local_server_spaces SET definition_hash = ${options.definition.hash}
+            WHERE space_id = ${options.spaceId} AND schema_generation = ${meta.schema_generation}
+              AND target_schema_version IS NULL AND target_schema_hash IS NULL AND migration_hash IS NULL`
+          const currentMeta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          if (
+            currentMeta.schema_generation !== meta.schema_generation ||
+            currentMeta.schema_version !== options.definition.schemaIdentity.version ||
+            currentMeta.schema_hash !== options.definition.schemaIdentity.hash ||
+            currentMeta.target_schema_version !== null || currentMeta.target_schema_hash !== null ||
+            currentMeta.migration_hash !== null
+          ) {
+            return yield* new ReplicaError.SchemaGenerationConflict({
+              expected: meta.schema_generation,
+              actual: currentMeta.schema_generation
+            })
+          }
+          return currentMeta.schema_generation
+        }))
+      }
+      if (meta.schema_generation >= Number.MAX_SAFE_INTEGER) {
+        return yield* new ReplicaError.CapacityExceeded({
+          resource: "schema generations",
+          limit: Number.MAX_SAFE_INTEGER
+        })
+      }
+      const generation = Identity.SchemaVersion.make(meta.schema_generation + 1)
+      yield* sql.withTransaction(Effect.gen(function*() {
+        const promoted = yield* beginPromotion({
+          expectedGeneration: meta.schema_generation,
+          generation,
+          sourceVersion: source.identity.version,
+          sourceHash: source.identity.hash
+        }).pipe(Effect.mapError(StorageUnavailable.make))
+        if (Option.isNone(promoted)) return
+        yield* sql`DELETE FROM effect_local_server_shadow_entities
+          WHERE space_id = ${options.spaceId} AND generation = ${generation}`
+        yield* sql`INSERT INTO effect_local_server_evolution
+          (space_id, source_schema_version, source_schema_hash, target_schema_version,
+            target_schema_hash, migration_hash, generation, phase, cursor_model, cursor_key, cursor_sequence)
+          VALUES (${options.spaceId}, ${source.identity.version}, ${source.identity.hash},
+            ${options.definition.schemaIdentity.version}, ${options.definition.schemaIdentity.hash},
+            ${options.evolution.migrationHash}, ${generation}, 'Log', NULL, NULL, 0)`
+      }))
+      progress = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+    }
+    if (Option.isNone(progress)) {
+      return yield* new ReplicaError.StorageCorrupt({ message: "Server schema evolution progress was not created" })
+    }
+    const expected = progress.value
+    if (
+      !sameIdentity(
+        identityFrom(expected.target_schema_version, expected.target_schema_hash),
+        options.definition.schemaIdentity
+      ) ||
+      expected.migration_hash !== options.evolution.migrationHash
+    ) {
+      return yield* new ReplicaError.InvalidConfiguration({
+        option: "evolution",
+        message: "The stored server promotion uses a different target or migration catalog"
+      })
+    }
+    const source = identityFrom(expected.source_schema_version, expected.source_schema_hash)
+    const definition = yield* sourceDefinition(options.evolution, source)
+
+    while (true) {
+      const current = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+      if (Option.isNone(current)) {
+        const meta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+        if (
+          meta.schema_generation === expected.generation &&
+          meta.schema_version === options.definition.schemaIdentity.version &&
+          meta.schema_hash === options.definition.schemaIdentity.hash &&
+          meta.target_schema_version === null && meta.target_schema_hash === null && meta.migration_hash === null
+        ) return expected.generation
+        return yield* new ReplicaError.SchemaGenerationConflict({
+          expected: expected.generation,
+          actual: meta.schema_generation
+        })
+      }
+      const state = current.value
+      if (state.generation !== expected.generation || state.migration_hash !== expected.migration_hash) {
+        return yield* new ReplicaError.SchemaGenerationConflict({
+          expected: expected.generation,
+          actual: state.generation
+        })
+      }
+      if (state.phase === "Log") {
+        const rows = yield* logBatch({ after: state.cursor_sequence ?? 0, limit: batchSize }).pipe(
+          Effect.mapError(StorageUnavailable.make)
+        )
+        yield* sql.withTransaction(Effect.gen(function*() {
+          yield* validateBatch(state)
+          for (const row of rows) {
+            const entry = yield* currentOrLegacyEntry(row, source, definition)
+            for (const change of entry.changes) {
+              const migrated = yield* Evolution.migrateModel({
+                evolution: options.evolution,
+                source: entry.sourceSchema,
+                model: change.entity.model,
+                modelVersion: change.entity.modelVersion,
+                key: change.entity.key,
+                ...(change._tag === "Upsert" ? { value: change.value } : {})
+              })
+              yield* registerLineage(change.entity.model, migrated)
+            }
+            if (row.source_schema_version === null || row.source_schema_hash === null) {
+              const entryJson = yield* Codec.stringify(entry)
+              yield* sql`UPDATE effect_local_authoritative_log SET entry_json = ${entryJson},
+                entry_bytes = ${new TextEncoder().encode(entryJson).byteLength},
+                source_schema_version = ${entry.sourceSchema.version}, source_schema_hash = ${entry.sourceSchema.hash}
+                WHERE space_id = ${options.spaceId} AND server_sequence = ${row.server_sequence}`
+            }
+          }
+          if (rows.length === 0) {
+            yield* sql`UPDATE effect_local_server_evolution SET phase = 'Entities', cursor_sequence = NULL,
+              cursor_model = NULL, cursor_key = NULL WHERE space_id = ${options.spaceId}
+              AND generation = ${state.generation}`
+          } else {
+            yield* sql`UPDATE effect_local_server_evolution SET cursor_sequence = ${
+              rows[rows.length - 1]!.server_sequence
+            }
+              WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
+          }
+        }))
+      } else if (state.phase === "Entities") {
+        const rows = yield* entityBatch({ model: state.cursor_model, key: state.cursor_key, limit: batchSize }).pipe(
+          Effect.mapError(StorageUnavailable.make)
+        )
+        yield* sql.withTransaction(Effect.gen(function*() {
+          yield* validateBatch(state)
+          for (const row of rows) {
+            const model = definition.modelByName.get(row.model)
+            const modelVersion = row.model_version ?? model?.version
+            if (modelVersion === undefined) {
+              return yield* new ReplicaError.StorageCorrupt({
+                message: `Stored entity references unknown model ${row.model}`
+              })
+            }
+            const migrated = yield* Evolution.migrateModel({
+              evolution: options.evolution,
+              source,
+              model: row.model,
+              modelVersion,
+              key: yield* decodeJson(Schema.Json, row.entity_key),
+              value: yield* decodeJson(Schema.Json, row.value_json)
+            })
+            yield* registerLineage(row.model, migrated)
+            yield* sql`INSERT INTO effect_local_server_shadow_entities
+              (space_id, generation, model, model_version, entity_key, value_json)
+              VALUES (${options.spaceId}, ${state.generation}, ${row.model}, ${migrated.modelVersion},
+                ${yield* Codec.stringify(migrated.key)}, ${yield* Codec.stringify(migrated.value)})`
+          }
+          if (rows.length === 0) {
+            yield* sql`UPDATE effect_local_server_evolution SET phase = 'Receipts', cursor_model = NULL,
+              cursor_key = NULL, cursor_sequence = 0 WHERE space_id = ${options.spaceId}
+              AND generation = ${state.generation}`
+          } else {
+            const last = rows[rows.length - 1]!
+            yield* sql`UPDATE effect_local_server_evolution SET cursor_model = ${last.model}, cursor_key = ${last.entity_key}
+              WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
+          }
+        }))
+      } else if (state.phase === "Receipts") {
+        const rows = yield* receiptBatch({ after: state.cursor_key, limit: batchSize }).pipe(
+          Effect.mapError(StorageUnavailable.make)
+        )
+        yield* sql.withTransaction(Effect.gen(function*() {
+          yield* validateBatch(state)
+          for (const row of rows) {
+            const receipt = yield* currentOrLegacyReceipt(row, source)
+            yield* sql`UPDATE effect_local_server_receipts SET receipt_json = ${yield* Codec.stringify(receipt)},
+              source_schema_version = ${receipt.sourceSchema.version}, source_schema_hash = ${receipt.sourceSchema.hash},
+              mutation_version = ${receipt._tag === "Legacy" ? null : receipt.mutationVersion},
+              mutation_name = ${receipt._tag === "Legacy" ? null : receipt.name},
+              rejection_origin = ${
+              receipt._tag === "Rejected" ? receipt.origin : receipt._tag === "Legacy" ? "Legacy" : null
+            }
+              WHERE space_id = ${options.spaceId} AND mutation_id = ${row.mutation_id}`
+          }
+          if (rows.length === 0) {
+            yield* sql`UPDATE effect_local_server_evolution SET phase = 'Finalize', cursor_key = NULL,
+              cursor_sequence = NULL
+              WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
+          } else {
+            yield* sql`UPDATE effect_local_server_evolution SET cursor_key = ${rows[rows.length - 1]!.mutation_id}
+              WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
+          }
+        }))
+      } else {
+        yield* sql.withTransaction(Effect.gen(function*() {
+          yield* validateBatch(state)
+          yield* sql`DELETE FROM effect_local_server_entities WHERE space_id = ${options.spaceId}`
+          yield* sql`INSERT INTO effect_local_server_entities
+            (space_id, model, model_version, entity_key, value_json)
+            SELECT space_id, model, model_version, entity_key, value_json
+            FROM effect_local_server_shadow_entities
+            WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
+          yield* sql`UPDATE effect_local_server_spaces SET definition_hash = ${options.definition.hash},
+            schema_version = ${options.definition.schemaIdentity.version},
+            schema_hash = ${options.definition.schemaIdentity.hash}, target_schema_version = NULL,
+            target_schema_hash = NULL, migration_hash = NULL
+            WHERE space_id = ${options.spaceId} AND schema_generation = ${state.generation}`
+          yield* sql`DELETE FROM effect_local_server_evolution
+            WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
+          yield* sql`DELETE FROM effect_local_server_shadow_entities
+            WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
+        }))
+      }
+      if (options.afterBatch !== undefined) yield* options.afterBatch
+    }
+  }).pipe(
+    Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
+    Effect.withSpan("SchemaEvolution.server", { attributes: { "space.id": options.spaceId } })
   )

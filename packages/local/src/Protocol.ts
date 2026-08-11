@@ -43,6 +43,12 @@ export const MutationEnvelope = Schema.Struct({
 })
 export type MutationEnvelope = typeof MutationEnvelope.Type
 
+export const SubmitRequest = Schema.Struct({
+  envelope: MutationEnvelope,
+  schema: Identity.SchemaIdentity
+})
+export type SubmitRequest = typeof SubmitRequest.Type
+
 export const mutationDigestInput = (envelope: Omit<MutationEnvelope, "digest">): unknown => {
   const identity = {
     spaceId: envelope.spaceId,
@@ -136,10 +142,17 @@ export type AcceptedMutation = typeof AcceptedMutation.Type
 
 export const PullRequest = Schema.Struct({
   spaceId: Identity.SpaceId,
+  schema: Identity.SchemaIdentity,
   after: Identity.ServerSequence,
   limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBatchEntries))
 })
 export type PullRequest = typeof PullRequest.Type
+
+export const WatchRequest = Schema.Struct({
+  spaceId: Identity.SpaceId,
+  schema: Identity.SchemaIdentity
+})
+export type WatchRequest = typeof WatchRequest.Type
 
 export const PullPage = Schema.Struct({
   entries: Schema.Array(AcceptedMutation).check(Schema.isMaxLength(maximumBatchEntries)),

@@ -92,7 +92,7 @@ export const layerJson = (options?: {
   )
 
 export class Submit extends Rpc.make("Submit", {
-  payload: Protocol.MutationEnvelope.fields,
+  payload: Protocol.SubmitRequest.fields,
   success: Protocol.Receipt,
   error: ReplicaError.ReplicaError,
   defect: RemoteDefect
@@ -106,7 +106,7 @@ export class Pull extends Rpc.make("Pull", {
 }) {}
 
 export class Watch extends Rpc.make("Watch", {
-  payload: { spaceId: Protocol.PullRequest.fields.spaceId },
+  payload: Protocol.WatchRequest.fields,
   success: Protocol.Wake,
   error: ReplicaError.ReplicaError,
   defect: RemoteDefect,

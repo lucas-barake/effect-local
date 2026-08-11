@@ -145,11 +145,12 @@ describe("WebSocket synchronization", () => {
         ...identity,
         digest: yield* Protocol.mutationDigest(identity)
       }
-      const receipt = yield* remote.submit(envelope)
+      const request = { envelope, schema: definition.schemaIdentity }
+      const receipt = yield* remote.submit(request)
       assert.strictEqual(receipt._tag, "Accepted")
 
       const revoked = yield* RevokedSyncEngine
-      const revokedRetry = yield* revoked.submit(envelope).pipe(Effect.flip)
+      const revokedRetry = yield* revoked.submit(request).pipe(Effect.flip)
       assert.strictEqual(revokedRetry._tag, "AuthorizationDenied")
 
       const sql = yield* SqlClient.SqlClient
@@ -157,20 +158,30 @@ describe("WebSocket synchronization", () => {
       const replyRows = yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM cluster_replies`
       assert.deepStrictEqual([messageRows[0]!.count, replyRows[0]!.count], [0, 0])
 
-      const page = yield* remote.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+      const page = yield* remote.pull({
+        spaceId,
+        schema: definition.schemaIdentity,
+        after: Identity.ServerSequence.make(0),
+        limit: 10
+      })
       assert.deepStrictEqual(page.entries.map((entry) => entry.mutationId), [mutationId])
 
       const denied = yield* remote.pull({
         spaceId: forbiddenSpaceId,
+        schema: definition.schemaIdentity,
         after: Identity.ServerSequence.make(0),
         limit: 10
       }).pipe(Effect.flip)
       assert.strictEqual(denied._tag, "AuthorizationDenied")
 
       const forbiddenIdentity = { ...identity, spaceId: forbiddenSpaceId }
-      const forbidden = yield* remote.submit({
+      const forbiddenEnvelope = {
         ...forbiddenIdentity,
         digest: yield* Protocol.mutationDigest(forbiddenIdentity)
+      }
+      const forbidden = yield* remote.submit({
+        envelope: forbiddenEnvelope,
+        schema: definition.schemaIdentity
       }).pipe(Effect.flip)
       assert.strictEqual(forbidden._tag, "AuthorizationDenied")
     }).pipe(
@@ -215,8 +226,9 @@ describe("WebSocket synchronization", () => {
         ...identity,
         digest: yield* Protocol.mutationDigest(identity)
       }
-      const first = yield* remote.submit(submitted)
-      const retry = yield* remote.submit(submitted)
+      const request = { envelope: submitted, schema: definition.schemaIdentity }
+      const first = yield* remote.submit(request)
+      const retry = yield* remote.submit(request)
 
       assert.strictEqual(first._tag, "Rejected")
       assert.deepStrictEqual(retry, first)
@@ -228,7 +240,12 @@ describe("WebSocket synchronization", () => {
           limit: Protocol.maximumReceiptBytes
         })
       }
-      const page = yield* remote.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+      const page = yield* remote.pull({
+        spaceId,
+        schema: definition.schemaIdentity,
+        after: Identity.ServerSequence.make(0),
+        limit: 10
+      })
       assert.deepStrictEqual(page.entries, [])
     }).pipe(
       Effect.provide(live),

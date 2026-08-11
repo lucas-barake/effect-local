@@ -1,3 +1,4 @@
+import type * as Definition from "@lucas-barake/effect-local/Definition"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -38,13 +39,14 @@ export class Reconciler extends Context.Service<Reconciler, Service>()(
 ) {}
 
 export interface Options {
+  readonly definition: Definition.Any
   readonly spaceId: Identity.SpaceId
   readonly pageSize?: number
   readonly retryDelay?: Duration.Input
 }
 
 export const layerOnePass = (
-  options: Pick<Options, "spaceId" | "pageSize">
+  options: Pick<Options, "definition" | "spaceId" | "pageSize">
 ): Layer.Layer<Reconciliation, ReplicaError.InvalidConfiguration, LocalStore.Store | SyncEngine.SyncEngine> =>
   Layer.effect(
     Reconciliation,
@@ -74,7 +76,12 @@ export const layerOnePass = (
         let hasMore = true
         while (hasMore) {
           const cursor = yield* local.cursor
-          const page = yield* remote.pull({ spaceId: options.spaceId, after: cursor, limit: pageSize })
+          const page = yield* remote.pull({
+            spaceId: options.spaceId,
+            schema: options.definition.schemaIdentity,
+            after: cursor,
+            limit: pageSize
+          })
           yield* local.applyEntries(page.entries)
           hasMore = page.hasMore
         }
@@ -83,7 +90,12 @@ export const layerOnePass = (
       const submitPending = Effect.gen(function*() {
         const pending = yield* local.pending
         for (const mutation of pending) {
-          yield* local.persistReceipt(yield* remote.submit(mutation.envelope))
+          yield* local.persistReceipt(
+            yield* remote.submit({
+              envelope: mutation.envelope,
+              schema: options.definition.schemaIdentity
+            })
+          )
         }
         yield* local.settleReceipts
       })
@@ -105,7 +117,7 @@ export const layerOnePass = (
   )
 
 export const layerInMemoryScheduler = (
-  options: Pick<Options, "spaceId" | "retryDelay">
+  options: Pick<Options, "definition" | "spaceId" | "retryDelay">
 ): Layer.Layer<
   Reconciler,
   ReplicaError.ReplicaError,
@@ -153,7 +165,7 @@ export const layerInMemoryScheduler = (
       const workerFiber = yield* Effect.forkScoped(worker)
       const watchFiber = yield* Effect.forkScoped(
         Effect.forever(
-          remote.watch(options.spaceId).pipe(
+          remote.watch({ spaceId: options.spaceId, schema: options.definition.schemaIdentity }).pipe(
             Stream.runForEach(() => requestAndNotify),
             Effect.catch((error) => Effect.logWarning("Sync watch ended", error)),
             Effect.ensuring(

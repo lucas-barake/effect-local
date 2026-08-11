@@ -22,7 +22,7 @@ const volatileAnnotations = Context.make(ClusterSchema.Persisted, false).pipe(
 
 export class Submit extends Rpc.make("Submit", {
   payload: {
-    envelope: Protocol.MutationEnvelope,
+    request: Protocol.SubmitRequest,
     principal: Schema.Json
   },
   success: Protocol.Receipt,
@@ -39,7 +39,7 @@ export class Pull extends Rpc.make("Pull", {
 }).annotateMerge(volatileAnnotations) {}
 
 export class Watch extends Rpc.make("Watch", {
-  payload: { principal: Schema.Json },
+  payload: { request: Protocol.WatchRequest, principal: Schema.Json },
   success: Protocol.Wake,
   error: ReplicaError.ReplicaError,
   stream: true
@@ -71,7 +71,7 @@ export const SpaceEntity = Entity.make("EffectLocal/Space", [
 export interface ClientService {
   readonly submit: (
     spaceId: Identity.SpaceId,
-    envelope: Protocol.MutationEnvelope,
+    request: Protocol.SubmitRequest,
     principal: typeof Schema.Json.Type
   ) => Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError>
   readonly pull: (
@@ -81,6 +81,7 @@ export interface ClientService {
   ) => Effect.Effect<Protocol.PullPage, ReplicaError.ReplicaError>
   readonly watch: (
     spaceId: Identity.SpaceId,
+    request: Protocol.WatchRequest,
     principal: typeof Schema.Json.Type
   ) => Stream.Stream<Protocol.Wake, ReplicaError.ReplicaError>
   readonly publishPresence: (
@@ -99,8 +100,8 @@ export class Client extends Context.Service<Client, ClientService>()(
 ) {}
 
 const mapClient = (makeClient: Effect.Success<typeof SpaceEntity.client>): ClientService => ({
-  submit: (spaceId, envelope, principal) =>
-    makeClient(spaceId).Submit({ envelope, principal }).pipe(
+  submit: (spaceId, request, principal) =>
+    makeClient(spaceId).Submit({ request, principal }).pipe(
       Effect.catchTags({
         MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
@@ -115,8 +116,8 @@ const mapClient = (makeClient: Effect.Success<typeof SpaceEntity.client>): Clien
         PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
     ),
-  watch: (spaceId, principal) =>
-    makeClient(spaceId).Watch({ principal }).pipe(
+  watch: (spaceId, request, principal) =>
+    makeClient(spaceId).Watch({ request, principal }).pipe(
       Stream.catchTags({
         MailboxFull: () => Stream.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Stream.fail(new ReplicaError.ServerUnavailable()),
@@ -159,12 +160,12 @@ export const layerHandlers = (options: HandlerOptions = {}) =>
 
       return SpaceEntity.of({
         Submit: ({ payload }) => {
-          if (spaceId === undefined || payload.envelope.spaceId !== spaceId) {
+          if (spaceId === undefined || payload.request.envelope.spaceId !== spaceId) {
             return Effect.fail(
               new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
             )
           }
-          return store.admit(payload.envelope, payload.principal)
+          return store.admit(payload.request, payload.principal)
         },
         Pull: ({ payload }) =>
           Rpc.fork(Effect.suspend(() => {
@@ -177,9 +178,9 @@ export const layerHandlers = (options: HandlerOptions = {}) =>
           })),
         Watch: ({ payload }) =>
           Rpc.fork(
-            spaceId === undefined
+            spaceId === undefined || payload.request.spaceId !== spaceId
               ? Stream.fail(new ReplicaError.ProtocolInvalid({ message: "The routed space is invalid" }))
-              : Stream.unwrap(store.watchAuthorized(spaceId, payload.principal))
+              : Stream.unwrap(store.watchAuthorized(payload.request, payload.principal))
           ),
         PublishPresence: ({ payload }) =>
           Rpc.fork(Effect.suspend(() => {

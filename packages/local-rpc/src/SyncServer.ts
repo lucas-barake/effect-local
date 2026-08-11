@@ -11,17 +11,17 @@ import * as SyncRpc from "./SyncRpc.js"
 export const layerHandlers = SyncRpc.Rpcs.toLayer(Effect.gen(function*() {
   const client = yield* SpaceEntity.Client
   return SyncRpc.Rpcs.of({
-    Submit: (envelope) =>
+    Submit: (request) =>
       Authentication.Principal.pipe(
-        Effect.flatMap((principal) => client.submit(envelope.spaceId, envelope, principal))
+        Effect.flatMap((principal) => client.submit(request.envelope.spaceId, request, principal))
       ),
     Pull: (request) =>
       Authentication.Principal.pipe(
         Effect.flatMap((principal) => client.pull(request.spaceId, request, principal))
       ),
-    Watch: ({ spaceId }) =>
+    Watch: (request) =>
       Stream.unwrap(Authentication.Principal.pipe(
-        Effect.map((principal) => client.watch(spaceId, principal))
+        Effect.map((principal) => client.watch(request.spaceId, request, principal))
       )),
     PublishPresence: (update) =>
       Authentication.Principal.pipe(

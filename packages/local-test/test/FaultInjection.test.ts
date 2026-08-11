@@ -9,6 +9,7 @@ import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -72,16 +73,22 @@ describe("test synchronization faults", () => {
     Effect.gen(function*() {
       const { faults, local, sync } = yield* makeServices
       const pending = yield* local.mutate(PutTodo, { id: "1", title: "offline" })
+      const request = Protocol.SubmitRequest.make({ envelope: pending.envelope, schema: definition.schemaIdentity })
       yield* faults.partition
-      const error = yield* sync.submit(pending.envelope).pipe(Effect.flip)
+      const error = yield* sync.submit(request).pipe(Effect.flip)
       assert.strictEqual(error._tag, "ProtocolInvalid")
       assert.deepStrictEqual(Option.getOrThrow(yield* local.get(Todo, "1")), { id: "1", title: "offline" })
       assert.strictEqual(yield* local.pendingCount, 1)
 
       yield* faults.heal
-      const receipt = yield* sync.submit(pending.envelope)
+      const receipt = yield* sync.submit(request)
       yield* local.applyReceipt(receipt)
-      const page = yield* sync.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+      const page = yield* sync.pull({
+        spaceId,
+        schema: definition.schemaIdentity,
+        after: Identity.ServerSequence.make(0),
+        limit: 10
+      })
       yield* local.applyEntries(page.entries)
       assert.strictEqual(yield* local.pendingCount, 0)
       assert.strictEqual(yield* local.cursor, 1)
@@ -91,13 +98,19 @@ describe("test synchronization faults", () => {
     Effect.gen(function*() {
       const { faults, local, sync } = yield* makeServices
       const pending = yield* local.mutate(PutTodo, { id: "1", title: "ambiguous" })
+      const request = Protocol.SubmitRequest.make({ envelope: pending.envelope, schema: definition.schemaIdentity })
       yield* faults.dropNextReceipt
-      const error = yield* sync.submit(pending.envelope).pipe(Effect.flip)
+      const error = yield* sync.submit(request).pipe(Effect.flip)
       assert.strictEqual(error._tag, "ProtocolInvalid")
-      const receipt = yield* sync.submit(pending.envelope)
+      const receipt = yield* sync.submit(request)
       assert.strictEqual(receipt._tag, "Accepted")
       if (receipt._tag === "Accepted") assert.strictEqual(receipt.serverSequence, 1)
-      const page = yield* sync.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+      const page = yield* sync.pull({
+        spaceId,
+        schema: definition.schemaIdentity,
+        after: Identity.ServerSequence.make(0),
+        limit: 10
+      })
       assert.strictEqual(page.entries.length, 1)
     }))
 
@@ -105,10 +118,15 @@ describe("test synchronization faults", () => {
     Effect.gen(function*() {
       const { faults, local, sync } = yield* makeServices
       const pending = yield* local.mutate(PutTodo, { id: "1", title: "duplicate" })
-      const receipt = yield* sync.submit(pending.envelope)
+      const receipt = yield* sync.submit({ envelope: pending.envelope, schema: definition.schemaIdentity })
       yield* local.applyReceipt(receipt)
       yield* faults.duplicateNextPage
-      const page = yield* sync.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+      const page = yield* sync.pull({
+        spaceId,
+        schema: definition.schemaIdentity,
+        after: Identity.ServerSequence.make(0),
+        limit: 10
+      })
       assert.deepStrictEqual(page.entries.map((entry) => entry.sequence), [1, 1])
       yield* local.applyEntries(page.entries)
       assert.strictEqual(yield* local.cursor, 1)

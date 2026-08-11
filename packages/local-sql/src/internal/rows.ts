@@ -55,6 +55,12 @@ export const ReceiptRow = Schema.Struct({
 
 export const ServerMetaRow = Schema.Struct({
   definition_hash: Schema.String,
+  schema_version: Identity.SchemaVersion,
+  schema_hash: Identity.SchemaHash,
+  schema_generation: NonNegativeInt,
+  target_schema_version: Schema.NullOr(Identity.SchemaVersion),
+  target_schema_hash: Schema.NullOr(Identity.SchemaHash),
+  migration_hash: Schema.NullOr(Identity.SchemaHash),
   next_server_sequence: PositiveInt
 })
 
@@ -68,8 +74,8 @@ export const ServerReceiptRow = Schema.Struct({
   digest_version: Protocol.MutationDigestVersion,
   source_schema_version: Identity.SchemaVersion,
   source_schema_hash: Identity.SchemaHash,
-  mutation_version: Identity.SchemaVersion,
-  mutation_name: Schema.String,
+  mutation_version: Schema.NullOr(Identity.SchemaVersion),
+  mutation_name: Schema.NullOr(Schema.String),
   rejection_origin: Schema.NullOr(Protocol.RejectionOrigin),
   mutation_id: Identity.MutationId,
   receipt_json: Schema.String,
