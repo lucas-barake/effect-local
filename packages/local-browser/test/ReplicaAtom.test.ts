@@ -2,7 +2,6 @@ import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime"
-import * as Reconciler from "@lucas-barake/effect-local-sql/Reconciler"
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
@@ -16,10 +15,13 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
+import * as Stream from "effect/Stream"
 import { Atom, AtomRegistry } from "effect/unstable/reactivity"
 import * as BrowserReplica from "../src/BrowserReplica.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
+const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
+const thirdSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000003")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
 const Todo = Model.make("Todo", {
   version: 1,
@@ -88,7 +90,7 @@ const sync = Layer.effect(
 const replica = SqlReplica.layer({
   ...clientHistory,
   definition,
-  spaceId,
+  initialSpaces: [spaceId, secondSpaceId],
   clientId,
   retryDelay: "10 millis"
 }).pipe(
@@ -119,9 +121,12 @@ describe("Replica Atom graph", () => {
     const readsAfterConstruction = reads
 
     assert.isAbove(readsAfterConstruction, 0)
-    assert.strictEqual(graph.entity(Todo)("1").idleTTL, 17)
-    assert.strictEqual(graph.query(ListTodos)(undefined).idleTTL, 17)
-    assert.strictEqual(graph.receipt(Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")).idleTTL, 17)
+    assert.strictEqual(graph.entity(spaceId, Todo)("1").idleTTL, 17)
+    assert.strictEqual(graph.query(spaceId, ListTodos)(undefined).idleTTL, 17)
+    assert.strictEqual(
+      graph.receipt(spaceId, Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")).idleTTL,
+      17
+    )
     assert.strictEqual(reads, readsAfterConstruction)
   })
 
@@ -132,9 +137,9 @@ describe("Replica Atom graph", () => {
         const graph = BrowserReplica.make(replica)
         const registry = AtomRegistry.make()
         yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
-        const entity = graph.entity(Todo)("1")
-        const query = graph.query(ListTodos)(undefined)
-        const mutation = graph.mutation(PutTodo)
+        const entity = graph.entity(spaceId, Todo)("1")
+        const query = graph.query(spaceId, ListTodos)(undefined)
+        const mutation = graph.mutation(spaceId, PutTodo)
         const unmountEntity = registry.mount(entity)
         const unmountQuery = registry.mount(query)
         const unmountMutation = registry.mount(mutation)
@@ -149,23 +154,115 @@ describe("Replica Atom graph", () => {
         assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, query), [])
         registry.set(mutation, { id: "1", title: "atom" })
         const pending = yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
+        yield* Effect.yieldNow
         assert.deepStrictEqual(Option.getOrThrow(yield* AtomRegistry.getResult(registry, entity)), {
           id: "1",
           title: "atom"
         })
         assert.strictEqual(pending.envelope.name, PutTodo.name)
-        const reconciler = yield* AtomRegistry.getResult(registry, graph.runtime.atom(Reconciler.Reconciler))
-        yield* reconciler.sync
+        const receipt = graph.receipt(spaceId, pending.envelope.mutationId)
+        const accepted = Option.getOrThrow(Option.getOrThrow(
+          yield* AtomRegistry.toStreamResult(registry, receipt).pipe(
+            Stream.filter(Option.isSome),
+            Stream.runHead
+          )
+        ))
+        assert.strictEqual(accepted._tag, "Accepted")
         assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, query), [{
           id: "1",
           title: "atom"
         }])
-
-        const receipt = graph.receipt(pending.envelope.mutationId)
-        const accepted = Option.getOrThrow(yield* AtomRegistry.getResult(registry, receipt))
-        assert.strictEqual(accepted._tag, "Accepted")
-        const status = yield* AtomRegistry.getResult(registry, graph.status)
+        const status = yield* AtomRegistry.getResult(registry, graph.status(spaceId))
         assert.strictEqual(status._tag, "Online")
       })
   )
+
+  it.live("keeps addressed atoms isolated and shares membership through one runtime", () =>
+    Effect.gen(function*() {
+      const graph = BrowserReplica.make(replica)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const firstEntity = graph.entity(spaceId, Todo)("shared")
+      const secondEntity = graph.entity(secondSpaceId, Todo)("shared")
+      const firstQuery = graph.query(spaceId, ListTodos)(undefined)
+      const secondQuery = graph.query(secondSpaceId, ListTodos)(undefined)
+      const firstMutation = graph.mutation(spaceId, PutTodo)
+      const secondMutation = graph.mutation(secondSpaceId, PutTodo)
+      const mounted = [
+        registry.mount(firstEntity),
+        registry.mount(secondEntity),
+        registry.mount(firstQuery),
+        registry.mount(secondQuery),
+        registry.mount(firstMutation),
+        registry.mount(secondMutation),
+        registry.mount(graph.spaces),
+        registry.mount(graph.aggregateStatus),
+        registry.mount(graph.join),
+        registry.mount(graph.leave)
+      ]
+      yield* Effect.addFinalizer(() => Effect.sync(() => mounted.forEach((unmount) => unmount())))
+
+      registry.set(firstMutation, { id: "shared", title: "first" })
+      registry.set(secondMutation, { id: "shared", title: "second" })
+      const [firstPending, secondPending] = yield* Effect.all([
+        AtomRegistry.getResult(registry, firstMutation, { suspendOnWaiting: true }),
+        AtomRegistry.getResult(registry, secondMutation, { suspendOnWaiting: true })
+      ])
+      yield* Effect.yieldNow
+      assert.strictEqual(Option.getOrThrow(yield* AtomRegistry.getResult(registry, firstEntity)).title, "first")
+      assert.strictEqual(Option.getOrThrow(yield* AtomRegistry.getResult(registry, secondEntity)).title, "second")
+      assert.deepStrictEqual(
+        (yield* AtomRegistry.getResult(registry, firstQuery)).filter((todo) => todo.id === "shared"),
+        [{
+          id: "shared",
+          title: "first"
+        }]
+      )
+      assert.deepStrictEqual(
+        (yield* AtomRegistry.getResult(registry, secondQuery)).filter((todo) => todo.id === "shared"),
+        [{
+          id: "shared",
+          title: "second"
+        }]
+      )
+
+      const awaitReceipt = (address: Identity.SpaceId, mutationId: Identity.MutationId) =>
+        AtomRegistry.toStreamResult(registry, graph.receipt(address, mutationId)).pipe(
+          Stream.filter(Option.isSome),
+          Stream.runHead,
+          Effect.map(Option.getOrThrow),
+          Effect.map(Option.getOrThrow)
+        )
+      const [firstReceipt, secondReceipt] = yield* Effect.all([
+        awaitReceipt(spaceId, firstPending.envelope.mutationId),
+        awaitReceipt(secondSpaceId, secondPending.envelope.mutationId)
+      ], { concurrency: "unbounded" })
+      assert.strictEqual(firstReceipt.spaceId, spaceId)
+      assert.strictEqual(secondReceipt.spaceId, secondSpaceId)
+      assert.strictEqual((yield* AtomRegistry.getResult(registry, graph.status(spaceId))).spaceId, spaceId)
+      assert.deepStrictEqual(
+        (yield* AtomRegistry.getResult(registry, graph.aggregateStatus)).spaces.map((status) => status.spaceId),
+        [spaceId, secondSpaceId]
+      )
+
+      registry.set(graph.join, thirdSpaceId)
+      const joinedSpaces = Option.getOrThrow(
+        yield* AtomRegistry.toStreamResult(registry, graph.spaces).pipe(
+          Stream.filter((spaces) => spaces.some((space) => space.spaceId === thirdSpaceId)),
+          Stream.runHead
+        )
+      )
+      assert.deepStrictEqual(joinedSpaces.map((space) => space.spaceId), [spaceId, secondSpaceId, thirdSpaceId])
+
+      registry.set(graph.leave, secondSpaceId)
+      const remainingSpaces = Option.getOrThrow(
+        yield* AtomRegistry.toStreamResult(registry, graph.spaces).pipe(
+          Stream.filter((spaces) => !spaces.some((space) => space.spaceId === secondSpaceId)),
+          Stream.runHead
+        )
+      )
+      assert.deepStrictEqual(remainingSpaces.map((space) => space.spaceId), [spaceId, thirdSpaceId])
+      const error = yield* AtomRegistry.getResult(registry, secondEntity).pipe(Effect.flip)
+      assert.strictEqual(error._tag, "SpaceNotJoined")
+    }))
 })
