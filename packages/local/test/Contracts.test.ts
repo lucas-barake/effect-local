@@ -20,10 +20,11 @@ const ListTodos = Query.make("ListTodos", { success: Schema.Array(Todo.schema), 
 describe("domain contracts", () => {
   it("uses JSON null as the wire representation for void payloads and results", () => {
     const mutation = Mutation.make("Touch", { version: 1 })
-    const query = Query.make("Count", { dependsOn: [] })
+    const query = Query.make("Count", {})
     assert.strictEqual(Schema.encodeSync(mutation.payloadSchema)(undefined), null)
     assert.strictEqual(Schema.decodeUnknownSync(mutation.successSchema)(null), undefined)
     assert.strictEqual(Schema.encodeSync(query.payloadSchema)(undefined), null)
+    assert.deepStrictEqual(query.dependsOn, [])
   })
 
   it("builds a stable definition hash from Schema contracts", () => {
@@ -31,6 +32,83 @@ describe("domain contracts", () => {
     const second = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo], queries: [ListTodos] })
     assert.strictEqual(first.hash, second.hash)
     assert.strictEqual(first.modelByName.get("Todo"), Todo)
+  })
+
+  it("keeps local secondary index layouts outside wire and domain identity", () => {
+    const IndexedTodo = Model.make("Todo", {
+      version: 1,
+      key: Schema.String,
+      schema: Todo.schema,
+      indexes: {
+        byTitle: {
+          version: 1,
+          partition: [],
+          sort: [{
+            name: "title",
+            affinity: "text",
+            schema: Schema.String,
+            extract: (todo: typeof Todo.schema.Type) => todo.title
+          }]
+        }
+      }
+    })
+    const plain = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo] })
+    const indexed = Definition.make({ version: 1, models: [IndexedTodo], mutations: [PutTodo] })
+    assert.deepStrictEqual(indexed.schemaIdentity, plain.schemaIdentity)
+    assert.strictEqual(indexed.hash, plain.hash)
+    assert.notStrictEqual(indexed.indexLayoutHash, plain.indexLayoutHash)
+    assert.isTrue(Object.isFrozen(IndexedTodo.indexes))
+    assert.isTrue(Object.isFrozen(IndexedTodo.indexes.byTitle.sort))
+  })
+
+  it("validates secondary index and component names", () => {
+    assert.throws(
+      () =>
+        Model.make("Indexed", {
+          version: 1,
+          key: Schema.String,
+          schema: Schema.Struct({ value: Schema.String }),
+          indexes: {
+            $invalid: {
+              version: 1,
+              partition: [],
+              sort: [{
+                name: "value",
+                affinity: "text",
+                schema: Schema.String,
+                extract: (value: { readonly value: string }) => value.value
+              }]
+            }
+          }
+        }),
+      /must not start/
+    )
+    assert.throws(
+      () =>
+        Model.make("Indexed", {
+          version: 1,
+          key: Schema.String,
+          schema: Schema.Struct({ value: Schema.String }),
+          indexes: {
+            duplicate: {
+              version: 1,
+              partition: [{
+                name: "value",
+                affinity: "text",
+                schema: Schema.String,
+                extract: (value: { readonly value: string }) => value.value
+              }],
+              sort: [{
+                name: "value",
+                affinity: "text",
+                schema: Schema.String,
+                extract: (value: { readonly value: string }) => value.value
+              }]
+            }
+          }
+        }),
+      /Duplicate index component/
+    )
   })
 
   it("rejects duplicate names and unregistered query dependencies", () => {

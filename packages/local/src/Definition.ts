@@ -20,6 +20,7 @@ export interface Definition<
   readonly version: Identity.SchemaVersion
   readonly schemaIdentity: Identity.SchemaIdentity
   readonly hash: string
+  readonly indexLayoutHash: string
 }
 
 const indexed = <A extends { readonly name: string },>(kind: string, values: ReadonlyArray<A>) => {
@@ -93,6 +94,32 @@ export function make(options: {
       dependsOn: query.dependsOn.map((model) => model.name).toSorted()
     })).toSorted(byName)
   })
+  const indexLayoutHash = Canonical.hash({
+    format: 1,
+    indexes: options.models.flatMap((model) =>
+      Object.entries(model.indexes).map(([name, index]) => ({
+        model: model.name,
+        name,
+        version: index.version,
+        partition: index.partition.map((component) => ({
+          name: component.name,
+          affinity: component.affinity,
+          schema: SchemaDescriptor.make(component.schema)
+        })),
+        sort: index.sort.map((component) => ({
+          name: component.name,
+          affinity: component.affinity,
+          schema: SchemaDescriptor.make(component.schema)
+        }))
+      }))
+    ).toSorted((left, right) => {
+      const leftName = `${left.model}\u0000${left.name}`
+      const rightName = `${right.model}\u0000${right.name}`
+      if (leftName < rightName) return -1
+      if (leftName > rightName) return 1
+      return 0
+    })
+  })
   return Object.freeze({
     models: Object.freeze([...options.models]),
     mutations: Object.freeze([...options.mutations]),
@@ -102,7 +129,8 @@ export function make(options: {
     queryByName,
     version,
     schemaIdentity,
-    hash
+    hash,
+    indexLayoutHash
   })
 }
 

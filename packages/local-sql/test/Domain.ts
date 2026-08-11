@@ -8,16 +8,30 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
+import * as Stream from "effect/Stream"
 
+const TodoSchema = Schema.Struct({
+  id: Schema.String,
+  title: Schema.String,
+  count: Schema.Number,
+  labels: Schema.Array(Schema.String)
+})
 export const Todo = Model.make("Todo", {
   version: 1,
   key: Schema.String,
-  schema: Schema.Struct({
-    id: Schema.String,
-    title: Schema.String,
-    count: Schema.Number,
-    labels: Schema.Array(Schema.String)
-  })
+  schema: TodoSchema,
+  indexes: {
+    byCount: {
+      version: 1,
+      partition: [],
+      sort: [{
+        name: "count",
+        affinity: "real",
+        schema: Schema.Number,
+        extract: (todo: typeof TodoSchema.Type) => todo.count
+      }]
+    }
+  }
 })
 
 export const PutTodo = Mutation.make("PutTodo", {
@@ -70,11 +84,20 @@ const ListTodos = Query.make("ListTodos", {
   dependsOn: [Todo]
 })
 
+export const ReadCountIndex = Query.make("ReadCountIndex", {
+  payload: { minimum: Schema.Number, direction: Schema.Literals(["asc", "desc"]) },
+  success: Schema.Struct({
+    first: Schema.Array(Schema.String),
+    second: Schema.Array(Schema.String),
+    streamed: Schema.Array(Schema.String)
+  })
+})
+
 export const definition = Definition.make({
   version: 1,
   models: [Todo],
   mutations: [PutTodo, RenameTodo, IncrementTodo, AddLabel, RejectAfterWrite, PutHugeTodo, ReturnHugeResult],
-  queries: [ListTodos]
+  queries: [ListTodos, ReadCountIndex]
 })
 
 const getTodo = (transaction: Parameters<ReturnType<typeof RenameTodo.of>>[0]["transaction"], id: string) =>
@@ -123,7 +146,24 @@ export const handlers = Layer.mergeAll(
     return transaction.set(Todo, payload.id, value).pipe(Effect.as(value))
   }),
   ReturnHugeResult.toLayer(() => Effect.succeed(hugeTitle)),
-  ListTodos.toLayer(({ query }) => query.all(Todo))
+  ListTodos.toLayer(({ query }) => query.all(Todo)),
+  ReadCountIndex.toLayer(({ payload, query }) =>
+    Effect.gen(function*() {
+      const builder = query.from(Todo, "byCount")
+        .where({ count: { gte: payload.minimum } })
+        .order(payload.direction)
+        .limit(2)
+      const first = yield* builder.page()
+      let second: ReadonlyArray<typeof Todo.schema.Type> = []
+      if (first.next !== undefined) second = (yield* builder.after(first.next).page()).items
+      const streamed = yield* builder.stream().pipe(Stream.runCollect)
+      return {
+        first: first.items.map((todo) => todo.id),
+        second: second.map((todo) => todo.id),
+        streamed: Array.from(streamed, (todo) => todo.id)
+      }
+    })
+  )
 )
 
 export const todo = (id: string, title = "first") => ({ id, title, count: 0, labels: [] })

@@ -60,14 +60,14 @@ export function make<
     readonly payload?: SchemaInput.Valid<P>
     readonly success?: A
     readonly error?: E
-    readonly dependsOn: ReadonlyArray<Model.Any>
+    readonly dependsOn?: ReadonlyArray<Model.Any>
   }
 ): Query<Name, SchemaInput.Wire<P>, A, E>
 export function make(name: string, options: {
   readonly payload?: SchemaInput.Input
   readonly success?: SchemaInput.WireSchema
   readonly error?: SchemaInput.WireSchema
-  readonly dependsOn: ReadonlyArray<Model.Any>
+  readonly dependsOn?: ReadonlyArray<Model.Any>
 }): Query<string, SchemaInput.WireSchema, SchemaInput.WireSchema, SchemaInput.WireSchema> {
   if (name.length === 0) return Defect.invalid("Query name must be nonempty")
   if (name.startsWith("$")) return Defect.invalid(`Query name must not start with $: ${name}`)
@@ -118,7 +118,7 @@ export function make(name: string, options: {
     payloadSchema,
     successSchema,
     errorSchema,
-    dependsOn: Object.freeze([...options.dependsOn]),
+    dependsOn: Object.freeze([...(options.dependsOn ?? [])]),
     handler,
     toLayer
   }

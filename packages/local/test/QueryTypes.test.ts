@@ -1,0 +1,76 @@
+import { assert, it } from "@effect/vitest"
+import * as Schema from "effect/Schema"
+import * as Model from "../src/Model.js"
+import type * as SecondaryIndex from "../src/SecondaryIndex.js"
+import type * as Transaction from "../src/Transaction.js"
+
+const TodoSchema = Schema.Struct({
+  id: Schema.String,
+  projectId: Schema.String,
+  createdAt: Schema.Number,
+  priority: Schema.Number
+})
+
+const Todo = Model.make("Todo", {
+  version: 1,
+  key: Schema.String,
+  schema: TodoSchema,
+  indexes: {
+    byProjectCreatedAt: {
+      version: 1,
+      partition: [{
+        name: "projectId",
+        affinity: "text",
+        schema: Schema.String,
+        extract: (todo: typeof TodoSchema.Type) => todo.projectId
+      }],
+      sort: [{
+        name: "createdAt",
+        affinity: "real",
+        schema: Schema.Number,
+        extract: (todo: typeof TodoSchema.Type) => todo.createdAt
+      }]
+    },
+    byPriority: {
+      version: 1,
+      partition: [],
+      sort: [{
+        name: "priority",
+        affinity: "integer",
+        schema: Schema.Int,
+        extract: (todo: typeof TodoSchema.Type) => todo.priority
+      }]
+    }
+  }
+})
+
+const typeContracts = (
+  query: Transaction.Query,
+  createdCursor: SecondaryIndex.Cursor<"Todo", "byProjectCreatedAt">,
+  priorityCursor: SecondaryIndex.Cursor<"Todo", "byPriority">
+) => {
+  const created = query.from(Todo, "byProjectCreatedAt")
+    .where({ projectId: "project-1", createdAt: { gte: 10, lt: 20 } })
+    .order("desc")
+    .limit(25)
+    .after(createdCursor)
+  created.page()
+  created.stream()
+
+  query.from(Todo, "byPriority").where({ priority: { gt: 1 } }).after(priorityCursor)
+
+  // @ts-expect-error undeclared indexes cannot be queried
+  query.from(Todo, "byTitle")
+  // @ts-expect-error where fields must belong to the declared index
+  query.from(Todo, "byProjectCreatedAt").where({ projectId: "project-1", priority: { gt: 1 } })
+  // @ts-expect-error partition values retain their declared Schema type
+  query.from(Todo, "byProjectCreatedAt").where({ projectId: 1 })
+  // @ts-expect-error cursors are scoped to their model and index
+  query.from(Todo, "byProjectCreatedAt").after(priorityCursor)
+}
+
+void typeContracts
+
+it("preserves declared secondary index names at runtime", () => {
+  assert.deepStrictEqual(Object.keys(Todo.indexes), ["byProjectCreatedAt", "byPriority"])
+})

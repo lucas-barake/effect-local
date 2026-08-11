@@ -162,6 +162,32 @@ const clientServices = (id: Identity.ClientId, server: ServerStore.Service) => {
 }
 
 describe("server reconciled mutation log", () => {
+  it.effect("filters, orders, paginates, and streams through a declared secondary index", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sharedDatabase = database()
+      const local = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
+        Layer.provide(runtime)
+      )
+      const queries = QueryExecutor.layer(Domain.definition).pipe(Layer.provide(Domain.handlers))
+      const context = yield* Layer.build(Layer.merge(local, queries).pipe(Layer.provide(sharedDatabase)))
+      const store = Context.get(context, LocalStore.Store)
+      const executor = Context.get(context, QueryExecutor.QueryExecutor)
+      for (const [id, count] of [["low", 1], ["middle", 3], ["high", 5], ["highest", 7]] as const) {
+        yield* store.mutate(Domain.PutTodo, { ...Domain.todo(id), count })
+      }
+
+      assert.deepStrictEqual(yield* executor.execute(Domain.ReadCountIndex, { minimum: 3, direction: "asc" }), {
+        first: ["middle", "high"],
+        second: ["highest"],
+        streamed: ["middle", "high", "highest"]
+      })
+      assert.deepStrictEqual(yield* executor.execute(Domain.ReadCountIndex, { minimum: 3, direction: "desc" }), {
+        first: ["highest", "high"],
+        second: ["middle"],
+        streamed: ["highest", "high", "middle"]
+      })
+    })))
+
   it.effect("falls forward to a covering snapshot when an expired receipt snapshot is retired", () =>
     Effect.scoped(
       Effect.gen(function*() {

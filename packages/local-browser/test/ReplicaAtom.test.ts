@@ -10,6 +10,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Query from "@lucas-barake/effect-local/Query"
+import * as Replica from "@lucas-barake/effect-local/Replica"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -29,13 +30,31 @@ const Todo = Model.make("Todo", {
   schema: Schema.Struct({ id: Schema.String, title: Schema.String })
 })
 const PutTodo = Mutation.make("PutTodo", { version: 1, payload: Todo.schema, success: Todo.schema })
+const Numbered = Model.make("Numbered", {
+  version: 1,
+  key: Schema.NumberFromString,
+  schema: Schema.Struct({ id: Schema.Number, value: Schema.String })
+})
+const PutNumbered = Mutation.make("PutNumbered", {
+  version: 1,
+  payload: Numbered.schema,
+  success: Numbered.schema
+})
 const ListTodos = Query.make("ListTodos", {
   success: Schema.Array(Todo.schema),
   dependsOn: [Todo]
 })
-const definition = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo], queries: [ListTodos] })
-const handlers = Layer.merge(
+const definition = Definition.make({
+  version: 1,
+  models: [Todo, Numbered],
+  mutations: [PutTodo, PutNumbered],
+  queries: [ListTodos]
+})
+const handlers = Layer.mergeAll(
   PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))),
+  PutNumbered.toLayer(({ payload, transaction }) =>
+    transaction.set(Numbered, payload.id, payload).pipe(Effect.as(payload))
+  ),
   ListTodos.toLayer(({ query }) => query.all(Todo))
 )
 const database = Layer.mergeAll(
@@ -101,6 +120,77 @@ const replica = SqlReplica.layer({
 )
 
 describe("Replica Atom graph", () => {
+  it.live("refreshes an entity atom when its key has a different encoded representation", () =>
+    Effect.gen(function*() {
+      const graph = BrowserReplica.make(replica)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const entity = graph.entity(Numbered)(1)
+      const mutation = graph.mutation(PutNumbered)
+      const unmountEntity = registry.mount(entity)
+      const unmountMutation = registry.mount(mutation)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          unmountMutation()
+          unmountEntity()
+        })
+      )
+      assert.isTrue(Option.isNone(yield* AtomRegistry.getResult(registry, entity)))
+      registry.set(mutation, { id: 1, value: "encoded-key" })
+      yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
+      assert.deepStrictEqual(Option.getOrThrow(yield* AtomRegistry.getResult(registry, entity)), {
+        id: 1,
+        value: "encoded-key"
+      })
+    }))
+
+  it.live("does not rerun an unrelated mounted entity atom", () =>
+    Effect.gen(function*() {
+      let unrelatedReads = 0
+      const observed = Layer.effect(
+        Replica.Replica,
+        Replica.Replica.pipe(
+          Effect.map((service) =>
+            Replica.Replica.of({
+              ...service,
+              get: (model, key) => {
+                if (model.name === Todo.name && Object.is(key, "unrelated")) unrelatedReads++
+                return service.get(model, key)
+              }
+            })
+          )
+        )
+      ).pipe(Layer.provide(replica))
+      const graph = BrowserReplica.make(observed)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const changed = graph.entity(Todo)("changed")
+      const unrelated = graph.entity(Todo)("unrelated")
+      const mutation = graph.mutation(PutTodo)
+      const unmountChanged = registry.mount(changed)
+      const unmountUnrelated = registry.mount(unrelated)
+      const unmountMutation = registry.mount(mutation)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          unmountMutation()
+          unmountUnrelated()
+          unmountChanged()
+        })
+      )
+      assert.isTrue(Option.isNone(yield* AtomRegistry.getResult(registry, changed)))
+      assert.isTrue(Option.isNone(yield* AtomRegistry.getResult(registry, unrelated)))
+      assert.strictEqual(unrelatedReads, 1)
+
+      registry.set(mutation, { id: "changed", title: "new" })
+      yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
+      assert.deepStrictEqual(Option.getOrThrow(yield* AtomRegistry.getResult(registry, changed)), {
+        id: "changed",
+        title: "new"
+      })
+      yield* Effect.sleep("20 millis")
+      assert.strictEqual(unrelatedReads, 1)
+    }))
+
   it("uses the shared runtime factory by default and preserves an explicit factory", () => {
     const graph = BrowserReplica.make(replica)
     assert.strictEqual(graph.factory, Atom.runtime)

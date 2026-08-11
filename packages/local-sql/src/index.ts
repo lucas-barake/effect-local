@@ -1,3 +1,4 @@
+export * as IndexStore from "./IndexStore.js"
 export * as LocalStore from "./LocalStore.js"
 export * as Migrations from "./Migrations.js"
 export * as MutationRuntime from "./MutationRuntime.js"

@@ -55,6 +55,11 @@ export const local = (options: {
   readonly schemaGeneration: number
   readonly projectionGeneration: number
   readonly changes?: Array<Protocol.EntityChange>
+  readonly onVisibleChange?: <M extends Model.Any,>(
+    model: M,
+    entityKey: string,
+    value: Model.Value<M> | undefined
+  ) => Effect.Effect<void, ReplicaError.StorageError>
 }): Transaction.Transaction => {
   const find = SqlSchema.findOneOption({
     Request: Schema.Struct({ model: Schema.String, key: Schema.String }),
@@ -102,6 +107,9 @@ export const local = (options: {
           ON CONFLICT (space_id, schema_generation, model, entity_key) DO UPDATE SET
             value_json = excluded.value_json, model_version = excluded.model_version`
         }
+        if (options.table === "visible") {
+          yield* (options.onVisibleChange?.(model, encoded.keyJson, value) ?? Effect.void)
+        }
         options.changes?.push({
           _tag: "Upsert",
           entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey },
@@ -120,6 +128,9 @@ export const local = (options: {
           yield* options.sql`DELETE FROM effect_local_client_canonical_entities_data
           WHERE space_id = ${options.spaceId} AND schema_generation = ${options.schemaGeneration}
             AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
+        }
+        if (options.table === "visible") {
+          yield* (options.onVisibleChange?.(model, encoded.keyJson, undefined) ?? Effect.void)
         }
         options.changes?.push({
           _tag: "Delete",

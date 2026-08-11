@@ -10,6 +10,7 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as IndexStore from "./IndexStore.js"
 import * as Codec from "./internal/codec.js"
 import * as Rows from "./internal/rows.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
@@ -99,7 +100,8 @@ export const layer = <D extends Definition.Any,>(
                 (row) => Codec.parse(row.value_json).pipe(Effect.flatMap((value) => Codec.decode(model.schema, value)))
               )
             )
-          )
+          ),
+        from: (model, index) => IndexStore.query(sql, generation, model, index)
       })
       const execute = <Q extends Query.Any,>(
         query: Q,
