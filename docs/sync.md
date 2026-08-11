@@ -44,8 +44,9 @@ watermark without inventing entity changes.
 A fresh, unknown, or schema-invalidated view cursor receives `BootstrapRequired`. The client stages pages durably and
 atomically installs the verified scoped snapshot. A newer manifest supersedes an older partial stage. The manifest
 binds the client ID, normalized scope digest, scope generation, view cursor, global sequence and terminal fences,
-count, bytes, and rolling digest. Snapshot entries contain only authorized view changes. They never contain mutation
-payloads, private results, or receipt bodies.
+count, bytes, and rolling digest. Snapshot entries contain only current authorized `Upsert` rows. They never contain
+mutation payloads, private results, receipt bodies, retractions, or identifiers from a previous principal. Installation
+derives absence retractions from the client's prior canonical state.
 
 `Delete` means the authoritative entity no longer exists. `Retract` means it exists but is outside the current scope or
 principal visibility. Retractions remove canonical and visible state and persist a generation owned tombstone so

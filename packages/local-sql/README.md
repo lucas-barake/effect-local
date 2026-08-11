@@ -13,18 +13,23 @@ The caller chooses the Workflow engine and runner. A durable single runner compo
 
 ```ts
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Layer from "effect/Layer"
 import * as ClusterWorkflowEngine from "effect/unstable/cluster/ClusterWorkflowEngine"
 import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
+import { definition, Todo } from "./domain.js"
 
 const WorkflowEngineLive = ClusterWorkflowEngine.layer.pipe(
   Layer.provideMerge(SingleRunner.layer({ runnerStorage: "sql" }))
 )
 
+const scope = Protocol.ReplicationScope.make({ models: [Todo.name] })
+
 const ReplicaLive = SqlReplica.layerWorkflow({
   definition,
   spaceId,
   clientId,
+  scope,
   retainedReceipts: 256,
   maximumReceipts: 1_024,
   retainedHistoryEntries: 256,
@@ -66,6 +71,7 @@ import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 
 const StoreLive = ServerStore.layer({
   definition,
+  readAuthorizationRefreshInterval: "30 seconds",
   authorizeAccess,
   authorizeMutation,
   authorizeRead,

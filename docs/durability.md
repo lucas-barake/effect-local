@@ -37,8 +37,11 @@ not an ambiguous mutation. Exact resubmission returns the stored receipt without
 Each scoped client view is also transactional. Acknowledged entities, the view revision, normalized scope, global
 watermark, and one immutable outstanding page are durable SQL state. The server does not recompute an exposed page on
 retry. It first acknowledges the exact target revision, updates materialized membership, and only then creates the
-next page. Per entity authorization and scope are recomputed before a page reaches the wire. Principal changes or a
-now unsafe outstanding page rotate the view and require a new scoped bootstrap.
+next page. The materialized view stores only current authorized `Upsert` rows. Acknowledged `Delete` and `Retract`
+changes remove membership instead of accumulating tombstones. Per entity authorization and scope are recomputed for
+the exact persisted entity value before a page reaches the wire. Principal changes or a now unsafe outstanding page
+rotate the view and require a new scoped bootstrap. Replacement snapshots never carry identifiers from the prior
+principal. The client derives missing canonical identities locally during atomic replacement.
 
 The space row and a trigger maintained shadow row maintain matching retained history and receipt counts. Admission
 cross checks them under the space lock. Entity count and snapshot bytes use the same lock. Hard caps fail before handler execution. State capacity checks run inside the handler
@@ -75,9 +78,10 @@ share one transaction. There is no backward storage migration path before v1.
 Domain schema evolution is forward only and crash resumable. It copies log provenance, entities, receipts, pending
 mutations, and retraction keys into an inactive generation in bounded batches. The client flips generations only after
 all state is ready, clears schema bound view and bootstrap cursors, then cleans the source generation resumably. The
-server invalidates every scoped view, outstanding page, and scoped snapshot in the same transaction that activates the
-new entity generation. A compatible `Evolution` catalog therefore upgrades an existing database. A changed definition
-without a matching evolution path is rejected.
+server activates the new entity generation and logically invalidates every scoped view by schema identity in the same
+constant work transaction. It then deletes old snapshot entries, snapshots, outstanding pages, view members, and views
+child first in bounded resumable phases. A compatible `Evolution` catalog therefore upgrades an existing database. A
+changed definition without a matching evolution path is rejected.
 
 Server migration requires a quiesced writer rollout. The migrated tables reject the legacy insert shape explicitly,
 so an old process cannot continue writing without terminal sequences and retention metadata.

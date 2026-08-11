@@ -135,6 +135,7 @@ import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -142,6 +143,7 @@ import { definition, DomainLive, ListTasks, PutTask, Task } from "./domain.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const scope = Protocol.ReplicationScope.make({ models: [Task.name] })
 
 const DatabaseLive = Layer.mergeAll(
   SqliteClient.layer({ filename: "tasks.sqlite" }),
@@ -158,7 +160,7 @@ const history = {
   migration: { retryDelay: "25 millis", maximumAttempts: 8 }
 } as const
 
-export const ReplicaLive = SqlReplica.layer({ definition, spaceId, clientId, ...history }).pipe(
+export const ReplicaLive = SqlReplica.layer({ definition, spaceId, clientId, scope, ...history }).pipe(
   Layer.provide(DomainLive),
   Layer.provide(DatabaseLive),
   Layer.provide(SyncLive)
