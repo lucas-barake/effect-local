@@ -126,6 +126,25 @@ const deleteEnvelope = (id: string, sequence: number) =>
     return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
   })
 
+const putManyEnvelope = (count: number, sequence: number) =>
+  Effect.gen(function*() {
+    const identity = {
+      spaceId,
+      clientId: writerId,
+      mutationId: Identity.MutationId.make(
+        `mut_00000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`
+      ),
+      localSequence: Identity.LocalSequence.make(sequence),
+      basis: Identity.ServerSequence.make(0),
+      name: Domain.PutManyTodos.name,
+      payload: { count },
+      digestVersion: 2 as const,
+      sourceSchema: Domain.definition.schemaIdentity,
+      mutationVersion: Domain.PutManyTodos.version
+    }
+    return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
+  })
+
 const pullRequest = (
   cursor: Protocol.ReplicationCursor | null = null,
   requestedScope = scope,
@@ -311,6 +330,71 @@ describe("scoped replication", () => {
         assert.strictEqual(wakes.length, 2)
         assert.deepStrictEqual(wakes[0], { spaceId })
         assert.deepStrictEqual(wakes[1], { spaceId })
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("wakes for a maximum-depth bulk mutation", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        const initial = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in initial)) assert.fail("expected scoped bootstrap")
+        yield* server.bootstrapAuthorized(bootstrapRequest(initial.manifest), "reader")
+        const firstWake = yield* Deferred.make<void>()
+        const watcher = yield* server.watchAuthorized(
+          Protocol.WatchRequest.make({
+            spaceId,
+            clientId: readerId,
+            schema: Domain.definition.schemaIdentity,
+            scope,
+            scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
+            cursor: initial.manifest.cursor
+          }),
+          "reader"
+        ).pipe(
+          Effect.map((stream) =>
+            stream.pipe(
+              Stream.tap(() => Deferred.succeed(firstWake, undefined)),
+              Stream.take(2),
+              Stream.runCollect
+            )
+          ),
+          Effect.flatMap(Effect.forkChild({ startImmediately: true }))
+        )
+        yield* Deferred.await(firstWake)
+        yield* server.submit(yield* putManyEnvelope(999, 1))
+        const wakes = yield* Fiber.join(watcher)
+        assert.strictEqual(wakes.length, 2)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("stages a maximum-entry bootstrap page", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        const local = yield* service(
+          LocalStore.Store,
+          LocalStore.layer({
+            ...clientHistory,
+            definition: Domain.definition,
+            spaceId,
+            clientId: readerId,
+            scope
+          }).pipe(Layer.provide(runtime), Layer.provide(database))
+        )
+        yield* server.submit(yield* putManyEnvelope(Protocol.maximumBootstrapEntries, 1))
+        const required = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        const page = yield* server.bootstrapAuthorized(
+          Protocol.BootstrapRequest.make({
+            ...bootstrapRequest(required.manifest),
+            limit: Protocol.maximumBootstrapEntries
+          }),
+          "reader"
+        )
+        assert.strictEqual(page.entries.length, Protocol.maximumBootstrapEntries)
+        yield* local.prepareBootstrap(required.manifest)
+        assert.isTrue(yield* local.stageBootstrapPage(page))
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 

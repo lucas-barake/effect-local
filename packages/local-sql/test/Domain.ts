@@ -37,6 +37,11 @@ export const DeleteTodo = Mutation.make("DeleteTodo", {
   payload: { id: Schema.String }
 })
 
+export const PutManyTodos = Mutation.make("PutManyTodos", {
+  version: 1,
+  payload: { count: Schema.Number }
+})
+
 export const IncrementTodo = Mutation.make("IncrementTodo", {
   version: 1,
   payload: { id: Schema.String, delta: Schema.Number },
@@ -82,6 +87,7 @@ export const definition = Definition.make({
     PutTodo,
     RenameTodo,
     DeleteTodo,
+    PutManyTodos,
     IncrementTodo,
     AddLabel,
     RejectAfterWrite,
@@ -108,6 +114,13 @@ export const handlers = Layer.mergeAll(
     })
   ),
   DeleteTodo.toLayer(({ payload, transaction }) => transaction.delete(Todo, payload.id)),
+  PutManyTodos.toLayer(({ payload, transaction }) =>
+    Effect.forEach(
+      Array.from({ length: payload.count }, (_, index) => todo(`bulk-${index}`)),
+      (value) => transaction.set(Todo, value.id, value),
+      { discard: true }
+    )
+  ),
   IncrementTodo.toLayer(({ payload, transaction }) =>
     Effect.gen(function*() {
       const current = yield* getTodo(transaction, payload.id)

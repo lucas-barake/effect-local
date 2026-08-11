@@ -1377,13 +1377,18 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         Request: Schema.Struct({
           spaceId: Identity.SpaceId,
           clientId: Identity.ClientId,
-          entities: Schema.Array(Schema.Struct({ model: Schema.String, key: Schema.String }))
+          entitiesJson: Schema.String
         }),
         Result: Rows.CountRow,
-        execute: ({ spaceId, clientId, entities }) =>
-          sql`SELECT COUNT(*) AS count FROM effect_local_server_replication_view_entities
-          WHERE space_id = ${spaceId} AND client_id = ${clientId} AND disposition = 'Upsert'
-            AND ${sql.or(entities.map((entity) => sql`(model = ${entity.model} AND entity_key = ${entity.key})`))}`
+        execute: ({ spaceId, clientId, entitiesJson }) =>
+          sql`SELECT EXISTS(
+            SELECT 1 FROM effect_local_server_replication_view_entities AS acknowledged
+            INNER JOIN json_each(${entitiesJson}) AS requested
+              ON acknowledged.model = json_extract(requested.value, '$.model')
+              AND acknowledged.entity_key = json_extract(requested.value, '$.key')
+            WHERE acknowledged.space_id = ${spaceId} AND acknowledged.client_id = ${clientId}
+              AND acknowledged.disposition = 'Upsert'
+          ) AS count`
       })
       const mutationWakeVisible = (
         request: Protocol.WatchRequest,
@@ -1400,7 +1405,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           const acknowledged = yield* countAcknowledgedEntities({
             spaceId: request.spaceId,
             clientId: request.clientId,
-            entities: identities
+            entitiesJson: yield* Codec.stringify(identities)
           }).pipe(Effect.mapError(StorageUnavailable.make))
           if (acknowledged.count > 0) return true
           for (const change of scoped) {

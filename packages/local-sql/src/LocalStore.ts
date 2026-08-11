@@ -323,12 +323,17 @@ export const layer = (
           sql`SELECT ordinal, change_json, entry_bytes
           FROM effect_local_client_scoped_bootstrap_entries ORDER BY ordinal`
       })
-      const countScopedBootstrapIdentity = SqlSchema.findOne({
-        Request: Schema.Struct({ snapshotId: Identity.SnapshotId, model: Schema.String, entityKey: Schema.String }),
+      const countScopedBootstrapIdentities = SqlSchema.findOne({
+        Request: Schema.Struct({ snapshotId: Identity.SnapshotId, identitiesJson: Schema.String }),
         Result: Rows.CountRow,
-        execute: ({ snapshotId, model, entityKey }) =>
-          sql`SELECT COUNT(*) AS count FROM effect_local_client_scoped_bootstrap_entries
-          WHERE snapshot_id = ${snapshotId} AND model = ${model} AND entity_key = ${entityKey}`
+        execute: ({ snapshotId, identitiesJson }) =>
+          sql`SELECT EXISTS(
+            SELECT 1 FROM effect_local_client_scoped_bootstrap_entries AS staged
+            INNER JOIN json_each(${identitiesJson}) AS incoming
+              ON staged.model = json_extract(incoming.value, '$.model')
+              AND staged.entity_key = json_extract(incoming.value, '$.key')
+            WHERE staged.snapshot_id = ${snapshotId}
+          ) AS count`
       })
       const findEntityIdentities = SqlSchema.findAll({
         Request: Schema.Void,
@@ -1021,12 +1026,7 @@ export const layer = (
                 })
               }
               const identity = `${entry.change.entity.model}\\u0000${validated.keyJson}`
-              const staged = yield* countScopedBootstrapIdentity({
-                snapshotId: page.manifest.snapshotId,
-                model: entry.change.entity.model,
-                entityKey: validated.keyJson
-              }).pipe(Effect.mapError(StorageUnavailable.make))
-              if (identities.has(identity) || staged.count > 0) {
+              if (identities.has(identity)) {
                 return yield* new ReplicaError.ProtocolInvalid({
                   message: `Snapshot ${page.manifest.snapshotId} contains a duplicate entity`
                 })
@@ -1050,6 +1050,19 @@ export const layer = (
                 entry_bytes: entry.entryBytes
               })
               nextOrdinal += 1
+            }
+            if (stagedRows.length > 0) {
+              const staged = yield* countScopedBootstrapIdentities({
+                snapshotId: page.manifest.snapshotId,
+                identitiesJson: yield* Codec.stringify(
+                  stagedRows.map((row) => ({ model: row.model, key: row.entity_key }))
+                )
+              }).pipe(Effect.mapError(StorageUnavailable.make))
+              if (staged.count > 0) {
+                return yield* new ReplicaError.ProtocolInvalid({
+                  message: `Snapshot ${page.manifest.snapshotId} contains a duplicate entity`
+                })
+              }
             }
             for (let offset = 0; offset < stagedRows.length; offset += 100) {
               yield* sql`INSERT INTO effect_local_client_scoped_bootstrap_entries
