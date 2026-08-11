@@ -12,6 +12,7 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as ClientLineage from "./internal/clientLineage.js"
 import * as Codec from "./internal/codec.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as SqlTransaction from "./internal/transaction.js"
@@ -209,8 +210,31 @@ const currentOrLegacyEntry = (
   Effect.gen(function*() {
     const parsed = yield* Codec.parse(row.entry_json)
     const current = yield* Codec.decode(Protocol.AcceptedMutation, parsed).pipe(Effect.result)
-    if (Result.isSuccess(current)) return current.success
+    if (Result.isSuccess(current)) {
+      const entry = current.success
+      const incompleteSource = (row.source_schema_version === null) !== (row.source_schema_hash === null)
+      if (
+        entry.sequence !== row.server_sequence || entry.mutationId !== row.mutation_id || incompleteSource ||
+        (row.source_schema_version !== null && row.source_schema_version !== entry.sourceSchema.version) ||
+        (row.source_schema_hash !== null && row.source_schema_hash !== entry.sourceSchema.hash)
+      ) {
+        return yield* new ReplicaError.StorageCorrupt({
+          message: `Accepted entry ${row.server_sequence} conflicts with its durable metadata`
+        })
+      }
+      return entry
+    }
     const legacy = yield* Codec.decode(LegacyAcceptedMutation, parsed)
+    const incompleteSource = (row.source_schema_version === null) !== (row.source_schema_hash === null)
+    if (
+      legacy.sequence !== row.server_sequence || legacy.mutationId !== row.mutation_id || incompleteSource ||
+      (row.source_schema_version !== null && row.source_schema_version !== source.version) ||
+      (row.source_schema_hash !== null && row.source_schema_hash !== source.hash)
+    ) {
+      return yield* new ReplicaError.StorageCorrupt({
+        message: `Legacy accepted entry ${row.server_sequence} conflicts with its durable metadata`
+      })
+    }
     const changes: Array<Protocol.EntityChange> = []
     for (const change of legacy.changes) {
       const model = definition.modelByName.get(change.entity.model)
@@ -244,8 +268,39 @@ const currentOrLegacyReceipt = (
   Effect.gen(function*() {
     const parsed = yield* Codec.parse(row.receipt_json)
     const current = yield* Codec.decode(Protocol.Receipt, parsed).pipe(Effect.result)
-    if (Result.isSuccess(current)) return current.success
+    if (Result.isSuccess(current)) {
+      const receipt = current.success
+      const incompleteSource = (row.source_schema_version === null) !== (row.source_schema_hash === null)
+      const expectedVersion = receipt._tag === "Legacy" ? null : receipt.mutationVersion
+      const expectedName = receipt._tag === "Legacy" ? null : receipt.name
+      const expectedOrigin = receipt._tag === "Rejected" ? receipt.origin : receipt._tag === "Legacy" ? "Legacy" : null
+      if (
+        receipt.mutationId !== row.mutation_id || receipt.localSequence !== row.local_sequence || incompleteSource ||
+        (row.source_schema_version !== null && row.source_schema_version !== receipt.sourceSchema.version) ||
+        (row.source_schema_hash !== null && row.source_schema_hash !== receipt.sourceSchema.hash) ||
+        (row.mutation_version !== null && row.mutation_version !== expectedVersion) ||
+        (row.mutation_name !== null && row.mutation_name !== expectedName) ||
+        (row.rejection_origin !== null && row.rejection_origin !== expectedOrigin)
+      ) {
+        return yield* new ReplicaError.StorageCorrupt({
+          message: `Receipt ${row.mutation_id} conflicts with its durable metadata`
+        })
+      }
+      return receipt
+    }
     const legacy = yield* Codec.decode(LegacyReceipt, parsed)
+    const incompleteSource = (row.source_schema_version === null) !== (row.source_schema_hash === null)
+    if (
+      legacy.mutationId !== row.mutation_id || legacy.localSequence !== row.local_sequence || incompleteSource ||
+      (row.source_schema_version !== null && row.source_schema_version !== source.version) ||
+      (row.source_schema_hash !== null && row.source_schema_hash !== source.hash) ||
+      row.mutation_version !== null || row.mutation_name !== null ||
+      (row.rejection_origin !== null && row.rejection_origin !== "Legacy")
+    ) {
+      return yield* new ReplicaError.StorageCorrupt({
+        message: `Legacy receipt ${row.mutation_id} conflicts with its durable metadata`
+      })
+    }
     return Protocol.LegacyReceipt.make({
       spaceId: legacy.spaceId,
       clientId: legacy.clientId,
@@ -468,99 +523,7 @@ export const client = (options: ClientOptions) =>
         optimistic_result_json, changes_json FROM effect_local_pending
         WHERE local_sequence > ${after} ORDER BY local_sequence LIMIT ${limit}`
     })
-    const readLineageGroup = SqlSchema.findOneOption({
-      Request: Schema.Struct({
-        schemaVersion: Identity.SchemaVersion,
-        schemaHash: Identity.SchemaHash,
-        model: Schema.String,
-        modelVersion: Identity.SchemaVersion,
-        key: Schema.String
-      }),
-      Result: LineageRow,
-      execute: (request) =>
-        sql`SELECT lineage_id FROM effect_local_client_key_lineage_groups
-        WHERE source_schema_version = ${request.schemaVersion} AND source_schema_hash = ${request.schemaHash}
-          AND source_model = ${request.model} AND source_model_version = ${request.modelVersion}
-          AND source_key = ${request.key}`
-    })
-    const readLineageTarget = SqlSchema.findOneOption({
-      Request: Schema.Struct({ model: Schema.String, modelVersion: Identity.SchemaVersion, key: Schema.String }),
-      Result: LineageRow,
-      execute: (request) =>
-        sql`SELECT lineage_id FROM effect_local_client_key_lineage_targets
-        WHERE target_model = ${request.model} AND target_model_version = ${request.modelVersion}
-          AND target_key = ${request.key}`
-    })
-
-    const registerLineage = (
-      model: string,
-      migrated: Evolution.MigratedModel
-    ) =>
-      Effect.gen(function*() {
-        const aliases = yield* Effect.forEach(
-          migrated.aliases,
-          (alias) => Codec.stringify(alias.key).pipe(Effect.map((key) => ({ ...alias, key })))
-        )
-        const groups = new Set<string>()
-        const sourceAliases = aliases.length === 1 ? aliases : aliases.slice(0, -1)
-        for (const alias of sourceAliases) {
-          const found = yield* readLineageGroup({
-            schemaVersion: alias.schemaIdentity.version,
-            schemaHash: alias.schemaIdentity.hash,
-            model,
-            modelVersion: alias.modelVersion,
-            key: alias.key
-          }).pipe(Effect.mapError(StorageUnavailable.make))
-          if (Option.isSome(found)) groups.add(found.value.lineage_id)
-        }
-        if (groups.size > 1) {
-          return yield* new ReplicaError.SchemaKeyCollision({ model, key: yield* Codec.stringify(migrated.key) })
-        }
-        const root = aliases[0]
-        const lineageId = groups.values().next().value ?? Canonical.stringify({
-          schemaIdentity: root.schemaIdentity,
-          model,
-          modelVersion: root.modelVersion,
-          key: root.key
-        })
-        const targetKey = yield* Codec.stringify(migrated.key)
-        const target = yield* readLineageTarget({
-          model,
-          modelVersion: migrated.modelVersion,
-          key: targetKey
-        }).pipe(Effect.mapError(StorageUnavailable.make))
-        if (Option.isSome(target) && target.value.lineage_id !== lineageId) {
-          return yield* new ReplicaError.SchemaKeyCollision({ model, key: targetKey })
-        }
-        for (const alias of aliases) {
-          yield* sql`INSERT INTO effect_local_client_key_lineage_groups
-            (source_schema_version, source_schema_hash, source_model, source_model_version, source_key, lineage_id)
-            VALUES (${alias.schemaIdentity.version}, ${alias.schemaIdentity.hash}, ${model},
-              ${alias.modelVersion}, ${alias.key}, ${lineageId})
-            ON CONFLICT (source_schema_version, source_schema_hash, source_model, source_model_version, source_key)
-            DO NOTHING`
-          yield* sql`INSERT INTO effect_local_client_key_lineage
-            (source_schema_version, source_schema_hash, source_model, source_model_version, source_key,
-              target_model, target_model_version, target_key)
-            VALUES (${alias.schemaIdentity.version}, ${alias.schemaIdentity.hash}, ${model},
-              ${alias.modelVersion}, ${alias.key}, ${model}, ${migrated.modelVersion}, ${targetKey})
-            ON CONFLICT (source_schema_version, source_schema_hash, source_model, source_model_version, source_key)
-            DO UPDATE SET target_model = excluded.target_model,
-              target_model_version = excluded.target_model_version, target_key = excluded.target_key`
-        }
-        yield* sql`INSERT INTO effect_local_client_key_lineage_targets
-          (target_model, target_model_version, target_key, lineage_id)
-          VALUES (${model}, ${migrated.modelVersion}, ${targetKey}, ${lineageId})
-          ON CONFLICT (target_model, target_model_version, target_key) DO NOTHING`
-        const storedTarget = yield* readLineageTarget({
-          model,
-          modelVersion: migrated.modelVersion,
-          key: targetKey
-        }).pipe(Effect.mapError(StorageUnavailable.make))
-        if (Option.isNone(storedTarget) || storedTarget.value.lineage_id !== lineageId) {
-          return yield* new ReplicaError.SchemaKeyCollision({ model, key: targetKey })
-        }
-      })
+    const registerLineage = ClientLineage.make(sql)
 
     const validateBatch = (state: typeof ProgressRow.Type) =>
       Effect.gen(function*() {
@@ -818,7 +781,7 @@ export const client = (options: ClientOptions) =>
             for (const change of historicalChanges) {
               const migrated = yield* Evolution.migrateModel({
                 evolution: options.evolution,
-                source: envelope.sourceSchema,
+                source,
                 model: change.entity.model,
                 modelVersion: change.entity.modelVersion,
                 key: change.entity.key,
@@ -996,6 +959,8 @@ export const server = (options: ServerOptions) =>
       execute: ({ expectedGeneration, generation, sourceVersion, sourceHash }) =>
         sql`UPDATE effect_local_server_spaces SET
           schema_version = ${sourceVersion}, schema_hash = ${sourceHash},
+          legacy_schema_version = COALESCE(legacy_schema_version, ${sourceVersion}),
+          legacy_schema_hash = COALESCE(legacy_schema_hash, ${sourceHash}),
           target_schema_version = ${options.definition.schemaIdentity.version},
           target_schema_hash = ${options.definition.schemaIdentity.hash},
           migration_hash = ${options.evolution.migrationHash}, schema_generation = ${generation}

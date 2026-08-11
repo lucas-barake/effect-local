@@ -154,6 +154,12 @@ const validateOptions = (options: HistoryOptions) =>
     return yield* Effect.void
   })
 
+const LegacySpaceRow = Schema.Struct({
+  definition_hash: Schema.String,
+  legacy_schema_version: Schema.NullOr(Identity.SchemaVersion),
+  legacy_schema_hash: Schema.NullOr(Identity.SchemaHash)
+})
+
 export const layer = <R = never,>(options: Options<R>): Layer.Layer<
   ServerStore,
   ReplicaError.ReplicaError,
@@ -367,6 +373,67 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           WHERE space_id = ${spaceId} AND terminal_sequence <= ${through}
           ORDER BY terminal_sequence LIMIT ${limit}`
       })
+      const findLegacySpace = SqlSchema.findOneOption({
+        Request: Schema.String,
+        Result: LegacySpaceRow,
+        execute: (spaceId) =>
+          sql`SELECT definition_hash, legacy_schema_version, legacy_schema_hash
+          FROM effect_local_server_spaces WHERE space_id = ${spaceId}`
+      })
+      const resolveLegacyEnvelope = (envelope: Protocol.MutationEnvelope) =>
+        Effect.gen(function*() {
+          if (envelope.digestVersion !== 1) return envelope
+          const stored = yield* findLegacySpace(envelope.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
+          let sourceDefinition: Definition.Any | undefined
+          if (Option.isSome(stored)) {
+            const incompleteBaseline = (stored.value.legacy_schema_version === null) !==
+              (stored.value.legacy_schema_hash === null)
+            if (incompleteBaseline) {
+              return yield* new ReplicaError.StorageCorrupt({
+                message: `Space ${envelope.spaceId} has incomplete legacy schema metadata`
+              })
+            }
+            if (stored.value.legacy_schema_version !== null && stored.value.legacy_schema_hash !== null) {
+              sourceDefinition = evolution.definitionByIdentity.get(
+                `${stored.value.legacy_schema_version}:${stored.value.legacy_schema_hash}`
+              )
+              if (sourceDefinition === undefined) {
+                return yield* new ReplicaError.ProtocolInvalid({
+                  message:
+                    `Persisted legacy schema ${stored.value.legacy_schema_version}:${stored.value.legacy_schema_hash} is not configured`
+                })
+              }
+            } else {
+              sourceDefinition = evolution.legacyBaselineByHash.get(stored.value.definition_hash)?.definition
+            }
+          }
+          if (sourceDefinition === undefined) {
+            const identities = new Map<string, Definition.Any>()
+            for (const baseline of evolution.legacyBaselines) {
+              identities.set(
+                `${baseline.definition.schemaIdentity.version}:${baseline.definition.schemaIdentity.hash}`,
+                baseline.definition
+              )
+            }
+            if (identities.size !== 1) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: "Legacy mutation digest has no unambiguous configured schema baseline"
+              })
+            }
+            sourceDefinition = identities.values().next().value
+          }
+          const mutation = sourceDefinition?.mutationByName.get(envelope.name)
+          if (sourceDefinition === undefined || mutation === undefined) {
+            return yield* new ReplicaError.ProtocolInvalid({
+              message: `Legacy mutation ${envelope.name} has no configured schema baseline`
+            })
+          }
+          return Protocol.MutationEnvelope.make({
+            ...envelope,
+            sourceSchema: sourceDefinition.schemaIdentity,
+            mutationVersion: mutation.version
+          })
+        })
 
       const manifestFromRow = (row: typeof Rows.SnapshotManifestRow.Type) =>
         Protocol.SnapshotManifest.make({
@@ -708,11 +775,45 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         })
 
       const admit = (request: Protocol.SubmitRequest, principal: typeof Schema.Json.Type) => {
-        const { envelope } = request
+        const submittedEnvelope = request.envelope
         return Effect.gen(function*() {
-          yield* authorizeAccess(envelope, principal)
+          yield* authorizeAccess(submittedEnvelope, principal)
+          yield* validateCallerSchema(request.schema)
+          const exactReceipt = yield* findReceiptByMutation({
+            spaceId: submittedEnvelope.spaceId,
+            mutationId: submittedEnvelope.mutationId
+          }).pipe(Effect.mapError(StorageUnavailable.make))
+          if (Option.isSome(exactReceipt)) {
+            if (exactReceipt.value.digest !== submittedEnvelope.digest) {
+              return yield* new ReplicaError.MutationIdentityConflict({
+                mutationId: submittedEnvelope.mutationId
+              })
+            }
+            return yield* decodeStoredReceipt(exactReceipt.value, submittedEnvelope).pipe(
+              Effect.flatMap((receipt) => SchemaEvolution.migrateReceipt(receipt, evolution))
+            )
+          }
+          const envelope = yield* resolveLegacyEnvelope(submittedEnvelope)
           yield* prepareSpace(envelope.spaceId, request.schema)
-          if ((yield* Protocol.encodedBytesEffect(envelope)) > Protocol.maximumMutationBytes) {
+          if (envelope.digestVersion === 1) {
+            yield* sql`UPDATE effect_local_server_spaces SET
+              legacy_schema_version = COALESCE(legacy_schema_version, ${envelope.sourceSchema.version}),
+              legacy_schema_hash = COALESCE(legacy_schema_hash, ${envelope.sourceSchema.hash})
+              WHERE space_id = ${envelope.spaceId}`
+          }
+          const sizeInput = envelope.digestVersion === 1
+            ? {
+              spaceId: envelope.spaceId,
+              clientId: envelope.clientId,
+              mutationId: envelope.mutationId,
+              localSequence: envelope.localSequence,
+              basis: envelope.basis,
+              name: envelope.name,
+              payload: envelope.payload,
+              digest: envelope.digest
+            }
+            : envelope
+          if ((yield* Protocol.encodedBytesEffect(sizeInput)) > Protocol.maximumMutationBytes) {
             return yield* new ReplicaError.CapacityExceeded({
               resource: "mutation bytes",
               limit: Protocol.maximumMutationBytes
@@ -996,32 +1097,35 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         }).pipe(
           Effect.catchIf(
             SqlError.isSqlError,
-            (cause) => Effect.fail(new ReplicaError.UnknownCommitOutcome({ mutationId: envelope.mutationId, cause }))
+            (cause) =>
+              Effect.fail(new ReplicaError.UnknownCommitOutcome({ mutationId: submittedEnvelope.mutationId, cause }))
           ),
-          Effect.tap((receipt) => {
-            if (receipt._tag !== "Accepted") return Effect.void
-            return RcMap.has(wakes, envelope.spaceId).pipe(
-              Effect.flatMap((hasWatchers) => {
-                if (!hasWatchers) return Effect.void
-                return Effect.scoped(
-                  RcMap.get(wakes, envelope.spaceId).pipe(
-                    Effect.flatMap((channel) =>
-                      PubSub.publish(channel, {
-                        spaceId: envelope.spaceId,
-                        sequence: receipt.serverSequence
-                      })
+          Effect.tap((receipt) =>
+            receipt._tag === "Accepted"
+              ? RcMap.has(wakes, submittedEnvelope.spaceId).pipe(
+                Effect.flatMap((hasWatchers) =>
+                  hasWatchers
+                    ? Effect.scoped(
+                      RcMap.get(wakes, submittedEnvelope.spaceId).pipe(
+                        Effect.flatMap((channel) =>
+                          PubSub.publish(channel, {
+                            spaceId: submittedEnvelope.spaceId,
+                            sequence: receipt.serverSequence
+                          })
+                        )
+                      )
                     )
-                  )
-                )
-              }),
-              Effect.asVoid
-            )
-          }),
+                    : Effect.void
+                ),
+                Effect.asVoid
+              )
+              : Effect.void
+          ),
           Effect.withSpan("ServerStore.submit", {
             attributes: {
-              "mutation.name": envelope.name,
-              "mutation.id": envelope.mutationId,
-              "space.id": envelope.spaceId
+              "mutation.name": submittedEnvelope.name,
+              "mutation.id": submittedEnvelope.mutationId,
+              "space.id": submittedEnvelope.spaceId
             }
           })
         )

@@ -4,6 +4,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Option from "effect/Option"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
@@ -70,6 +71,11 @@ const MigrationRow = Schema.Struct({
   checksum: Identity.SchemaHash
 })
 const CountRow = Schema.Struct({ count: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) })
+
+const ClientIdentityRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  client_id: Identity.ClientId
+})
 
 const mismatch = (catalog: Catalog, message: string) => new ReplicaError.StorageMigrationMismatch({ catalog, message })
 
@@ -756,7 +762,17 @@ const serverV5 = makeMigration({
 })
 
 export const clientCatalog = Object.freeze([clientV1, clientV2, clientV3, clientV4, clientV5, clientV6])
-export const serverCatalog = Object.freeze([serverV1, serverV2, serverV3, serverV4, serverV5])
+
+const serverV6 = makeMigration({
+  id: 6,
+  name: "legacy-schema-baseline",
+  statements: [
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN legacy_schema_version INTEGER",
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN legacy_schema_hash TEXT"
+  ]
+})
+
+export const serverCatalog = Object.freeze([serverV1, serverV2, serverV3, serverV4, serverV5, serverV6])
 
 export const client = (options: {
   readonly definition: Definition.Any
@@ -767,6 +783,29 @@ export const client = (options: {
   Effect.gen(function*() {
     const sql = yield* SqlClient.SqlClient
     yield* runCatalog("Client", clientCatalog, options.migration)
+    const readIdentity = SqlSchema.findOneOption({
+      Request: Schema.Void,
+      Result: ClientIdentityRow,
+      execute: () => sql`SELECT space_id, client_id FROM effect_local_client_meta WHERE singleton = 1`
+    })
+    const existing = yield* readIdentity(undefined).pipe(
+      Effect.mapError((cause) =>
+        SqlError.isSqlError(cause)
+          ? StorageUnavailable.make(cause)
+          : new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause })
+      )
+    )
+    if (
+      Option.isSome(existing) &&
+      (existing.value.space_id !== options.spaceId || existing.value.client_id !== options.clientId)
+    ) {
+      return yield* new ReplicaError.ReplicaIdentityMismatch({
+        expectedSpaceId: options.spaceId,
+        actualSpaceId: existing.value.space_id,
+        expectedClientId: options.clientId,
+        actualClientId: existing.value.client_id
+      })
+    }
     yield* sql`INSERT INTO effect_local_client_meta
     (singleton, space_id, client_id, definition_hash, next_local_sequence, server_cursor, visible_revision,
       requested_generation, completed_generation)

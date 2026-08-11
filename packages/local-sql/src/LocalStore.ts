@@ -17,6 +17,7 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as ClientLineage from "./internal/clientLineage.js"
 import * as Codec from "./internal/codec.js"
 import * as Rows from "./internal/rows.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
@@ -169,6 +170,7 @@ export const layer = (
           ? {}
           : { batchSize: options.schemaEvolutionBatchSize })
       })
+      const registerLineage = ClientLineage.make(sql)
 
       const migrateEntryChanges = (entry: Protocol.AcceptedMutation) =>
         Effect.forEach(entry.changes, (change) =>
@@ -180,22 +182,23 @@ export const layer = (
             key: change.entity.key,
             ...(change._tag === "Upsert" ? { value: change.value } : {})
           }).pipe(
-            Effect.flatMap((migrated): Effect.Effect<Protocol.EntityChange, ReplicaError.StorageCorrupt> => {
-              const entity = {
-                model: change.entity.model,
-                modelVersion: migrated.modelVersion,
-                key: migrated.key
-              }
-              if (change._tag === "Delete") return Effect.succeed(Protocol.Delete.make({ entity }))
-              if (migrated.value === undefined) {
-                return Effect.fail(
-                  new ReplicaError.StorageCorrupt({
+            Effect.flatMap((migrated) =>
+              Effect.gen(function*() {
+                yield* registerLineage(change.entity.model, migrated)
+                const entity = {
+                  model: change.entity.model,
+                  modelVersion: migrated.modelVersion,
+                  key: migrated.key
+                }
+                if (change._tag === "Delete") return Protocol.Delete.make({ entity })
+                if (migrated.value === undefined) {
+                  return yield* new ReplicaError.StorageCorrupt({
                     message: `Migrated upsert for ${change.entity.model} has no value`
                   })
-                )
-              }
-              return Effect.succeed(Protocol.Upsert.make({ entity, value: migrated.value }))
-            })
+                }
+                return Protocol.Upsert.make({ entity, value: migrated.value })
+              })
+            )
           ))
 
       const findMeta = SqlSchema.findOne({
@@ -451,9 +454,8 @@ export const layer = (
           for (const item of replayPending) {
             const changes: Array<Protocol.EntityChange> = []
             const result = yield* sql.withTransaction(
-              runtime.execute(
-                item.envelope.name,
-                item.envelope.payload,
+              runtime.executeEnvelope(
+                item.envelope,
                 SqlTransaction.local({ sql, definition: options.definition, table: "visible", changes }),
                 changes
               ).pipe(
