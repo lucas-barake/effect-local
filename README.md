@@ -127,8 +127,8 @@ inputs in the mutation payload before committing it.
 
 ## SQLite replica
 
-`SqlReplica.layer` assembles the public `Replica` service from a local store, query executor, and scoped reconciler.
-Supply the domain handlers, a `SqlClient`, `Crypto`, and a `SyncEngine`:
+`SqlReplica.layer` assembles one public `Replica` that owns one SQLite database, one synchronization transport, and
+any number of joined spaces. Supply the domain handlers, a `SqlClient`, `Crypto`, and a `SyncEngine`:
 
 ```ts
 import { NodeCrypto } from "@effect/platform-node"
@@ -158,7 +158,12 @@ const history = {
   migration: { retryDelay: "25 millis", maximumAttempts: 8 }
 } as const
 
-export const ReplicaLive = SqlReplica.layer({ definition, spaceId, clientId, ...history }).pipe(
+export const ReplicaLive = SqlReplica.layer({
+  definition,
+  clientId,
+  initialSpaces: [spaceId],
+  ...history
+}).pipe(
   Layer.provide(DomainLive),
   Layer.provide(DatabaseLive),
   Layer.provide(SyncLive)
@@ -166,22 +171,30 @@ export const ReplicaLive = SqlReplica.layer({ definition, spaceId, clientId, ...
 
 const program = Replica.Replica.use((replica) =>
   Effect.gen(function*() {
-    const pending = yield* replica.mutate(PutTask, {
+    const space = yield* replica.space(spaceId)
+    const pending = yield* space.mutate(PutTask, {
       id: "task-1",
       title: "Ship the mutation log",
       completed: false
     })
-    const task = yield* replica.get(Task, "task-1")
-    const tasks = yield* replica.query(ListTasks, undefined)
+    const task = yield* space.get(Task, "task-1")
+    const tasks = yield* space.query(ListTasks, undefined)
     return { pending, task, tasks }
   })
 ).pipe(Effect.provide(ReplicaLive), Effect.scoped)
 ```
 
+Call `replica.join(spaceId)` to add membership, `replica.leave(spaceId)` to evict that space, and `replica.spaces` to
+list the current handles. Each handle scopes mutation, entity, query, receipt, cursor, and status state to its space.
+Leaving cascades through every client table without changing the durable client identity or any other space. A stale
+handle returns `SpaceUnavailable`, including after the same space is joined again with a fresh membership incarnation.
+
 `SyncLive` can be the RPC client Layer from the next section or any implementation of `SyncEngine`. Local commits do
-not wait for it. The scoped reconciler retries pending mutations with their stable identity and resumes pulls from the
-durable server cursor. The explicit Workflow composition persists only reconciliation execution control. Application
-data stays in the same SQLite tables used by the in memory composition.
+not wait for it. One dispatcher owns keyed watches and reconciliation turns for every joined space. A failed or busy
+space does not block another space, while all requests still share the one `SyncEngine` and its one RPC WebSocket.
+Per space status is available on each handle. `replica.status` returns the sorted aggregate with total pending work.
+The explicit Workflow composition persists only reconciliation execution control. Application data stays in the same
+SQLite tables used by the in memory composition.
 
 Use `SqlReplica.layerWorkflow` when reconciliation must recover through Effect Workflow. Supply
 `ClusterWorkflowEngine.layer` and the official runner Layer separately. For one SQLite owner this is normally
@@ -226,16 +239,21 @@ import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserRepli
 
 export const graph = BrowserReplica.make(ReplicaLive)
 
-export const taskAtom = graph.entity(Task)("task-1")
-export const tasksAtom = graph.query(ListTasks)(undefined)
-export const putTaskAtom = graph.mutation(PutTask)
-export const replicaStatusAtom = graph.status
+export const taskAtom = graph.entity(spaceId, Task)("task-1")
+export const tasksAtom = graph.query(spaceId, ListTasks)(undefined)
+export const putTaskAtom = graph.mutation(spaceId, PutTask)
+export const spaceStatusAtom = graph.status(spaceId)
+export const replicaStatusAtom = graph.aggregateStatus
+export const spacesAtom = graph.spaces
+export const joinAtom = graph.join
+export const leaveAtom = graph.leave
 ```
 
 The graph defaults to Effect's shared `Atom.runtime`, so every graph participates in one application memo map. Entity
-and query atoms register deduplicated Effect `Reactivity` keys and refresh after local commits and reconciliation
-transactions. Mutation atoms are concurrent and preserve their typed result. Pass an application factory with
-`options.factory` when the application already owns a deliberate custom runtime.
+and query atoms register space addressed Effect `Reactivity` keys and refresh after local commits and reconciliation
+transactions. Mutation, receipt, and status atoms also require a space address. The membership and aggregate atoms
+share the same runtime. Mutation atoms are concurrent and preserve their typed result. Pass an application factory
+with `options.factory` when the application already owns a deliberate custom runtime.
 
 ## Selective field semantics
 

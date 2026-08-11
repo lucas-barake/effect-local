@@ -19,8 +19,9 @@ durable stage. Canonical state is unchanged while the stage is incomplete. Final
 classifies pending work against the accepted and terminal snapshot fences, replaces canonical state, advances the
 cursor, rebuilds optimistic visible state, and clears staging in one transaction. Restart resumes the next ordinal.
 
-On restart, visible entities and pending envelopes are already durable. Reconciliation resumes from the stored cursor
-and resubmits the same pending identities.
+On restart, joined spaces, visible entities, and pending envelopes are already durable. One replica restores every
+membership and reconciliation resumes each stored cursor independently. Leaving closes that space's runtime and
+cascades its rows through the membership owner. The singleton client identity and other spaces remain intact.
 
 ## Server transactions
 
@@ -55,9 +56,10 @@ retries its stable identity. A later exact receipt resolves whether the original
 ## Validation
 
 Every durable JSON column is parsed and Schema decoded before use. The definition hash prevents a database from being
-opened with a different domain. The local database also validates its space and client identity. Envelopes have a
-canonical SHA 256 digest. Unknown mutation names, malformed payloads, cursor gaps, identity conflicts, and capacity
-violations are typed failures.
+opened with a different domain. The local database validates its singleton client identity while membership rows
+define the joined spaces. Envelopes have a canonical SHA 256 digest. Version 3 binds the membership incarnation into
+that digest. Unknown mutation names, malformed payloads, cursor gaps, identity conflicts, and capacity violations are
+typed failures.
 
 Client and server schemas advance through a package owned ordered migration catalog. Each stored descriptor includes
 its id, name, and checksum. Migration acquires a database writer mutex before catalog reads, validates the complete
