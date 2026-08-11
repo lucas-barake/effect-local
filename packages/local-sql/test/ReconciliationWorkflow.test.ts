@@ -1,12 +1,14 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Ref from "effect/Ref"
@@ -35,6 +37,13 @@ const database = () =>
   )
 
 const runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.handlers))
+
+const definitionV2 = Definition.make({
+  version: 2,
+  models: Domain.definition.models,
+  mutations: Domain.definition.mutations,
+  queries: Domain.definition.queries
+})
 
 const serverLayer = ServerStore.layerTrusted({ definition: Domain.definition }).pipe(
   Layer.provide(runtime),
@@ -127,6 +136,7 @@ describe("reconciliation workflow", () => {
         generation: 1
       })
       const error = yield* ReconciliationWorkflow.make({
+        schemaIdentity: payload.schemaIdentity,
         spaceId,
         clientId
       }).execute(payload).pipe(Effect.flip, Effect.provide(context))
@@ -171,6 +181,107 @@ describe("reconciliation workflow", () => {
 
       assert.strictEqual(yield* local.pendingCount, 0)
       assert.strictEqual(Option.getOrThrow(yield* local.receipt(mutation.envelope.mutationId))._tag, "Accepted")
+    }))
+
+  it.effect("uses the current handler after registering a new schema on one Cluster Workflow engine", () =>
+    Effect.gen(function*() {
+      const replicaDatabase = database()
+      const runner = SingleRunner.layer({ runnerStorage: "sql" }).pipe(Layer.provide(replicaDatabase))
+      const engineContext = yield* Layer.build(
+        ClusterWorkflowEngine.layer.pipe(Layer.provideMerge(runner))
+      )
+      const engine = Context.get(engineContext, WorkflowEngine.WorkflowEngine)
+
+      const register = (
+        definition: Definition.Any,
+        registrationEngine: WorkflowEngine.WorkflowEngine["Service"] = engine
+      ) =>
+        Effect.gen(function*() {
+          const localContext = yield* Layer.build(
+            LocalStore.layer({ definition, spaceId, clientId }).pipe(
+              Layer.provide(MutationRuntime.layer(definition).pipe(Layer.provide(Domain.handlers))),
+              Layer.provide(database())
+            )
+          )
+          const local = Context.get(localContext, LocalStore.Store)
+          const remote = SyncEngine.SyncEngine.of({
+            submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+            pull: () => Effect.succeed({ entries: [], hasMore: false }),
+            watch: () => Stream.never
+          })
+          const reconciliationContext = yield* Layer.build(
+            Reconciler.layerOnePass({ definition, spaceId }).pipe(
+              Layer.provide(Layer.succeed(LocalStore.Store, local)),
+              Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote))
+            )
+          )
+          const reconciliation = Context.get(reconciliationContext, Reconciler.Reconciliation)
+          yield* Layer.build(
+            ReconciliationWorkflow.layerRegistration({ definition, spaceId, clientId }).pipe(
+              Layer.provide(Layer.succeed(LocalStore.Store, local)),
+              Layer.provide(Layer.succeed(Reconciler.Reconciliation, reconciliation)),
+              Layer.provide(Layer.succeed(WorkflowEngine.WorkflowEngine, registrationEngine))
+            )
+          )
+          return local
+        })
+
+      const legacy = yield* register(Domain.definition)
+      const registrationEntered = yield* Deferred.make<void>()
+      const interruptedEngine = new Proxy(engine, {
+        get: (target, property, receiver) =>
+          property === "register"
+            ? () => Deferred.succeed(registrationEntered, undefined).pipe(Effect.andThen(Effect.never))
+            : Reflect.get(target, property, receiver)
+      })
+      const interruptedRegistration = yield* Effect.forkChild(register(definitionV2, interruptedEngine))
+      yield* Deferred.await(registrationEntered)
+      yield* Fiber.interrupt(interruptedRegistration)
+
+      const retainedGeneration = yield* legacy.requestReconciliation
+      const retainedPayload = ReconciliationWorkflow.Payload.make({
+        schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
+        spaceId,
+        clientId,
+        generation: retainedGeneration
+      })
+      yield* ReconciliationWorkflow.make(retainedPayload).execute(retainedPayload).pipe(
+        Effect.provideService(WorkflowEngine.WorkflowEngine, engine)
+      )
+      assert.deepStrictEqual(yield* legacy.reconciliationGenerations, {
+        requested: retainedGeneration,
+        completed: retainedGeneration
+      })
+
+      const current = yield* register(definitionV2)
+      const generation = yield* current.requestReconciliation
+      const payload = ReconciliationWorkflow.Payload.make({
+        schemaIdentity: `${definitionV2.schemaIdentity.version}:${definitionV2.schemaIdentity.hash}`,
+        spaceId,
+        clientId,
+        generation
+      })
+
+      yield* ReconciliationWorkflow.make(payload).execute(payload).pipe(
+        Effect.provideService(WorkflowEngine.WorkflowEngine, engine)
+      )
+      assert.deepStrictEqual(yield* current.reconciliationGenerations, {
+        requested: generation,
+        completed: generation
+      })
+
+      const legacyGeneration = yield* legacy.requestReconciliation
+      const legacyPayload = ReconciliationWorkflow.Payload.make({
+        schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
+        spaceId,
+        clientId,
+        generation: legacyGeneration
+      })
+      const error = yield* ReconciliationWorkflow.make(legacyPayload).execute(legacyPayload).pipe(
+        Effect.flip,
+        Effect.provideService(WorkflowEngine.WorkflowEngine, engine)
+      )
+      assert.strictEqual(error._tag, "StaleSchema")
     }))
 
   it.effect("keeps registrations for distinct replicas isolated in one workflow engine", () =>

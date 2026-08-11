@@ -18,7 +18,11 @@ export type Result = Result_.Result<{
 }, typeof Schema.Json.Type>
 
 export interface CurrentMutationView {
-  readonly envelope: Protocol.MutationEnvelope
+  readonly spaceId: Identity.SpaceId
+  readonly clientId: Identity.ClientId
+  readonly mutationId: Identity.MutationId
+  readonly localSequence: Identity.LocalSequence
+  readonly basis: Identity.ServerSequence
   readonly name: string
   readonly payload: typeof Schema.Json.Type
   readonly mutationVersion: Identity.SchemaVersion
@@ -103,7 +107,11 @@ export const layer = <D extends Definition.Any,>(
           value: envelope.payload
         }).pipe(
           Effect.map((migrated) => ({
-            envelope,
+            spaceId: envelope.spaceId,
+            clientId: envelope.clientId,
+            mutationId: envelope.mutationId,
+            localSequence: envelope.localSequence,
+            basis: envelope.basis,
             name: envelope.name,
             payload: migrated.value,
             mutationVersion: migrated.mutationVersion

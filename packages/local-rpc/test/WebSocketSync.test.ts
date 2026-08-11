@@ -5,14 +5,17 @@ import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
 import * as Definition from "@lucas-barake/effect-local/Definition"
+import * as Evolution from "@lucas-barake/effect-local/Evolution"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as MutableRef from "effect/MutableRef"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
@@ -41,12 +44,47 @@ const Todo = Model.make("Todo", {
 })
 const PutTodo = Mutation.make("PutTodo", { version: 1, payload: Todo.schema, success: Todo.schema })
 const ReturnHugeResult = Mutation.make("ReturnHugeResult", { version: 1, success: Schema.String })
-const definition = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo, ReturnHugeResult] })
-const handlers = Layer.merge(
+const AssignRoleV1 = Mutation.make("AssignRole", {
+  version: 1,
+  payload: Schema.Struct({ account: Schema.String }),
+  success: Schema.String
+})
+const AssignRoleV2 = Mutation.make("AssignRole", {
+  version: 2,
+  payload: Schema.Struct({ account: Schema.String, role: Schema.Literals(["member", "admin"]) }),
+  success: Schema.String
+})
+const definitionV1 = Definition.make({
+  version: 1,
+  models: [Todo],
+  mutations: [PutTodo, ReturnHugeResult, AssignRoleV1]
+})
+const definition = Definition.make({
+  version: 2,
+  models: [Todo],
+  mutations: [PutTodo, ReturnHugeResult, AssignRoleV2]
+})
+const evolution = Evolution.make({
+  current: definition,
+  steps: [Evolution.step({
+    id: "definition/1-to-2",
+    from: definitionV1,
+    to: definition,
+    mutations: [Evolution.mutation({
+      id: "assign-role/1-to-2",
+      from: AssignRoleV1,
+      to: AssignRoleV2,
+      payload: (payload) => ({ ...payload, role: "admin" }) satisfies typeof AssignRoleV2.payloadSchema.Type
+    })]
+  })]
+})
+const handlers = Layer.mergeAll(
   PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))),
-  ReturnHugeResult.toLayer(() => Effect.succeed("x".repeat(SyncRpc.maximumFrameBytes)))
+  ReturnHugeResult.toLayer(() => Effect.succeed("x".repeat(SyncRpc.maximumFrameBytes))),
+  AssignRoleV2.toLayer(({ payload }) => Effect.succeed(payload.role))
 )
-const runtime = MutationRuntime.layer(definition).pipe(Layer.provide(handlers))
+const runtime = MutationRuntime.layer(definition, evolution).pipe(Layer.provide(handlers))
+const readAuthorized = MutableRef.make(true)
 const database = Layer.mergeAll(
   SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
   NodeCrypto.layer,
@@ -55,14 +93,24 @@ const database = Layer.mergeAll(
 
 const store = ServerStore.layer({
   definition,
+  evolution,
   authorizeAccess: ({ principal, spaceId: requestedSpaceId }) =>
     principal !== null && typeof principal === "object" && !Array.isArray(principal) &&
       "subject" in principal && principal.subject === "test" && requestedSpaceId === spaceId
       ? Effect.void
       : Effect.fail({ reason: "forbidden" }),
-  authorizeMutation: () => Effect.void,
+  authorizeMutation: (input) => {
+    const SourceAuthorizationInput = Schema.Struct({ envelope: Protocol.MutationEnvelope })
+    const payload = Schema.is(SourceAuthorizationInput)(input)
+      ? input.envelope.payload
+      : input.mutation.payload
+    return Schema.is(AssignRoleV2.payloadSchema)(payload) && payload.role === "admin"
+      ? Effect.fail({ reason: "admin role requires elevated access" })
+      : Effect.void
+  },
   authorizeRead: ({ principal, spaceId: requestedSpaceId }) =>
-    principal !== null && typeof principal === "object" && !Array.isArray(principal) &&
+    MutableRef.get(readAuthorized) && principal !== null && typeof principal === "object" &&
+      !Array.isArray(principal) &&
       "subject" in principal && principal.subject === "test" && requestedSpaceId === spaceId
       ? Effect.void
       : Effect.fail({ reason: "forbidden" })
@@ -186,6 +234,78 @@ describe("WebSocket synchronization", () => {
       assert.strictEqual(forbidden._tag, "AuthorizationDenied")
     }).pipe(
       Effect.provide(Layer.merge(live, database)),
+      Effect.provide(NodeCrypto.layer)
+    ))
+
+  it.effect("reauthorizes an established watch before emitting a later wake", () =>
+    Effect.gen(function*() {
+      MutableRef.set(readAuthorized, true)
+      const remote = yield* SyncEngine.SyncEngine
+      const initialWake = yield* Deferred.make<void>()
+      const watching = yield* remote.watch({ spaceId, schema: definition.schemaIdentity }).pipe(
+        Stream.tap((wake) => wake.sequence === 0 ? Deferred.succeed(initialWake, undefined) : Effect.void),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Deferred.await(initialWake)
+      MutableRef.set(readAuthorized, false)
+
+      const identity = {
+        spaceId,
+        clientId,
+        mutationId,
+        localSequence: Identity.LocalSequence.make(1),
+        basis: Identity.ServerSequence.make(0),
+        name: PutTodo.name,
+        payload: { id: "1", title: "socket" },
+        digestVersion: 2 as const,
+        sourceSchema: definition.schemaIdentity,
+        mutationVersion: PutTodo.version
+      }
+      const envelope: Protocol.MutationEnvelope = {
+        ...identity,
+        digest: yield* Protocol.mutationDigest(identity)
+      }
+      const receipt = yield* remote.submit({ envelope, schema: definition.schemaIdentity })
+      assert.strictEqual(receipt._tag, "Accepted")
+
+      const denied = yield* Fiber.join(watching).pipe(Effect.flip)
+      assert.strictEqual(denied._tag, "AuthorizationDenied")
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => MutableRef.set(readAuthorized, true))),
+      Effect.provide(live),
+      Effect.provide(NodeCrypto.layer)
+    ))
+
+  it.effect("authorizes only the migrated mutation payload", () =>
+    Effect.gen(function*() {
+      const remote = yield* SyncEngine.SyncEngine
+      const identity = {
+        spaceId,
+        clientId,
+        mutationId,
+        localSequence: Identity.LocalSequence.make(1),
+        basis: Identity.ServerSequence.make(0),
+        name: AssignRoleV1.name,
+        payload: { account: "victim" },
+        digestVersion: 2 as const,
+        sourceSchema: definitionV1.schemaIdentity,
+        mutationVersion: AssignRoleV1.version
+      }
+      const envelope: Protocol.MutationEnvelope = {
+        ...identity,
+        digest: yield* Protocol.mutationDigest(identity)
+      }
+      const receipt = yield* remote.submit({ envelope, schema: definition.schemaIdentity })
+
+      assert.strictEqual(receipt._tag, "Rejected")
+      if (receipt._tag === "Rejected") {
+        assert.strictEqual(receipt.origin, "Authorization")
+        assert.deepStrictEqual(receipt.rejection, { reason: "admin role requires elevated access" })
+      }
+    }).pipe(
+      Effect.provide(live),
       Effect.provide(NodeCrypto.layer)
     ))
 

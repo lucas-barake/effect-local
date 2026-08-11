@@ -79,7 +79,7 @@ const localLayer = (id = clientId) =>
 
 const serverLayer = (
   authorizeMutation?: (input: {
-    readonly envelope: Protocol.MutationEnvelope
+    readonly mutation: MutationRuntime.CurrentMutationView
     readonly principal: Schema.Json
   }) => Effect.Effect<void, Schema.Json>
 ) =>
@@ -698,8 +698,8 @@ describe("server reconciled mutation log", () => {
     Effect.scoped(Effect.gen(function*() {
       const server = yield* service(
         ServerStore.ServerStore,
-        serverLayer(({ envelope }) =>
-          envelope.name === Domain.RenameTodo.name ? Effect.fail({ reason: "denied" }) : Effect.void
+        serverLayer(({ mutation }) =>
+          mutation.name === Domain.RenameTodo.name ? Effect.fail({ reason: "denied" }) : Effect.void
         )
       )
       const services = yield* Layer.build(clientServices(clientId, server))

@@ -35,18 +35,48 @@ const PayloadFields = {
 export const Payload = Schema.Struct(PayloadFields)
 export type Payload = typeof Payload.Type
 
-const schemaIdentity = (definition: Definition.Any): string =>
+const schemaIdentityKey = (definition: Definition.Any): string =>
   `${definition.schemaIdentity.version}:${definition.schemaIdentity.hash}`
 
-type ReplicaIdentity = Pick<Payload, "spaceId" | "clientId">
+type ReplicaIdentity = Pick<Payload, "schemaIdentity" | "spaceId" | "clientId">
 
-export const make = ({ clientId, spaceId }: ReplicaIdentity) =>
-  Workflow.make(`effect-local/ReconcileReplica/v2/${JSON.stringify([spaceId, clientId])}`, {
+interface RegisteredSchema {
+  readonly version: number
+  readonly hash: string
+}
+
+interface WorkflowRegistrationState {
+  readonly schemas: Map<string, RegisteredSchema>
+}
+
+const workflowRegistrationStateSymbol = Symbol.for(
+  "@lucas-barake/effect-local-sql/ReconciliationWorkflow/WorkflowRegistrationState"
+)
+
+type EngineWithRegistrationState = WorkflowEngine.WorkflowEngine["Service"] & {
+  [workflowRegistrationStateSymbol]?: WorkflowRegistrationState
+}
+
+const replicaIdentityKey = (options: Pick<Options, "spaceId" | "clientId">) =>
+  JSON.stringify([options.spaceId, options.clientId])
+
+const workflowRegistrationState = (
+  engine: WorkflowEngine.WorkflowEngine["Service"]
+): WorkflowRegistrationState => {
+  const owned: EngineWithRegistrationState = engine
+  if (owned[workflowRegistrationStateSymbol] !== undefined) return owned[workflowRegistrationStateSymbol]
+  const state: WorkflowRegistrationState = { schemas: new Map() }
+  Object.defineProperty(owned, workflowRegistrationStateSymbol, { value: state })
+  return state
+}
+
+export const make = ({ clientId, schemaIdentity: workflowSchemaIdentity, spaceId }: ReplicaIdentity) =>
+  Workflow.make(`effect-local/ReconcileReplica/v2/${JSON.stringify([workflowSchemaIdentity, spaceId, clientId])}`, {
     payload: PayloadFields,
     success: Schema.Void,
     error: ReplicaError.ReplicaError,
-    idempotencyKey: ({ clientId, generation, schemaIdentity, spaceId }) =>
-      JSON.stringify([schemaIdentity, spaceId, clientId, generation])
+    idempotencyKey: (payload) =>
+      JSON.stringify([payload.schemaIdentity, payload.spaceId, payload.clientId, payload.generation])
   })
 
 export const Execution = Schema.Struct({
@@ -150,15 +180,33 @@ const retryMillis = (configuration: RetryConfigurationService, attempt: number) 
     configuration.retryDelayMillis * 2 ** Math.min(attempt - 1, 52)
   )
 
-const handler = (options: Options, configuration: RetryConfigurationService) => (payload: Payload) =>
+const handler = (
+  options: Options,
+  configuration: RetryConfigurationService,
+  registrationState: WorkflowRegistrationState
+) =>
+(payload: Payload) =>
   Effect.gen(function*() {
     if (
-      payload.schemaIdentity !== schemaIdentity(options.definition) ||
+      payload.schemaIdentity !== schemaIdentityKey(options.definition) ||
       payload.spaceId !== options.spaceId ||
       payload.clientId !== options.clientId
     ) {
       return yield* new ReplicaError.ProtocolInvalid({
         message: "Reconciliation workflow payload does not match this replica"
+      })
+    }
+    const registered = registrationState.schemas.get(replicaIdentityKey(options))
+    if (
+      registered !== undefined &&
+      (registered.version !== options.definition.schemaIdentity.version ||
+        registered.hash !== options.definition.schemaIdentity.hash)
+    ) {
+      return yield* new ReplicaError.StaleSchema({
+        expectedVersion: registered.version,
+        expectedHash: registered.hash,
+        actualVersion: options.definition.schemaIdentity.version,
+        actualHash: options.definition.schemaIdentity.hash
       })
     }
     const local = yield* LocalStore.Store
@@ -193,7 +241,7 @@ const layerRegistrationWithConfiguration = (
   options: Options
 ): Layer.Layer<
   Registration,
-  never,
+  ReplicaError.InvalidConfiguration,
   LocalStore.Store | Reconciler.Reconciliation | RetryConfiguration | WorkflowEngine.WorkflowEngine
 > =>
   Layer.unwrap(
@@ -201,13 +249,58 @@ const layerRegistrationWithConfiguration = (
       const configuration = yield* RetryConfiguration
       const engine = yield* WorkflowEngine.WorkflowEngine
       const evolution = options.evolution ?? Evolution.make({ current: options.definition })
+      const registrationState = workflowRegistrationState(engine)
+      const replicaKey = replicaIdentityKey(options)
       yield* engine.register(
         make({
+          schemaIdentity: schemaIdentityKey(options.definition),
           spaceId: options.spaceId,
           clientId: options.clientId
         }),
-        handler(options, configuration)
+        handler(options, configuration, registrationState)
       )
+      const registered = registrationState.schemas.get(replicaKey)
+      if (
+        registered !== undefined &&
+        registered.version === options.definition.schemaIdentity.version &&
+        registered.hash !== options.definition.schemaIdentity.hash
+      ) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "definition",
+          message:
+            `Reconciliation workflow schema version ${registered.version} is already registered with another hash`
+        })
+      }
+      if (registered === undefined || registered.version < options.definition.schemaIdentity.version) {
+        registrationState.schemas.set(replicaKey, options.definition.schemaIdentity)
+      }
+      const legacySchemas = new Map<string, Definition.Any>()
+      for (const step of evolution.steps) {
+        legacySchemas.set(schemaIdentityKey(step.from), step.from)
+      }
+      for (const baseline of evolution.legacyBaselines) {
+        legacySchemas.set(schemaIdentityKey(baseline.definition), baseline.definition)
+      }
+      legacySchemas.delete(schemaIdentityKey(options.definition))
+      for (const [identity, definition] of legacySchemas) {
+        yield* engine.register(
+          make({
+            schemaIdentity: identity,
+            spaceId: options.spaceId,
+            clientId: options.clientId
+          }),
+          () =>
+            Effect.gen(function*() {
+              const current = registrationState.schemas.get(replicaKey) ?? options.definition.schemaIdentity
+              return yield* new ReplicaError.StaleSchema({
+                expectedVersion: current.version,
+                expectedHash: current.hash,
+                actualVersion: definition.schemaIdentity.version,
+                actualHash: definition.schemaIdentity.hash
+              })
+            })
+        )
+      }
       const legacyDefinitions = new Map<string, Definition.Any>()
       for (const step of evolution.steps) legacyDefinitions.set(step.from.hash, step.from)
       for (const baseline of evolution.legacyBaselines) {
@@ -230,14 +323,15 @@ const layerRegistrationWithConfiguration = (
           }
         )
         yield* engine.register(legacy, () =>
-          Effect.fail(
-            new ReplicaError.StaleSchema({
-              expectedVersion: options.definition.schemaIdentity.version,
-              expectedHash: options.definition.schemaIdentity.hash,
+          Effect.gen(function*() {
+            const current = registrationState.schemas.get(replicaKey) ?? options.definition.schemaIdentity
+            return yield* new ReplicaError.StaleSchema({
+              expectedVersion: current.version,
+              expectedHash: current.hash,
               actualVersion: definition.schemaIdentity.version,
               actualHash: definition.schemaIdentity.hash
             })
-          ))
+          }))
       }
       return Layer.succeed(Registration, Registration.of({ registered: true }))
     })
@@ -278,7 +372,7 @@ const layerSchedulerWithConfiguration = (
                 const generations = yield* local.reconciliationGenerations
                 if (generations.completed >= generations.requested) return
                 const payload = Payload.make({
-                  schemaIdentity: schemaIdentity(options.definition),
+                  schemaIdentity: schemaIdentityKey(options.definition),
                   spaceId: options.spaceId,
                   clientId: options.clientId,
                   generation: generations.requested

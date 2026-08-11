@@ -63,7 +63,6 @@ export interface Options<R = never,> {
     readonly principal: typeof Schema.Json.Type
   }) => Effect.Effect<void, typeof Schema.Json.Type, R>
   readonly authorizeMutation: (input: {
-    readonly envelope: Protocol.MutationEnvelope
     readonly mutation: MutationRuntime.CurrentMutationView
     readonly principal: typeof Schema.Json.Type
   }) => Effect.Effect<void, typeof Schema.Json.Type, R>
@@ -412,7 +411,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               return yield* new ReplicaError.OutOfOrderMutation({ expected, actual: envelope.localSequence })
             }
 
-            const authorization = yield* options.authorizeMutation({ envelope, mutation, principal }).pipe(
+            const authorization = yield* options.authorizeMutation({ mutation, principal }).pipe(
               Effect.provide(context),
               Effect.result
             )
@@ -643,7 +642,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             }
           })
         )
-      const watch = (request: Protocol.WatchRequest) =>
+      const watch = (request: Protocol.WatchRequest, principal: typeof Schema.Json.Type) =>
         Stream.unwrap(
           RcMap.get(wakes, request.spaceId).pipe(
             Effect.flatMap((channel) => PubSub.subscribe(channel)),
@@ -659,14 +658,21 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                     return Stream.succeed({ spaceId: request.spaceId, sequence } satisfies Protocol.Wake).pipe(
                       Stream.concat(Stream.fromSubscription(subscription)),
                       Stream.mapEffect((wake) =>
-                        sql.withTransaction(Effect.gen(function*() {
-                          const current = yield* lockSpace(request.spaceId).pipe(
-                            Effect.mapError(StorageUnavailable.make)
+                        authorizeRead(request.spaceId, principal).pipe(
+                          Effect.andThen(
+                            sql.withTransaction(Effect.gen(function*() {
+                              const current = yield* lockSpace(request.spaceId).pipe(
+                                Effect.mapError(StorageUnavailable.make)
+                              )
+                              yield* validateStoredSpace(current)
+                              return wake
+                            })).pipe(
+                              Effect.catchIf(
+                                SqlError.isSqlError,
+                                (cause) => Effect.fail(StorageUnavailable.make(cause))
+                              )
+                            )
                           )
-                          yield* validateStoredSpace(current)
-                          return wake
-                        })).pipe(
-                          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
                         )
                       )
                     )
@@ -716,14 +722,14 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           return Stream.unwrap(
             authorizeRead(request.spaceId, null).pipe(
               Effect.andThen(prepareSpace(request.spaceId, request.schema)),
-              Effect.as(watch(request))
+              Effect.as(watch(request, null))
             )
           )
         },
         watchAuthorized: (request, principal) =>
           authorizeRead(request.spaceId, principal).pipe(
             Effect.andThen(prepareSpace(request.spaceId, request.schema)),
-            Effect.as(watch(request))
+            Effect.as(watch(request, principal))
           )
       })
     })
