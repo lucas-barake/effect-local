@@ -591,19 +591,20 @@ export const layer = (
                 limit: options.maximumReceipts
               })
             }
-            const receiptSchema = receipt._tag === "Expired"
-              ? pendingMutation.envelope.sourceSchema
-              : receipt.sourceSchema
-            const receiptMutationVersion = receipt._tag === "Accepted" || receipt._tag === "Rejected"
-              ? receipt.mutationVersion
-              : receipt._tag === "Expired"
-              ? pendingMutation.envelope.mutationVersion
-              : null
-            const receiptName = receipt._tag === "Accepted" || receipt._tag === "Rejected"
-              ? receipt.name
-              : receipt._tag === "Expired"
-              ? pendingMutation.envelope.name
-              : null
+            let receiptSchema = receipt.sourceSchema
+            if (receipt._tag === "Expired") receiptSchema = pendingMutation.envelope.sourceSchema
+            let receiptMutationVersion: Identity.SchemaVersion | null = null
+            if (receipt._tag === "Accepted" || receipt._tag === "Rejected") {
+              receiptMutationVersion = receipt.mutationVersion
+            } else if (receipt._tag === "Expired") {
+              receiptMutationVersion = pendingMutation.envelope.mutationVersion
+            }
+            let receiptName: string | null = null
+            if (receipt._tag === "Accepted" || receipt._tag === "Rejected") {
+              receiptName = receipt.name
+            } else if (receipt._tag === "Expired") {
+              receiptName = pendingMutation.envelope.name
+            }
             yield* sql`INSERT INTO effect_local_receipts
           (mutation_id, local_sequence, receipt_json, source_schema_version, source_schema_hash,
             mutation_version, mutation_name, rejection_origin)

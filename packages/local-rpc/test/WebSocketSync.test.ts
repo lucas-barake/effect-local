@@ -121,9 +121,10 @@ const store = ServerStore.layer({
       ? Effect.void
       : Effect.fail({ reason: "forbidden" }),
   authorizeMutation: ({ mutation }) => {
-    return Schema.is(AssignRoleV2.payloadSchema)(mutation.payload) && mutation.payload.role === "admin"
-      ? Effect.fail({ reason: "admin role requires elevated access" })
-      : Effect.void
+    if (Schema.is(AssignRoleV2.payloadSchema)(mutation.payload) && mutation.payload.role === "admin") {
+      return Effect.fail({ reason: "admin role requires elevated access" })
+    }
+    return Effect.void
   },
   authorizeRead: ({ principal, spaceId: requestedSpaceId }) =>
     MutableRef.get(readAuthorized) && principal !== null && typeof principal === "object" &&

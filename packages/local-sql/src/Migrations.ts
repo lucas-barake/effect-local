@@ -20,7 +20,7 @@ export interface Migration {
   readonly name: string
   readonly checksum: Identity.SchemaHash
   readonly statements: ReadonlyArray<string>
-  readonly effect?: ((sql: SqlClient.SqlClient) => Effect.Effect<void, ReplicaError.ReplicaError, never>) | undefined
+  readonly effect?: ((sql: SqlClient.SqlClient) => Effect.Effect<void, ReplicaError.ReplicaError>) | undefined
 }
 
 export interface Options {
@@ -38,7 +38,7 @@ export const makeMigration = (options: {
   readonly statements: ReadonlyArray<string>
   readonly effect?: {
     readonly id: string
-    readonly run: (sql: SqlClient.SqlClient) => Effect.Effect<void, ReplicaError.ReplicaError, never>
+    readonly run: (sql: SqlClient.SqlClient) => Effect.Effect<void, ReplicaError.ReplicaError>
   } | undefined
 }): Migration => {
   if (!Number.isSafeInteger(options.id) || options.id <= 0) {
@@ -146,14 +146,17 @@ export const runCatalog = (
       execute: () => sql`SELECT id, name, checksum FROM effect_local_server_migrations ORDER BY id`
     })
     const migrate = Effect.gen(function*() {
-      yield* sql.unsafe(catalog === "Client" ? clientLedger : serverLedger)
+      let ledger = serverLedger
+      if (catalog === "Client") ledger = clientLedger
+      yield* sql.unsafe(ledger)
       yield* sql.withTransaction(Effect.gen(function*() {
-        const applied = yield* (catalog === "Client" ? readClient(undefined) : readServer(undefined)).pipe(
-          Effect.mapError((cause) =>
-            SqlError.isSqlError(cause)
-              ? StorageUnavailable.make(cause)
-              : new ReplicaError.StorageCorrupt({ message: `${catalog} migration ledger is corrupt`, cause })
-          )
+        let read = readServer
+        if (catalog === "Client") read = readClient
+        const applied = yield* read(undefined).pipe(
+          Effect.mapError((cause) => {
+            if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
+            return new ReplicaError.StorageCorrupt({ message: `${catalog} migration ledger is corrupt`, cause })
+          })
         )
         if (applied.length > migrations.length) {
           return yield* mismatch(
@@ -162,8 +165,8 @@ export const runCatalog = (
           )
         }
         for (let index = 0; index < applied.length; index++) {
-          const stored = applied[index]!
-          const expected = migrations[index]!
+          const stored = applied[index]
+          const expected = migrations[index]
           if (stored.id !== expected.id || stored.name !== expected.name || stored.checksum !== expected.checksum) {
             return yield* mismatch(
               catalog,
@@ -172,7 +175,7 @@ export const runCatalog = (
           }
         }
         for (let index = applied.length; index < migrations.length; index++) {
-          const migration = migrations[index]!
+          const migration = migrations[index]
           yield* Effect.forEach(migration.statements, (statement) => sql.unsafe(statement), { discard: true })
           if (migration.effect !== undefined) yield* migration.effect(sql)
           if (catalog === "Client") {
@@ -180,16 +183,17 @@ export const runCatalog = (
           VALUES (${migration.id}, ${migration.name}, ${migration.checksum})`
           } else {
             yield* sql`INSERT INTO effect_local_server_migrations (id, name, checksum)
-          VALUES (${migration.id}, ${migration.name}, ${migration.checksum})`
+            VALUES (${migration.id}, ${migration.name}, ${migration.checksum})`
           }
         }
+        return yield* Effect.void
       }))
     }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
     let attempt = 1
     while (true) {
       const result = yield* migrate.pipe(Effect.result)
-      if (Result.isSuccess(result)) return
+      if (Result.isSuccess(result)) return yield* Effect.void
       const failure = result.failure
       if (
         failure._tag !== "StorageUnavailable" ||

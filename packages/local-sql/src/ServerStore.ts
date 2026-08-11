@@ -1078,6 +1078,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             const terminalSequence = Identity.TerminalSequence.make(storedSpace.next_terminal_sequence)
             let receiptServerSequence: Identity.ServerSequence | null = null
             if (receipt._tag === "Accepted") receiptServerSequence = receipt.serverSequence
+            let rejectionOrigin: Protocol.RejectionOrigin | null = null
+            if (receipt._tag === "Rejected") rejectionOrigin = receipt.origin
             yield* sql`INSERT INTO effect_local_server_receipts
               (space_id, client_id, local_sequence, mutation_id, digest, terminal_sequence, server_sequence,
                 receipt_json, digest_version, source_schema_version, source_schema_hash, mutation_version,
@@ -1086,7 +1088,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 ${envelope.digest}, ${terminalSequence}, ${receiptServerSequence},
                 ${yield* Codec.stringify(receipt)}, ${envelope.digestVersion},
                 ${receipt.sourceSchema.version}, ${receipt.sourceSchema.hash}, ${receipt.mutationVersion},
-                ${receipt.name}, ${receipt._tag === "Rejected" ? receipt.origin : null})`
+                ${receipt.name}, ${rejectionOrigin})`
             yield* sql`UPDATE effect_local_server_spaces SET
               next_terminal_sequence = next_terminal_sequence + 1
               WHERE space_id = ${envelope.spaceId}`
@@ -1577,10 +1579,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           : request
       const trustedBootstrapRequest = (
         request: Protocol.BootstrapRequest | Omit<Protocol.BootstrapRequest, "schema">
-      ): Protocol.BootstrapRequest =>
-        Schema.is(Protocol.BootstrapRequest)(request)
-          ? request
-          : { ...request, schema: options.definition.schemaIdentity }
+      ): Protocol.BootstrapRequest => {
+        if (Schema.is(Protocol.BootstrapRequest)(request)) return request
+        return { ...request, schema: options.definition.schemaIdentity }
+      }
 
       return ServerStore.of({
         submit: (request) => admit(trustedSubmitRequest(request), null),

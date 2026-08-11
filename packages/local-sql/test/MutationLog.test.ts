@@ -307,7 +307,7 @@ describe("server reconciled mutation log", () => {
           const requestedSpace = Identity.SpaceId.make(
             `spc_00000000-0000-4000-8000-${String(index).padStart(12, "0")}`
           )
-          const identity = {
+          const identity: Omit<Protocol.MutationEnvelope, "digest"> = {
             spaceId: requestedSpace,
             clientId,
             mutationId: Identity.MutationId.make(
@@ -317,7 +317,7 @@ describe("server reconciled mutation log", () => {
             basis: Identity.ServerSequence.make(0),
             name: Domain.PutTodo.name,
             payload: Domain.todo(`maintain-${index}`),
-            digestVersion: 2 as const,
+            digestVersion: 2,
             sourceSchema: Domain.definition.schemaIdentity,
             mutationVersion: Domain.PutTodo.version
           }
