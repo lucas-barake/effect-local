@@ -26,9 +26,11 @@ const EvolutionPhase = Schema.Literals([
   "Entities",
   "Receipts",
   "Pending",
+  "Retractions",
   "Flip",
   "CleanupCanonical",
   "CleanupVisible",
+  "CleanupRetractions",
   "CleanupReceipts",
   "CleanupPending",
   "Finalize"
@@ -64,6 +66,12 @@ const EntityBatchRow = Schema.Struct({
   model_version: NullableSchemaVersion,
   entity_key: Schema.String,
   value_json: Schema.String
+})
+
+const RetractionBatchRow = Schema.Struct({
+  model: Schema.String,
+  model_version: Identity.SchemaVersion,
+  entity_key: Schema.String
 })
 
 const LogBatchRow = Schema.Struct({
@@ -592,6 +600,12 @@ export const client = (options: ClientOptions) =>
         sql`SELECT COUNT(*) AS count FROM effect_local_client_pending_data
         WHERE generation = ${generation}`
     })
+    const countRetractionGeneration = SqlSchema.findOne({
+      Request: NonNegativeInt,
+      Result: CountRow,
+      execute: (generation) =>
+        sql`SELECT COUNT(*) AS count FROM effect_local_client_retractions WHERE generation = ${generation}`
+    })
     const beginPromotion = SqlSchema.findOneOption({
       Request: Schema.Struct({
         expectedGeneration: NonNegativeInt,
@@ -656,6 +670,49 @@ export const client = (options: ClientOptions) =>
           AND (model > ${model} OR (model = ${model} AND entity_key > ${key}))
         ORDER BY model, entity_key LIMIT ${limit}`
     })
+    const initialRetractionMetadata = SqlSchema.findAll({
+      Request: Schema.Struct({ generation: NonNegativeInt, limit: Schema.Number }),
+      Result: EntityBytesRow,
+      execute: ({ generation, limit }) =>
+        sql`SELECT model, entity_key, length(CAST(entity_key AS BLOB)) AS row_bytes
+        FROM effect_local_client_retractions WHERE generation = ${generation}
+        ORDER BY model, entity_key LIMIT ${limit}`
+    })
+    const continuingRetractionMetadata = SqlSchema.findAll({
+      Request: Schema.Struct({
+        generation: NonNegativeInt,
+        model: Schema.String,
+        key: Schema.String,
+        limit: Schema.Number
+      }),
+      Result: EntityBytesRow,
+      execute: ({ generation, model, key, limit }) =>
+        sql`SELECT model, entity_key, length(CAST(entity_key AS BLOB)) AS row_bytes
+        FROM effect_local_client_retractions WHERE generation = ${generation}
+          AND (model > ${model} OR (model = ${model} AND entity_key > ${key}))
+        ORDER BY model, entity_key LIMIT ${limit}`
+    })
+    const initialRetractionBatch = SqlSchema.findAll({
+      Request: Schema.Struct({ generation: NonNegativeInt, limit: Schema.Number }),
+      Result: RetractionBatchRow,
+      execute: ({ generation, limit }) =>
+        sql`SELECT model, model_version, entity_key FROM effect_local_client_retractions
+        WHERE generation = ${generation} ORDER BY model, entity_key LIMIT ${limit}`
+    })
+    const continuingRetractionBatch = SqlSchema.findAll({
+      Request: Schema.Struct({
+        generation: NonNegativeInt,
+        model: Schema.String,
+        key: Schema.String,
+        limit: Schema.Number
+      }),
+      Result: RetractionBatchRow,
+      execute: ({ generation, model, key, limit }) =>
+        sql`SELECT model, model_version, entity_key FROM effect_local_client_retractions
+        WHERE generation = ${generation}
+          AND (model > ${model} OR (model = ${model} AND entity_key > ${key}))
+        ORDER BY model, entity_key LIMIT ${limit}`
+    })
     const logMetadata = SqlSchema.findAll({
       Request: Schema.Struct({ after: NonNegativeInt, limit: Schema.Number }),
       Result: SequenceBytesRow,
@@ -717,7 +774,7 @@ export const client = (options: ClientOptions) =>
         let expectedActiveGeneration: number = state.generation
         if (
           state.phase === "Flip" || state.phase === "Log" || state.phase === "Entities" ||
-          state.phase === "Receipts" || state.phase === "Pending"
+          state.phase === "Receipts" || state.phase === "Pending" || state.phase === "Retractions"
         ) {
           expectedActiveGeneration = state.source_generation
         }
@@ -781,6 +838,7 @@ export const client = (options: ClientOptions) =>
         yield* sql`DELETE FROM effect_local_client_visible_entities_data WHERE generation = ${generation}`
         yield* sql`DELETE FROM effect_local_client_receipts_data WHERE generation = ${generation}`
         yield* sql`DELETE FROM effect_local_client_pending_data WHERE generation = ${generation}`
+        yield* sql`DELETE FROM effect_local_client_retractions WHERE generation = ${generation}`
         yield* sql`INSERT INTO effect_local_client_evolution
           (singleton, source_schema_version, source_schema_hash, target_schema_version, target_schema_hash,
             migration_hash, generation, source_generation, phase, cursor_model, cursor_key, cursor_sequence)
@@ -1054,7 +1112,8 @@ export const client = (options: ClientOptions) =>
                 ${yield* Codec.stringify(changes)})`
           }
           if (rows.length === 0) {
-            yield* sql`UPDATE effect_local_client_evolution SET phase = 'Flip', cursor_sequence = NULL
+            yield* sql`UPDATE effect_local_client_evolution SET phase = 'Retractions', cursor_model = NULL,
+              cursor_key = NULL, cursor_sequence = NULL
               WHERE singleton = 1 AND generation = ${state.generation}`
           } else {
             yield* sql`UPDATE effect_local_client_evolution SET cursor_sequence = ${
@@ -1064,11 +1123,79 @@ export const client = (options: ClientOptions) =>
           }
           return undefined
         }))
+      } else if (state.phase === "Retractions") {
+        const request = {
+          generation: state.source_generation,
+          model: state.cursor_model,
+          key: state.cursor_key,
+          limit: batchSize
+        }
+        let metadata: ReadonlyArray<typeof EntityBytesRow.Type>
+        if (state.cursor_model === null || state.cursor_key === null) {
+          metadata = yield* initialRetractionMetadata({
+            generation: request.generation,
+            limit: request.limit
+          }).pipe(Effect.mapError(StorageUnavailable.make))
+        } else {
+          metadata = yield* continuingRetractionMetadata({
+            generation: request.generation,
+            model: state.cursor_model,
+            key: state.cursor_key,
+            limit: request.limit
+          }).pipe(Effect.mapError(StorageUnavailable.make))
+        }
+        const limit = yield* boundedCount(metadata, batchBytes)
+        let rows: ReadonlyArray<typeof RetractionBatchRow.Type>
+        if (state.cursor_model === null || state.cursor_key === null) {
+          rows = yield* initialRetractionBatch({ generation: request.generation, limit }).pipe(
+            Effect.mapError(StorageUnavailable.make)
+          )
+        } else {
+          rows = yield* continuingRetractionBatch({
+            generation: request.generation,
+            model: state.cursor_model,
+            key: state.cursor_key,
+            limit
+          }).pipe(Effect.mapError(StorageUnavailable.make))
+        }
+        yield* sql.withTransaction(Effect.gen(function*() {
+          yield* validateBatch(state)
+          for (const row of rows) {
+            const migrated = yield* Evolution.migrateModel({
+              evolution: options.evolution,
+              source,
+              model: row.model,
+              modelVersion: row.model_version,
+              key: yield* decodeJson(Schema.Json, row.entity_key)
+            })
+            yield* registerLineage(row.model, migrated)
+            const key = yield* Codec.stringify(migrated.key)
+            yield* sql`INSERT INTO effect_local_client_retractions
+              (generation, model, model_version, entity_key)
+              VALUES (${state.generation}, ${row.model}, ${migrated.modelVersion}, ${key})
+              ON CONFLICT (generation, model, entity_key) DO UPDATE SET
+                model_version = excluded.model_version`
+            yield* sql`DELETE FROM effect_local_client_visible_entities_data
+              WHERE generation = ${state.generation} AND model = ${row.model} AND entity_key = ${key}`
+          }
+          if (rows.length === 0) {
+            yield* sql`UPDATE effect_local_client_evolution SET phase = 'Flip', cursor_model = NULL,
+              cursor_key = NULL WHERE singleton = 1 AND generation = ${state.generation}`
+          } else {
+            const last = rows[rows.length - 1]
+            yield* sql`UPDATE effect_local_client_evolution SET cursor_model = ${last.model},
+              cursor_key = ${last.entity_key} WHERE singleton = 1 AND generation = ${state.generation}`
+          }
+        }))
       } else if (state.phase === "Flip") {
         yield* sql.withTransaction(Effect.gen(function*() {
           yield* validateBatch(state)
+          yield* sql`DELETE FROM effect_local_client_scoped_bootstrap_entries`
+          yield* sql`DELETE FROM effect_local_client_scoped_bootstrap WHERE singleton = 1`
           yield* sql`UPDATE effect_local_client_meta SET active_schema_generation = ${state.generation},
-            visible_revision = visible_revision + 1
+            visible_revision = visible_revision + 1, replication_view_id = NULL,
+            replication_view_revision = 0, installed_snapshot_id = NULL,
+            installed_snapshot_sequence = 0, installed_snapshot_terminal_sequence = 0
             WHERE singleton = 1 AND schema_generation = ${state.generation}
               AND active_schema_generation = ${state.source_generation}`
           yield* sql`UPDATE effect_local_client_evolution SET phase = 'CleanupCanonical'
@@ -1095,6 +1222,20 @@ export const client = (options: ClientOptions) =>
             SELECT rowid FROM effect_local_client_visible_entities_data
             WHERE generation = ${state.source_generation} ORDER BY model, entity_key LIMIT ${batchSize})`
           const remaining = yield* countVisibleGeneration(state.source_generation).pipe(
+            Effect.mapError(StorageUnavailable.make)
+          )
+          if (remaining.count === 0) {
+            yield* sql`UPDATE effect_local_client_evolution SET phase = 'CleanupRetractions'
+            WHERE singleton = 1 AND generation = ${state.generation}`
+          }
+        }))
+      } else if (state.phase === "CleanupRetractions") {
+        yield* sql.withTransaction(Effect.gen(function*() {
+          yield* validateBatch(state)
+          yield* sql`DELETE FROM effect_local_client_retractions WHERE rowid IN (
+            SELECT rowid FROM effect_local_client_retractions
+            WHERE generation = ${state.source_generation} ORDER BY model, entity_key LIMIT ${batchSize})`
+          const remaining = yield* countRetractionGeneration(state.source_generation).pipe(
             Effect.mapError(StorageUnavailable.make)
           )
           if (remaining.count === 0) {
@@ -1735,6 +1876,14 @@ export const server = (options: ServerOptions) =>
       } else if (state.phase === "Flip") {
         yield* sql.withTransaction(Effect.gen(function*() {
           yield* validateBatch(state)
+          yield* sql`DELETE FROM effect_local_server_scoped_snapshot_entries
+            WHERE snapshot_id IN (
+              SELECT snapshot_id FROM effect_local_server_scoped_snapshots WHERE space_id = ${options.spaceId}
+            )`
+          yield* sql`DELETE FROM effect_local_server_scoped_snapshots WHERE space_id = ${options.spaceId}`
+          yield* sql`DELETE FROM effect_local_server_replication_pages WHERE space_id = ${options.spaceId}`
+          yield* sql`DELETE FROM effect_local_server_replication_view_entities WHERE space_id = ${options.spaceId}`
+          yield* sql`DELETE FROM effect_local_server_replication_views WHERE space_id = ${options.spaceId}`
           yield* sql`UPDATE effect_local_server_spaces SET
             active_schema_generation = ${state.generation},
             entity_count = ${state.target_entity_count}, entity_bytes = ${state.target_entity_bytes}

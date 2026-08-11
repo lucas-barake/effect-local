@@ -1471,7 +1471,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           )
         },
         pullAuthorized: (request, principal) =>
-          prepareSpace(request.spaceId, request.schema).pipe(
+          authorizeReadScope(request, principal).pipe(
+            Effect.andThen(prepareSpace(request.spaceId, request.schema)),
             Effect.andThen(scopedReplication.pull(request, principal))
           ),
         bootstrap: (input) => {
@@ -1481,7 +1482,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           )
         },
         bootstrapAuthorized: (request, principal) =>
-          prepareSpace(request.spaceId, request.schema).pipe(
+          authorizeReadScope(request, principal).pipe(
+            Effect.andThen(prepareSpace(request.spaceId, request.schema)),
             Effect.andThen(scopedReplication.bootstrap(request, principal))
           ),
         maintain,
@@ -1494,7 +1496,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           )
         },
         watchAuthorized: (request, principal) =>
-          prepareSpace(request.spaceId, request.schema).pipe(
+          authorizeReadScope(request, principal).pipe(
+            Effect.andThen(prepareSpace(request.spaceId, request.schema)),
             Effect.as(watch(request, principal))
           )
       })
