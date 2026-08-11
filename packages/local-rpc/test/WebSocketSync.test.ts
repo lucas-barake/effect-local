@@ -10,6 +10,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
@@ -20,6 +21,7 @@ import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
 import * as HttpRouter from "effect/unstable/http/HttpRouter"
 import * as HttpServer from "effect/unstable/http/HttpServer"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as Authentication from "../src/Authentication.js"
 import * as PresenceClient from "../src/PresenceClient.js"
 import * as PresenceHub from "../src/PresenceHub.js"
@@ -72,12 +74,17 @@ const authenticator = Layer.succeed(
     authenticate: (credential) =>
       Redacted.value(credential) === "secret"
         ? Effect.succeed({ subject: "test" })
+        : Redacted.value(credential) === "revoked"
+        ? Effect.succeed({ subject: "revoked" })
         : Effect.fail(new Authentication.AuthenticationFailure())
   })
 )
 const authenticationServer = Authentication.layerServer.pipe(Layer.provide(authenticator))
-const authenticationClient = Authentication.layerClient.pipe(Layer.provide(
+const authenticationClient = Layer.fresh(Authentication.layerClient).pipe(Layer.provide(
   Layer.succeed(Authentication.Credentials, Redacted.make("secret"))
+))
+const revokedAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(Layer.provide(
+  Layer.succeed(Authentication.Credentials, Redacted.make("revoked"))
 ))
 const presenceHub = PresenceHub.layerTrusted()
 const cluster = SpaceEntity.layer().pipe(
@@ -105,13 +112,21 @@ const client = Layer.merge(SyncClient.layer, PresenceClient.layer).pipe(
   Layer.provide(clientProtocol),
   Layer.provide(authenticationClient)
 )
-const live = client.pipe(
+class RevokedSyncEngine extends Context.Service<RevokedSyncEngine, SyncEngine.Service>()(
+  "@lucas-barake/effect-local-rpc/test/RevokedSyncEngine"
+) {}
+const revokedClient = Layer.effect(RevokedSyncEngine, SyncEngine.SyncEngine).pipe(
+  Layer.provide(Layer.fresh(SyncClient.layer)),
+  Layer.provide(Layer.fresh(clientProtocol)),
+  Layer.provide(revokedAuthenticationClient)
+)
+const live = Layer.merge(client, revokedClient).pipe(
   Layer.provideMerge(websocketServer),
   Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
 )
 
 describe("WebSocket synchronization", () => {
-  it.effect("round trips typed mutation receipts and preserves domain RPC failures", () =>
+  it.effect("reauthorizes exact retries without retaining mutation history in Cluster storage", () =>
     Effect.gen(function*() {
       const remote = yield* SyncEngine.SyncEngine
       const identity = {
@@ -129,6 +144,16 @@ describe("WebSocket synchronization", () => {
       }
       const receipt = yield* remote.submit(envelope)
       assert.strictEqual(receipt._tag, "Accepted")
+
+      const revoked = yield* RevokedSyncEngine
+      const revokedRetry = yield* revoked.submit(envelope).pipe(Effect.flip)
+      assert.strictEqual(revokedRetry._tag, "AuthorizationDenied")
+
+      const sql = yield* SqlClient.SqlClient
+      const messageRows = yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM cluster_messages`
+      const replyRows = yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM cluster_replies`
+      assert.deepStrictEqual([messageRows[0]!.count, replyRows[0]!.count], [0, 0])
+
       const page = yield* remote.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
       assert.deepStrictEqual(page.entries.map((entry) => entry.mutationId), [mutationId])
 
@@ -146,7 +171,7 @@ describe("WebSocket synchronization", () => {
       }).pipe(Effect.flip)
       assert.strictEqual(forbidden._tag, "AuthorizationDenied")
     }).pipe(
-      Effect.provide(live),
+      Effect.provide(Layer.merge(live, database)),
       Effect.provide(NodeCrypto.layer)
     ))
 

@@ -34,10 +34,11 @@ executes the same handler, and either stores a terminal rejection or appends pub
 changes at the next dense sequence. The submitting client's result remains in its private receipt. A client installs
 contiguous accepted entries into canonical state and then replays its remaining pending mutations over that state.
 
-Effect Cluster owns deployment neutral routing. One volatile entity per space gives every runner the same wake and
-presence owner without copying application data into Cluster storage. Effect Workflow owns durable client scheduling
-through finite reconciliation generations. SQLite remains the only authority for mutations, receipts, log entries,
-canonical state, and reconciliation progress.
+Effect Cluster owns deployment neutral routing and live ownership. One entity per space serializes mutation admission,
+holds wake and presence recipients, and routes them across runners. The actor does not retain mutation payloads or
+replies in Cluster message history. Server SQL stores the authoritative log and receipts. Clients retain pending
+mutations and durable cursors in SQLite. Effect Workflow owns durable client scheduling through finite reconciliation
+generations.
 
 Ordinary fields store ordinary values. Applications that need concurrent intent for a specific field can use an
 explicit `Field.Semantics` such as a counter or grow only set. Every other model avoids causal metadata.
@@ -189,8 +190,8 @@ tests and already trusted processes.
 `SyncRpc.Rpcs` multiplexes submit, pull, watch, and presence on one Effect RPC WebSocket. The server uses
 `Authentication.layerServer`; the client uses `Authentication.layerClient`, which writes a redacted bearer credential
 to the request headers. The authenticated server facade sends all five operations to the Cluster entity for the
-requested space. Cluster supplies the unique live owner and cross runner stream routing. SQL remains the durable
-submit and pull boundary. The application chooses Effect's runner storage, message storage, runner transport, and
+requested space. Cluster supplies the unique live owner and cross runner stream routing. SQL stores the authoritative
+accepted log and terminal receipts. The application chooses Effect's runner storage, message storage, runner transport, and
 deployment Layers. It also remains responsible for its HTTP server, WebSocket path, TLS, Origin policy, credential
 verification, and tenant authorization. Provide `SyncRpc.layerJson` on both sides. It bounds and sanitizes complete
 JSON frames. A reverse proxy or lower level WebSocket upgrade handler must enforce the same native ingress payload
@@ -254,8 +255,9 @@ pnpm bench
 - A terminal rejection rolls back its optimistic write set and replays remaining pending mutations.
 - Queues, mutation payloads, presence payloads, pull counts, and pull bytes are bounded.
 - Presence is best effort, bounded, TTL based, and never enters the durable mutation log.
-- Cluster routes each space to one live owner across runners. Cluster messages stay volatile because SQL already owns
-  submit idempotency and durability.
+- Cluster routes each space to one live owner across runners. Entity operations are volatile. A failed submit remains
+  in the client's pending SQLite outbox until exact resubmission returns the SQL backed terminal receipt. Pull and watch
+  recover from the durable server sequence.
 - Workflow executions are finite and generation keyed. SQLite progress repairs lost wakes and browser termination when
   a runner starts again.
 - The server is an authority, not a peer. Conflict behavior is arrival order unless a handler explicitly applies field

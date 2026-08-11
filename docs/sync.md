@@ -29,10 +29,21 @@ admission, and read policies. Receipt retries recheck current access before read
 requires a tagged publish or watch policy that can bind the claimed presence client ID to the principal. The explicit
 `layerTrusted` constructors are reserved for tests and already trusted processes.
 
-Cluster operations are deliberately volatile. Submit already has exact durable idempotency in `ServerStore`, and pull
-reads the authoritative log. Persisting the same request in Cluster would create a second retry ledger. Wrapping
-submit in a Cluster transaction would also separate the post-admission wake from the physical SQL commit. Cluster
-therefore supplies ownership, routing, and cross runner streams. SQL supplies application durability.
+The space entity is the single live owner and relay for a space. Its operations are deliberately volatile. Durable
+mutation custody has two owners at different stages. Before admission, the client keeps the pending envelope in its
+SQLite outbox. After admission, `ServerStore` keeps the terminal receipt and accepted event in
+`effect_local_server_receipts` and `effect_local_authoritative_log`. If a runner fails before SQL commit, the entity call
+fails and the client resubmits. If SQL committed before the reply was lost, exact resubmission returns the stored receipt.
+
+This is the same store backed actor pattern as the former recipient relay. Persisting Submit through Effect beta 101
+`MessageStorage` would retain every completed request payload and reply with no per-request retention control. The
+authoritative mutation would then exist permanently in both Cluster history and the server log. Keeping entity calls
+volatile avoids that duplicate history while Cluster still supplies unique ownership, cross runner routing, and live
+recipient streams.
+
+The application can route a `ServerStore` service by `spaceId`, use one shared database, or colocate a database with a
+runner whose placement policy keeps the data reachable. Pull recovers from the authoritative sequence. Wake and
+presence streams reconnect to the current space owner.
 
 `SyncRpc.layerJson` is the WebSocket serializer. WebSocket messages are already framed, so it keeps no cumulative
 buffer. It rejects an inbound UTF-8 frame before JSON parsing and rejects an outbound frame after encoding when it

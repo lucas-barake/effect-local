@@ -9,7 +9,6 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import type * as Protocol from "@lucas-barake/effect-local/Protocol"
-import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
@@ -17,7 +16,6 @@ import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
-import * as ClusterSchema from "effect/unstable/cluster/ClusterSchema"
 import * as Entity from "effect/unstable/cluster/Entity"
 import * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
@@ -70,15 +68,6 @@ const envelope = (spaceId: Identity.SpaceId) => {
 }
 
 describe("SpaceEntity", () => {
-  it.effect("keeps every operation volatile", () =>
-    Effect.sync(() => {
-      for (const rpc of SpaceEntity.SpaceEntity.protocol.requests.values()) {
-        assert.isFalse(Context.get(rpc.annotations, ClusterSchema.Persisted))
-        assert.isFalse(Context.get(rpc.annotations, ClusterSchema.WithTransaction))
-        assert.isFalse(Context.get(rpc.annotations, ClusterSchema.Uninterruptible))
-      }
-    }))
-
   it.effect("routes synchronization and presence through one concurrent space owner", () =>
     Effect.gen(function*() {
       const presenceReady = yield* Deferred.make<void>()

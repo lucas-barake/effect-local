@@ -82,10 +82,15 @@ Workflow payload contains only definition, space, client, and generation identit
 idempotent reconciliation operation as the in memory scheduler.
 
 The server front door is an authenticated WebSocket RPC facade. It routes submit, pull, watch, presence publish, and
-presence watch through one volatile Effect Cluster entity keyed by space. That owner holds the per-space wake and
-presence hubs, so a client connected to one runner observes work admitted through another. Cluster does not wrap the
-server SQL transaction. This keeps durable receipt insertion, canonical writes, log insertion, sequence allocation,
-and post-commit wake ordering under one transaction owner.
+presence watch through one Effect Cluster entity keyed by space. The sequential entity command lane gives a space one
+live mutation owner while forked reads and streams stay concurrent. The owner holds per-space wake and presence
+recipients, so a client connected to one runner observes work admitted through another.
+
+Entity operations are volatile. Client SQLite owns a mutation until admission returns its exact receipt. Server SQL then
+owns the authoritative mutation log, terminal receipt, canonical changes, and total sequence. A runner failure before
+the SQL commit leaves the client mutation pending. A lost reply after commit is repaired by exact idempotent
+resubmission. Cluster provides ownership and routing without retaining a second permanent copy of every mutation payload
+and private reply.
 
 Applications provide Effect's Cluster runner, storage, and transport Layers. A single process can use
 `SingleRunner`. Sharded deployments can use shared runner storage and the Node runner transport. The authoritative

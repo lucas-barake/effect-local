@@ -15,6 +15,11 @@ import type * as Sharding from "effect/unstable/cluster/Sharding"
 import * as Rpc from "effect/unstable/rpc/Rpc"
 import * as PresenceHub from "./PresenceHub.js"
 
+const volatileAnnotations = Context.make(ClusterSchema.Persisted, false).pipe(
+  Context.add(ClusterSchema.WithTransaction, false),
+  Context.add(ClusterSchema.Uninterruptible, false)
+)
+
 export class Submit extends Rpc.make("Submit", {
   payload: {
     envelope: Protocol.MutationEnvelope,
@@ -22,7 +27,7 @@ export class Submit extends Rpc.make("Submit", {
   },
   success: Protocol.Receipt,
   error: ReplicaError.ReplicaError
-}) {}
+}).annotateMerge(volatileAnnotations) {}
 
 export class Pull extends Rpc.make("Pull", {
   payload: {
@@ -31,14 +36,14 @@ export class Pull extends Rpc.make("Pull", {
   },
   success: Protocol.PullPage,
   error: ReplicaError.ReplicaError
-}) {}
+}).annotateMerge(volatileAnnotations) {}
 
 export class Watch extends Rpc.make("Watch", {
   payload: { principal: Schema.Json },
   success: Protocol.Wake,
   error: ReplicaError.ReplicaError,
   stream: true
-}) {}
+}).annotateMerge(volatileAnnotations) {}
 
 export class PublishPresence extends Rpc.make("PublishPresence", {
   payload: {
@@ -46,14 +51,14 @@ export class PublishPresence extends Rpc.make("PublishPresence", {
     principal: Schema.Json
   },
   error: ReplicaError.ReplicaError
-}) {}
+}).annotateMerge(volatileAnnotations) {}
 
 export class WatchPresence extends Rpc.make("WatchPresence", {
   payload: { principal: Schema.Json },
   success: Protocol.PresenceUpdate,
   error: ReplicaError.ReplicaError,
   stream: true
-}) {}
+}).annotateMerge(volatileAnnotations) {}
 
 export const SpaceEntity = Entity.make("EffectLocal/Space", [
   Submit,
@@ -62,9 +67,6 @@ export const SpaceEntity = Entity.make("EffectLocal/Space", [
   PublishPresence,
   WatchPresence
 ])
-  .annotateRpcs(ClusterSchema.Persisted, false)
-  .annotateRpcs(ClusterSchema.WithTransaction, false)
-  .annotateRpcs(ClusterSchema.Uninterruptible, false)
 
 export interface ClientService {
   readonly submit: (
@@ -141,7 +143,6 @@ const mapClient = (makeClient: Effect.Success<typeof SpaceEntity.client>): Clien
 
 export interface HandlerOptions {
   readonly maxIdleTime?: Duration.Input
-  readonly concurrency?: number | "unbounded"
   readonly mailboxCapacity?: number | "unbounded"
   readonly disableFatalDefects?: boolean
   readonly defectRetryPolicy?: Schedule.Schedule<any, unknown>
@@ -165,33 +166,39 @@ export const layerHandlers = (options: HandlerOptions = {}) =>
           }
           return store.admit(payload.envelope, payload.principal)
         },
-        Pull: ({ payload }) => {
-          if (spaceId === undefined || payload.request.spaceId !== spaceId) {
-            return Effect.fail(
-              new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
-            )
-          }
-          return store.pullAuthorized(payload.request, payload.principal)
-        },
+        Pull: ({ payload }) =>
+          Rpc.fork(Effect.suspend(() => {
+            if (spaceId === undefined || payload.request.spaceId !== spaceId) {
+              return Effect.fail(
+                new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
+              )
+            }
+            return store.pullAuthorized(payload.request, payload.principal)
+          })),
         Watch: ({ payload }) =>
-          spaceId === undefined
-            ? Stream.fail(new ReplicaError.ProtocolInvalid({ message: "The routed space is invalid" }))
-            : Stream.unwrap(store.watchAuthorized(spaceId, payload.principal)),
-        PublishPresence: ({ payload }) => {
-          if (spaceId === undefined || payload.update.spaceId !== spaceId) {
-            return Effect.fail(
-              new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
-            )
-          }
-          return presence.publish(payload.update, payload.principal)
-        },
+          Rpc.fork(
+            spaceId === undefined
+              ? Stream.fail(new ReplicaError.ProtocolInvalid({ message: "The routed space is invalid" }))
+              : Stream.unwrap(store.watchAuthorized(spaceId, payload.principal))
+          ),
+        PublishPresence: ({ payload }) =>
+          Rpc.fork(Effect.suspend(() => {
+            if (spaceId === undefined || payload.update.spaceId !== spaceId) {
+              return Effect.fail(
+                new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
+              )
+            }
+            return presence.publish(payload.update, payload.principal)
+          })),
         WatchPresence: ({ payload }) =>
-          spaceId === undefined
-            ? Stream.fail(new ReplicaError.ProtocolInvalid({ message: "The routed space is invalid" }))
-            : presence.watch(spaceId, payload.principal)
+          Rpc.fork(
+            spaceId === undefined
+              ? Stream.fail(new ReplicaError.ProtocolInvalid({ message: "The routed space is invalid" }))
+              : presence.watch(spaceId, payload.principal)
+          )
       })
     }),
-    { concurrency: "unbounded", ...options }
+    { ...options, concurrency: 1 }
   )
 
 export const layerClient: Layer.Layer<Client, never, Sharding.Sharding> = Layer.effect(
