@@ -72,6 +72,7 @@ import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 
 export const Task = Model.make("Task", {
+  version: 1,
   key: Schema.String,
   schema: Schema.Struct({
     id: Schema.String,
@@ -81,11 +82,13 @@ export const Task = Model.make("Task", {
 })
 
 export const PutTask = Mutation.make("PutTask", {
+  version: 1,
   payload: Task.schema,
   success: Task.schema
 })
 
 export const ToggleTask = Mutation.make("ToggleTask", {
+  version: 1,
   payload: { id: Schema.String }
 })
 
@@ -95,6 +98,7 @@ export const ListTasks = Query.make("ListTasks", {
 })
 
 export const definition = Definition.make({
+  version: 1,
   models: [Task],
   mutations: [PutTask, ToggleTask],
   queries: [ListTasks]

@@ -406,87 +406,40 @@ export const make = (options: {
   })
 }
 
-const unsupported = (evolution: Evolution, source: Identity.SchemaIdentity) =>
-  new ReplicaError.SchemaEvolutionUnsupported({
-    sourceVersion: source.version,
-    sourceHash: source.hash,
-    targetVersion: evolution.current.schemaIdentity.version,
-    targetHash: evolution.current.schemaIdentity.hash
-  })
-
 const pathFrom = (
   evolution: Evolution,
   source: Identity.SchemaIdentity
 ): Effect.Effect<ReadonlyArray<Step>, ReplicaError.SchemaEvolutionUnsupported> => {
   if (sameIdentity(source, evolution.current.schemaIdentity)) return Effect.succeed([])
-  if (!evolution.definitionByIdentity.has(identityKey(source))) return Effect.fail(unsupported(evolution, source))
+  if (!evolution.definitionByIdentity.has(identityKey(source))) {
+    return Effect.fail(
+      new ReplicaError.SchemaEvolutionUnsupported({
+        sourceVersion: source.version,
+        sourceHash: source.hash,
+        targetVersion: evolution.current.schemaIdentity.version,
+        targetHash: evolution.current.schemaIdentity.hash
+      })
+    )
+  }
   const path: Array<Step> = []
   let identity = source
   while (!sameIdentity(identity, evolution.current.schemaIdentity)) {
     const next = evolution.stepBySourceIdentity.get(identityKey(identity))
-    if (next === undefined) return Effect.fail(unsupported(evolution, source))
+    if (next === undefined) {
+      return Effect.fail(
+        new ReplicaError.SchemaEvolutionUnsupported({
+          sourceVersion: source.version,
+          sourceHash: source.hash,
+          targetVersion: evolution.current.schemaIdentity.version,
+          targetHash: evolution.current.schemaIdentity.hash
+        })
+      )
+    }
     path.push(next)
     identity = next.to.schemaIdentity
   }
   return Effect.succeed(path)
 }
-
-type Part = "Key" | "Value" | "Payload" | "Success" | "Rejection"
-type PureSchema = Schema.Codec<any, any, never, never>
-
-const failed = (
-  step: Step,
-  componentKind: "Model" | "Mutation",
-  componentName: string,
-  part: Part,
-  fromVersion: number,
-  toVersion: number,
-  cause: unknown
-) =>
-  new ReplicaError.SchemaEvolutionFailed({
-    stepId: step.id,
-    componentKind,
-    componentName,
-    part,
-    fromVersion,
-    toVersion,
-    cause
-  })
-
-const decode = (
-  schema: PureSchema,
-  input: unknown,
-  error: (cause: unknown) => ReplicaError.SchemaEvolutionFailed
-): Effect.Effect<unknown, ReplicaError.SchemaEvolutionFailed> =>
-  Schema.decodeUnknownEffect(schema)(input).pipe(Effect.mapError(error))
-
-const encode = (
-  schema: SchemaInput.WireSchema,
-  input: unknown,
-  error: (cause: unknown) => ReplicaError.SchemaEvolutionFailed
-): Effect.Effect<typeof Schema.Json.Type, ReplicaError.SchemaEvolutionFailed> =>
-  Schema.encodeUnknownEffect(schema)(input).pipe(
-    Effect.mapError(error),
-    Effect.flatMap((encoded) => Schema.decodeUnknownEffect(Schema.Json)(encoded).pipe(Effect.mapError(error)))
-  )
-
-const transform = (
-  from: SchemaInput.WireSchema,
-  to: SchemaInput.WireSchema,
-  input: typeof Schema.Json.Type,
-  migrate: (value: unknown) => unknown,
-  error: (cause: unknown) => ReplicaError.SchemaEvolutionFailed
-): Effect.Effect<
-  { readonly encoded: typeof Schema.Json.Type; readonly value: unknown },
-  ReplicaError.SchemaEvolutionFailed
-> =>
-  Effect.gen(function*() {
-    const source = yield* decode(from, input, error)
-    const migrated = yield* Effect.sync(() => migrate(source))
-    const value = yield* decode(Schema.toType(to), migrated, error)
-    const encoded = yield* encode(to, value, error)
-    return { encoded, value }
-  })
 
 export const migrateModel = (options: {
   readonly evolution: Evolution
@@ -501,7 +454,12 @@ export const migrateModel = (options: {
     const sourceDefinition = options.evolution.definitionByIdentity.get(identityKey(options.source))
     const sourceModel = sourceDefinition?.modelByName.get(options.model)
     if (sourceModel === undefined || sourceModel.version !== options.modelVersion) {
-      return yield* Effect.fail(unsupported(options.evolution, options.source))
+      return yield* new ReplicaError.SchemaEvolutionUnsupported({
+        sourceVersion: options.source.version,
+        sourceHash: options.source.hash,
+        targetVersion: options.evolution.current.schemaIdentity.version,
+        targetHash: options.evolution.current.schemaIdentity.hash
+      })
     }
     let key = options.key
     let value = options.value
@@ -512,30 +470,133 @@ export const migrateModel = (options: {
       const source = entry.from.modelByName.get(options.model)
       const target = entry.to.modelByName.get(options.model)
       if (source === undefined || target === undefined || source.version !== version) {
-        return yield* Effect.fail(unsupported(options.evolution, options.source))
+        return yield* new ReplicaError.SchemaEvolutionUnsupported({
+          sourceVersion: options.source.version,
+          sourceHash: options.source.hash,
+          targetVersion: options.evolution.current.schemaIdentity.version,
+          targetHash: options.evolution.current.schemaIdentity.hash
+        })
       }
       const migration = entry.models.get(options.model)
-      const keyError = (cause: unknown) =>
-        failed(entry, "Model", options.model, "Key", source.version, target.version, cause)
-      const sourceKey = yield* decode(source.key, key, keyError)
+      const sourceKey = yield* Schema.decodeUnknownEffect(source.key)(key).pipe(
+        Effect.mapError((cause) =>
+          new ReplicaError.SchemaEvolutionFailed({
+            stepId: entry.id,
+            componentKind: "Model",
+            componentName: options.model,
+            part: "Key",
+            fromVersion: source.version,
+            toVersion: target.version,
+            cause
+          })
+        )
+      )
       const migratedKey = yield* Effect.sync(() =>
         migration?.migrateKey === undefined ?
           sourceKey :
           migration.migrateKey(sourceKey)
       )
-      const targetKey = yield* decode(Schema.toType(target.key), migratedKey, keyError)
-      key = yield* encode(target.key, targetKey, keyError)
+      const targetKey = yield* Schema.decodeUnknownEffect(Schema.toType(target.key))(migratedKey).pipe(
+        Effect.mapError((cause) =>
+          new ReplicaError.SchemaEvolutionFailed({
+            stepId: entry.id,
+            componentKind: "Model",
+            componentName: options.model,
+            part: "Key",
+            fromVersion: source.version,
+            toVersion: target.version,
+            cause
+          })
+        )
+      )
+      key = yield* Schema.encodeUnknownEffect(target.key)(targetKey).pipe(
+        Effect.mapError((cause) =>
+          new ReplicaError.SchemaEvolutionFailed({
+            stepId: entry.id,
+            componentKind: "Model",
+            componentName: options.model,
+            part: "Key",
+            fromVersion: source.version,
+            toVersion: target.version,
+            cause
+          })
+        ),
+        Effect.flatMap((encoded) =>
+          Schema.decodeUnknownEffect(Schema.Json)(encoded).pipe(
+            Effect.mapError((cause) =>
+              new ReplicaError.SchemaEvolutionFailed({
+                stepId: entry.id,
+                componentKind: "Model",
+                componentName: options.model,
+                part: "Key",
+                fromVersion: source.version,
+                toVersion: target.version,
+                cause
+              })
+            )
+          )
+        )
+      )
       if (value !== undefined) {
-        const valueError = (cause: unknown) =>
-          failed(entry, "Model", options.model, "Value", source.version, target.version, cause)
-        const sourceValue = yield* decode(source.schema, value, valueError)
+        const sourceValue = yield* Schema.decodeUnknownEffect(source.schema)(value).pipe(
+          Effect.mapError((cause) =>
+            new ReplicaError.SchemaEvolutionFailed({
+              stepId: entry.id,
+              componentKind: "Model",
+              componentName: options.model,
+              part: "Value",
+              fromVersion: source.version,
+              toVersion: target.version,
+              cause
+            })
+          )
+        )
         const migratedValue = yield* Effect.sync(() =>
           migration?.migrateValue === undefined ?
             sourceValue :
             migration.migrateValue({ key: sourceKey, targetKey, value: sourceValue })
         )
-        const targetValue = yield* decode(Schema.toType(target.schema), migratedValue, valueError)
-        value = yield* encode(target.schema, targetValue, valueError)
+        const targetValue = yield* Schema.decodeUnknownEffect(Schema.toType(target.schema))(migratedValue).pipe(
+          Effect.mapError((cause) =>
+            new ReplicaError.SchemaEvolutionFailed({
+              stepId: entry.id,
+              componentKind: "Model",
+              componentName: options.model,
+              part: "Value",
+              fromVersion: source.version,
+              toVersion: target.version,
+              cause
+            })
+          )
+        )
+        value = yield* Schema.encodeUnknownEffect(target.schema)(targetValue).pipe(
+          Effect.mapError((cause) =>
+            new ReplicaError.SchemaEvolutionFailed({
+              stepId: entry.id,
+              componentKind: "Model",
+              componentName: options.model,
+              part: "Value",
+              fromVersion: source.version,
+              toVersion: target.version,
+              cause
+            })
+          ),
+          Effect.flatMap((encoded) =>
+            Schema.decodeUnknownEffect(Schema.Json)(encoded).pipe(
+              Effect.mapError((cause) =>
+                new ReplicaError.SchemaEvolutionFailed({
+                  stepId: entry.id,
+                  componentKind: "Model",
+                  componentName: options.model,
+                  part: "Value",
+                  fromVersion: source.version,
+                  toVersion: target.version,
+                  cause
+                })
+              )
+            )
+          )
+        )
       }
       version = target.version
       identity = entry.to.schemaIdentity
@@ -566,7 +627,12 @@ const migrateMutationPart = (options: {
     const sourceDefinition = options.evolution.definitionByIdentity.get(identityKey(options.source))
     const sourceMutation = sourceDefinition?.mutationByName.get(options.mutation)
     if (sourceMutation === undefined || sourceMutation.version !== options.mutationVersion) {
-      return yield* Effect.fail(unsupported(options.evolution, options.source))
+      return yield* new ReplicaError.SchemaEvolutionUnsupported({
+        sourceVersion: options.source.version,
+        sourceHash: options.source.hash,
+        targetVersion: options.evolution.current.schemaIdentity.version,
+        targetHash: options.evolution.current.schemaIdentity.hash
+      })
     }
     let value = options.value
     let version = options.mutationVersion
@@ -574,11 +640,14 @@ const migrateMutationPart = (options: {
       const source = entry.from.mutationByName.get(options.mutation)
       const target = entry.to.mutationByName.get(options.mutation)
       if (source === undefined || target === undefined || source.version !== version) {
-        return yield* Effect.fail(unsupported(options.evolution, options.source))
+        return yield* new ReplicaError.SchemaEvolutionUnsupported({
+          sourceVersion: options.source.version,
+          sourceHash: options.source.hash,
+          targetVersion: options.evolution.current.schemaIdentity.version,
+          targetHash: options.evolution.current.schemaIdentity.hash
+        })
       }
       const migration = entry.mutations.get(options.mutation)
-      const error = (cause: unknown) =>
-        failed(entry, "Mutation", options.mutation, options.part, source.version, target.version, cause)
       let fromSchema: SchemaInput.WireSchema
       let toSchema: SchemaInput.WireSchema
       let migrate: (input: unknown) => unknown
@@ -599,7 +668,61 @@ const migrateMutationPart = (options: {
           migrate = migration?.migrateRejection ?? ((input) => input)
           break
       }
-      value = (yield* transform(fromSchema, toSchema, value, migrate, error)).encoded
+      const sourceValue = yield* Schema.decodeUnknownEffect(fromSchema)(value).pipe(
+        Effect.mapError((cause) =>
+          new ReplicaError.SchemaEvolutionFailed({
+            stepId: entry.id,
+            componentKind: "Mutation",
+            componentName: options.mutation,
+            part: options.part,
+            fromVersion: source.version,
+            toVersion: target.version,
+            cause
+          })
+        )
+      )
+      const migrated = yield* Effect.sync(() => migrate(sourceValue))
+      const targetValue = yield* Schema.decodeUnknownEffect(Schema.toType(toSchema))(migrated).pipe(
+        Effect.mapError((cause) =>
+          new ReplicaError.SchemaEvolutionFailed({
+            stepId: entry.id,
+            componentKind: "Mutation",
+            componentName: options.mutation,
+            part: options.part,
+            fromVersion: source.version,
+            toVersion: target.version,
+            cause
+          })
+        )
+      )
+      value = yield* Schema.encodeUnknownEffect(toSchema)(targetValue).pipe(
+        Effect.mapError((cause) =>
+          new ReplicaError.SchemaEvolutionFailed({
+            stepId: entry.id,
+            componentKind: "Mutation",
+            componentName: options.mutation,
+            part: options.part,
+            fromVersion: source.version,
+            toVersion: target.version,
+            cause
+          })
+        ),
+        Effect.flatMap((encoded) =>
+          Schema.decodeUnknownEffect(Schema.Json)(encoded).pipe(
+            Effect.mapError((cause) =>
+              new ReplicaError.SchemaEvolutionFailed({
+                stepId: entry.id,
+                componentKind: "Mutation",
+                componentName: options.mutation,
+                part: options.part,
+                fromVersion: source.version,
+                toVersion: target.version,
+                cause
+              })
+            )
+          )
+        )
+      )
       version = target.version
     }
     return {

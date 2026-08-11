@@ -42,6 +42,13 @@ const clientLedger = (sql: SqlClient.SqlClient) =>
     execute: () => sql`SELECT id, name, checksum FROM effect_local_client_migrations ORDER BY id`
   })(undefined)
 
+const serverMigrationLedger = (sql: SqlClient.SqlClient) =>
+  SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: LedgerRow,
+    execute: () => sql`SELECT id, name, checksum FROM effect_local_server_migrations ORDER BY id`
+  })(undefined)
+
 const tableNames = (sql: SqlClient.SqlClient) =>
   SqlSchema.findAll({
     Request: Schema.Void,
@@ -112,8 +119,10 @@ describe("storage migration catalogs", () => {
         spaceId,
         clientId
       })
+      yield* Migrations.server()
 
       assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6])
+      assert.deepStrictEqual((yield* serverMigrationLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6])
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
         "effect_local_client_evolution",
@@ -132,6 +141,29 @@ describe("storage migration catalogs", () => {
         "effect_local_server_key_lineage_targets",
         "effect_local_server_shadow_entities"
       ])
+    }).pipe(Effect.provide(database)))
+
+  it.effect("claims pending migrations before executing their effects", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const migration = Migrations.makeMigration({
+        id: 1,
+        name: "claimed-first",
+        statements: ["SELECT 1"],
+        effect: {
+          id: "assert-claim",
+          run: (transaction) =>
+            clientLedger(transaction).pipe(
+              Effect.orDie,
+              Effect.flatMap((rows) => {
+                if (rows.length === 1 && rows[0]?.id === 1) return Effect.void
+                return Effect.die("Migration effect ran before its durable claim")
+              })
+            )
+        }
+      })
+      yield* Migrations.runCatalog("Client", [migration])
+      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1])
     }).pipe(Effect.provide(database)))
 
   it.effect("rejects changed, deleted, inserted, duplicate, and gapped migration history", () =>

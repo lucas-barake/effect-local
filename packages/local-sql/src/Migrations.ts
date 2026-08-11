@@ -77,8 +77,6 @@ const ClientIdentityRow = Schema.Struct({
   client_id: Identity.ClientId
 })
 
-const mismatch = (catalog: Catalog, message: string) => new ReplicaError.StorageMigrationMismatch({ catalog, message })
-
 const validateCatalog = (
   catalog: Catalog,
   migrations: ReadonlyArray<Migration>
@@ -87,12 +85,17 @@ const validateCatalog = (
   for (let index = 0; index < migrations.length; index++) {
     const migration = migrations[index]!
     if (migration.id !== index + 1) {
-      return mismatch(
+      return new ReplicaError.StorageMigrationMismatch({
         catalog,
-        `${catalog} migration ids must be contiguous from 1. Expected ${index + 1}, got ${migration.id}`
-      )
+        message: `${catalog} migration ids must be contiguous from 1. Expected ${index + 1}, got ${migration.id}`
+      })
     }
-    if (names.has(migration.name)) return mismatch(catalog, `Duplicate migration name: ${migration.name}`)
+    if (names.has(migration.name)) {
+      return new ReplicaError.StorageMigrationMismatch({
+        catalog,
+        message: `Duplicate migration name: ${migration.name}`
+      })
+    }
     names.add(migration.name)
   }
   return undefined
@@ -159,25 +162,24 @@ export const runCatalog = (
           })
         )
         if (applied.length > migrations.length) {
-          return yield* mismatch(
+          return yield* new ReplicaError.StorageMigrationMismatch({
             catalog,
-            `${catalog} catalog deleted ${applied.length - migrations.length} applied migration(s)`
-          )
+            message: `${catalog} catalog deleted ${applied.length - migrations.length} applied migration(s)`
+          })
         }
         for (let index = 0; index < applied.length; index++) {
           const stored = applied[index]
           const expected = migrations[index]
           if (stored.id !== expected.id || stored.name !== expected.name || stored.checksum !== expected.checksum) {
-            return yield* mismatch(
+            return yield* new ReplicaError.StorageMigrationMismatch({
               catalog,
-              `Applied migration ${stored.id}:${stored.name}:${stored.checksum} does not match ${expected.id}:${expected.name}:${expected.checksum}`
-            )
+              message:
+                `Applied migration ${stored.id}:${stored.name}:${stored.checksum} does not match ${expected.id}:${expected.name}:${expected.checksum}`
+            })
           }
         }
         for (let index = applied.length; index < migrations.length; index++) {
           const migration = migrations[index]
-          yield* Effect.forEach(migration.statements, (statement) => sql.unsafe(statement), { discard: true })
-          if (migration.effect !== undefined) yield* migration.effect(sql)
           if (catalog === "Client") {
             yield* sql`INSERT INTO effect_local_client_migrations (id, name, checksum)
           VALUES (${migration.id}, ${migration.name}, ${migration.checksum})`
@@ -185,6 +187,11 @@ export const runCatalog = (
             yield* sql`INSERT INTO effect_local_server_migrations (id, name, checksum)
             VALUES (${migration.id}, ${migration.name}, ${migration.checksum})`
           }
+        }
+        for (let index = applied.length; index < migrations.length; index++) {
+          const migration = migrations[index]
+          yield* Effect.forEach(migration.statements, (statement) => sql.unsafe(statement), { discard: true })
+          if (migration.effect !== undefined) yield* migration.effect(sql)
         }
         return yield* Effect.void
       }))
@@ -196,6 +203,11 @@ export const runCatalog = (
       if (Result.isSuccess(result)) return yield* Effect.void
       const failure = result.failure
       if (
+        failure._tag === "StorageUnavailable" &&
+        SqlError.isSqlError(failure.cause) &&
+        (failure.cause.reason._tag === "ConstraintError" || failure.cause.reason._tag === "UniqueViolation")
+      ) continue
+      if (
         failure._tag !== "StorageUnavailable" ||
         !SqlError.isSqlError(failure.cause) ||
         failure.cause.reason._tag !== "LockTimeoutError" ||
@@ -204,7 +216,9 @@ export const runCatalog = (
       attempt += 1
       yield* Effect.sleep(retryDelayMillis)
     }
-  })
+  }).pipe(Effect.withSpan("Migrations.runCatalog", {
+    attributes: { "migration.catalog": catalog, "migration.count": migrations.length }
+  }))
 
 const clientV1 = makeMigration({
   id: 1,
