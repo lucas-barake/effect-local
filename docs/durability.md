@@ -7,20 +7,22 @@ SQLite is the client commit boundary. The server SQL transaction is the shared a
 A local mutation transaction contains sequence allocation, handler writes, the pending envelope, its optimistic
 result, and the write set. A process crash either preserves all of them or none of them.
 
-An accepted batch transaction validates dense sequence continuity, stores each accepted entry, applies its write set
-to canonical state, records local receipts, settles matching pending mutations, rebuilds visible state, advances the
-cursor, and advances the visible revision. A rejection transaction records the receipt, removes its pending mutation,
-and performs the same visible replay without advancing the server cursor. Settled receipts and accepted evidence are
-deleted only behind explicit local retention targets. A receipt referenced by pending work is never pruned.
+A replication page transaction validates its scope generation, exact next view revision, change schemas, encoded byte
+count, and digest. It applies all `Upsert`, `Delete`, and `Retract` changes, rebuilds visible state with unresolved
+pending mutations, and advances the view cursor atomically. Only a final page advances the separate dense server
+watermark used as the next mutation basis. Retractions are durable and suppress matching pending replay. A rejection
+transaction records the receipt, removes its pending mutation, and performs the same visible replay without advancing
+either cursor. Settled receipts and accepted evidence are deleted only behind explicit local retention targets. A
+receipt referenced by pending work is never pruned.
 
-A bootstrap page transaction validates the complete manifest identity, exact next ordinal, domain key and value
-Schemas, canonical entity bytes, duplicate keys, aggregate bytes, continuation, and rolling digest before extending a
-durable stage. Canonical state is unchanged while the stage is incomplete. Final installation revalidates the stage,
+A bootstrap page transaction validates the complete client, scope, schema, and view identity, exact next ordinal,
+domain key and value Schemas, entry bytes, duplicate keys, aggregate bytes, continuation, and rolling digest before
+extending a durable stage. Canonical state is unchanged while the stage is incomplete. Final installation revalidates the stage,
 classifies pending work against the accepted and terminal snapshot fences, replaces canonical state, advances the
 cursor, rebuilds optimistic visible state, and clears staging in one transaction. Restart resumes the next ordinal.
 
-On restart, visible entities and pending envelopes are already durable. Reconciliation resumes from the stored cursor
-and resubmits the same pending identities.
+On restart, visible entities, pending envelopes, desired scope, view cursor, global watermark, and retractions are
+already durable. Reconciliation resumes the same view and resubmits the same pending identities.
 
 ## Server transactions
 
@@ -31,6 +33,12 @@ watermark advancement.
 
 The server stores terminal receipts before replying. A dropped response is therefore an ambiguous acknowledgement,
 not an ambiguous mutation. Exact resubmission returns the stored receipt without executing the handler again.
+
+Each scoped client view is also transactional. Acknowledged entities, the view revision, normalized scope, global
+watermark, and one immutable outstanding page are durable SQL state. The server does not recompute an exposed page on
+retry. It first acknowledges the exact target revision, updates materialized membership, and only then creates the
+next page. Per entity authorization and scope are recomputed before a page reaches the wire. Principal changes or a
+now unsafe outstanding page rotate the view and require a new scoped bootstrap.
 
 The space row and a trigger maintained shadow row maintain matching retained history and receipt counts. Admission
 cross checks them under the space lock. Entity count and snapshot bytes use the same lock. Hard caps fail before handler execution. State capacity checks run inside the handler
@@ -59,11 +67,17 @@ opened with a different domain. The local database also validates its space and 
 canonical SHA 256 digest. Unknown mutation names, malformed payloads, cursor gaps, identity conflicts, and capacity
 violations are typed failures.
 
-Client and server schemas advance through a package owned ordered migration catalog. Each stored descriptor includes
+Client and server storage schemas advance through a package owned ordered migration catalog. Each stored descriptor includes
 its id, name, and checksum. Migration acquires a database writer mutex before catalog reads, validates the complete
 stored prefix, and retries only SQLite lock timeouts within the configured attempt bound. Bodies and catalog inserts
-share one transaction. There is no backward migration path before v1. Changing the domain definition changes its hash
-and requires a fresh database.
+share one transaction. There is no backward storage migration path before v1.
+
+Domain schema evolution is forward only and crash resumable. It copies log provenance, entities, receipts, pending
+mutations, and retraction keys into an inactive generation in bounded batches. The client flips generations only after
+all state is ready, clears schema bound view and bootstrap cursors, then cleans the source generation resumably. The
+server invalidates every scoped view, outstanding page, and scoped snapshot in the same transaction that activates the
+new entity generation. A compatible `Evolution` catalog therefore upgrades an existing database. A changed definition
+without a matching evolution path is rejected.
 
 Server migration requires a quiesced writer rollout. The migrated tables reject the legacy insert shape explicitly,
 so an old process cannot continue writing without terminal sequences and retention metadata.
