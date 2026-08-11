@@ -1104,7 +1104,9 @@ export const client = (options: ClientOptions) =>
           yield* validateBatch(state)
           yield* sql`UPDATE effect_local_client_spaces SET active_schema_generation = ${state.generation},
             active_projection_generation = ${state.target_projection_generation},
-            projection_schema_generation = ${state.generation}, visible_revision = visible_revision + 1
+            projection_schema_generation = ${state.generation},
+            projection_replay_generation = NULL, projection_replay_cursor = NULL,
+            visible_revision = visible_revision + 1
             WHERE space_id = ${options.spaceId} AND schema_generation = ${state.generation}
               AND active_schema_generation = ${state.source_generation}`
           yield* sql`UPDATE effect_local_client_evolution SET phase = 'CleanupCanonical'
@@ -1131,7 +1133,6 @@ export const client = (options: ClientOptions) =>
           yield* sql`DELETE FROM effect_local_client_visible_entities_data WHERE rowid IN (
             SELECT rowid FROM effect_local_client_visible_entities_data
             WHERE space_id = ${options.spaceId} AND schema_generation = ${state.source_generation}
-              AND projection_generation = ${state.source_projection_generation}
             ORDER BY model, entity_key LIMIT ${batchSize})`
           const remaining = yield* countVisibleGeneration(state.source_generation).pipe(
             Effect.mapError(StorageUnavailable.make)

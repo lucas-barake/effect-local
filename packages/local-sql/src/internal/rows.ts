@@ -221,6 +221,10 @@ export const ChangeRow = Schema.Struct({
 
 export const CountRow = Schema.Struct({ count: NonNegativeInt })
 export const SpaceIdRow = Schema.Struct({ space_id: Identity.SpaceId })
+export const SpacePendingCountRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  count: NonNegativeInt
+})
 export const SequenceRow = Schema.Struct({ server_sequence: Identity.ServerSequence })
 export const TerminalReceiptIdentityRow = Schema.Struct({
   terminal_sequence: Identity.TerminalSequence,

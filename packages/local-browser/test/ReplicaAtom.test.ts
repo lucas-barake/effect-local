@@ -177,7 +177,7 @@ describe("Replica Atom graph", () => {
       })
   )
 
-  it.live("keeps addressed atoms isolated and shares membership through one runtime", () =>
+  it.effect("keeps addressed atoms isolated and shares membership through one runtime", () =>
     Effect.gen(function*() {
       const graph = BrowserReplica.make(replica)
       const registry = AtomRegistry.make()

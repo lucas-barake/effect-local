@@ -249,6 +249,46 @@ describe("reconciliation workflow", () => {
       assert.strictEqual(error._tag, "SpaceUnavailable")
     }))
 
+  it.effect("interrupts the workflow generation that is active during leave", () =>
+    Effect.gen(function*() {
+      const pullEntered = yield* Deferred.make<void>()
+      const pullInterrupted = yield* Deferred.make<void>()
+      const blockedSync = Layer.succeed(
+        SyncEngine.SyncEngine,
+        SyncEngine.SyncEngine.of({
+          submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          pull: () =>
+            Deferred.succeed(pullEntered, undefined).pipe(
+              Effect.andThen(Effect.never),
+              Effect.onInterrupt(() => Deferred.succeed(pullInterrupted, undefined))
+            ),
+          bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          watch: () => Stream.never
+        })
+      )
+      const replicaLayer = SqlReplica.layerWorkflow({
+        ...clientHistory,
+        definition: Domain.definition,
+        spaceId,
+        clientId,
+        retryDelay: "1 millis"
+      }).pipe(
+        Layer.provide(Domain.handlers),
+        Layer.provide(database()),
+        Layer.provide(blockedSync),
+        Layer.provideMerge(WorkflowEngine.layerMemory)
+      )
+      const context = yield* Layer.build(replicaLayer)
+      const replica = Context.get(context, Replica.Replica)
+      const space = yield* replica.space(spaceId)
+      yield* Deferred.await(pullEntered)
+      yield* space.mutate(Domain.PutTodo, Domain.todo("next-generation"))
+
+      yield* replica.leave(spaceId)
+
+      assert.isTrue(yield* Deferred.isDone(pullInterrupted))
+    }))
+
   it.effect("rejects a workflow handle addressed to another replica", () =>
     Effect.gen(function*() {
       const serverContext = yield* Layer.build(serverLayer)
@@ -313,7 +353,7 @@ describe("reconciliation workflow", () => {
       const space = yield* replica.space(spaceId)
 
       const mutation = yield* space.mutate(Domain.PutTodo, Domain.todo("cluster"))
-      const requested = 1
+      const requested = 2
       const payload = ReconciliationWorkflow.Payload.make({
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,

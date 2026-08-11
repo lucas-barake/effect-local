@@ -738,6 +738,75 @@ describe("client schema evolution", () => {
       assert.strictEqual(remaining[0].count, 0)
     })).pipe(Effect.provide(database)))
 
+  it.effect("recovers schema promotion from an interrupted projection replay", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const v1 = yield* buildStore(definitionV1, handlersV1)
+      yield* v1.mutate(PutTodoV1, { id: "7", title: "pending" })
+      yield* v1.applyEntries([Protocol.AcceptedMutation.make({
+        sequence: Identity.ServerSequence.make(1),
+        spaceId,
+        clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"),
+        mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000207"),
+        localSequence: Identity.LocalSequence.make(1),
+        sourceSchema: definitionV1.schemaIdentity,
+        digest: "7".repeat(64),
+        changes: [Protocol.Upsert.make({
+          entity: { model: TodoV1.name, modelVersion: TodoV1.version, key: "8" },
+          value: { id: "8", title: "committed" }
+        })]
+      })])
+      const source = (yield* sql<{
+        readonly active_schema_generation: number
+        readonly active_projection_generation: number
+      }>`SELECT active_schema_generation, active_projection_generation
+        FROM effect_local_client_spaces WHERE space_id = ${spaceId}`)[0]
+      const interruptedProjection = source.active_projection_generation + 1
+      yield* sql`INSERT INTO effect_local_client_visible_entities_data
+        (space_id, schema_generation, projection_generation, model, model_version, entity_key, value_json)
+        SELECT space_id, schema_generation, ${interruptedProjection}, model, model_version, entity_key, value_json
+        FROM effect_local_client_visible_entities_data
+        WHERE space_id = ${spaceId} AND schema_generation = ${source.active_schema_generation}
+          AND projection_generation = ${source.active_projection_generation}
+        ORDER BY model, entity_key LIMIT 1`
+      yield* sql`UPDATE effect_local_client_spaces
+        SET projection_replay_generation = ${interruptedProjection}, projection_replay_cursor = 'pending:0'
+        WHERE space_id = ${spaceId}`
+
+      const batches = yield* Ref.make(0)
+      const afterBatch = Ref.updateAndGet(batches, (count) => count + 1).pipe(
+        Effect.flatMap((count) => {
+          if (count > 40) return Effect.die("schema evolution cleanup stalled")
+          return Effect.void
+        })
+      )
+      const runtimeV2 = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(handlersV2))
+      yield* SchemaEvolution.client({
+        definition: definitionV2,
+        evolution,
+        spaceId,
+        clientId,
+        batchSize: 1,
+        afterBatch
+      }).pipe(Effect.provide(runtimeV2))
+
+      const metadata = (yield* sql<{
+        readonly projection_replay_generation: number | null
+        readonly projection_replay_cursor: string | null
+      }>`SELECT projection_replay_generation, projection_replay_cursor
+        FROM effect_local_client_spaces WHERE space_id = ${spaceId}`)[0]
+      assert.isNull(metadata.projection_replay_generation)
+      assert.isNull(metadata.projection_replay_cursor)
+      const remaining = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+        FROM effect_local_client_visible_entities_data
+        WHERE space_id = ${spaceId} AND schema_generation = ${source.active_schema_generation}`
+      assert.strictEqual(remaining[0].count, 0)
+
+      const v2 = yield* buildStore(definitionV2, handlersV2, evolution)
+      assert.strictEqual(Option.getOrThrow(yield* v2.get(TodoV2, 7)).title, "pending")
+      assert.strictEqual(Option.getOrThrow(yield* v2.get(TodoV2, 8)).title, "committed")
+    })).pipe(Effect.provide(database)))
+
   it.effect("rejects one evolution row larger than the configured byte budget", () =>
     Effect.scoped(Effect.gen(function*() {
       const v1 = yield* buildStore(definitionV1, handlersV1)

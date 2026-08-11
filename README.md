@@ -162,6 +162,7 @@ export const ReplicaLive = SqlReplica.layer({
   definition,
   clientId,
   initialSpaces: [spaceId],
+  reconciliationConcurrency: 8,
   ...history
 }).pipe(
   Layer.provide(DomainLive),

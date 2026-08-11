@@ -1,6 +1,6 @@
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import type * as Evolution from "@lucas-barake/effect-local/Evolution"
-import type * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
@@ -11,12 +11,15 @@ import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
+import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
+import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
+import * as Rows from "./internal/rows.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as LocalStore from "./LocalStore.js"
 import * as Migrations from "./Migrations.js"
@@ -43,6 +46,7 @@ export interface Options<D extends Definition.Any,> {
   readonly maximumBootstrapPageBytes: number
   readonly migration: Migrations.Options
   readonly pageSize?: number
+  readonly reconciliationConcurrency?: number
   readonly retryDelay?: Duration.Input
   readonly maximumRetryDelay?: Duration.Input
   readonly maximumAttempts?: number
@@ -121,12 +125,14 @@ const makeLayer = <D extends Definition.Any, R,>(
       const reactivity = yield* Reactivity.Reactivity
       const parentScope = yield* Effect.scope
       const rootContext = yield* Effect.context<BaseRequirements<D> | R>()
-      const membershipGate = yield* Semaphore.make(1)
       const entries = new Map<Identity.SpaceId, Entry>()
       let nextGeneration = 0
       const workflow = yield* workflowEngine
       let manager: Reconciler.ManagerService | undefined
-      if (workflow === undefined) manager = yield* Reconciler.makeManager
+      if (workflow === undefined) {
+        if (options.reconciliationConcurrency === undefined) manager = yield* Reconciler.makeManager()
+        else manager = yield* Reconciler.makeManager({ concurrency: options.reconciliationConcurrency })
+      }
 
       yield* Migrations.client({
         definition: options.definition,
@@ -135,224 +141,274 @@ const makeLayer = <D extends Definition.Any, R,>(
       })
 
       const checkActive = (spaceId: Identity.SpaceId, generation: number) =>
-        membershipGate.withPermit(Effect.gen(function*() {
+        Effect.suspend(() => {
           const current = entries.get(spaceId)
-          if (current?._tag === "Active" && current.generation === generation) return current
-          return yield* new ReplicaError.SpaceUnavailable({ spaceId })
-        }))
+          if (current?._tag === "Active" && current.generation === generation) return Effect.succeed(current)
+          return Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId }))
+        })
 
       const initialize = (spaceId: Identity.SpaceId, generation: number) =>
         Effect.gen(function*() {
           const childScope = yield* Scope.fork(parentScope)
-          const mutationRuntime = MutationRuntime.layer(options.definition, options.evolution)
-          const localLayer = LocalStore.layer({ ...options, spaceId }).pipe(Layer.provide(mutationRuntime))
-          const queryLayer = QueryExecutor.layer(options.definition, spaceId)
-          let local: LocalStore.Service
-          let queries: QueryExecutor.Service
-          let reconciler: Reconciler.Service
-          let interruptReconciliation = Effect.void
-          if (workflow !== undefined) {
-            const workflowContext = Context.add(rootContext, WorkflowEngine.WorkflowEngine, workflow)
-            const runtime = yield* Layer.buildWithScope(
-              Layer.mergeAll(
-                localLayer,
-                queryLayer,
-                ReconciliationWorkflow.layer({ ...options, spaceId }).pipe(
-                  Layer.provide(localLayer),
-                  Layer.provide(Layer.succeed(ReconciliationWorkflow.RegistrationScope, parentScope))
-                )
-              ),
-              childScope
-            ).pipe(
-              Effect.provide(workflowContext),
-              Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
-            )
-            local = Context.get(runtime, LocalStore.Store)
-            queries = Context.get(runtime, QueryExecutor.QueryExecutor)
-            reconciler = Context.get(runtime, Reconciler.Reconciler)
-            interruptReconciliation = Effect.gen(function*() {
-              const generations = yield* local.reconciliationGenerations
-              if (generations.completed >= generations.requested) return
-              const payload = ReconciliationWorkflow.Payload.make({
-                schemaIdentity:
-                  `${options.definition.schemaIdentity.version}:${options.definition.schemaIdentity.hash}`,
+          return yield* Effect.gen(function*() {
+            const mutationRuntime = MutationRuntime.layer(options.definition, options.evolution)
+            const localLayer = LocalStore.layer({ ...options, spaceId }).pipe(Layer.provide(mutationRuntime))
+            const queryLayer = QueryExecutor.layer(options.definition, spaceId)
+            let local: LocalStore.Service
+            let queries: QueryExecutor.Service
+            let reconciler: Reconciler.Service
+            let interruptReconciliation = Effect.void
+            if (workflow !== undefined) {
+              const workflowContext = Context.add(rootContext, WorkflowEngine.WorkflowEngine, workflow)
+              const runtime = yield* Layer.buildWithScope(
+                Layer.mergeAll(
+                  localLayer,
+                  queryLayer,
+                  ReconciliationWorkflow.layer({ ...options, spaceId }).pipe(
+                    Layer.provide(localLayer),
+                    Layer.provide(Layer.succeed(ReconciliationWorkflow.RegistrationScope, parentScope))
+                  )
+                ),
+                childScope
+              ).pipe(
+                Effect.provide(workflowContext),
+                Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
+              )
+              local = Context.get(runtime, LocalStore.Store)
+              queries = Context.get(runtime, QueryExecutor.QueryExecutor)
+              reconciler = Context.get(runtime, Reconciler.Reconciler)
+              interruptReconciliation = reconciler.shutdown
+            } else {
+              if (manager === undefined) return yield* Effect.die("Reconciler manager was not initialized")
+              const runtime = yield* Layer.buildWithScope(
+                Layer.mergeAll(
+                  localLayer,
+                  queryLayer,
+                  Reconciler.layerOnePass({ ...options, spaceId }).pipe(Layer.provide(localLayer))
+                ),
+                childScope
+              ).pipe(
+                Effect.provide(rootContext),
+                Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
+              )
+              local = Context.get(runtime, LocalStore.Store)
+              queries = Context.get(runtime, QueryExecutor.QueryExecutor)
+              const reconciliation = Context.get(runtime, Reconciler.Reconciliation)
+              let managedSpace: Reconciler.ManagedSpace = {
                 spaceId,
-                clientId: options.clientId,
-                membershipIncarnation: local.membershipIncarnation,
-                generation: generations.requested
+                generation,
+                definition: options.definition,
+                local,
+                reconciliation
+              }
+              if (options.retryDelay !== undefined) {
+                managedSpace = { ...managedSpace, retryDelay: options.retryDelay }
+              }
+              yield* Effect.acquireRelease(
+                manager.register(managedSpace),
+                () => manager.unregister(spaceId, generation)
+              ).pipe(Scope.provide(childScope))
+              reconciler = Reconciler.Reconciler.of({
+                sync: manager.sync(spaceId),
+                notify: manager.notify(spaceId).pipe(Effect.orDie),
+                status: manager.status(spaceId).pipe(Effect.orDie),
+                shutdown: Effect.void
               })
-              yield* workflow.interruptUnsafe(
-                ReconciliationWorkflow.make(payload),
-                yield* ReconciliationWorkflow.executionId(payload)
-              )
-            }).pipe(Effect.orDie)
-          } else {
-            if (manager === undefined) return yield* Effect.die("Reconciler manager was not initialized")
-            const runtime = yield* Layer.buildWithScope(
-              Layer.mergeAll(
-                localLayer,
-                queryLayer,
-                Reconciler.layerOnePass({ ...options, spaceId }).pipe(Layer.provide(localLayer))
-              ),
-              childScope
-            ).pipe(
-              Effect.provide(rootContext),
-              Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
-            )
-            local = Context.get(runtime, LocalStore.Store)
-            queries = Context.get(runtime, QueryExecutor.QueryExecutor)
-            const reconciliation = Context.get(runtime, Reconciler.Reconciliation)
-            let managedSpace: Reconciler.ManagedSpace = {
+            }
+            const operationGate = yield* Semaphore.make(1)
+            const admit = <A, E,>(effect: Effect.Effect<A, E>) =>
+              operationGate.withPermit(checkActive(spaceId, generation).pipe(Effect.andThen(effect)))
+            const handle: Replica.Space = {
               spaceId,
-              generation,
-              definition: options.definition,
-              local,
-              reconciliation
-            }
-            if (options.retryDelay !== undefined) {
-              managedSpace = { ...managedSpace, retryDelay: options.retryDelay }
-            }
-            yield* manager.register(managedSpace)
-            yield* Scope.addFinalizer(childScope, manager.unregister(spaceId, generation))
-            reconciler = Reconciler.Reconciler.of({
-              sync: manager.sync(spaceId),
-              notify: manager.notify(spaceId).pipe(Effect.orDie),
-              status: manager.status(spaceId).pipe(Effect.orDie)
-            })
-          }
-          const operationGate = yield* Semaphore.make(1)
-          let active!: ActiveEntry
-          const admit = <A, E,>(effect: Effect.Effect<A, E>) =>
-            operationGate.withPermit(checkActive(spaceId, generation).pipe(Effect.andThen(effect)))
-          const handle: Replica.Space = {
-            spaceId,
-            mutate: (mutation, payload) =>
-              admit(local.mutate(mutation, payload).pipe(Effect.tap(() => reconciler.notify))),
-            get: (model, key) => admit(local.get(model, key)),
-            query: (query, payload) => admit(queries.execute(query, payload)),
-            receipt: (mutationId) => admit(local.receipt(mutationId)),
-            status: admit(
-              Effect.all([reconciler.status, local.pendingCount]).pipe(
-                Effect.map(([status, pending]) => addressedStatus(spaceId, { ...status, pending }))
+              mutate: (mutation, payload) =>
+                admit(local.mutate(mutation, payload).pipe(Effect.tap(() => reconciler.notify))),
+              get: (model, key) => admit(local.get(model, key)),
+              query: (query, payload) => admit(queries.execute(query, payload)),
+              receipt: (mutationId) => admit(local.receipt(mutationId)),
+              status: admit(
+                Effect.all([reconciler.status, local.pendingCount]).pipe(
+                  Effect.map(([status, pending]) => addressedStatus(spaceId, { ...status, pending }))
+                )
               )
-            )
-          }
-          active = {
-            _tag: "Active",
-            generation,
-            scope: childScope,
-            operationGate,
-            local,
-            queries,
-            reconciler,
-            interruptReconciliation,
-            handle
-          }
-          return active
+            }
+            return {
+              _tag: "Active",
+              generation,
+              scope: childScope,
+              operationGate,
+              local,
+              queries,
+              reconciler,
+              interruptReconciliation,
+              handle
+            } satisfies ActiveEntry
+          }).pipe(
+            Effect.onExit((exit) => {
+              if (Exit.isFailure(exit)) return Scope.close(childScope, exit)
+              return Effect.void
+            })
+          )
         })
 
       const join = (spaceId: Identity.SpaceId): Effect.Effect<Replica.Space, ReplicaError.ReplicaError> =>
-        Effect.gen(function*() {
-          const completion = yield* Deferred.make<Replica.Space, ReplicaError.ReplicaError>()
-          const decision = yield* membershipGate.withPermit(Effect.sync(() => {
-            const current = entries.get(spaceId)
-            if (current?._tag === "Active") return { _tag: "Active" as const, entry: current }
-            if (current?._tag === "Joining") return { _tag: "WaitJoin" as const, completion: current.completion }
-            if (current?._tag === "Leaving") return { _tag: "WaitLeave" as const, completion: current.completion }
-            const generation = ++nextGeneration
-            entries.set(spaceId, { _tag: "Joining", generation, completion })
-            return { _tag: "Initialize" as const, generation, completion }
-          }))
-          if (decision._tag === "Active") return decision.entry.handle
-          if (decision._tag === "WaitJoin") return yield* Deferred.await(decision.completion)
-          if (decision._tag === "WaitLeave") {
-            yield* Deferred.await(decision.completion)
-            return yield* join(spaceId)
-          }
-          const result = yield* initialize(spaceId, decision.generation).pipe(Effect.result)
-          if (result._tag === "Success") {
-            yield* membershipGate.withPermit(Effect.sync(() => entries.set(spaceId, result.success)))
-            yield* Deferred.succeed(decision.completion, result.success.handle)
-            yield* reactivity.invalidate([`effect-local:space:${spaceId}`, "effect-local:status"])
-            return result.success.handle
-          }
-          yield* membershipGate.withPermit(Effect.sync(() => {
-            const current = entries.get(spaceId)
-            if (current?._tag === "Joining" && current.generation === decision.generation) entries.delete(spaceId)
-          }))
-          yield* Deferred.fail(decision.completion, result.failure)
-          return yield* Effect.fail(result.failure)
-        })
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function*() {
+            const completion = yield* Deferred.make<Replica.Space, ReplicaError.ReplicaError>()
+            const decision = yield* Effect.sync(() => {
+              const current = entries.get(spaceId)
+              if (current?._tag === "Active") return { _tag: "Active" as const, entry: current }
+              if (current?._tag === "Joining") return { _tag: "WaitJoin" as const, completion: current.completion }
+              if (current?._tag === "Leaving") return { _tag: "WaitLeave" as const, completion: current.completion }
+              const generation = ++nextGeneration
+              entries.set(spaceId, { _tag: "Joining", generation, completion })
+              return { _tag: "Initialize" as const, generation, completion }
+            })
+            if (decision._tag === "Active") return decision.entry.handle
+            if (decision._tag === "WaitJoin") return yield* restore(Deferred.await(decision.completion))
+            if (decision._tag === "WaitLeave") {
+              yield* restore(Deferred.await(decision.completion))
+              return yield* join(spaceId)
+            }
+            const result = yield* restore(initialize(spaceId, decision.generation)).pipe(Effect.exit)
+            if (result._tag === "Success") {
+              yield* Effect.sync(() => entries.set(spaceId, result.value))
+              yield* Deferred.succeed(decision.completion, result.value.handle)
+              yield* reactivity.invalidate([`effect-local:space:${spaceId}`, "effect-local:status"])
+              return result.value.handle
+            }
+            yield* Effect.sync(() => {
+              const current = entries.get(spaceId)
+              if (current?._tag === "Joining" && current.generation === decision.generation) entries.delete(spaceId)
+            })
+            const handleResult = Exit.map(result, (entry) => entry.handle)
+            yield* Deferred.done(decision.completion, handleResult)
+            return yield* handleResult
+          })
+        )
+
+      const evictMembership = (spaceId: Identity.SpaceId) =>
+        sql.withTransaction(sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`).pipe(
+          Effect.asVoid,
+          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
+        )
 
       const leave = (spaceId: Identity.SpaceId): Effect.Effect<void, ReplicaError.ReplicaError> =>
-        Effect.gen(function*() {
-          const completion = yield* Deferred.make<void, ReplicaError.ReplicaError>()
-          const decision = yield* membershipGate.withPermit(Effect.sync(() => {
-            const current = entries.get(spaceId)
-            if (current === undefined) return { _tag: "Missing" as const }
-            if (current._tag === "Joining") return { _tag: "WaitJoin" as const, completion: current.completion }
-            if (current._tag === "Leaving") return { _tag: "WaitLeave" as const, completion: current.completion }
-            entries.set(spaceId, {
-              _tag: "Leaving",
-              generation: current.generation,
-              completion
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function*() {
+            const completion = yield* Deferred.make<void, ReplicaError.ReplicaError>()
+            const decision = yield* Effect.sync(() => {
+              const current = entries.get(spaceId)
+              if (current === undefined) return { _tag: "Missing" as const }
+              if (current._tag === "Joining") return { _tag: "WaitJoin" as const, completion: current.completion }
+              if (current._tag === "Leaving") return { _tag: "WaitLeave" as const, completion: current.completion }
+              entries.set(spaceId, {
+                _tag: "Leaving",
+                generation: current.generation,
+                completion
+              })
+              return { _tag: "Evict" as const, entry: current, completion }
             })
-            return { _tag: "Evict" as const, entry: current, completion }
-          }))
-          if (decision._tag === "Missing") return yield* Effect.void
-          if (decision._tag === "WaitJoin") {
-            yield* Deferred.await(decision.completion)
-            return yield* leave(spaceId)
-          }
-          if (decision._tag === "WaitLeave") {
-            yield* Deferred.await(decision.completion)
-            return yield* Effect.void
-          }
-          const result = yield* decision.entry.interruptReconciliation.pipe(
-            Effect.andThen(Scope.close(decision.entry.scope, Exit.void)),
-            Effect.andThen(decision.entry.operationGate.withPermit(
-              sql.withTransaction(sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`).pipe(
-                Effect.asVoid
+            if (decision._tag === "Missing") return yield* restore(evictMembership(spaceId))
+            if (decision._tag === "WaitJoin") {
+              yield* restore(Deferred.await(decision.completion))
+              return yield* leave(spaceId)
+            }
+            if (decision._tag === "WaitLeave") {
+              yield* restore(Deferred.await(decision.completion))
+              return yield* Effect.void
+            }
+            let scopeClosed = false
+            const result = yield* restore(decision.entry.operationGate.withPermit(
+              decision.entry.interruptReconciliation.pipe(
+                Effect.andThen(Effect.uninterruptible(
+                  Scope.close(decision.entry.scope, Exit.void).pipe(
+                    Effect.andThen(Effect.sync(() => {
+                      scopeClosed = true
+                    }))
+                  )
+                )),
+                Effect.andThen(evictMembership(spaceId))
               )
-            )),
-            Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
-            Effect.result
-          )
-          if (result._tag === "Success") {
-            yield* membershipGate.withPermit(Effect.sync(() => entries.delete(spaceId)))
-            yield* Deferred.succeed(decision.completion, undefined)
-            yield* reactivity.invalidate([`effect-local:space:${spaceId}`, "effect-local:status"])
-            return yield* Effect.void
-          }
-          yield* membershipGate.withPermit(Effect.sync(() => entries.delete(spaceId)))
-          yield* Deferred.fail(decision.completion, result.failure)
-          return yield* Effect.fail(result.failure)
-        })
+            )).pipe(Effect.exit)
+            if (result._tag === "Success") {
+              yield* Effect.sync(() => entries.delete(spaceId))
+              yield* Deferred.succeed(decision.completion, undefined)
+              yield* reactivity.invalidate([`effect-local:space:${spaceId}`, "effect-local:status"])
+              return yield* Effect.void
+            }
+            yield* Effect.sync(() => {
+              if (scopeClosed) entries.delete(spaceId)
+              else entries.set(spaceId, decision.entry)
+            })
+            yield* Deferred.done(decision.completion, result)
+            return yield* result
+          })
+        )
 
       const space = (spaceId: Identity.SpaceId) =>
-        membershipGate.withPermit(Effect.gen(function*() {
+        Effect.suspend(() => {
           const entry = entries.get(spaceId)
-          if (entry?._tag === "Active") return entry.handle
-          return yield* new ReplicaError.SpaceNotJoined({ spaceId })
-        }))
+          if (entry?._tag === "Active") return Effect.succeed(entry.handle)
+          return Effect.fail(new ReplicaError.SpaceNotJoined({ spaceId }))
+        })
 
-      const spaces = membershipGate.withPermit(Effect.sync(() =>
+      const spaces = Effect.sync(() =>
         Array.from(entries.entries())
           .filter((entry): entry is [Identity.SpaceId, ActiveEntry] => entry[1]._tag === "Active")
           .toSorted(([left], [right]) => left.localeCompare(right))
           .map(([, entry]) => entry.handle)
-      ))
+      )
 
       const status = Effect.gen(function*() {
-        const handles = yield* spaces
-        const statuses = yield* Effect.forEach(handles, (handle) => handle.status, { concurrency: "unbounded" })
+        const active = yield* Effect.sync(() =>
+          Array.from(entries.values())
+            .filter((entry): entry is ActiveEntry => entry._tag === "Active")
+            .toSorted((left, right) => left.handle.spaceId.localeCompare(right.handle.spaceId))
+        )
+        if (active.length === 0) return aggregateStatus([])
+        const readPendingCounts = SqlSchema.findAll({
+          Request: Schema.Array(Identity.SpaceId),
+          Result: Rows.SpacePendingCountRow,
+          execute: (spaceIds) =>
+            sql`SELECT s.space_id, COUNT(p.mutation_id) AS count
+            FROM effect_local_client_spaces AS s
+            LEFT JOIN effect_local_client_pending_data AS p
+              ON p.space_id = s.space_id AND p.schema_generation = s.active_schema_generation
+            WHERE s.space_id IN ${sql.in(spaceIds)}
+            GROUP BY s.space_id`
+        })
+        const counts = yield* readPendingCounts(active.map((entry) => entry.handle.spaceId)).pipe(
+          Effect.mapError((cause) => {
+            if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
+            return new ReplicaError.StorageCorrupt({ message: "Client pending count row is corrupt", cause })
+          })
+        )
+        const pendingBySpace = new Map(counts.map((row) => [row.space_id, row.count]))
+        const statuses = yield* Effect.forEach(
+          active,
+          (entry) =>
+            entry.reconciler.status.pipe(
+              Effect.map((spaceStatus) =>
+                addressedStatus(entry.handle.spaceId, {
+                  ...spaceStatus,
+                  pending: pendingBySpace.get(entry.handle.spaceId) ?? 0
+                })
+              )
+            ),
+          { concurrency: "unbounded" }
+        )
         return aggregateStatus(statuses)
       })
 
-      const restored = yield* sql<{ readonly space_id: Identity.SpaceId }>`
-        SELECT space_id FROM effect_local_client_spaces ORDER BY space_id`.pipe(
-        Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
-      )
+      const readSpaces = SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: Rows.SpaceIdRow,
+        execute: () => sql`SELECT space_id FROM effect_local_client_spaces ORDER BY space_id`
+      })
+      const restored = yield* readSpaces(undefined).pipe(Effect.mapError((cause) => {
+        if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
+        return new ReplicaError.StorageCorrupt({ message: "Client membership row is corrupt", cause })
+      }))
       const configured: Array<Identity.SpaceId> = []
       if (options.initialSpaces !== undefined) configured.push(...options.initialSpaces)
       if (options.spaceId !== undefined) configured.push(options.spaceId)

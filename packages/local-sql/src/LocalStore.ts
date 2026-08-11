@@ -71,7 +71,8 @@ export interface Service {
   readonly requestReconciliation: Effect.Effect<number, ReplicaError.ReplicaError>
   readonly completeReconciliation: (generation: number) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly applyEntries: (
-    entries: ReadonlyArray<Protocol.AcceptedMutation>
+    entries: ReadonlyArray<Protocol.AcceptedMutation>,
+    options?: { readonly publishProjection?: boolean }
   ) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly applyReceipts: (
     receipts: ReadonlyArray<Protocol.Receipt>
@@ -271,11 +272,14 @@ export const layer = (
           )
           ORDER BY p.local_sequence LIMIT ${limit}`
       })
-      const findProjectionRows = SqlSchema.findAll({
+      const copyProjectionRows = SqlSchema.findAll({
         Request: Schema.Struct({ schemaGeneration: Schema.Int, projectionGeneration: Schema.Int, limit: Schema.Int }),
         Result: Rows.ProjectionEntityRow,
         execute: ({ schemaGeneration, projectionGeneration, limit }) =>
-          sql`SELECT c.model, c.model_version, c.entity_key, c.value_json
+          sql`INSERT INTO effect_local_client_visible_entities_data
+            (space_id, schema_generation, projection_generation, model, model_version, entity_key, value_json)
+          SELECT c.space_id, c.schema_generation, ${projectionGeneration}, c.model, c.model_version,
+            c.entity_key, c.value_json
           FROM effect_local_client_canonical_entities_data AS c
           WHERE c.space_id = ${options.spaceId} AND c.schema_generation = ${schemaGeneration}
             AND NOT EXISTS (
@@ -284,7 +288,8 @@ export const layer = (
                 AND v.projection_generation = ${projectionGeneration}
                 AND v.model = c.model AND v.entity_key = c.entity_key
             )
-          ORDER BY c.model, c.entity_key LIMIT ${limit}`
+          ORDER BY c.model, c.entity_key LIMIT ${limit}
+          RETURNING model, model_version, entity_key, value_json`
       })
       const findProjectionRowIds = SqlSchema.findAll({
         Request: Schema.Struct({
@@ -540,12 +545,32 @@ export const layer = (
           )
         }
         return reactivity.invalidate({
-          [spaceKey]: [],
           [`${spaceKey}:entities`]: uniqueEntities.map((entity) => [entity.model, entity.key]),
           [`${spaceKey}:status`]: [],
           "effect-local:status": []
         }).pipe(Effect.andThen(invalidateReceipts))
       }
+
+      const deferredEntities = new Map<string, Protocol.EntityKey>()
+      const deferredReceiptIds = new Set<Identity.MutationId>()
+      const deferInvalidation = (
+        entities: ReadonlyArray<Protocol.EntityKey>,
+        receiptIds: ReadonlyArray<Identity.MutationId>
+      ) =>
+        Effect.sync(() => {
+          for (const entity of entities) deferredEntities.set(SqlTransaction.entityKey(entity), entity)
+          for (const mutationId of receiptIds) deferredReceiptIds.add(mutationId)
+        })
+      const flushDeferredInvalidations = Effect.suspend(() => {
+        const entities = Array.from(deferredEntities.values())
+        const receiptIds = Array.from(deferredReceiptIds)
+        return invalidate(entities, receiptIds).pipe(
+          Effect.andThen(Effect.sync(() => {
+            for (const entity of entities) deferredEntities.delete(SqlTransaction.entityKey(entity))
+            for (const mutationId of receiptIds) deferredReceiptIds.delete(mutationId)
+          }))
+        )
+      })
 
       const nextProjectionGeneration = (current: number) => {
         if (current >= Number.MAX_SAFE_INTEGER) {
@@ -562,9 +587,7 @@ export const layer = (
       const requestProjectionReplay = (current: typeof Rows.ClientMetaRow.Type) =>
         Effect.gen(function*() {
           if (current.projection_replay_generation !== null) {
-            return yield* new ReplicaError.StorageCorrupt({
-              message: "Projection replay was not resumed before another replay was requested"
-            })
+            return current.projection_replay_generation
           }
           const target = yield* nextProjectionGeneration(current.active_projection_generation)
           yield* sql`UPDATE effect_local_client_spaces
@@ -682,7 +705,7 @@ export const layer = (
               if (row.projection_replay_generation !== target || row.projection_replay_cursor !== "canonical") {
                 return yield* new ReplicaError.StorageCorrupt({ message: "Projection copy fence changed" })
               }
-              const rows = yield* findProjectionRows({
+              const rows = yield* copyProjectionRows({
                 schemaGeneration: replaySchemaGeneration,
                 projectionGeneration: target,
                 limit: projectionReplayBatchSize
@@ -691,12 +714,6 @@ export const layer = (
                 yield* sql`UPDATE effect_local_client_spaces SET projection_replay_cursor = 'pending:0'
                   WHERE space_id = ${options.spaceId}`
                 return false
-              }
-              for (const entity of rows) {
-                yield* sql`INSERT INTO effect_local_client_visible_entities_data
-                  (space_id, schema_generation, projection_generation, model, model_version, entity_key, value_json)
-                  VALUES (${options.spaceId}, ${replaySchemaGeneration}, ${target}, ${entity.model},
-                    ${entity.model_version}, ${entity.entity_key}, ${entity.value_json})`
               }
               return true
             })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
@@ -773,12 +790,16 @@ export const layer = (
           if (!deleted) break
           yield* Effect.yieldNow
         }
-        yield* invalidate([])
         return yield* Effect.void
       })
 
       const withProjectionGate = <A, E, R,>(effect: Effect.Effect<A, E, R>) =>
-        projectionGate.withPermit(rebuildProjection.pipe(Effect.andThen(effect)))
+        projectionGate.withPermit(
+          rebuildProjection.pipe(
+            Effect.andThen(flushDeferredInvalidations),
+            Effect.andThen(effect)
+          )
+        )
 
       const pruneReceipts = (target: number) =>
         Effect.gen(function*() {
@@ -1645,9 +1666,15 @@ export const layer = (
         reconciliationGenerations,
         requestReconciliation,
         completeReconciliation,
-        applyEntries: (entries) =>
-          withProjectionGate(Effect.gen(function*() {
-            if (entries.length === 0) return yield* Effect.void
+        applyEntries: (entries, applyOptions) =>
+          projectionGate.withPermit(Effect.gen(function*() {
+            if (entries.length === 0) {
+              if (applyOptions?.publishProjection !== false) {
+                yield* rebuildProjection
+                yield* flushDeferredInvalidations
+              }
+              return yield* Effect.void
+            }
             const touched: Array<Protocol.EntityKey> = []
             const settledReceiptIds: Array<Identity.MutationId> = []
             let prunedReceiptIds: ReadonlyArray<Identity.MutationId> = []
@@ -1770,11 +1797,14 @@ export const layer = (
               prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
               return yield* Effect.void
             })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
-            yield* rebuildProjection
-            yield* invalidate(
+            yield* deferInvalidation(
               touched,
               [...settledReceiptIds, ...prunedReceiptIds]
             )
+            if (applyOptions?.publishProjection !== false) {
+              yield* rebuildProjection
+              yield* flushDeferredInvalidations
+            }
             return undefined
           })).pipe(Effect.withSpan("LocalStore.applyEntries", {
             attributes: { "entry.count": entries.length, "space.id": options.spaceId }

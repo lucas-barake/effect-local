@@ -6,6 +6,7 @@ SQLite persistence and authoritative mutation ordering for Effect Local.
 client table is partitioned by `space_id`. Each `Replica.Space` handle owns its operations and status. The root service
 joins, leaves, lists, and addresses handles, and reports aggregate status. One dispatcher schedules keyed watches and
 turns over the shared `SyncEngine`, so the RPC composition uses one WebSocket while spaces make progress independently.
+`reconciliationConcurrency` bounds how many finite turns the lightweight `SqlReplica.layer` dispatcher can run at once.
 
 `SqlReplica.layerWorkflow` uses the same store, query executor, and idempotent reconciliation pass with finite Effect
 Workflow generations. Local SQLite stores canonical entities, visible entities, pending mutations, bounded terminal

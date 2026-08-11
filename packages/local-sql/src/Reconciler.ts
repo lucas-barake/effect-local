@@ -34,6 +34,7 @@ export interface Service {
   readonly sync: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly notify: Effect.Effect<void>
   readonly status: Effect.Effect<ReplicaStatus.ReplicaStatus>
+  readonly shutdown: Effect.Effect<void>
 }
 
 export class Reconciler extends Context.Service<Reconciler, Service>()(
@@ -51,7 +52,10 @@ export interface ManagedSpace {
   readonly spaceId: Identity.SpaceId
   readonly generation: number
   readonly definition: Definition.Any
-  readonly local: LocalStore.Service
+  readonly local: Pick<
+    LocalStore.Service,
+    "requestReconciliation" | "reconciliationGenerations" | "completeReconciliation"
+  >
   readonly reconciliation: ReconciliationService
   readonly retryDelay?: Duration.Input
 }
@@ -84,139 +88,166 @@ interface Work {
 
 const managedKey = (spaceId: Identity.SpaceId, generation: number) => `${spaceId}:${generation}`
 
-export const makeManager: Effect.Effect<
+export const makeManager = (options: {
+  readonly concurrency?: number
+} = {}): Effect.Effect<
   ManagerService,
-  never,
+  ReplicaError.InvalidConfiguration,
   SyncEngine.SyncEngine | Scope.Scope
-> = Effect.gen(function*() {
-  const remote = yield* SyncEngine.SyncEngine
-  const gate = yield* Semaphore.make(1)
-  const queue = yield* Queue.unbounded<Work>()
-  const turns = yield* FiberMap.make<string, void, never>()
-  const watches = yield* FiberMap.make<string, void, never>()
-  const spaces = new Map<Identity.SpaceId, ManagedState>()
-
-  const lookup = (spaceId: Identity.SpaceId) =>
-    gate.withPermit(Effect.gen(function*() {
-      const space = spaces.get(spaceId)
-      if (space !== undefined) return space
-      return yield* new ReplicaError.SpaceNotJoined({ spaceId })
-    }))
-
-  const enqueue = (space: ManagedState) =>
-    gate.withPermit(Effect.gen(function*() {
-      const current = spaces.get(space.spaceId)
-      if (current !== space) {
-        yield* new ReplicaError.SpaceNotJoined({ spaceId: space.spaceId })
-        return
-      }
-      current.dirtyEpoch += 1
-      yield* current.local.requestReconciliation
-      if (current.queued || current.running) return
-      current.queued = true
-      yield* Queue.offer(queue, { spaceId: current.spaceId, generation: current.generation })
-    }))
-
-  const notify = (spaceId: Identity.SpaceId) => lookup(spaceId).pipe(Effect.flatMap(enqueue))
-
-  const runTurn = (space: ManagedState, epoch: number) =>
-    Effect.gen(function*() {
-      const generations = yield* space.local.reconciliationGenerations
-      if (generations.completed >= generations.requested) return
-      yield* space.reconciliation.sync
-      yield* space.local.completeReconciliation(generations.requested)
-      yield* space.reconciliation.succeeded
-    }).pipe(
-      Effect.catch((error) =>
-        space.reconciliation.failed(error).pipe(
-          Effect.andThen(Effect.sleep(space.retryDelayMillis)),
-          Effect.andThen(enqueue(space)),
-          Effect.catch(() => Effect.void)
-        )
-      ),
-      Effect.ensuring(gate.withPermit(Effect.gen(function*() {
-        const current = spaces.get(space.spaceId)
-        if (current !== space) return
-        current.running = false
-        if (current.dirtyEpoch <= epoch || current.queued) return
-        current.queued = true
-        yield* Queue.offer(queue, { spaceId: current.spaceId, generation: current.generation })
-      })))
+> =>
+  Effect.gen(function*() {
+    const remote = yield* SyncEngine.SyncEngine
+    const concurrency = options.concurrency ?? 8
+    if (!Number.isSafeInteger(concurrency) || concurrency <= 0) {
+      return yield* new ReplicaError.InvalidConfiguration({
+        option: "reconciliationConcurrency",
+        message: "reconciliationConcurrency must be a positive safe integer"
+      })
+    }
+    const queue = yield* Effect.acquireRelease(
+      Queue.unbounded<Work>(),
+      Queue.shutdown
     )
+    const turns = yield* FiberMap.make<string, void, never>()
+    const watches = yield* FiberMap.make<string, void, never>()
+    const spaces = new Map<Identity.SpaceId, ManagedState>()
 
-  const dispatcher = Effect.forever(Effect.gen(function*() {
-    const work = yield* Queue.take(queue)
-    const selected = yield* gate.withPermit(Effect.sync(() => {
-      const current = spaces.get(work.spaceId)
-      if (current === undefined || current.generation !== work.generation || !current.queued) return undefined
-      current.queued = false
-      if (current.running) return undefined
-      current.running = true
-      return { space: current, epoch: current.dirtyEpoch }
-    }))
-    if (selected === undefined) return
-    yield* FiberMap.run(
-      turns,
-      managedKey(selected.space.spaceId, selected.space.generation),
-      runTurn(selected.space, selected.epoch),
-      { startImmediately: true }
-    )
-  }))
-  yield* Effect.forkScoped(dispatcher)
+    const lookup = (spaceId: Identity.SpaceId) =>
+      Effect.suspend(() => {
+        const space = spaces.get(spaceId)
+        if (space === undefined) return Effect.fail(new ReplicaError.SpaceNotJoined({ spaceId }))
+        return Effect.succeed(space)
+      })
 
-  const register = (space: ManagedSpace) =>
-    Effect.gen(function*() {
-      const retryDelayMillis = yield* Configuration.positiveFiniteDurationMillis(
-        "retryDelay",
-        space.retryDelay ?? Duration.seconds(1)
+    const enqueue = (space: ManagedState) =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function*() {
+          const current = spaces.get(space.spaceId)
+          if (current !== space) {
+            yield* new ReplicaError.SpaceNotJoined({ spaceId: space.spaceId })
+            return
+          }
+          yield* restore(current.local.requestReconciliation)
+          const admitted = spaces.get(space.spaceId)
+          if (admitted !== space) {
+            yield* new ReplicaError.SpaceNotJoined({ spaceId: space.spaceId })
+            return
+          }
+          admitted.dirtyEpoch += 1
+          if (admitted.queued || admitted.running) return
+          admitted.queued = true
+          yield* Queue.offer(queue, { spaceId: admitted.spaceId, generation: admitted.generation })
+        })
       )
-      const state: ManagedState = {
-        ...space,
-        retryDelayMillis,
-        queued: false,
-        running: false,
-        dirtyEpoch: 0
-      }
-      yield* gate.withPermit(Effect.sync(() => spaces.set(space.spaceId, state)))
-      yield* FiberMap.run(
-        watches,
-        managedKey(space.spaceId, space.generation),
-        Effect.forever(
-          remote.watch({ spaceId: space.spaceId, schema: space.definition.schemaIdentity }).pipe(
-            Stream.runForEach(() => enqueue(state)),
-            Effect.catch((error) =>
-              state.reconciliation.failed(error).pipe(
-                Effect.andThen(enqueue(state)),
-                Effect.catch(() => Effect.void)
-              )
-            ),
-            Effect.andThen(Effect.sleep(retryDelayMillis))
+
+    const notify = (spaceId: Identity.SpaceId) => lookup(spaceId).pipe(Effect.flatMap(enqueue))
+
+    const runTurn = (space: ManagedState, epoch: number) =>
+      Effect.gen(function*() {
+        const generations = yield* space.local.reconciliationGenerations
+        if (generations.completed >= generations.requested) return
+        yield* space.reconciliation.sync
+        yield* space.local.completeReconciliation(generations.requested)
+        yield* space.reconciliation.succeeded
+      }).pipe(
+        Effect.catch((error) =>
+          space.reconciliation.failed(error).pipe(
+            Effect.andThen(Effect.sleep(space.retryDelayMillis)),
+            Effect.andThen(enqueue(space)),
+            Effect.catch(() => Effect.void)
           )
         ),
+        Effect.ensuring(Effect.uninterruptible(Effect.gen(function*() {
+          const current = spaces.get(space.spaceId)
+          if (current !== space) return
+          current.running = false
+          if (current.dirtyEpoch <= epoch || current.queued) return
+          current.queued = true
+          yield* Queue.offer(queue, { spaceId: current.spaceId, generation: current.generation })
+        })))
+      )
+
+    const worker = Effect.forever(Effect.gen(function*() {
+      const work = yield* Queue.take(queue)
+      const selected = yield* Effect.sync(() => {
+        const current = spaces.get(work.spaceId)
+        if (current === undefined || current.generation !== work.generation || !current.queued) return undefined
+        current.queued = false
+        if (current.running) return undefined
+        current.running = true
+        return { space: current, epoch: current.dirtyEpoch }
+      })
+      if (selected === undefined) return
+      const fiber = yield* FiberMap.run(
+        turns,
+        managedKey(selected.space.spaceId, selected.space.generation),
+        runTurn(selected.space, selected.epoch),
         { startImmediately: true }
       )
-      yield* enqueue(state)
-    })
+      yield* Fiber.await(fiber)
+    }))
+    yield* Effect.forEach(
+      Array.from({ length: concurrency }),
+      () => Effect.forkScoped(worker),
+      { discard: true }
+    )
 
-  const unregister = (spaceId: Identity.SpaceId, generation: number) =>
-    Effect.gen(function*() {
-      yield* gate.withPermit(Effect.sync(() => {
+    const register = (space: ManagedSpace) =>
+      Effect.gen(function*() {
+        const retryDelayMillis = yield* Configuration.positiveFiniteDurationMillis(
+          "retryDelay",
+          space.retryDelay ?? Duration.seconds(1)
+        )
+        const state: ManagedState = {
+          ...space,
+          retryDelayMillis,
+          queued: false,
+          running: false,
+          dirtyEpoch: 0
+        }
+        yield* Effect.sync(() => spaces.set(space.spaceId, state))
+        yield* FiberMap.run(
+          watches,
+          managedKey(space.spaceId, space.generation),
+          Effect.forever(
+            remote.watch({ spaceId: space.spaceId, schema: space.definition.schemaIdentity }).pipe(
+              Stream.runForEach(() => enqueue(state)),
+              Effect.catch((error) =>
+                state.reconciliation.failed(error).pipe(
+                  Effect.andThen(enqueue(state)),
+                  Effect.catch(() => Effect.void)
+                )
+              ),
+              Effect.andThen(Effect.sleep(retryDelayMillis))
+            )
+          ),
+          { startImmediately: true }
+        )
+        yield* enqueue(state)
+      }).pipe(Effect.onError(() => unregister(space.spaceId, space.generation)))
+
+    const unregister = (spaceId: Identity.SpaceId, generation: number) =>
+      Effect.gen(function*() {
         const current = spaces.get(spaceId)
         if (current?.generation === generation) spaces.delete(spaceId)
-      }))
-      const key = managedKey(spaceId, generation)
-      yield* FiberMap.remove(watches, key)
-      yield* FiberMap.remove(turns, key)
-    })
+        const key = managedKey(spaceId, generation)
+        yield* FiberMap.remove(watches, key)
+        yield* FiberMap.remove(turns, key)
+      })
 
-  const sync = (spaceId: Identity.SpaceId) => lookup(spaceId).pipe(Effect.flatMap((space) => space.reconciliation.sync))
-  const status = (spaceId: Identity.SpaceId) =>
-    lookup(spaceId).pipe(Effect.flatMap((space) => space.reconciliation.status))
+    const sync = (spaceId: Identity.SpaceId) =>
+      lookup(spaceId).pipe(Effect.flatMap((space) => space.reconciliation.sync))
+    const status = (spaceId: Identity.SpaceId) =>
+      lookup(spaceId).pipe(Effect.flatMap((space) => space.reconciliation.status))
 
-  return Manager.of({ register, unregister, sync, notify, status })
-})
+    return Manager.of({ register, unregister, sync, notify, status })
+  })
 
-export const layerManager: Layer.Layer<Manager, never, SyncEngine.SyncEngine> = Layer.effect(Manager, makeManager)
+export const layerManager: Layer.Layer<Manager, ReplicaError.InvalidConfiguration, SyncEngine.SyncEngine> = Layer
+  .effect(
+    Manager,
+    makeManager()
+  )
 
 export const layerOnePass = (
   options: Pick<Options, "definition" | "spaceId" | "pageSize">
@@ -340,7 +371,7 @@ export const layerOnePass = (
             yield* bootstrap(result.manifest)
             continue
           }
-          yield* local.applyEntries(result.entries)
+          yield* local.applyEntries(result.entries, { publishProjection: !result.hasMore })
           if (!result.hasMore) return
         }
       })
@@ -467,7 +498,12 @@ export const layerInMemoryScheduler = (
         )
       )
 
-      return Reconciler.of({ sync: reconciliation.sync, notify, status: reconciliation.status })
+      return Reconciler.of({
+        sync: reconciliation.sync,
+        notify,
+        status: reconciliation.status,
+        shutdown: Effect.void
+      })
     })
   )
 

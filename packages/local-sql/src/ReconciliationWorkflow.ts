@@ -9,6 +9,7 @@ import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
+import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
@@ -474,7 +475,14 @@ const layerSchedulerWithConfiguration = (
       const reconciliation = yield* Reconciler.Reconciliation
       yield* Registration
       const remote = yield* SyncEngine.SyncEngine
+      const engine = yield* WorkflowEngine.WorkflowEngine
       const wake = yield* Queue.sliding<void>(1)
+      const activeExecution = yield* Ref.make<
+        Option.Option<{
+          readonly workflow: ReturnType<typeof make>
+          readonly executionId: string
+        }>
+      >(Option.none())
       const notify = Queue.offer(wake, undefined).pipe(Effect.asVoid)
       const requestAndNotify = local.requestReconciliation.pipe(Effect.andThen(notify))
 
@@ -492,7 +500,12 @@ const layerSchedulerWithConfiguration = (
                   membershipIncarnation: local.membershipIncarnation,
                   generation: generations.requested
                 })
-                yield* make(payload).execute(payload)
+                const workflow = make(payload)
+                const activeExecutionId = yield* executionId(payload)
+                yield* Ref.set(activeExecution, Option.some({ workflow, executionId: activeExecutionId }))
+                yield* workflow.execute(payload).pipe(
+                  Effect.ensuring(Ref.set(activeExecution, Option.none()))
+                )
               }
             })
           ),
@@ -528,7 +541,20 @@ const layerSchedulerWithConfiguration = (
         )
       )
 
-      return Reconciler.Reconciler.of({ sync: reconciliation.sync, notify, status: reconciliation.status })
+      const shutdown = Effect.gen(function*() {
+        const active = yield* Ref.get(activeExecution)
+        const supervisorInterruption = yield* Effect.forkChild(Fiber.interrupt(supervisorFiber), {
+          startImmediately: true
+        })
+        if (Option.isSome(active)) {
+          const result = yield* engine.poll(active.value.workflow, active.value.executionId)
+          if (Option.isNone(result)) {
+            yield* engine.interruptUnsafe(active.value.workflow, active.value.executionId)
+          }
+        }
+        yield* Fiber.join(supervisorInterruption)
+      })
+      return Reconciler.Reconciler.of({ sync: reconciliation.sync, notify, status: reconciliation.status, shutdown })
     })
   )
 

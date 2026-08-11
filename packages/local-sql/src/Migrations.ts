@@ -1369,6 +1369,21 @@ const serverV7 = makeMigration({
   ]
 })
 
+const ServerV8ReceiptRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  client_id: Identity.ClientId,
+  membership_incarnation: Identity.MembershipIncarnation,
+  local_sequence: Identity.LocalSequence,
+  receipt_json: Schema.String
+})
+
+const ServerV8EntryRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  server_sequence: Identity.ServerSequence,
+  membership_incarnation: Identity.MembershipIncarnation,
+  entry_json: Schema.String
+})
+
 const serverV8 = makeMigration({
   id: 8,
   name: "membership-incarnation-lineage",
@@ -1492,41 +1507,74 @@ const serverV8 = makeMigration({
     id: "canonicalize-membership-lineage",
     run: (sql) =>
       Effect.gen(function*() {
-        const receipts = yield* sql<{
-          readonly space_id: string
-          readonly client_id: string
-          readonly membership_incarnation: string
-          readonly local_sequence: number
-          readonly receipt_json: string
-        }>`SELECT space_id, client_id, membership_incarnation, local_sequence, receipt_json
-          FROM effect_local_server_receipts`
-        for (const row of receipts) {
-          const receipt = yield* Codec.parse(row.receipt_json).pipe(
-            Effect.flatMap((value) => Codec.decode(Protocol.Receipt, value))
-          )
-          const normalized = { ...receipt, membershipIncarnation: row.membership_incarnation }
-          yield* sql`UPDATE effect_local_server_receipts SET receipt_json = ${yield* Codec.stringify(normalized)}
-            WHERE space_id = ${row.space_id} AND client_id = ${row.client_id}
-              AND membership_incarnation = ${row.membership_incarnation}
-              AND local_sequence = ${row.local_sequence}`
+        const readReceipts = SqlSchema.findAll({
+          Request: Schema.Struct({
+            spaceId: Schema.String,
+            clientId: Schema.String,
+            membershipIncarnation: Schema.String,
+            localSequence: Schema.Int
+          }),
+          Result: ServerV8ReceiptRow,
+          execute: (cursor) =>
+            sql`SELECT space_id, client_id, membership_incarnation, local_sequence, receipt_json
+            FROM effect_local_server_receipts
+            WHERE (space_id, client_id, membership_incarnation, local_sequence) >
+              (${cursor.spaceId}, ${cursor.clientId}, ${cursor.membershipIncarnation}, ${cursor.localSequence})
+            ORDER BY space_id, client_id, membership_incarnation, local_sequence LIMIT 256`
+        })
+        const readEntries = SqlSchema.findAll({
+          Request: Schema.Struct({ spaceId: Schema.String, serverSequence: Schema.Int }),
+          Result: ServerV8EntryRow,
+          execute: (cursor) =>
+            sql`SELECT space_id, server_sequence, membership_incarnation, entry_json
+            FROM effect_local_authoritative_log
+            WHERE (space_id, server_sequence) > (${cursor.spaceId}, ${cursor.serverSequence})
+            ORDER BY space_id, server_sequence LIMIT 256`
+        })
+        const decodeRows = <A, E,>(effect: Effect.Effect<A, E | SqlError.SqlError>) =>
+          effect.pipe(Effect.mapError((cause) => {
+            if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
+            return new ReplicaError.StorageCorrupt({ message: "Server migration 8 row is corrupt", cause })
+          }))
+        let receiptCursor = { spaceId: "", clientId: "", membershipIncarnation: "", localSequence: -1 }
+        while (true) {
+          const receipts = yield* decodeRows(readReceipts(receiptCursor))
+          for (const row of receipts) {
+            const receipt = yield* Codec.parse(row.receipt_json).pipe(
+              Effect.flatMap((value) => Codec.decode(Protocol.Receipt, value))
+            )
+            const normalized = { ...receipt, membershipIncarnation: row.membership_incarnation }
+            yield* sql`UPDATE effect_local_server_receipts SET receipt_json = ${yield* Codec.stringify(normalized)}
+              WHERE space_id = ${row.space_id} AND client_id = ${row.client_id}
+                AND membership_incarnation = ${row.membership_incarnation}
+                AND local_sequence = ${row.local_sequence}`
+          }
+          if (receipts.length < 256) break
+          const last = receipts[receipts.length - 1]
+          receiptCursor = {
+            spaceId: last.space_id,
+            clientId: last.client_id,
+            membershipIncarnation: last.membership_incarnation,
+            localSequence: last.local_sequence
+          }
         }
-        const entries = yield* sql<{
-          readonly space_id: string
-          readonly server_sequence: number
-          readonly membership_incarnation: string
-          readonly entry_json: string
-        }>`SELECT space_id, server_sequence, membership_incarnation, entry_json
-          FROM effect_local_authoritative_log`
-        for (const row of entries) {
-          const entry = yield* Codec.parse(row.entry_json).pipe(
-            Effect.flatMap((value) => Codec.decode(Protocol.AcceptedMutation, value))
-          )
-          const normalized = { ...entry, membershipIncarnation: row.membership_incarnation }
-          const entryJson = yield* Codec.stringify(normalized)
-          const entryBytes = yield* Protocol.encodedBytesEffect(normalized)
-          yield* sql`UPDATE effect_local_authoritative_log
-            SET entry_json = ${entryJson}, entry_bytes = ${entryBytes}
-            WHERE space_id = ${row.space_id} AND server_sequence = ${row.server_sequence}`
+        let entryCursor = { spaceId: "", serverSequence: -1 }
+        while (true) {
+          const entries = yield* decodeRows(readEntries(entryCursor))
+          for (const row of entries) {
+            const entry = yield* Codec.parse(row.entry_json).pipe(
+              Effect.flatMap((value) => Codec.decode(Protocol.AcceptedMutation, value))
+            )
+            const normalized = { ...entry, membershipIncarnation: row.membership_incarnation }
+            const entryJson = yield* Codec.stringify(normalized)
+            const entryBytes = yield* Protocol.encodedBytesEffect(normalized)
+            yield* sql`UPDATE effect_local_authoritative_log
+              SET entry_json = ${entryJson}, entry_bytes = ${entryBytes}
+              WHERE space_id = ${row.space_id} AND server_sequence = ${row.server_sequence}`
+          }
+          if (entries.length < 256) break
+          const last = entries[entries.length - 1]
+          entryCursor = { spaceId: last.space_id, serverSequence: last.server_sequence }
         }
       }).pipe(
         Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))

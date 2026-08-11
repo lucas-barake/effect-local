@@ -568,6 +568,55 @@ describe("server reconciled mutation log", () => {
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
+  it.effect("publishes one projection after a multi-page catch up", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, serverLayer())
+        for (let sequence = 1; sequence <= 4; sequence++) {
+          yield* server.submit(
+            yield* envelope(
+              Domain.PutTodo.name,
+              Domain.todo(`paged-${sequence}`),
+              sequence,
+              Identity.MutationId.make(`mut_00000000-0000-4000-8004-${String(sequence).padStart(12, "0")}`)
+            )
+          )
+        }
+
+        const databaseContext = yield* Layer.build(database())
+        const sql = Context.get(databaseContext, SqlClient.SqlClient)
+        const services = Layer.mergeAll(
+          Layer.succeed(SqlClient.SqlClient, sql),
+          Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto)),
+          Layer.succeed(Reactivity.Reactivity, Context.get(databaseContext, Reactivity.Reactivity))
+        )
+        const localContext = yield* Layer.build(
+          LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(services)
+          )
+        )
+        const local = Context.get(localContext, LocalStore.Store)
+        yield* sql`CREATE TABLE projection_insert_probe (count INTEGER NOT NULL)`
+        yield* sql`CREATE TRIGGER projection_insert_probe_trigger
+        AFTER INSERT ON effect_local_client_visible_entities_data
+        BEGIN INSERT INTO projection_insert_probe VALUES (1); END`
+        const reconciliation = yield* service(
+          Reconciler.Reconciliation,
+          Reconciler.layerOnePass({ definition: Domain.definition, spaceId, pageSize: 1 }).pipe(
+            Layer.provide(Layer.succeed(LocalStore.Store, local)),
+            Layer.provide(directSync(server))
+          )
+        )
+
+        yield* reconciliation.sync
+
+        const copied = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM projection_insert_probe`
+        assert.strictEqual(copied[0].count, 4)
+        assert.strictEqual(yield* local.cursor, 4)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
   it.effect("resumes a durable bootstrap stage after reopening the client database", () =>
     Effect.scoped(
       Effect.gen(function*() {
